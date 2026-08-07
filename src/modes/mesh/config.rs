@@ -1214,15 +1214,146 @@ fn labels_match_subset<L: WorkloadLabels + ?Sized>(
 /// may consume the service, so it is deliberately not part of this visibility
 /// check.
 pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namespace: &str) -> bool {
-    if entry.export_to.is_empty() {
-        return entry.namespace == workload_namespace;
+    export_visibility_admits(&entry.export_to, &entry.namespace, workload_namespace)
+}
+
+/// The ONE `exportTo` visibility evaluator, shared by ServiceEntry,
+/// DestinationRule, and VirtualService-derived CORS policy so the three can
+/// never drift apart.
+///
+/// `.` expands against `declaring_namespace` — which is why every carrier of
+/// an `exportTo` list must also carry its declaring namespace. An EMPTY list
+/// is namespace-local: Ferrum's fail-closed-by-omission convention on the
+/// native/file/carrier sources (Kubernetes translation materializes Istio's
+/// public default as an explicit `["*"]` instead of leaving the list empty).
+///
+/// Every source canonicalizes entries before this evaluator runs. Deliberately
+/// do not reinterpret padded or otherwise unnormalized input here: an invalid
+/// value must match nothing until boundary normalization and validation have
+/// accepted it, never accidentally widen visibility.
+pub(crate) fn export_visibility_admits(
+    export_to: &[String],
+    declaring_namespace: &str,
+    workload_namespace: &str,
+) -> bool {
+    let declaring_namespace = declaring_namespace.trim();
+    let workload_namespace = workload_namespace.trim();
+    if export_to.is_empty() {
+        return declaring_namespace == workload_namespace;
     }
 
-    entry.export_to.iter().any(|target| {
+    export_to.iter().any(|target| {
         target == "*"
             || target == workload_namespace
-            || (target == "." && entry.namespace == workload_namespace)
+            || (target == "." && declaring_namespace == workload_namespace)
     })
+}
+
+/// THE `exportTo` entry canonicalizer, and the other half of
+/// [`export_visibility_admits`]'s contract.
+///
+/// The evaluator deliberately refuses to reinterpret padded input, which only
+/// holds as a safety property if EVERY source canonicalizes first — otherwise
+/// a boundary that validates a trimmed copy (`validate_mesh_export_to` trims
+/// per entry) accepts `" beta "` while the stored entry goes on to match
+/// nothing, i.e. accepted-then-silently-inert. Config-source normalization
+/// (`MeshConfig::normalize`), the Kubernetes translator, and the xDS carrier
+/// decode paths all funnel through this ONE function so they cannot drift.
+///
+/// Trimming is the whole transformation: an entry that is still invalid after
+/// trimming stays invalid and is rejected by [`validate_mesh_export_to`].
+pub fn normalize_mesh_export_to(export_to: &mut [String]) {
+    for entry in export_to {
+        let trimmed = entry.trim();
+        if trimmed.len() != entry.len() {
+            *entry = trimmed.to_string();
+        }
+    }
+}
+
+/// True when this DestinationRule is exported to `workload_namespace`
+/// (issue #2465).
+///
+/// This is the visibility half of DestinationRule selection and runs BEFORE
+/// [`destination_rule_lookup_tier`]: a rule the subscriber cannot see is never
+/// eligible for any tier, so root-namespace fallback can never resurrect a
+/// namespace-local rule.
+pub fn destination_rule_exported_to_namespace(
+    rule: &MeshDestinationRule,
+    workload_namespace: &str,
+) -> bool {
+    export_visibility_admits(&rule.export_to, &rule.namespace, workload_namespace)
+}
+
+/// Istio's DestinationRule lookup path, most specific first (issue #2469).
+///
+/// Istio resolves the DestinationRule for a destination host by searching the
+/// client's own namespace, then the target service's namespace, then
+/// `meshConfig.rootNamespace` — the FIRST tier that yields a visible rule
+/// wins outright. Derived `Ord` follows the declaration order, so
+/// `Client < Service < Root < Unscoped` and "smallest tier wins" is the
+/// selection rule.
+///
+/// [`Unscoped`](Self::Unscoped) is the lowest-priority bucket for a rule whose
+/// namespace is none of the three: slice narrowing refuses those outright, so
+/// it only ever appears on the data-plane materialization pass, where it keeps
+/// an unexpected rule from outranking a properly scoped one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DestinationRuleLookupTier {
+    /// Declared in the client workload's own namespace.
+    Client,
+    /// Declared in the target service's namespace.
+    Service,
+    /// Declared in the configured `istio_root_namespace`.
+    Root,
+    /// Declared somewhere else entirely.
+    Unscoped,
+}
+
+impl DestinationRuleLookupTier {
+    /// True when this tier is part of Istio's lookup path at all.
+    #[inline]
+    pub fn is_in_lookup_path(self) -> bool {
+        self != DestinationRuleLookupTier::Unscoped
+    }
+}
+
+/// Classify a DestinationRule's declaring namespace into its Istio lookup tier.
+///
+/// Ties resolve to the most specific tier (a rule in a namespace that is both
+/// the client's and the service's is `Client`), so tier assignment never
+/// depends on how `(namespace, name)` happens to sort.
+///
+/// `service_namespace` is `None` when the caller could not establish, from
+/// evidence, which namespace owns the target service — an ambiguously owned
+/// external host, or a two-label short host with no matching entry in the
+/// service inventory. That DISABLES the service tier rather than guessing a
+/// namespace: guessing lets a rule from an unrelated namespace nominate itself
+/// as the owner of a host it does not own (issue #2469).
+///
+/// EVERY tier comparison is guarded against an empty namespace on the
+/// authoritative side. An empty `client_namespace`, `service_namespace`, or
+/// `root_namespace` disables that tier rather than matching every rule whose
+/// own namespace also trims to empty.
+pub fn destination_rule_lookup_tier(
+    rule_namespace: &str,
+    client_namespace: &str,
+    service_namespace: Option<&str>,
+    root_namespace: &str,
+) -> DestinationRuleLookupTier {
+    let rule_namespace = rule_namespace.trim();
+    let client_namespace = client_namespace.trim();
+    let service_namespace = service_namespace.map(str::trim).filter(|ns| !ns.is_empty());
+    let root_namespace = root_namespace.trim();
+    if !client_namespace.is_empty() && rule_namespace == client_namespace {
+        DestinationRuleLookupTier::Client
+    } else if service_namespace == Some(rule_namespace) {
+        DestinationRuleLookupTier::Service
+    } else if !root_namespace.is_empty() && rule_namespace == root_namespace {
+        DestinationRuleLookupTier::Root
+    } else {
+        DestinationRuleLookupTier::Unscoped
+    }
 }
 
 pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
@@ -1478,6 +1609,31 @@ pub struct MeshSidecar {
     /// explicit empty `ingress: []`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<MeshSidecarIngress>,
+    /// Istio `spec.outboundTrafficPolicy.mode` — the workload-scoped override of
+    /// the mesh-wide [`MeshConfig::outbound_traffic_policy`] (issue #3262).
+    ///
+    /// `None` = the Sidecar OMITTED `outboundTrafficPolicy`, so the workload
+    /// inherits the mesh-wide policy (slice `outbound_traffic_policy`, else
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`). `Some(_)` REPLACES it for every
+    /// workload this Sidecar applies to — Istio resolves exactly ONE Sidecar per
+    /// workload, so there is no inheritance chain here (unlike `egress`, whose
+    /// omitted-means-inherit walk is a separate, egress-only concern).
+    ///
+    /// On the K8s path, a present object with omitted/null `mode` uses Istio's
+    /// documented `ALLOW_ANY` default. A PRESENT `outboundTrafficPolicy` block
+    /// Ferrum cannot represent exactly — an unrecognized/non-string `mode`, a
+    /// non-object block, or an `egressProxy` Ferrum cannot route through —
+    /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
+    /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
+    /// is never REJECTED over this field: dropping it would also drop its egress
+    /// narrowing and thereby WIDEN both the slice's service view and the derived
+    /// outbound registry.
+    ///
+    /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
+    /// effective gate as `ingress[]` materialization) — see
+    /// `MeshSlice::sidecar_outbound_traffic_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
 /// A single ingress listener entry under a [`MeshSidecar`] (`spec.ingress[]`).
@@ -1896,6 +2052,31 @@ pub struct MeshDestinationRule {
     /// overrides. Proxies reference these via `upstream_subset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsets: Vec<MeshSubset>,
+    /// Export visibility from Istio `spec.exportTo` (issue #2465).
+    ///
+    /// Supported values are `*` (visible mesh-wide), `.` (visible only in this
+    /// rule's own [`namespace`](Self::namespace)), and explicit namespace
+    /// names. `~` and every other token is unsupported and rejected — see
+    /// [`validate_mesh_export_to`].
+    ///
+    /// Omitted-versus-explicitly-empty is DEFINED, not guessed, and the two
+    /// sources differ deliberately:
+    ///
+    /// * **Kubernetes**: an omitted (or explicitly empty) `spec.exportTo` is
+    ///   translated into an explicit `["*"]`, preserving Istio's public
+    ///   default.
+    /// * **Native / file / xDS carrier**: an EMPTY list is namespace-local,
+    ///   the same fail-closed-by-omission convention
+    ///   [`ServiceEntry::export_to`] and
+    ///   [`MeshVirtualServiceCorsPolicy::export_to`] already use. Write
+    ///   `["*"]` to publish a rule mesh-wide on those sources.
+    ///
+    /// Visibility is evaluated by [`destination_rule_exported_to_namespace`]
+    /// BEFORE lookup-tier selection and before a per-node slice is serialized,
+    /// so a namespace-local rule never reaches a subscriber outside its
+    /// declared visibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
 }
 
 /// Traffic policy controlling connection pool, outlier detection, and LB.
@@ -1931,10 +2112,13 @@ pub struct MeshTrafficPolicy {
     /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
-    /// Cap on inflight backend TCP connections per target, mapped from
-    /// Istio `connectionPool.tcp.maxConnections`. Currently enforced only
-    /// by stream-family backend dispatch (TCP / TCP+TLS proxies); HTTP-family
-    /// dispatch ignores the field — that is tracked as a follow-on PR.
+    /// Cap on concurrent OPEN backend connections per destination, mapped from
+    /// Istio `connectionPool.tcp.maxConnections`. Enforced by every transport
+    /// whose physical connection lifecycle Ferrum owns: stream-family (TCP /
+    /// TCP+TLS), HTTP-family WebSocket, the pooled multiplexed transports
+    /// (direct H2, gRPC, native H3, HBONE, mesh-mTLS), and known-HTTP/1.1
+    /// reqwest dispatch. `Some(0)` is rejected by validation on both the K8s
+    /// and native/file paths because it would refuse every connection.
     /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
@@ -2288,18 +2472,20 @@ pub struct MeshVirtualServiceCorsPolicy {
 /// Returns true when a VirtualService-derived CORS policy is visible to a
 /// workload namespace — the [`service_entry_exported_to_namespace`] rules
 /// applied to the carried `export_to` field.
+///
+/// Routes through the ONE shared evaluator `export_visibility_admits`, so
+/// ServiceEntry, DestinationRule, and VirtualService-derived CORS can never
+/// drift apart on what `.`, `*`, an explicit namespace, or an EMPTY list
+/// means. `validate_virtual_service_cors_policies` runs the same
+/// [`validate_mesh_export_to`] fail-closed boundary check DestinationRules
+/// get, while config-source normalization canonicalizes accepted entries
+/// before this evaluator sees them. The evaluator itself never reinterprets
+/// unnormalized input.
 pub fn virtual_service_cors_policy_exported_to_namespace(
     policy: &MeshVirtualServiceCorsPolicy,
     workload_namespace: &str,
 ) -> bool {
-    if policy.export_to.is_empty() {
-        return policy.namespace == workload_namespace;
-    }
-    policy.export_to.iter().any(|target| {
-        target == "*"
-            || target == workload_namespace
-            || (target == "." && policy.namespace == workload_namespace)
-    })
+    export_visibility_admits(&policy.export_to, &policy.namespace, workload_namespace)
 }
 
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
@@ -2719,8 +2905,14 @@ pub struct MeshWaypointServiceRef {
     pub name: String,
 }
 
-/// Istio mesh-wide outbound traffic policy. Mirrors
-/// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
+/// Istio outbound traffic policy. Mirrors the upstream `OutboundTrafficPolicy`
+/// message, which Istio uses at TWO scopes: mesh-wide
+/// (`MeshConfig.outboundTrafficPolicy.mode`, carried on
+/// [`MeshConfig::outbound_traffic_policy`]) and workload-scoped
+/// (`Sidecar.outboundTrafficPolicy.mode`, carried on
+/// [`MeshSidecar::outbound_traffic_policy`]). The workload-scoped value wins for
+/// the workloads its Sidecar selects; the effective value is resolved once per
+/// slice apply by `MeshSlice::effective_outbound_traffic_policy`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundTrafficPolicy {
@@ -2756,6 +2948,11 @@ impl MeshConfig {
             &self.sidecars,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
+        );
+        validate_mesh_root_namespace(
+            "MeshConfig.istio_root_namespace",
+            &self.istio_root_namespace,
+            &mut errors,
         );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
         errors
@@ -3172,6 +3369,12 @@ fn validate_virtual_service_cors_policies(
         validate_non_empty_string(format!("{context}.name"), &policy.name, errors);
         validate_non_empty_string(format!("{context}.namespace"), &policy.namespace, errors);
         validate_non_empty_string(format!("{context}.host"), &policy.host, errors);
+        // Same fail-closed export boundary DestinationRules get: this list is
+        // the ONLY thing standing between a namespace-local CORS policy and
+        // another tenant's outbound routes, and
+        // `virtual_service_cors_policy_exported_to_namespace` interprets it
+        // through the shared evaluator rather than re-validating it.
+        validate_mesh_export_to(&context, &policy.export_to, errors);
         if policy.cors.allowed_origins.is_empty() {
             errors.push(format!(
                 "{context}: cors.allowed_origins must declare at least one origin matcher"
@@ -3758,6 +3961,15 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
+        // Export visibility is security-relevant (issue #2465): an
+        // unsupported or self-conflicting list must reject the config rather
+        // than be interpreted, so a typo can never widen a namespace-local
+        // rule into a mesh-wide one.
+        validate_mesh_export_to(
+            &format!("MeshDestinationRule '{}'", dr.name),
+            &dr.export_to,
+            &mut errors,
+        );
         // Validate top-level trafficPolicy boundary fields (outlier-detection
         // ranges, client-TLS mode/cert consistency) that the K8s translator
         // enforces but the native/file/xDS slice path otherwise skips.
@@ -3777,7 +3989,7 @@ fn validate_mesh_config_internal(
         // Walk every place a `connectionPool.http` block can ride a DR:
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
-        validate_dr_connection_pool_http(
+        validate_dr_connection_pool(
             &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
             dr.traffic_policy.as_ref(),
             &mut errors,
@@ -3799,7 +4011,7 @@ fn validate_mesh_config_internal(
                 policy,
                 &mut errors,
             );
-            validate_dr_connection_pool_http(
+            validate_dr_connection_pool(
                 &format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
                     dr.name, port
@@ -3824,7 +4036,7 @@ fn validate_mesh_config_internal(
                     &mut errors,
                 );
             }
-            validate_dr_connection_pool_http(
+            validate_dr_connection_pool(
                 &format!(
                     "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
                     dr.name, i
@@ -3945,6 +4157,95 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
     if value.trim().is_empty() {
         errors.push(format!("{context}: must not be empty"));
     }
+}
+
+/// Upper bound on `exportTo` entries. Visibility lists are authored by hand
+/// and a mesh has far fewer namespaces than this; the cap keeps a hostile
+/// config from turning every visibility check into an unbounded scan.
+pub const MESH_EXPORT_TO_MAX_ENTRIES: usize = 64;
+
+/// Validate an `exportTo` visibility list (issue #2465).
+///
+/// Fail-closed and shared by every source that carries one: an unsupported,
+/// malformed, or self-conflicting list is a config REJECTION, never a silent
+/// downgrade to "visible everywhere". Rejecting before publication leaves the
+/// previously accepted slice live.
+///
+/// Diagnostics name the field and the offending INDEX plus a fixed
+/// classification — the raw value is never echoed, because it is
+/// operator-supplied and can be arbitrarily long or hostile.
+pub fn validate_mesh_export_to(context: &str, export_to: &[String], errors: &mut Vec<String>) {
+    if export_to.len() > MESH_EXPORT_TO_MAX_ENTRIES {
+        errors.push(format!(
+            "{context}.exportTo: must not exceed {MESH_EXPORT_TO_MAX_ENTRIES} entries (got {})",
+            export_to.len()
+        ));
+        return;
+    }
+    let mut has_wildcard = false;
+    for (index, raw) in export_to.iter().enumerate() {
+        let entry = raw.trim();
+        if entry == "*" {
+            has_wildcard = true;
+            continue;
+        }
+        if entry == "." {
+            continue;
+        }
+        if entry.is_empty() {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: must not be empty; use '.', '*', or a namespace name"
+            ));
+            continue;
+        }
+        if entry == "~" {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: '~' is not a supported exportTo value; use '.', '*', or a namespace name"
+            ));
+            continue;
+        }
+        if !is_dns1123_namespace_label(entry) {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: must be '.', '*', or a lowercase RFC 1123 namespace name of at most 63 characters"
+            ));
+        }
+    }
+    if has_wildcard && export_to.len() > 1 {
+        errors.push(format!(
+            "{context}.exportTo: '*' is mesh-wide and conflicts with the other {} entries; declare either '*' alone or an explicit namespace list",
+            export_to.len() - 1
+        ));
+    }
+}
+
+/// Validate the policy-authority namespace carried by a mesh config or xDS
+/// slice (issue #2469).
+///
+/// The root namespace decides which tenant may supply mesh-wide policy, so a
+/// non-empty but malformed value must be rejected at the source boundary. The
+/// diagnostic intentionally withholds the operator/CP-supplied value.
+pub fn validate_mesh_root_namespace(context: &str, namespace: &str, errors: &mut Vec<String>) {
+    if !is_dns1123_namespace_label(namespace.trim()) {
+        errors.push(format!(
+            "{context}: must be a lowercase RFC 1123 namespace name of at most 63 characters"
+        ));
+    }
+}
+
+/// RFC 1123 label check used for namespace names inside `exportTo`.
+fn is_dns1123_namespace_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return false;
+    }
+    matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
+        && matches!(bytes.last(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
@@ -4079,6 +4380,24 @@ fn validate_mesh_traffic_policy_tls(
     tls: &MeshTrafficPolicyTls,
     errors: &mut Vec<String>,
 ) {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            &format!("{context}.ca_certificates"),
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        errors.push(error);
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        &format!("{context}.ca_certificates"),
+        &format!("{context}.insecure_skip_verify"),
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        errors.push(error);
+    }
+
     match tls.mode {
         MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
@@ -4128,24 +4447,41 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
     }
 }
 
-/// Validate a DestinationRule `connectionPool.http` block from the native/file
-/// mesh slice path, matching the lower-bound checks the K8s translator
-/// (`translate_http_uint32`) enforces at parse time.
+/// Validate a DestinationRule `connectionPool` block from the native/file mesh
+/// slice path, matching the lower-bound checks the K8s translator
+/// (`translate_http_uint32`, `translate_tcp_max_connections`) enforces at parse
+/// time.
 ///
-/// `http1MaxPendingRequests` is load-bearing because the
-/// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
-/// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
-/// hand-authored native/file DR would silently blackhole all H1 traffic to the
-/// matched destination. The K8s translator rejects 0/negative; this keeps the
-/// native/file path equivalent. `maxRetries: 0` is valid and explicitly
-/// disables an existing retry policy for the selected destination; negatives
-/// are already impossible because both fields deserialize as `u32`.
-fn validate_dr_connection_pool_http(
+/// Two fields are load-bearing because `Some(0)` is a hard-deny at runtime
+/// rather than "unlimited", so an accidental `0` on a hand-authored native/file
+/// DR would silently blackhole traffic to the matched destination:
+///
+/// * `http1MaxPendingRequests` — the
+///   [`crate::backend_pending_limit::BackendPendingLimiter`] sheds every
+///   HTTP/1.1 request at `0`.
+/// * `tcp.maxConnections` — the
+///   [`crate::backend_conn_limit::BackendConnectionLimiter`] refuses every
+///   backend connection at `0`, on every transport (stream, WebSocket, and the
+///   pooled multiplexed pools), so the destination becomes unreachable.
+///
+/// The K8s translator rejects 0/negative for both; this keeps the native/file
+/// path equivalent. `maxRetries: 0` is valid and explicitly disables an existing
+/// retry policy for the selected destination; negatives are already impossible
+/// because these fields deserialize as `u32`.
+fn validate_dr_connection_pool(
     context: &str,
     policy: Option<&MeshTrafficPolicy>,
     errors: &mut Vec<String>,
 ) {
-    let Some(http) = policy.and_then(|p| p.connection_pool_http.as_ref()) else {
+    let Some(policy) = policy else {
+        return;
+    };
+    if policy.max_connections == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.tcp.maxConnections must be positive (0 would refuse every backend connection)"
+        ));
+    }
+    let Some(http) = policy.connection_pool_http.as_ref() else {
         return;
     };
     if http.http1_max_pending_requests == Some(0) {
@@ -4504,6 +4840,7 @@ fn normalize_mesh_fields_internal(
         for host in &mut se.hosts {
             *host = normalize_mesh_hostname_like(host);
         }
+        normalize_mesh_export_to(&mut se.export_to);
         for ep in &mut se.endpoints {
             ep.address.make_ascii_lowercase();
         }
@@ -4516,6 +4853,11 @@ fn normalize_mesh_fields_internal(
     normalize_mesh_policy_fields(policies);
     for dr in destination_rules {
         dr.host = normalize_mesh_hostname_like(&dr.host);
+        // `exportTo` is semantic identity carried through native, file, and
+        // xDS JSON. Canonicalize the same whitespace the evaluator and
+        // validator recognize so equivalent visibility does not produce
+        // different carrier bytes or defeat slice dedupe.
+        normalize_mesh_export_to(&mut dr.export_to);
     }
     // Same treatment as DestinationRule hosts: synthesis matches
     // `policy.host` against service FQDNs via `destination_rule_host_matches`
@@ -4523,6 +4865,7 @@ fn normalize_mesh_fields_internal(
     // like `" Svc.Default "` would silently attach no CORS plugin.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);
+        normalize_mesh_export_to(&mut policy.export_to);
     }
     for sidecar in sidecars {
         for egress in &mut sidecar.egress {

@@ -34,14 +34,17 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
+use crate::backend_conn_limit::{
+    PooledConnectionAdmission, SharedBackendConnectionGuard, SharedBackendConnectionLimiter,
+};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
@@ -256,6 +259,10 @@ pub enum GrpcBody {
         /// is recorded at upload termination, not at response-header time.
         /// `None` when no circuit breaker is configured for the proxy.
         upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+        /// Authoritative gRPC length-prefixed message counter shared with
+        /// `RequestContext.grpc_request_messages_observed`.
+        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
     /// Streaming body sourced from a channel rather than a hyper `Incoming`.
     ///
@@ -288,6 +295,10 @@ pub enum GrpcBody {
         /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
         /// bridge, which records the circuit-breaker outcome at response time.
         upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+        /// Authoritative gRPC length-prefixed message counter shared with
+        /// `RequestContext.grpc_request_messages_observed`.
+        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
 }
 
@@ -342,23 +353,30 @@ impl http_body::Body for GrpcBody {
                 bytes_seen,
                 max_bytes,
                 exceeded,
+                grpc_messages,
+                grpc_scanner,
                 ..
             } => match Pin::new(incoming).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
-                    if *max_bytes > 0
-                        && let Some(data) = frame.data_ref()
-                    {
-                        *bytes_seen = bytes_seen.saturating_add(data.len());
-                        if *bytes_seen > *max_bytes {
-                            exceeded.store(true, Ordering::Release);
-                            // Return an error to RST_STREAM the request,
-                            // preventing the backend from treating a truncated
-                            // prefix as a completed stream.
-                            return Poll::Ready(Some(Err(format!(
-                                "gRPC request payload exceeds maximum of {} bytes",
-                                max_bytes
-                            )
-                            .into())));
+                    if let Some(data) = frame.data_ref() {
+                        if *max_bytes > 0 {
+                            *bytes_seen = bytes_seen.saturating_add(data.len());
+                            if *bytes_seen > *max_bytes {
+                                exceeded.store(true, Ordering::Release);
+                                // Return an error to RST_STREAM the request,
+                                // preventing the backend from treating a truncated
+                                // prefix as a completed stream.
+                                return Poll::Ready(Some(Err(format!(
+                                    "gRPC request payload exceeds maximum of {} bytes",
+                                    max_bytes
+                                )
+                                .into())));
+                            }
+                        }
+                        if let (Some(messages), Some(scanner)) =
+                            (grpc_messages.as_ref(), grpc_scanner.as_mut())
+                        {
+                            scanner.push(data, messages);
                         }
                     }
                     Poll::Ready(Some(Ok(frame)))
@@ -375,6 +393,8 @@ impl http_body::Body for GrpcBody {
                 cancelled,
                 cancelled_terminal,
                 forwarded_bytes,
+                grpc_messages,
+                grpc_scanner,
                 ..
             } => {
                 if *cancelled_terminal {
@@ -412,6 +432,11 @@ impl http_body::Body for GrpcBody {
                                 }
                             }
                             forwarded_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            if let (Some(messages), Some(scanner)) =
+                                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+                            {
+                                scanner.push(data, messages);
+                            }
                         }
                         Poll::Ready(Some(Ok(frame)))
                     }
@@ -599,6 +624,12 @@ struct GrpcPoolManager {
     tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter, installed once by `ProxyState` via
+    /// [`GrpcConnectionPool::attach_backend_conn_limit`]. Unset for focused
+    /// tests and standalone callers, in which case no cap is enforced. Read
+    /// only on the cold connection-establishment path.
+    backend_conn_limit: OnceLock<SharedBackendConnectionLimiter>,
 }
 
 impl Default for GrpcConnectionPool {
@@ -670,12 +701,21 @@ impl GrpcConnectionPool {
             tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
+            backend_conn_limit: OnceLock::new(),
         });
 
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// this pool's physical H2 connections are admitted against the same
+    /// per-destination ceiling as WebSocket, raw TCP, and the other pooled
+    /// transports. Idempotent; later calls are ignored.
+    pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
+        let _ = self.pool.manager().backend_conn_limit.set(limiter);
     }
 
     /// Number of connections in the pool (for metrics).
@@ -1010,6 +1050,36 @@ impl GrpcPoolManager {
             .as_ref()
             .and_then(|m| m.get(&port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        // DestinationRule `connectionPool.tcp.maxConnections`. Reserved BEFORE
+        // any dial and handed to the spawned connection driver below, so the
+        // slot lives exactly as long as this physical H2 connection: it is
+        // released on idle eviction, pool drain/clear, SVID drain,
+        // reload/update/delete, shutdown, or peer GOAWAY, and NOT when the
+        // request that happened to create the connection finishes. Reuse takes
+        // no slot, so unlimited multiplexed gRPC streams ride one admitted
+        // connection.
+        let conn_admission = PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            host,
+            port,
+        );
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(GrpcProxyError::backend_unavailable(
+                        GrpcBackendUnavailableKind::MaxConnections,
+                        format!(
+                            "gRPC pool: {limit} for backend {}:{}",
+                            admission.host(),
+                            admission.policy_port()
+                        ),
+                    ));
+                }
+            },
+            None => None,
+        };
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
         // The candidate attempt includes TCP socket setup, negotiated ALPN h2
@@ -1033,6 +1103,9 @@ impl GrpcPoolManager {
                 let connector = connector.clone();
                 let server_name = server_name.clone();
                 let pool_config = &pool_config;
+                // One reservation, cloned per candidate: a failed attempt drops
+                // its clone, so only an established connection keeps the slot.
+                let conn_slot = conn_slot.clone();
                 async move {
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
@@ -1051,7 +1124,7 @@ impl GrpcPoolManager {
                         pool_config.enable_http_keep_alive,
                         pool_config.tcp_keepalive_seconds,
                     );
-                    self.create_tls_connection(tcp, connector, server_name, pool_config)
+                    self.create_tls_connection(tcp, connector, server_name, pool_config, conn_slot)
                         .await
                 }
             })
@@ -1059,6 +1132,7 @@ impl GrpcPoolManager {
         } else {
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
                 let pool_config = &pool_config;
+                let conn_slot = conn_slot.clone();
                 async move {
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
@@ -1077,7 +1151,8 @@ impl GrpcPoolManager {
                         pool_config.enable_http_keep_alive,
                         pool_config.tcp_keepalive_seconds,
                     );
-                    self.create_h2c_connection(tcp, pool_config).await
+                    self.create_h2c_connection(tcp, pool_config, conn_slot)
+                        .await
                 }
             })
             .await
@@ -1166,6 +1241,7 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
+        conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let settings_received = Arc::new(AtomicBool::new(false));
         let io = TokioIo::new(H2cSettingsIo::new(tcp, Arc::clone(&settings_received)));
@@ -1188,6 +1264,9 @@ impl GrpcPoolManager {
         }
 
         tokio::spawn(async move {
+            // The `maxConnections` slot lives exactly as long as the connection
+            // driver, i.e. as long as the socket is open.
+            let _conn_slot = conn_slot;
             if let Err(e) = conn.await {
                 debug!("gRPC h2c connection closed: {}", e);
             }
@@ -1267,6 +1346,7 @@ impl GrpcPoolManager {
         connector: tokio_rustls::TlsConnector,
         server_name: rustls::pki_types::ServerName<'static>,
         pool_config: &PoolConfig,
+        conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
@@ -1296,6 +1376,9 @@ impl GrpcPoolManager {
 
         // TLS negotiation already proved H2 via ALPN.
         tokio::spawn(async move {
+            // The `maxConnections` slot lives exactly as long as the connection
+            // driver, i.e. as long as the socket is open.
+            let _conn_slot = conn_slot;
             if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
@@ -1482,6 +1565,17 @@ pub enum GrpcBackendUnavailableKind {
     /// keep [`Self::BackendRequest`] even on `is_canceled` because the
     /// upload may already be unreplayable.
     DispatchCanceled,
+    /// The destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
+    /// connection may be opened. Nothing was dialed — pre-wire, and mapped to
+    /// [`crate::retry::ErrorClass::BackendConnectionLimit`] so
+    /// `retry_on_connect_failure` can rotate to another LB target with its own
+    /// admission lane while the refusal stays neutral to the destination's
+    /// circuit breaker, passive health, and adaptive concurrency — the full
+    /// raw-TCP over-cap posture. `get_sender()` first falls back to an
+    /// already-established shard, so a capped destination keeps serving by
+    /// multiplexing rather than failing.
+    MaxConnections,
 }
 
 impl GrpcBackendUnavailableKind {
@@ -1502,7 +1596,11 @@ impl GrpcBackendUnavailableKind {
             | Self::H2Handshake
             | Self::H2cHandshake
             | Self::InvalidServerName
-            | Self::DispatchCanceled => true,
+            | Self::DispatchCanceled
+            // Over-cap refusal happens before any dial, so it is pre-wire and
+            // `retry_on_connect_failure` may rotate to another LB target (with
+            // its own admission lane) — the same posture the raw-TCP path takes.
+            | Self::MaxConnections => true,
             Self::BackendRequest => false,
         }
     }
@@ -1642,6 +1740,13 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                 message,
             },
             SharedPoolCreateKind::Internal => Self::Internal(message),
+            // Coalesced waiters must see the SAME typed over-cap refusal the
+            // creator produced, so `get_sender`'s already-established-shard
+            // fallback and the pre-wire `BackendConnectionLimit` classification
+            // apply to them identically.
+            SharedPoolCreateKind::MaxConnections => {
+                Self::backend_unavailable(GrpcBackendUnavailableKind::MaxConnections, message)
+            }
             // NegotiatedHttp1 is an H2-pool signal; gRPC create never emits it.
             // Fall through to unavailable reconstruction so waiters still fail.
             SharedPoolCreateKind::NegotiatedHttp1
@@ -1679,6 +1784,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     | ErrorClass::GatewayBufferCapacity
                     | ErrorClass::RequestBodyTooLarge
                     | ErrorClass::GracefulRemoteClose
+                    | ErrorClass::BackendConnectionLimit
                     | ErrorClass::RequestError => GrpcBackendUnavailableKind::Connect,
                 };
                 // Retain the shared classification payload as the typed source so
@@ -1708,6 +1814,20 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Preserve the over-cap refusal as a STRUCTURAL kind so coalesced
+            // waiters rebuild the same typed variant. Its ErrorClass alone
+            // (`ConnectionPoolError`) is shared with unrelated pool faults and
+            // would collapse to `Unavailable` in the class-driven arm below.
+            Self::BackendUnavailable {
+                kind: GrpcBackendUnavailableKind::MaxConnections,
+                message,
+                ..
+            } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::MaxConnections,
                 error_class,
                 None,
             ),
@@ -1757,13 +1877,21 @@ pub mod grpc_status {
 
 /// Map an HTTP rejection status to the closest gRPC status code for
 /// gateway-generated trailers-only errors.
+///
+/// HTTP 404 maps to [`grpc_status::UNIMPLEMENTED`], matching the official
+/// gRPC HTTP↔status table
+/// (<https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>)
+/// and Gateway API `GRPCExactMethodMatching` (unmatched methods must surface
+/// `codes.Unimplemented`, not `NotFound`). Route misses, GRPCRoute
+/// `reject_unmatched`, and other Ferrum-authored 404 refusals therefore stay
+/// client-parseable as "this method is not routed/implemented here."
 pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     match status {
         StatusCode::BAD_REQUEST => grpc_status::INVALID_ARGUMENT,
         StatusCode::METHOD_NOT_ALLOWED => grpc_status::UNIMPLEMENTED,
         StatusCode::UNAUTHORIZED => grpc_status::UNAUTHENTICATED,
         StatusCode::FORBIDDEN => grpc_status::PERMISSION_DENIED,
-        StatusCode::NOT_FOUND => grpc_status::NOT_FOUND,
+        StatusCode::NOT_FOUND => grpc_status::UNIMPLEMENTED,
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => grpc_status::DEADLINE_EXCEEDED,
         StatusCode::CONFLICT => grpc_status::ABORTED,
         StatusCode::PRECONDITION_FAILED => grpc_status::FAILED_PRECONDITION,
@@ -2831,14 +2959,24 @@ pub async fn proxy_grpc_request_streaming(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
+    grpc_request_messages: Option<Arc<AtomicU64>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
+    let (grpc_messages, grpc_scanner) = match grpc_request_messages {
+        Some(messages) => (
+            Some(messages),
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
+        ),
+        None => (None, None),
+    };
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
         upload_observer,
+        grpc_messages,
+        grpc_scanner,
     };
     proxy_grpc_streaming_dispatch(
         parts.method,
@@ -2886,7 +3024,15 @@ pub async fn proxy_grpc_request_streaming_channel(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
+    grpc_request_messages: Option<Arc<AtomicU64>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
+    let (grpc_messages, grpc_scanner) = match grpc_request_messages {
+        Some(messages) => (
+            Some(messages),
+            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
+        ),
+        None => (None, None),
+    };
     let grpc_body = GrpcBody::Channel {
         receiver,
         bytes_seen: 0,
@@ -2896,6 +3042,8 @@ pub async fn proxy_grpc_request_streaming_channel(
         cancelled_terminal: false,
         forwarded_bytes: body_bytes_forwarded,
         upload_observer,
+        grpc_messages,
+        grpc_scanner,
     };
     proxy_grpc_streaming_dispatch(
         method,

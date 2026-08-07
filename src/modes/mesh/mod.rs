@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,18 +52,21 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshInboundTcpRoute,
-    MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy,
-    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
-    service_entry_exported_to_namespace,
+    AppProtocol, DestinationRuleLookupTier, EastWestGateway, MeshConfig, MeshDestinationRule,
+    MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
+    MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
+    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::modes::mesh::slice::{
+    MeshSlice, MeshSliceRequest, ServiceEntryHostOwner, destination_host_owner,
+    index_service_entry_host_owners, mesh_service_identities,
+};
 use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
@@ -2251,8 +2254,10 @@ fn gateway_config_from_mesh_slice_with_federation(
     let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
     let proxies = decode_virtual_service_l4_proxies(slice)?;
+    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
     let config = GatewayConfig {
         proxies,
+        upstreams,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -2271,6 +2276,12 @@ fn gateway_config_from_mesh_slice_with_federation(
             trust_bundles,
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
+            // Keep the reconstructed mesh block agreeing with the slice the
+            // materializer actually reads (issue #2469). Missing / blank root
+            // provenance stays blank here — do not invent `istio-system` and
+            // thereby grant root-tier policy without trustworthy evidence.
+            // Materialization classifies tiers from the slice, not this field.
+            istio_root_namespace: slice.istio_root_namespace.trim().to_string(),
             ..MeshConfig::default()
         })),
         loaded_at,
@@ -2280,6 +2291,11 @@ fn gateway_config_from_mesh_slice_with_federation(
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
+    let carried_upstream_ids: BTreeSet<&str> = slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .filter_map(|value| value.get("id").and_then(|id| id.as_str()))
+        .collect();
     slice
         .virtual_service_l4_proxies
         .iter()
@@ -2303,7 +2319,47 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
                     "Mesh slice VirtualService L4 proxy {index} has invalid ownership or matcher identity"
                 ));
             }
+            if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                && !carried_upstream_ids.contains(upstream_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} references missing upstream {upstream_id}"
+                ));
+            }
             Ok(proxy)
+        })
+        .collect()
+}
+
+fn decode_virtual_service_l4_upstreams(
+    slice: &MeshSlice,
+) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error> {
+    let referenced: BTreeSet<&str> = slice
+        .virtual_service_l4_proxies
+        .iter()
+        .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+        .collect();
+    slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                    )
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !referenced.contains(upstream.id.as_str())
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 upstream {index} has invalid ownership or is unreferenced"
+                ));
+            }
+            Ok(upstream)
         })
         .collect()
 }
@@ -4991,8 +5047,8 @@ fn materialize_mesh_outbound_proxies(
             }
             // Name the upstream with the service FQDN (not the internal id) so a
             // DestinationRule keyed on the service host matches it
-            // (`destination_rule_matches_upstream` matches by target host / upstream
-            // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
+            // (`upstream_destination_rule_match_hosts` enumerates target host /
+            // upstream NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
             // would apply to outbound HBONE routes (top-level connectTimeout / LB /
             // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
             // fans out from the owning Service port onto the targets' dial ports).
@@ -7078,18 +7134,6 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
         .map(|port| port.port)
 }
 
-/// Apply DestinationRule traffic policies onto matching upstreams.
-///
-/// For each DestinationRule, we find upstreams whose targets match the DR
-/// host and apply:
-/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
-/// - `outlierDetection` onto the upstream's passive health check
-/// - `loadBalancer` onto the upstream's algorithm
-/// - `subsets` as `SubsetDefinition` entries on the upstream
-///
-/// Multiple DRs targeting the same upstream are applied in a deterministic
-/// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
-/// is reproducible across CP restarts and DP subscribers.
 /// Synthesize per-route `cors` plugin instances onto materialized sidecar
 /// OUTBOUND routes from the slice's VirtualService-derived CORS policies
 /// (issue #1973). Istio applies VirtualService policy on the client sidecar,
@@ -7125,9 +7169,21 @@ fn synthesize_mesh_outbound_cors_plugins(
     // normalization on this DP, and `destination_rule_host_matches` lowercases
     // and strips trailing dots but does NOT trim whitespace — a padded carried
     // host would silently match no service and synthesize no plugin.
+    let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
         .virtual_service_cors_policies
         .iter()
+        // Re-apply the visibility boundary on the DP before ANY host match,
+        // symmetrically with the DestinationRule re-check in
+        // `apply_destination_rules`. A VirtualService CORS policy is
+        // host-targeting client-side traffic policy with the same blast
+        // radius as a DR: without this, a cross-wired or independently
+        // implemented producer could inject another tenant's CORS behavior
+        // onto this workload's outbound routes even though the
+        // byte-equivalent DestinationRule would be filtered out.
+        .filter(|policy| {
+            config::virtual_service_cors_policy_exported_to_namespace(policy, client_namespace)
+        })
         .map(|policy| (config::normalize_mesh_hostname_like(&policy.host), policy))
         .collect();
     sorted_policies.sort_by(|a, b| (&a.1.namespace, &a.1.name).cmp(&(&b.1.namespace, &b.1.name)));
@@ -7211,14 +7267,60 @@ fn synthesize_mesh_outbound_cors_plugins(
     }
 }
 
+/// Apply DestinationRule traffic policies onto matching upstreams.
+///
+/// For each DestinationRule, we find upstreams whose targets match the DR
+/// host and apply:
+/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
+/// - `outlierDetection` onto the upstream's passive health check
+/// - `loadBalancer` onto the upstream's algorithm
+/// - `subsets` as `SubsetDefinition` entries on the upstream
+///
+/// Selection follows Istio's lookup path, NOT resource spelling (issue #2469).
+/// Arbitration is PER DESTINATION HOST, because that is the unit Istio
+/// resolves: a rule in the subscriber's own namespace outranks one in the
+/// target service's namespace, which outranks the mesh root namespace, and a
+/// rule outside all three is refused. Losing-tier rules are skipped for that
+/// host, so renaming a namespace can never flip which policy wins, and an
+/// upstream whose targets span two services still resolves each destination
+/// independently instead of letting one host's winner suppress the only rule
+/// the other host has.
+///
+/// Independent per-host lookups do NOT imply per-host application: every field
+/// a rule projects lands on the shared `Upstream`. An upstream whose
+/// destinations resolve to DIFFERENT winning rule sets is therefore REFUSED
+/// (fail-closed, before any mutation) rather than merged in sorted order — see
+/// the representability check below. Single-destination upstreams, and
+/// upstreams whose destinations share one winning rule set, are unaffected.
+///
+/// `exportTo` visibility has already been applied at slice construction and is
+/// re-applied below, so only rules this subscriber may see arrive here.
+///
+/// Within the winning tier every rule is same-namespace by construction — one
+/// owner, Istio's merge case — and those apply in deterministic
+/// `(namespace, name, normalized host spelling)` order so the
+/// last-writer-wins-per-field outcome is reproducible across CP restarts and
+/// DP subscribers, including native input that repeats one name for distinct
+/// host spellings. This order is an intra-tier tiebreak only; it is never
+/// cross-tier precedence.
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<(), anyhow::Error> {
-    let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
-        mesh_slice.destination_rules.iter().collect();
-    sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    let client_namespace = mesh_slice.namespace.as_str();
+    let mut sorted_destination_rules: Vec<&MeshDestinationRule> = mesh_slice
+        .destination_rules
+        .iter()
+        // Re-apply the visibility boundary on the DP before ANY lookup or
+        // selection. Ferrum CP already narrows native/xDS slices, but this
+        // protects file/native/carrier consumers from a cross-wired or
+        // independently implemented producer that sends a rule the
+        // subscriber is not allowed to see.
+        .filter(|dr| destination_rule_exported_to_namespace(dr, client_namespace))
+        .collect();
+    sorted_destination_rules
+        .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -7294,15 +7396,164 @@ fn apply_destination_rules(
         );
     }
 
-    for dr in sorted_destination_rules {
+    // Target-service ownership evidence for the matched destination host, built
+    // once per apply from the SAME indexes the slice builder's admission pass
+    // used so the two halves cannot classify one destination differently.
+    //
+    // The upstream's own namespace is not a substitute. An external host pins no
+    // namespace in its own syntax, and a ServiceEntry-derived EgressGateway
+    // upstream is stamped with the GATEWAY's namespace (`build_egress_upstream`),
+    // which is not an operator choice — so without the declaring ServiceEntry an
+    // owner-authored trafficPolicy the control plane admitted at the service tier
+    // would be refused here and silently dropped.
+    //
+    // The slice's `service_entries` are already `exportTo`-narrowed by the CP;
+    // the filter is re-applied for the same reason the DestinationRule
+    // visibility filter above is — a cross-wired or independently implemented
+    // producer must not be able to vouch for an owner this subscriber may not
+    // even see.
+    let service_identities = mesh_service_identities(&mesh_slice.services);
+    let visible_service_entries: Vec<&ServiceEntry> = mesh_slice
+        .service_entries
+        .iter()
+        .filter(|entry| service_entry_exported_to_namespace(entry, client_namespace))
+        .collect();
+    let service_entry_hosts = index_service_entry_host_owners(visible_service_entries);
+
+    // Istio resolves the DestinationRule for a destination HOST, so tier
+    // arbitration is per destination host, not per upstream. Arbitrating per
+    // upstream conflates independent lookups whenever one upstream's targets
+    // span two services: the upstream-wide minimum then skips the ONLY rule a
+    // second host has, and that host's policy is silently dropped.
+    //
+    // Precomputed once for the whole apply pass — cold-path slice-apply work,
+    // never per request. `winning_tier_by_upstream_host[i][j]` is the winning
+    // tier for `upstream_destination_rule_match_hosts(config.upstreams[i])[j]`;
+    // the host list is derived from the same helper at both computation and
+    // use, so the parallel indexes cannot drift.
+    let tier_scope = MaterializationTierScope {
+        client_namespace,
+        root_namespace: mesh_slice.istio_root_namespace.trim(),
+        cluster_domain: runtime.cluster_domain.trim_matches('.'),
+        mesh_service_identities: &service_identities,
+        service_entry_hosts: &service_entry_hosts,
+    };
+    // The pass ALSO decides representability. An `Upstream` is ONE object: every
+    // field a winning rule projects — load balancer, hash keys, backend TLS,
+    // outlier/passive thresholds, connection-pool caps, locality, subsets — is
+    // upstream-WIDE. Per-host arbitration resolves each destination
+    // independently, but there is no per-host slot to project a winner into, so
+    // when two destinations on one upstream resolve to DIFFERENT winning rule
+    // sets the only representable outcomes are (a) letting the sorted
+    // application order below decide which host's rule overwrites the other's
+    // upstream-wide fields, or (b) refusing. (a) is order-dependent CROSS-SERVICE
+    // policy transfer — `beta`'s rule silently governing traffic to `alpha`'s
+    // service because `beta` sorts later — so this refuses instead, before any
+    // upstream is mutated. See `docs/mesh.md` "An upstream that spans two
+    // destinations".
+    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> =
+        Vec::with_capacity(config.upstreams.len());
+    for upstream in &config.upstreams {
+        let hosts = upstream_destination_rule_match_hosts(upstream);
+        let mut winners: Vec<Option<DestinationRuleLookupTier>> = Vec::with_capacity(hosts.len());
+        // The winning rule SET (indexes into `sorted_destination_rules`, which
+        // is deterministically ordered) for each host that resolved one. Hosts
+        // with NO winner contribute nothing: a destination no visible rule
+        // targets cannot disagree with one that has a rule, and refusing there
+        // would reject the ordinary "upstream carries a static fallback target"
+        // shape that has always inherited the upstream-wide policy.
+        let mut winning_rule_sets: Vec<Vec<usize>> = Vec::new();
+        for host in hosts {
+            let mut winner: Option<DestinationRuleLookupTier> = None;
+            for dr in sorted_destination_rules.iter().copied() {
+                if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                    continue;
+                }
+                let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                    continue;
+                };
+                winner = Some(match winner {
+                    Some(current) => current.min(tier),
+                    None => tier,
+                });
+            }
+            if let Some(tier) = winner {
+                winning_rule_sets.push(
+                    sorted_destination_rules
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|&(_, dr)| {
+                            destination_rule_host_matches(&dr.host, &dr.namespace, host)
+                                && tier_scope.eligible_tier(dr, upstream, host) == Some(tier)
+                        })
+                        .map(|(idx, _)| idx)
+                        .collect(),
+                );
+            }
+            winners.push(winner);
+        }
+        let representable = winning_rule_sets
+            .first()
+            .is_none_or(|first| winning_rule_sets.iter().all(|set| set == first));
+        if !representable {
+            let mut distinct = winning_rule_sets;
+            distinct.sort_unstable();
+            distinct.dedup();
+            return Err(anyhow::anyhow!(
+                "DestinationRule policy for upstream={} namespace={} cannot be represented: \
+                 its destinations resolve to {} DIFFERENT winning DestinationRule sets, and \
+                 every field a rule projects is upstream-wide, so applying them would let \
+                 one destination's policy govern the other. Split the upstream so each \
+                 destination has its own, or give the destinations one common winning rule.",
+                upstream.id,
+                upstream.namespace,
+                distinct.len()
+            ));
+        }
+        winning_tier_by_upstream_host.push(winners);
+    }
+
+    // Rules that matched a destination but were refused at every one of them
+    // for being declared outside Istio's client/service/root lookup
+    // namespaces. Counted, then reported ONCE — a per-rule warning would be
+    // per-reload × per-DP spam.
+    let mut refused_out_of_lookup_path = 0usize;
+
+    for dr in sorted_destination_rules.iter().copied() {
+        let mut matched_any_host = false;
+        let mut eligible_any_host = false;
         let matching_upstream_indices: Vec<usize> = config
             .upstreams
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                destination_rule_matches_upstream(dr, upstream).then_some(idx)
+                let winners = winning_tier_by_upstream_host.get(idx)?;
+                let hosts = upstream_destination_rule_match_hosts(upstream);
+                let mut wins_a_host = false;
+                for (host_idx, host) in hosts.into_iter().enumerate() {
+                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                        continue;
+                    }
+                    matched_any_host = true;
+                    // A rule outside the lookup path is refused outright; a
+                    // rule from a lower-priority tier must not overwrite the
+                    // winning tier's policy for THIS host.
+                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                        continue;
+                    };
+                    eligible_any_host = true;
+                    if winners.get(host_idx).copied().flatten() == Some(tier) {
+                        wins_a_host = true;
+                    }
+                }
+                wins_a_host.then_some(idx)
             })
             .collect();
+
+        if matched_any_host && !eligible_any_host {
+            refused_out_of_lookup_path += 1;
+        }
 
         if matching_upstream_indices.is_empty() {
             debug!(
@@ -7722,6 +7973,19 @@ fn apply_destination_rules(
         }
     }
 
+    if refused_out_of_lookup_path > 0 {
+        // Bounded and value-free: only the count and the subscriber's own
+        // namespace. A slice-built path refuses these at admission, so
+        // reaching here means a producer sent a rule this subscriber's lookup
+        // path never covered.
+        warn!(
+            client_namespace = %client_namespace,
+            refused = refused_out_of_lookup_path,
+            "Refused DestinationRules declared outside Istio's client/service/root \
+             lookup namespaces before materialization"
+        );
+    }
+
     // Final pass: project per-subset `trafficPolicy.tls` overlays onto each
     // upstream's `resolved_subset_tls` map. Runs once after all DRs are
     // applied so subset TLS layers over the FINAL upstream-level TLS rather
@@ -7972,16 +8236,122 @@ fn into_upstream_locality(
     }
 }
 
-fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstream) -> bool {
-    upstream
-        .targets
-        .iter()
-        .any(|target| destination_rule_host_matches(&dr.host, &dr.namespace, &target.host))
-        || upstream
-            .name
-            .as_deref()
-            .is_some_and(|name| destination_rule_host_matches(&dr.host, &dr.namespace, name))
-        || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
+/// The lookup inputs the data-plane DestinationRule tier pass resolves
+/// against, gathered once per apply so the per-`(rule, upstream, host)`
+/// classification stays a pure function of them (issue #2469).
+struct MaterializationTierScope<'a> {
+    /// The subscriber workload's namespace — Istio's FIRST lookup tier.
+    client_namespace: &'a str,
+    /// The mesh's `meshConfig.rootNamespace`, carried on `MeshSlice`. EMPTY
+    /// (absent / blank / whitespace-only provenance) disables the root tier
+    /// and refuses Unscoped rules; see
+    /// [`MaterializationTierScope::eligible_tier`].
+    root_namespace: &'a str,
+    /// Cluster DNS domain, used to read a target service namespace out of a
+    /// `name.namespace.svc.<domain>` host.
+    cluster_domain: &'a str,
+    /// The slice's own `(namespace, name)` service inventory, which confirms a
+    /// two-label `name.namespace` destination host.
+    mesh_service_identities: &'a std::collections::BTreeSet<(String, String)>,
+    /// Which namespace DECLARED each external host this subscriber can see,
+    /// indexed from the slice's own `service_entries`. The only ownership
+    /// evidence an external host has — it pins no namespace syntactically, and
+    /// the upstream carrying it need not live in the owning namespace.
+    service_entry_hosts: &'a std::collections::BTreeMap<String, ServiceEntryHostOwner>,
+}
+
+impl MaterializationTierScope<'_> {
+    /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
+    /// triple, or `None` when the rule must be refused outright.
+    ///
+    /// Service-tier ownership evidence, in order:
+    ///
+    /// 1. the owner of the MATCHED destination host, resolved by the shared
+    ///    [`destination_host_owner`] — `.svc` syntax, then an
+    ///    inventory-confirmed two-label `name.namespace`, then the declaring
+    ///    ServiceEntry. When this resolves, it is AUTHORITATIVE: an upstream
+    ///    container namespace must not widen it. That closes the operator-
+    ///    authored / multi-target case where a single upstream namespace cannot
+    ///    own every matched host, and where `by_upstream.min(by_host)` would
+    ///    otherwise let the upstream's unrelated namespace manufacture a more
+    ///    privileged service tier for a host owned elsewhere.
+    /// 2. otherwise the upstream's own `namespace`, retained only as a narrow
+    ///    fallback when host ownership genuinely cannot be resolved and the
+    ///    upstream namespace is still a trustworthy ownership signal —
+    ///    notably every materialized mesh outbound upstream
+    ///    (`mesh_outbound_route_upstream` stamps the service's namespace). For
+    ///    an external host the host-owner arm (1) already recovers the
+    ///    declaring ServiceEntry, so a ServiceEntry-derived EgressGateway
+    ///    upstream stamped with the GATEWAY's namespace still admits the
+    ///    owner-authored service-tier rule the control plane admitted.
+    ///
+    /// The host-owner resolver is the SAME helper, in the same precedence
+    /// ORDER, that `admit_destination_rules` used to admit the rule, and that
+    /// is the point: the two halves must agree by construction. Keeping the
+    /// ORDER matters: consulting the ServiceEntry index ahead of `.svc`
+    /// syntax or the service inventory would let a carrier-supplied
+    /// ServiceEntry declaring `reviews.beta[.svc…]` transfer ownership of
+    /// `beta`'s service to its own namespace.
+    ///
+    /// Missing, empty, or whitespace-only root provenance fails closed:
+    /// `Unscoped` is refused rather than restored to the pre-#2469 permissive
+    /// bucketing. Client and service tiers that are independently provable
+    /// still apply; a legitimate root-tier default is simply unavailable
+    /// without trustworthy root provenance — never guessed. Every Ferrum-built
+    /// slice carries a non-empty root namespace.
+    ///
+    /// This is a precedence pass layered over admission, not a replacement for
+    /// it: visibility (`exportTo`) and namespace eligibility are enforced
+    /// fail-closed at slice construction, where the client namespace, the mesh
+    /// root namespace, and the full service inventory are all known. It exists
+    /// so a reverse-translated xDS carrier — which never passes
+    /// `admit_destination_rules` — cannot land an arbitrary namespace's rule
+    /// on this workload's routes.
+    fn eligible_tier(
+        &self,
+        dr: &MeshDestinationRule,
+        upstream: &Upstream,
+        matched_host: &str,
+    ) -> Option<DestinationRuleLookupTier> {
+        let host_owner = destination_host_owner(
+            matched_host,
+            self.cluster_domain,
+            self.mesh_service_identities,
+            self.service_entry_hosts,
+        );
+        let service_namespace = match host_owner.as_ref() {
+            Some(owner) => Some(owner.namespace()),
+            None => {
+                let upstream_namespace = upstream.namespace.trim();
+                (!upstream_namespace.is_empty()).then_some(upstream_namespace)
+            }
+        };
+        let tier = destination_rule_lookup_tier(
+            &dr.namespace,
+            self.client_namespace,
+            service_namespace,
+            self.root_namespace,
+        );
+        tier.is_in_lookup_path().then_some(tier)
+    }
+}
+
+/// Every candidate destination host a DestinationRule may match this upstream
+/// on, in a STABLE order: target hosts first, then the upstream `name`, then
+/// the upstream `id`.
+///
+/// A DR matches the upstream iff it matches at least one of these. Order is
+/// load-bearing — `apply_destination_rules` indexes its precomputed per-host
+/// winning tiers against this list, and calls this helper again during
+/// application, so the two must enumerate identically.
+fn upstream_destination_rule_match_hosts(upstream: &Upstream) -> Vec<&str> {
+    let mut hosts: Vec<&str> = Vec::with_capacity(upstream.targets.len() + 2);
+    hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+    if let Some(name) = upstream.name.as_deref() {
+        hosts.push(name);
+    }
+    hosts.push(upstream.id.as_str());
+    hosts
 }
 
 /// True when EVERY target of this upstream dispatches through an SVID-backed
@@ -8171,6 +8541,24 @@ fn apply_traffic_policy_tls_to_backend_config(
     identity: &str,
     presents_dynamic_svid: bool,
 ) -> Result<(), anyhow::Error> {
+    if let Some(ca_certificates) = tls.ca_certificates.as_deref()
+        && let Err(error) = crate::config::types::validate_tls_material_source_field(
+            "DestinationRule trafficPolicy.tls.ca_certificates",
+            ca_certificates,
+            crate::tls::source::MaterialKind::CaBundle,
+        )
+    {
+        return Err(anyhow::anyhow!(error));
+    }
+    if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
+        "DestinationRule trafficPolicy.tls.ca_certificates",
+        "DestinationRule trafficPolicy.tls.insecure_skip_verify",
+        tls.ca_certificates.as_deref(),
+        tls.insecure_skip_verify,
+    ) {
+        return Err(anyhow::anyhow!(error));
+    }
+
     match tls.mode {
         MtlsMode::Disable => {
             slot.client_cert_path = None;
@@ -9425,13 +9813,21 @@ fn inject_mesh_global_plugins(
         );
     }
 
-    // Outbound registry: inject the `mesh_outbound_registry` plugin when
-    // either the slice (CRD path) OR the runtime env var declares
-    // REGISTRY_ONLY. Both default to AllowAny (no plugin) so non-mesh
-    // and permissive deployments pay zero per-request cost.
-    let effective_outbound_policy = mesh_slice
-        .outbound_traffic_policy
-        .unwrap_or(runtime.outbound_traffic_policy);
+    // Outbound registry: inject the `mesh_outbound_registry` plugin when the
+    // applicable Istio `Sidecar.outboundTrafficPolicy` (issue #3262), the
+    // mesh-wide slice policy (CRD path), or the runtime env var declares
+    // REGISTRY_ONLY, in that precedence order. All three default to AllowAny
+    // (no plugin) so non-mesh and permissive deployments pay zero per-request
+    // cost. `effective_outbound_traffic_policy` is the single source of that
+    // precedence — `refresh_mesh_outbound_enforcement` reads the same one for
+    // the stream-family lane, so the two families can never disagree about
+    // whether the gate is ARMED. Their registry CONTENTS can still differ: this
+    // lane is handed the merged materialization slice (remote-cluster endpoints
+    // unioned in) while the stream lane reads the un-merged base slice, so a
+    // multicluster remote destination can be admitted here and refused there
+    // (fail-closed on the stream side).
+    let effective_outbound_policy =
+        mesh_slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     if matches!(
         effective_outbound_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
@@ -9632,14 +10028,25 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
 /// populated with the slice-derived registry; otherwise the slot is
 /// cleared so the stream proxies fall through to `Decision::Skip` for
 /// every connect.
+///
+/// "Effective" is resolved by the shared `MeshSlice::effective_outbound_traffic_policy`
+/// (workload-scoped Sidecar → mesh-wide slice → env default, issue #3262), the
+/// same call `inject_mesh_global_plugins` makes for the HTTP-family lane, so the
+/// two families can never disagree about whether the gate is ARMED. The admitted
+/// registry CONTENTS are NOT shared: this lane builds from the `slice` it is
+/// handed (the un-merged base slice at the apply site), while HTTP-family
+/// injection builds from the merged materialization slice, so on the multicluster
+/// path a poller-discovered remote destination can be in the HTTP registry and
+/// absent here — a stream connect to it is then refused, which is the
+/// fail-closed direction. Clearing the slot on an `AllowAny` slice is what makes
+/// an update/delete that RELAXES the policy take effect immediately instead of
+/// leaving a stale gate armed.
 fn refresh_mesh_outbound_enforcement(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
 ) {
-    let effective_policy = slice
-        .outbound_traffic_policy
-        .unwrap_or(runtime.outbound_traffic_policy);
+    let effective_policy = slice.effective_outbound_traffic_policy(runtime.outbound_traffic_policy);
     let next = if matches!(
         effective_policy,
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
@@ -17189,6 +17596,87 @@ mod tests {
         );
     }
 
+    fn carried_cors_policy(
+        namespace: &str,
+        export_to: &[&str],
+    ) -> config::MeshVirtualServiceCorsPolicy {
+        config::MeshVirtualServiceCorsPolicy {
+            name: "reviews-cors".to_string(),
+            namespace: namespace.to_string(),
+            host: "reviews.default.svc.cluster.local".to_string(),
+            export_to: export_to.iter().map(|entry| entry.to_string()).collect(),
+            cors: config::MeshCorsPolicy {
+                allowed_origins: vec![config::MeshCorsOriginMatch::Exact(
+                    "https://tenant-b.example".to_string(),
+                )],
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                exposed_headers: Vec::new(),
+                max_age_seconds: None,
+                allow_credentials: None,
+                unmatched_preflights: None,
+            },
+        }
+    }
+
+    fn synthesized_cors_plugin_ids(policy: config::MeshVirtualServiceCorsPolicy) -> Vec<String> {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            virtual_service_cors_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        synthesize_mesh_outbound_cors_plugins(&mut config, &runtime, &slice);
+        config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "cors")
+            .map(|plugin| plugin.id.clone())
+            .collect()
+    }
+
+    /// Defence in depth, symmetric with the DestinationRule re-check in
+    /// `apply_destination_rules`: a CORS policy that reached the slice from a
+    /// cross-wired or independently implemented producer must not be
+    /// synthesized onto another tenant's outbound routes. The byte-equivalent
+    /// DestinationRule is filtered, so this one has to be too.
+    #[test]
+    fn mesh_outbound_cors_synthesis_refuses_a_policy_not_exported_here() {
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["."])).is_empty(),
+            "a namespace-local policy from another namespace must not attach \
+             CORS behavior to this workload's outbound routes"
+        );
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["tenant-c"])).is_empty(),
+            "an allowlist that omits this namespace must not attach CORS behavior"
+        );
+        assert!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &[])).is_empty(),
+            "an EMPTY carried export_to is namespace-local, not public"
+        );
+    }
+
+    /// The gate is `exportTo`, not "same namespace": a genuinely public
+    /// cross-namespace policy still applies.
+    #[test]
+    fn mesh_outbound_cors_synthesis_admits_a_publicly_exported_policy() {
+        assert_eq!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["*"])),
+            vec!["__mesh-cors-default-reviews-80".to_string()],
+        );
+        assert_eq!(
+            synthesized_cors_plugin_ids(carried_cors_policy("tenant-b", &["default"])),
+            vec!["__mesh-cors-default-reviews-80".to_string()],
+        );
+    }
+
     #[test]
     fn http_tcp_and_udp_stream_port_predicates_partition_protocols() {
         // The three routability predicates must form a STRICT 3-WAY PARTITION
@@ -17685,6 +18173,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18369,6 +18858,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18423,6 +18913,7 @@ mod tests {
                     traffic_policy,
                     port_level_settings,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshSlice::default()
             }
@@ -18574,6 +19065,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18634,6 +19126,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18726,6 +19219,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18830,6 +19324,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18896,6 +19391,7 @@ mod tests {
                 },
             )]),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         };
         let slice = MeshSlice {
             namespace: "default".to_string(),
@@ -18965,6 +19461,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -20628,6 +21125,7 @@ mod tests {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -20647,6 +21145,284 @@ mod tests {
                 .iter()
                 .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
         );
+    }
+
+    /// A slice carrying one DestinationRule declared in `rule_namespace`,
+    /// publicly exported, targeting a `default`-namespace service. The
+    /// subscriber is in `alpha`, so the rule's tier is decided purely by how
+    /// `rule_namespace` relates to client / service / root.
+    fn lookup_tier_slice(rule_namespace: &str, istio_root_namespace: &str) -> MeshSlice {
+        MeshSlice {
+            namespace: "alpha".to_string(),
+            istio_root_namespace: istio_root_namespace.to_string(),
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: rule_namespace.to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshSlice::default()
+        }
+    }
+
+    fn lookup_tier_rule_applied(slice: &MeshSlice) -> bool {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), slice)
+            .expect("destination rules apply");
+        config.upstreams[0].algorithm == LoadBalancerAlgorithm::Random
+    }
+
+    /// Issue #2469 on the reverse-translated xDS path, where carrier-recovered
+    /// rules never pass `admit_destination_rules`: a publicly exported rule
+    /// from a namespace that is neither the client's, nor the target service's,
+    /// nor the mesh root is refused at materialization instead of applying
+    /// whenever no higher tier matches.
+    #[test]
+    fn destination_rule_outside_the_lookup_path_is_refused_at_materialization() {
+        assert!(
+            !lookup_tier_rule_applied(&lookup_tier_slice("gamma", "istio-system")),
+            "an unrelated namespace's rule must not reach the upstream"
+        );
+    }
+
+    /// The refusal must not swallow the tiers that ARE in the lookup path —
+    /// carrying the root namespace is what makes `Root` distinguishable from
+    /// `Unscoped` in the first place.
+    #[test]
+    fn destination_rule_root_and_service_tiers_survive_the_refusal() {
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("istio-system", "istio-system")),
+            "the configured root namespace is Istio's third lookup tier"
+        );
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("default", "istio-system")),
+            "the target service's namespace is Istio's second lookup tier"
+        );
+        assert!(
+            lookup_tier_rule_applied(&lookup_tier_slice("alpha", "istio-system")),
+            "the client's own namespace is Istio's first lookup tier"
+        );
+    }
+
+    /// Missing, empty, or whitespace-only root provenance must fail closed:
+    /// an unrelated namespace's rule is refused, while independently provable
+    /// client/service tiers remain available. A legitimate root-tier default
+    /// is unavailable without trustworthy provenance — never guessed.
+    #[test]
+    fn destination_rule_missing_root_provenance_fails_closed_at_materialization() {
+        for (label, root) in [("absent / empty", ""), ("whitespace-only", "   \t  ")] {
+            assert!(
+                !lookup_tier_rule_applied(&lookup_tier_slice("gamma", root)),
+                "{label}: Unscoped rule must be refused without trustworthy root provenance"
+            );
+            assert!(
+                lookup_tier_rule_applied(&lookup_tier_slice("default", root)),
+                "{label}: service-tier evidence from the matched host must still apply"
+            );
+            assert!(
+                lookup_tier_rule_applied(&lookup_tier_slice("alpha", root)),
+                "{label}: client-tier evidence must still apply"
+            );
+            assert!(
+                !lookup_tier_rule_applied(&lookup_tier_slice("istio-system", root)),
+                "{label}: root-tier must not be guessed when provenance is blank"
+            );
+        }
+    }
+
+    /// An upstream container namespace must not widen a resolved host owner into
+    /// a more privileged service tier. `evil` cannot grant `evil` service-tier
+    /// policy for a host owned by `beta`, including on a mixed-target upstream.
+    #[test]
+    fn destination_rule_upstream_namespace_cannot_widen_resolved_host_owner() {
+        let beta_host = "reviews.beta.svc.cluster.local";
+        let other_host = "ratings.gamma.svc.cluster.local";
+
+        for label in [
+            "single-target operator upstream",
+            "mixed-target operator upstream",
+        ] {
+            let mut upstream = destination_rule_test_upstream("u-evil", beta_host);
+            upstream.namespace = "evil".to_string();
+            if label.starts_with("mixed") {
+                upstream.targets.push(UpstreamTarget {
+                    host: other_host.to_string(),
+                    port: 8080,
+                    service_port_policy_key: None,
+                    weight: 1,
+                    tags: HashMap::new(),
+                    locality: None,
+                    path: None,
+                });
+            }
+            let mut proxy = destination_rule_test_proxy("p1", &upstream.id);
+            // Keep proxy/upstream namespaces aligned so the DR projection is
+            // not skipped for unrelated namespace-gate reasons.
+            proxy.namespace = "evil".to_string();
+            let mut config = GatewayConfig {
+                proxies: vec![proxy],
+                upstreams: vec![upstream],
+                ..GatewayConfig::default()
+            };
+            let original_algorithm = config.upstreams[0].algorithm;
+            let slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "hijack".to_string(),
+                    namespace: "evil".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+                .expect("destination rules apply");
+            assert_eq!(
+                config.upstreams[0].algorithm, original_algorithm,
+                "{label}: evil must not manufacture service-tier policy for a beta-owned host"
+            );
+
+            // Legitimate client / service precedence still works on the same
+            // upstream shape once the rule is actually in the lookup path.
+            config.upstreams[0].algorithm = LoadBalancerAlgorithm::RoundRobin;
+            let client_slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "client-policy".to_string(),
+                    namespace: "alpha".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &client_slice)
+                .expect("client-tier rule applies");
+            assert_eq!(
+                config.upstreams[0].algorithm,
+                LoadBalancerAlgorithm::Random,
+                "{label}: client-tier precedence must remain intact"
+            );
+
+            config.upstreams[0].algorithm = LoadBalancerAlgorithm::RoundRobin;
+            let service_slice = MeshSlice {
+                namespace: "alpha".to_string(),
+                istio_root_namespace: "istio-system".to_string(),
+                destination_rules: vec![MeshDestinationRule {
+                    name: "service-policy".to_string(),
+                    namespace: "beta".to_string(),
+                    host: beta_host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                }],
+                ..MeshSlice::default()
+            };
+            apply_destination_rules(&mut config, &test_mesh_runtime_config(), &service_slice)
+                .expect("service-tier rule applies");
+            assert_eq!(
+                config.upstreams[0].algorithm,
+                LoadBalancerAlgorithm::LeastConnections,
+                "{label}: resolved host owner beta must still grant service tier"
+            );
+        }
+    }
+
+    /// Client-tier beats service-tier beats root-tier even when an unrelated
+    /// upstream namespace is present — precedence must stay Istio-shaped after
+    /// the host-owner-authoritative repair.
+    #[test]
+    fn destination_rule_client_service_root_precedence_with_foreign_upstream_namespace() {
+        let host = "reviews.beta.svc.cluster.local";
+        let mut upstream = destination_rule_test_upstream("u1", host);
+        upstream.namespace = "evil".to_string();
+        let mut proxy = destination_rule_test_proxy("p1", "u1");
+        proxy.namespace = "evil".to_string();
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            namespace: "alpha".to_string(),
+            istio_root_namespace: "istio-system".to_string(),
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "root-policy".to_string(),
+                    namespace: "istio-system".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        connect_timeout_ms: Some(9000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+                MeshDestinationRule {
+                    name: "service-policy".to_string(),
+                    namespace: "beta".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                        connect_timeout_ms: Some(5000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+                MeshDestinationRule {
+                    name: "client-policy".to_string(),
+                    namespace: "alpha".to_string(),
+                    host: host.to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        connect_timeout_ms: Some(1000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
+                },
+            ],
+            ..MeshSlice::default()
+        };
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1000);
     }
 
     #[test]
@@ -20676,6 +21452,7 @@ mod tests {
                         labels: HashMap::from([("version".to_string(), "v2".to_string())]),
                         traffic_policy: None,
                     }],
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -20726,6 +21503,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "a-first".to_string(),
@@ -20738,6 +21516,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -20748,6 +21527,48 @@ mod tests {
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
+    #[test]
+    fn destination_rule_materialization_rechecks_export_visibility_before_lookup() {
+        let host = "reviews.beta.svc.cluster.local";
+        let mut upstream = destination_rule_test_upstream("u1", host);
+        upstream.namespace = "beta".to_string();
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        let original_timeout = config.proxies[0].backend_connect_timeout_ms;
+        let slice = MeshSlice {
+            namespace: "alpha".to_string(),
+            destination_rules: vec![MeshDestinationRule {
+                name: "private-service-policy".to_string(),
+                namespace: "beta".to_string(),
+                host: host.to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec![".".to_string()],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("hidden DestinationRule is ignored");
+
+        assert_eq!(
+            config.proxies[0].backend_connect_timeout_ms,
+            original_timeout
+        );
+        assert_eq!(
+            config.upstreams[0].algorithm,
+            LoadBalancerAlgorithm::RoundRobin
+        );
     }
 
     #[test]
@@ -20786,6 +21607,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "z-no-locality".to_string(),
@@ -20797,6 +21619,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -20991,6 +21814,30 @@ mod tests {
             .expect("traffic policy applies");
 
         assert!(!upstream.backend_tls_verify_server_cert);
+    }
+
+    #[test]
+    fn dr_tls_system_roots_with_insecure_skip_verify_fails_cold_apply() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Simple,
+                ca_certificates: Some("system://".to_string()),
+                insecure_skip_verify: true,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        let error =
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+                .expect_err(
+                    "cold apply must defend against an unvalidated contradictory trust policy",
+                );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("insecure_skip_verify"), "{diagnostic}");
+        assert!(diagnostic.contains("system://"), "{diagnostic}");
     }
 
     #[test]
@@ -21498,6 +22345,7 @@ mod tests {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21575,6 +22423,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21670,6 +22519,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21723,6 +22573,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21794,6 +22645,7 @@ mod tests {
                             ..MeshTrafficPolicy::default()
                         }),
                     }],
+                    export_to: vec!["*".to_string()],
                 },
                 // Later (name "reviews-b"): no subsets, top-level connectTimeout.
                 MeshDestinationRule {
@@ -21806,6 +22658,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -21862,6 +22715,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21917,6 +22771,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21996,6 +22851,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -22056,6 +22912,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -22119,6 +22976,7 @@ mod tests {
                     labels: HashMap::from([("version".to_string(), "v2".to_string())]),
                     traffic_policy: None,
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -22221,6 +23079,7 @@ mod tests {
                 }),
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -22305,6 +23164,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -22386,6 +23246,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: first_port_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "b-partial".to_string(),
@@ -22394,6 +23255,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: second_port_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -22453,6 +23315,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: hash_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "b-random".to_string(),
@@ -22461,6 +23324,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: random_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -22485,11 +23349,13 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
@@ -22557,6 +23423,7 @@ mod tests {
             trust_bundles: None,
             multi_cluster: None,
             outbound_traffic_policy: None,
+            sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
             runtime_overlay: crate::modes::mesh::config::MeshRuntimeOverlay::default(),
@@ -30387,6 +31254,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -30456,6 +31324,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -31243,6 +32112,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -31386,6 +32256,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -31469,6 +32340,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };

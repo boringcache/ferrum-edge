@@ -31,7 +31,7 @@ use ferrum_edge::_test_support::{
     compose_db_with_k8s_overlay, empty_k8s_overlay_slot, merge_k8s_translation,
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
-use ferrum_edge::config::types::{GatewayConfig, K8sMeshOverlay};
+use ferrum_edge::config::types::{GatewayConfig, K8sMeshOverlay, Upstream};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
@@ -743,6 +743,94 @@ fn republishing_the_same_snapshot_replaces_rather_than_duplicates() {
     );
 }
 
+/// A VirtualService whose `tcp[]` block weights two destinations. Weighted L4
+/// splits materialize a generated `istio-vs-l4-upstream-*` upstream.
+fn weighted_l4_virtual_service(weights: &[u32]) -> K8sObject {
+    let route: Vec<Value> = weights
+        .iter()
+        .enumerate()
+        .map(|(index, weight)| {
+            json!({
+                "destination": {
+                    "host": format!("mysql-v{}.default.svc.cluster.local", index + 1),
+                    "port": {"number": 3306}
+                },
+                "weight": weight,
+            })
+        })
+        .collect();
+    object(
+        "networking.istio.io/v1beta1",
+        "VirtualService",
+        "default",
+        "db-split",
+        json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{"match": [{"port": 3306}], "route": route}],
+        }),
+    )
+}
+
+fn l4_upstreams(config: &GatewayConfig) -> Vec<&Upstream> {
+    config
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.id.starts_with("istio-vs-l4-upstream-"))
+        .collect()
+}
+
+#[test]
+fn republishing_a_weighted_l4_virtual_service_replaces_its_generated_upstream() {
+    // Generated `istio-vs-l4-upstream-*` ids must be recognized as
+    // Kubernetes-managed. A prefix missing from the managed list is never
+    // withdrawn before the translation is layered back on, so every compose
+    // appends another copy: unbounded growth in the published snapshot, a
+    // spurious content change (and republication to every DP) on each
+    // reconcile, and a deleted VirtualService that never gives its upstream
+    // back.
+    let managed = managed(&["default"]);
+    let populated = authoritative_translation(&[weighted_l4_virtual_service(&[80, 20])]);
+    assert_eq!(
+        l4_upstreams(&populated).len(),
+        1,
+        "the weighted tcp[] split must translate to exactly one generated upstream"
+    );
+
+    let first = merge_k8s_translation(&GatewayConfig::default(), &populated, &managed);
+    let second = merge_k8s_translation(&first, &populated, &managed);
+    let third = merge_k8s_translation(&second, &populated, &managed);
+    assert_eq!(
+        l4_upstreams(&third).len(),
+        1,
+        "re-publishing the same VirtualService must replace its upstream, not stack copies"
+    );
+
+    let updated = authoritative_translation(&[weighted_l4_virtual_service(&[20, 80])]);
+    let after_update = merge_k8s_translation(&third, &updated, &managed);
+    let live = l4_upstreams(&after_update);
+    assert_eq!(
+        live.len(),
+        1,
+        "a weight change must replace the prior generation, not leave it behind"
+    );
+    assert_eq!(
+        live[0]
+            .targets
+            .iter()
+            .map(|target| target.weight)
+            .collect::<Vec<_>>(),
+        vec![20, 80],
+        "the surviving upstream must carry the updated weights"
+    );
+
+    let withdrawn =
+        merge_k8s_translation(&after_update, &authoritative_empty_translation(), &managed);
+    assert!(
+        l4_upstreams(&withdrawn).is_empty(),
+        "deleting the VirtualService must withdraw its generated weighted L4 upstream"
+    );
+}
+
 #[test]
 fn repeated_empty_snapshots_are_idempotent_and_publish_once() {
     let populated =
@@ -1227,6 +1315,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             traffic_policy: None,
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         virtual_service_cors_policies: vec![MeshVirtualServiceCorsPolicy {
             name: name("cors"),
@@ -1257,6 +1346,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }],
         waypoint_bindings: vec![MeshWaypointBinding {
             name: name("waypoint"),

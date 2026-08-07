@@ -14,7 +14,7 @@ coverage matrix is emitted by the conformance suite to
 
 | Tier | Meaning | Enforcement |
 |---|---|---|
-| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive, at both layers.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a semantic regression to anything but `Supported` fails CI (`tests/conformance/ga_scope.rs`). The **live** half is equally blocking: the `mesh-e2e-sidecar` and `multicluster-federation` suites run on every relevant PR, every merge-queue `merge_group`, and every main push, the results are merge-blocking required checks (the dedicated workflows' `Mesh E2E Sidecar Live` and `Multicluster Federation Live` gate jobs, required via branch protection), and `release.yml` refuses to ship a tag whose SHA lacks green live runs for both suites. Both suites validate their emitted `live-assertions.json` against the contract — required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts — but by different mechanisms, because the trusted Cross build policy freezes each workflow's existing Cross-sensitive surfaces. `mesh-e2e-sidecar` validates in-workflow inside its live job (`tests/conformance/live_contract.rs::live_contract_artifact_gate`). `multicluster-federation` cannot add a cargo step to its frozen live job, so its `gate` job — the job that publishes the required check — downloads the published artifact with a SHA-pinned `actions/download-artifact` and validates it with the standard-library `.github/scripts/validate_live_assertions.py` (exact schema/suite/commit/platform profile, six-hour freshness ceiling, no duplicates, exactly the required id set, every required id `pass`). The fixture additionally fails closed on its own `ferrum_live_assertions_require_all_passed`, and the hosted conformance suite (`live_contract.rs`, `mesh_multicluster_federation.rs`) pins both required sets to the enforced, non-`live_deferred` contract rows in the `Tests` aggregate. |
+| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive semantically, and live-blocking when enrolled.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a semantic regression to anything but `Supported` fails CI (`tests/conformance/ga_scope.rs`). Non-`live_deferred` rows are also blocking through the `mesh-e2e-sidecar` and `multicluster-federation` suites on relevant PRs, merge queue runs, and main pushes; explicitly `live_deferred` rows remain semantic gates and are reported as awaiting authorized live enrollment. Both suites validate their emitted `live-assertions.json` against the contract — required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts — but by different mechanisms, because the trusted Cross build policy freezes each workflow's existing Cross-sensitive surfaces. `mesh-e2e-sidecar` validates in-workflow inside its live job (`tests/conformance/live_contract.rs::live_contract_artifact_gate`). `multicluster-federation` cannot add a cargo step to its frozen live job, so its `gate` job — the job that publishes the required check — downloads the published artifact with a SHA-pinned `actions/download-artifact` and validates it with the standard-library `.github/scripts/validate_live_assertions.py` (exact schema/suite/commit/platform profile, six-hour freshness ceiling, no duplicates, exactly the required id set, every required id `pass`). The fixture additionally fails closed on its own `ferrum_live_assertions_require_all_passed`, and the hosted conformance suite (`live_contract.rs`, `mesh_multicluster_federation.rs`) pins both required sets to the enforced, non-`live_deferred` contract rows in the `Tests` aggregate. |
 | **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. | Observational — may be `Deferred` without failing CI. |
 | **Experimental** | Usable with a safety-relevant caveat (plaintext, partial enforcement) or live-datapath-unverified. Opt-in; not recommended without compensating controls. | Observational. |
 | **Dev-only** | Gated behind a build feature or dev opt-in; not in the default published image. | Observational. |
@@ -32,8 +32,12 @@ now enrolled vertically** (semantic assertion → contract row → required live
 assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
 RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
-`mesh-e2e-sidecar` suite must emit and pass. No row is `live_deferred`: the
-last (VS CORS) closed with issue #1973 — the mesh slice now carries
+`mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
+visibility and lookup-namespace resolution are also GA-enrolled and
+semantically blocking, with focused Rust conformance/integration coverage;
+their declared live IDs remain `live_deferred` because Trusted Cross policy
+forbids PR-authored changes to the sidecar suite's executable/configuration
+surfaces. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
 plugin onto its materialized outbound routes. **SPIFFE identity plumbing
 (SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):
@@ -63,8 +67,19 @@ CI today."
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
-  `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
-  traffic surface **and the native config transport** are now **live-verified
+  `DestinationRule` LB/timeout/outlier **plus `exportTo` namespace visibility
+  and the client → target-service → root-namespace lookup hierarchy**
+  (issues #2465 / #2469). Lookup resolution is per destination HOST at both
+  layers, the mesh root namespace rides the slice so the data plane can refuse
+  a rule outside all three lookup namespaces (missing/blank root provenance
+  fails closed rather than restoring permissive Unscoped bucketing), host-owner
+  evidence is authoritative over a conflicting upstream container namespace, and
+  VirtualService-derived CORS
+  policy narrows through the SAME shared `exportTo` evaluator at the same
+  enforcement points a DestinationRule does. These new DestinationRule semantics are pinned by
+  Rust conformance/integration gates and are explicitly live-deferred under
+  Trusted Cross policy. The existing sidecar traffic surface **and the native
+  config transport** remain **live-verified
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
   captured datapath (STRICT mTLS positive + plaintext-rejected negative,
   destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
@@ -184,15 +199,6 @@ need them, or because they are blocked upstream / architecturally:
   highest-precedence subset port-level tier is unsupported). Express per-port
   policy at top-level or via subset `connectionPool` fields; see `docs/mesh.md`.
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
-- **VirtualService `tcp[]` / `tls[]` weighted multi-destination splitting** —
-  `tls[]` SNI passthrough (`sniHosts` + port → passthrough stream proxy) and
-  plain `tcp[]` port routing **are supported**, including L4 match predicates
-  `sourceLabels` / `sourceSubnets` / `destinationSubnets` / `gateways` /
-  `sourceNamespace` via precomputed `Proxy.stream_match` (see `docs/mesh.md`
-  L4 routing and `tests/integration/mesh_l7_routing_tests.rs` /
-  `tests/conformance/istio_virtual_service.rs`). Residual fail-closed gap:
-  weighted multi-destination L4 splitting. Model splits with an upstream-backed
-  stream proxy — do not treat TLS-SNI or the L4 match predicates as roadmap work.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;
   targets verified-Beta, not GA.
 
@@ -212,7 +218,7 @@ ledger unless they change the support contract.
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

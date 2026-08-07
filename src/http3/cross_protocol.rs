@@ -1204,11 +1204,25 @@ fn record_cross_protocol_client_acquire_failure(
 
 /// Run gateway-local dispatch-policy checks that must happen before backend
 /// admission for one H3→HTTP plain-bridge attempt.
+///
+/// On success it also carries the resolved backend-TLS-SNI dial for this
+/// attempt (`None` for the ordinary non-SNI route), because deciding it here is
+/// what makes a *failed* resolution fail closed at the same point as every other
+/// local dispatch-policy rejection: before backend admission, before
+/// `record_cross_protocol_connection_start`, and before any client is fetched
+/// or body relayed.
+struct PlainAttemptDispatch<'a> {
+    pending_slot: Option<crate::backend_pending_limit::BackendPendingGuard>,
+    /// Target-pinned, ALPN-restricted dial proxy plus the backend URL whose
+    /// authority is the overridden TLS server name.
+    sni_dial: Option<(std::borrow::Cow<'a, Proxy>, String)>,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_plain_attempt_local_policy_or_reject<S>(
+async fn run_plain_attempt_local_policy_or_reject<'a, S>(
     state: &ProxyState,
     epoch: &RequestEpoch,
-    dispatch_proxy: &Proxy,
+    dispatch_proxy: &'a Proxy,
     stream: &mut RequestStream<S, Bytes>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
@@ -1222,10 +1236,7 @@ async fn run_plain_attempt_local_policy_or_reject<S>(
     bytes_sent: u64,
     halt_request_body_before_reject: bool,
     ctx: &mut RequestContext,
-) -> Result<
-    Result<Option<crate::backend_pending_limit::BackendPendingGuard>, CrossProtocolOutcome>,
-    anyhow::Error,
->
+) -> Result<Result<PlainAttemptDispatch<'a>, CrossProtocolOutcome>, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
@@ -1321,47 +1332,92 @@ where
         return Ok(Err(outcome));
     }
 
-    if dispatch_proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %dispatch_proxy.id,
-            backend_tls_sni = ?dispatch_proxy.resolved_tls.sni,
-            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
-        );
-        record_backend_outcome_no_conn_end(
-            state,
-            dispatch_proxy,
-            &epoch.load_balancer,
-            upstream_balancer,
-            current_target,
-            current_cb_target_key,
-            502,
-            false,
-            Some(ErrorClass::DispatchPolicyRejected),
-            cb_is_half_open_probe,
-            false,
-            backend_start.elapsed(),
-        );
-        if halt_request_body_before_reject {
-            crate::http3::stream_util::halt_request_body(stream);
+    // A backend TLS SNI override is no longer rejected outright: the H3→HTTP
+    // plain bridge dispatches through the same reqwest pool as the H1/H2 path,
+    // so it honors an overridden TLS server name the same way — the override
+    // goes in the dial URL's authority and the pooled client's resolver is
+    // pinned to THIS attempt's resolved target address
+    // (`crate::proxy::backend_tls_sni_reqwest_dial`). Rejecting unconditionally
+    // would make every BackendTLSPolicy-covered backend a guaranteed 502 for
+    // HTTP/3 clients while the identical route worked over HTTP/1.1 and HTTP/2.
+    //
+    // But an override that CANNOT be expressed here (DNS resolution failed, the
+    // resolved address is absent/non-IP, or the backend URL's authority is not
+    // this attempt's target) must still fail closed: dialing `current_url` with
+    // the target-derived server name would silently ignore a mandatory TLS
+    // identity. That decision belongs at this point — a local dispatch-policy
+    // rejection, evaluated before backend admission, before the least-connections
+    // connection-start record, and before any client fetch or body relay — so it
+    // gets exactly the accounting every other rejection in this function gets.
+    //
+    // Scoped to a TLS backend, matching the H1/H2 fork (`proxy_to_backend`
+    // consults the override only under `DispatchKind::HttpsPool`). A stray SNI
+    // on a plaintext backend has no server name to override on ANY frontend, so
+    // failing H3 closed there would make a config that serves fine over
+    // HTTP/1.1 and HTTP/2 a total outage for HTTP/3 — the exact asymmetry this
+    // whole path exists to remove.
+    let requires_sni_dial = dispatch_proxy.resolved_tls.sni.is_some()
+        && dispatch_proxy
+            .backend_scheme
+            .is_some_and(|scheme| scheme.is_tls_backend());
+    let sni_dial = if requires_sni_dial {
+        // Resolution runs only for an SNI route. The answer is the shared DNS
+        // cache's, which applies the backend egress policy, so the pin is an
+        // already-screened address for the selected target.
+        let resolved =
+            resolve_cross_protocol_backend_ip(state, dispatch_proxy, current_target).await;
+        match crate::proxy::backend_tls_sni_reqwest_dial(
+            std::borrow::Cow::Borrowed(dispatch_proxy),
+            current_url,
+            effective_host,
+            resolved.as_deref(),
+        ) {
+            Some(dial) => Some(dial),
+            None => {
+                warn!(
+                    proxy_id = %dispatch_proxy.id,
+                    backend_tls_sni = ?dispatch_proxy.resolved_tls.sni,
+                    reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+                    "cross-protocol H3→HTTP bridge cannot express the backend TLS SNI override on this attempt; returning 502 without dialing"
+                );
+                record_backend_outcome_no_conn_end(
+                    state,
+                    dispatch_proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
+                    current_target,
+                    current_cb_target_key,
+                    502,
+                    false,
+                    Some(ErrorClass::DispatchPolicyRejected),
+                    cb_is_half_open_probe,
+                    false,
+                    backend_start.elapsed(),
+                );
+                if halt_request_body_before_reject {
+                    crate::http3::stream_util::halt_request_body(stream);
+                }
+                let mut outcome = write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"Bad Gateway"}"#,
+                    Some((
+                        "gateway-error-reason",
+                        crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+                    )),
+                    backend_start,
+                    bytes_sent,
+                )
+                .await?;
+                outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+                outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+                return Ok(Err(outcome));
+            }
         }
-        let mut outcome = write_plain_gateway_error(
-            stream,
-            ctx,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Bad Gateway"}"#,
-            Some((
-                "gateway-error-reason",
-                crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            )),
-            backend_start,
-            bytes_sent,
-        )
-        .await?;
-        outcome.backend_target = Some(strip_query_from_backend_url(current_url));
-        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
-        return Ok(Err(outcome));
-    }
+    } else {
+        None
+    };
 
     // Cap lookup AND lane key use the DR policy port (`dispatch_policy_port`),
     // never the dial port — same identity `proxy_to_backend` /
@@ -1383,7 +1439,10 @@ where
         dispatch_proxy.upstream_subset.as_deref(),
         pending_cap,
     ) {
-        Ok(slot) => Ok(Ok(slot)),
+        Ok(pending_slot) => Ok(Ok(PlainAttemptDispatch {
+            pending_slot,
+            sni_dial,
+        })),
         Err(limit) => {
             warn!(
                 proxy_id = %dispatch_proxy.id,
@@ -1773,7 +1832,14 @@ where
                         current_target.as_deref(),
                     );
 
-                    let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
+                    // Also resolves this attempt's backend-TLS-SNI dial, and
+                    // fails closed (502, `gateway-error-reason`) when a
+                    // requested override cannot be expressed — before admission,
+                    // before the connection-start record, before any dial.
+                    let PlainAttemptDispatch {
+                        mut pending_slot,
+                        sni_dial,
+                    } = match run_plain_attempt_local_policy_or_reject(
                         state,
                         epoch,
                         dispatch_proxy,
@@ -1793,7 +1859,7 @@ where
                     )
                     .await?
                     {
-                        Ok(slot) => slot,
+                        Ok(dispatch) => dispatch,
                         Err(outcome) => return Ok(outcome),
                     };
 
@@ -1829,11 +1895,22 @@ where
                         current_target.as_deref(),
                     );
 
+                    // The backend TLS SNI override was resolved (or failed
+                    // closed) above, before admission and before the
+                    // connection-start record. Only the dial is rewritten:
+                    // `dispatch_proxy` and `current_url` stay the real target for
+                    // circuit-breaker / load-balancer keys and for
+                    // `outcome.backend_target`.
+                    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_dial.as_ref() {
+                        Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
+                        None => (dispatch_proxy, current_url.as_str()),
+                    };
+
                     let client_result = match crate::plugins::await_grpc_deadline(
                         grpc_web_deadline_at,
                         get_cross_protocol_client(
                             state,
-                            dispatch_proxy,
+                            dial_proxy,
                             epoch,
                             upstream_balancer,
                             current_target.as_deref(),
@@ -1890,7 +1967,7 @@ where
                             dispatch_proxy,
                             req_method.clone(),
                             proxy_headers,
-                            &current_url,
+                            dial_url,
                             effective_host,
                             client_ip,
                             xff_append_ip,
@@ -2259,7 +2336,15 @@ where
                     current_target.as_deref(),
                 );
 
-                let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
+                // Also resolves this attempt's backend-TLS-SNI dial, and fails
+                // closed (502, `gateway-error-reason`) when a requested override
+                // cannot be expressed. `halt_request_body_before_reject` is
+                // `true` here, so a streaming request body is terminated on that
+                // rejection exactly as on every other local-policy rejection.
+                let PlainAttemptDispatch {
+                    mut pending_slot,
+                    sni_dial,
+                } = match run_plain_attempt_local_policy_or_reject(
                     state,
                     epoch,
                     dispatch_proxy,
@@ -2279,7 +2364,7 @@ where
                 )
                 .await?
                 {
-                    Ok(slot) => slot,
+                    Ok(dispatch) => dispatch,
                     Err(outcome) => return Ok(outcome),
                 };
 
@@ -2311,11 +2396,18 @@ where
                     current_target.as_deref(),
                 );
 
+                // Same backend-TLS-SNI dial as the buffered attempt above; see
+                // `run_plain_attempt_local_policy_or_reject` for the rationale.
+                let (dial_proxy, dial_url): (&Proxy, &str) = match sni_dial.as_ref() {
+                    Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
+                    None => (dispatch_proxy, current_url.as_str()),
+                };
+
                 let client_result = match crate::plugins::await_grpc_deadline(
                     grpc_web_deadline_at,
                     get_cross_protocol_client(
                         state,
-                        dispatch_proxy,
+                        dial_proxy,
                         epoch,
                         upstream_balancer,
                         current_target.as_deref(),
@@ -2371,7 +2463,7 @@ where
                     dispatch_proxy,
                     req_method,
                     proxy_headers,
-                    &current_url,
+                    dial_url,
                     effective_host,
                     client_ip,
                     xff_append_ip,
@@ -4032,11 +4124,14 @@ where
     ) = stream_hyper_incoming(
         stream,
         streaming.body,
-        coalesce,
-        max_resp_bytes,
-        streaming.response_read_timeout_ms,
-        streaming.grpc_deadline_at,
-        grpc_web_translation_mode,
+        StreamHyperIncomingOpts {
+            coalesce,
+            max_response_body_size_bytes: max_resp_bytes,
+            response_read_timeout_ms: streaming.response_read_timeout_ms,
+            grpc_deadline_at: streaming.grpc_deadline_at,
+            grpc_web_translation_mode,
+            grpc_response_messages: &ctx.grpc_response_messages_observed,
+        },
     )
     .await;
 
@@ -4658,6 +4753,17 @@ where
     } else {
         body.len() as u64
     };
+    // `body` is already the backend-visible native representation: a prebuffered
+    // body went through `apply_request_body_plugins_with_context` in
+    // `cross_protocol::run` (that is where gRPC-Web text base64 is decoded and
+    // the terminal trailer frame is split off), and the non-prebuffered arm is
+    // reachable only when no body-transforming plugin is configured. `bytes_sent`
+    // above stays the raw client-wire length.
+    crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+        &ctx.metadata,
+        &ctx.grpc_request_messages_observed,
+        &body,
+    );
 
     // Build the backend-facing header map (X-Forwarded-*, Via, Forwarded,
     // Early-Data) via the shared helper so the buffered and streaming H3 gRPC
@@ -5173,6 +5279,10 @@ where
             // trailers.
             let mut response_status = resp.status;
             let mut response_body = resp.body;
+            // Preserve the native gRPC representation for message accounting.
+            // A later gRPC-Web transform may base64/reframe the client-visible
+            // bytes, which are not themselves native length-prefixed frames.
+            let backend_response_body_for_message_count = response_body.clone();
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
@@ -5396,6 +5506,7 @@ where
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
                             buffered_initial_response_header_policy_state = None;
+                            response_body_rejected = true;
                             break;
                         }
                     }
@@ -5637,7 +5748,15 @@ where
                     .await
                 };
                 match body_write {
-                    Ok(()) => bytes_streamed = body_len,
+                    Ok(()) => {
+                        bytes_streamed = body_len;
+                        if !response_body_rejected && !terminal_gateway_deadline {
+                            crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+                                &ctx.grpc_response_messages_observed,
+                                &backend_response_body_for_message_count,
+                            );
+                        }
+                    }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                         crate::proxy::insert_grpc_error_metadata(
                             &mut ctx.metadata,
@@ -6237,6 +6356,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         None,
         ctx.grpc_deadline_at(),
         &mut held_frontend_grpc_upload,
+        Some(Arc::clone(&ctx.grpc_request_messages_observed)),
     )
     .await;
 
@@ -6863,6 +6983,17 @@ where
     )
 }
 
+/// Bundle streaming/policy knobs for [`stream_hyper_incoming`] so the helper
+/// stays under clippy's argument limit after gRPC response-message accounting.
+struct StreamHyperIncomingOpts<'a> {
+    coalesce: CoalesceConfig,
+    max_response_body_size_bytes: usize,
+    response_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    grpc_web_translation_mode: Option<bool>,
+    grpc_response_messages: &'a AtomicU64,
+}
+
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
 /// frames for `send_trailers`. Returns
 /// `(bytes_streamed, body_completed, client_disconnected, body_error_class,
@@ -6870,11 +7001,7 @@ where
 async fn stream_hyper_incoming<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut incoming: Incoming,
-    coalesce: CoalesceConfig,
-    max_response_body_size_bytes: usize,
-    response_read_timeout_ms: u64,
-    grpc_deadline_at: Option<tokio::time::Instant>,
-    grpc_web_translation_mode: Option<bool>,
+    opts: StreamHyperIncomingOpts<'_>,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6883,6 +7010,14 @@ where
     // `split()` send half (streaming-request gRPC path).
     S: SendStream<Bytes>,
 {
+    let StreamHyperIncomingOpts {
+        coalesce,
+        max_response_body_size_bytes,
+        response_read_timeout_ms,
+        grpc_deadline_at,
+        grpc_web_translation_mode,
+        grpc_response_messages,
+    } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(coalesce.flush_interval);
@@ -6894,6 +7029,8 @@ where
     let mut trailers: Option<HeaderMap> = None;
     let mut clean_deadline_completion = false;
     let mut client_deadline_expired = false;
+    let mut grpc_response_scanner =
+        crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default();
     let read_timeout_active = response_read_timeout_ms > 0 && grpc_deadline_at.is_none();
     let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
         response_read_timeout_ms.max(1),
@@ -7022,6 +7159,7 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
+                                let metric_data = data.clone();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
                                     crate::plugins::grpc_web::encode_streaming_data(data, text_mode)
                                 } else {
@@ -7031,6 +7169,8 @@ where
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7040,16 +7180,21 @@ where
 
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
-                                let out = coalesce_buf.split().freeze();
+                                let metric_data = coalesce_buf.split().freeze();
                                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                                    crate::plugins::grpc_web::encode_streaming_data(
+                                        metric_data.clone(),
+                                        text_mode,
+                                    )
                                 } else {
-                                    out
+                                    metric_data.clone()
                                 };
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
+                                grpc_response_scanner
+                                    .push(&metric_data, grpc_response_messages);
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -7073,16 +7218,17 @@ where
                 }
             }
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(metric_data.clone(), text_mode)
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
                 flush_timer
                     .as_mut()
@@ -7100,16 +7246,17 @@ where
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
-                let out = coalesce_buf.split().freeze();
+                let metric_data = coalesce_buf.split().freeze();
                 let out = if let Some(text_mode) = grpc_web_translation_mode {
-                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                    crate::plugins::grpc_web::encode_streaming_data(metric_data.clone(), text_mode)
                 } else {
-                    out
+                    metric_data.clone()
                 };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
                 }
+                grpc_response_scanner.push(&metric_data, grpc_response_messages);
                 bytes_streamed += out_len;
             }
             // When trailers are present, the caller writes the trailing

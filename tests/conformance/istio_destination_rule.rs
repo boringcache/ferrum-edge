@@ -9,13 +9,17 @@
 //! note. Deferred fields are also surfaced in the DestinationRule
 //! `status.ferrum.translation.deferred_fields` block by the Istio controller.
 
+use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    MeshDestinationRule, MeshLoadBalancer, MeshSimpleLb, MtlsMode,
+    MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshService, MeshSidecar, MeshSidecarEgress,
+    MeshSimpleLb, MtlsMode, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    destination_rule_exported_to_namespace,
 };
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use serde_json::{Value, json};
 
 use crate::conformance::registry::{Maturity, Status};
@@ -158,7 +162,7 @@ fn dr_connection_pool_tcp_max_connections() {
         feature = "trafficPolicy.connectionPool.tcp.maxConnections",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "T1-D (PR #897): translated to MeshConnectionPoolTcp.max_connections; enforced by stream-family (TCP/TCP+TLS) dispatch and by HTTP-family WebSocket dispatch (one dedicated backend connection per session). Pooled multiplexed HTTP transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not enforce it — see docs/mesh.md.",
+        notes = "T1-D (PR #897), extended by issue #3290: translated to MeshConnectionPoolTcp.max_connections and enforced as a physical open-connection ceiling on every transport whose socket lifecycle Ferrum owns — stream-family (TCP/TCP+TLS), HTTP-family WebSocket, the pooled multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS — each connection's slot is owned by that connection's own driver task, so it retires with the socket rather than with the pooled handle), and the reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2), admitted inside reqwest's own connector via the vendored connection_admission hook so pooled reuse and multiplexed streams take no slot while an idle socket still holds one — see docs/mesh.md.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -696,4 +700,268 @@ fn dr_subsets_with_traffic_policy() {
         .as_ref()
         .expect("v2 tls");
     assert_eq!(tls.sni.as_deref(), Some("v2.example.com"));
+}
+
+// ── Export visibility and lookup hierarchy (issues #2465, #2469) ─────────
+
+/// `spec.exportTo` — the namespaces a DestinationRule is visible in.
+///
+/// Istio's default for an omitted list is public, so the translator
+/// materializes it as an explicit `["*"]`. `.` restricts the rule to its own
+/// namespace, `*` publishes it mesh-wide, and an explicit list names the
+/// consuming namespaces. Visibility is enforced by slice narrowing BEFORE
+/// lookup selection and before a per-node slice is serialized, so a
+/// namespace-local rule never reaches a subscriber outside its declared
+/// visibility.
+#[test]
+fn dr_export_to_visibility() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "exportTo",
+        status = Status::Supported,
+        maturity = Maturity::Ga,
+        notes = "Omitted/empty spec.exportTo becomes an explicit [\"*\"] (Istio's public default); '.', '*', and explicit namespace lists are honored by slice narrowing before DestinationRule lookup and before per-node slice serialization. Unsupported values ('~', malformed namespaces, '*' mixed with an explicit list) are rejected fail-closed. On the native/file source an EMPTY export_to is namespace-local by Ferrum convention, matching ServiceEntry.",
+    );
+
+    let default_visibility = translated(json!({"host": "echo.default.svc.cluster.local"}));
+    assert_eq!(default_visibility.export_to, vec!["*".to_string()]);
+
+    let namespace_local = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "exportTo": ["."],
+    }));
+    assert_eq!(namespace_local.export_to, vec![".".to_string()]);
+    assert!(destination_rule_exported_to_namespace(
+        &namespace_local,
+        "default"
+    ));
+    assert!(!destination_rule_exported_to_namespace(
+        &namespace_local,
+        "other"
+    ));
+
+    let allowlisted = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "exportTo": ["alpha", "gamma"],
+    }));
+    assert!(destination_rule_exported_to_namespace(
+        &allowlisted,
+        "alpha"
+    ));
+    assert!(!destination_rule_exported_to_namespace(
+        &allowlisted,
+        "delta"
+    ));
+}
+
+/// An unsupported or self-conflicting `exportTo` fails the resource closed
+/// rather than being silently widened to "visible everywhere".
+#[test]
+fn dr_export_to_unsupported_values_rejected() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "exportTo (unsupported values)",
+        status = Status::Supported,
+        maturity = Maturity::Ga,
+        notes = "'~', empty entries, non-RFC-1123 namespaces, over-long lists, and '*' combined with an explicit namespace are rejected with FerrumAccepted=False/Invalid; the diagnostic names the field and index and never echoes the raw operator value.",
+    );
+    for spec in [
+        json!({"host": "echo.default.svc.cluster.local", "exportTo": ["~"]}),
+        json!({"host": "echo.default.svc.cluster.local", "exportTo": [""]}),
+        json!({"host": "echo.default.svc.cluster.local", "exportTo": ["Alpha"]}),
+        json!({"host": "echo.default.svc.cluster.local", "exportTo": ["*", "alpha"]}),
+    ] {
+        assert!(
+            translate_k8s_objects(&[destination_rule(spec.clone())], options()).is_err(),
+            "expected rejection for {spec}"
+        );
+    }
+}
+
+/// Istio's DestinationRule lookup path: the client's namespace, then the
+/// target service's namespace, then `meshConfig.rootNamespace`. The first tier
+/// with a visible rule wins outright; resource ordering is an intra-tier
+/// tiebreak only and never cross-tier precedence.
+#[test]
+fn dr_lookup_hierarchy_client_then_service_then_root() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "DestinationRule lookup hierarchy (client → service → root namespace)",
+        status = Status::Supported,
+        maturity = Maturity::Ga,
+        notes = "Resolved in slice narrowing and re-applied per upstream at materialization, where exportTo visibility is defensively rechecked before lookup. The configured istio_root_namespace is the final fallback tier. Composes with exportTo: a rule the subscriber cannot see is never a candidate for any tier. The service tier is granted only on evidence of ownership — the service inventory, a .svc-qualified host, or the namespace of exactly one visible ServiceEntry for an external host; an unknown or contested owner disables the tier rather than defaulting to the rule's own namespace.",
+    );
+
+    let host = "reviews.beta.svc.cluster.local";
+    let base_rules = |extra: Vec<MeshDestinationRule>| {
+        let mut rules = vec![
+            dr_named("beta", "service-default", host),
+            dr_named("istio-system", "mesh-default", host),
+        ];
+        rules.extend(extra);
+        rules
+    };
+
+    // Client tier wins when present.
+    assert_eq!(
+        admitted_names(
+            base_rules(vec![dr_named("alpha", "client-override", host)]),
+            "alpha"
+        ),
+        vec!["client-override".to_string()]
+    );
+    // Falls back to the service namespace.
+    assert_eq!(
+        admitted_names(base_rules(Vec::new()), "alpha"),
+        vec!["service-default".to_string()]
+    );
+    // Falls back to the configured root namespace.
+    assert_eq!(
+        admitted_names(
+            vec![dr_named("istio-system", "mesh-default", host)],
+            "alpha"
+        ),
+        vec!["mesh-default".to_string()]
+    );
+
+    // The same three tiers for an EXTERNAL host, whose service tier is the
+    // namespace of the ServiceEntry that declares it.
+    let external = "api.example.com";
+    let entries = vec![external_service_entry("beta", external)];
+    assert_eq!(
+        admitted_names_with_entries(
+            entries.clone(),
+            vec![
+                dr_named("istio-system", "mesh-default", external),
+                dr_named("beta", "service-default", external),
+                dr_named("alpha", "client-override", external),
+            ],
+            "alpha",
+        ),
+        vec!["client-override".to_string()]
+    );
+    assert_eq!(
+        admitted_names_with_entries(
+            entries.clone(),
+            vec![
+                dr_named("istio-system", "mesh-default", external),
+                dr_named("beta", "service-default", external),
+            ],
+            "alpha",
+        ),
+        vec!["service-default".to_string()],
+        "the declaring ServiceEntry's namespace is the service tier"
+    );
+    // A namespace that owns nothing here is not a tier, however it exports
+    // itself; and contested ownership disables the service tier rather than
+    // picking a claimant.
+    assert!(
+        admitted_names_with_entries(entries, vec![dr_named("evil", "hijack", external)], "alpha",)
+            .is_empty()
+    );
+    assert!(
+        admitted_names_with_entries(
+            vec![
+                external_service_entry("beta", external),
+                external_service_entry("gamma", external),
+            ],
+            vec![dr_named("beta", "service-default", external)],
+            "alpha",
+        )
+        .is_empty()
+    );
+}
+
+/// A mesh-external `ServiceEntry` exported mesh-wide.
+fn external_service_entry(namespace: &str, host: &str) -> ServiceEntry {
+    ServiceEntry {
+        name: format!("{namespace}-external"),
+        namespace: namespace.to_string(),
+        hosts: vec![host.to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 443,
+            protocol: Default::default(),
+            name: Some("https".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    }
+}
+
+fn dr_named(namespace: &str, name: &str, host: &str) -> MeshDestinationRule {
+    MeshDestinationRule {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        host: host.to_string(),
+        traffic_policy: None,
+        port_level_settings: std::collections::HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    }
+}
+
+/// Build a slice for a subscriber in `namespace` with an all-admitting Sidecar
+/// (cross-namespace lookup only arises inside an egress scope) and return the
+/// admitted rule names.
+fn admitted_names(destination_rules: Vec<MeshDestinationRule>, namespace: &str) -> Vec<String> {
+    admitted_names_with_entries(Vec::new(), destination_rules, namespace)
+}
+
+fn admitted_names_with_entries(
+    service_entries: Vec<ServiceEntry>,
+    destination_rules: Vec<MeshDestinationRule>,
+    namespace: &str,
+) -> Vec<String> {
+    let mesh = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        service_entries,
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "reviews".to_string(),
+            namespace: "beta".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: Default::default(),
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: std::collections::HashMap::new(),
+        }],
+        sidecars: vec![MeshSidecar {
+            name: "default-sc".to_string(),
+            namespace: namespace.to_string(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["*/*".to_string()],
+                port: None,
+            }],
+            ingress_declared: false,
+            ingress: Vec::new(),
+            outbound_traffic_policy: None,
+        }],
+        destination_rules,
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest {
+        node_id: format!("node-{namespace}"),
+        namespace: namespace.to_string(),
+        cluster_domain: "cluster.local".to_string(),
+        ..MeshSliceRequest::default()
+    }
+    .with_enforce_sidecar_egress(true);
+    MeshSlice::from_gateway_config(&config, request)
+        .destination_rules
+        .into_iter()
+        .map(|dr| dr.name)
+        .collect()
 }

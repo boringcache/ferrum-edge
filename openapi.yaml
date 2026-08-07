@@ -7397,7 +7397,15 @@ components:
         backend_tls_server_ca_cert_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to custom CA bundle for backend TLS verification. Max 4096 characters.
+          description: >-
+            Path (or typed source URI) for the custom CA bundle used for backend
+            TLS verification. Max 4096 characters. The reserved value
+            `system://` selects the built-in system/webpki trust anchors
+            explicitly: unlike leaving this field null, it does NOT fall back to
+            the global `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. `system://` requires
+            `backend_tls_verify_server_cert: true` and must be spelled exactly,
+            with no path or query options.
         dns_override:
           type: [string, "null"]
 
@@ -10139,14 +10147,34 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+            The reserved value `system://` inverts that: it pins the built-in
+            system/webpki trust anchors, and — unlike leaving this field null —
+            deliberately does NOT fall back to the global
+            `FERRUM_TLS_CA_BUNDLE_PATH` and never inherits
+            `FERRUM_TLS_NO_VERIFY`. It is the representation of Gateway API
+            `BackendTLSPolicy` `wellKnownCACertificates: System`, requires
+            `backend_tls_verify_server_cert: true`, and must be spelled
+            exactly, with no path or query options.
         backend_tls_sni:
           type: [string, "null"]
           maxLength: 253
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
-            DestinationRule `trafficPolicy.tls.sni` projects to this field.
-            Stored/projected only — backend handshake SNI consumption is not
-            yet enforced (tracked by GAP-1B).
+            DestinationRule `trafficPolicy.tls.sni` and Gateway API
+            `BackendTLSPolicy` `validation.hostname` both project to this
+            field. Enforced at the backend handshake on every path where
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            reqwest HTTP/1.1 dial (which carries the override in the request
+            URL authority while pinning the socket to the selected target).
+            It also partitions backend connection pools, so two values never
+            share a connection. Must be an exact DNS hostname — not a
+            wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
+            HTTP/1.1 dial serves them, this field is accepted alongside
+            effective retry, request-body-buffering plugins, and
+            `pool_enable_http2: false`; admission returns no 400 for those
+            combinations. Direct WebSocket (`wss://`) transport cannot apply
+            it and refuses such an upgrade with 502; see
+            `docs/backend_mtls.md`.
         backend_tls_san_allow_list:
           type: array
           maxItems: 256
@@ -10157,9 +10185,13 @@ components:
           description: >-
             Optional allow-list of backend certificate Subject Alternative
             Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
-            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
-            projects to this field. Stored/projected only — SAN allow-list
-            verification is not yet enforced (tracked by GAP-1C).
+            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames` and
+            Gateway API `BackendTLSPolicy` `validation.subjectAltNames` both
+            project to this field. Enforced by the backend server verifier on
+            the rustls-based backend paths, and part of the backend pool key
+            (as a digest) so two allow-lists never share a connection. Not
+            enforced when per-proxy or global no-verify is enabled, which is
+            warned about at startup; see `docs/backend_mtls.md`.
         locality_lb_strict:
           type: boolean
           default: false
@@ -15362,6 +15394,7 @@ components:
         - port_exhaustion
         - graceful_remote_close
         - dispatch_policy_rejected
+        - backend_connection_limit
         - request_error
       description: |
         Stable classification of a backend dispatch failure. Emitted on
@@ -15380,6 +15413,14 @@ components:
         adaptive-concurrency effect) and not retried, and it surfaces as HTTP
         `503` or gRPC `RESOURCE_EXHAUSTED` — never as a backend `502` /
         `response_body_too_large`.
+        `backend_connection_limit` is the gateway refusing to open one more
+        physical backend connection because the destination is already at its
+        DestinationRule `connectionPool.tcp.maxConnections` ceiling. Nothing was
+        dialed, so it is health-neutral (no circuit-breaker, passive-health,
+        load-balancer-penalty, or adaptive-concurrency effect) — a saturated
+        operator-configured ceiling must never eject a healthy destination —
+        while still being pre-wire, so `retry_on_connect_failure` may rotate to
+        another load-balanced target with its own admission lane.
 
     DisconnectCause:
       type: string
@@ -16546,10 +16587,14 @@ components:
       type: object
       description: |
         Plugin: mesh_outbound_registry — Implements Istio
-        `MeshConfig.outboundTrafficPolicy.mode: REGISTRY_ONLY`. Rejects HTTP
+        `outboundTrafficPolicy.mode: REGISTRY_ONLY`. Rejects HTTP
         requests whose `Host` header is not in the configured destination
-        registry. Auto-injected by mesh mode when the slice declares
-        `RegistryOnly`; not registered when policy is `AllowAny` (default).
+        registry. Auto-injected by mesh mode when the EFFECTIVE outbound policy
+        resolves to `RegistryOnly` — workload-scoped
+        `Sidecar.outboundTrafficPolicy`, else mesh-wide
+        `MeshConfig.outboundTrafficPolicy`, else
+        `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`; not registered when the effective
+        policy is `AllowAny` (default).
         Operator-managed instances on non-mesh gateways behave as a generic
         HTTP `Host` allowlist.
 
@@ -23982,7 +24027,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -24232,7 +24277,27 @@ components:
           minimum: 1
           maximum: 4096
           default: 64
-          description: Maximum simultaneous federation provider chains, including fallback and OAuth work. Excess requests fail with 503 without queueing.
+          description: "Maximum simultaneous federation provider chains, including fallback and OAuth work, and including claimed streaming chains — a stream holds its permit for the whole life of the response and returns it on completion, client disconnect, downstream policy cut, backend error, or cancellation. Excess requests fail with 503 without queueing."
+        streaming:
+          type: object
+          additionalProperties: false
+          description: "Incremental provider response streaming for OpenAI Chat Completions requests with `stream: true`. Disabled by default; when absent, streaming requests keep returning 501 and non-streaming federation behavior is unchanged."
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: "Claim streaming requests in before_proxy and commit one eligible provider before any downstream-visible byte. Enabling this makes the plugin declare a backend-boundary header policy and request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy."
+            max_event_bytes:
+              type: integer
+              minimum: 4096
+              maximum: 1048576
+              default: 262144
+              description: "Ceiling on one retained server-sent event. This is the whole retained state of a claimed stream — at most one event is held at a time (the partial event being assembled, or the terminal `data: [DONE]` event once the provider frames its completion) and there is no queue — so retention grows with neither stream length nor transport chunk size: the ceiling is enforced on every complete AND partial event before any of its bytes are retained or released. An event that exceeds it fails closed with a fixed-cardinality terminal SSE error event that never echoes provider bytes. The terminal event is held until the provider's body ends, because a client may stop reading at `[DONE]`; any provider byte after it fails the stream closed and the marker is dropped rather than released."
+            read_timeout_seconds:
+              type: integer
+              minimum: 0
+              maximum: 86400
+              description: "Streaming-only override for the provider whole-exchange budget. When omitted, a claimed stream uses the SELECTED provider's own `read_timeout_seconds`. On the reqwest dispatch path this budget covers connect through the last response body byte — it is a whole-exchange bound, not a per-chunk inactivity bound — so a generation that legitimately runs longer than the provider's per-call budget needs this override. `0` removes the gateway-imposed whole-exchange bound entirely. The provider's `connect_timeout_seconds` is always applied to the committed streaming destination and is not overridable here."
 
     AiStreamRouterConfig:
       type: object
