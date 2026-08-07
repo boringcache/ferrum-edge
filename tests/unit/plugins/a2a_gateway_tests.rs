@@ -4167,9 +4167,14 @@ fn openapi_grpc_services_default_is_the_canonical_a2a_03_service() {
     }
     assert!(inside, "A2aGatewayConfig schema section not found");
     let section = section.as_str();
+    // Both published identities are recognized by default so a deployment that
+    // relied on the former 1.0 default keeps method-policy enforcement, but the
+    // 0.3 service stays FIRST: it is the primary identity, and the only one
+    // eligible for Agent Card rewriting.
     assert!(
-        section.contains(r#"default: ["a2a.v1.A2AService"]"#),
-        "endpoint.grpc_services must default to the canonical A2A 0.3 service"
+        section.contains(r#"default: ["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]"#),
+        "endpoint.grpc_services must default to the canonical A2A 0.3 service first, \
+         with A2A 1.0 recognized for policy"
     );
     assert!(
         !section.contains(r#"default: ["lf.a2a.v1.A2AService"]"#),
