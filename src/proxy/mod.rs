@@ -987,6 +987,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
                     | retry::ErrorClass::DispatchPolicyRejected
+                    | retry::ErrorClass::BackendConnectionLimit
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -5809,19 +5810,49 @@ pub struct ProxyState {
     #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Per-destination open-connection limiter enforcing DestinationRule
-    /// `connectionPool.tcp.maxConnections` for the HTTP-family WebSocket
-    /// dispatch path (H1/H2 here and H3 in `src/http3/websocket.rs`). A
-    /// proxied WebSocket session opens one dedicated, non-pooled backend
-    /// connection whose lifetime equals the session, so an RAII
-    /// [`crate::backend_conn_limit::BackendConnectionGuard`] held for the
-    /// session bounds concurrent open connections per `(host, port)` —
-    /// matching Envoy `maxConnections` semantics and the raw-TCP path's
-    /// `BackendInflightGuard`. The pooled, multiplexed HTTP-family
-    /// transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not
-    /// consume this limiter; see `docs/mesh.md` and the module docs in
-    /// `src/backend_conn_limit.rs` for why their pool-internal connection
-    /// lifecycle makes a request-keyed counter the wrong control.
+    /// `connectionPool.tcp.maxConnections` across EVERY backend transport
+    /// whose physical connection lifecycle Ferrum owns: raw TCP/TCP+TLS,
+    /// WebSocket (H1/H2 here and H3 in `src/http3/websocket.rs`), the pooled
+    /// multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS),
+    /// and the reqwest transports (admitted through
+    /// [`crate::backend_conn_limit::ReqwestConnectionAdmission`] below).
+    /// A dedicated session holds an RAII
+    /// [`crate::backend_conn_limit::BackendConnectionGuard`] for the session;
+    /// a pooled connection holds a
+    /// [`crate::backend_conn_limit::SharedBackendConnectionGuard`] handed to
+    /// its own connection driver, so the slot retires exactly when the socket
+    /// dies (handshake failure, idle eviction, pool drain, reload/delete, SVID
+    /// drain, shutdown) and reuse/multiplexing takes no extra slot. One shared
+    /// instance means the ceiling is per destination `(host, policy port)`, not
+    /// per transport.
+    ///
+    /// "Shared" is literal and has to stay that way. Raw TCP reaches this exact
+    /// `Arc` through `TcpProxyMetrics.backend_inflight`, which the stream
+    /// listener manager is handed via `attach_backend_conn_limit` right after
+    /// construction and before the first `reconcile()` — if a stream listener
+    /// ever built its own limiter instead, a destination's effective ceiling
+    /// would become `cap` per listener plus another `cap` for the HTTP family.
+    /// The host component of the key is normalized inside the limiter, not at
+    /// the callers, because the callers disagree on spelling (configured host
+    /// vs. reqwest's URL-normalized authority).
+    ///
+    /// See `docs/mesh.md` and the module docs in `src/backend_conn_limit.rs`.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
+    /// Gateway-wide `connectionPool.tcp.maxConnections` admission hook for the
+    /// reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2).
+    ///
+    /// reqwest owns its socket pool internally, so the cap is enforced at its
+    /// connector — the one place a NEW physical socket is dialed — through the
+    /// vendored `ClientBuilder::connection_admission` hook. Pooled reuse and
+    /// multiplexed H2 streams never reach it, and the admitted token is owned
+    /// by the connection object, so an idle socket reqwest retains after a
+    /// request still holds its slot. The dispatch path binds the destination
+    /// lane (dial `(host, port)` -> policy port + cap) to its own dispatch with
+    /// an RAII
+    /// [`crate::backend_conn_limit::ReqwestLaneLease`] held across `send()`, and
+    /// only when a cap is configured — so a lane is live exactly while a capped
+    /// request can cause a dial, and a removed cap drains with its requests.
+    pub reqwest_conn_admission: Arc<crate::backend_conn_limit::ReqwestConnectionAdmission>,
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
     /// backend-dispatch path. Bounds how many requests can be simultaneously
@@ -7080,6 +7111,22 @@ impl ProxyState {
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
+        // ONE `connectionPool.tcp.maxConnections` counter for the whole
+        // gateway: raw TCP, WebSocket, and every pooled multiplexed transport
+        // admit on the same per-`(host, policy port)` lane, so a destination's
+        // ceiling is a real per-destination ceiling rather than one ceiling per
+        // transport. Constructed before the pools so each can be handed a
+        // reference at construction time (see `attach_backend_conn_limit`).
+        let backend_conn_limit = Arc::new(
+            crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
+                pool_shard_amount,
+            ),
+        );
+        let reqwest_conn_admission =
+            Arc::new(crate::backend_conn_limit::ReqwestConnectionAdmission::new(
+                backend_conn_limit.clone(),
+                pool_shard_amount,
+            ));
         let grpc_pool = Arc::new(
             GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
                 global_pool_config.clone(),
@@ -7138,6 +7185,14 @@ impl ProxyState {
             dns_cache.clone(),
             backend_svid_generation.clone(),
         ));
+        // Wire the shared destination ceiling into every socket-owning pool.
+        // Additive and idempotent (`OnceLock::set`): a pool constructed without
+        // it (focused tests, standalone callers) simply never enforces a cap.
+        grpc_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        http2_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
@@ -7150,6 +7205,9 @@ impl ProxyState {
             shared_crls.clone(),
             backend_svid_generation.clone(),
         ));
+        // Same shared ceiling for the reqwest transports, installed on every
+        // client this pool builds (see `ReqwestConnectionAdmission`).
+        connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
         // the RouterCache constructor resolves the auto sentinel (single source of truth).
@@ -7428,6 +7486,14 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
+        // relay session, so they must admit on the SAME per-destination lane as
+        // WebSocket, the pooled multiplexed transports, and reqwest. Attached
+        // here — after construction, before any `reconcile()` — so every spawned
+        // listener's `TcpProxyMetrics` carries this exact `Arc` instead of a
+        // private per-listener limiter (which would make the effective ceiling
+        // `cap` per listener plus another `cap` for the whole HTTP family).
+        stream_listener_manager.attach_backend_conn_limit(backend_conn_limit.clone());
 
         let state = Self {
             config: config_arc,
@@ -7520,11 +7586,8 @@ impl ProxyState {
             backend_svid_rotation_tx,
             backend_svid_generation,
             bpf_metrics_state,
-            backend_conn_limit: Arc::new(
-                crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
-                    pool_shard_amount,
-                ),
-            ),
+            backend_conn_limit,
+            reqwest_conn_admission,
             backend_pending_limit: Arc::new(
                 crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
                     pool_shard_amount,
@@ -8207,7 +8270,14 @@ impl ProxyState {
                 // `record.last_probe_error` directly instead — the outer
                 // function merges this into the combined error string.
                 let class = http2_pool::classify_http2_pool_error(&err);
-                let preserve = is_transient_capability_probe_failure(class);
+                // Same reasoning as the H3 probe: a `maxConnections` refusal is
+                // a gateway-side ceiling, not evidence the backend lost H2. This
+                // arm already probes `Unknown`, so preserving is all that is
+                // needed to keep a prior `Supported` from being erased whenever
+                // the refresh happens to run while the cap is saturated.
+                use http2_pool::Http2PoolError;
+                let refused_by_cap = matches!(err, Http2PoolError::MaxConnectionsExceeded { .. });
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 record.plain_http.h2_tls =
                     backend_capabilities::merge_protocol_probe_classification(
                         previous_h2_tls,
@@ -8413,10 +8483,25 @@ impl ProxyState {
             },
             Ok(Err(err)) => {
                 let class = crate::http3::client::classify_http3_error(err.as_ref());
-                let preserve = is_transient_capability_probe_failure(class);
+                // A `connectionPool.tcp.maxConnections` refusal is the GATEWAY
+                // declining to open one more socket to a destination that is at
+                // its ceiling — the probe never dialed, so it carries ZERO
+                // evidence about the backend's H3 support. Reading it as
+                // `Unsupported` would durably downgrade a perfectly healthy H3
+                // backend (and route every subsequent request through reqwest)
+                // simply because live traffic had the cap saturated when the
+                // refresh ran. Probe `Unknown` + preserve, so a prior
+                // `Supported` survives and a first probe stays undecided.
+                let refused_by_cap = crate::pool::is_max_connections_refusal(err.as_ref());
+                let probed = if refused_by_cap {
+                    ProtocolSupport::Unknown
+                } else {
+                    ProtocolSupport::Unsupported
+                };
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 let h3 = backend_capabilities::merge_protocol_probe_classification(
                     previous_h3,
-                    ProtocolSupport::Unsupported,
+                    probed,
                     preserve,
                 );
                 if preserve && matches!(h3, ProtocolSupport::Supported) {
@@ -9737,6 +9822,13 @@ impl ProxyState {
                 self.router_cache.clear_lookup_caches();
             }
         }
+        // No withdrawal pass is needed for the reqwest `maxConnections` admission
+        // lanes: a lane exists only while some capped dispatch holds a lease
+        // across its `send()`, so a cap this publication REMOVED stops applying
+        // as soon as the requests dispatched under the old configuration drain,
+        // and the registry drains with them. A cap this publication CHANGED is
+        // replaced wholesale by the first dispatch carrying the newer generation
+        // (see `ReqwestConnectionAdmission`).
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
         self.consumer_index
@@ -24276,6 +24368,7 @@ async fn handle_proxy_request_inner(
 
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
+    ctx.config_generation = epoch.config_generation;
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
@@ -28063,12 +28156,22 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, grpc_cb_probe_slot);
+                    // A `maxConnections` refusal is retryable (pre-wire, so the
+                    // loop may rotate to another target) but carries no backend
+                    // signal — the ceiling is the gateway's own policy. Settle
+                    // the breaker neutrally instead of opening it on a healthy
+                    // destination whose cap simply saturated.
+                    if backend_dispatch::client_side_no_backend_signal(grpc_retry_error_class) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, true, grpc_cb_probe_slot);
+                    }
                     // This intermediate failure consumes the probe slot (if any);
                     // the post-dispatch record must not decrement it again.
                     grpc_cb_probe_slot = false;
                     // The probe slot this guard would release on drop has now
-                    // been released by record_failure above, so disarm it.
+                    // been released by the record above (failure or neutral —
+                    // both consume it), so disarm it.
                     // Otherwise a future dropped during the retry backoff/next
                     // attempt would call record_neutral on the same breaker and
                     // release a second slot (over-admitting probes when
@@ -28440,7 +28543,18 @@ async fn handle_proxy_request_inner(
                             ..
                         }
                     );
-                    cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    // A DestinationRule `maxConnections` refusal is a
+                    // gateway-side ceiling, not a backend fault: no socket was
+                    // opened. Settle NEUTRAL, the same posture the raw-TCP
+                    // over-cap path and `apply_circuit_breaker_outcome` take,
+                    // so a saturated cap cannot open the breaker on a healthy
+                    // destination.
+                    let grpc_error_class = retry::classify_grpc_proxy_error(e);
+                    if backend_dispatch::client_side_no_backend_signal(Some(grpc_error_class)) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    }
                 }
             }
         }
@@ -30657,11 +30771,25 @@ async fn handle_proxy_request_inner(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(
-                    result.status_code,
-                    result.connection_error,
-                    cb_retry_probe_slot_available,
-                );
+                // A retryable outcome that carries NO backend-health signal must
+                // settle the breaker NEUTRALLY here, not as a failure. Until
+                // `BackendConnectionLimit` there was no such class — every other
+                // `client_side_no_backend_signal` class is rejected by
+                // `should_retry`, so this arm only ever saw genuine backend
+                // failures. A `maxConnections` refusal is pre-wire (so the loop
+                // may rotate to another target) but is the operator's own
+                // gateway-side ceiling, so charging it would open the breaker on
+                // a healthy destination. Mirrors `apply_circuit_breaker_outcome`
+                // and the raw-TCP over-cap path's `record_cb_neutral`.
+                if backend_dispatch::client_side_no_backend_signal(result.error_class) {
+                    cb.record_neutral(cb_retry_probe_slot_available);
+                } else {
+                    cb.record_failure(
+                        result.status_code,
+                        result.connection_error,
+                        cb_retry_probe_slot_available,
+                    );
+                }
                 cb_retry_probe_slot_available = false;
             }
 
@@ -33439,12 +33567,19 @@ pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
     if let Some(target) = upstream_target {
         let policy_port = target.dispatch_policy_port();
         if policy_port != target.port
-            && let Some(policy_override) = effective
+            && let Some(mut policy_override) = effective
                 .dispatch_port_overrides
                 .as_ref()
                 .and_then(|overrides| overrides.get(&policy_port))
                 .cloned()
         {
+            // Stamp the service port the policy came from. The pools read this
+            // entry by dial port, so without the stamp the
+            // `connectionPool.tcp.maxConnections` counter lane would key on the
+            // workload port while WebSocket/raw-TCP sessions to the same
+            // destination key on the service port — two lanes, so an effective
+            // 2×cap ceiling. See `ResolvedPortOverride::policy_port`.
+            policy_override.policy_port = Some(policy_port);
             // Direct H2 and gRPC pools receive only this effective proxy, then
             // look up socket keepalive by `proxy.backend_port`. Mirror the selected
             // service-port policy onto that dial port in the per-dispatch clone so
@@ -33852,6 +33987,23 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
+    // Lease the `connectionPool.tcp.maxConnections` lane for this retry
+    // attempt's destination. The retry may target a DIFFERENT LB target than the
+    // initial attempt, so the lane for that host must be live before the dial
+    // this attempt can cause. Enforcement itself lives in reqwest's connector
+    // (see `proxy_to_backend`); a retry that reuses an idle socket never reaches
+    // the connector and takes no slot at all.
+    let retry_conn_lane_lease =
+        resolve_backend_max_connections(proxy, retry_policy_port).map(|cap| {
+            state.reqwest_conn_admission.lease_lane(
+                request_ctx.config_generation,
+                effective_host,
+                retry_dial_port,
+                retry_policy_port,
+                cap,
+            )
+        });
+
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let send_result = match crate::plugins::await_grpc_deadline(
@@ -33875,6 +34027,10 @@ pub(crate) async fn proxy_to_backend_retry(
     // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
     // the drop is a no-op.
     drop(retry_pending_slot);
+    // Same join point for this attempt's `maxConnections` lane lease — see
+    // `proxy_to_backend` for why `send()` resolving is the last moment a new
+    // physical dial can be caused.
+    drop(retry_conn_lane_lease);
     match send_result {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -34043,6 +34199,29 @@ pub(crate) async fn proxy_to_backend_retry(
             }
         }
         Err(e) => {
+            // Gateway-side `maxConnections` refusal on the retry dial: neutral
+            // 503, exactly as on the initial attempt. Classifying it as a
+            // connect failure would let the retry loop keep re-dialing a
+            // destination that is at its ceiling.
+            if crate::backend_conn_limit::is_backend_connection_limit_error(&e) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = retry_dial_port,
+                    max_connections_policy_port = retry_policy_port,
+                    "Refusing new backend connection on retry: DestinationRule maxConnections reached for destination"
+                );
+                return retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                };
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
@@ -36316,6 +36495,34 @@ async fn proxy_to_backend(
         }
     };
 
+    // DestinationRule `connectionPool.tcp.maxConnections` on the reqwest path.
+    //
+    // reqwest fully owns and hides its socket pool, so the cap is NOT enforced
+    // here: a request-lifetime slot would read zero while reqwest still holds
+    // the socket idle (and would count H2 streams, not connections). It is
+    // enforced inside reqwest's connector instead — the one place a NEW
+    // physical socket is dialed — via the vendored `connection_admission` hook
+    // installed on every pooled client. All this dispatch does is publish the
+    // destination lane the connector will look the cap up in, and only when a
+    // cap is actually configured; an uncapped destination touches nothing.
+    //
+    // The lane is keyed by the DIAL `(host, port)` (what the connector sees in
+    // the URI) but COUNTS on the DestinationRule policy port, so a `targetPort`
+    // remap, a WebSocket session, and a raw-TCP session to the same destination
+    // all share one ceiling. The lease is taken BEFORE `send()` and released
+    // after it resolves — exactly the window in which this request can cause a
+    // dial — so the lane is live for every dial it causes and for no longer. A
+    // `maxConnections` an operator removed stops applying as soon as the
+    // requests dispatched under it drain, with no epoch registry to sweep.
+    let conn_lane_lease = resolve_backend_max_connections(proxy, pending_policy_port).map(|cap| {
+        state.reqwest_conn_admission.lease_lane(
+            request_ctx.config_generation,
+            effective_host,
+            pending_dial_port,
+            pending_policy_port,
+            cap,
+        )
+    });
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
@@ -36364,6 +36571,12 @@ async fn proxy_to_backend(
     // point (admission reject); this explicit drop covers the response-handling
     // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
     drop(pending_slot);
+    // Same join point for the `maxConnections` lane lease: `send()` resolving is
+    // the last moment this request can cause a NEW physical dial (redirects and
+    // connection establishment all happen inside it; the response body streams
+    // on the socket that is already open). Holding it longer would only keep a
+    // retired policy alive after a reload. RAII covers the early returns above.
+    drop(conn_lane_lease);
     let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
@@ -36733,6 +36946,36 @@ async fn proxy_to_backend(
                 );
             }
 
+            // A dial this gateway refused because the destination is at its
+            // DestinationRule `maxConnections` ceiling is NOT a backend fault:
+            // no socket was opened and the backend never saw the request. Answer
+            // with the same neutral 503 / `DispatchPolicyRejected` posture as the
+            // `http1MaxPendingRequests` shed — no health charge, no circuit
+            // breaker, no adaptive-concurrency shrink, and not retried as a
+            // connect failure (which would just re-refuse and amplify).
+            if crate::backend_conn_limit::is_backend_connection_limit_error(&e) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = pending_dial_port,
+                    max_connections_policy_port = pending_policy_port,
+                    "Refusing new backend connection: DestinationRule maxConnections reached for destination"
+                );
+                return backend_dispatch_response(
+                    retry::BackendResponse {
+                        status_code: 503,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    },
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
@@ -41144,6 +41387,10 @@ async fn proxy_to_backend_http3(
                 let h3_result = if let Some(target) = upstream_target {
                     let target_host = target.host.clone();
                     let target_port = target.port;
+                    // DestinationRule policy port for `maxConnections` admission.
+                    // Differs from `target_port` only under a `targetPort` remap;
+                    // passing the dial port would resolve no cap at all.
+                    let target_policy_port = target.dispatch_policy_port();
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
                     state
@@ -41152,6 +41399,7 @@ async fn proxy_to_backend_http3(
                             proxy,
                             &target_host,
                             target_port,
+                            target_policy_port,
                             method,
                             backend_url,
                             &http3_headers,
@@ -41517,6 +41765,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -41525,6 +41777,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41621,6 +41874,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -41629,6 +41886,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -42213,12 +42471,17 @@ async fn proxy_to_backend_http3_retry(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             state
                 .h3_pool
                 .request_with_target_streaming(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -42349,12 +42612,17 @@ async fn proxy_to_backend_http3_retry(
     let h3_result = if let Some(target) = upstream_target {
         let target_host = target.host.clone();
         let target_port = target.port;
+        // DestinationRule policy port for `maxConnections` admission. Differs
+        // from `target_port` only under a `targetPort` remap; passing the dial
+        // port would resolve no cap at all.
+        let target_policy_port = target.dispatch_policy_port();
         state
             .h3_pool
             .request_with_target(
                 proxy,
                 &target_host,
                 target_port,
+                target_policy_port,
                 method,
                 backend_url,
                 &http3_headers,
