@@ -1307,11 +1307,7 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let src = observed_src
-        .lock()
-        .await
-        .clone()
-        .expect("backend must observe PROXY header");
+    let src = (*observed_src.lock().await).expect("backend must observe PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -1375,11 +1371,7 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let src = observed_src
-        .lock()
-        .await
-        .clone()
-        .expect("backend must observe outbound PROXY header");
+    let src = (*observed_src.lock().await).expect("backend must observe outbound PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50)),
