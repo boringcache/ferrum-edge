@@ -21,8 +21,8 @@ use crate::plugins::mesh::authz::{
     parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
-    MESH_METRICS_DISABLED_METADATA, MESH_REQUEST_COUNT_OVERRIDES_METADATA,
-    MESH_REQUEST_DURATION_OVERRIDES_METADATA, MeshMetricFamily, MeshMetricLabel,
+    MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
+    MeshMetricLabel,
 };
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
@@ -163,8 +163,8 @@ pub struct WorkloadMetrics {
     custom_tags: HashMap<String, String>,
     /// Custom tags populated from request headers.
     custom_header_tags: HashMap<String, String>,
-    request_count_tag_overrides: Option<String>,
-    request_duration_tag_overrides: Option<String>,
+    /// Per-family compact tag-override plans stamped into request metadata.
+    tag_override_plans: Vec<(MeshMetricFamily, String)>,
     disabled_metrics_marker: Option<String>,
     custom_trace_attributes_marker: Option<String>,
     /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
@@ -307,10 +307,9 @@ impl WorkloadMetrics {
         // and never from a controller-host translation.
         resolve_custom_env_tags_with(&mut custom_tags, &custom_env_tags, env_lookup)?;
         let ParsedMetricConfig {
-            request_count_tag_overrides,
-            request_duration_tag_overrides,
+            tag_override_plans,
             disabled_metrics_marker,
-        } = parse_metric_config(config.get("metrics"), true)?;
+        } = parse_metric_config(config.get("metrics"))?;
         let tracing_providers = parse_tracing_providers(config)?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
@@ -345,8 +344,7 @@ impl WorkloadMetrics {
             sampling_percentage,
             custom_tags,
             custom_header_tags,
-            request_count_tag_overrides,
-            request_duration_tag_overrides,
+            tag_override_plans,
             disabled_metrics_marker,
             custom_trace_attributes_marker,
             tracing_providers,
@@ -666,17 +664,8 @@ impl WorkloadMetrics {
         if let Some(marker) = self.disabled_metrics_marker.as_ref() {
             metadata.insert(MESH_METRICS_DISABLED_METADATA.to_string(), marker.clone());
         }
-        if let Some(plan) = self.request_count_tag_overrides.as_ref() {
-            metadata.insert(
-                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
-                plan.clone(),
-            );
-        }
-        if let Some(plan) = self.request_duration_tag_overrides.as_ref() {
-            metadata.insert(
-                MESH_REQUEST_DURATION_OVERRIDES_METADATA.to_string(),
-                plan.clone(),
-            );
+        for (family, plan) in &self.tag_override_plans {
+            metadata.insert(family.override_metadata_key().to_string(), plan.clone());
         }
     }
 
@@ -1013,6 +1002,16 @@ impl Plugin for WorkloadMetrics {
             "tcp"
         };
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
+        // The stream path, rather than an individual plugin instance, owns the
+        // exactly-once TCP opened/closed lifecycle. Prove that at least one
+        // workload_metrics instance actually observed this connection before a
+        // later finalizer can emit it: mesh routing/security code may have
+        // pre-populated other `mesh.*` labels even when an earlier plugin
+        // rejects before this hook is reached.
+        metadata.insert(
+            MESH_WORKLOAD_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        );
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
         if self.trace_context_enabled() && trace_is_sampled(metadata) {
@@ -1071,6 +1070,14 @@ impl Plugin for WorkloadMetrics {
                 self.insert_proxy_destination_labels(metadata, &proxy_namespace, &proxy_name);
             }
         }
+        // TCP_OPENED_CONNECTIONS is deliberately NOT emitted here. Several
+        // effective `workload_metrics` instances may run this hook for one
+        // connection, each over metadata that later instances still modify, and
+        // a later plugin may still reject the stream or the client may
+        // disconnect during admission. The stream path finalizes the opened
+        // counter once after the last hook that actually ran (and, for captured
+        // mesh egress TCP, after selected target metadata is stamped) via
+        // `prometheus_helpers::finalize_mesh_tcp_opened_stream`.
         PluginResult::Continue
     }
 
@@ -1154,8 +1161,7 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
 }
 
 struct ParsedMetricConfig {
-    request_count_tag_overrides: Option<String>,
-    request_duration_tag_overrides: Option<String>,
+    tag_override_plans: Vec<(MeshMetricFamily, String)>,
     disabled_metrics_marker: Option<String>,
 }
 
@@ -1163,42 +1169,13 @@ struct ParsedMetricConfig {
 enum MetricSelector {
     All,
     Emitted(MeshMetricFamily),
-    RecognizedUnsupported(&'static str),
 }
 
 fn metric_selector(name: &str) -> Option<MetricSelector> {
     if name.trim().eq_ignore_ascii_case("ALL_METRICS") {
         return Some(MetricSelector::All);
     }
-    if let Some(family) = MeshMetricFamily::from_config_name(name) {
-        return Some(MetricSelector::Emitted(family));
-    }
-    match name.trim().to_ascii_uppercase().as_str() {
-        "REQUEST_SIZE" => Some(MetricSelector::RecognizedUnsupported("REQUEST_SIZE")),
-        "RESPONSE_SIZE" => Some(MetricSelector::RecognizedUnsupported("RESPONSE_SIZE")),
-        "TCP_OPENED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
-            "TCP_OPENED_CONNECTIONS",
-        )),
-        "TCP_CLOSED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
-            "TCP_CLOSED_CONNECTIONS",
-        )),
-        "TCP_SENT_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_SENT_BYTES")),
-        "TCP_RECEIVED_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_RECEIVED_BYTES")),
-        "GRPC_REQUEST_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
-            "GRPC_REQUEST_MESSAGES",
-        )),
-        "GRPC_RESPONSE_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
-            "GRPC_RESPONSE_MESSAGES",
-        )),
-        _ => None,
-    }
-}
-
-pub(crate) fn is_recognized_unsupported_istio_metric_family(name: &str) -> bool {
-    matches!(
-        metric_selector(name),
-        Some(MetricSelector::RecognizedUnsupported(_))
-    )
+    MeshMetricFamily::from_config_name(name).map(MetricSelector::Emitted)
 }
 
 enum ParsedTagOperation<'a> {
@@ -1243,44 +1220,33 @@ fn parse_tag_operation<'a>(
     }
 }
 
-fn parse_metric_config(
-    value: Option<&Value>,
-    emit_unsupported_family_warning: bool,
-) -> Result<ParsedMetricConfig, String> {
+fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
         return Ok(ParsedMetricConfig {
-            request_count_tag_overrides: None,
-            request_duration_tag_overrides: None,
+            tag_override_plans: Vec::new(),
             disabled_metrics_marker: None,
         });
     };
     let object = metrics
         .as_object()
         .ok_or_else(|| "workload_metrics: 'metrics' must be an object".to_string())?;
-    let mut disabled_count = false;
-    let mut disabled_duration = false;
-    let mut ignored_metric_families = BTreeSet::new();
+    let mut disabled = BTreeSet::new();
     if let Some(value) = object.get("disabled_metrics") {
-        let disabled = value.as_array().ok_or_else(|| {
+        let entries = value.as_array().ok_or_else(|| {
             "workload_metrics: metrics.disabled_metrics must be an array".to_string()
         })?;
-        for metric in disabled {
+        for metric in entries {
             let name = metric.as_str().ok_or_else(|| {
                 "workload_metrics: disabled metric names must be strings".to_string()
             })?;
             match metric_selector(name) {
                 Some(MetricSelector::All) => {
-                    disabled_count = true;
-                    disabled_duration = true;
+                    for family in MeshMetricFamily::ALL {
+                        disabled.insert(family.disabled_name());
+                    }
                 }
-                Some(MetricSelector::Emitted(MeshMetricFamily::RequestCount)) => {
-                    disabled_count = true;
-                }
-                Some(MetricSelector::Emitted(MeshMetricFamily::RequestDuration)) => {
-                    disabled_duration = true;
-                }
-                Some(MetricSelector::RecognizedUnsupported(canonical)) => {
-                    ignored_metric_families.insert(canonical);
+                Some(MetricSelector::Emitted(family)) => {
+                    disabled.insert(family.disabled_name());
                 }
                 None => {
                     return Err(format!(
@@ -1291,8 +1257,7 @@ fn parse_metric_config(
         }
     }
 
-    let mut request_count_plan = String::new();
-    let mut request_duration_plan = String::new();
+    let mut plans: HashMap<MeshMetricFamily, String> = HashMap::new();
     if let Some(value) = object.get("tag_overrides") {
         let overrides = value.as_array().ok_or_else(|| {
             "workload_metrics: metrics.tag_overrides must be an array".to_string()
@@ -1321,14 +1286,6 @@ fn parse_metric_config(
                     ));
                 }
             };
-            let emitted_family = match selector {
-                MetricSelector::All => None,
-                MetricSelector::Emitted(family) => Some(family),
-                MetricSelector::RecognizedUnsupported(canonical) => {
-                    ignored_metric_families.insert(canonical);
-                    continue;
-                }
-            };
             let label = MeshMetricLabel::from_config_name(name)
                 .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
             let encoded = match operation {
@@ -1346,45 +1303,46 @@ fn parse_metric_config(
                     value_len = value.len()
                 ),
             };
-            match emitted_family {
-                None => {
-                    request_count_plan.push_str(&encoded);
-                    request_duration_plan.push_str(&encoded);
+            match selector {
+                MetricSelector::All => {
+                    for family in MeshMetricFamily::ALL {
+                        plans.entry(family).or_default().push_str(&encoded);
+                    }
                 }
-                Some(MeshMetricFamily::RequestCount) => {
-                    request_count_plan.push_str(&encoded);
-                }
-                Some(MeshMetricFamily::RequestDuration) => {
-                    request_duration_plan.push_str(&encoded);
+                MetricSelector::Emitted(family) => {
+                    plans.entry(family).or_default().push_str(&encoded);
                 }
             }
         }
     }
 
-    if emit_unsupported_family_warning && !ignored_metric_families.is_empty() {
-        let metric_families = ignored_metric_families
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(",");
-        tracing::warn!(
-            plugin = "workload_metrics",
-            %metric_families,
-            "ignoring Istio metric-family policy for standard families Ferrum does not emit"
-        );
-    }
-
-    let disabled_marker = match (disabled_count, disabled_duration) {
-        (true, true) => Some("request_count,request_duration".to_string()),
-        (true, false) => Some("request_count".to_string()),
-        (false, true) => Some("request_duration".to_string()),
-        (false, false) => None,
+    let disabled_metrics_marker = if disabled.is_empty() {
+        None
+    } else {
+        Some(
+            MeshMetricFamily::ALL
+                .iter()
+                .filter_map(|family| {
+                    disabled
+                        .contains(family.disabled_name())
+                        .then_some(family.disabled_name())
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     };
+    let tag_override_plans = MeshMetricFamily::ALL
+        .iter()
+        .filter_map(|family| {
+            plans
+                .remove(family)
+                .filter(|plan| !plan.is_empty())
+                .map(|plan| (*family, plan))
+        })
+        .collect();
     Ok(ParsedMetricConfig {
-        request_count_tag_overrides: (!request_count_plan.is_empty()).then_some(request_count_plan),
-        request_duration_tag_overrides: (!request_duration_plan.is_empty())
-            .then_some(request_duration_plan),
-        disabled_metrics_marker: disabled_marker,
+        tag_override_plans,
+        disabled_metrics_marker,
     })
 }
 
@@ -1414,7 +1372,7 @@ pub(crate) fn validate_istio_telemetry_config(
     if let Some(metrics) = metrics {
         let metrics = serde_json::to_value(metrics)
             .map_err(|error| format!("workload_metrics: invalid translated metrics: {error}"))?;
-        parse_metric_config(Some(&metrics), false)?;
+        parse_metric_config(Some(&metrics))?;
     }
     Ok(())
 }
@@ -2869,11 +2827,21 @@ mod tests {
         .expect("metric config");
 
         assert_eq!(
-            metrics.request_count_tag_overrides.as_deref(),
+            metrics
+                .tag_override_plans
+                .iter()
+                .find(|(family, _)| *family
+                    == crate::plugins::mesh::prometheus_helpers::MeshMetricFamily::RequestCount)
+                .map(|(_, plan)| plan.as_str()),
             Some("s0,4:edge;")
         );
         assert_eq!(
-            metrics.request_duration_tag_overrides.as_deref(),
+            metrics
+                .tag_override_plans
+                .iter()
+                .find(|(family, _)| *family
+                    == crate::plugins::mesh::prometheus_helpers::MeshMetricFamily::RequestDuration)
+                .map(|(_, plan)| plan.as_str()),
             Some("r11;")
         );
         assert_eq!(

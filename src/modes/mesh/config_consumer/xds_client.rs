@@ -1473,6 +1473,7 @@ fn reverse_translate(
         labels_ambiguous: recovered.labels_ambiguous
             && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
         virtual_service_l4_proxies: recovered.virtual_service_l4_proxies,
+        virtual_service_l4_upstreams: recovered.virtual_service_l4_upstreams,
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -1664,6 +1665,7 @@ struct RecoveredSliceCarriers {
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
     virtual_service_l4_proxies: Vec<serde_json::Value>,
+    virtual_service_l4_upstreams: Vec<serde_json::Value>,
     /// Authoritative config revision (issue #2473) recovered from the
     /// `ConfigRevision` carrier. `None` when the CP's config authority is
     /// unordered (or predates the carrier) — the DP freshness gate then treats
@@ -2070,6 +2072,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
         MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
             recovered.virtual_service_l4_proxies = value
+        }
+        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
+            recovered.virtual_service_l4_upstreams = value
         }
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
@@ -5077,7 +5082,16 @@ mod tests {
                 "backend_host": "db.default.svc.cluster.local",
                 "backend_port": 3306,
                 "listen_port": 3306,
+                "upstream_id": "istio-vs-l4-upstream-default-db-tcp-0",
                 "stream_match": {"arms": [{"gateways": ["mesh"]}]}
+            })],
+            virtual_service_l4_upstreams: vec![serde_json::json!({
+                "id": "istio-vs-l4-upstream-default-db-tcp-0",
+                "namespace": "default",
+                "targets": [
+                    {"host": "db-v1.default.svc.cluster.local", "port": 3306, "weight": 80},
+                    {"host": "db-v2.default.svc.cluster.local", "port": 3306, "weight": 20}
+                ]
             })],
             workloads: vec![workload.clone()],
             ambient_udp_source_workloads: vec![workload.clone()],
@@ -5256,6 +5270,10 @@ mod tests {
         assert_eq!(
             recovered.virtual_service_l4_proxies,
             native.virtual_service_l4_proxies
+        );
+        assert_eq!(
+            recovered.virtual_service_l4_upstreams,
+            native.virtual_service_l4_upstreams
         );
         assert_eq!(recovered.workloads, native.workloads);
         assert_eq!(

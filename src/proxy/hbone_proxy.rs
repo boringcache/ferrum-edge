@@ -246,6 +246,12 @@ fn build_hbone_relay_summary(
         body_completed,
         bytes_sent: bytes_client_to_backend,
         bytes_received: bytes_backend_to_client,
+        grpc_request_messages: ctx
+            .grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        grpc_response_messages: ctx
+            .grpc_response_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire),
         metadata: crate::proxy::clone_log_metadata(ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
