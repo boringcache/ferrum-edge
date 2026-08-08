@@ -825,11 +825,8 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
 /// `status.ancestors` toward the MaxItems=16 ceiling.
 ///
 /// The remaining way to reach the ceiling is third-party controllers filling
-/// it. Gateway API forbids adding an entry then, so Ferrum publishes none — and
-/// translation independently refuses the policy through the shared
-/// `backend_tls_policy::policy_status_ancestors_representable` predicate, so
-/// behaviour and status stay in agreement instead of the policy silently
-/// governing traffic it cannot report.
+/// it. Gateway API forbids adding an entry then, so Ferrum publishes none.
+/// This status-output constraint does not affect data-plane translation.
 fn backend_tls_policy_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -848,9 +845,9 @@ fn backend_tls_policy_status(
 
     let existing_ancestors = object.status.get("ancestors");
     let mut ancestors = retained_non_ferrum_status_entries(&object.status, "ancestors");
-    // Capacity is measured over the retained third-party entries only, exactly
-    // as the translator measures it. All-or-nothing: a partial write would be
-    // the silent truncation the spec forbids.
+    // Capacity is measured over the retained third-party entries only.
+    // All-or-nothing: a partial write would be the silent truncation the spec
+    // forbids.
     let representable = ancestors_set.len() <= policy_status_ancestor_capacity(&object.status);
     debug_assert_eq!(
         policy_status_ancestor_capacity(&object.status),

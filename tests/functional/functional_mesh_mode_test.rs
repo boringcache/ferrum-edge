@@ -10710,6 +10710,11 @@ fn udp_fail_closed_guard_probe_literal_matches_source() {
 /// and binds capture/reply sockets inside the pod netns, and the captured flow
 /// traverses gateway A's HBONE datagram tunnel plus gateway B's real destination
 /// relay before returning from the original VIP:port.
+///
+/// Scope: source-capture producer + HBONE egress to a **host-loopback** UDP echo
+/// (`start_counting_udp_echo` on `127.0.0.1`). Does **not** exercise the
+/// enrolled-destination pod-netns relay path (destination workload inside its own
+/// pod netns with registry mapping and tc-inbound admit) — tracked on #3621.
 #[cfg(target_os = "linux")]
 #[ignore = "requires root + netns + iptables/TPROXY + iproute2"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
