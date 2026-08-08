@@ -38,8 +38,8 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
 use ferrum_edge::proxy::grpc_proxy::{
-    GrpcConnectionPool, GrpcDispatchTransport, GrpcResponseKind, proxy_grpc_request_from_bytes,
-    proxy_grpc_request_streaming_channel,
+    GrpcConnectionPool, GrpcDispatchTransport, GrpcProxyError, GrpcResponseKind, GrpcTimeoutKind,
+    proxy_grpc_request_from_bytes, proxy_grpc_request_streaming_channel,
 };
 use ferrum_edge::proxy::hbone_pool::{
     HBONE_AUTHORITY_HOST_TAG, HBONE_DIAL_HOST_TAG, HBONE_PORT_TAG, HBONE_TARGET_TAG,
@@ -893,6 +893,73 @@ async fn grpc_over_ambient_hbone_fails_closed_when_the_pinned_peer_does_not_matc
         result.is_err(),
         "an HBONE peer whose SVID does not match the pinned mesh.spiffe_id must fail closed, \
          never fall back to an unauthenticated direct dial"
+    );
+}
+
+#[tokio::test]
+async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeout() {
+    let ids = mesh_identities();
+    // Accept the relayed application TCP connection but never speak HTTP/2.
+    // Before the regression fix this left the nested hyper handshake waiting
+    // forever whenever the client supplied no grpc-timeout.
+    let app_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled app");
+    let app_addr = app_listener.local_addr().expect("stalled app addr");
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (_tcp, _) = app_listener.accept().await.expect("accept stalled app");
+        let _ = accepted_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    let (relay_addr, _connect_observed_rx) = start_hbone_grpc_relay(ids.server_slot).await;
+
+    let grpc_pool = GrpcConnectionPool::default();
+    let mesh_pool = mesh_mtls_pool(Arc::clone(&ids.gateway_slot));
+    let ambient_pool = hbone_pool(ids.gateway_slot);
+    let mut proxy = grpc_proxy_for_test();
+    proxy.backend_connect_timeout_ms = 250;
+    let target = hbone_target(app_addr.port(), relay_addr.port(), ids.peer_id.as_str());
+    let transport =
+        GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, &ambient_pool, Some(&target))
+            .expect("mesh.hbone target must resolve the Ambient HBONE transport");
+
+    let (headers, proxy_headers) = grpc_request_headers();
+    let dns = DnsCache::new(DnsConfig::default());
+    let started = tokio::time::Instant::now();
+    let result = proxy_grpc_request_from_bytes(
+        hyper::Method::POST,
+        headers,
+        grpc_message(b"ping"),
+        None,
+        &proxy,
+        &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
+        &transport,
+        &dns,
+        &proxy_headers,
+        false,
+        0,
+        None,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), accepted_rx)
+        .await
+        .expect("the relay reached the stalled app before the timeout")
+        .expect("stalled app acceptance signal");
+    assert!(
+        matches!(
+            result,
+            Err(GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Connect,
+                ..
+            })
+        ),
+        "a stalled nested HTTP/2 handshake must be a connect timeout"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the nested HTTP/2 handshake must not outlive the configured connect timeout"
     );
 }
 

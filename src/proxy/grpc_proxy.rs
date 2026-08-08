@@ -2917,10 +2917,32 @@ impl<'a> GrpcDispatchTransport<'a> {
                     .map(GrpcDispatchSender::MeshMtls)
                     .map_err(mesh_mtls_pool_error_to_grpc)
             }
-            Self::Hbone(hbone) => open_hbone_grpc_sender(hbone, proxy)
+            Self::Hbone(hbone) => {
+                // Bound the WHOLE Ambient acquisition, including the nested
+                // HTTP/2 handshake after CONNECT succeeds. Without this outer
+                // deadline, an app that accepted the relayed TCP connection
+                // but never sent HTTP/2 SETTINGS could retain a request
+                // forever when the client supplied no grpc-timeout.
+                let timeout_ms =
+                    crate::proxy::hbone_pool::effective_connect_timeout_ms_for_policy_port(
+                        proxy,
+                        hbone.target.dispatch_policy_port(),
+                    );
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    open_hbone_grpc_sender(hbone, proxy),
+                )
                 .await
-                .map(GrpcDispatchSender::H2)
-                .map_err(hbone_pool_error_to_grpc),
+                {
+                    Ok(result) => result
+                        .map(GrpcDispatchSender::H2)
+                        .map_err(hbone_pool_error_to_grpc),
+                    Err(_) => Err(GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Connect,
+                        message: format!("Ambient HBONE connect timeout after {timeout_ms}ms"),
+                    }),
+                }
+            }
         }
     }
 

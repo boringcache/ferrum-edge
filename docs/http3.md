@@ -172,7 +172,7 @@ target:
 | No mesh tag | `state.grpc_pool` (direct h2c / TLS) | Unchanged behavior. |
 | `mesh.mtls`, same-cluster | `state.mesh_mtls_pool` (SVID-mTLS HTTP/2) | Destination identity pinned from `mesh.spiffe_id`. |
 | `mesh.mtls`, cross-cluster | same pool, east-west branch | East-west gateway dial + destination-FQDN SNI override (`mesh.eastwest_sni`) + trust-domain-scoped verification (`mesh.trust_domain`). |
-| `mesh.hbone`, same-cluster | nested HTTP/2 over `state.hbone_pool`'s CONNECT byte tunnel | Destination identity pinned; the peer's HBONE relay byte-copies the tunnel to the app socket, so the inner connection is ordinary h2c. |
+| `mesh.hbone`, same-cluster | nested HTTP/2 over `state.hbone_pool`'s CONNECT byte tunnel | Materialized mesh targets pin the destination identity. An operator-supplied target that deliberately omits the optional peer tag retains HBONE's existing trust-domain-only verification; a present but invalid tag fails closed. The peer's HBONE relay byte-copies the tunnel to the app socket, so the inner connection is ordinary h2c. |
 | `mesh.hbone`, cross-cluster | same, over the cross-cluster dial | Remote east-west gateway (`mesh.hbone_dial_host` / `mesh.hbone_port`), SNI override, trust-domain scope; the CONNECT authority is the real remote pod from `mesh.hbone_authority_host`. |
 
 Both mesh transports are HTTP/2 end to end, so gRPC framing, `grpc-status` /
@@ -181,6 +181,11 @@ client cancellation behave exactly as they do on the direct gRPC pool. The
 shared `GrpcBody` is handed through unchanged, so the channel-backed streaming
 path still commits request DATA incrementally and a peer can answer before the
 H3 client half-closes (true bidirectional streaming).
+
+HBONE sender acquisition, including the inner HTTP/2 handshake after CONNECT,
+is bounded by the destination policy port's effective backend connect timeout.
+A relayed app that accepts TCP but never sends HTTP/2 settings therefore cannot
+retain the RPC indefinitely when the client supplied no `grpc-timeout`.
 
 Everything undispatchable **fails closed** with a Trailers-Only gRPC
 `UNAVAILABLE`, before any dial:
