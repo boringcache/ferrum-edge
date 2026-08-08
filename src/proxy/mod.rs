@@ -52095,39 +52095,41 @@ mod tests {
         // hostname, but the effective socket target after synthesis/override
         // must be a dial endpoint. Admitting the hostname here would let
         // resolve_local_udp_dest DNS-bypass endpoints[].
-        let mut mesh = MeshConfig::default();
-        mesh.egress_udp_destinations = vec![
-            MeshEgressUdpDestination {
-                host: "static.external.com".to_string(),
-                port: 53,
-                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+        let mesh = MeshConfig {
+            egress_udp_destinations: vec![
+                MeshEgressUdpDestination {
+                    host: "static.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
                     host: "198.51.100.9".to_string(),
                     port: 53,
-                }],
-                service_entry: "static".to_string(),
-                namespace: "default".to_string(),
-            },
-            MeshEgressUdpDestination {
-                host: "198.51.100.9".to_string(),
-                port: 53,
-                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
-                    host: "198.51.100.9".to_string(),
-                    port: 53,
-                }],
-                service_entry: "static".to_string(),
-                namespace: "default".to_string(),
-            },
-            MeshEgressUdpDestination {
-                host: "dns.external.com".to_string(),
-                port: 53,
-                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
                     host: "dns.external.com".to_string(),
                     port: 53,
-                }],
-                service_entry: "dns".to_string(),
-                namespace: "default".to_string(),
-            },
-        ];
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "dns.external.com".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "dns".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
 
         // Original-authority lookup is unchanged: STATIC hostname still
         // selects a declared dial endpoint.
