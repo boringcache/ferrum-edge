@@ -1745,6 +1745,13 @@ The CONNECT remap is deliberately narrow and fails closed before any dial:
   listener sets are refused rather than falling through to the transparent
   relay. With no declared `ingress` block, ordinary Ambient/Waypoint relay
   behavior is unchanged.
+- The remap is **`Sidecar`-topology only**, matching the inbound materializer it
+  gates. `FERRUM_MESH_SIDECAR_ENFORCED` is topology-independent, so an
+  Ambient/Waypoint proxy in a mesh that also runs sidecars can receive a slice
+  whose applicable `Sidecar` declares `ingress[]`. Those topologies materialize
+  no inbound routes at all and serve every authenticated inbound through the
+  transparent relay, so the declaration marker is not back-projected there and
+  their relay behavior is unchanged.
 
 #### Live datapath coverage
 

@@ -2042,13 +2042,6 @@ impl MeshSidecarIngress {
     pub(crate) fn is_declared_http_family_listener(&self) -> bool {
         self.port != 0 && is_http_family_app_protocol(self.protocol)
     }
-
-    /// Whether this entry would materialize on either the HTTP or stream
-    /// inbound lane were its `defaultEndpoint` routable (nonzero listener
-    /// port + recognized modeled protocol).
-    pub(crate) fn is_declared_modeled_listener(&self) -> bool {
-        self.port != 0 && is_modeled_ingress_app_protocol(self.protocol)
-    }
 }
 
 /// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
@@ -3026,6 +3019,13 @@ pub struct MeshConfig {
     /// so those cases deny rather than falling through to the transparent
     /// relay and dialing a port the operator removed. `serde(skip)`: never
     /// operator-settable, never serialized.
+    ///
+    /// Back-projected under `MeshTopology::Sidecar` ONLY, matching the inbound
+    /// materializer this marker gates. `FERRUM_MESH_SIDECAR_ENFORCED` is
+    /// topology-independent, so an Ambient/Waypoint proxy can be handed a slice
+    /// whose applicable Sidecar declares `ingress[]` — and those topologies
+    /// materialize no inbound routes at all, so honoring the marker there would
+    /// deny every transparent-relay CONNECT instead of replacing a surface.
     #[serde(skip)]
     pub sidecar_ingress_declared: bool,
     /// Runtime-only back-projection of `MeshSlice.declared_ingress_http_ports`

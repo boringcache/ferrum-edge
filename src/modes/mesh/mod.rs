@@ -1292,7 +1292,19 @@ fn prepare_normalized_gateway_config_for_mesh(
         // ingress blocks still replace the ordinary inbound CONNECT surface;
         // without this marker those cases could fall through to the transparent
         // relay and dial a port the operator removed.
-        mesh.sidecar_ingress_declared = mesh_slice.sidecar_ingress_declared;
+        //
+        // SIDECAR-TOPOLOGY ONLY, mirroring `materialize_sidecar_inbound_proxies`'s
+        // own `topology != Sidecar` early return. `Sidecar.ingress[]` replaces a
+        // workload's SIDECAR inbound surface; the slice builder resolves it from
+        // `FERRUM_MESH_SIDECAR_ENFORCED` alone, which is topology-independent, so
+        // an Ambient/Waypoint proxy in a mesh that also runs sidecars can carry a
+        // true marker for an inbound surface it never materializes. Those
+        // topologies serve ALL authenticated inbound through the transparent
+        // relay, so back-projecting the marker there would make
+        // `resolve_sidecar_ingress_connect_relay` deny every CONNECT — an inbound
+        // outage, not a fail-closed refinement of anything the operator replaced.
+        mesh.sidecar_ingress_declared =
+            runtime.topology == MeshTopology::Sidecar && mesh_slice.sidecar_ingress_declared;
         // Back-project the DECLARED HTTP-family ingress port count untouched by
         // the re-validation drops above (F6 §6.2). The drops reduce the
         // materialized `local_ingress_listeners` (siblings), but the declared
@@ -33699,6 +33711,83 @@ mod tests {
             Some(expected_pod_ip),
         );
         assert_eq!(stale, config::SidecarIngressConnectRelay::NotDeclared);
+    }
+
+    /// The `sidecar_ingress_declared` marker is SIDECAR-topology only, exactly
+    /// like the materializer it gates.
+    ///
+    /// `FERRUM_MESH_SIDECAR_ENFORCED` is topology-independent, so an
+    /// Ambient/Waypoint proxy in a mesh that also runs sidecars can receive a
+    /// slice whose applicable `Sidecar` declares `ingress[]`. Those topologies
+    /// materialize NO inbound routes and serve every authenticated inbound
+    /// through the transparent CONNECT relay, so back-projecting the marker
+    /// there would `Deny` every inbound CONNECT — an outage, not a fail-closed
+    /// refinement of a surface the operator replaced.
+    #[test]
+    fn sidecar_ingress_declared_marker_is_scoped_to_sidecar_topology() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![ingress_stream_listener(
+                16379,
+                "127.0.0.1",
+                6379,
+                AppProtocol::Redis,
+            )],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let pod_ip = "10.244.1.7"
+            .parse::<std::net::IpAddr>()
+            .expect("test pod IP");
+
+        for topology in [MeshTopology::Ambient, MeshTopology::NodeWaypoint] {
+            let runtime = MeshRuntimeConfig {
+                workload_spiffe_id: Some(spiffe.to_string()),
+                topology,
+                ..test_mesh_runtime_config()
+            };
+            let config =
+                gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("prepared");
+            let mesh = config.mesh.as_deref().expect("prepared mesh");
+            assert!(
+                !mesh.sidecar_ingress_declared,
+                "{topology:?} must not inherit the Sidecar ingress declaration marker"
+            );
+            // The ordinary transparent relay therefore keeps deciding every
+            // authenticated inbound CONNECT, declared listener port included.
+            assert_eq!(
+                mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 16379, Some(pod_ip)),
+                config::SidecarIngressConnectRelay::NotDeclared,
+                "{topology:?} inbound CONNECT must fall through to the open-relay guard"
+            );
+            assert_eq!(
+                mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 8080, Some(pod_ip)),
+                config::SidecarIngressConnectRelay::NotDeclared,
+                "{topology:?} must not deny an unrelated inbound CONNECT port"
+            );
+        }
+
+        // Sidecar topology is unchanged: the marker rides and the remap applies.
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh");
+        assert!(mesh.sidecar_ingress_declared);
+        assert_eq!(
+            mesh.resolve_sidecar_ingress_connect_relay("10.244.1.7", 8080, Some(pod_ip)),
+            config::SidecarIngressConnectRelay::Deny,
+            "a declared Sidecar ingress block still replaces the ordinary inbound surface"
+        );
     }
 
     /// The mapping `sidecar_ingress_stream_listener_materializes_tcp_route_*`

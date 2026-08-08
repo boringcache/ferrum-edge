@@ -5910,6 +5910,12 @@ struct RequestConnectionMetadata {
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached and binds a Sidecar ingress CONNECT to this replica.
+    ///
+    /// Populated only on MESH listeners (`mesh_direction.is_some()`), like
+    /// `orig_dst`, and only after the accept loop's overload / connection-permit
+    /// fast-reject arms — the `getsockname` must not be charged to every
+    /// non-mesh accept or to a flood of connections the gateway is about to RST.
+    /// `None` everywhere else; its one consumer fails closed without it.
     accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
@@ -16936,11 +16942,6 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
-                        // Capture the concrete destination before the stream is
-                        // wrapped or moved. An accepted stream identifies the
-                        // pod IP the peer reached even when the listener itself
-                        // is bound to a wildcard address.
-                        let accepted_local_addr = stream.local_addr().ok();
                         let restored = source_ip_override.current();
                         let remote_addr = resolve_accept_peer_identity(remote_addr, restored);
                         accept_backoff.on_success();
@@ -17054,6 +17055,18 @@ async fn run_accept_loop(
                                 crate::socket_opts::original_dst(&stream),
                                 node_waypoint_orig_dst,
                             )
+                        } else {
+                            None
+                        };
+                        // Concrete local address of the accepted connection —
+                        // the pod IP the peer actually reached, even when the
+                        // listener is bound to a wildcard address. Gated on a
+                        // mesh listener exactly like `orig_dst` above (its only
+                        // consumer is the mesh-inbound CONNECT boundary), and
+                        // read only AFTER the overload/permit fast-reject arms
+                        // so a connection flood still costs zero extra syscalls.
+                        let accepted_local_addr = if mesh_direction.is_some() {
+                            stream.local_addr().ok()
                         } else {
                             None
                         };
