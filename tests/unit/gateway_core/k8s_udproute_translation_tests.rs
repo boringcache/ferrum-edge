@@ -299,9 +299,12 @@ fn udp_route_rejects_non_service_backend_kind() {
     let err = translated.expect_err("unsupported backendRef target kind fails closed");
 
     let message = err.to_string();
-    assert!(message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'"));
     assert!(
-        message.contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(
+        message
+            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
     );
 }
 
@@ -1004,9 +1007,12 @@ fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
         .expect_err("an unsupported kind fails the rule closed");
 
     let message = err.to_string();
-    assert!(message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'"));
     assert!(
-        message.contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(
+        message
+            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
     );
 }
 
@@ -1046,9 +1052,12 @@ fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
         .expect_err("an unsupported zero-weight target kind fails closed");
 
     let message = err.to_string();
-    assert!(message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'"));
     assert!(
-        message.contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(
+        message
+            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
     );
 }
 
