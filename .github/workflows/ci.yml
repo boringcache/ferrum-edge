@@ -1967,8 +1967,10 @@ jobs:
       # Trusted-base chart runtime lint: reject container-runtime socket mounts /
       # host storage and privileged: true on node-agent/ambient chart surfaces.
       # Extract the checker from the base branch on pull_request / merge_group so
-      # a hostile PR cannot replace it; bootstrap from the reviewed checkout only
-      # when the base has no checker yet.
+      # this step cannot be made to execute the proposed checker. The workflow
+      # wiring remains a reviewed PR surface and is checked by the required CI
+      # aggregate. Bootstrap from the reviewed checkout only when the base has no
+      # checker yet.
       - name: Check node-agent chart runtime mounts
         run: |
           set -euo pipefail

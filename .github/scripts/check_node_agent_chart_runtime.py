@@ -5,12 +5,13 @@
 runtime socket mount or `privileged: true` on the node-agent / ambient
 workloads. This checker is that gate.
 
-Trusted CI extracts this script from the base branch (see the always-on
-`chart-runtime-lint` job in `.github/workflows/ci.yml`) and runs it against the
-pull request's chart tree, so a malicious PR cannot replace the checker while
-still passing the gate. That job is deliberately separate from `ci-plan`: the
-trusted ARM64 Cross build policy freezes the per-job digest of every
-Cross-sensitive `ci.yml` job, and `ci-plan` is one of them.
+The Helm Chart job extracts this script from the base branch and runs it against
+the pull request's chart tree. While that step remains wired, a pull request
+cannot make the job execute its proposed checker. The workflow wiring remains a
+reviewed PR surface and is independently checked by `verify_required_ci.py`.
+The job is deliberately separate from `ci-plan`: the trusted ARM64 Cross build
+policy freezes the per-job digest of every Cross-sensitive `ci.yml` job, and
+`ci-plan` is one of them.
 
 The scanner reasons about chart workload/value content after stripping Helm and
 YAML comments, so prose such as the existing RuntimeDefault/containerd seccomp
@@ -124,7 +125,7 @@ def iter_scan_paths(root: Path) -> list[Path]:
     missing: list[str] = []
     for relative in REQUIRED_RELATIVE_PATHS:
         path = root / relative
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             missing.append(relative)
             continue
         paths.add(path)
@@ -135,6 +136,11 @@ def iter_scan_paths(root: Path) -> list[Path]:
         )
     for pattern in GOVERNED_GLOBS:
         for path in sorted(root.glob(pattern)):
+            if path.is_symlink():
+                relative = path.relative_to(root).as_posix()
+                raise OSError(
+                    f"governed chart surface must not be a symlink: {relative}"
+                )
             if path.is_file():
                 paths.add(path)
     return sorted(paths)
@@ -161,6 +167,8 @@ def scan_text(relative: str, text: str) -> list[str]:
 
 
 def scan_file(root: Path, path: Path) -> list[str]:
+    if path.is_symlink():
+        raise OSError(f"governed chart surface must not be a symlink: {path}")
     try:
         relative = path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError as exc:
@@ -423,6 +431,30 @@ spec:
                 failures.append(
                     "additional/renamed chart template was not governed"
                 )
+
+        symlink_root = Path(tmp) / "symlink"
+        _required_tree(
+            symlink_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        symlink_target = symlink_root / "clean-ambient.yaml"
+        _write(symlink_target, _CLEAN_AMBIENT)
+        governed_symlink = symlink_root / REQUIRED_RELATIVE_PATHS[1]
+        governed_symlink.unlink()
+        try:
+            governed_symlink.symlink_to(symlink_target)
+        except (NotImplementedError, OSError):
+            # Some non-Linux developer environments do not permit symlinks.
+            pass
+        else:
+            try:
+                check_repository(symlink_root)
+            except (FileNotFoundError, OSError):
+                pass
+            else:
+                failures.append("symlinked governed chart surface was accepted")
 
         missing_root = Path(tmp) / "missing"
         _write(missing_root / REQUIRED_RELATIVE_PATHS[0], _CLEAN_NODE_AGENT)
