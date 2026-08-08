@@ -24,9 +24,10 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
 6. [AppArmor profile](#apparmor-profile)
 7. [Pod Security Standards compatibility](#pod-security-standards-compatibility)
 8. [Network exposure and NetworkPolicy](#network-exposure-and-networkpolicy)
-9. [Audit and logging](#audit-and-logging)
-10. [Compromise containment](#compromise-containment)
-11. [Threat-by-threat checklist](#threat-by-threat-checklist)
+9. [CNI install lifecycle](#cni-install-lifecycle)
+10. [Audit and logging](#audit-and-logging)
+11. [Compromise containment](#compromise-containment)
+12. [Threat-by-threat checklist](#threat-by-threat-checklist)
 
 ## Threat model
 
@@ -189,6 +190,16 @@ The node agent does **not** need, and the chart does **not** mount:
 - `/etc` (host configuration), `/var/log` (host logs), `/dev` (raw devices),
   `/lib/modules` (kernel modules).
 - Any pod's filesystem or volume.
+
+One documented exception, and only when you opt in with
+`nodeAgent.cni.enabled=true`: the CNI install lifecycle mounts
+`/opt/cni/bin`, `/etc/cni/net.d`, and the socket directory
+(`/var/run/ferrum`) read-write. This is a narrow, named carve-out from the
+"no `/etc`" rule above — `/etc/cni/net.d` only, never `/etc` itself — and it
+is what the installer, the rollback watcher, and the uninstall hook use to
+write and remove Ferrum's own plugin binary and chained conflist. See
+[CNI install lifecycle](#cni-install-lifecycle) for the ownership rules that
+bound what those mounts are allowed to touch.
 
 If you see a fork or downstream chart that adds any of these mounts to
 the node-agent DaemonSet, treat it as a red flag and confirm the use
@@ -514,6 +525,57 @@ NetworkPolicy has **no effect on `hostNetwork: true` pods** because the
 CNI does not see their traffic. Operators relying on per-pod
 NetworkPolicy for compliance must use a node-level firewall (iptables /
 nftables / cilium hostFirewall) to enforce egress from the node-agent.
+
+## CNI install lifecycle
+
+Opting in to `nodeAgent.cni.enabled=true` gives three short-lived workloads
+write access to two shared host directories, `/opt/cni/bin` and
+`/etc/cni/net.d`. Those directories belong to the cluster's primary CNI, so
+the security question is not "can Ferrum write there" — it must — but "what
+bounds what Ferrum writes and deletes there".
+
+**Availability is part of the threat model here.** While the chain is
+installed, `ferrum-cni` is in the ADD path of every pod on the node and fails
+closed when the node-agent is unreachable, so an unremovable or stranded
+conflist is a node-wide denial of pod creation. That is why removal exists,
+why it is automatic on `helm uninstall`, and why a cleanup that cannot
+complete reports failure instead of success (see
+[docs/node_agent.md](node_agent.md) → "CNI plugin install").
+
+| Workload | Runs | Access | Bound |
+|---|---|---|---|
+| `ferrum-cni-installer` (init container) | at pod start | rw on both host dirs + socket dir | Writes exactly two paths: `<hostBinDir>/ferrum-cni` and the configured conflist name. Reads neighbouring configs only to copy the primary's plugin list; never modifies one. |
+| `ferrum-cni-rollback` (native sidecar) | until readiness or the deadline | rw on both host dirs, read on the socket | May remove only artifacts carrying this release's owner **and** this pod's generation. |
+| `ferrum-mesh-cni-cleanup` (pre-delete hook DaemonSet) | during `helm uninstall` | rw on both host dirs | May remove only artifacts carrying this release's owner. No ServiceAccount token, no RBAC, no Kubernetes API access. |
+| `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role is a single rule: `get` on `daemonsets`/`daemonsets/status` with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup. |
+
+Removal is gated on evidence written at install time, never on a path guess:
+
+- The conflist must carry `managedBy: ferrum-edge` inside its own `ferrum-cni`
+  plugin entry, and its `owner`/`generation` must match the run's scope.
+- The binary is removed only when the sibling ownership manifest's recorded
+  SHA-256 matches the bytes on disk, and never while any configuration still
+  chains to it.
+- The configured file name is validated as a single path component, so `..`
+  or an embedded separator can never redirect a delete out of the directory.
+- Artifacts are opened with `O_NOFOLLOW`, and symlinks, hard-linked files,
+  non-regular files, and oversized files are refused rather than removed —
+  closing the "swap a symlink into the configured name and let root delete an
+  arbitrary path" class.
+- Ownership tokens are bounded to 128 bytes of `[A-Za-z0-9._:/@#-]`, so
+  nothing operator-supplied reaches the filesystem or a log line unchecked.
+  Cleanup diagnostics report fixed reason strings and operator-configured
+  paths only; file contents are never echoed.
+
+Everything else in the directory — the primary CNI's config, another
+meta-plugin's config, another Ferrum release's chain — is retained and
+reported, not deleted.
+
+The rollback watcher and cleanup hook run with all capabilities dropped,
+`allowPrivilegeEscalation: false`, and `readOnlyRootFilesystem: true`. They
+run as UID 0 because `/etc/cni/net.d` and `/opt/cni/bin` are root-owned on
+every supported distribution; they hold no Linux capability that would let
+them do anything beyond file I/O in the two mounted directories.
 
 ## Audit and logging
 

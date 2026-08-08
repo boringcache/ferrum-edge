@@ -1,0 +1,270 @@
+{{- /*
+  CNI cleanup on `helm uninstall` (issue #3609).
+
+  Enabling nodeAgent.cni writes a chained `*-ferrum.conflist` into every
+  node's /etc/cni/net.d. From that point every pod ADD on the node traverses
+  ferrum-cni, and an ADD that cannot reach the node-agent fails closed. So a
+  release that is deleted without removing that file leaves a node-wide
+  pod-creation outage behind, pointing at a socket that no longer exists.
+
+  Shape of the fix, and why:
+
+  * A DaemonSet, not a Job. Cleanup has to happen on EVERY node that ever ran
+    the installer; a Job runs on one node and would silently strand the rest
+    of a multi-node cluster. Each pod becomes Ready only after
+    `ferrum-cni uninstall` succeeded on ITS node.
+  * PLUS a later-weighted wait Job, because Helm's hook wait only watches
+    `Job` and `Pod` kinds — a hook DaemonSet on its own is created and then
+    left behind, so the release (and the node-agent socket) could be deleted
+    while cleanup pods were still starting. The Job blocks on the DaemonSet's
+    ready count and gives the phase a completion boundary Helm understands.
+    A node that cannot be cleaned fails the uninstall visibly instead of
+    reporting a clean removal.
+  * `pre-delete`, so all of this happens while the node-agent and its socket
+    are still part of the release.
+  * `pre-delete` ONLY. `helm upgrade` and `helm rollback` do not fire it, so a
+    routine rolling pod replacement never removes CNI state that is still
+    required.
+  * Narrow identities. The cleanup pods do pure host-filesystem work: their
+    ServiceAccount has no role and their token is not mounted at all. Only
+    the wait Job talks to the API, and its Role grants exactly `get` on the
+    one DaemonSet by name.
+  * Removal itself is ownership-scoped in the binary — only artifacts carrying
+    this release's `managedBy`/`owner` marker are touched, and only after
+    symlink/hard-link/size/content checks. Another product's CNI config, or
+    another Ferrum release's, is left exactly as it was.
+
+  Failure is deliberately loud: a cleanup container exits non-zero, its pod
+  restarts, readiness never flips, the wait Job times out, and
+  `helm uninstall` fails with every hook resource still present for
+  `kubectl logs`. Helm's `hook-succeeded` deletion only runs after the whole
+  phase succeeds, so nothing is cleaned up out from under an investigation.
+  Recover with the manual steps in docs/node_agent.md "Recovering a node".
+*/ -}}
+{{- $cni := .Values.nodeAgent.cni }}
+{{- $uninstall := dict "enabled" false }}
+{{- if and $cni $cni.uninstall }}{{ $uninstall = $cni.uninstall }}{{ end }}
+{{- if and .Values.nodeAgent.enabled $cni $cni.enabled $uninstall.enabled }}
+{{- $imageRepository := toString (default .Values.image.repository .Values.nodeAgent.image.repository) -}}
+{{- $imageTag := toString (default .Values.image.tag .Values.nodeAgent.image.tag) -}}
+{{- if and (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") (not (hasSuffix "-ebpf" $imageTag)) -}}
+{{- $imageTag = printf "%s-ebpf" $imageTag -}}
+{{- end -}}
+{{- $image := printf "%s:%s" $imageRepository $imageTag -}}
+{{- $ownerId := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $readyMarker := "/tmp/ferrum-cni-uninstall.ready" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-mesh-cni-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  # The narrowest grant that can answer "did cleanup finish on every node":
+  # read the status of exactly one DaemonSet, by name, in this namespace.
+  # No list, no watch (neither can be restricted by resourceNames), no write.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "daemonsets/status"]
+    resourceNames: ["ferrum-mesh-cni-cleanup"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-mesh-cni-cleanup-wait
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-mesh-cni-cleanup-wait
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-mesh-cni-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-cni-cleanup
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-cni-cleanup
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh-cni-cleanup
+      automountServiceAccountToken: false
+      {{- with $uninstall.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ferrum-cni-cleanup
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /app/ferrum-cni
+            - uninstall
+          env:
+            - name: HOST_BIN_DIR
+              value: {{ $cni.hostBinDir | quote }}
+            - name: HOST_CONF_DIR
+              value: {{ $cni.hostConfDir | quote }}
+            - name: CONF_FILE_NAME
+              value: {{ $cni.confFileName | quote }}
+            {{- /* Owner only, no generation: whichever revision of THIS
+                   release is currently installed on the node must go. */}}
+            - name: EXPECTED_OWNER
+              value: {{ $ownerId | quote }}
+            {{- /* Publishing this marker is what makes the pod Ready, so
+                   Helm's hook wait means "cleanup finished on this node". */}}
+            - name: READY_MARKER_PATH
+              value: {{ $readyMarker | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: host-cni-bin
+              mountPath: {{ $cni.hostBinDir }}
+            - name: host-cni-conf
+              mountPath: {{ $cni.hostConfDir }}
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            exec:
+              command:
+                - /app/ferrum-cni
+                - uninstall-status
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 1
+          resources:
+            {{- toYaml (default dict $uninstall.resources) | nindent 12 }}
+      volumes:
+        - name: host-cni-bin
+          hostPath:
+            path: {{ $cni.hostBinDir }}
+            type: DirectoryOrCreate
+        - name: host-cni-conf
+          hostPath:
+            path: {{ $cni.hostConfDir }}
+            type: DirectoryOrCreate
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    {{- /* Later than the DaemonSet so it waits on an object that exists. */}}
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- /* One attempt. A retry would restart the wait budget and hide a node
+         that never finished behind an apparently fresh timer. */}}
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh-cni-cleanup-wait
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ferrum-cni-cleanup-wait
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /app/ferrum-cni
+            - await-cleanup
+          env:
+            - name: RELEASE_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: CLEANUP_DAEMONSET_NAME
+              value: ferrum-mesh-cni-cleanup
+            - name: CLEANUP_TIMEOUT_SECS
+              value: {{ default 300 $uninstall.timeoutSeconds | quote }}
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml (default dict $uninstall.resources) | nindent 12 }}
+{{- end }}

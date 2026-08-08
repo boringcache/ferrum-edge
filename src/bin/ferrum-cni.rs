@@ -34,6 +34,9 @@ mod cni_main {
 
     use ferrum_edge::cni::client::{DEFAULT_RPC_TIMEOUT, send_rpc};
     use ferrum_edge::cni::install;
+    use ferrum_edge::cni::lifecycle::{
+        self, CleanupWaitConfig, RollbackWatchConfig, RollbackWatchOutcome, probe_node_agent_status,
+    };
     use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
     use ferrum_edge::cni::spec::{
         CniCommand, CniError, CniInvocation, CniNetConfig, CniSuccessResult, K8sPodIdentity,
@@ -51,20 +54,26 @@ mod cni_main {
     const DEFAULT_CNI_SOCKET_PATH: &str = "/var/run/ferrum/node-agent-cni.sock";
 
     pub fn run() -> ExitCode {
-        if std::env::args().nth(1).as_deref() == Some("install") {
-            return match install::install_from_env() {
-                Ok(path) => {
-                    eprintln!(
-                        "ferrum-cni: installed chained CNI config at {}",
-                        path.display()
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("ferrum-cni: install failed: {err}");
-                    ExitCode::from(1)
-                }
-            };
+        // Lifecycle verbs are driven by the Helm chart's init container,
+        // rollback sidecar, and pre-delete cleanup hook. kubelet never passes
+        // argv to a CNI plugin, so an argument-bearing invocation is
+        // unambiguously the lifecycle CLI and never a plugin call.
+        match std::env::args().nth(1).as_deref() {
+            Some("install") => return run_install(),
+            Some("uninstall") => return run_uninstall(),
+            Some("uninstall-status") => return run_uninstall_status(),
+            Some("await-cleanup") => return run_await_cleanup(),
+            Some("rollback-watch") => return run_rollback_watch(),
+            Some(_) => {
+                // The argument is not echoed: it is untrusted process input
+                // and the accepted set is fixed and short.
+                eprintln!(
+                    "ferrum-cni: unknown subcommand; expected one of \
+                     install | uninstall | uninstall-status | await-cleanup | rollback-watch"
+                );
+                return ExitCode::from(2);
+            }
+            None => {}
         }
 
         let command = match CniInvocation::command_from_env() {
@@ -126,6 +135,179 @@ mod cni_main {
             CniCommand::Gc => handle_gc(&net_config),
             verb @ (CniCommand::Add | CniCommand::Del | CniCommand::Check) => {
                 handle_verb(verb, &net_config, &invocation)
+            }
+        }
+    }
+
+    /// `ferrum-cni install` — copy the binary and write the chained conflist.
+    fn run_install() -> ExitCode {
+        match install::install_from_env() {
+            Ok(path) => {
+                eprintln!(
+                    "ferrum-cni: installed chained CNI config at {}",
+                    path.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("ferrum-cni: install failed: {err}");
+                ExitCode::from(1)
+            }
+        }
+    }
+
+    /// `ferrum-cni uninstall` — remove the Ferrum-owned artifacts, then
+    /// optionally hold so a Helm hook can wait on readiness.
+    ///
+    /// Exit 1 whenever the chained conflist is still in place: leaving that
+    /// file behind is the node-wide pod-creation dependency, and reporting
+    /// success for it would let `helm uninstall` declare a clean removal that
+    /// silently strands the node.
+    fn run_uninstall() -> ExitCode {
+        let report = match install::uninstall_from_env() {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("ferrum-cni: uninstall failed: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        for line in report.summary_lines() {
+            eprintln!("ferrum-cni: {line}");
+        }
+        if !report.is_success() {
+            eprintln!(
+                "ferrum-cni: uninstall did NOT clear the chained CNI configuration. \
+                 Pod creation on this node still traverses ferrum-cni. Inspect the \
+                 file above and remove it manually once you have confirmed it is the \
+                 Ferrum-generated chain; the primary CNI configuration it chains \
+                 behind was never modified and needs no repair."
+            );
+            return ExitCode::from(1);
+        }
+
+        // Holding is opt-in. Absent `READY_MARKER_PATH` this is a plain
+        // one-shot cleanup (manual runs, Jobs); with it set the process stays
+        // up so a DaemonSet-shaped Helm hook can become Ready exactly once
+        // the work on this node is done.
+        match lifecycle::ready_marker_path_from_env() {
+            Err(_) => ExitCode::SUCCESS,
+            Ok(marker_path) => {
+                if let Err(err) = lifecycle::write_ready_marker(&marker_path) {
+                    eprintln!(
+                        "ferrum-cni: cleanup succeeded but the readiness marker at \
+                         {marker_path} could not be written: {err}"
+                    );
+                    return ExitCode::from(1);
+                }
+                eprintln!(
+                    "ferrum-cni: cleanup complete on this node; holding so the release \
+                     hook can observe readiness"
+                );
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        }
+    }
+
+    /// `ferrum-cni uninstall-status` — readiness probe for the cleanup hook.
+    fn run_uninstall_status() -> ExitCode {
+        match lifecycle::ready_marker_path_from_env() {
+            Ok(marker_path) if lifecycle::ready_marker_present(&marker_path) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::from(1),
+            Err(err) => {
+                eprintln!("ferrum-cni: {err}");
+                ExitCode::from(1)
+            }
+        }
+    }
+
+    /// `ferrum-cni await-cleanup` — the completion boundary for the Helm
+    /// pre-delete phase.
+    ///
+    /// Helm's hook wait only watches `Job` and `Pod` kinds, so a hook
+    /// DaemonSet alone would be fire-and-forget and the release could be torn
+    /// down while cleanup was still starting on some nodes. This runs as a
+    /// later-weighted hook Job and blocks until every cleanup pod is Ready.
+    fn run_await_cleanup() -> ExitCode {
+        let config = match CleanupWaitConfig::from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("ferrum-cni: cleanup wait could not start: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("ferrum-cni: could not start the cleanup wait runtime: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        match runtime.block_on(lifecycle::await_cleanup_daemonset(&config)) {
+            Ok(report) => {
+                eprintln!(
+                    "ferrum-cni: CNI cleanup completed on {} of {} scheduled nodes",
+                    report.ready, report.desired
+                );
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("ferrum-cni: {message}");
+                ExitCode::from(1)
+            }
+        }
+    }
+
+    /// `ferrum-cni rollback-watch` — remove this generation's artifacts when
+    /// the node-agent never reaches CNI readiness.
+    fn run_rollback_watch() -> ExitCode {
+        let config = match RollbackWatchConfig::from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("ferrum-cni: rollback watch could not start: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        eprintln!(
+            "ferrum-cni: watching for node-agent CNI readiness (budget {}s, poll {}s)",
+            config.ready_timeout.as_secs(),
+            config.poll_interval.as_secs()
+        );
+        let mut probe = || probe_node_agent_status(&config);
+        match lifecycle::run_rollback_watch(&config, &mut probe) {
+            Ok(RollbackWatchOutcome::Ready) => {
+                eprintln!(
+                    "ferrum-cni: node-agent reached CNI readiness; retaining the chained \
+                     configuration for the lifetime of this pod"
+                );
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            Ok(RollbackWatchOutcome::RolledBack(report)) => {
+                eprintln!(
+                    "ferrum-cni: node-agent did not reach CNI readiness within {}s; rolling \
+                     back this install generation's CNI artifacts",
+                    config.ready_timeout.as_secs()
+                );
+                for line in report.summary_lines() {
+                    eprintln!("ferrum-cni: {line}");
+                }
+                eprintln!(
+                    "ferrum-cni: rollback finished. Pod creation on this node no longer \
+                     depends on the node-agent; enrollment falls back to the kube-rs \
+                     watcher. Recreate the node-agent pod to reinstall the chain once the \
+                     underlying failure is fixed."
+                );
+                ExitCode::from(1)
+            }
+            Err(err) => {
+                eprintln!("ferrum-cni: rollback failed: {err}");
+                ExitCode::from(1)
             }
         }
     }

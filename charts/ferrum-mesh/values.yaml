@@ -501,3 +501,62 @@ nodeAgent:
     # `ferrum.socketPath` field from this value so the two halves cannot
     # drift.
     socketFileName: node-agent-cni.sock
+    # Automatic rollback for an install that never reaches a usable node-agent.
+    #
+    # Once the chained conflist is written, EVERY pod ADD on the node
+    # traverses ferrum-cni and an unanswered ADD fails closed. The rollback
+    # watcher runs as a native sidecar (an init container with
+    # `restartPolicy: Always`, Kubernetes 1.29+) alongside the node-agent,
+    # polls the CNI STATUS verb, and removes THIS pod's own generation of the
+    # artifacts if readiness is never reached — then exits non-zero so the
+    # failure stays visible. Readiness reached even once means the artifacts
+    # are retained for the lifetime of the pod. Ownership + generation
+    # markers, not elapsed time alone, decide what may be removed, so a slow
+    # start that is overtaken by a newer install never deletes the newer
+    # artifacts.
+    #
+    # Set `enabled: false` on clusters older than 1.29 (no native sidecars)
+    # or where you would rather leave a broken install in place and recover
+    # by hand — see docs/node_agent.md "Recovering a node".
+    rollback:
+      enabled: true
+      # Budget for the node-agent to answer CNI STATUS. Keep this comfortably
+      # above worst-case node-agent start (image pull, bpffs mount, initial
+      # pod relist) so a healthy slow start is never rolled back.
+      readyTimeoutSeconds: 300
+      pollIntervalSeconds: 5
+    # Cleanup on `helm uninstall`.
+    #
+    # Renders a `pre-delete` hook DaemonSet (one pod per node, so a
+    # multi-node cluster is fully cleaned, unlike a single-pod Job) that runs
+    # `ferrum-cni uninstall` before any release resource — including the
+    # node-agent and its socket — is deleted. Each pod becomes Ready only
+    # after cleanup on ITS node succeeded.
+    #
+    # A later-weighted wait Job blocks until every one of those pods is Ready,
+    # because Helm's hook wait only watches Job and Pod kinds — a hook
+    # DaemonSet alone would be fire-and-forget. So a node that cannot be
+    # cleaned fails the uninstall visibly instead of silently stranding a
+    # chained conflist that points at a dead socket. The wait Job's Role
+    # grants exactly `get` on that one DaemonSet by name; the cleanup pods
+    # themselves get no token at all.
+    #
+    # Cleanup is scoped by the ownership marker written at install time and
+    # is a no-op for artifacts owned by a different release. It runs on
+    # uninstall ONLY: `helm upgrade` and `helm rollback` do not fire
+    # pre-delete hooks, so a routine rolling replacement never removes CNI
+    # state that is still required.
+    uninstall:
+      enabled: true
+      # How long the wait Job gives every node's cleanup pod to finish. Must
+      # fit inside `helm uninstall --timeout` (default 5m) or Helm gives up
+      # first and you lose the specific "N of M nodes" diagnostic.
+      timeoutSeconds: 240
+      # Extra tolerations for the cleanup DaemonSet. The hook already
+      # tolerates every taint by default so cleanup reaches nodes the
+      # node-agent could run on; this is here for clusters that need
+      # additional scheduling hints.
+      tolerations:
+        - operator: Exists
+      # Resource requests/limits for the short-lived cleanup pod.
+      resources: {}

@@ -98,7 +98,7 @@ issue body alone.
 | SPIFFE Workload API JWT-SVID mint/validate | #3617 | X.509 complete; JWT RPCs return `UNIMPLEMENTED` fail-closed until mint/validate ships |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 | Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
-| CNI ferrum-cni chaining uninstall/rollback | #3609 | Node-agent becomes node-wide pod-creation dependency |
+| CNI `ferrum-cni` in-place upgrade barrier | #3609 (uninstall/rollback shipped) | Install/uninstall/rollback lifecycle and the node-wide-dependency docs landed; an in-flight `ferrum-cni` exec'd from the previous inode still finishes against the old binary |
 | Cross-region CP failover topology | #3610 | `multi_region_ha.md` vs CP rejection/failover fence |
 | CP/K8s authoritative mesh config revision | #3611 | DP stale-fallback gate inert in flagship K8s topology |
 | Gateway API port-aware route representation | #3612 | Per-listener routes collide at validation |

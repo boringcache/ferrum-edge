@@ -12,6 +12,11 @@
 //!
 //! - [`spec`] — the CNI specification's stdin/stdout JSON, plus the
 //!   parsed-env representation of `CNI_*` invocation variables.
+//! Two more modules cover the host-side install lifecycle rather than the
+//! wire: [`install`] writes and provably removes the Ferrum-owned binary and
+//! chained conflist, and [`lifecycle`] rolls that install back when the
+//! node-agent never reaches CNI readiness.
+//!
 //! - [`rpc`] — the small node-agent RPC the CNI binary speaks once it has
 //!   extracted the K8s pod metadata from CNI args. Keeping these shapes
 //!   distinct keeps the CNI parser independent of the node-agent surface
@@ -31,6 +36,7 @@
 
 pub mod client;
 pub mod install;
+pub mod lifecycle;
 pub mod ownership;
 pub mod rpc;
 pub mod spec;
