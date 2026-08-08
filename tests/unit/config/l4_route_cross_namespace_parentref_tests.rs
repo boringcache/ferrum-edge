@@ -138,6 +138,40 @@ fn tcp_route_cross_namespace_parent_ref_materializes_in_gateway_namespace() {
 }
 
 #[test]
+fn weighted_tcp_route_cross_namespace_parent_keeps_upstream_with_proxy() {
+    let route = object(
+        "TCPRoute",
+        "weighted-db",
+        "apps",
+        json!({
+            "parentRefs": [{
+                "name": "edge",
+                "namespace": "infra",
+                "sectionName": "tcp"
+            }],
+            "rules": [{
+                "backendRefs": [
+                    {"name": "db-primary", "port": 5432, "weight": 90},
+                    {"name": "db-canary", "port": 5432, "weight": 10}
+                ]
+            }]
+        }),
+    );
+
+    let result = translate_k8s_objects(&[tcp_gateway("All"), route], options())
+        .expect("weighted cross-namespace parentRef must materialize");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert_eq!(result.config.upstreams.len(), 1);
+    let proxy = &result.config.proxies[0];
+    let upstream = &result.config.upstreams[0];
+    assert_eq!(proxy.namespace, "infra");
+    assert_eq!(upstream.namespace, proxy.namespace);
+    assert_eq!(proxy.upstream_id.as_deref(), Some(upstream.id.as_str()));
+    assert_eq!(upstream.targets.len(), 2);
+}
+
+#[test]
 fn tls_route_cross_namespace_parent_ref_materializes_when_allowed() {
     let route = object(
         "TLSRoute",

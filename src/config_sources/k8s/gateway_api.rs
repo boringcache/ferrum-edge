@@ -6050,7 +6050,10 @@ fn l4_route_proxies_for_namespace(
             );
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
-                object.metadata.namespace.clone(),
+                // Runtime upstream lookup is keyed by the proxy namespace.
+                // A cross-namespace parent therefore needs its generated
+                // weighted upstream in the parent Gateway namespace too.
+                config_namespace.to_string(),
                 resolved.backends,
             ));
             (String::new(), 0, Some(upstream_id))
