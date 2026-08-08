@@ -3384,11 +3384,11 @@ fn l4_route_backend_binding(
             Ok((backend.host, backend.port, None, None))
         }
         _ => {
-            let upstream_id = resource_id(
-                "istio-vs-l4-upstream",
+            let upstream_id = virtual_service_l4_upstream_id(
+                kind,
                 &object.metadata.namespace,
                 &object.metadata.name,
-                &format!("{kind}-{block_index}"),
+                block_index,
             );
             let Some(first) = backends.first() else {
                 return Err(invalid_resource(
@@ -3411,6 +3411,70 @@ fn l4_route_backend_binding(
             ))
         }
     }
+}
+
+/// Reconciler-managed prefix for generated weighted-L4 upstreams. Must stay
+/// listed in `K8S_MANAGED_UPSTREAM_ID_PREFIXES` (`src/k8s_controller/reconciler.rs`)
+/// — that list is the only withdrawal mechanism for translator-generated
+/// upstreams, so a prefix missing from it makes every compose append another
+/// copy instead of replacing it.
+const L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+
+/// Hex characters of the identity digest every generated L4 upstream id
+/// carries. 64 bits is far past birthday relevance for the per-cluster
+/// population of VirtualService `tcp[]`/`tls[]` route blocks.
+const L4_UPSTREAM_ID_DIGEST_HEX_LEN: usize = 16;
+
+/// The `__` separator plus the digest: the fixed tail every generated id ends
+/// with, reserved out of the id budget below.
+const L4_UPSTREAM_ID_SUFFIX_LEN: usize = 2 + L4_UPSTREAM_ID_DIGEST_HEX_LEN;
+
+/// Budget for the human-readable half of the id, so the whole id always fits
+/// `config::types::MAX_ID_LENGTH` and can never be rejected by
+/// `GatewayConfig::validate_resource_ids` for a long VirtualService name.
+const L4_UPSTREAM_ID_BODY_BUDGET: usize =
+    crate::config::types::MAX_ID_LENGTH - L4_UPSTREAM_ID_PREFIX.len() - L4_UPSTREAM_ID_SUFFIX_LEN;
+
+fn virtual_service_l4_upstream_id(
+    route_kind: &str,
+    namespace: &str,
+    vs_name: &str,
+    block_index: usize,
+) -> String {
+    // Two different `(namespace, name)` pairs must never derive one id.
+    // `exportTo` copies the projected upstream into the CONSUMER namespace, so
+    // a collision there lets one tenant's VirtualService silently REPLACE
+    // another tenant's L4 destination. `resource_id`'s `-` join is lossy in
+    // exactly that way: namespace `team-a` + name `db` and namespace `team` +
+    // name `a-db` both render `istio-vs-l4-upstream-team-a-db-tcp-0`.
+    //
+    // Uniqueness rests on the trailing digest, NOT on the readable body. The
+    // digest is taken over the LENGTH-FRAMED, UNSANITIZED components, so it
+    // survives both the `/`/`.` sanitization below and the length trim. Neither
+    // a separator nor a length prefix can carry uniqueness on its own here:
+    // that sanitization is length-preserving, so a VirtualService named
+    // `my.app` and one named `my-app` (both legal DNS-1123 subdomains) collapse
+    // to the same bytes and the same component lengths. The `__` separators are
+    // kept only so the common case stays readable — Kubernetes namespaces and
+    // object names cannot contain `_`.
+    let kind_len = route_kind.len();
+    let ns_len = namespace.len();
+    let name_len = vs_name.len();
+    let identity =
+        format!("{kind_len}|{route_kind}|{ns_len}|{namespace}|{name_len}|{vs_name}|{block_index}");
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    let digest = &digest[..L4_UPSTREAM_ID_DIGEST_HEX_LEN];
+
+    let readable = format!("{route_kind}__{namespace}__{vs_name}__{block_index}");
+    let mut body = readable.replace(['/', '.'], "-");
+    if body.len() > L4_UPSTREAM_ID_BODY_BUDGET {
+        let mut end = L4_UPSTREAM_ID_BODY_BUDGET;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    format!("{L4_UPSTREAM_ID_PREFIX}{body}__{digest}")
 }
 
 fn virtual_service_l4_proxy_id(

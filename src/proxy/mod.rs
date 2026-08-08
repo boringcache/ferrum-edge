@@ -2613,32 +2613,34 @@ pub(crate) fn can_use_direct_http2_pool(
 /// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
 ///
 /// `get_sender()` may dial or probe the backend, so callers must use this
-/// stricter predicate before opening an H2 sender. When body-size limits are
-/// enabled, ordinary (non-SNI) requests stay on the reqwest path so local
-/// request-size checks and deferred backend admission run before any backend
-/// interaction. Backend TLS SNI overrides cannot use reqwest, so callers that
-/// require direct-H2 for SNI should consult [`can_use_direct_http2_pool`]
-/// instead and enforce limits in-path (413 / 502) on the H2 sender.
+/// predicate before opening an H2 sender. Body-size limits are enforced
+/// in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
+/// frame-by-frame when `Content-Length` is absent — so nonzero
+/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
+/// (non-SNI) routes from the multiplexed pool. The retained size-limit
+/// parameters keep call-site signatures stable; they do not gate
+/// dispatch. Retry body replay and request-body-buffering plugins still
+/// force the reqwest path via [`can_use_direct_http2_pool`].
 pub(crate) fn can_dispatch_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
     requires_request_body_buffering: bool,
-    max_request_body_size_bytes: usize,
-    max_response_body_size_bytes: usize,
+    _max_request_body_size_bytes: usize,
+    _max_response_body_size_bytes: usize,
 ) -> bool {
     can_use_direct_http2_pool(
         enable_http2,
         retain_request_body,
         requires_request_body_buffering,
-    ) && max_request_body_size_bytes == 0
-        && max_response_body_size_bytes == 0
+    )
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
-/// `can_dispatch` is the body/limit/`enable_http2` gate
+/// `can_dispatch` is the body-compat/`enable_http2` gate
 /// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
@@ -31138,6 +31140,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             };
+            // Retry helpers can reject the selected target before dialing it
+            // (most notably when the egress policy blocks its resolved
+            // address). Do not let the response path mistake that target for
+            // the backend that served the response and mint affinity for it.
+            sticky_dispatch_refused = matches!(
+                result.error_class,
+                Some(retry::ErrorClass::DispatchPolicyRejected)
+            );
             // If H3 was attempted and produced a transport-level failure,
             // downgrade the cached capability so subsequent requests (and
             // any future retry that rotates BACK to this target) skip the
@@ -35566,26 +35576,17 @@ async fn proxy_to_backend(
         let direct_h2_supports = direct_h2_capability
             .as_ref()
             .is_some_and(|record| record.plain_http.h2_tls.is_supported());
-        let direct_h2_compatible = can_use_direct_http2_pool(
+        // Body-size limits are enforced in-path on the direct-H2 sender /
+        // response collectors (413 / 502), including for ordinary
+        // (non-SNI) routes — same semantics as the SNI arm and the
+        // reqwest path's ErrorClass / connection_error contracts.
+        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
+            effective_max_request_body_size_bytes,
+            effective_max_response_body_size_bytes,
         );
-        // Backend TLS SNI cannot fall back to reqwest. Body-size limits are
-        // enforced in-path on the direct-H2 sender / response collectors
-        // (413 / 502), so nonzero FERRUM_MAX_*_BODY_SIZE_BYTES must not
-        // disqualify SNI routes the way they do for ordinary H2 preference.
-        let direct_h2_can_dispatch = if requires_direct_h2_for_sni {
-            direct_h2_compatible
-        } else {
-            can_dispatch_direct_http2_pool(
-                pool_config.enable_http2,
-                retain_request_body,
-                requires_request_body_buffering,
-                effective_max_request_body_size_bytes,
-                effective_max_response_body_size_bytes,
-            )
-        };
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
@@ -35635,9 +35636,9 @@ async fn proxy_to_backend(
         let direct_h2_dispatch = direct_h2_dispatch && sni_dial.is_none();
         if direct_h2_dispatch {
             // 413 on an oversized declared Content-Length BEFORE dial/admission,
-            // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
-            // size violation — especially important for SNI routes that must
-            // stay on direct-H2 under nonzero body limits.
+            // matching HBONE/mesh-mTLS / reqwest ordering so a capacity 503
+            // cannot mask a size violation on direct-H2 under nonzero body
+            // limits (ordinary routes and SNI alike).
             if let Some(reject) = oversized_request_body_dispatch_reject(
                 effective_max_request_body_size_bytes,
                 method,
@@ -35828,16 +35829,6 @@ async fn proxy_to_backend(
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
             // after its own request-body collection / final-body hooks.
-        } else if direct_h2_compatible
-            && !direct_h2_can_dispatch
-            && (direct_h2_supports || requires_direct_h2_for_sni)
-        {
-            debug!(
-                proxy_id = %proxy.id,
-                max_request_body_size_bytes = effective_max_request_body_size_bytes,
-                max_response_body_size_bytes = effective_max_response_body_size_bytes,
-                "H2 pool bypassed because body-size limits are enabled"
-            );
         }
         if requires_direct_h2_for_sni && sni_dial.is_none() {
             // Retry body replay, a request-body-buffering plugin, or
@@ -40935,12 +40926,11 @@ async fn proxy_to_backend_http2(
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
     //
-    // The channel is installed only when `max_request_body_size_bytes > 0`, and
-    // limits-on requests reach direct-H2 only through a backend TLS SNI override
-    // (`can_dispatch_direct_http2_pool` requires a zero limit otherwise). So the
-    // gate — and the interleaving it gives up, a genuinely full-duplex non-gRPC
-    // H2 app now sees response headers withheld until its upload terminates —
-    // is scoped to SNI-override routes that have a request-size limit set.
+    // The channel is installed only when `max_request_body_size_bytes > 0`.
+    // Ordinary and SNI direct-H2 routes both enforce nonzero request limits
+    // in-path, so the gate — and the interleaving it gives up, a genuinely
+    // full-duplex non-gRPC H2 app now sees response headers withheld until
+    // its upload terminates — applies whenever a request-size limit is set.
     if let Some(body_completion_rx) = body_completion_rx {
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any

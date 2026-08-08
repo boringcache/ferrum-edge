@@ -273,11 +273,11 @@ async fn h2_streaming_status_then_stall_trips_circuit_breaker(status: u16) {
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("warn")
-        // Direct-H2 dispatch (`can_dispatch_direct_http2_pool`) requires BOTH
-        // body-size limits at 0 — otherwise the request stays on the reqwest
-        // path (so local 413 checks run first) and never reaches the
-        // `StreamingH2` arm this test exercises. The buffer cutoff at 0 then
-        // selects the direct-streaming H2 body (no coalescing buffer).
+        // Direct-H2 dispatch engages once the capability registry marks the
+        // backend h2_tls-supported. Body limits are zeroed here so the
+        // StreamingH2 stall path is free of size-limit adapters; nonzero
+        // limits also allow direct-H2 (issue #3622) but wrap unknown-length
+        // responses in the size-limited coalescing body.
         .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
         .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
         .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
