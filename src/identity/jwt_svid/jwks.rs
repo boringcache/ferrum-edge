@@ -545,8 +545,7 @@ fn spki_pem_from_jwk(jwk: &Map<String, Value>) -> Result<String, JwtSvidError> {
                 // members here also keeps an oversized one from being
                 // DER-encoded at all; `jwk_public_key` re-checks the resulting
                 // key after the round trip.
-                let modulus =
-                    jwk_base64url_bounded(jwk, "n", (MAX_RSA_MODULUS_BITS / 8) as usize)?;
+                let modulus = jwk_base64url_bounded(jwk, "n", (MAX_RSA_MODULUS_BITS / 8) as usize)?;
                 let exponent = jwk_base64url_bounded(jwk, "e", MAX_RSA_EXPONENT_BYTES)?;
                 if modulus.first() == Some(&0) || exponent.first() == Some(&0) {
                     return Err(JwtSvidError::InvalidAuthority(

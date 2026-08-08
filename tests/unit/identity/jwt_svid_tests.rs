@@ -2242,7 +2242,11 @@ fn rsa_jwk_members() -> (Vec<u8>, Vec<u8>) {
     let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
     let decode = |member: &str| {
         URL_SAFE_NO_PAD
-            .decode(parsed["keys"][0][member].as_str().expect("member is a string"))
+            .decode(
+                parsed["keys"][0][member]
+                    .as_str()
+                    .expect("member is a string"),
+            )
             .expect("member is base64url")
     };
     (decode("n"), decode("e"))
@@ -2272,7 +2276,9 @@ fn spki_der_from_pem(pem: &str) -> Vec<u8> {
         .lines()
         .filter(|line| !line.starts_with("-----"))
         .collect();
-    STANDARD.decode(body.as_bytes()).expect("PEM body is base64")
+    STANDARD
+        .decode(body.as_bytes())
+        .expect("PEM body is base64")
 }
 
 #[test]
@@ -2355,8 +2361,12 @@ fn an_even_rsa_modulus_is_refused_on_both_the_jwk_and_the_spki_path() {
     );
     der[tail - 1] &= 0xfe;
     let tampered = spki_pem_from_der(&der);
-    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "rsa-1", tampered.as_str()))
-        .expect_err("an even modulus must not become a verification key");
+    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(
+        td(),
+        "rsa-1",
+        tampered.as_str(),
+    ))
+    .expect_err("an even modulus must not become a verification key");
     assert!(
         error.to_string().contains("even"),
         "the SPKI path must refuse the same way the JWK path does: {error}"
@@ -2397,8 +2407,12 @@ fn an_off_curve_ec_point_is_refused_on_both_the_jwk_and_the_spki_path() {
     let key = forge_key();
     // Baseline: the untampered key is admitted, so the negative cases below
     // prove something about the point rather than about the fixture.
-    decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "k1", key.public_key_pem.as_str()))
-        .expect("a genuine P-256 authority is usable");
+    decoding_key_for_authority(&PublishedJwtAuthority::new(
+        td(),
+        "k1",
+        key.public_key_pem.as_str(),
+    ))
+    .expect("a genuine P-256 authority is usable");
 
     // SPKI path: flip the last byte of the uncompressed point. The OID, the
     // 0x04 marker, and both coordinate lengths are all still correct — only
@@ -2407,8 +2421,12 @@ fn an_off_curve_ec_point_is_refused_on_both_the_jwk_and_the_spki_path() {
     let last = der.len() - 1;
     der[last] ^= 0x01;
     let tampered_pem = spki_pem_from_der(&der);
-    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "k1", tampered_pem.as_str()))
-        .expect_err("an off-curve point must not become a verification key");
+    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(
+        td(),
+        "k1",
+        tampered_pem.as_str(),
+    ))
+    .expect_err("an off-curve point must not become a verification key");
     let message = error.to_string();
     assert!(
         !message.contains(&STANDARD.encode(&der)[..16]),
@@ -2417,8 +2435,12 @@ fn an_off_curve_ec_point_is_refused_on_both_the_jwk_and_the_spki_path() {
 
     // JWK path: the same tampering expressed as a `y` coordinate, so a hostile
     // federated bundle cannot republish an off-curve authority either.
-    let published = jwks_document(&[PublishedJwtAuthority::new(td(), "k1", key.public_key_pem.as_str())])
-        .expect("baseline JWKS builds");
+    let published = jwks_document(&[PublishedJwtAuthority::new(
+        td(),
+        "k1",
+        key.public_key_pem.as_str(),
+    )])
+    .expect("baseline JWKS builds");
     let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
     let mut y = URL_SAFE_NO_PAD
         .decode(parsed["keys"][0]["y"].as_str().expect("y is a string"))
@@ -2530,7 +2552,10 @@ async fn an_ephemeral_rotation_retires_only_public_material() {
 
     let retained = authority.retained_public_material();
     assert_eq!(retained.len(), 1, "the outgoing key is retained");
-    assert_eq!(retained[0].0, retired_kid, "the outgoing key id is retained");
+    assert_eq!(
+        retained[0].0, retired_kid,
+        "the outgoing key id is retained"
+    );
     assert!(
         retained[0].1.starts_with("-----BEGIN PUBLIC KEY-----")
             && !retained[0].1.contains("PRIVATE"),
@@ -2571,7 +2596,10 @@ mod federated_bounds {
             Err(CaError::UnknownTrustDomain("not used".to_string()))
         }
 
-        async fn trust_bundle(&self, domain: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+        async fn trust_bundle(
+            &self,
+            domain: &TrustDomain,
+        ) -> Result<PublishedTrustBundle, CaError> {
             self.bundle_calls.fetch_add(1, Ordering::SeqCst);
             if domain != &self.trust_domain {
                 // Every federated alias is an "absent peer", which is precisely

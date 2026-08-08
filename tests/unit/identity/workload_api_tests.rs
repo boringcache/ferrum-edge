@@ -2194,7 +2194,11 @@ mod socket_publication {
             identity,
             "the published name is the inode that was bound and permissioned in staging"
         );
-        assert_eq!(metadata.mode() & 0o777, 0o660, "the configured mode survives");
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o660,
+            "the configured mode survives"
+        );
         assert_eq!(
             metadata.nlink(),
             1,
