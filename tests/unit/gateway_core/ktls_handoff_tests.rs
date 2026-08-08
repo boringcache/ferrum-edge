@@ -256,12 +256,7 @@ fn malformed_client_hello_vector_boundaries_are_refused() {
 
     // supported_versions with an odd version vector cannot be walked as u16s.
     let odd_versions = [0x00, 0x2B, 0x00, 0x04, 0x03, 0x03, 0x04, 0x03];
-    let odd_versions = minimal_client_hello(
-        &aes128_suite,
-        &odd_versions,
-        odd_versions.len(),
-        &[],
-    );
+    let odd_versions = minimal_client_hello(&aes128_suite, &odd_versions, odd_versions.len(), &[]);
     assert!(client_hello_ktls_facts(&odd_versions).is_none());
 
     // The one-byte vector length must consume the entire extension payload.
