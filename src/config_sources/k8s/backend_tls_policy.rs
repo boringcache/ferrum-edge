@@ -57,12 +57,8 @@ const MAX_ADMITTED_TARGET_REFS: usize = 16;
 /// Gateway API v1.5.1 `PolicyStatus.ancestors` is a hard MaxItems=16 list-map.
 ///
 /// The spec is explicit that when the list is full an implementation MUST NOT
-/// add another entry, MUST consider the policy unimplementable for the
-/// ancestors it cannot represent, and MUST signal that on related resources.
-/// Truncating while still applying the policy is therefore not an option, so
-/// the ceiling lives here — beside translation — and the Gateway API status
-/// writer reads the same constant and the same predicates below. Splitting the
-/// two is exactly how status and data-plane behaviour drift apart.
+/// add another entry. This limit is only an output constraint for the status
+/// writer; status owned by other controllers must not influence translation.
 pub(crate) const MAX_POLICY_ANCESTORS: usize = 16;
 
 /// Ferrum's desired `status.ancestors` set for one `BackendTLSPolicy`: the core
@@ -143,19 +139,6 @@ pub(crate) fn policy_status_ancestor_capacity(status: &Value) -> usize {
                 .count()
         });
     MAX_POLICY_ANCESTORS.saturating_sub(third_party)
-}
-
-/// Whether Ferrum can publish its **complete** ancestor set inside the cap.
-///
-/// Third-party controllers can legitimately fill the list. When they leave no
-/// room, Gateway API forbids adding an entry, so Ferrum cannot represent this
-/// policy at all — and a policy Ferrum cannot represent must not keep silently
-/// governing backend TLS. Translation consults this and rejects the policy
-/// (fail-closed HTTP 500 on covered backends, never plaintext); the status
-/// writer consults it and publishes no Ferrum ancestor. One predicate, so the
-/// two cannot disagree.
-pub(crate) fn policy_status_ancestors_representable(object: &K8sObject) -> bool {
-    policy_status_ancestor_services(object).len() <= policy_status_ancestor_capacity(&object.status)
 }
 
 /// Resolved BackendTLSPolicy overlay projected onto an Upstream.
@@ -605,17 +588,6 @@ pub(super) fn collect(
             target_refs
                 .len()
                 .min(MAX_ADMITTED_TARGET_REFS.saturating_add(1))
-        )))
-    } else if !policy_status_ancestors_representable(object) {
-        // Gateway API MUST NOT add an ancestor beyond the 16-entry cap, so a
-        // policy whose ancestors are all spoken for by other controllers is
-        // unimplementable for Ferrum. Applying it anyway would leave the data
-        // plane originating TLS that no status can report. Fail closed here so
-        // covered backends abort with 500 (never plaintext) and the affected
-        // routes carry the visible `InvalidBackendTlsPolicy` fault.
-        Err(BackendTlsPolicyError::invalid(format!(
-            "PolicyStatus.ancestors has no capacity left for Ferrum ({} of {MAX_POLICY_ANCESTORS} entries are owned by other controllers); Gateway API forbids exceeding the ancestor limit, so this BackendTLSPolicy is unimplementable and matching backends fail closed",
-            MAX_POLICY_ANCESTORS.saturating_sub(policy_status_ancestor_capacity(&object.status))
         )))
     } else {
         match object.spec.get("options") {

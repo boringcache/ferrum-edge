@@ -34,10 +34,10 @@ const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 ///
 /// `a2aproject/A2A` at tag `v0.3.0`, `specification/grpc/a2a.proto`, declares
 /// `package a2a.v1; service A2AService`, so the fully-qualified name is
-/// `a2a.v1.A2AService`. It is the default precisely because it is the identity
-/// whose `AgentCard` layout [`DEFAULT_PROTOCOL_VERSION`] describes; A2A 1.0's
-/// `lf.a2a.v1.A2AService` is a different package carrying a renumbered card and
-/// is never defaulted in (see [`A2A_10_GRPC_SERVICE`]).
+/// `a2a.v1.A2AService`. It is the primary default because it is the identity
+/// whose `AgentCard` layout [`DEFAULT_PROTOCOL_VERSION`] describes. A2A 1.0's
+/// `lf.a2a.v1.A2AService` is also recognized by default for policy continuity,
+/// but its renumbered card is never decoded as 0.3.
 const DEFAULT_GRPC_SERVICE: &str = "a2a.v1.A2AService";
 /// A2A 1.0's gRPC service (`package lf.a2a.v1`). Recognized so an operator can
 /// detect and police 1.0 traffic; its Agent Card layout is not one this
@@ -1474,8 +1474,9 @@ fn parse_grpc_services(
 }
 
 fn default_grpc_services() -> HashMap<String, A2aGrpcCardSchema> {
-    let mut services = HashMap::with_capacity(1);
+    let mut services = HashMap::with_capacity(2);
     services.insert(DEFAULT_GRPC_SERVICE.to_string(), A2aGrpcCardSchema::A2a03);
+    services.insert(A2A_10_GRPC_SERVICE.to_string(), A2aGrpcCardSchema::A2a10);
     services
 }
 

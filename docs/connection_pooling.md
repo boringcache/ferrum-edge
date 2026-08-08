@@ -141,7 +141,7 @@ FERRUM_POOL_ENABLE_HTTP2=true
 
 HTTP/1.1 client-facing listeners use vectored writes (`writev`) on both plaintext and TLS server paths. This lets hyper batch response headers and body chunks into fewer transport writes, which is most visible on bulk H1-TLS responses.
 
-When an HTTPS backend is classified as HTTP/2-capable, plain HTTP traffic can use the direct H2 pool instead of reqwest. Direct-H2 responses still stream by default through the H2 coalescer. Only known large responses (`Content-Length >= 512 KiB`, within the response size limit) bypass coalescing; small, mid-sized, unknown-size, and gRPC streaming responses stay on the coalescing path. See [Response Body Streaming](response_body_streaming.md#response-body-coalescing) for the exact rules.
+When an HTTPS backend is classified as HTTP/2-capable, plain HTTP traffic can use the direct H2 pool instead of reqwest. Nonzero global body-size limits (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, including the defaults) are enforced in-path on that pool — declared overruns reject before dial/admission (`413` / `502`), and unknown-length bodies are bounded frame-by-frame — so operators keep both OOM protection and multiplexed H2. Direct-H2 responses still stream by default through the H2 coalescer. Only known large responses (`Content-Length >= 512 KiB`, within the response size limit) bypass coalescing; small, mid-sized, unknown-size, and gRPC streaming responses stay on the coalescing path. See [Response Body Streaming](response_body_streaming.md#response-body-coalescing) for the exact rules and [Size Limits](size_limits.md#direct-http2-pool-preference-vs-body-limits) for in-path enforcement.
 
 ### WebSocket Services
 ```yaml
