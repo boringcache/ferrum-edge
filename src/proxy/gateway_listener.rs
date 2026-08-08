@@ -730,8 +730,9 @@ impl GatewayListenerManager {
     /// Drive the manager for the life of the process.
     ///
     /// The initial reconcile has already run; this loop reconciles on every
-    /// subsequent config publication, retries outstanding bind failures on a
-    /// slow tick, and shuts every listener down on the global shutdown signal.
+    /// subsequent config publication, supervises listener tasks and retries
+    /// outstanding bind failures on a slow tick, and shuts every listener down
+    /// on the global shutdown signal.
     ///
     /// A bind failure is deliberately **not** fatal, in any mode. A Gateway
     /// listener port is control-plane input (or, for `:80`/`:443`, a port the
@@ -777,9 +778,12 @@ impl GatewayListenerManager {
                     self.reconcile().await;
                 }
                 _ = retry.tick() => {
-                    if !self.bind_failures().is_empty() {
-                        self.reconcile().await;
-                    }
+                    // Reconcile even when the previous pass was healthy. A TCP
+                    // or QUIC accept-loop can end after that pass; checking only
+                    // an already-populated failure list would leave the first
+                    // healthy-to-dead transition invisible forever unless an
+                    // unrelated config publication happened to arrive.
+                    self.reconcile().await;
                 }
             }
         }
