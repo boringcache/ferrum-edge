@@ -9,8 +9,8 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | `usize` | `16384` (16KB) | Maximum size of any single request header (name + value in bytes). Prevents individual oversized headers. |
 | `FERRUM_MAX_HEADER_COUNT` | `usize` | `100` | Maximum number of request headers allowed. Set to `0` for unlimited. |
-| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection via `http_body_util::Limited`. |
-| `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum response body size from backends. Set to `0` for unlimited. Protects against backends sending unexpectedly large responses. |
+| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection / streaming (`http_body_util::Limited`, `SizeLimitedIncoming` on direct-H2). Nonzero values do not disqualify the multiplexed direct-H2 pool. |
+| `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum response body size from backends. Set to `0` for unlimited. Protects against backends sending unexpectedly large responses; enforced on reqwest and in-path on direct-H2. Nonzero values do not disqualify the multiplexed direct-H2 pool. |
 | `FERRUM_MAX_URL_LENGTH_BYTES` | `usize` | `8192` (8KB) | Maximum URL length in bytes (path + query string). Set to `0` for unlimited. |
 | `FERRUM_MAX_QUERY_PARAMS` | `usize` | `100` | Maximum number of query parameters allowed. Set to `0` for unlimited. |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum total received gRPC payload size in bytes. For unary RPCs this is effectively a per-message limit. For streaming RPCs it caps the cumulative body size. Set to `0` for unlimited. |
@@ -65,9 +65,18 @@ See [Response Body Streaming — Interaction with Response Size Limits](response
 
 ### Direct HTTP/2 pool preference vs body limits
 
-Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool only when **both** `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` are `0` (and retries / request-body-buffering plugins are absent). Under the default nonzero body caps the gateway stays on the reqwest path for those ordinary routes — a silent **performance** cliff away from multiplexed H2 (logged at `debug!` only). Set both limits to `0` when you need direct-H2 preference and can accept unlimited body sizes at the gateway layer.
+Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool whenever the backend is classified H2-capable and the request is body-compat (no retry body replay, no request-body-buffering plugins, `pool_enable_http2: true`). Nonzero `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` — including the default 10 MiB caps — do **not** force the reqwest path: limits are enforced **in-path** on the direct-H2 sender and response collectors.
 
-Backend TLS SNI overrides are the exception: they prefer direct-H2 even with nonzero body limits and enforce 413/502 in-path. Combinations direct-H2 cannot serve (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) fall through to the reqwest HTTP/1.1 SNI dial, which carries the override in the request URL authority while pinning the socket to the selected target; they are **admitted**, not rejected at config admission. A dial that genuinely cannot be constructed still fails closed at runtime with a `502` — see [DestinationRule TLS SNI](mesh.md).
+| Overrun | When known | Status / `ErrorClass` |
+|---------|------------|------------------------|
+| Request body | Declared `Content-Length` over limit | `413` / `RequestBodyTooLarge` **before** dial/admission (same deferred-admission ordering as reqwest) |
+| Request body | Unknown length / mid-stream | Frame-by-frame via `SizeLimitedIncoming`; `413` / `RequestBodyTooLarge`, `connection_error=false` |
+| Response body | Declared `Content-Length` over limit | `502` / `ResponseBodyTooLarge` before body bytes flow |
+| Response body | Unknown length / mid-stream | Size-limited H2 body adapters; post-commit stream termination after the limit |
+
+`SizeLimitedIncoming` treats `max_bytes = 0` as deny-all; the gateway maps the operator spelling `FERRUM_MAX_*_BODY_SIZE_BYTES=0` (unlimited) to an unbounded adapter budget before constructing the limiter.
+
+Backend TLS SNI overrides use the same in-path enforcement. Combinations direct-H2 cannot serve (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) fall through to the reqwest HTTP/1.1 SNI dial when an SNI override is present; they are **admitted**, not rejected at config admission. A dial that genuinely cannot be constructed still fails closed at runtime with a `502` — see [DestinationRule TLS SNI](mesh.md).
 
 ## HTTP/3 (QUIC) Enforcement
 

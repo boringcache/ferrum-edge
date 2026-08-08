@@ -141,7 +141,7 @@ FERRUM_POOL_ENABLE_HTTP2=true
 
 HTTP/1.1 client-facing listeners use vectored writes (`writev`) on both plaintext and TLS server paths. This lets hyper batch response headers and body chunks into fewer transport writes, which is most visible on bulk H1-TLS responses.
 
-When an HTTPS backend is classified as HTTP/2-capable, plain HTTP traffic can use the direct H2 pool instead of reqwest. Direct-H2 responses still stream by default through the H2 coalescer. Only known large responses (`Content-Length >= 512 KiB`, within the response size limit) bypass coalescing; small, mid-sized, unknown-size, and gRPC streaming responses stay on the coalescing path. See [Response Body Streaming](response_body_streaming.md#response-body-coalescing) for the exact rules.
+When an HTTPS backend is classified as HTTP/2-capable, plain HTTP traffic can use the direct H2 pool instead of reqwest. Nonzero global body-size limits (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, including the defaults) are enforced in-path on that pool — declared overruns reject before dial/admission (`413` / `502`), and unknown-length bodies are bounded frame-by-frame — so operators keep both OOM protection and multiplexed H2. Direct-H2 responses still stream by default through the H2 coalescer. Only known large responses (`Content-Length >= 512 KiB`, within the response size limit) bypass coalescing; small, mid-sized, unknown-size, and gRPC streaming responses stay on the coalescing path. See [Response Body Streaming](response_body_streaming.md#response-body-coalescing) for the exact rules and [Size Limits](size_limits.md#direct-http2-pool-preference-vs-body-limits) for in-path enforcement.
 
 ### WebSocket Services
 ```yaml
@@ -213,7 +213,7 @@ This may be useful in development or when backends are not yet available at gate
 
 ## Database Pool Observability
 
-The admin `/status` (and `/health`) endpoint includes database connection pool statistics when the database is connected. This helps operators monitor pool utilization and tune `FERRUM_DB_POOL_*` settings.
+The admin `/status` and `/health` endpoints include database connection pool statistics when the database is connected, but only in the **authenticated detail tier** (valid admin JWT, matching `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP). Unauthenticated probes receive only `status` and `ready`. This helps operators monitor pool utilization and tune `FERRUM_DB_POOL_*` settings.
 
 ```json
 {
@@ -253,7 +253,7 @@ The admin `/status` (and `/health`) endpoint includes database connection pool s
 
 On Linux, all pool outbound TCP connections (HTTP/2 direct pool and gRPC pool) have `IP_BIND_ADDRESS_NO_PORT` set, which defers ephemeral port allocation to `connect()` time. This enables the kernel to co-select the source port as part of the full 4-tuple (src_ip, src_port, dst_ip, dst_port), allowing port reuse across different destinations and reducing ephemeral port pressure under high connection rates.
 
-If the gateway exhausts available ephemeral ports (EADDRNOTAVAIL), the error is classified as `PortExhaustion`, logged at `error` level, and tracked in the `port_exhaustion_events` counter on `GET /overload`. To mitigate:
+If the gateway exhausts available ephemeral ports (EADDRNOTAVAIL), the error is classified as `PortExhaustion`, logged at `error` level, and tracked in the `port_exhaustion_events` counter on authenticated `GET /overload` detail. To mitigate:
 
 - Widen the kernel port range: `sysctl net.ipv4.ip_local_port_range="1024 65535"`
 - Enable TIME_WAIT reuse: `sysctl net.ipv4.tcp_tw_reuse=1`

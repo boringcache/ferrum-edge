@@ -382,6 +382,34 @@ request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
 
+#### Scope of the repository-script (automation) freeze
+
+The same verifier also freezes repository scripts, and it does so bluntly: once
+a file is judged Cross-sensitive, its surface is a single
+`file:<sha256-of-the-whole-file>`, so **no pull request may change a single byte
+of it** — not a comment, not whitespace, not a retry loop.
+
+Sensitivity is inferred from text, so it false-positives. A Gateway API lab
+harness that never invokes `cross` or `cargo` earned it purely by containing
+fixture strings (`/cross` as an HTTPRoute path prefix, `blackbox-cross` as a
+backend name), which permanently blocked a CI flake fix in that file.
+
+The freeze is therefore scoped to automation **reachable from the trusted ARM64
+cross-build jobs** (`build-arm64-cross`, `build-release-arm64-cross`), which is
+the property the policy actually protects: a pull request must not alter
+anything that executes with elevated trust inside that build. Reachability is
+seeded from those job blocks plus every local composite action — actions are
+included wholesale because a protected job may `uses:` any of them, and seeding
+a partial set would under-approximate and silently release a file that really
+does run in the trusted build.
+
+The narrowing fails closed. If either revision's protected job cannot be located
+or parsed, or the reachability walk reports an error, the scope is treated as
+unknown and **every** automation file is compared exactly as before. A file
+reachable on *either* revision stays in scope, so a pull request cannot drop the
+reachability edge and edit the file in the same commit. Newly reaching an
+already-Cross-sensitive script from a protected job is still rejected.
+
 ### Refreshing kind / kubectl / Helm versions and checksums
 
 Versions and digests live as defaults on the

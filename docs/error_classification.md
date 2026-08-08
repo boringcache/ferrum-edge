@@ -202,7 +202,7 @@ For a TCP/DTLS session that the backend tore down mid-relay — same `proxy_id` 
 Refer to the canonical-taxonomy table above for what each class means. A few class-specific operational notes:
 
 - **`ConnectionPoolError`** — pool exhaustion. Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout`.
-- **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on `GET /overload`.
+- **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on authenticated `GET /overload` detail (unauthenticated callers receive only `{"level": ...}`).
 - **`TlsError`** — for self-signed certs in development, set `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain. The typed `StreamSetupKind::FrontendTlsHandshake` vs `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed without inspecting the message.
 - **`GracefulRemoteClose`** — informational, not an error. The peer closed the session cleanly. Do not alert on this.
 - **`ClientDisconnect`** — the client (not the backend) dropped the connection. Often benign (user navigated away). High rates may indicate aggressive client-side timeouts.
