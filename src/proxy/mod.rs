@@ -5540,6 +5540,53 @@ pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
     delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
+/// Config-publication notification handle carried by [`ProxyState`].
+///
+/// This is a deliberately one-way seam. Subscribing is public so watchers that
+/// own sockets — notably
+/// [`crate::proxy::gateway_listener::GatewayListenerManager`], which cannot be
+/// constructed before the state it serves — can react to a config swap without
+/// polling the `ArcSwap`. *Advancing* the revision is crate-private, so only
+/// [`ProxyState::bump_config_revision`], reached from a committed config
+/// publication, can signal one. Exposing the raw `watch::Sender` would let any
+/// holder fake a publication and drive listener bind / withdrawal for a config
+/// generation that was never installed.
+///
+/// Construction stays public (`new` / `Default`) so external test crates can
+/// still build a `ProxyState` without that write capability.
+#[derive(Clone)]
+pub struct ConfigRevisionNotifier {
+    tx: Arc<watch::Sender<u64>>,
+}
+
+impl ConfigRevisionNotifier {
+    /// A notifier whose revision starts at `0` and has no watchers.
+    pub fn new() -> Self {
+        Self {
+            tx: Arc::new(watch::channel(0u64).0),
+        }
+    }
+
+    /// Watch for config publications. The value is meaningless; only the
+    /// change notification matters.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
+
+    /// Signal that a new config generation is live.
+    fn bump(&self) {
+        self.tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+}
+
+impl Default for ConfigRevisionNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -5651,7 +5698,10 @@ pub struct ProxyState {
     /// — subscribe here instead of polling the `ArcSwap`. The value itself is
     /// meaningless; only the change notification matters, and `watch`
     /// coalesces bursts so a rapid reload sequence costs one reconcile.
-    config_revision_tx: Arc<watch::Sender<u64>>,
+    ///
+    /// The field is public but the write capability is not: see
+    /// [`ConfigRevisionNotifier`].
+    pub config_revision: ConfigRevisionNotifier,
     /// Windowed per-second rate metrics computed by a background task.
     /// Read by the admin `/status` endpoint; written by `metrics::start_metrics_monitor`.
     pub windowed_metrics: Arc<crate::metrics::WindowedMetrics>,
@@ -7528,7 +7578,7 @@ impl ProxyState {
             },
             max_concurrent_requests_per_ip,
             stream_listener_manager,
-            config_revision_tx: Arc::new(watch::channel(0u64).0),
+            config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
@@ -7636,7 +7686,7 @@ impl ProxyState {
     /// reconcile Gateway API listener sockets on reload / update / delete /
     /// withdrawal without polling.
     pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
-        self.config_revision_tx.subscribe()
+        self.config_revision.subscribe()
     }
 
     /// The Alt-Svc value to advertise for the frontend port a request arrived
@@ -7675,9 +7725,7 @@ impl ProxyState {
 
     /// Notify config watchers that a new config generation is live.
     fn bump_config_revision(&self) {
-        self.config_revision_tx.send_modify(|revision| {
-            *revision = revision.wrapping_add(1);
-        });
+        self.config_revision.bump();
     }
 
     fn collect_backend_capability_targets(

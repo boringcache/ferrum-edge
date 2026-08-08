@@ -93,6 +93,9 @@ fn port_scoped_proxy(id: &str, backend_port: u16, listen_port: Option<u16>) -> P
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        // Outbound PROXY protocol stays disabled: these are HTTP proxies, and
+        // the fail-safe default is for the backend to see the gateway egress IP.
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),

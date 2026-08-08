@@ -1455,28 +1455,48 @@ pub(super) fn collect_gateway_listener_policy(
 ///
 /// Port-aware routing gives each *listener* its own route-table identity, but
 /// the operating system still gives one socket per port. Two listener
-/// definitions can therefore be individually valid and jointly unservable:
+/// definitions can therefore be individually valid and jointly unservable.
+/// Only two shapes qualify:
 ///
-/// - one terminates TLS and the other is plaintext (a socket is one or the
-///   other), or
-/// - both terminate TLS but resolve to different credentials (a socket
-///   presents one certificate).
+/// - **`ProtocolConflict`** — the port is claimed both plaintext and
+///   TLS-terminating. A socket is one or the other, so every claim on it is
+///   refused.
+/// - **`HostnameConflict`** — TLS-terminating claims on the port come from more
+///   than one Gateway namespace *and* name more than one distinct credential.
+///   Ferrum resolves one frontend TLS serving slot per Gateway namespace
+///   (`gateway_frontend_tls_namespace_source`), so listeners inside a single
+///   namespace always collapse onto one credential and never conflict here;
+///   across namespaces there is no such arbitration and the one socket would
+///   silently present a foreign Gateway's certificate.
 ///
-/// Gateway API v1.5.1 marks both sides `Conflicted` in exactly this situation,
-/// so both are refused rather than guessing a winner: guessing would serve one
-/// Gateway's traffic under another Gateway's listener contract.
+/// Differing `tls.certificateRefs` alone are deliberately **not** a conflict.
+/// Gateway API v1.5.1 defines listener distinctness on `(port, hostname)` for
+/// the HTTP family and states outright that "the `tls` field is not used for
+/// determining if a listener is distinct". Sibling HTTPS listeners with
+/// disjoint hostnames and different `certificateRefs` are therefore distinct
+/// and must stay Accepted; the listener whose credential does not win its
+/// namespace's serving slot already has `routes_materializable` cleared by
+/// [`disable_gateway_frontend_tls_route_materialization`], so it advertises no
+/// routes and cannot serve traffic under another listener's certificate.
+///
+/// Refusals are order-independent: they are decided from the fully collected
+/// listener-policy set, and both/every side of a conflict is refused rather
+/// than guessing a winner.
 ///
 /// Listeners that are already non-materializable contribute no claim and are
 /// ignored, so a broken sibling cannot take down a healthy listener.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
-    #[derive(PartialEq, Eq)]
-    enum PortShape {
-        Plaintext,
-        Tls(Option<(String, String)>),
+    #[derive(Default)]
+    struct PortClaims {
+        plaintext: Vec<GatewayApiListenerKey>,
+        tls: Vec<GatewayApiListenerKey>,
+        /// Gateway namespaces contributing a TLS-terminating claim.
+        tls_namespaces: BTreeSet<String>,
+        /// Distinct `(cert_path, key_path)` credentials those claims name.
+        tls_credentials: BTreeSet<(String, String)>,
     }
 
-    let mut shapes_by_port: BTreeMap<u16, Vec<(GatewayApiListenerKey, PortShape)>> =
-        BTreeMap::new();
+    let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
     for (key, policy) in &acc.gateway_api_listener_policies {
         // Only the HTTP family shares the HTTP-route socket set — the same
         // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
@@ -1493,46 +1513,61 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) else {
             continue;
         };
-        let shape = if policy.requires_frontend_tls {
-            PortShape::Tls(policy.frontend_tls_source.clone())
+        let claims = claims_by_port.entry(port).or_default();
+        if policy.requires_frontend_tls {
+            claims.tls.push(key.clone());
+            claims.tls_namespaces.insert(key.namespace.clone());
+            if let Some(source) = policy.frontend_tls_source.clone() {
+                claims.tls_credentials.insert(source);
+            }
         } else {
-            PortShape::Plaintext
-        };
-        shapes_by_port
-            .entry(port)
-            .or_default()
-            .push((key.clone(), shape));
+            claims.plaintext.push(key.clone());
+        }
     }
 
     let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    for (port, claims) in shapes_by_port {
-        if claims.len() < 2 || claims.iter().all(|(_, shape)| *shape == claims[0].1) {
+    for (port, claims) in claims_by_port {
+        let protocol_conflict = !claims.plaintext.is_empty() && !claims.tls.is_empty();
+        // One namespace always resolves to one serving credential, so only a
+        // cross-namespace disagreement can leave the socket unable to present
+        // every claimant's certificate.
+        let credential_conflict = claims.tls_namespaces.len() > 1
+            && claims.tls_credentials.len() > 1
+            && !protocol_conflict;
+        if !protocol_conflict && !credential_conflict {
             continue;
         }
-        let listeners = claims
+        let (reason, refused_keys, detail) = if protocol_conflict {
+            (
+                "ProtocolConflict",
+                claims
+                    .plaintext
+                    .iter()
+                    .chain(claims.tls.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                "both plaintext and TLS-terminating (one socket is one or the other)",
+            )
+        } else {
+            (
+                "HostnameConflict",
+                claims.tls,
+                "TLS-terminating claims from different Gateway namespaces naming different \
+                 credentials (one socket presents one certificate)",
+            )
+        };
+        let listeners = refused_keys
             .iter()
-            .map(|(key, _)| key.to_string())
+            .map(|key| key.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        // A port claimed both plaintext and TLS is a protocol conflict; TLS
-        // siblings that resolve to different certificates conflict over which
-        // hostname's credential the one socket presents.
-        let reason = if claims
-            .iter()
-            .any(|(_, shape)| *shape == PortShape::Plaintext)
-        {
-            "ProtocolConflict"
-        } else {
-            "HostnameConflict"
-        };
         let message = format!(
             "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend \
-             shapes (plaintext vs TLS, or different TLS credentials). One socket cannot serve \
-             both, so every claim on this port is refused (Conflicted)."
+             shapes: {detail}, so every conflicting claim on this port is refused (Conflicted)."
         );
         warnings.push(message.clone());
-        refused.extend(claims.into_iter().map(|(key, _)| {
+        refused.extend(refused_keys.into_iter().map(|key| {
             (
                 key,
                 GatewayApiListenerConflict {

@@ -408,6 +408,9 @@ impl GatewayListenerManager {
     }
 
     /// Most recent refusals / bind failures. Lock-free read.
+    // Same bin-target caveat as `active_ports`: the observability seam is
+    // consumed by `tests/` and external library callers, not by the binary.
+    #[allow(dead_code)]
     pub fn bind_failures(&self) -> Arc<Vec<GatewayListenerBindFailure>> {
         self.bind_failures.load_full()
     }

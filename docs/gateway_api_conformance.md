@@ -261,11 +261,30 @@ distinguishable both in the route table and on the wire:
   the conflict; other parentRefs of the same Route, and `status.parents[]`
   entries owned by other controllers, are untouched. Both colliding Routes are
   reported identically regardless of the order the objects are observed in.
-- A numeric port claimed by two listeners with incompatible physical shapes —
-  one plaintext and one TLS-terminating, or two TLS listeners resolving to
-  different credentials — is refused at admission. One socket cannot serve
-  both, so **both** claims fail closed (matching the Gateway API `Conflicted`
-  condition) rather than one silently winning the socket.
+- A numeric port claimed by two listeners with incompatible physical shapes is
+  refused at admission, and **every** conflicting claim fails closed (matching
+  the Gateway API `Conflicted` condition) rather than one silently winning the
+  socket. Exactly two shapes qualify:
+  - **plaintext vs TLS-terminating on one port** (`ProtocolConflict`). A socket
+    is one or the other.
+  - **TLS-terminating claims from more than one Gateway namespace that name
+    more than one distinct credential** (`HostnameConflict`). Ferrum resolves
+    one frontend TLS serving slot per Gateway *namespace*, so there is no
+    arbitration across namespaces and the one socket would present a foreign
+    Gateway's certificate.
+
+  Differing `tls.certificateRefs` on their own are deliberately **not** a
+  conflict. Gateway API v1.5.1 defines HTTP-family listener distinctness on
+  `(port, hostname)` and states that "the `tls` field is not used for
+  determining if a listener is distinct", so sibling HTTPS listeners on one port
+  with disjoint hostnames and different `certificateRefs` stay `Accepted`.
+  Within a namespace the listener whose `certificateRef` does not win that
+  namespace's single serving slot keeps its listener status but materializes no
+  routes, so it never serves traffic under another listener's certificate. Until
+  Ferrum can select a certificate per SNI hostname, that listener's `Programmed`
+  condition therefore reports a socket that is bound and serving a *different*
+  Gateway's credential; the guarantee it does make is that no route is
+  advertised on it.
 
 **Listener lifecycle and its bounds.** The listener set is reconciled on every
 config publication, so reload / update / delete / withdrawal reach the sockets
@@ -299,10 +318,12 @@ without a restart. Two bounds are deliberate and tested:
 **Listener status for a refused port.** The same-port incompatible-shape
 refusal is reported on the Gateway's own `status.listeners[]` entry, not only as
 a translator warning: every refused listener reports `Conflicted=True`
-(`ProtocolConflict` for plaintext-vs-TLS, `HostnameConflict` for TLS siblings
-resolving to different credentials), `Accepted=False` with `PortUnavailable`,
-and `Programmed=False`. `ResolvedRefs` still describes that listener's own
-references, which the port conflict does not invalidate.
+(`ProtocolConflict` for plaintext-vs-TLS, `HostnameConflict` for cross-namespace
+TLS claims naming different credentials), `Accepted=False` with
+`PortUnavailable`, and `Programmed=False`. `ResolvedRefs` still describes that
+listener's own references, which the port conflict does not invalidate. A
+listener that is merely a same-namespace TLS sibling with a different
+`certificateRef` is not refused and keeps its ordinary status.
 
 **HTTP/3 on Gateway listener ports.** When `FERRUM_ENABLE_HTTP3=true` and
 frontend TLS is configured, every TLS-class Gateway listener port also gets its

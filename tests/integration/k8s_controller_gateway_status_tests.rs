@@ -897,6 +897,10 @@ fn cross_kind_rejection_does_not_reach_l4_routes_on_the_same_gateway() {
 // (`PortUnavailable`) — never `Accepted=True` / `NoConflicts`.
 
 fn tls_secret_object(name: &str) -> K8sObject {
+    tls_secret_object_in(name, "default")
+}
+
+fn tls_secret_object_in(name: &str, namespace: &str) -> K8sObject {
     use base64::Engine as _;
     let cert = include_str!("../certs/server.crt");
     let key = include_str!("../certs/server.key");
@@ -904,7 +908,7 @@ fn tls_secret_object(name: &str) -> K8sObject {
         "v1",
         "Secret",
         name,
-        "default",
+        namespace,
         json!({
             "type": "kubernetes.io/tls",
             "data": {
@@ -935,7 +939,15 @@ fn listener_condition<'a>(listener: &'a Value, condition_type: &str) -> &'a Valu
 }
 
 fn gateway_update(objects: &[K8sObject], name: &str) -> GatewayApiStatusUpdate {
-    plan_gateway_api_status_updates(objects, options(), &[])
+    gateway_update_with_options(objects, options(), name)
+}
+
+fn gateway_update_with_options(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    name: &str,
+) -> GatewayApiStatusUpdate {
+    plan_gateway_api_status_updates(objects, options, &[])
         .into_iter()
         .find(|update| update.kind == "Gateway" && update.name == name)
         .expect("a Gateway status update")
@@ -1011,8 +1023,20 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     assert_listener_refused(&update, "secure", "ProtocolConflict");
 }
 
+/// Gateway API v1.5.1 defines HTTP-family listener distinctness on
+/// `(port, hostname)` and states that "the `tls` field is not used for
+/// determining if a listener is distinct". Sibling HTTPS listeners with
+/// disjoint hostnames and *different* `certificateRefs` are therefore distinct
+/// and must keep reporting `Accepted=True` / no `Conflicted`. Ferrum resolves
+/// one frontend TLS serving slot per Gateway namespace, so the listener whose
+/// credential does not win the slot simply materializes no routes — it never
+/// serves traffic under the other listener's certificate.
+///
+/// This is the shape the upstream conformance suite exercises with
+/// `same-namespace-with-https-listener` and the ReferenceGrant Gateways, which
+/// all share port 443 inside `gateway-conformance-infra`.
 #[test]
-fn tls_listeners_sharing_a_port_with_different_credentials_report_conflicted() {
+fn tls_listeners_sharing_a_port_in_one_namespace_with_different_credentials_stay_accepted() {
     let gateway = object(
         "gateway.networking.k8s.io/v1",
         "Gateway",
@@ -1055,8 +1079,138 @@ fn tls_listeners_sharing_a_port_with_different_credentials_report_conflicted() {
     ];
 
     let update = gateway_update(&objects, "edge");
-    assert_listener_refused(&update, "first", "HostnameConflict");
-    assert_listener_refused(&update, "second", "HostnameConflict");
+    for name in ["first", "second"] {
+        let listener = listener_status(&update, name);
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "listener {name} differs only by TLS credential, which is not a distinctness \
+             field: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "listener {name} must stay Accepted: {accepted:?}"
+        );
+    }
+}
+
+/// The exact upstream conformance shape: two *different* Gateways in one
+/// namespace both claim port 443 with catch-all HTTPS listeners naming
+/// different Secrets (`GatewaySecretReferenceGrant*` beside
+/// `same-namespace-with-https-listener`). Both must stay Accepted — the
+/// namespace resolves one serving slot, so this is not a physical port
+/// conflict.
+#[test]
+fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            "default",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "cert-a"),
+        gateway_for("reference-grant-edge", "cert-b"),
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    for gateway in ["edge", "reference-grant-edge"] {
+        let update = gateway_update(&objects, gateway);
+        let listener = listener_status(&update, "https");
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "Gateway {gateway} must not be reported Conflicted: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "Gateway {gateway} listener must stay Accepted: {accepted:?}"
+        );
+        let programmed = listener_condition(listener, "Programmed");
+        assert_eq!(
+            programmed["status"].as_str(),
+            Some("True"),
+            "Gateway {gateway} listener must stay Programmed: {programmed:?}"
+        );
+    }
+}
+
+/// Across Gateway namespaces there is no per-namespace serving-slot
+/// arbitration, so one socket really would have to present a foreign Gateway's
+/// certificate. That claim stays fail-closed on both sides.
+#[test]
+fn tls_listeners_on_one_port_across_namespaces_with_different_certs_conflict() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, namespace: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            namespace,
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "hostname": format!("{name}.example.com"),
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "default", "cert-a"),
+        gateway_for("other-edge", "other", "cert-b"),
+        tls_secret_object_in("cert-a", "default"),
+        tls_secret_object_in("cert-b", "other"),
+    ];
+    let namespaces = vec!["default".to_string(), "other".to_string()];
+    let options = options().with_source_namespaces(namespaces);
+
+    let update = gateway_update_with_options(&objects, options.clone(), "edge");
+    assert_listener_refused(&update, "https", "HostnameConflict");
+    let other = gateway_update_with_options(&objects, options, "other-edge");
+    assert_listener_refused(&other, "https", "HostnameConflict");
 }
 
 /// A compatible same-port pair must stay clean: no `Conflicted`, and the

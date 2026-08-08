@@ -23,10 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cross-kind arbitration is keyed by the resolved Gateway listener identity, not
   by port number, so it retains healthy sibling claims and sibling listeners
   sharing a port cannot suppress or TLS-taint one another. A numeric port
-  claimed by incompatible listener shapes (plaintext vs TLS, or differing TLS
-  credentials) is refused at admission on both sides, reported on the Gateway's
-  `status.listeners[]` as `Conflicted=True` / `Accepted=False`
-  (`PortUnavailable`) / `Programmed=False`. Same-kind route merging keys on the
+  claimed by physically incompatible listener shapes — plaintext vs
+  TLS-terminating, or TLS claims from more than one Gateway namespace naming
+  more than one credential — is refused at admission on every conflicting side,
+  reported on the Gateway's `status.listeners[]` as `Conflicted=True` /
+  `Accepted=False` (`PortUnavailable`) / `Programmed=False`. Differing
+  `certificateRefs` alone are not a conflict: Gateway API v1.5.1 excludes the
+  `tls` field from listener distinctness, so same-port HTTPS siblings with
+  disjoint hostnames stay Accepted and Ferrum's existing one-serving-slot-per-
+  namespace rule keeps the non-winning listener's routes unmaterialized. Same-kind route merging keys on the
   exact admitting listener, so two Gateways sharing a port never have their
   dispatch rules combined, and a host+path claimed by two different listeners on
   one port is refused on both sides — in Route status as well as in the data
