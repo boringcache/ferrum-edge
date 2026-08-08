@@ -672,6 +672,21 @@ fn udp_route_with_only_non_gateway_parents_opens_no_listener() {
         udp_route("typo", mistyped),
     ];
     assert_no_listener_for_declared_parent(&objects, 5353);
+
+    // Kubernetes CRD admission rejects these shapes, but a config-source
+    // boundary must not reinterpret present-but-invalid parentRefs as absent
+    // and thereby open the legacy fallback listener.
+    for parent_refs in [json!([]), json!({"name": "edge"})] {
+        let invalid = json!({
+            "parentRefs": parent_refs,
+            "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+        });
+        let invalid_objects = [
+            gateway_class(),
+            udp_route("invalid-parent-refs", invalid),
+        ];
+        assert_no_listener_for_declared_parent(&invalid_objects, 5353);
+    }
 }
 
 #[test]

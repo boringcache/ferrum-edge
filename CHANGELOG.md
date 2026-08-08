@@ -41,9 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Service` parent, a mistyped `kind`, an unrecognized `group`) opens nothing
   either: Ferrum implements no non-Gateway `UDPRoute` parent and such a route is
   not a status candidate, so the backend-port fallback would be an unannounced
-  north-south UDP listener. Only a `UDPRoute` with no `parentRefs` at all keeps
-  that fallback; `TCPRoute`/`TLSRoute` keep their historical Gateway-parent-only
-  gate. Update and delete regenerate live stream listeners and upstreams.
+  north-south UDP listener. Present but malformed or explicitly empty
+  `parentRefs` fail closed too. Only a `UDPRoute` with no `parentRefs` field at
+  all keeps that fallback; `TCPRoute`/`TLSRoute` keep their historical
+  Gateway-parent-only gate. Update and delete regenerate live stream listeners
+  and upstreams.
   Attachment, weighted backend sets, ReferenceGrant fail-closed behavior,
   status, update, and deletion are gated by CI Unit Tests
   (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the **live
