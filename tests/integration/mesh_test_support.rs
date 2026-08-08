@@ -65,6 +65,7 @@ pub fn default_mesh_runtime() -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: None,
         workload_svid_cert_path: None,
