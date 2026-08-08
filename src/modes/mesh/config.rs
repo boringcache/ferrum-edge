@@ -2973,9 +2973,11 @@ pub struct MeshConfig {
     /// synthesis); `handle_hbone_udp_request` then re-checks the **effective**
     /// post-route-override destination via
     /// `crate::proxy::mesh_egress_udp_destination_allowed` before opening any
-    /// socket — the synthesized relay proxy inherits the global plugin chain, so
-    /// a route-override plugin could otherwise move the dial target outside the
-    /// operator-declared set after the build-time lookup ran.
+    /// socket — that guard matches **precomputed dial endpoints only**, so a
+    /// route-override plugin cannot land on a STATIC hostname authority and
+    /// DNS-bypass the operator-declared `endpoints[]` after the build-time
+    /// lookup ran. The vector is bounded by
+    /// [`crate::modes::mesh::MAX_EGRESS_UDP_DESTINATIONS`].
     ///
     /// **Fail closed by construction.** The vector is assigned UNCONDITIONALLY on
     /// every mesh apply — empty for every non-`EgressGateway` topology, when
@@ -3017,12 +3019,13 @@ pub struct MeshConfig {
 /// `MESH_EXTERNAL` `ServiceEntry` UDP port under `EgressGateway` topology
 /// (issue #3263).
 ///
-/// The gateway terminates the sidecar's authenticated mesh transport (SVID-mTLS
-/// on `:15006` / HBONE on `:15008`), unframes the `udp`-marked CONNECT body with
-/// the shared datagram codec (`crate::proxy::mesh_udp_frame`), and relays each
-/// datagram over a `connect()`ed local `UdpSocket` — so the reply peer is pinned
-/// by the kernel to the exact destination that was admitted here. There is no
-/// plaintext UDP listener and no DTLS material to seed.
+/// The gateway terminates the sidecar's authenticated mesh transport on its
+/// `:15090` SVID-mTLS egress listener (not Sidecar `:15006` / Ambient `:15008`),
+/// unframes the `udp`-marked CONNECT body with the shared datagram codec
+/// (`crate::proxy::mesh_udp_frame`), and relays each datagram over a
+/// `connect()`ed local `UdpSocket` — so the reply peer is pinned by the kernel
+/// to the exact destination that was admitted here. There is no plaintext UDP
+/// listener and no DTLS material to seed.
 ///
 /// **Authority and dial destination are represented separately.** `host` is the
 /// exact authority host an admitted CONNECT may name (a declared ServiceEntry
@@ -3034,10 +3037,13 @@ pub struct MeshConfig {
 /// bypass STATIC endpoint semantics. Under `DNS`/`NONE` resolution the entry
 /// declares no dialable endpoint set, so the single dial endpoint is the
 /// authority host itself (resolved at dial time, which is what those modes mean).
+/// The post-route-override guard admits only dial endpoints, so an override that
+/// lands on a STATIC hostname authority cannot DNS-bypass `endpoints[]`.
 ///
 /// Matching is exact and ASCII-case-insensitive — wildcard ServiceEntry hosts
 /// (`*.example.com`) are refused at materialization so no admission is ever
-/// decided by a prefix/subnet guess.
+/// decided by a prefix/subnet guess. The allowlist as a whole is bounded by
+/// [`MAX_EGRESS_UDP_DESTINATIONS`](crate::modes::mesh::MAX_EGRESS_UDP_DESTINATIONS).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MeshEgressUdpDestination {
     /// Exact authority host admitted for a `udp` CONNECT (lowercased).

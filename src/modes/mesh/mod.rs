@@ -9586,6 +9586,20 @@ fn build_udp_egress_destinations_for_entry(
 /// gateway may dial, never widen it).
 pub const MAX_EGRESS_UDP_DIAL_ENDPOINTS: usize = 64;
 
+/// Upper bound on the total number of admitted external UDP egress destinations
+/// the EgressGateway allowlist may carry (issue #3263).
+///
+/// Each `(authority host, service port)` admission is one entry, including the
+/// additional endpoint-IP authorities a `STATIC` entry materializes. Without a
+/// total cap a large accepted slice can materialize an unbounded host/port
+/// product and turn every authenticated CONNECT's allowlist walk into an
+/// unbounded scan. Entries beyond the cap are refused fail-closed with a
+/// field-specific warning; the per-destination
+/// [`MAX_EGRESS_UDP_DIAL_ENDPOINTS`] cap is unchanged. The allowlist stays a
+/// bounded `Vec` rebuilt on apply — no request-path locks or per-CONNECT
+/// allocations.
+pub const MAX_EGRESS_UDP_DESTINATIONS: usize = 256;
+
 /// Resolve the `STATIC` dial endpoint set of one external `ServiceEntry` UDP
 /// port: every `endpoints[].address` that is a bare IP literal, paired with the
 /// port that endpoint is reached on.
@@ -9654,8 +9668,9 @@ fn resolve_static_udp_dial_endpoints(
 }
 
 /// Insert one `(host, port)` admission with its precomputed dial endpoints,
-/// refusing a duplicate another ServiceEntry already claimed. Returns `true`
-/// when the admission was added.
+/// refusing a duplicate another ServiceEntry already claimed and refusing
+/// entries that would push the allowlist past
+/// [`MAX_EGRESS_UDP_DESTINATIONS`]. Returns `true` when the admission was added.
 fn push_udp_egress_destination(
     entry: &ServiceEntry,
     host: &str,
@@ -9672,6 +9687,19 @@ fn push_udp_egress_destination(
     // Authority hosts are compared ASCII-case-insensitively on the request path,
     // so normalize once here instead of per CONNECT.
     let host = host.to_ascii_lowercase();
+    if destinations.len() >= MAX_EGRESS_UDP_DESTINATIONS {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            field = "egress_udp_destinations",
+            host = %host,
+            port,
+            max_destinations = MAX_EGRESS_UDP_DESTINATIONS,
+            "Skipping UDP egress ServiceEntry destination: total admitted destinations \
+             would exceed the allowlist cap"
+        );
+        return false;
+    }
     if !materialized_udp_destinations.insert((host.clone(), port)) {
         warn!(
             service_entry = %entry.name,
@@ -16216,26 +16244,48 @@ fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
 /// operator variables.
 ///
 /// Fail-closed and field-specific:
-/// - both unset ⇒ `None` (source-side external UDP egress is simply off);
+/// - both unset / empty ⇒ `None` (source-side external UDP egress is simply off);
 /// - one set without the other ⇒ hard startup error naming the missing variable
 ///   — an address without a pinned identity would dial an unverified peer, and
 ///   an identity without an address has nothing to dial;
 /// - a malformed `host:port`, port `0`, empty/invalid/overlong host, wildcard,
-///   URL/userinfo/path/query/fragment material, whitespace/control characters,
-///   or invalid SPIFFE id ⇒ hard startup error naming the offending variable.
+///   URL/userinfo/path/query/fragment material, surrounding or embedded
+///   whitespace/control characters, or invalid SPIFFE id ⇒ hard startup error
+///   naming the offending variable.
 ///
 /// Host shape is a bounded DNS hostname, an IPv4 literal, or a bracketed IPv6
 /// literal — an EgressGateway is normally reached by its in-cluster Service
 /// FQDN. The FQDN is resolved at dial time by the mesh-mTLS pool, and the
 /// handshake still pins [`SpiffeId`] as the expected peer, so name resolution
 /// cannot substitute a different gateway identity. Diagnostics name the field
-/// and the violation class; they never echo the raw configured value.
+/// and the violation class; they never echo the raw configured value or the
+/// SPIFFE parser payload (which embeds the rejected identity).
 fn parse_egress_gateway_endpoint(
     addr_raw: Option<&str>,
     spiffe_raw: Option<&str>,
 ) -> Result<Option<MeshEgressGatewayEndpoint>, String> {
-    let addr_raw = addr_raw.map(str::trim).filter(|value| !value.is_empty());
-    let spiffe_raw = spiffe_raw.map(str::trim).filter(|value| !value.is_empty());
+    let addr_raw = match addr_raw {
+        None => None,
+        Some("") => None,
+        Some(value) => {
+            reject_egress_gateway_env_boundary_whitespace(
+                value,
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR",
+            )?;
+            Some(value)
+        }
+    };
+    let spiffe_raw = match spiffe_raw {
+        None => None,
+        Some("") => None,
+        Some(value) => {
+            reject_egress_gateway_env_boundary_whitespace(
+                value,
+                "FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID",
+            )?;
+            Some(value)
+        }
+    };
     let (addr_raw, spiffe_raw) = match (addr_raw, spiffe_raw) {
         (None, None) => return Ok(None),
         (Some(_), None) => {
@@ -16320,16 +16370,40 @@ fn parse_egress_gateway_endpoint(
     };
 
     let port = parse_egress_gateway_port(port_raw)?;
+    // Never format `{e}`: `SpiffeIdError` embeds the full raw rejected identity
+    // (including overlong / hostile input). Name the variable and the class only.
     let spiffe_id = spiffe_raw
         .parse::<crate::identity::SpiffeId>()
-        .map_err(|e| {
-            format!("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID must be a valid SPIFFE id: {e}")
+        .map_err(|_| {
+            "FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID must be a valid SPIFFE id".to_string()
         })?;
     Ok(Some(MeshEgressGatewayEndpoint {
         host,
         port,
         spiffe_id,
     }))
+}
+
+/// Refuse surrounding whitespace or control characters on an egress-gateway
+/// env value without echoing the configured string.
+fn reject_egress_gateway_env_boundary_whitespace(
+    value: &str,
+    var_name: &'static str,
+) -> Result<(), String> {
+    let Some(first) = value.chars().next() else {
+        return Ok(());
+    };
+    let last = value.chars().next_back().unwrap_or(first);
+    if first.is_ascii_whitespace()
+        || first.is_control()
+        || last.is_ascii_whitespace()
+        || last.is_control()
+    {
+        return Err(format!(
+            "{var_name} must not have surrounding whitespace or control characters"
+        ));
+    }
+    Ok(())
 }
 
 /// Normalize and admit the host portion of `FERRUM_MESH_EGRESS_GATEWAY_ADDR`.
@@ -30188,6 +30262,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_egress_gateway_endpoint_rejects_surrounding_whitespace_and_hides_spiffe_payload() {
+        let spiffe = "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress";
+        let addr = "egress.example.com:15090";
+
+        for (padded_addr, label) in [
+            (format!(" {addr}"), "leading space addr"),
+            (format!("{addr} "), "trailing space addr"),
+            (format!("\t{addr}"), "leading tab addr"),
+            (format!("{addr}\n"), "trailing newline addr"),
+        ] {
+            let err = parse_egress_gateway_endpoint(Some(&padded_addr), Some(spiffe))
+                .expect_err(label);
+            assert!(
+                err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"),
+                "{label}: must name ADDR, got {err}"
+            );
+            assert!(
+                err.contains("surrounding whitespace") || err.contains("control characters"),
+                "{label}: must refuse boundary whitespace/control, got {err}"
+            );
+            assert!(!err.contains(addr), "{label}: must not echo addr; got {err}");
+        }
+
+        for (padded_spiffe, label) in [
+            (format!(" {spiffe}"), "leading space spiffe"),
+            (format!("{spiffe} "), "trailing space spiffe"),
+            (format!("\t{spiffe}"), "leading tab spiffe"),
+        ] {
+            let err = parse_egress_gateway_endpoint(Some(addr), Some(&padded_spiffe))
+                .expect_err(label);
+            assert!(
+                err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"),
+                "{label}: must name SPIFFE_ID, got {err}"
+            );
+            assert!(
+                err.contains("surrounding whitespace") || err.contains("control characters"),
+                "{label}: must refuse boundary whitespace/control, got {err}"
+            );
+            assert!(
+                !err.contains(spiffe),
+                "{label}: must not echo SPIFFE value; got {err}"
+            );
+        }
+
+        // Hostile / overlong SPIFFE values must be absent from the returned
+        // error: SpiffeIdError embeds the raw identity, so formatting `{e}`
+        // would leak them.
+        let hostile = "spiffe://cluster.local/ns/default/sa/<script>alert(1)</script>";
+        let err = parse_egress_gateway_endpoint(Some(addr), Some(hostile))
+            .expect_err("hostile spiffe");
+        assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"));
+        assert!(
+            err.contains("must be a valid SPIFFE id"),
+            "diagnostic must name the class, got {err}"
+        );
+        assert!(
+            !err.contains(hostile) && !err.contains("<script>") && !err.contains("alert(1)"),
+            "diagnostic must not echo hostile SPIFFE payload; got {err}"
+        );
+
+        let overlong = format!("spiffe://cluster.local/{}", "a".repeat(3000));
+        let err = parse_egress_gateway_endpoint(Some(addr), Some(&overlong))
+            .expect_err("overlong spiffe");
+        assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"));
+        assert!(
+            !err.contains(&overlong) && !err.contains(&"a".repeat(64)),
+            "diagnostic must not echo overlong SPIFFE payload; got {err}"
+        );
+        // Keep the message bounded: class diagnostic only.
+        assert!(
+            err.len() < 200,
+            "SPIFFE diagnostic must stay bounded, got len {}",
+            err.len()
+        );
+    }
+
+    #[test]
     fn mesh_egress_gateway_listener_plan_has_single_mtls_listener() {
         with_mesh_env(
             &[
@@ -32344,6 +32495,88 @@ mod tests {
                 service_entry: "dns".to_string(),
                 namespace: "default".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn egress_udp_destinations_respect_total_allowlist_cap() {
+        // At the closed total cap every DNS host authority is admitted; one
+        // more is refused fail-closed so CONNECT-time walks stay bounded.
+        let hosts_at_cap: Vec<String> = (0..MAX_EGRESS_UDP_DESTINATIONS)
+            .map(|i| format!("host{i}.external.com"))
+            .collect();
+        let service_entries = vec![ServiceEntry {
+            name: "bulk".to_string(),
+            namespace: "default".to_string(),
+            hosts: hosts_at_cap.clone(),
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_, _, at_cap) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            at_cap.len(),
+            MAX_EGRESS_UDP_DESTINATIONS,
+            "exactly the total allowlist cap must be admitted"
+        );
+        assert!(at_cap.iter().all(|dest| {
+            dest.port == 53
+                && dest.dial_endpoints.len() == 1
+                && dest.dial_endpoints[0].host == dest.host
+                && dest.dial_endpoints[0].port == 53
+        }));
+
+        let mut hosts_over_cap = hosts_at_cap;
+        hosts_over_cap.push(format!("host{MAX_EGRESS_UDP_DESTINATIONS}.external.com"));
+        let service_entries = vec![ServiceEntry {
+            name: "bulk".to_string(),
+            namespace: "default".to_string(),
+            hosts: hosts_over_cap,
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_, _, over_cap) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            over_cap.len(),
+            MAX_EGRESS_UDP_DESTINATIONS,
+            "destinations beyond the total allowlist cap must be refused"
+        );
+        assert!(
+            over_cap
+                .iter()
+                .all(|dest| dest.host != format!("host{MAX_EGRESS_UDP_DESTINATIONS}.external.com")),
+            "the overflow host must not be admitted"
         );
     }
 

@@ -2341,19 +2341,22 @@ fn mesh_egress_udp_destination_dial_endpoint(
     Some((endpoint.host.clone(), endpoint.port))
 }
 
-/// Whether `host:port` is an admitted external UDP egress destination, matching
-/// EITHER an admitted authority (ServiceEntry host / endpoint IP + service port)
-/// or one of that destination's precomputed dial endpoints.
+/// Whether `host:port` is a precomputed dial endpoint of an admitted external
+/// UDP egress destination.
 ///
 /// This is the live post-route-override guard in `handle_hbone_udp_request`.
 /// Route-miss synthesis already selected an admitted dial endpoint from the
-/// CONNECT authority, but the synthesized relay proxy inherits the global
-/// plugin chain and a `before_proxy` route-override can rewrite `app_host` /
-/// `app_port` before any socket opens. Re-checking here is therefore necessary
-/// and nonredundant: an override that lands on an operator-declared authority
-/// or dial endpoint stays admitted, and anything else is refused. The
-/// dial-endpoint arm is required because the un-overridden effective
-/// destination *is* the selected dial endpoint, not the original authority.
+/// CONNECT authority via [`mesh_egress_udp_destination_dial_endpoint`], but the
+/// synthesized relay proxy inherits the global plugin chain and a `before_proxy`
+/// route-override can rewrite `app_host` / `app_port` before any socket opens.
+/// Re-checking here is therefore necessary and nonredundant — and it MUST match
+/// dial endpoints only, never authority hosts: a `STATIC` ServiceEntry host is
+/// a valid CONNECT authority, but admitting it as an effective socket target
+/// would let `resolve_local_udp_dest` DNS-resolve that hostname and bypass the
+/// operator-declared `endpoints[]` set. Under `DNS`/`NONE` the dial endpoint
+/// *is* the authority host, so those destinations stay usable; a `STATIC`
+/// endpoint-IP authority is usable because that IP is itself a dial endpoint.
+/// The original-authority lookup used at CONNECT synthesis is unchanged.
 fn mesh_egress_udp_destination_allowed(
     host: &str,
     port: u16,
@@ -2367,11 +2370,9 @@ fn mesh_egress_udp_destination_allowed(
     }
     let host = hbone_relay_authority_host_for_mesh(host);
     mesh.egress_udp_destinations.iter().any(|dest| {
-        (dest.port == port && dest.host.eq_ignore_ascii_case(host))
-            || dest
-                .dial_endpoints
-                .iter()
-                .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
+        dest.dial_endpoints
+            .iter()
+            .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
     })
 }
 
@@ -52067,6 +52068,109 @@ mod tests {
 
         assert_eq!(relay.backend_host, "fd00:10:244:1::4");
         assert_eq!(relay.backend_port, 8080);
+    }
+
+    #[test]
+    fn mesh_egress_udp_post_override_allows_only_dial_endpoints() {
+        use crate::modes::mesh::config::{
+            MeshConfig, MeshEgressUdpDestination, MeshEgressUdpDialEndpoint,
+        };
+
+        // STATIC host authority + declared endpoint: CONNECT may name the
+        // hostname, but the effective socket target after synthesis/override
+        // must be a dial endpoint. Admitting the hostname here would let
+        // resolve_local_udp_dest DNS-bypass endpoints[].
+        let mut mesh = MeshConfig::default();
+        mesh.egress_udp_destinations = vec![
+            MeshEgressUdpDestination {
+                host: "static.external.com".to_string(),
+                port: 53,
+                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    host: "198.51.100.9".to_string(),
+                    port: 53,
+                }],
+                service_entry: "static".to_string(),
+                namespace: "default".to_string(),
+            },
+            MeshEgressUdpDestination {
+                host: "198.51.100.9".to_string(),
+                port: 53,
+                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    host: "198.51.100.9".to_string(),
+                    port: 53,
+                }],
+                service_entry: "static".to_string(),
+                namespace: "default".to_string(),
+            },
+            MeshEgressUdpDestination {
+                host: "dns.external.com".to_string(),
+                port: 53,
+                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                }],
+                service_entry: "dns".to_string(),
+                namespace: "default".to_string(),
+            },
+        ];
+
+        // Original-authority lookup is unchanged: STATIC hostname still
+        // selects a declared dial endpoint.
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("static.external.com", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("STATIC.EXTERNAL.COM", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+
+        // Post-override guard: STATIC hostname is NOT a dialable socket target.
+        assert!(
+            !mesh_egress_udp_destination_allowed("static.external.com", 53, Some(&mesh)),
+            "STATIC hostname must not pass the post-override dial-endpoint guard"
+        );
+        // Declared STATIC endpoint IP and DNS/NONE dial targets still pass.
+        assert!(mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "dns.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "DNS.EXTERNAL.COM",
+            53,
+            Some(&mesh)
+        ));
+        // Unrelated host stays denied; empty mesh denies.
+        assert!(!mesh_egress_udp_destination_allowed(
+            "other.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(!mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            None
+        ));
+
+        // Synthesis converts a STATIC authority CONNECT into the dial endpoint
+        // backend — the unmodified happy path that the post-override guard must
+        // still accept.
+        let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+            .expect("STATIC authority must synthesize a dial-endpoint relay");
+        assert_eq!(relay.backend_host, "198.51.100.9");
+        assert_eq!(relay.backend_port, 53);
+        assert!(mesh_egress_udp_destination_allowed(
+            &relay.backend_host,
+            relay.backend_port,
+            Some(&mesh)
+        ));
     }
 
     #[test]

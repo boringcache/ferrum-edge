@@ -1058,9 +1058,12 @@ pub(super) async fn handle_hbone_udp_request(
     // destination was already guarded at build time, so this is a no-op for it.
     //
     // The EgressGateway external-UDP allowlist (issue #3263) is the SECOND
-    // admissible source and is checked with the same post-override rigor: an
-    // admitted external destination stays admitted, and anything a route
-    // override rewrote to an unadmitted host/port is refused here.
+    // admissible source and is checked with the same post-override rigor, but
+    // only against precomputed dial endpoints: a STATIC ServiceEntry hostname
+    // is a valid CONNECT authority, yet must never become an effective socket
+    // target (that would DNS-bypass the declared endpoints[]). DNS/NONE and
+    // STATIC endpoint-IP dial targets remain usable because they are themselves
+    // dial endpoints. Anything a route override rewrote off that set is refused.
     let mesh_config = epoch.config.mesh.as_deref();
     let local_relay_allowed =
         inbound_hbone_relay_destination_allowed(app_host, app_port, mesh_config);
