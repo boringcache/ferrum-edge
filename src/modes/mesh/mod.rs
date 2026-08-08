@@ -5704,7 +5704,7 @@ fn materialize_mesh_external_udp_egress_upstreams(
     let now = chrono::Utc::now();
     let mut upstreams: Vec<Upstream> = Vec::new();
 
-    for entry in &mesh_slice.service_entries {
+    'service_entries: for entry in &mesh_slice.service_entries {
         if entry.location != ServiceEntryLocation::MeshExternal {
             continue;
         }
@@ -5764,6 +5764,16 @@ fn materialize_mesh_external_udp_egress_upstreams(
                 continue;
             }
             for endpoint in &endpoints {
+                if routes.len() >= MAX_EGRESS_UDP_DESTINATIONS {
+                    warn!(
+                        service_entry = %entry.name,
+                        namespace = %entry.namespace,
+                        field = "external_udp_egress_routes",
+                        max_routes = MAX_EGRESS_UDP_DESTINATIONS,
+                        "Skipping source-side external UDP egress routes beyond the total route cap"
+                    );
+                    break 'service_entries;
+                }
                 // `resolve_static_udp_dial_endpoints` resolves the DIAL port; the
                 // captured original destination and the CONNECT authority both
                 // carry the SERVICE port, which is what the gateway admits.
@@ -9593,17 +9603,18 @@ fn build_udp_egress_destinations_for_entry(
 /// gateway may dial, never widen it).
 pub const MAX_EGRESS_UDP_DIAL_ENDPOINTS: usize = 64;
 
-/// Upper bound on the total number of admitted external UDP egress destinations
-/// the EgressGateway allowlist may carry (issue #3263).
+/// Upper bound on the total number of external UDP egress destinations one
+/// prepared mesh config may carry (issue #3263).
 ///
 /// Each `(authority host, service port)` admission is one entry, including the
-/// additional endpoint-IP authorities a `STATIC` entry materializes. Without a
-/// total cap a large accepted slice can materialize an unbounded host/port
-/// product and turn every authenticated CONNECT's allowlist walk into an
-/// unbounded scan. Entries beyond the cap are refused fail-closed with a
-/// field-specific warning; the per-destination
-/// [`MAX_EGRESS_UDP_DIAL_ENDPOINTS`] cap is unchanged. The allowlist stays a
-/// bounded `Vec` rebuilt on apply — no request-path locks or per-CONNECT
+/// additional endpoint-IP authorities a `STATIC` entry materializes. The same
+/// bound applies to SOURCE-side `(endpoint IP, service port)` routes and their
+/// synthesized upstreams. Without a total cap a large accepted slice can grow
+/// both the gateway's per-CONNECT allowlist scan and the source's cold-path
+/// route/upstream table without bound. Entries beyond the cap are refused
+/// fail-closed with a field-specific warning; the per-destination
+/// [`MAX_EGRESS_UDP_DIAL_ENDPOINTS`] cap is unchanged. Both collections stay
+/// bounded `Vec`s rebuilt on apply — no request-path locks or per-CONNECT
 /// allocations.
 pub const MAX_EGRESS_UDP_DESTINATIONS: usize = 256;
 

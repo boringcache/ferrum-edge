@@ -692,10 +692,12 @@ fn se_udp_egress_destinations_require_stream_egress_opt_in() {
 
 fn static_udp_service_entry(
     name: &str,
-    hosts: Vec<&str>,
+    hosts: Vec<impl Into<String>>,
     port: u16,
-    endpoints: Vec<&str>,
+    endpoints: Vec<impl Into<String>>,
 ) -> K8sObject {
+    let hosts: Vec<String> = hosts.into_iter().map(Into::into).collect();
+    let endpoints: Vec<String> = endpoints.into_iter().map(Into::into).collect();
     service_entry(
         name,
         json!({
@@ -891,6 +893,59 @@ fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
         !target.tags.contains_key("mesh.hbone"),
         "the EgressGateway exposes no :15008 HBONE listener"
     );
+}
+
+/// A large accepted slice must not expand the source-side route/upstream table
+/// without bound. Routes beyond the shared external-UDP cap are omitted
+/// fail-closed, and every retained route still has exactly one gateway
+/// upstream.
+#[test]
+fn se_udp_source_side_routes_respect_total_cap() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP routes have a total materialization cap (#3263)",
+        status = Status::Supported,
+        notes = "#3263: the same fixed bound that limits the gateway allowlist also limits source-side endpoint routes and their synthesized upstreams; excess entries stay unroutable.",
+    );
+    let limit = ferrum_edge::modes::mesh::MAX_EGRESS_UDP_DESTINATIONS;
+    let objects: Vec<K8sObject> = (0..=limit)
+        .map(|index| {
+            let address = format!("198.18.{}.{}", index / 254, index % 254 + 1);
+            static_udp_service_entry(
+                &format!("udp-{index}"),
+                vec![format!("udp-{index}.external.test")],
+                514,
+                vec![address],
+            )
+        })
+        .collect();
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(
+        translation.config,
+        &sidecar_source_runtime_with_gateway(),
+    )
+    .expect("mesh apply");
+    let routes = &prepared
+        .mesh
+        .as_deref()
+        .expect("mesh block")
+        .external_udp_egress_routes;
+    assert_eq!(routes.len(), limit, "routes beyond the cap must be omitted");
+    let external_upstreams: Vec<_> = prepared
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-"))
+        .collect();
+    assert_eq!(
+        external_upstreams.len(),
+        limit,
+        "the source must not synthesize upstreams beyond the route cap"
+    );
+    assert!(routes.iter().all(|route| {
+        external_upstreams
+            .iter()
+            .any(|upstream| upstream.id == route.upstream_id)
+    }));
 }
 
 /// Fail closed: without an explicitly configured gateway endpoint/identity the
