@@ -86,8 +86,10 @@ struct RouteHostScope {
     proxy_hosts: Vec<String>,
     conflict_hostname: String,
     parent_refs: Vec<String>,
-    /// The Gateway listener this scope materializes on. `None` only when no
-    /// listener policy resolved the parentRef (unknown Gateway).
+    /// The Gateway listener this scope materializes on. `None` only for the
+    /// deliberately parentless legacy shape (`spec.parentRefs` absent): a
+    /// declared Gateway parentRef that resolves no concrete listener must
+    /// emit no scope at all rather than a listener-less claim.
     listener: Option<GatewayApiListenerKey>,
     /// `listener`'s numeric port — the runtime `Proxy.listen_port` stamp.
     listen_port: Option<u16>,
@@ -3018,7 +3020,7 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
                 for parent_ref in parent_refs {
                     // One conflict key per resolved *listener*, not per port:
                     // sibling listeners sharing a numeric port stay independent
-                    // claims. Unresolved parentRefs keep the single
+                    // claims. The parentless legacy shape keeps a single
                     // listener-less key that predates listener resolution.
                     let resolved: Vec<Option<GatewayApiListenerKey>> = listeners
                         .get(parent_ref.as_str())
@@ -4262,8 +4264,10 @@ fn route_allowed_parent_ref_keys_for_hostname(
 /// `conflict_hostname`.
 ///
 /// An empty listener set means the reference is known-good but no listener
-/// policy resolved it — an unknown Gateway — and callers fall back to the
-/// literal parentRef identity.
+/// policy resolved it — typically the parentless legacy shape, which carries a
+/// synthetic parentRef identity with no concrete listener. Callers that see a
+/// *declared* Gateway parent with no attached listeners must fail closed
+/// rather than materializing a listener-less claim.
 fn route_allowed_parent_listeners_for_hostname(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -5477,10 +5481,11 @@ fn route_host_scopes_for_path(inputs: RouteHostScopeInputs<'_>) -> Vec<RouteHost
     } = inputs;
     let mut scopes = Vec::new();
     for (host_index, hostname) in conflict_hostnames.iter().enumerate() {
-        // Keep only references that actually resolved a listener. An entry
-        // with an EMPTY listener set is the resolver's "known-good parentRef,
-        // unknown Gateway" signal, not a listener claim; iterating it below
-        // would emit no scope at all and silently drop the whole route.
+        // Keep only references that actually resolved a concrete listener.
+        // An entry with an EMPTY listener set is not a materializable claim:
+        // iterating it below would emit no scope. Declared Gateway parents in
+        // that state fail closed below; only the parentless legacy shape keeps
+        // a listener-less, port-agnostic claim.
         let resolved: Vec<(String, BTreeSet<GatewayApiListenerKey>)> =
             route_allowed_parent_listeners_for_hostname(
                 object,
@@ -5493,27 +5498,27 @@ fn route_host_scopes_for_path(inputs: RouteHostScopeInputs<'_>) -> Vec<RouteHost
             .filter(|(_, listener_keys)| !listener_keys.is_empty())
             .collect();
         if resolved.is_empty() {
-            // Unknown Gateway: keep a listener-less, port-agnostic claim so
-            // status still reports the authored parentRef.
-            let mut parent_refs = route_allowed_parent_ref_keys_for_hostname(
+            // A declared Gateway parentRef that resolves no concrete,
+            // materializable listener must emit nothing — no proxy, upstream,
+            // plugin, or materialized-parent record for that parent. Falling
+            // back to a listener-less claim would expose the backend on
+            // unrelated frontends while status correctly reports
+            // NoMatchingParent / NotAllowedByListeners. Same rule for an
+            // absent Gateway and for sectionName/port/policy gates that clear
+            // no listener.
+            if route_declares_gateway_parent_ref(object) {
+                continue;
+            }
+            // Parentless legacy shape only: keep a listener-less, port-agnostic
+            // claim. Do not broaden this into removal of that compatibility
+            // surface.
+            let parent_refs = route_allowed_parent_ref_keys_for_hostname(
                 object,
                 acc,
                 requested_hostnames,
                 Some(config_namespace),
                 hostname,
             );
-            if parent_refs.is_empty() {
-                // The hostname-scoped view drops a parentRef whose Gateway is
-                // absent from this snapshot. Fall back to the route's authored,
-                // namespace-scoped parentRefs — the pre-port-aware identity —
-                // so an unresolvable parent still materializes a listener-less
-                // claim instead of losing the route.
-                parent_refs = route_allowed_parent_ref_keys_for_namespace(
-                    object,
-                    acc,
-                    Some(config_namespace),
-                );
-            }
             if parent_refs.is_empty() {
                 continue;
             }

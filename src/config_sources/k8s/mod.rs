@@ -603,9 +603,11 @@ pub struct GatewayApiRouteConflictKey {
     pub hostname: String,
     pub listen_path: String,
     pub match_signature: String,
-    /// The Gateway listener this claim attaches to. `None` when no listener
-    /// policy resolved the parentRef (unknown Gateway) — arbitration then
-    /// falls back to the literal parentRef identity alone.
+    /// The Gateway listener this claim attaches to. `None` for the deliberately
+    /// parentless legacy shape (and for arbitration identities that predate
+    /// listener resolution). Declared Gateway parents that resolve no concrete
+    /// listener must not materialize traffic; conflict keys may still carry the
+    /// literal parentRef identity alone.
     ///
     /// This is the identity, not `listen_port`: sibling listeners can share a
     /// numeric port, and collapsing them would make one listener's cross-kind
@@ -636,8 +638,9 @@ pub struct GatewayApiMaterializedRouteParent {
 /// Identity is the resolved [`GatewayApiListenerKey`], never the numeric port,
 /// the route name, or the hostname: sibling listeners may share a port, so
 /// collapsing them would let one listener's refusal withdraw an unrelated
-/// claim. `listener` is `None` only when no listener policy resolved the
-/// parentRef (an unknown Gateway), which is a port-agnostic claim.
+/// claim. `listener` is `None` only for the deliberately parentless legacy
+/// shape (a port-agnostic claim). A declared Gateway parentRef that resolves
+/// no concrete listener must not materialize an attachment at all.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GatewayApiRouteAttachment {
     pub route: K8sResourceKey,
@@ -792,8 +795,9 @@ pub(crate) struct K8sAccumulator {
     /// kinds even when they share hosts+path.
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     /// The exact Gateway API listener each materialized route proxy was
-    /// admitted on. `None` means the parentRef resolved no listener policy
-    /// (unknown Gateway), which is a port-agnostic claim.
+    /// admitted on. `None` is reserved for the deliberately parentless legacy
+    /// shape (a port-agnostic claim). Declared Gateway parents that resolve no
+    /// concrete listener must not materialize a proxy at all.
     ///
     /// Same-kind route merging keys on THIS, never on the numeric port: two
     /// Gateways (or two sibling listeners) can share a port, and Gateway API

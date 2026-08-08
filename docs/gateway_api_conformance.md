@@ -297,6 +297,14 @@ distinguishable both in the route table and on the wire:
   class on the namespace-qualified `GatewayConfig.http_tls_listen_ports`
   (`(namespace, port)`). Both are read from **that listener's own policy** — a
   sibling listener sharing a port number never reclassifies another's routes.
+- A declared Gateway `parentRef` that resolves no concrete, materializable
+  listener — an absent Gateway, a hostname / sectionName / port / policy gate
+  that clears no listener — materializes **nothing** for that parent (no proxy,
+  upstream, plugin, or materialized-parent record). Status stays
+  `Accepted=False` with `NoMatchingParent` / `NotAllowedByListeners` /
+  `NoMatchingListenerHostname` rather than `Programmed`. The listener-less,
+  port-agnostic claim survives only for the deliberately parentless legacy
+  shape (`spec.parentRefs` absent).
 - `GatewayListenerManager` (`src/proxy/gateway_listener.rs`) binds a real
   socket for every declared listener port in `file`, `database`, and `dp` mode,
   alongside the global `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`
