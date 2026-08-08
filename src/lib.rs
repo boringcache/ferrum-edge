@@ -7623,6 +7623,7 @@ pub mod _test_support {
         >,
         resource: kube::api::ApiResource,
         revision: std::sync::Arc<crate::k8s_controller::revision::K8sConfigRevisionTracker>,
+        metrics: std::sync::Arc<crate::k8s_controller::metrics::ControllerMetrics>,
     }
 
     impl K8sWatchScopeForTest {
@@ -7650,6 +7651,13 @@ pub mod _test_support {
         /// unparsable `resourceVersion` values).
         pub fn revision_stats(&self) -> crate::k8s_controller::revision::K8sRevisionStats {
             self.revision.stats()
+        }
+
+        /// Idle/readiness-timeout relists recorded by the production watcher.
+        /// Demand-driven revision-evidence refreshes deliberately do not
+        /// increment this long-standing metric.
+        pub fn watch_idle_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_idle_relists
         }
 
         /// Raise the demand-driven evidence refresh the reconciler publication
@@ -7862,13 +7870,15 @@ pub mod _test_support {
             Box::pin(std::future::ready(next))
         });
 
+        let metrics =
+            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
         let task = run_watcher_generations(
             target,
             initial_writer,
             store_set.clone(),
             change_notifier,
             RelistPolicy::from_idle_secs(idle_relist_secs),
-            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            std::sync::Arc::clone(&metrics),
             std::sync::Arc::clone(&revision),
             read_boundary,
             shutdown,
@@ -7881,6 +7891,7 @@ pub mod _test_support {
                 senders,
                 resource,
                 revision,
+                metrics,
             },
             task,
         )

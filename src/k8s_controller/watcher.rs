@@ -824,12 +824,18 @@ pub(crate) async fn run_watcher_generations<S, F>(
             // adopt a boundary read taken after the request was raised.
             let refresh_deadline = (refresh_requested && pending.is_none())
                 .then(|| generation_start + REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
-            let deadline = match (idle_deadline, refresh_deadline) {
-                (Some(idle), Some(refresh)) => Some(idle.min(refresh)),
-                (Some(idle), None) => Some(idle),
-                (None, Some(refresh)) => Some(refresh),
-                (None, None) => None,
-            };
+            // Preserve the reason as well as the earliest deadline. An armed
+            // refresh can coexist with an earlier idle deadline; classifying
+            // that wake-up from `refresh_requested` alone would both mislabel
+            // the log and inflate the long-standing `watch_idle_relists`
+            // metric with demand-driven refreshes.
+            let (deadline, relist_for_evidence_refresh) =
+                match (idle_deadline, refresh_deadline) {
+                    (Some(idle), Some(refresh)) if refresh <= idle => (Some(refresh), true),
+                    (Some(idle), Some(_)) | (Some(idle), None) => (Some(idle), false),
+                    (None, Some(refresh)) => (Some(refresh), true),
+                    (None, None) => (None, false),
+                };
 
             tokio::select! {
                 biased;
@@ -844,9 +850,11 @@ pub(crate) async fn run_watcher_generations<S, F>(
                     }
                 }
                 _ = sleep_until_or_pending(deadline) => {
-                    metrics
-                        .watch_idle_relists
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !relist_for_evidence_refresh {
+                        metrics
+                            .watch_idle_relists
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if pending.is_some() {
                         warn!(
                             kind = %target.kind,
@@ -857,7 +865,7 @@ pub(crate) async fn run_watcher_generations<S, F>(
                              retrying (the previous store keeps serving meanwhile)",
                             target.watcher_label
                         );
-                    } else if refresh_requested {
+                    } else if relist_for_evidence_refresh {
                         debug!(
                             kind = %target.kind,
                             api_version = %target.api_version,

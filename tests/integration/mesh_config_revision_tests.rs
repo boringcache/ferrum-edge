@@ -2749,6 +2749,11 @@ async fn a_withheld_publication_can_refresh_evidence_without_waiting_for_the_idl
     );
     assert_eq!(harness.revision_stats().evidence_refresh_requests, 1);
     assert_eq!(harness.revision_stats().unparsable_resource_versions, 0);
+    assert_eq!(
+        harness.watch_idle_relists(),
+        0,
+        "a demand-driven evidence refresh must not be reported as an idle relist"
+    );
 
     let _ = shutdown_tx.send(true);
     let _ = watcher.await;
