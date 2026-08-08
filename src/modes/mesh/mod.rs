@@ -5732,7 +5732,9 @@ fn materialize_mesh_external_udp_egress_upstreams(
         if !service_entry_exported_to_namespace(entry, &runtime.namespace) {
             continue;
         }
-        // The gateway half refuses an entry that declares no host at all
+        // Defense in depth: public admission rejects empty `hosts[]` before
+        // materialization, but slice carriers (xDS / native-slice paths) can
+        // bypass that validator. The gateway half also skips such an entry
         // (`entry.hosts.is_empty()` in `build_egress_proxies_and_upstreams`), so
         // it publishes NO admission for one — not even the endpoint-IP
         // authorities. Materializing a source route here anyway would publish a
@@ -30491,6 +30493,76 @@ mod tests {
         // Explicitly exported: the route materializes as before.
         assert_eq!(materialize(vec!["*".to_string()]), 1);
         assert_eq!(materialize(vec!["default".to_string()]), 1);
+    }
+
+    /// Host-less external STATIC UDP entries are refused source-side (issue #3263).
+    ///
+    /// Public admission rejects empty `hosts[]` before materialization; this
+    /// exercises the defense-in-depth guard in the materializer for slice
+    /// carriers that bypass the operator-input validator.
+    #[test]
+    fn source_side_external_udp_egress_skips_hostless_static_service_entry() {
+        let entry = ServiceEntry {
+            name: "syslog".to_string(),
+            namespace: "default".to_string(),
+            hosts: Vec::new(),
+            endpoints: vec![MeshEndpoint {
+                address: "203.0.113.7".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 514,
+                protocol: AppProtocol::Udp,
+                name: Some("udp".to_string()),
+                target_port: None,
+            }],
+            export_to: vec!["*".to_string()],
+            workload_selector: None,
+        };
+        let slice = MeshSlice {
+            service_entries: vec![entry],
+            ..MeshSlice::default()
+        };
+        let mut runtime = runtime_with_topology(MeshTopology::Sidecar);
+        runtime.namespace = "default".to_string();
+        runtime.egress_stream_enabled = true;
+        runtime.egress_gateway = Some(MeshEgressGatewayEndpoint {
+            host: "ferrum-egress.istio-system.svc.cluster.local".to_string(),
+            port: 15090,
+            spiffe_id: "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"
+                .parse()
+                .expect("gateway spiffe id"),
+        });
+        let mut config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig::default())),
+            ..GatewayConfig::default()
+        };
+
+        materialize_mesh_external_udp_egress_upstreams(&mut config, &runtime, &slice);
+
+        let mesh = config.mesh.as_deref().expect("mesh block");
+        assert!(
+            mesh.external_udp_egress_routes.is_empty(),
+            "a host-less external UDP ServiceEntry must materialize no egress routes"
+        );
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id.starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)),
+            "no external UDP upstream may be synthesized for a host-less entry"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id.starts_with(MESH_EXTERNAL_UDP_RELAY_PROXY_ID_PREFIX)),
+            "no external UDP relay proxy may be synthesized for a host-less entry"
+        );
     }
 
     #[test]
