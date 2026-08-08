@@ -920,11 +920,9 @@ fn se_udp_source_side_routes_respect_total_cap() {
         })
         .collect();
     let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(
-        translation.config,
-        &sidecar_source_runtime_with_gateway(),
-    )
-    .expect("mesh apply");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
+            .expect("mesh apply");
     let routes = &prepared
         .mesh
         .as_deref()
