@@ -10754,21 +10754,37 @@ impl ProxyState {
                     // disappear after its off-thread MMDB generation was
                     // accepted. Claim and publish that handoff rather than
                     // leaving it unowned or retaining stale geo readers.
-                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                    let plugin_cache = self.plugin_cache.build_country_mmdb_reload_inner(
                         &current.plugin_cache,
                         &new_config,
                         false,
-                    )?
-                    else {
+                    )?;
+                    // Gateway listener TLS classification and other projected
+                    // route-table inputs live outside ConfigDelta. An
+                    // incremental snapshot can therefore carry a real class
+                    // flip while every resource identity/timestamp remains
+                    // unchanged; publish the new table before waking the
+                    // listener manager.
+                    let rebuild_routes = Self::projected_route_proxy_content_changed(
+                        &current.config,
+                        &new_config,
+                    ) || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                    if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
-                    };
+                    }
+                    route_changed.set(rebuild_routes);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: Arc::clone(&current.route_table),
-                        plugin_cache,
+                        route_table: if rebuild_routes {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: false,
+                        route_changed: rebuild_routes,
                         lb_changed: false,
                     }));
                 }
@@ -10801,8 +10817,14 @@ impl ProxyState {
             &published.config,
         );
 
+        // `apply_incremental` is a distinct publication path used by database
+        // and CP/DP deltas. Wake socket reconciliation here as well as in the
+        // full-snapshot path; otherwise a newly added/removed listener waits for
+        // the slow supervision tick despite its config already being live.
+        self.bump_config_revision();
+
         let Some(delta) = applied_delta else {
-            debug!("Incremental config: accepted MMDB-only generation republished");
+            debug!("Incremental config: accepted projected route/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
 
