@@ -1357,9 +1357,11 @@ dr_rule_sticky() {
       host: $DR_LIVE_HOST
       export_to: $export_to_yaml
       traffic_policy:
-        load_balancer:
-          consistent_hash:
-            use_source_ip: true
+        # MeshLoadBalancer is an externally tagged enum. The localized file
+        # source parses YAML directly through serde_yaml, whose newtype-enum
+        # representation is a YAML tag rather than JSON's one-key mapping.
+        load_balancer: !consistent_hash
+          use_source_ip: true
 YAML
 }
 
@@ -1371,9 +1373,43 @@ dr_rule_round_robin() {
       host: $DR_LIVE_HOST
       export_to: $export_to_yaml
       traffic_policy:
-        load_balancer:
-          simple: ROUND_ROBIN
+        load_balancer: !simple ROUND_ROBIN
 YAML
+}
+
+# Preserve the exact failing replacement pod's startup evidence. `logs
+# deploy/client` can resolve to the old Ready replica during a failed rolling
+# update and therefore hide the new pod's parse/validation failure; enumerate
+# every client pod and collect both current and previous ferrum-edge logs.
+capture_client_rollout_failure() {
+  local diagnostics="$RESULTS_DIR/client-rollout-failure.txt"
+  local pod
+  : >"$diagnostics"
+  kubectl --context "$CONTEXT" -n "$NS" get pods -l app=client -o wide \
+    >>"$diagnostics" 2>&1 || true
+  while IFS= read -r pod; do
+    [[ -n "$pod" ]] || continue
+    printf '\n=== %s current ferrum-edge log ===\n' "$pod" >>"$diagnostics"
+    kubectl --context "$CONTEXT" -n "$NS" logs "$pod" -c ferrum-edge \
+      --tail=500 >>"$diagnostics" 2>&1 || true
+    printf '\n=== %s previous ferrum-edge log ===\n' "$pod" >>"$diagnostics"
+    kubectl --context "$CONTEXT" -n "$NS" logs "$pod" -c ferrum-edge \
+      --previous --tail=500 >>"$diagnostics" 2>&1 || true
+    printf '\n=== %s describe ===\n' "$pod" >>"$diagnostics"
+    kubectl --context "$CONTEXT" -n "$NS" describe "$pod" \
+      >>"$diagnostics" 2>&1 || true
+  done < <(
+    kubectl --context "$CONTEXT" -n "$NS" get pods -l app=client \
+      -o name 2>/dev/null || true
+  )
+}
+
+restart_client_for_config() {
+  kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
+  if ! kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m; then
+    capture_client_rollout_failure
+    return 1
+  fi
 }
 
 # Re-render the client ConfigMap with the given DestinationRule extras and
@@ -1383,8 +1419,7 @@ reload_client_with_dr_rules() {
   render_client_config \
     "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS" \
     "$DR_BACKEND_A_IP" "$DR_BACKEND_B_IP" "$extra_dr_rules"
-  kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
-  kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
+  restart_client_for_config
 }
 
 # Drive N requests at DR_LIVE_HOST through the captured client egress listener
@@ -1543,8 +1578,7 @@ probe_connect_timeout_two_phase() {
   # Distroless runtime image: no shell/kill, so config reload is a rollout
   # restart (the new pod reads the updated ConfigMap at startup).
   render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
-  kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
-  kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
+  restart_client_for_config
   # Re-settle the positive route first so phase 2 never times a request that
   # raced the fresh pod's slice load.
   local settle settle_status

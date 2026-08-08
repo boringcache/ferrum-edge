@@ -721,14 +721,19 @@ traffic_policy:
     interval_seconds: 10
     base_ejection_seconds: 30
     max_ejection_percent: 50
-  load_balancer:
-    consistent_hash:
-      http_header_name: "x-user-id"
+  load_balancer: !consistent_hash
+    http_header_name: "x-user-id"
 subsets:
   - name: "v1"
     labels:
       version: "v1"
 ```
+
+The YAML file form uses `serde_yaml`'s externally tagged enum syntax for
+`load_balancer`: `!consistent_hash` for a hash policy and
+`!simple ROUND_ROBIN` (or another supported simple algorithm) for a simple
+policy. JSON and native carrier representations continue to use their normal
+externally tagged object form.
 
 **Host matching**: the DR `host` is matched against upstream targets, the upstream `name`, and the upstream `id`. Short hostnames are namespace-completed (`reviews` ⇒ `reviews.{namespace}.svc.*`); namespaced (`reviews.ns`) and `.svc`-suffixed forms are also supported. A short host resolves in the RULE's own namespace, so a cross-namespace rule must use the FQDN form.
 
