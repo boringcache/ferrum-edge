@@ -49,7 +49,9 @@ use crate::config::file_loader;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
-use crate::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+use crate::proxy::gateway_listener::{
+    GatewayListenerHttp3, GatewayListenerManager, GatewayListenerTls,
+};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls;
@@ -1405,7 +1407,7 @@ pub async fn serve(
     // identity) gets a real socket here, in addition to the global proxy
     // ports. Reconciled on every config publication, so SIGHUP reload and
     // in-process `update_config` add/remove listeners without a restart.
-    let gateway_listeners = Arc::new(GatewayListenerManager::new(
+    let gateway_listener_manager = GatewayListenerManager::new(
         proxy_state.clone(),
         env_config.proxy_socket_addr(0).ip(),
         GatewayListenerTls {
@@ -1414,7 +1416,27 @@ pub async fn serve(
                 .as_ref()
                 .and_then(|h| h.slot.clone()),
         },
-    ));
+    );
+    // Every TLS-class Gateway listener port also gets its own QUIC socket, so
+    // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
+    // HTTP/1.1 and HTTP/2.
+    let gateway_listener_manager = if env_config.enable_http3 && tls_config.is_some() {
+        gateway_listener_manager.with_http3(GatewayListenerHttp3 {
+            config: crate::http3::config::Http3ServerConfig::from_env_config(&env_config),
+            tls_policy: tls_policy.clone(),
+            client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
+            client_crls: crls.clone(),
+            tls_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+            tls_revision_rx: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.revision_rx.clone()),
+        })
+    } else {
+        gateway_listener_manager
+    };
+    let gateway_listeners = Arc::new(gateway_listener_manager);
     gateway_listeners.reconcile().await;
     {
         let sh = shutdown_tx.subscribe();

@@ -2795,6 +2795,44 @@ mod tests {
         assert_eq!(cfg.upstreams[0].namespace, "production");
     }
 
+    /// DP backstop for the same metadata the CP now prunes at its own
+    /// boundary: a snapshot that still carries another namespace's Gateway
+    /// listener classification must not survive the DP filter either.
+    #[test]
+    fn filter_config_strips_foreign_gateway_listener_tls_classification() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy_in_namespace("p-prod", "production")],
+            consumers: Vec::new(),
+            plugin_configs: Vec::new(),
+            upstreams: Vec::new(),
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
+            trust_bundles: None,
+            mesh: None,
+            http_tls_listen_ports: [
+                ("production".to_string(), 8443),
+                ("staging".to_string(), 9443),
+            ]
+            .into_iter()
+            .collect(),
+            mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
+        };
+
+        filter_config_to_namespace(&mut cfg, "production");
+
+        assert_eq!(
+            cfg.http_tls_listen_ports,
+            [("production".to_string(), 8443)].into_iter().collect(),
+            "a foreign namespace's listener port/TLS classification must not survive"
+        );
+    }
+
     #[test]
     fn filter_config_returns_zero_when_clean() {
         let mut cfg = GatewayConfig {

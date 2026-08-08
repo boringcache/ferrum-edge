@@ -1638,18 +1638,36 @@ pub async fn run(
     // supervisor reconciles on each config publication, so database polling —
     // add, update, delete, and Gateway/Route withdrawal — reaches the socket
     // set without a restart.
-    let gateway_listeners = Arc::new(
-        crate::proxy::gateway_listener::GatewayListenerManager::new(
-            proxy_state.clone(),
-            env_config.proxy_socket_addr(0).ip(),
-            crate::proxy::gateway_listener::GatewayListenerTls {
-                static_config: tls_config.clone(),
-                reload_slot: proxy_frontend_reload_handles
-                    .as_ref()
-                    .and_then(|h| h.slot.clone()),
-            },
-        ),
+    let gateway_listener_manager = crate::proxy::gateway_listener::GatewayListenerManager::new(
+        proxy_state.clone(),
+        env_config.proxy_socket_addr(0).ip(),
+        crate::proxy::gateway_listener::GatewayListenerTls {
+            static_config: tls_config.clone(),
+            reload_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+        },
     );
+    // Every TLS-class Gateway listener port also gets its own QUIC socket, so
+    // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
+    // HTTP/1.1 and HTTP/2.
+    let gateway_listener_manager = if env_config.enable_http3 && tls_config.is_some() {
+        gateway_listener_manager.with_http3(crate::proxy::gateway_listener::GatewayListenerHttp3 {
+            config: crate::http3::config::Http3ServerConfig::from_env_config(&env_config),
+            tls_policy: tls_policy.clone(),
+            client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
+            client_crls: crls.clone(),
+            tls_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+            tls_revision_rx: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.revision_rx.clone()),
+        })
+    } else {
+        gateway_listener_manager
+    };
+    let gateway_listeners = Arc::new(gateway_listener_manager);
     gateway_listeners.reconcile().await;
     {
         let sh = shutdown_tx.subscribe();

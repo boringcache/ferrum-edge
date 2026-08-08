@@ -125,10 +125,7 @@ fn test_env_config(proxy_http_port: u16, admin_http_port: u16) -> EnvConfig {
     }
 }
 
-fn serve_options(
-    proxy_http: TcpListener,
-    admin_http: TcpListener,
-) -> ServeOptions {
+fn serve_options(proxy_http: TcpListener, admin_http: TcpListener) -> ServeOptions {
     ServeOptions {
         proxy_http: Some(proxy_http),
         proxy_https: None,
@@ -391,12 +388,193 @@ async fn gateway_listener_port_colliding_with_a_reserved_port_is_refused() {
     );
     let failures = handles.gateway_listeners.bind_failures();
     assert!(
-        failures.iter().any(|failure| failure.port == global_proxy_port),
+        failures
+            .iter()
+            .any(|failure| failure.port == global_proxy_port),
         "the refusal must be surfaced, not silent: {failures:?}"
     );
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+}
+
+/// A config publication that lands **between** the readiness reconcile and the
+/// supervisor's first poll must still be applied.
+///
+/// The manager subscribes in `new()`, so the publication is already pending on
+/// the receiver `run()` consumes. Subscribing inside `run()` instead would mark
+/// it as already seen, and because the slow retry tick only reconciles when a
+/// bind failure is outstanding, the socket set would stay stale indefinitely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+
+    let (backend, _b) = start_body_backend(b"listener-a").await;
+    let listener_port = reserve_free_port().await;
+
+    let state = ProxyState::new(
+        config_with(vec![]),
+        DnsCache::new(DnsConfig::default()),
+        test_env_config(0, 0),
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0;
+
+    let manager = std::sync::Arc::new(GatewayListenerManager::new(
+        state.clone(),
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        GatewayListenerTls::default(),
+    ));
+
+    // Readiness reconcile: nothing to bind yet.
+    manager.reconcile().await;
+    assert!(manager.active_ports().await.is_empty());
+
+    // The publication happens HERE — after the readiness reconcile and before
+    // the supervisor task exists.
+    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+        "gw-a",
+        backend,
+        Some(listener_port),
+    )]));
+    assert!(
+        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+        "publication must apply: {outcome:?}"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let supervisor = tokio::spawn(manager.clone().run(shutdown_rx));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if manager.active_ports().await == vec![listener_port] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the publication made before the supervisor started was never reconciled; \
+             failures {:?}",
+            manager.bind_failures()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+}
+
+/// An HTTP↔HTTPS class flip must never leave the retiring plaintext accept
+/// loops running beside the new TLS ones.
+///
+/// With `FERRUM_ACCEPT_THREADS > 1` every accept loop binds the same port
+/// through `SO_REUSEPORT`, so an overlap lets the kernel hand new connections
+/// to whichever generation it likes — plaintext or TLS. Once `reconcile()`
+/// returns, the plaintext generation must be gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_http_to_https_class_flip_retires_the_plaintext_accept_loops_first() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (backend, _b) = start_body_backend(b"listener-a").await;
+    let listener_port = reserve_free_port().await;
+
+    let mut env = test_env_config(0, 0);
+    // The whole point: several SO_REUSEPORT accept loops per listener.
+    env.accept_threads = 4;
+
+    let plaintext = config_with(vec![port_scoped_proxy(
+        "gw-a",
+        backend,
+        Some(listener_port),
+    )]);
+    let state = ProxyState::new(
+        plaintext.clone(),
+        DnsCache::new(DnsConfig::default()),
+        env,
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0;
+
+    let manager = GatewayListenerManager::new(
+        state.clone(),
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        GatewayListenerTls {
+            static_config: Some(self_signed_server_config()),
+            reload_slot: None,
+        },
+    );
+    manager.reconcile().await;
+    assert_eq!(manager.active_ports().await, vec![listener_port]);
+    assert_eq!(
+        http_get(listener_port, "/api/x").await.1,
+        "listener-a",
+        "the plaintext generation serves before the flip"
+    );
+
+    // Flip the same port to TLS.
+    let mut tls_config = plaintext.clone();
+    tls_config.http_tls_listen_ports.insert((
+        ferrum_edge::config::types::default_namespace(),
+        listener_port,
+    ));
+    let outcome = state.update_config(tls_config);
+    assert!(
+        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+        "class flip must apply: {outcome:?}"
+    );
+    manager.reconcile().await;
+    assert_eq!(manager.active_ports().await, vec![listener_port]);
+
+    // Every plaintext accept socket is closed, so no cleartext request can be
+    // answered on this port any more — the kernel has no old-generation socket
+    // left to distribute to.
+    for attempt in 0..20 {
+        if let Ok((status, body)) = try_http_get(listener_port, "/api/x").await {
+            assert_ne!(
+                status, 200,
+                "attempt {attempt}: a retired plaintext accept loop still served \
+                 cleartext on a TLS listener port: {body}"
+            );
+        }
+    }
+
+    manager.shutdown_all().await;
+}
+
+fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+    let params = rcgen::CertificateParams::new(vec![HOST.to_string()]).expect("cert params");
+    let cert = params.self_signed(&key_pair).expect("self-sign cert");
+    let cert_pem = cert.pem();
+    let mut cert_reader = cert_pem.as_bytes();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(Result::ok)
+        .collect();
+    let key_pem = key_pair.serialize_pem();
+    let mut key_reader = key_pem.as_bytes();
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .expect("read private key")
+        .expect("private key present");
+    std::sync::Arc::new(
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
+        .expect("server config"),
+    )
 }
 
 /// The supervisor reconciles asynchronously after a config publication, so

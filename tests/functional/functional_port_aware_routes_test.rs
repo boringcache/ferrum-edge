@@ -371,3 +371,137 @@ fn sighup(gateway: &TestGateway) {
         .args(["-HUP", &pid.to_string()])
         .output();
 }
+
+/// Two **TLS** Gateway listener ports with HTTP/3 enabled.
+///
+/// The single process-global QUIC socket cannot serve either of them (the
+/// single-listener protocol remap is off with two same-class ports), so each
+/// TLS listener port must get its own QUIC socket. This drives the real binary
+/// over HTTP/1.1-or-2 **and** HTTP/3 on both ports, and then withdraws one
+/// listener by SIGHUP to prove the QUIC socket follows the lifecycle.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn functional_port_aware_routes_two_tls_listeners_serve_http3() {
+    use crate::scaffolding::clients::{GetOptions, Http3Client};
+
+    let (backend_a, _ha) = spawn_backend("tls-a").await;
+    let (backend_b, _hb) = spawn_backend("tls-b").await;
+    let port_a = reserve_free_port().await;
+    let port_b = reserve_free_port().await;
+    assert_ne!(port_a, port_b);
+
+    let both = format!(
+        r#"
+version: "1"
+http_tls_listen_ports:
+  - ["ferrum", {port_a}]
+  - ["ferrum", {port_b}]
+proxies:{}{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-a", port_a, backend_a),
+        plaintext_proxy("gw-b", port_b, backend_b),
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(both)
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway");
+
+    wait_until_listening(port_a, "TLS Gateway listener A").await;
+    wait_until_listening(port_b, "TLS Gateway listener B").await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("build TLS client");
+    assert_eq!(get_on_tls_port(&client, port_a, "/api/x").await.1, "tls-a");
+    assert_eq!(get_on_tls_port(&client, port_b, "/api/x").await.1, "tls-b");
+
+    // HTTP/3 on BOTH TLS listener ports — the case a single global UDP socket
+    // cannot cover.
+    assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
+    assert_eq!(h3_body(port_b, "/api/x").await, "tls-b");
+
+    // ── Withdraw listener B ──────────────────────────────────────────────
+    let config_path = gateway
+        .config_path
+        .as_ref()
+        .expect("file-mode harness must populate config_path");
+    let only_a = format!(
+        r#"
+version: "1"
+http_tls_listen_ports:
+  - ["ferrum", {port_a}]
+proxies:{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-a", port_a, backend_a),
+    );
+    std::fs::write(config_path, only_a).expect("rewrite config");
+    sighup(&gateway);
+    wait_until_not_listening(port_b, "withdrawn TLS Gateway listener B").await;
+
+    // The withdrawn port's QUIC socket goes with it; the survivor keeps
+    // serving HTTP/3.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let client = Http3Client::insecure().expect("H3 client");
+        let attempt = client
+            .get_with_options(
+                &format!("https://127.0.0.1:{port_b}/api/x"),
+                GetOptions::default().header("host", HOST),
+            )
+            .await;
+        if attempt.is_err() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the withdrawn TLS listener kept serving HTTP/3"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
+}
+
+/// One HTTP/3 GET against a Gateway listener port, retried until the QUIC
+/// socket is accepting (listener bind is asynchronous relative to readiness).
+#[cfg(unix)]
+async fn h3_body(port: u16, path: &str) -> String {
+    use crate::scaffolding::clients::{GetOptions, Http3Client};
+
+    let url = format!("https://127.0.0.1:{port}{path}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let client = Http3Client::insecure().expect("H3 client");
+        match client
+            .get_with_options(&url, GetOptions::default().header("host", HOST))
+            .await
+        {
+            Ok(response) => {
+                assert_eq!(
+                    response.status.as_u16(),
+                    200,
+                    "HTTP/3 on Gateway listener port {port} must serve"
+                );
+                return String::from_utf8_lossy(&response.body_bytes).to_string();
+            }
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "HTTP/3 never reached Gateway listener port {port}: {error}"
+                );
+                sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}

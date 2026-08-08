@@ -407,7 +407,10 @@ async fn test_http3_proxy_state_creation() {
                 ),
             )
         },
-        alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        alt_svc_header: Some(std::sync::Arc::from("h3=\":8443\"; ma=86400")),
+        gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,
@@ -707,7 +710,10 @@ async fn test_http3_full_integration() {
                 ),
             )
         },
-        alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        alt_svc_header: Some(std::sync::Arc::from("h3=\":8443\"; ma=86400")),
+        gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,

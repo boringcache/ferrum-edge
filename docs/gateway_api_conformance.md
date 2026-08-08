@@ -241,6 +241,15 @@ distinguishable both in the route table and on the wire:
   sibling claims on other listeners. The arbitration domain is the resolved
   `GatewayApiListenerKey`, not the numeric port, so sibling listeners that
   merely share a port are independent.
+- Same-kind route merging keys on the **exact admitting listener**, never on the
+  numeric port. Two Gateways (or two sibling listeners) sharing a port never
+  have their dispatch rules or default backends combined, because Gateway API
+  attached each Route to only one of them. If two different listeners would
+  materialize the *same* `(namespace, hosts, listen path, listen port)` slot,
+  that claim is physically ambiguous — one socket, one route-table slot, two
+  contracts — so **both** sides are refused with a translator warning rather
+  than letting observation order decide. Same-port listeners with disjoint
+  hostnames are unaffected and keep serving independently.
 - A numeric port claimed by two listeners with incompatible physical shapes —
   one plaintext and one TLS-terminating, or two TLS listeners resolving to
   different credentials — is refused at admission. One socket cannot serve
@@ -264,11 +273,32 @@ without a restart. Two bounds are deliberate and tested:
   way the failure is logged and surfaced on
   `GatewayListenerManager::bind_failures`, and routes scoped to that listener
   stay unreachable rather than being served somewhere else.
+- **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
+  accept-loop task is awaited before the replacement binds, so with
+  `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
+  never coexist on one port. Already accepted connections keep draining.
+- **A listener that stops serving is rebound.** A started listener whose accept
+  loop later ends — cleanly, with an error, or by panic — is reaped on the next
+  reconcile, surfaced as a bind failure, and rebound; finished drains are reaped
+  too, so completed handles never accumulate for the life of the process.
 
-**Residual.** The same-port incompatible-shape refusal is reported as a
-translator warning and through the attached Routes' `Accepted` conditions (a
-refused listener admits no route). A dedicated `Conflicted` condition on the
-Gateway's own `status.listeners[]` entry for that case is not yet written.
+**Listener status for a refused port.** The same-port incompatible-shape
+refusal is reported on the Gateway's own `status.listeners[]` entry, not only as
+a translator warning: every refused listener reports `Conflicted=True`
+(`ProtocolConflict` for plaintext-vs-TLS, `HostnameConflict` for TLS siblings
+resolving to different credentials), `Accepted=False` with `PortUnavailable`,
+and `Programmed=False`. `ResolvedRefs` still describes that listener's own
+references, which the port conflict does not invalidate.
+
+**HTTP/3 on Gateway listener ports.** When `FERRUM_ENABLE_HTTP3=true` and
+frontend TLS is configured, every TLS-class Gateway listener port also gets its
+own QUIC socket, added, withdrawn and class-flipped with its TCP listener. Two
+TLS listener ports are therefore reachable over HTTP/3 as well as HTTP/1.1 and
+HTTP/2. `Alt-Svc` is advertised per frontend port and only where a QUIC socket
+really exists, so a client is never steered from a port-scoped listener to the
+global HTTPS port whose route table cannot match the port-scoped route. A port
+whose QUIC bind fails keeps serving H1/H2, reports the failure on
+`GatewayListenerManager::bind_failures`, advertises no HTTP/3, and is retried.
 
 **Single-listener protocol remap.** When the whole route table declares exactly
 one listener port of a protocol class, a request arriving on the global process

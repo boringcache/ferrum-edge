@@ -5583,9 +5583,16 @@ pub struct ProxyState {
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
     pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
-    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
-    /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
-    pub alt_svc_header: Option<String>,
+    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement on the
+    /// process-global proxy ports. `None` when HTTP/3 is disabled; avoids a
+    /// `format!()` allocation per response.
+    pub alt_svc_header: Option<Arc<str>>,
+    /// Pre-computed Alt-Svc values for dynamically bound Gateway API listener
+    /// ports that really have a QUIC socket, published by
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] on each
+    /// reconcile. Read lock-free; a port that is absent advertises nothing,
+    /// so a client is never steered to a port with no HTTP/3 listener.
+    pub gateway_h3_alt_svc: Arc<ArcSwap<HashMap<u16, Arc<str>>>>,
     /// Pre-computed Via header values per protocol version (RFC 9110 §7.6.3).
     /// `None` when `FERRUM_ADD_VIA_HEADER=false` (default). Keyed by protocol version string.
     pub via_header_http11: Option<String>,
@@ -6998,8 +7005,11 @@ impl ProxyState {
             ));
         }
 
-        let alt_svc_header = if env_config.enable_http3 {
-            Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
+        let alt_svc_header: Option<Arc<str>> = if env_config.enable_http3 {
+            Some(Arc::from(format!(
+                "h3=\":{}\"; ma=86400",
+                env_config.proxy_https_port
+            )))
         } else {
             None
         };
@@ -7482,6 +7492,7 @@ impl ProxyState {
             backend_capabilities,
             backend_capabilities_refresh,
             alt_svc_header,
+            gateway_h3_alt_svc: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             via_header_http11,
             via_header_http2,
             via_header_http3,
@@ -7626,6 +7637,40 @@ impl ProxyState {
     /// withdrawal without polling.
     pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
         self.config_revision_tx.subscribe()
+    }
+
+    /// The Alt-Svc value to advertise for the frontend port a request arrived
+    /// on, or `None` when HTTP/3 is not reachable there.
+    ///
+    /// HTTP/3 lives on a UDP socket, so it is only advertisable where one
+    /// exists. The process-global proxy ports keep the precomputed value; a
+    /// Gateway API listener port advertises itself only while
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] has a QUIC
+    /// listener bound on it. Advertising the global HTTPS port from a
+    /// port-scoped listener would steer the client to a socket whose route
+    /// table cannot match the port-scoped route. One `ArcSwap` load and one
+    /// small-map lookup; no allocation and no lock.
+    pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
+        let global = self.alt_svc_header.as_ref()?;
+        match frontend_port {
+            Some(port)
+                if port != self.env_config.proxy_https_port
+                    && port != self.env_config.proxy_http_port =>
+            {
+                self.gateway_h3_alt_svc.load().get(&port).cloned()
+            }
+            _ => Some(Arc::clone(global)),
+        }
+    }
+
+    /// Publish the Gateway API listener ports that currently have a live QUIC
+    /// listener, with their precomputed Alt-Svc values.
+    pub fn publish_gateway_h3_alt_svc(&self, ports: &[u16]) {
+        let map: HashMap<u16, Arc<str>> = ports
+            .iter()
+            .map(|port| (*port, Arc::from(format!("h3=\":{port}\"; ma=86400"))))
+            .collect();
+        self.gateway_h3_alt_svc.store(Arc::new(map));
     }
 
     /// Notify config watchers that a new config generation is live.
@@ -32460,9 +32505,10 @@ async fn handle_proxy_request_inner(
         resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
     }
 
-    // Advertise HTTP/3 availability via pre-computed Alt-Svc header
-    if let Some(ref alt_svc) = state.alt_svc_header {
-        resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
+    // Advertise HTTP/3 availability via pre-computed Alt-Svc header, for the
+    // frontend port this request actually arrived on.
+    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
+        resp_builder = resp_builder.header("alt-svc", alt_svc.as_ref());
     }
 
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
@@ -32566,7 +32612,7 @@ async fn handle_proxy_request_inner(
             gateway_owned_headers
                 .insert(headers_mod::GatewayOwnedResponseHeader::GatewayUpstreamStatus);
         }
-        if let Some(alt_svc) = state.alt_svc_header.as_ref() {
+        if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
             final_headers.insert("alt-svc".into(), alt_svc.to_string());
             gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::AltSvc);
         }

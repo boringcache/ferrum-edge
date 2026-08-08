@@ -4462,7 +4462,7 @@ impl GatewayConfig {
                     }
                 }
             } else if let Some(port) = proxy.listen_port
-                && port < 1
+                && port == 0
             {
                 errors.push(format!(
                     "HTTP proxy '{}' has invalid listen_port {} (must be >= 1)",

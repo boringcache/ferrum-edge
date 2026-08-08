@@ -1346,7 +1346,7 @@ fn gateway_status(
         Value::Array(gateway_listener_statuses(
             object,
             indexes,
-            result.ok().map(|translation| &translation.config),
+            result.ok(),
             accepted,
             status_context.data_plane_ready,
         )),
@@ -1369,10 +1369,11 @@ fn gateway_status_address(address: &str) -> Value {
 fn gateway_listener_statuses(
     gateway: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
-    config: Option<&GatewayConfig>,
+    translation: Option<&crate::config_sources::k8s::K8sTranslation>,
     gateway_accepted: bool,
     data_plane_ready: bool,
 ) -> Vec<Value> {
+    let config = translation.map(|translation| &translation.config);
     gateway
         .spec
         .get("listeners")
@@ -1394,13 +1395,29 @@ fn gateway_listener_statuses(
             let route_kinds = listener_route_kind_status(protocol, listener);
             let listener_validation_error =
                 validate_gateway_listener_allowed_routes(listener).err();
-            let accepted = gateway_accepted
+            // A listener the translator refused for a physical same-port shape
+            // conflict is unservable no matter how valid its own spec is: it
+            // reports `Conflicted=True`, `Accepted=False`/`PortUnavailable`,
+            // and `Programmed=False`. `ResolvedRefs` still describes the
+            // listener's own references, which the conflict does not touch.
+            let conflict = translation.and_then(|translation| {
+                translation
+                    .listener_conflicts
+                    .get(&crate::config_sources::k8s::GatewayApiListenerKey {
+                        namespace: gateway.metadata.namespace.clone(),
+                        gateway: gateway.metadata.name.clone(),
+                        listener: listener_name.to_string(),
+                    })
+            });
+            let spec_accepted = gateway_accepted
                 && route_kinds.protocol_supported
                 && listener_validation_error.is_none();
-            let resolved_refs = accepted && references.resolved && route_kinds.route_kinds_valid;
+            let accepted = spec_accepted && conflict.is_none();
+            let resolved_refs =
+                spec_accepted && references.resolved && route_kinds.route_kinds_valid;
             let materialized = config
                 .is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
-            let programmed = resolved_refs && materialized && data_plane_ready;
+            let programmed = resolved_refs && materialized && data_plane_ready && conflict.is_none();
             let unresolved_reason = if listener_validation_error.is_some() {
                 "Invalid"
             } else if !route_kinds.route_kinds_valid {
@@ -1422,6 +1439,11 @@ fn gateway_listener_statuses(
                 "UnsupportedProtocol"
             } else if listener_validation_error.is_some() {
                 "Invalid"
+            } else if conflict.is_some() {
+                // The listener spec is valid; the PORT cannot be allocated for
+                // it because a sibling listener claims it with an
+                // incompatible frontend shape.
+                "PortUnavailable"
             } else {
                 "Accepted"
             };
@@ -1431,6 +1453,8 @@ fn gateway_listener_statuses(
                 "Ferrum supports protocol TLS only with spec.listeners[].tls.mode=Passthrough"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
+            } else if let Some(conflict) = conflict {
+                conflict.message.as_str()
             } else {
                 validation_message
                     .as_deref()
@@ -1452,7 +1476,7 @@ fn gateway_listener_statuses(
                     resolved_refs,
                     if resolved_refs {
                         "ResolvedRefs"
-                    } else if accepted {
+                    } else if spec_accepted {
                         unresolved_reason
                     } else if listener_validation_error.is_some() {
                         "Invalid"
@@ -1461,7 +1485,7 @@ fn gateway_listener_statuses(
                     },
                     if resolved_refs {
                         "All listener references accepted by Ferrum"
-                    } else if accepted || listener_validation_error.is_some() {
+                    } else if spec_accepted || listener_validation_error.is_some() {
                         unresolved_message
                     } else {
                         "Ferrum could not resolve this listener"
@@ -1474,6 +1498,8 @@ fn gateway_listener_statuses(
                     programmed,
                     if programmed {
                         "Programmed"
+                    } else if conflict.is_some() {
+                        "Invalid"
                     } else if accepted && !resolved_refs {
                         unresolved_reason
                     } else if listener_validation_error.is_some() {
@@ -1487,6 +1513,8 @@ fn gateway_listener_statuses(
                     },
                     if programmed {
                         "Ferrum programmed this listener"
+                    } else if let Some(conflict) = conflict {
+                        conflict.message.as_str()
                     } else if (accepted && !resolved_refs)
                         || listener_validation_error.is_some()
                     {
@@ -1503,9 +1531,12 @@ fn gateway_listener_statuses(
                     gateway,
                     existing_listener_conditions,
                     "Conflicted",
-                    false,
-                    "NoConflicts",
-                    "No Gateway API listener conflicts detected by Ferrum",
+                    conflict.is_some(),
+                    conflict.map_or("NoConflicts", |conflict| conflict.reason),
+                    conflict.map_or(
+                        "No Gateway API listener conflicts detected by Ferrum",
+                        |conflict| conflict.message.as_str(),
+                    ),
                 ),
             ];
             json!({

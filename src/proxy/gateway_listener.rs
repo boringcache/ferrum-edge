@@ -14,12 +14,18 @@
 //!
 //! # Lifecycle contract
 //!
-//! - **Startup.** The first reconcile runs inside the mode's serve path, before
-//!   it reports readiness, so a config present at startup is already listening.
-//!   A bind failure there is **not** fatal in any mode — see "Ports this
-//!   manager refuses" below.
-//! - **Update.** A port whose TLS class changed is closed and rebound, because
-//!   plaintext and TLS are different sockets.
+//! - **Startup.** The manager subscribes to config publications in
+//!   [`GatewayListenerManager::new`], *before* the mode's first reconcile, and
+//!   the supervisor consumes that same receiver. A publication that lands
+//!   between the readiness reconcile and [`GatewayListenerManager::run`] is
+//!   therefore still delivered — it cannot be swallowed as "already seen".
+//! - **Update.** A port whose TLS class changed is closed, **awaited**, and
+//!   only then rebound: with `FERRUM_ACCEPT_THREADS > 1` both generations bind
+//!   the same port through `SO_REUSEPORT`, so an overlap would let the kernel
+//!   hand new connections to the retiring plaintext (or TLS) accept loop.
+//!   Awaiting the accept-loop task closes every accept socket first; already
+//!   accepted connections keep draining in their own tasks through the cloned
+//!   shutdown receivers they hold.
 //! - **Removal / withdrawal.** Routes are withdrawn by the atomic
 //!   `ArcSwap` config publish that *precedes* this reconcile, so from the
 //!   instant a listener leaves the config its port answers `404` — never stale
@@ -28,9 +34,26 @@
 //!   signal and then drains in-flight requests under the normal graceful
 //!   shutdown budget. The bounded window is therefore "already-accepted
 //!   connections finish; nothing new is routed", not "traffic keeps being
-//!   served".
+//!   served". Finished drains are reaped on every reconcile, so completed
+//!   handles never accumulate until process exit.
+//! - **Supervision.** A started listener whose task later finishes — cleanly,
+//!   with an error, or by panic — is reaped on the next reconcile, surfaced on
+//!   [`GatewayListenerManager::bind_failures`], and rebound. A dead accept loop
+//!   is never mistaken for a healthy port.
 //! - **Shutdown.** The global shutdown signal closes every managed listener and
-//!   the manager awaits their drains before returning.
+//!   the manager awaits their drains, logging both listener errors
+//!   (`Ok(Err(..))`) and join failures (`Err(..)`), before returning.
+//!
+//! # HTTP/3
+//!
+//! When HTTP/3 is enabled and frontend TLS is configured, every TLS-class
+//! Gateway listener port also gets its own QUIC socket, added, withdrawn and
+//! class-flipped with the TCP listener it accompanies. Without that a
+//! TLS-classified port is reachable over HTTP/1.1 and HTTP/2 but not HTTP/3,
+//! and the port-aware H3 route lookup would have no socket to run on. The ports
+//! that really have a QUIC listener are published to
+//! `ProxyState::gateway_h3_alt_svc`, so `Alt-Svc` advertises HTTP/3 only where
+//! it exists.
 //!
 //! # Ports this manager refuses
 //!
@@ -170,10 +193,31 @@ pub struct GatewayListenerBindFailure {
     pub error: String,
 }
 
+type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
+
 struct LiveListener {
     class: GatewayListenerClass,
     shutdown_tx: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    /// The TCP accept-loop task. Returns once every accept socket is closed;
+    /// accepted connections drain in their own tasks.
+    tcp: ListenerTask,
+    /// The QUIC listener task on the same port, when HTTP/3 is enabled and this
+    /// is a TLS-class listener.
+    quic: Option<ListenerTask>,
+}
+
+impl LiveListener {
+    /// Whether either task has ended. A started listener whose accept loop has
+    /// exited is not a healthy port, however it exited.
+    fn is_finished(&self) -> bool {
+        self.tcp.is_finished() || self.quic.as_ref().is_some_and(ListenerTask::is_finished)
+    }
+
+    fn tasks(self) -> Vec<ListenerTask> {
+        let mut tasks = vec![self.tcp];
+        tasks.extend(self.quic);
+        tasks
+    }
 }
 
 /// TLS material for Gateway listeners that terminate TLS.
@@ -190,34 +234,106 @@ impl GatewayListenerTls {
     fn is_configured(&self) -> bool {
         self.static_config.is_some() || self.reload_slot.is_some()
     }
+
+    /// The `ServerConfig` a QUIC listener starts from.
+    ///
+    /// The reload slot is preferred, exactly as for TCP; an empty slot (DP
+    /// before its first CP-delivered TLS overlay) is not an error — the H3
+    /// listener binds disabled and enables itself on the reload path.
+    fn quic_initial_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        if let Some(slot) = self.reload_slot.as_ref() {
+            let current = slot.load_full();
+            if let Some(config) = (*current).clone() {
+                return Some(config);
+            }
+        }
+        self.static_config.clone()
+    }
+}
+
+/// HTTP/3 inputs for TLS-class Gateway listener ports.
+///
+/// Present only when `FERRUM_ENABLE_HTTP3` is on and the mode resolved frontend
+/// TLS; the fields mirror the global H3 listener's so a dynamic port behaves
+/// identically to `FERRUM_PROXY_HTTPS_PORT`.
+#[derive(Clone)]
+pub struct GatewayListenerHttp3 {
+    pub config: crate::http3::config::Http3ServerConfig,
+    pub tls_policy: crate::tls::TlsPolicy,
+    pub client_ca_bundle_path: Option<String>,
+    pub client_crls: crate::tls::CrlList,
+    /// Frontend TLS live-reload inputs, when the mode enabled reload. Held as
+    /// parts because `Http3FrontendTlsReload` is built per listener.
+    pub tls_slot: Option<crate::tls::SharedFrontendTls>,
+    pub tls_revision_rx: Option<watch::Receiver<u64>>,
+}
+
+impl GatewayListenerHttp3 {
+    fn frontend_tls_reload(&self) -> Option<crate::http3::server::Http3FrontendTlsReload> {
+        let tls_slot = self.tls_slot.clone()?;
+        let revision_rx = self.tls_revision_rx.clone()?;
+        Some(crate::http3::server::Http3FrontendTlsReload {
+            tls_slot,
+            revision_rx,
+        })
+    }
 }
 
 pub struct GatewayListenerManager {
     state: ProxyState,
     bind_addr: std::net::IpAddr,
     tls: GatewayListenerTls,
+    http3: Option<GatewayListenerHttp3>,
     listeners: Mutex<BTreeMap<u16, LiveListener>>,
-    /// Draining listeners whose port left the config. Awaited at shutdown so a
+    /// Draining listeners whose port left the config. Finished handles are
+    /// reaped on every reconcile and the rest are awaited at shutdown, so a
     /// removal never leaks a task past process exit.
-    draining: Mutex<Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>,
+    draining: Mutex<Vec<ListenerTask>>,
+    /// Config-publication receiver, created in [`Self::new`] — before the
+    /// mode's readiness reconcile — and consumed by [`Self::run`]. Subscribing
+    /// inside `run` would mark every publication since construction as already
+    /// seen, and the slow retry tick only reconciles when a bind failure is
+    /// outstanding, so a missed publication could stay missed indefinitely.
+    revisions: Mutex<Option<watch::Receiver<u64>>>,
     bind_failures: arc_swap::ArcSwap<Vec<GatewayListenerBindFailure>>,
 }
 
 impl GatewayListenerManager {
     pub fn new(state: ProxyState, bind_addr: std::net::IpAddr, tls: GatewayListenerTls) -> Self {
+        let revisions = state.subscribe_config_revision();
         Self {
             state,
             bind_addr,
             tls,
+            http3: None,
             listeners: Mutex::new(BTreeMap::new()),
             draining: Mutex::new(Vec::new()),
+            revisions: Mutex::new(Some(revisions)),
             bind_failures: arc_swap::ArcSwap::from_pointee(Vec::new()),
         }
+    }
+
+    /// Bind a QUIC listener beside every TLS-class Gateway listener port.
+    #[must_use]
+    pub fn with_http3(mut self, http3: GatewayListenerHttp3) -> Self {
+        self.http3 = Some(http3);
+        self
     }
 
     /// Ports currently bound by this manager, for tests and diagnostics.
     pub async fn active_ports(&self) -> Vec<u16> {
         self.listeners.lock().await.keys().copied().collect()
+    }
+
+    /// Ports that currently have a live QUIC listener, for tests and
+    /// diagnostics.
+    pub async fn active_http3_ports(&self) -> Vec<u16> {
+        self.listeners
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(port, listener)| listener.quic.is_some().then_some(*port))
+            .collect()
     }
 
     /// Most recent refusals / bind failures. Lock-free read.
@@ -249,7 +365,28 @@ impl GatewayListenerManager {
             );
         }
 
+        self.reap_finished_drains().await;
+
         let mut live = self.listeners.lock().await;
+
+        // Reap listeners whose task ended after startup. A finished accept loop
+        // means the port is no longer served; leaving the entry in place would
+        // make every later reconcile treat it as healthy and never rebind.
+        let dead: Vec<u16> = live
+            .iter()
+            .filter_map(|(port, listener)| listener.is_finished().then_some(*port))
+            .collect();
+        for port in dead {
+            if let Some(listener) = live.remove(&port) {
+                let _ = listener.shutdown_tx.send(true);
+                let (error, pending) = Self::describe_ended_listener(listener).await;
+                if !pending.is_empty() {
+                    self.draining.lock().await.extend(pending);
+                }
+                error!(port, "Gateway API listener ended unexpectedly: {error}");
+                failures.push(GatewayListenerBindFailure { port, error });
+            }
+        }
 
         // Close listeners whose port left the config, and rebind ports whose
         // TLS class changed — a socket is plaintext or TLS, never both.
@@ -259,20 +396,72 @@ impl GatewayListenerManager {
                 (plan.ports.get(port) != Some(&listener.class)).then_some(*port)
             })
             .collect();
+        // Ports whose retiring generation has not finished closing its accept
+        // sockets. Rebinding them in this pass could co-serve two classes, so
+        // they are left unbound and retried.
+        let mut defer_rebind: BTreeSet<u16> = BTreeSet::new();
         for port in stale {
-            if let Some(listener) = live.remove(&port) {
-                info!(
-                    port,
-                    "Closing Gateway API {} listener — no longer declared by config",
-                    listener.class.label()
-                );
-                let _ = listener.shutdown_tx.send(true);
-                self.draining.lock().await.push(listener.task);
+            let Some(listener) = live.remove(&port) else {
+                continue;
+            };
+            let class_flip = plan.ports.contains_key(&port);
+            info!(
+                port,
+                "Closing Gateway API {} listener — {}",
+                listener.class.label(),
+                if class_flip {
+                    "its frontend class changed"
+                } else {
+                    "no longer declared by config"
+                }
+            );
+            let _ = listener.shutdown_tx.send(true);
+            if class_flip {
+                // The replacement binds the same port. With
+                // `FERRUM_ACCEPT_THREADS > 1` both generations use
+                // SO_REUSEPORT, so until every old accept socket is closed the
+                // kernel could hand new connections to the retiring class.
+                // Await the accept-loop task — accepted connections keep
+                // draining independently through their cloned shutdown
+                // receivers.
+                let mut retired = true;
+                let mut pending: Vec<ListenerTask> = Vec::new();
+                for task in listener.tasks() {
+                    match Self::await_listener_task(port, task).await {
+                        Ok(()) => {}
+                        Err(task) => {
+                            retired = false;
+                            pending.push(task);
+                        }
+                    }
+                }
+                if !retired {
+                    // Fail closed: keep the port unbound rather than starting
+                    // the new class beside accept loops that are still up.
+                    let error = format!(
+                        "port {port} did not finish retiring its previous frontend class within \
+                         {}s; the replacement listener is deferred to the next reconcile",
+                        CLASS_FLIP_RETIRE_TIMEOUT.as_secs()
+                    );
+                    warn!(port, "Gateway API listener class flip deferred: {error}");
+                    failures.push(GatewayListenerBindFailure { port, error });
+                    defer_rebind.insert(port);
+                    self.draining.lock().await.extend(pending);
+                }
+            } else {
+                self.draining.lock().await.extend(listener.tasks());
             }
         }
 
         for (port, class) in &plan.ports {
-            if live.contains_key(port) {
+            if defer_rebind.contains(port) {
+                continue;
+            }
+            if let Some(listener) = live.get_mut(port) {
+                // Retry a QUIC socket that did not come up with its TCP peer.
+                if let Some(error) = self.ensure_quic(*port, listener).await {
+                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                }
                 continue;
             }
             if *class == GatewayListenerClass::Tls && !self.tls.is_configured() {
@@ -285,7 +474,10 @@ impl GatewayListenerManager {
                 continue;
             }
             match self.spawn_listener(*port, *class).await {
-                Ok(listener) => {
+                Ok(mut listener) => {
+                    if let Some(error) = self.ensure_quic(*port, &mut listener).await {
+                        failures.push(GatewayListenerBindFailure { port: *port, error });
+                    }
                     live.insert(*port, listener);
                 }
                 Err(error) => {
@@ -294,10 +486,149 @@ impl GatewayListenerManager {
                 }
             }
         }
+
+        let h3_ports: Vec<u16> = live
+            .iter()
+            .filter_map(|(port, listener)| listener.quic.is_some().then_some(*port))
+            .collect();
         drop(live);
 
+        // Advertise HTTP/3 only where a QUIC socket really exists.
+        self.state.publish_gateway_h3_alt_svc(&h3_ports);
         self.bind_failures.store(Arc::new(failures.clone()));
         failures
+    }
+
+    /// Drop finished drains so completed handles cannot accumulate for the life
+    /// of the process, logging anything they failed with.
+    async fn reap_finished_drains(&self) {
+        let mut draining = self.draining.lock().await;
+        let mut retained = Vec::with_capacity(draining.len());
+        for task in std::mem::take(&mut *draining) {
+            if task.is_finished() {
+                Self::log_listener_task_outcome(task.await);
+            } else {
+                retained.push(task);
+            }
+        }
+        *draining = retained;
+    }
+
+    /// Render why a listener stopped serving, awaiting each of its tasks under
+    /// the same bounded budget as a class flip. Tasks that have not finished are
+    /// returned so the caller can leave them draining instead of blocking.
+    async fn describe_ended_listener(listener: LiveListener) -> (String, Vec<ListenerTask>) {
+        let mut reasons: Vec<String> = Vec::new();
+        let mut pending: Vec<ListenerTask> = Vec::new();
+        for mut task in listener.tasks() {
+            match tokio::time::timeout(CLASS_FLIP_RETIRE_TIMEOUT, &mut task).await {
+                Ok(Ok(Ok(()))) => reasons.push("accept loop exited without error".to_string()),
+                Ok(Ok(Err(err))) => reasons.push(format!("{err:#}")),
+                Ok(Err(err)) => reasons.push(format!("listener task ended abnormally: {err}")),
+                Err(_) => {
+                    reasons.push("a sibling listener task is still draining".to_string());
+                    pending.push(task);
+                }
+            }
+        }
+        (
+            format!(
+                "the listener stopped serving and is being rebound ({})",
+                reasons.join("; ")
+            ),
+            pending,
+        )
+    }
+
+    /// Await a retiring listener task under a bound. `Err(task)` hands the
+    /// still-running task back so the caller can defer instead of assuming the
+    /// old generation is gone.
+    async fn await_listener_task(port: u16, mut task: ListenerTask) -> Result<(), ListenerTask> {
+        // `JoinHandle` is `Future + Unpin`, so the borrow keeps the handle
+        // usable when the budget expires — the task is deferred, never leaked.
+        match tokio::time::timeout(CLASS_FLIP_RETIRE_TIMEOUT, &mut task).await {
+            Ok(outcome) => {
+                Self::log_listener_task_outcome(outcome);
+                Ok(())
+            }
+            Err(_) => {
+                warn!(
+                    port,
+                    "Gateway API listener did not stop accepting within the retire budget"
+                );
+                Err(task)
+            }
+        }
+    }
+
+    fn log_listener_task_outcome(
+        outcome: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ) {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!("Gateway API listener returned an error: {err:#}"),
+            Err(err) => warn!("Gateway API listener task ended abnormally: {err}"),
+        }
+    }
+
+    /// Bind the QUIC socket for a TLS-class listener when HTTP/3 is enabled.
+    ///
+    /// Returns the failure reason when the QUIC listener could not be started.
+    /// The TCP listener keeps serving H1/H2 in that case and the QUIC bind is
+    /// retried on the next reconcile / retry tick; `Alt-Svc` does not advertise
+    /// HTTP/3 for the port until the socket exists, so no client is steered at
+    /// a socket that is not there.
+    async fn ensure_quic(&self, port: u16, listener: &mut LiveListener) -> Option<String> {
+        let http3 = self.http3.as_ref()?;
+        if listener.class != GatewayListenerClass::Tls || listener.quic.is_some() {
+            return None;
+        }
+        let Some(tls_config) = self.tls.quic_initial_config() else {
+            return Some(format!(
+                "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is not \
+                 served on this Gateway listener port"
+            ));
+        };
+        let addr = SocketAddr::new(self.bind_addr, port);
+        let (started_tx, started_rx) = oneshot::channel();
+        let state = self.state.clone();
+        let shutdown_rx = listener.shutdown_tx.subscribe();
+        let h3_config = http3.config.clone();
+        let tls_policy = http3.tls_policy.clone();
+        let options = crate::http3::server::Http3ListenerOptions {
+            client_ca_bundle_path: http3.client_ca_bundle_path.clone(),
+            client_crls: http3.client_crls.clone(),
+            started_tx: Some(started_tx),
+            frontend_tls_reload: http3.frontend_tls_reload(),
+        };
+        let task = tokio::spawn(async move {
+            crate::http3::server::start_http3_listener_with_signal(
+                addr,
+                state,
+                shutdown_rx,
+                tls_config,
+                h3_config,
+                &tls_policy,
+                options,
+            )
+            .await
+        });
+        match started_rx.await {
+            Ok(()) => {
+                info!(port, "Gateway API HTTP/3 (QUIC) listener started on {addr}");
+                listener.quic = Some(task);
+                None
+            }
+            Err(_) => {
+                let error = match task.await {
+                    Ok(Err(err)) => format!("{err:#}"),
+                    Ok(Ok(())) => "HTTP/3 listener exited before reporting readiness".to_string(),
+                    Err(err) => format!("HTTP/3 listener task panicked: {err}"),
+                };
+                error!(port, "Gateway API HTTP/3 listener bind failed: {error}");
+                Some(error)
+            }
+        }
     }
 
     async fn spawn_listener(
@@ -359,7 +690,8 @@ impl GatewayListenerManager {
                 Ok(LiveListener {
                     class,
                     shutdown_tx,
-                    task,
+                    tcp: task,
+                    quic: None,
                 })
             }
             Err(_) => Err(match task.await {
@@ -376,17 +708,19 @@ impl GatewayListenerManager {
             let mut live = self.listeners.lock().await;
             std::mem::take(&mut *live).into_values().collect()
         };
-        let mut tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+        let mut tasks: Vec<ListenerTask> = Vec::new();
         for listener in listeners {
             let _ = listener.shutdown_tx.send(true);
-            tasks.push(listener.task);
+            tasks.extend(listener.tasks());
         }
         tasks.append(&mut *self.draining.lock().await);
         for task in tasks {
-            if let Err(err) = task.await {
-                warn!("Gateway API listener task ended abnormally: {err}");
-            }
+            // Both halves are logged: a listener that returned an error and a
+            // task that panicked are different faults and neither may be
+            // silently dropped.
+            Self::log_listener_task_outcome(task.await);
         }
+        self.state.publish_gateway_h3_alt_svc(&[]);
     }
 
     /// Drive the manager for the life of the process.
@@ -406,7 +740,18 @@ impl GatewayListenerManager {
         self: Arc<Self>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), anyhow::Error> {
-        let mut revisions = self.state.subscribe_config_revision();
+        // The receiver created in `new()`, before the mode's readiness
+        // reconcile. A publication in between is still pending on it.
+        let mut revisions = match self.revisions.lock().await.take() {
+            Some(revisions) => revisions,
+            None => {
+                warn!(
+                    "Gateway API listener supervisor started twice; subscribing to config \
+                     publications again"
+                );
+                self.state.subscribe_config_revision()
+            }
+        };
         let mut retry = tokio::time::interval(BIND_RETRY_INTERVAL);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         retry.tick().await; // the first tick completes immediately
@@ -441,3 +786,156 @@ impl GatewayListenerManager {
 
 /// How often an unbound Gateway listener port is retried.
 const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a class-flipping listener may take to close its accept sockets
+/// before the replacement bind is deferred to the next reconcile. Bounded so a
+/// wedged accept loop cannot stall the supervisor, and fail-closed so the two
+/// frontend classes never coexist on one port.
+const CLASS_FLIP_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+mod tests {
+    //! Supervision of already-started listener tasks.
+    //!
+    //! Deliberately inline and minimal: killing a live accept-loop task and
+    //! observing the drain queue are private-state behaviors, and exposing an
+    //! "abort this listener" or "inspect my drains" API on the production
+    //! manager to reach them from `tests/` would be a worse trade.
+
+    use super::*;
+    use crate::config::EnvConfig;
+    use crate::config::types::GatewayConfig;
+    use crate::dns::{DnsCache, DnsConfig};
+
+    fn port_scoped_config(port: u16) -> GatewayConfig {
+        let proxy: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
+            "id": "gw-a",
+            "hosts": ["app.example.com"],
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 1,
+            "listen_port": port,
+        }))
+        .expect("port-scoped proxy should deserialize");
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            ..GatewayConfig::default()
+        };
+        config.resolve_dispatch_kind();
+        config
+    }
+
+    fn test_state(config: GatewayConfig) -> ProxyState {
+        let env = EnvConfig {
+            proxy_http_port: 0,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
+            .expect("proxy state")
+            .0
+    }
+
+    async fn free_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    /// A started listener whose accept-loop task later dies must be reaped,
+    /// surfaced as a failure, and rebound — never left in the live map where
+    /// the next reconcile would read the port as healthy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_listener_task_is_reaped_surfaced_and_rebound() {
+        let port = free_port().await;
+        let manager = GatewayListenerManager::new(
+            test_state(port_scoped_config(port)),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        );
+        assert!(manager.reconcile().await.is_empty());
+        assert_eq!(manager.active_ports().await, vec![port]);
+
+        // Kill the accept loop behind the manager's back, exactly as a panic
+        // or an unexpected loop exit would.
+        {
+            let live = manager.listeners.lock().await;
+            live.get(&port).expect("listener").tcp.abort();
+        }
+        // Let the abort land before reconciling.
+        while !manager
+            .listeners
+            .lock()
+            .await
+            .get(&port)
+            .expect("listener")
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| failure.port == port),
+            "the dead listener must be surfaced as a failure: {failures:?}"
+        );
+        assert_eq!(
+            manager.active_ports().await,
+            vec![port],
+            "the port must be rebound, not left dead"
+        );
+        assert!(
+            !manager
+                .listeners
+                .lock()
+                .await
+                .get(&port)
+                .expect("listener")
+                .is_finished(),
+            "the rebound listener must be live"
+        );
+        manager.shutdown_all().await;
+    }
+
+    /// A withdrawn listener's drain handle is reaped once it finishes, so
+    /// completed handles cannot accumulate until process exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_drain_handles_do_not_accumulate() {
+        let port = free_port().await;
+        let state = test_state(port_scoped_config(port));
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        );
+        manager.reconcile().await;
+        assert_eq!(manager.active_ports().await, vec![port]);
+
+        // Withdraw the listener; its accept loop drains asynchronously.
+        state.update_config(GatewayConfig::default());
+        manager.reconcile().await;
+        assert!(manager.active_ports().await.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            manager.reconcile().await;
+            if manager.draining.lock().await.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a finished drain handle was never reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        manager.shutdown_all().await;
+    }
+}

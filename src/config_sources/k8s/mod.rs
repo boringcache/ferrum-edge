@@ -365,6 +365,27 @@ pub struct K8sTranslation {
     /// API status writer. Computed during translation (the only place the
     /// ConfigMap/Secret CA index exists) so status planning never retranslates.
     pub backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+    /// Gateway listeners this translation refused because two listeners claim
+    /// one numeric port with physically incompatible frontend shapes, keyed by
+    /// listener identity with the operator-facing reason.
+    ///
+    /// The status writer projects these as `Conflicted=True` /
+    /// `Programmed=False`, so a listener admission refused can never report
+    /// `Accepted=True` / `NoConflicts`.
+    pub listener_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+}
+
+/// One refused Gateway API listener claim, in the shape
+/// `Gateway.status.listeners[].conditions[type=Conflicted]` publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiListenerConflict {
+    /// Gateway API `ListenerConditionReason` for `Conflicted=True` —
+    /// `ProtocolConflict` when the port is claimed both plaintext and TLS,
+    /// `HostnameConflict` when TLS-terminating siblings resolve to different
+    /// certificates on one socket.
+    pub reason: &'static str,
+    pub message: String,
 }
 
 /// Translation outcome for one Gateway API `BackendTLSPolicy`, in the shape the
@@ -622,6 +643,21 @@ impl std::fmt::Display for GatewayApiListenerKey {
     }
 }
 
+/// The physical route-table slot one materialized Gateway API proxy occupies.
+///
+/// Two claims with the same slot are the same `(namespace, hosts, listen_path,
+/// listen_port)` tuple `GatewayConfig::validate_unique_listen_paths` treats as a
+/// duplicate. Same-listener claims legitimately collapse into one proxy;
+/// different-listener claims on one slot are physically ambiguous and are
+/// refused on both sides.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GatewayApiRouteSlot {
+    pub namespace: String,
+    pub hosts: Vec<String>,
+    pub listen_path: Option<String>,
+    pub listen_port: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum GatewayApiAllowedRoutesNamespaces {
     #[default]
@@ -713,8 +749,28 @@ pub(crate) struct K8sAccumulator {
     /// keep separate `listen_port` identities and must not collapse across
     /// kinds even when they share hosts+path.
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
+    /// The exact Gateway API listener each materialized route proxy was
+    /// admitted on. `None` means the parentRef resolved no listener policy
+    /// (unknown Gateway), which is a port-agnostic claim.
+    ///
+    /// Same-kind route merging keys on THIS, never on the numeric port: two
+    /// Gateways (or two sibling listeners) can share a port, and Gateway API
+    /// attached neither Route to the other's listener, so their dispatch rules
+    /// and default backends must never be combined.
+    pub(crate) gateway_api_route_proxy_listeners:
+        HashMap<NamespacedResourceId, Option<GatewayApiListenerKey>>,
+    /// Route-table slots refused because two different listener identities
+    /// claimed them. Fail closed on both sides and stay refused for every later
+    /// claim in the same pass, so the outcome does not depend on object order.
+    pub(crate) gateway_api_refused_route_slots: HashSet<GatewayApiRouteSlot>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Listeners refused by physical same-port shape arbitration, with the
+    /// operator-facing reason. Projected onto `Gateway.status.listeners[]` as
+    /// `Conflicted=True` / `Programmed=False` so status can never claim a
+    /// listener this translator explicitly refused.
+    pub(crate) gateway_api_listener_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
     /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
     /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
     /// key membership; the bool is ownership only — interoperable waypoint
@@ -770,7 +826,10 @@ impl K8sAccumulator {
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
             gateway_api_route_proxy_kinds: HashMap::new(),
+            gateway_api_route_proxy_listeners: HashMap::new(),
+            gateway_api_refused_route_slots: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
+            gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
@@ -1012,6 +1071,27 @@ impl K8sAccumulator {
         self.config.proxies.push(proxy);
     }
 
+    /// Withdraw one already-materialized proxy and everything keyed to it.
+    ///
+    /// Used by the Gateway API translator when a second, differently-identified
+    /// listener claims the same physical route slot: both sides are refused, so
+    /// the side already admitted has to be taken back out. Upstreams are left
+    /// alone — an unreferenced upstream serves no traffic and
+    /// `validate_upstream_references` only checks the proxy→upstream direction.
+    pub(crate) fn withdraw_proxy(&mut self, namespace: &str, id: &str) {
+        let proxies = &mut self.config.proxies;
+        proxies.retain(|proxy| !(proxy.namespace == namespace && proxy.id == id));
+        let plugins = &mut self.config.plugin_configs;
+        plugins.retain(|plugin| {
+            !(plugin.namespace == namespace && plugin.proxy_id.as_deref() == Some(id))
+        });
+        if let Some(key) = namespaced_resource_key(namespace, id) {
+            self.proxy_sources.remove(&key);
+            self.gateway_api_route_proxy_kinds.remove(&key);
+            self.gateway_api_route_proxy_listeners.remove(&key);
+        }
+    }
+
     pub(crate) fn upsert_upstream(&mut self, upstream: Upstream) {
         if namespaced_resource_key(&upstream.namespace, &upstream.id).is_none() {
             self.warnings.push(format!(
@@ -1112,6 +1192,7 @@ impl K8sAccumulator {
             route_conflicts: self.gateway_api_route_conflicts,
             materialized_route_parents: self.gateway_api_materialized_route_parents,
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
+            listener_conflicts: self.gateway_api_listener_conflicts,
         }
     }
 }

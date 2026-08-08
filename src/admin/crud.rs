@@ -3296,7 +3296,7 @@ impl AdminResource for Proxy {
                 Some(_) => {}
             }
         } else if let Some(port) = self.listen_port
-            && port < 1
+            && port == 0
         {
             return Err(ValidationError::Message(
                 "listen_port 0 must be >= 1".to_string(),

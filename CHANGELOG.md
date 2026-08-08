@@ -24,8 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by port number, so it retains healthy sibling claims and sibling listeners
   sharing a port cannot suppress or TLS-taint one another. A numeric port
   claimed by incompatible listener shapes (plaintext vs TLS, or differing TLS
-  credentials) is refused at admission on both sides. Same-listener overlaps
-  still fail closed.
+  credentials) is refused at admission on both sides, reported on the Gateway's
+  `status.listeners[]` as `Conflicted=True` / `Accepted=False`
+  (`PortUnavailable`) / `Programmed=False`. Same-kind route merging keys on the
+  exact admitting listener, so two Gateways sharing a port never have their
+  dispatch rules combined, and a host+path claimed by two different listeners on
+  one port is refused on both sides. When HTTP/3 is enabled, every TLS-class
+  listener port also gets its own QUIC socket and `Alt-Svc` advertises HTTP/3
+  only where one exists. Listener supervision reaps and rebinds a listener whose
+  accept loop dies, and an HTTP↔HTTPS class flip retires the old accept loops
+  before rebinding so the two classes never coexist on one port.
 
 - `ai_federation` incremental provider response streaming behind a new root
   `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat

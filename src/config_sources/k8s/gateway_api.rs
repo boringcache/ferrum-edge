@@ -11,12 +11,12 @@ use crate::modes::mesh::config::{
 use crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json;
 
 use super::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
-    GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
+    GatewayApiListenerPolicy, GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewaySessionPersistence, K8sAccumulator,
-    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
+    GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
+    K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
     optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
@@ -1504,7 +1504,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             .push((key.clone(), shape));
     }
 
-    let mut refused: Vec<GatewayApiListenerKey> = Vec::new();
+    let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (port, claims) in shapes_by_port {
         if claims.len() < 2 || claims.iter().all(|(_, shape)| *shape == claims[0].1) {
@@ -1515,20 +1515,44 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             .map(|(key, _)| key.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        warnings.push(format!(
+        // A port claimed both plaintext and TLS is a protocol conflict; TLS
+        // siblings that resolve to different certificates conflict over which
+        // hostname's credential the one socket presents.
+        let reason = if claims
+            .iter()
+            .any(|(_, shape)| *shape == PortShape::Plaintext)
+        {
+            "ProtocolConflict"
+        } else {
+            "HostnameConflict"
+        };
+        let message = format!(
             "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend \
              shapes (plaintext vs TLS, or different TLS credentials). One socket cannot serve \
              both, so every claim on this port is refused (Conflicted)."
-        ));
-        refused.extend(claims.into_iter().map(|(key, _)| key));
+        );
+        warnings.push(message.clone());
+        refused.extend(claims.into_iter().map(|(key, _)| {
+            (
+                key,
+                GatewayApiListenerConflict {
+                    reason,
+                    message: message.clone(),
+                },
+            )
+        }));
     }
 
     acc.warnings.extend(warnings);
-    for key in refused {
+    for (key, conflict) in refused {
         if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
             policy.materializable = false;
             policy.routes_materializable = false;
         }
+        // Recorded for `Gateway.status.listeners[]`: a listener refused here
+        // must report `Conflicted=True` / `Programmed=False`, never
+        // `Accepted=True` / `NoConflicts`.
+        acc.gateway_api_listener_conflicts.insert(key, conflict);
     }
 }
 
@@ -2418,11 +2442,11 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
                     if accepted_entry.candidate.resource.kind == entry.candidate.resource.kind {
                         return None;
                     }
-                    let overlaps = route_claims[*accepted_index]
-                        .get(listener)
-                        .is_some_and(|accepted_hostnames| {
+                    let overlaps = route_claims[*accepted_index].get(listener).is_some_and(
+                        |accepted_hostnames| {
                             cross_kind_hostnames_overlap(hostnames, accepted_hostnames)
-                        });
+                        },
+                    );
                     overlaps.then(|| accepted_entry.candidate.resource.clone())
                 });
 
@@ -2645,13 +2669,48 @@ fn upsert_http_route_resources(
             .and_then(|key| plugins_by_proxy.remove(&key))
             .unwrap_or_default();
         let proxy_key = namespaced_resource_key(&proxy.namespace, &proxy.id);
-        if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind) {
-            acc.upsert_proxy(proxy, SourceKind::GatewayApi);
-            acc.config.plugin_configs.extend(route_plugins);
+        let slot = route_slot_of(&proxy);
+        // A slot already refused for listener ambiguity stays refused for the
+        // rest of this pass, so the outcome cannot depend on which claim the
+        // translator happened to observe first.
+        if acc.gateway_api_refused_route_slots.contains(&slot) {
+            acc.warnings.push(format!(
+                "Gateway API route proxy '{}/{}' is refused: its host+path claim on this listener \
+                 port was already refused because two different Gateway API listeners claim it",
+                proxy.namespace, proxy.id
+            ));
             if let Some(key) = proxy_key {
-                acc.gateway_api_route_proxy_kinds
-                    .insert(key, route_kind.to_string());
+                acc.gateway_api_route_proxy_listeners.remove(&key);
             }
+            continue;
+        }
+        if merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind) {
+            continue;
+        }
+        if let Some(conflict) = conflicting_slot_claim(acc, &proxy) {
+            // Two different Gateway API listeners materialize one physical
+            // route-table slot. Gateway API attached each Route to exactly one
+            // of them, so neither may absorb the other's rules, and one socket
+            // cannot serve two contradictory contracts on the same host+path.
+            // Refuse both sides rather than letting observation order decide.
+            acc.warnings.push(format!(
+                "Gateway API route proxies '{}/{}' and '{}/{}' claim the same host+path on \
+                 listener port {:?} from different Gateway API listeners; the claim is \
+                 physically ambiguous, so both are refused (Conflicted)",
+                conflict.0, conflict.1, proxy.namespace, proxy.id, proxy.listen_port
+            ));
+            acc.withdraw_proxy(&conflict.0, &conflict.1);
+            if let Some(key) = proxy_key {
+                acc.gateway_api_route_proxy_listeners.remove(&key);
+            }
+            acc.gateway_api_refused_route_slots.insert(slot);
+            continue;
+        }
+        acc.upsert_proxy(proxy, SourceKind::GatewayApi);
+        acc.config.plugin_configs.extend(route_plugins);
+        if let Some(key) = proxy_key {
+            acc.gateway_api_route_proxy_kinds
+                .insert(key, route_kind.to_string());
         }
     }
 
@@ -2749,11 +2808,20 @@ fn merge_http_route_proxy(
     true
 }
 
-/// Only proxies from the same Gateway API route kind and the same listen_port
-/// may collapse. Distinct listener ports are independent route-table slots;
-/// merging across ports would reintroduce the port-agnostic collision that
-/// port-aware representation exists to avoid. Same-kind same-port collapse
-/// still preserves rule ordering and fall-through within one listener.
+/// Only proxies from the same Gateway API route kind admitted on the **same
+/// Gateway API listener** may collapse.
+///
+/// The numeric `listen_port` is deliberately not the merge key. Gateway API
+/// permits several listeners — of one Gateway or of different Gateways — to
+/// share a port, and a Route attached to listener A was never attached to
+/// listener B. Merging by port would combine two unrelated listeners' dispatch
+/// rules and default backends, serving one Gateway's traffic under another
+/// Gateway's route contract. Same-kind, same-listener collapse still preserves
+/// rule ordering and fall-through within one listener.
+///
+/// `None == None` (an unresolved/unknown Gateway parentRef) is a legitimate
+/// match: those claims are port-agnostic and carry no listener identity to
+/// distinguish, exactly as before port-aware representation.
 fn can_merge_http_route_proxy(
     acc: &K8sAccumulator,
     existing: &Proxy,
@@ -2761,13 +2829,56 @@ fn can_merge_http_route_proxy(
     route_kind: &str,
 ) -> bool {
     acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
-        && existing.namespace == proxy.namespace
-        && existing.listen_path == proxy.listen_path
-        && existing.listen_port == proxy.listen_port
-        && existing.hosts == proxy.hosts
+        && occupies_same_route_slot(existing, proxy)
+        && route_proxy_listener(acc, existing) == route_proxy_listener(acc, proxy)
         && namespaced_resource_key(&existing.namespace, &existing.id)
             .and_then(|key| acc.gateway_api_route_proxy_kinds.get(&key))
             .is_some_and(|kind| kind == route_kind)
+}
+
+/// Whether two materialized proxies occupy one physical route-table slot —
+/// the tuple `GatewayConfig::validate_unique_listen_paths` treats as duplicate.
+fn occupies_same_route_slot(existing: &Proxy, proxy: &Proxy) -> bool {
+    existing.namespace == proxy.namespace
+        && existing.listen_path == proxy.listen_path
+        && existing.listen_port == proxy.listen_port
+        && existing.hosts == proxy.hosts
+}
+
+/// An already-materialized Gateway API proxy that occupies the candidate's
+/// physical route slot but was admitted on a **different** listener.
+///
+/// Returned as `(namespace, id)` so the caller can withdraw it without holding
+/// a borrow of the accumulator across the mutation.
+fn conflicting_slot_claim(acc: &K8sAccumulator, proxy: &Proxy) -> Option<(String, String)> {
+    acc.config
+        .proxies
+        .iter()
+        .find(|existing| {
+            acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
+                && occupies_same_route_slot(existing, proxy)
+                && route_proxy_listener(acc, existing) != route_proxy_listener(acc, proxy)
+        })
+        .map(|existing| (existing.namespace.clone(), existing.id.clone()))
+}
+
+fn route_slot_of(proxy: &Proxy) -> GatewayApiRouteSlot {
+    GatewayApiRouteSlot {
+        namespace: proxy.namespace.clone(),
+        hosts: proxy.hosts.clone(),
+        listen_path: proxy.listen_path.clone(),
+        listen_port: proxy.listen_port,
+    }
+}
+
+/// The Gateway API listener a materialized route proxy was admitted on.
+fn route_proxy_listener<'a>(
+    acc: &'a K8sAccumulator,
+    proxy: &Proxy,
+) -> Option<&'a GatewayApiListenerKey> {
+    namespaced_resource_key(&proxy.namespace, &proxy.id)
+        .and_then(|key| acc.gateway_api_route_proxy_listeners.get(&key))
+        .and_then(Option::as_ref)
 }
 
 fn dispatch_plugin_index(
@@ -4766,6 +4877,17 @@ fn http_route_resources(
                         acc.config
                             .http_tls_listen_ports
                             .insert((config_namespace.clone(), port));
+                    }
+                    // Record the exact admitting listener for this proxy id
+                    // BEFORE it reaches `upsert_http_route_resources`, so the
+                    // same-kind merge decision can compare listener identity
+                    // for both the candidate and any existing sibling instead
+                    // of collapsing them by numeric port.
+                    if let Some(key) =
+                        namespaced_resource_key(config_namespace, proxy_id.as_str())
+                    {
+                        acc.gateway_api_route_proxy_listeners
+                            .insert(key, host_scope.listener.clone());
                     }
                     let mut proxy = proxy_for_route(RouteProxySpec {
                         id: proxy_id.clone(),
@@ -7544,8 +7666,9 @@ mod tests {
         );
         secure_route.metadata.name = "secure-route".to_string();
 
-        let result = translate_k8s_objects(&[gateway, secret, plain_route, secure_route], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[gateway, secret, plain_route, secure_route], options())
+                .expect("translation succeeds");
 
         assert!(
             result.config.proxies.is_empty(),
@@ -7563,6 +7686,199 @@ mod tests {
             }),
             "the refusal must be reported: {:?}",
             result.warnings
+        );
+    }
+
+    /// Adversarial: two DIFFERENT Gateways share a numeric port with a
+    /// compatible plaintext shape, and each admits a Route claiming the same
+    /// host + path. Gateway API attached neither Route to the other's
+    /// listener, so their dispatch rules and default backends must never be
+    /// combined — and the two claims cannot both own one physical route-table
+    /// slot either, so both are refused rather than one silently absorbing
+    /// the other's routing policy.
+    #[test]
+    fn routes_on_different_same_port_listeners_never_combine_routing_policy() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+
+        let mut route_a = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-a", "sectionName": "http"}],
+                "hostnames": ["app.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-a", "port": 8080}]
+                }]
+            }),
+        );
+        route_a.metadata.name = "route-a".to_string();
+        let mut route_b = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-b", "sectionName": "http"}],
+                "hostnames": ["app.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-b", "port": 9090}]
+                }]
+            }),
+        );
+        route_b.metadata.name = "route-b".to_string();
+
+        for objects in [
+            vec![
+                gateway_a.clone(),
+                gateway_b.clone(),
+                route_a.clone(),
+                route_b.clone(),
+            ],
+            // Order must not decide the outcome.
+            vec![gateway_b, gateway_a, route_b, route_a],
+        ] {
+            let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+            assert!(
+                result.config.proxies.is_empty(),
+                "an ambiguous same-slot claim from two listeners must materialize nothing: {:?}",
+                result.config.proxies
+            );
+            assert!(
+                !result
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                "no combined dispatch plugin may survive: {:?}",
+                result.config.plugin_configs
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("physically ambiguous")),
+                "the refusal must be reported: {:?}",
+                result.warnings
+            );
+            assert!(
+                result.config.validate_unique_listen_paths().is_ok(),
+                "the refusal must leave a valid config: {:?}",
+                result.config.validate_unique_listen_paths()
+            );
+        }
+    }
+
+    /// The compatible case must keep working: two listeners sharing a port
+    /// with DISJOINT hostnames each keep their own proxy, their own dispatch
+    /// plugin, and their own backend — nothing is merged across listeners.
+    #[test]
+    fn same_port_listeners_with_disjoint_hostnames_keep_independent_routing() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "b.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+
+        let mut route_a = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-a", "sectionName": "http"}],
+                "hostnames": ["a.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-a", "port": 8080}]
+                }]
+            }),
+        );
+        route_a.metadata.name = "route-a".to_string();
+        let mut route_b = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-b", "sectionName": "http"}],
+                "hostnames": ["b.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-b", "port": 9090}]
+                }]
+            }),
+        );
+        route_b.metadata.name = "route-b".to_string();
+
+        let result = translate_k8s_objects(&[gateway_a, gateway_b, route_a, route_b], options())
+            .expect("translation succeeds");
+
+        let mut backends: Vec<u16> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.backend_port)
+            .collect();
+        backends.sort_unstable();
+        assert_eq!(
+            backends,
+            vec![8080, 9090],
+            "both same-port listeners must keep their own route: {:?}",
+            result.config.proxies
+        );
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.listen_port == Some(8080)),
+            "both claims live on the shared numeric port"
+        );
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "disjoint hostnames keep the shared port valid: {:?}",
+            result.config.validate_unique_listen_paths()
         );
     }
 

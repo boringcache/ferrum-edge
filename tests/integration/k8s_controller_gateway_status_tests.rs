@@ -887,3 +887,232 @@ fn cross_kind_rejection_does_not_reach_l4_routes_on_the_same_gateway() {
         "the rejected GRPCRoute must not produce a proxy"
     );
 }
+
+// ── Same-port listener conflicts on `Gateway.status.listeners[]` ────────────
+//
+// `refuse_incompatible_same_port_listeners()` makes a listener non-
+// materializable when one numeric port is claimed with physically
+// incompatible frontend shapes. Status must say so: a refused listener
+// reports `Conflicted=True`, `Programmed=False`, and `Accepted=False`
+// (`PortUnavailable`) — never `Accepted=True` / `NoConflicts`.
+
+fn tls_secret_object(name: &str) -> K8sObject {
+    use base64::Engine as _;
+    let cert = include_str!("../certs/server.crt");
+    let key = include_str!("../certs/server.key");
+    let secret = object(
+        "v1",
+        "Secret",
+        name,
+        "default",
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {
+                "tls.crt": base64::engine::general_purpose::STANDARD.encode(cert),
+                "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
+            }
+        }),
+    );
+    secret
+}
+
+fn listener_status<'a>(update: &'a GatewayApiStatusUpdate, name: &str) -> &'a Value {
+    update.status["listeners"]
+        .as_array()
+        .expect("listener statuses")
+        .iter()
+        .find(|listener| listener["name"].as_str() == Some(name))
+        .expect("the listener must be reported")
+}
+
+fn listener_condition<'a>(listener: &'a Value, condition_type: &str) -> &'a Value {
+    listener["conditions"]
+        .as_array()
+        .expect("listener conditions")
+        .iter()
+        .find(|condition| condition["type"].as_str() == Some(condition_type))
+        .unwrap_or_else(|| panic!("a {condition_type} condition"))
+}
+
+fn gateway_update(objects: &[K8sObject], name: &str) -> GatewayApiStatusUpdate {
+    plan_gateway_api_status_updates(objects, options(), &[])
+        .into_iter()
+        .find(|update| update.kind == "Gateway" && update.name == name)
+        .expect("a Gateway status update")
+}
+
+fn assert_listener_refused(update: &GatewayApiStatusUpdate, name: &str, reason: &str) {
+    let listener = listener_status(update, name);
+    let conflicted = listener_condition(listener, "Conflicted");
+    assert_eq!(
+        conflicted["status"].as_str(),
+        Some("True"),
+        "listener {name} must report Conflicted=True: {conflicted:?}"
+    );
+    assert_eq!(
+        conflicted["reason"].as_str(),
+        Some(reason),
+        "listener {name} conflict reason: {conflicted:?}"
+    );
+    let accepted = listener_condition(listener, "Accepted");
+    assert_eq!(
+        accepted["status"].as_str(),
+        Some("False"),
+        "a refused listener must not report Accepted=True: {accepted:?}"
+    );
+    assert_eq!(accepted["reason"].as_str(), Some("PortUnavailable"));
+    let programmed = listener_condition(listener, "Programmed");
+    assert_eq!(
+        programmed["status"].as_str(),
+        Some("False"),
+        "a refused listener must not report Programmed=True: {programmed:?}"
+    );
+}
+
+#[test]
+fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "plain",
+                    "port": 8443,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "secure",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let update = gateway_update(&objects, "edge");
+    assert_listener_refused(&update, "plain", "ProtocolConflict");
+    assert_listener_refused(&update, "secure", "ProtocolConflict");
+}
+
+#[test]
+fn tls_listeners_sharing_a_port_with_different_credentials_report_conflicted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "first",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "a.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-a"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "second",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-b"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![
+        class,
+        gateway,
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    let update = gateway_update(&objects, "edge");
+    assert_listener_refused(&update, "first", "HostnameConflict");
+    assert_listener_refused(&update, "second", "HostnameConflict");
+}
+
+/// A compatible same-port pair must stay clean: no `Conflicted`, and the
+/// listeners keep their ordinary `Accepted=True` reporting.
+#[test]
+fn compatible_same_port_listeners_report_no_conflict() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "first",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "a.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "second",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let update = gateway_update(&objects, "edge");
+    for name in ["first", "second"] {
+        let listener = listener_status(&update, name);
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "listener {name} must not be reported Conflicted: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "listener {name} must stay Accepted: {accepted:?}"
+        );
+    }
+}
