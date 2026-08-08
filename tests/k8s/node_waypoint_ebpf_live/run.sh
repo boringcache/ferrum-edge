@@ -978,8 +978,16 @@ verify_ambient_spire_identity() {
     return
   fi
 
-  log "checking ambient NodeWaypoint Workload API SVIDs"
+  log "checking ambient NodeWaypoint SPIRE Agent SVID metrics"
   local spec_file="$RESULTS_DIR/ambient-spire-pods.json"
+  local metrics_proof="$ROOT_DIR/tests/k8s/lib/spire_ambient_metrics.py"
+  if [[ ! -f "$metrics_proof" && -f "$PWD/tests/k8s/lib/spire_ambient_metrics.py" ]]; then
+    metrics_proof="$PWD/tests/k8s/lib/spire_ambient_metrics.py"
+  fi
+  if [[ ! -f "$metrics_proof" ]]; then
+    echo "missing SPIRE ambient metrics proof helper: $metrics_proof" >&2
+    return 1
+  fi
   mkdir -p "$RESULTS_DIR/ambient-spire-metrics"
   if ! kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
@@ -1079,7 +1087,10 @@ PY
     fetched=false
     for _ in $(seq 1 40); do
       if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
-        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
+        if python3 -I "$metrics_proof" \
+          --metrics-file "$metrics_file" \
+          --expected-spiffe "$expected_spiffe" \
+          --trust-domain "$TRUST_DOMAIN"; then
           fetched=true
           break
         fi
@@ -1090,6 +1101,10 @@ PY
     wait "$pf_pid" 2>/dev/null || true
     if [[ "$fetched" != "true" ]]; then
       echo "ambient pod $pod on $node did not report SPIRE Agent SVID metric for $expected_spiffe" >&2
+      python3 -I "$metrics_proof" \
+        --metrics-file "$metrics_file" \
+        --expected-spiffe "$expected_spiffe" \
+        --trust-domain "$TRUST_DOMAIN" >&2 || true
       cat "$metrics_file" >&2 || true
       collect_spire_diagnostics
       return 1
@@ -1101,7 +1116,7 @@ PY
     pass \
     "" \
     "" \
-    "ambient-nodewaypoints-loaded-per-node-workload-api-svids" \
+    "ambient-nodewaypoints-loaded-per-node-spire-agent-svids" \
     "" \
     "" \
     "ambient-spire-pods.json,ambient-spire-metrics"

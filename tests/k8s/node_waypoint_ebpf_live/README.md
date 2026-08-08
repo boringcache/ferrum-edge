@@ -16,7 +16,11 @@ The script renders the chart first and fails if an enabled eBPF node-agent or
 NodeWaypoint proxy would use a non-`-ebpf` image. It then installs the chart,
 installs a minimal SPIRE Server/Agent fixture by default, registers per-node
 NodeWaypoint SVID entries, checks that every ambient NodeWaypoint pod reports a
-matching `ferrum_mesh_cert_expiry_seconds{source="workload_api"}` metric, checks
+fail-closed SPIRE Agent identity proof
+(`ferrum_mesh_cert_expiry_seconds{spiffe_id=<per-node>,source="spire_agent"}`
+with positive expiry, `ferrum_mesh_ca_health{ca_type="spire_agent"} 1`, and
+`ferrum_mesh_trust_bundle_version{trust_domain=<domain>,source="spire_agent"}`
+>= 1), checks
 `/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`, collects BPF
 program/link/map evidence with `bpftool`, creates same-node and cross-node
 source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
@@ -43,7 +47,7 @@ accepts a direct 403 or the source-side 502 wrapper that explicitly reports the
 destination HBONE CONNECT was rejected with 403; in both cases the destination
 policy-deny counter for the expected NodeWaypoint assertor must increase.
 The production SPIRE pass also restarts the SPIRE Agent DaemonSet and the
-NodeWaypoint ambient DaemonSet, then waits for new Workload API SVID metrics,
+NodeWaypoint ambient DaemonSet, then waits for fresh SPIRE Agent SVID metrics,
 registry/mesh-slice readiness, fresh source admission, allow/deny traffic, and
 plaintext/no-client-SVID HBONE rejection before recording
 `node_waypoint.identity.spire_restart_recovery`. It also asserts ADR
