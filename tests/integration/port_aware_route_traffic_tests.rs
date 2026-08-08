@@ -389,7 +389,9 @@ async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
     );
     let failures = handles.gateway_listeners.bind_failures();
     assert!(
-        failures.iter().all(|failure| failure.port != global_proxy_port),
+        failures
+            .iter()
+            .all(|failure| failure.port != global_proxy_port),
         "a same-class global frontend satisfies the listener, not a failure: {failures:?}"
     );
     assert_eq!(

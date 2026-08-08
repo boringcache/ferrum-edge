@@ -10765,10 +10765,9 @@ impl ProxyState {
                     // flip while every resource identity/timestamp remains
                     // unchanged; publish the new table before waking the
                     // listener manager.
-                    let rebuild_routes = Self::projected_route_proxy_content_changed(
-                        &current.config,
-                        &new_config,
-                    ) || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                    let rebuild_routes =
+                        Self::projected_route_proxy_content_changed(&current.config, &new_config)
+                            || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
                     if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
                     }

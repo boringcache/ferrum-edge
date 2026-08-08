@@ -1301,16 +1301,14 @@ fn merge_http_tls_listen_ports(
                 .map(|port| (proxy.namespace.clone(), port))
         })
         .collect();
-    merged
-        .http_tls_listen_ports
-        .retain(|entry| {
-            // A current translation is authoritative for every managed
-            // namespace. Do not infer ownership from a surviving proxy at the
-            // same `(namespace, port)`: that proxy may be file/native-authored,
-            // and retaining the old Kubernetes bit would silently reclassify
-            // it as TLS after the Gateway listener was deleted.
-            !namespace_is_managed(&entry.0, managed_namespaces) && claimed.contains(entry)
-        });
+    merged.http_tls_listen_ports.retain(|entry| {
+        // A current translation is authoritative for every managed
+        // namespace. Do not infer ownership from a surviving proxy at the
+        // same `(namespace, port)`: that proxy may be file/native-authored,
+        // and retaining the old Kubernetes bit would silently reclassify
+        // it as TLS after the Gateway listener was deleted.
+        !namespace_is_managed(&entry.0, managed_namespaces) && claimed.contains(entry)
+    });
     merged
         .http_tls_listen_ports
         .extend(k8s_config.http_tls_listen_ports.iter().cloned());

@@ -344,10 +344,7 @@ impl GatewayListenerManager {
             );
         }
         if tls.is_configured() && state.env_config.proxy_https_port != 0 {
-            existing_frontends.insert(
-                state.env_config.proxy_https_port,
-                GatewayListenerClass::Tls,
-            );
+            existing_frontends.insert(state.env_config.proxy_https_port, GatewayListenerClass::Tls);
         }
         Self {
             state,
