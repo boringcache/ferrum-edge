@@ -588,13 +588,15 @@ fn remove_owned_binary(
     binary_path: &Path,
 ) -> Result<CniArtifactOutcome, CniInstallError> {
     let Some(manifest) = manifest else {
-        return Ok(match open_classified(binary_path, MAX_OWNED_BINARY_BYTES)? {
-            ClassifiedArtifact::Absent => CniArtifactOutcome::AlreadyAbsent,
-            ClassifiedArtifact::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
-            ClassifiedArtifact::Present { .. } => CniArtifactOutcome::RetainedForeign(
-                "no ownership manifest records this binary as Ferrum-installed",
-            ),
-        });
+        return Ok(
+            match open_classified(binary_path, MAX_OWNED_BINARY_BYTES)? {
+                ClassifiedArtifact::Absent => CniArtifactOutcome::AlreadyAbsent,
+                ClassifiedArtifact::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
+                ClassifiedArtifact::Present { .. } => CniArtifactOutcome::RetainedForeign(
+                    "no ownership manifest records this binary as Ferrum-installed",
+                ),
+            },
+        );
     };
     if !manifest.speaks_for(&config.conf_file_name) {
         return Ok(CniArtifactOutcome::RetainedForeign(
@@ -953,10 +955,7 @@ enum ArtifactRead {
 enum ClassifiedArtifact {
     Absent,
     Rejected(&'static str),
-    Present {
-        file: File,
-        identity: FileIdentity,
-    },
+    Present { file: File, identity: FileIdentity },
 }
 
 enum OpenedArtifact {
@@ -1088,9 +1087,11 @@ fn hash_open_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<String
 fn installed_binary_digest(path: &Path) -> Result<Option<String>, CniInstallError> {
     match open_classified(path, MAX_OWNED_BINARY_BYTES)? {
         ClassifiedArtifact::Absent | ClassifiedArtifact::Rejected(_) => Ok(None),
-        ClassifiedArtifact::Present { mut file, .. } => {
-            Ok(Some(hash_open_file(&mut file, path, MAX_OWNED_BINARY_BYTES)?))
-        }
+        ClassifiedArtifact::Present { mut file, .. } => Ok(Some(hash_open_file(
+            &mut file,
+            path,
+            MAX_OWNED_BINARY_BYTES,
+        )?)),
     }
 }
 
@@ -1517,13 +1518,14 @@ fn copy_and_hash(
             });
         }
     };
-    let source_is_regular = input
-        .metadata()
-        .map(|meta| meta.is_file())
-        .map_err(|err| CniInstallError::Io {
-            path: source.display().to_string(),
-            source: err,
-        })?;
+    let source_is_regular =
+        input
+            .metadata()
+            .map(|meta| meta.is_file())
+            .map_err(|err| CniInstallError::Io {
+                path: source.display().to_string(),
+                source: err,
+            })?;
     if !source_is_regular {
         return Err(CniInstallError::UnusableSourceBinary {
             path: source.display().to_string(),

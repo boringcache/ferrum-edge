@@ -1970,7 +1970,10 @@ mod install_lifecycle {
         assert!(ready_marker_present(&marker));
 
         clear_stale_ready_marker(&marker).expect("a stale marker is retractable");
-        assert!(!ready_marker_present(&marker), "the next run starts un-ready");
+        assert!(
+            !ready_marker_present(&marker),
+            "the next run starts un-ready"
+        );
         // Retracting an absent marker is the state this is trying to reach.
         clear_stale_ready_marker(&marker).expect("retraction is idempotent");
 
