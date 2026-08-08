@@ -219,22 +219,65 @@ dispatch-rule list, and only claim-for-claim collisions are resolved as
 conflicts.
 
 **Port-aware route representation.** Ferrum materializes Gateway API HTTP-family
-routes with the admitting listener's port on `Proxy.listen_port`, so listeners
-of one Gateway are distinguishable in the route table:
+routes with the admitting listener's identity, so listeners of one Gateway are
+distinguishable both in the route table and on the wire:
 
+- The admitting listener's port is stamped on `Proxy.listen_port`, and its TLS
+  class on the namespace-qualified `GatewayConfig.http_tls_listen_ports`
+  (`(namespace, port)`). Both are read from **that listener's own policy** — a
+  sibling listener sharing a port number never reclassifies another's routes.
+- `GatewayListenerManager` (`src/proxy/gateway_listener.rs`) binds a real
+  socket for every declared listener port in `file`, `database`, and `dp` mode,
+  alongside the global `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`
+  sockets. Two same-protocol listeners such as `:80` and `:8080` therefore both
+  serve, and each request matches only the route attached to the listener it
+  arrived on.
 - Two routes that share `(hostname, listen path)` on **different** listeners
-  validate and serve independently — traffic on each frontend reaches only the
-  route attached to that listener (exact port match, or the HTTP/HTTPS protocol
-  remap when a single listener port of that class is projected onto
-  `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`).
-- Overlapping host+path on the **same** effective listener still fails closed
-  at config validation (`Overlapping host+listen_path`) with field-specific
-  Gateway API status diagnostics.
+  validate and serve independently. Overlapping host+path on the **same**
+  listener still fails closed at config validation
+  (`Overlapping host+listen_path`) with field-specific Gateway API status
+  diagnostics.
 - A Route that loses cross-kind arbitration on one listener retains healthy
-  sibling claims on other listeners. Claims that need independent acceptance
-  no longer require splitting into separate Route objects solely to survive a
-  loss elsewhere; `sectionName` / `port` scoping remains the way to attach to a
-  specific listener.
+  sibling claims on other listeners. The arbitration domain is the resolved
+  `GatewayApiListenerKey`, not the numeric port, so sibling listeners that
+  merely share a port are independent.
+- A numeric port claimed by two listeners with incompatible physical shapes —
+  one plaintext and one TLS-terminating, or two TLS listeners resolving to
+  different credentials — is refused at admission. One socket cannot serve
+  both, so **both** claims fail closed (matching the Gateway API `Conflicted`
+  condition) rather than one silently winning the socket.
+
+**Listener lifecycle and its bounds.** The listener set is reconciled on every
+config publication, so reload / update / delete / withdrawal reach the sockets
+without a restart. Two bounds are deliberate and tested:
+
+- **Withdrawal is fail-closed but not instantaneous at the socket.** Routes are
+  withdrawn by the atomic config swap that *precedes* the listener reconcile, so
+  a withdrawn listener's port answers `404` from that instant — it can never
+  stale-route. The socket itself stops accepting as soon as the accept loop
+  observes its per-listener shutdown signal and then drains in-flight requests
+  under the normal graceful-shutdown budget.
+- **A listener port that cannot be bound is reported, not fatal.** A port
+  already owned by a global proxy / admin / control-plane listener, or by a
+  TCP/UDP stream proxy, is refused; a port the process lacks permission to bind
+  (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
+  way the failure is logged and surfaced on
+  `GatewayListenerManager::bind_failures`, and routes scoped to that listener
+  stay unreachable rather than being served somewhere else.
+
+**Residual.** The same-port incompatible-shape refusal is reported as a
+translator warning and through the attached Routes' `Accepted` conditions (a
+refused listener admits no route). A dedicated `Conflicted` condition on the
+Gateway's own `status.listeners[]` entry for that case is not yet written.
+
+**Single-listener protocol remap.** When the whole route table declares exactly
+one listener port of a protocol class, a request arriving on the global process
+bind of that class is also served by it. This exists for the Service-fronted
+topology, where a `Service` maps the Gateway listener port (`:80`) onto the
+pod's `FERRUM_PROXY_HTTP_PORT` (`:8000`) and the listener port is never bound
+inside the pod. With two or more same-class listener ports the remap is off and
+only an exact listener match serves, because the request would otherwise be
+ambiguous.
 
 ### Fail-closed match shapes
 

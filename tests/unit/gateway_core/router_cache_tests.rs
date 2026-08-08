@@ -1713,8 +1713,9 @@ fn port_scoped_siblings_select_by_frontend_port() {
     tls.listen_port = Some(443);
     tls.backend_port = 8443;
 
+    let tls_namespace = tls.namespace.clone();
     let mut config = test_config(vec![plain, tls]);
-    config.http_tls_listen_ports.insert(443);
+    config.http_tls_listen_ports.insert((tls_namespace, 443));
     let cache = RouterCache::new(&config, 100);
 
     let on_http = cache
@@ -1731,6 +1732,54 @@ fn port_scoped_siblings_select_by_frontend_port() {
         .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(80), false)
         .expect("exact nontls port");
     assert_eq!(exact_plain.proxy.id, "plain");
+}
+
+/// A TLS listener on `:443` in one namespace must not reclassify another
+/// namespace's plaintext `:443` route. The classification key is
+/// `(namespace, port)`, resolved once per candidate at table build time.
+#[test]
+fn tls_classification_does_not_leak_across_namespaces() {
+    let mut plain = test_proxy("plain", "/api");
+    plain.namespace = "team-a".to_string();
+    plain.hosts = vec!["a.example.com".into()];
+    plain.listen_port = Some(443);
+    plain.backend_port = 8080;
+
+    let mut secure = test_proxy("secure", "/api");
+    secure.namespace = "team-b".to_string();
+    secure.hosts = vec!["b.example.com".into()];
+    secure.listen_port = Some(443);
+    secure.backend_port = 8443;
+
+    let mut config = test_config(vec![plain, secure]);
+    // Only team-b terminates TLS on 443.
+    config
+        .http_tls_listen_ports
+        .insert(("team-b".to_string(), 443));
+    let cache = RouterCache::new(&config, 100);
+
+    let on_plaintext = cache
+        .find_proxy_on_frontend(Some("a.example.com"), "/api/x", Some(443), false)
+        .expect("team-a's plaintext :443 route must still match a plaintext frontend");
+    assert_eq!(on_plaintext.proxy.id, "plain");
+
+    let on_tls = cache
+        .find_proxy_on_frontend(Some("b.example.com"), "/api/x", Some(443), true)
+        .expect("team-b's TLS :443 route must match a TLS frontend");
+    assert_eq!(on_tls.proxy.id, "secure");
+
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("a.example.com"), "/api/x", Some(443), true)
+            .is_none(),
+        "a plaintext-classified route must not be served on a TLS frontend"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("b.example.com"), "/api/x", Some(443), false)
+            .is_none(),
+        "a TLS-classified route must not be served on a plaintext frontend"
+    );
 }
 
 #[test]

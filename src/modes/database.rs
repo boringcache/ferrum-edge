@@ -1632,6 +1632,40 @@ pub async fn run(
         info!("TLS not configured - HTTPS listener disabled");
     }
 
+    // ── Gateway API listener ports ───────────────────────────────────────
+    // Bind a real socket for every HTTP-family proxy carrying a `listen_port`
+    // (Gateway API listener identity), alongside the global proxy ports. The
+    // supervisor reconciles on each config publication, so database polling —
+    // add, update, delete, and Gateway/Route withdrawal — reaches the socket
+    // set without a restart.
+    let gateway_listeners = Arc::new(
+        crate::proxy::gateway_listener::GatewayListenerManager::new(
+            proxy_state.clone(),
+            env_config.proxy_socket_addr(0).ip(),
+            crate::proxy::gateway_listener::GatewayListenerTls {
+                static_config: tls_config.clone(),
+                reload_slot: proxy_frontend_reload_handles
+                    .as_ref()
+                    .and_then(|h| h.slot.clone()),
+            },
+        ),
+    );
+    gateway_listeners.reconcile().await;
+    {
+        let sh = shutdown_tx.subscribe();
+        let manager = gateway_listeners.clone();
+        let gateway_listener_handle = tokio::spawn(async move {
+            manager
+                .run(sh)
+                .await
+                .context("Gateway API listener supervisor failed")
+        });
+        handles.push((
+            "Gateway API listener supervisor".to_string(),
+            gateway_listener_handle,
+        ));
+    }
+
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
     let mut h3_listener_started = false;
     if env_config.enable_http3 {

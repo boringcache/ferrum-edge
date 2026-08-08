@@ -39,6 +39,7 @@ pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
+pub mod gateway_listener;
 pub mod grpc_proxy;
 pub mod hbone_pool;
 mod hbone_proxy;
@@ -5634,6 +5635,16 @@ pub struct ProxyState {
     pub max_concurrent_requests_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
+    /// Monotonic counter bumped once per successful config publication.
+    ///
+    /// Watchers that must react to a config swap but do not live inside
+    /// `ProxyState` — notably
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`], which owns
+    /// sockets and therefore cannot be constructed before the state it serves
+    /// — subscribe here instead of polling the `ArcSwap`. The value itself is
+    /// meaningless; only the change notification matters, and `watch`
+    /// coalesces bursts so a rapid reload sequence costs one reconcile.
+    config_revision_tx: Arc<watch::Sender<u64>>,
     /// Windowed per-second rate metrics computed by a background task.
     /// Read by the admin `/status` endpoint; written by `metrics::start_metrics_monitor`.
     pub windowed_metrics: Arc<crate::metrics::WindowedMetrics>,
@@ -7506,6 +7517,7 @@ impl ProxyState {
             },
             max_concurrent_requests_per_ip,
             stream_listener_manager,
+            config_revision_tx: Arc::new(watch::channel(0u64).0),
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
@@ -7605,6 +7617,22 @@ impl ProxyState {
             ));
         }
         Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
+    /// Subscribe to config-publication notifications.
+    ///
+    /// Used by [`crate::proxy::gateway_listener::GatewayListenerManager`] to
+    /// reconcile Gateway API listener sockets on reload / update / delete /
+    /// withdrawal without polling.
+    pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
+        self.config_revision_tx.subscribe()
+    }
+
+    /// Notify config watchers that a new config generation is live.
+    fn bump_config_revision(&self) {
+        self.config_revision_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
     }
 
     fn collect_backend_capability_targets(
@@ -10001,6 +10029,11 @@ impl ProxyState {
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
             self.spawn_backend_capability_refresh();
 
+            // Wake external config watchers (Gateway API listener lifecycle).
+            // Published AFTER the epoch swap, so a woken reconciler always
+            // reads the config it is reacting to — never a half-applied one.
+            self.bump_config_revision();
+
             // Reconcile stream proxy listeners (TCP/UDP)
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -10187,6 +10220,11 @@ impl ProxyState {
             &published.plugin_cache,
             &published.config,
         );
+
+        // Wake external config watchers (Gateway API listener lifecycle) on the
+        // incremental path too — an add/update/delete of a port-scoped route
+        // arrives here, not through the full-rebuild branch.
+        self.bump_config_revision();
 
         // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
         // there is no resource delta to drive pruning, DNS warmup, listener

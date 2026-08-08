@@ -512,7 +512,14 @@ mod tests {
         let after = store.load();
         let cache = RouterCache::new(&after.config, 100);
         let matched = cache
-            .find_proxy_in_snapshot(&after.route_table, after.route_generation, None, "/secure", None, false)
+            .find_proxy_in_snapshot(
+                &after.route_table,
+                after.route_generation,
+                None,
+                "/secure",
+                None,
+                false,
+            )
             .unwrap_or_else(|| panic!("secure route should be visible"));
         assert_eq!(matched.proxy.id, "secure");
 

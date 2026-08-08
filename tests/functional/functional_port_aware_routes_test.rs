@@ -1,9 +1,18 @@
-//! Functional coverage for port-aware HTTP routes (issue #3612).
+//! Functional coverage for port-aware Gateway API routes (issue #3612).
 //!
-//! Proves the binary data path respects `Proxy.listen_port` with the
-//! HTTP/HTTPS protocol remap used by Gateway API listener projection onto
-//! `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`, and that a SIGHUP
-//! reload can withdraw one port-scoped sibling without disturbing the other.
+//! Everything here runs against the **real `ferrum-edge` binary**. The Gateway
+//! API listener ports are bound by the gateway's own listener lifecycle — the
+//! test only reserves free port numbers and then releases them — so a
+//! regression that stops binding those ports fails these tests rather than
+//! being papered over by a helper.
+//!
+//! Covered:
+//! - two **same-protocol** listener ports (`:A` and `:B`, both plaintext)
+//!   carrying identical `host` + `listen_path`, each reaching only its own
+//!   backend, with the global process bind failing closed;
+//! - an HTTP listener and an HTTPS listener on **distinct** ports, each
+//!   reaching only its own backend on the correct protocol;
+//! - SIGHUP reload that adds a listener port and withdraws another.
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
@@ -15,6 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+
+const HOST: &str = "app.example.com";
 
 async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -39,53 +50,111 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
     (port, handle)
 }
 
-async fn get_with_host(client: &reqwest::Client, url: String, host: &str) -> (u16, String) {
+/// Reserve an ephemeral port number, then release the socket so the gateway
+/// binds it itself. The gateway's readiness barrier is what proves it won the
+/// race; a lost race shows up as an explicit "never bound" failure below.
+async fn reserve_free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+async fn get_on_port(client: &reqwest::Client, port: u16, path: &str) -> (u16, String) {
     let resp = client
-        .get(&url)
-        .header("Host", host)
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .header("Host", HOST)
         .send()
         .await
-        .expect("HTTP GET should complete");
+        .unwrap_or_else(|e| panic!("HTTP GET to port {port} failed: {e}"));
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     (status, body)
 }
 
-fn config_yaml(plain_port: u16, tls_port: u16) -> String {
+async fn get_on_tls_port(client: &reqwest::Client, port: u16, path: &str) -> (u16, String) {
+    let resp = client
+        .get(format!("https://127.0.0.1:{port}{path}"))
+        .header("Host", HOST)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("HTTPS GET to port {port} failed: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    (status, body)
+}
+
+/// Poll until the gateway is accepting on `port`, or fail with a clear
+/// "never bound" message. The listener lifecycle is asynchronous relative to
+/// process readiness, so a bounded poll is correct here — a sleep is not.
+async fn wait_until_listening(port: u16, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("gateway never bound {what} on port {port}");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_until_not_listening(port: u16, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("gateway never released {what} on port {port}");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn plaintext_proxy(id: &str, listen_port: u16, backend_port: u16) -> String {
     format!(
         r#"
-version: "1"
-http_tls_listen_ports: [443]
-proxies:
-  - id: "plain-api"
-    hosts: ["app.example.com"]
+  - id: "{id}"
+    hosts: ["{HOST}"]
     listen_path: "/api"
-    listen_port: 80
+    listen_port: {listen_port}
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {plain_port}
-    strip_listen_path: true
-  - id: "tls-api"
-    hosts: ["app.example.com"]
-    listen_path: "/api"
-    listen_port: 443
-    backend_scheme: http
-    backend_host: "127.0.0.1"
-    backend_port: {tls_port}
-    strip_listen_path: true
-consumers: []
-plugin_configs: []
-"#
+    backend_port: {backend_port}
+    strip_listen_path: true"#
     )
 }
 
+/// The exact case #3612 filed: one hostname and one path, two listeners of the
+/// same protocol. Both must be bound by the binary and route independently.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
-async fn functional_port_aware_routes_plaintext_remap_and_reload() {
-    let (plain_backend, _h1) = spawn_backend("plain-backend").await;
-    let (tls_backend, _h2) = spawn_backend("tls-backend").await;
+async fn functional_port_aware_routes_two_same_protocol_listeners() {
+    let (backend_a, _ha) = spawn_backend("listener-a").await;
+    let (backend_b, _hb) = spawn_backend("listener-b").await;
+    let port_a = reserve_free_port().await;
+    let port_b = reserve_free_port().await;
+    assert_ne!(port_a, port_b);
 
-    let config = config_yaml(plain_backend, tls_backend);
+    let config = format!(
+        r#"
+version: "1"
+proxies:{}{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-a", port_a, backend_a),
+        plaintext_proxy("gw-b", port_b, backend_b),
+    );
+
     let gateway = TestGateway::builder()
         .mode_file(config)
         .log_level("warn")
@@ -94,52 +163,211 @@ async fn functional_port_aware_routes_plaintext_remap_and_reload() {
         .expect("start gateway");
     let client = reqwest::Client::new();
 
-    // Process plaintext bind remaps to the single nontls listen_port (80).
-    let (status, body) =
-        get_with_host(&client, gateway.proxy_url("/api/x"), "app.example.com").await;
-    assert_eq!(status, 200, "plaintext remap must hit the HTTP listener route");
-    assert_eq!(body, "plain-backend");
+    wait_until_listening(port_a, "Gateway listener A").await;
+    wait_until_listening(port_b, "Gateway listener B").await;
 
-    // Reload: drop the plaintext sibling; only the TLS-scoped claim remains.
-    // Without a TLS frontend it must not answer on plaintext (remap disabled
-    // when the only remaining listen_port is TLS-class).
-    let reload = format!(
+    let (status_a, body_a) = get_on_port(&client, port_a, "/api/x").await;
+    assert_eq!(status_a, 200, "listener A must serve: {body_a}");
+    assert_eq!(body_a, "listener-a");
+
+    let (status_b, body_b) = get_on_port(&client, port_b, "/api/x").await;
+    assert_eq!(status_b, 200, "listener B must serve: {body_b}");
+    assert_eq!(body_b, "listener-b");
+
+    // With two same-protocol listener ports the compatibility remap is off, so
+    // the global process bind is not a stand-in for either listener.
+    let resp = client
+        .get(gateway.proxy_url("/api/x"))
+        .header("Host", HOST)
+        .send()
+        .await
+        .expect("global bind answers");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "the global plaintext bind must not guess between two same-protocol listeners"
+    );
+}
+
+/// HTTP and HTTPS Gateway listeners on distinct ports, each with its own
+/// backend. Proves the listener's TLS class — not its port number — decides
+/// which frontend serves it, through the real binary.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn functional_port_aware_routes_http_and_https_listeners() {
+    let (plain_backend, _hp) = spawn_backend("plain-backend").await;
+    let (tls_backend, _ht) = spawn_backend("tls-backend").await;
+    let plain_port = reserve_free_port().await;
+    let tls_port = reserve_free_port().await;
+    assert_ne!(plain_port, tls_port);
+
+    // `http_tls_listen_ports` is namespace-qualified: the entry is the
+    // `(namespace, port)` pair the listener was admitted under.
+    let config = format!(
         r#"
 version: "1"
-http_tls_listen_ports: [443]
-proxies:
-  - id: "tls-api"
-    hosts: ["app.example.com"]
-    listen_path: "/api"
-    listen_port: 443
-    backend_scheme: http
-    backend_host: "127.0.0.1"
-    backend_port: {tls_backend}
-    strip_listen_path: true
+http_tls_listen_ports:
+  - ["ferrum", {tls_port}]
+proxies:{}{}
 consumers: []
 plugin_configs: []
-"#
+"#,
+        plaintext_proxy("gw-plain", plain_port, plain_backend),
+        plaintext_proxy("gw-tls", tls_port, tls_backend),
     );
+
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway");
+
+    wait_until_listening(plain_port, "plaintext Gateway listener").await;
+    wait_until_listening(tls_port, "TLS Gateway listener").await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("build TLS client");
+
+    let (status_plain, body_plain) = get_on_port(&client, plain_port, "/api/x").await;
+    assert_eq!(status_plain, 200, "HTTP listener must serve: {body_plain}");
+    assert_eq!(body_plain, "plain-backend");
+
+    let (status_tls, body_tls) = get_on_tls_port(&client, tls_port, "/api/x").await;
+    assert_eq!(status_tls, 200, "HTTPS listener must serve: {body_tls}");
+    assert_eq!(body_tls, "tls-backend");
+
+    // Cross-protocol must fail closed. A plaintext request to the TLS
+    // listener's socket either fails at the transport (the socket speaks TLS)
+    // or is refused — it must never be served by the TLS-scoped route.
+    let plaintext_to_tls_listener = client
+        .get(format!("http://127.0.0.1:{tls_port}/api/x"))
+        .header("Host", HOST)
+        .send()
+        .await;
+    match plaintext_to_tls_listener {
+        Err(_) => {}
+        Ok(response) => assert_ne!(
+            response.status().as_u16(),
+            200,
+            "a plaintext request must never be served by the TLS listener's route"
+        ),
+    }
+
+    // The gateway's own plaintext bind is not a Gateway listener. Exactly one
+    // plaintext listener port is declared, so the documented single-listener
+    // compatibility remap admits it — assert that documented behaviour rather
+    // than leaving the surface untested.
+    let global = client
+        .get(gateway.proxy_url("/api/x"))
+        .header("Host", HOST)
+        .send()
+        .await
+        .expect("global plaintext bind answers");
+    let status_global = global.status().as_u16();
+    let body_global = global.text().await.unwrap_or_default();
+    assert_eq!(
+        status_global, 200,
+        "with one plaintext listener port the global bind remaps onto it: {body_global}"
+    );
+    assert_eq!(body_global, "plain-backend");
+}
+
+/// Reload lifecycle through SIGHUP on the real binary: add a listener port,
+/// then withdraw one and prove the withdrawn port stops routing.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn functional_port_aware_routes_reload_adds_and_withdraws_listeners() {
+    let (backend_a, _ha) = spawn_backend("listener-a").await;
+    let (backend_b, _hb) = spawn_backend("listener-b").await;
+    let port_a = reserve_free_port().await;
+    let port_b = reserve_free_port().await;
+    assert_ne!(port_a, port_b);
+
+    let initial = format!(
+        r#"
+version: "1"
+proxies:{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-a", port_a, backend_a),
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(initial)
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("start gateway");
+    let client = reqwest::Client::new();
+
+    wait_until_listening(port_a, "Gateway listener A").await;
+    assert_eq!(get_on_port(&client, port_a, "/api/x").await.1, "listener-a");
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port_b))
+            .await
+            .is_err(),
+        "an undeclared listener port must not be bound"
+    );
+
     let config_path = gateway
         .config_path
         .as_ref()
         .expect("file-mode harness must populate config_path");
-    std::fs::write(config_path, reload).expect("rewrite config");
 
-    #[cfg(unix)]
-    {
-        let pid = gateway.pid().expect("gateway still running");
-        let _ = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
-            .output();
-    }
-
-    sleep(Duration::from_secs(2)).await;
-
-    let (status, _) =
-        get_with_host(&client, gateway.proxy_url("/api/x"), "app.example.com").await;
-    assert_eq!(
-        status, 404,
-        "after withdrawing the plaintext sibling, TLS-only listen_port must not remap onto plaintext"
+    // ── Reload 1: add listener B ─────────────────────────────────────────
+    let with_both = format!(
+        r#"
+version: "1"
+proxies:{}{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-a", port_a, backend_a),
+        plaintext_proxy("gw-b", port_b, backend_b),
     );
+    std::fs::write(config_path, with_both).expect("rewrite config");
+    sighup(&gateway);
+    wait_until_listening(port_b, "added Gateway listener B").await;
+
+    assert_eq!(get_on_port(&client, port_b, "/api/x").await.1, "listener-b");
+    assert_eq!(
+        get_on_port(&client, port_a, "/api/x").await.1,
+        "listener-a",
+        "adding a listener must not disturb the existing one"
+    );
+
+    // ── Reload 2: withdraw listener A ────────────────────────────────────
+    let only_b = format!(
+        r#"
+version: "1"
+proxies:{}
+consumers: []
+plugin_configs: []
+"#,
+        plaintext_proxy("gw-b", port_b, backend_b),
+    );
+    std::fs::write(config_path, only_b).expect("rewrite config");
+    sighup(&gateway);
+    wait_until_not_listening(port_a, "withdrawn Gateway listener A").await;
+
+    assert_eq!(
+        get_on_port(&client, port_b, "/api/x").await.1,
+        "listener-b",
+        "the surviving sibling listener keeps serving across the withdrawal"
+    );
+}
+
+#[cfg(unix)]
+fn sighup(gateway: &TestGateway) {
+    let pid = gateway.pid().expect("gateway still running");
+    let _ = std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .output();
 }

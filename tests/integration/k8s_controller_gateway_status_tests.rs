@@ -724,9 +724,11 @@ fn cross_kind_wildcard_claim_losing_one_listener_retains_sibling_claims() {
             "the GRPCRoute loses on the shared listener but retains the grpc-only claim"
         );
         assert!(
-            translation.config.proxies.iter().any(|proxy| {
-                proxy.backend_port == 50051 && proxy.listen_port == Some(8080)
-            }),
+            translation
+                .config
+                .proxies
+                .iter()
+                .any(|proxy| { proxy.backend_port == 50051 && proxy.listen_port == Some(8080) }),
             "retained GRPCRoute claim must be scoped to the grpc-only listener"
         );
         assert!(

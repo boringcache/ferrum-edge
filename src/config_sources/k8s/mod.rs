@@ -557,9 +557,17 @@ pub struct GatewayApiRouteConflictKey {
     pub hostname: String,
     pub listen_path: String,
     pub match_signature: String,
-    /// Gateway listener port this claim attaches to. `None` when no listener
+    /// The Gateway listener this claim attaches to. `None` when no listener
     /// policy resolved the parentRef (unknown Gateway) — arbitration then
     /// falls back to the literal parentRef identity alone.
+    ///
+    /// This is the identity, not `listen_port`: sibling listeners can share a
+    /// numeric port, and collapsing them would make one listener's cross-kind
+    /// loss withdraw an unrelated sibling claim.
+    pub listener: Option<GatewayApiListenerKey>,
+    /// Numeric port of `listener`, carried for diagnostics and for the
+    /// runtime `Proxy.listen_port` stamp. Always derived from `listener`, so it
+    /// never widens the identity.
     pub listen_port: Option<u16>,
 }
 
@@ -593,11 +601,25 @@ impl K8sServiceKey {
     }
 }
 
+/// Stable identity of one Gateway API listener.
+///
+/// This is the arbitration/materialization domain for HTTP-family routes: a
+/// numeric port is **not** an identity, because Gateway API explicitly permits
+/// several listeners of one Gateway (and listeners of different Gateways) to
+/// share a port while being distinguished by `hostname` and protocol. Keying
+/// anything listener-specific by port alone lets a sibling listener suppress or
+/// TLS-taint an unrelated claim.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct GatewayApiListenerKey {
+pub struct GatewayApiListenerKey {
     pub namespace: String,
     pub gateway: String,
     pub listener: String,
+}
+
+impl std::fmt::Display for GatewayApiListenerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}#{}", self.namespace, self.gateway, self.listener)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -640,6 +662,17 @@ pub(crate) struct GatewayApiListenerPolicy {
     pub materializable: bool,
     pub routes_materializable: bool,
     pub requires_frontend_tls: bool,
+    /// Upper-cased `spec.listeners[].protocol` (`HTTP`, `HTTPS`, `TLS`, …).
+    /// Only the HTTP family participates in HTTP-route materialization and in
+    /// same-port frontend-shape admission.
+    pub protocol: String,
+    /// Resolved `(cert_path, key_path)` this listener would terminate with.
+    /// `None` for plaintext listeners and for TLS listeners whose
+    /// `certificateRefs` did not resolve to exactly one usable credential.
+    ///
+    /// Used to detect listeners that share a numeric port but demand
+    /// incompatible credential ownership — one socket cannot present two.
+    pub frontend_tls_source: Option<(String, String)>,
 }
 
 pub(crate) struct K8sAccumulator {
@@ -1159,6 +1192,10 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
             let _ = gateway_api::collect_gateway_listener_policy(acc, object);
         }
     }
+    // Keep status-context listener admission identical to the translation
+    // pass, or a route's status would arbitrate against a listener the data
+    // plane refused.
+    gateway_api::refuse_incompatible_same_port_listeners(acc);
 }
 
 /// Build the Gateway API status-context accumulator once per reconcile/plan.
@@ -1282,6 +1319,11 @@ where
             }
         }
     }
+
+    // Every listener policy is now known, so same-port physical compatibility
+    // can be decided before any route arbitrates or materializes against a
+    // listener that could never have been bound.
+    gateway_api::refuse_incompatible_same_port_listeners(&mut acc);
 
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));

@@ -57,7 +57,7 @@ Current mesh HBONE/DNS perf status lives in
 | CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
 | CP/K8s authoritative mesh config revision | [#3611](https://github.com/ferrum-edge/ferrum-edge/issues/3611) | |
-| Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | Done — per-listener `listen_port` identity, protocol remap, per-listener cross-kind retention |
+| Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | Done — `GatewayApiListenerKey` identity, real per-listener socket binding + reload/withdrawal, per-listener cross-kind retention. Residual: no `Conflicted` condition on `Gateway.status.listeners[]` for the same-port incompatible-shape refusal |
 | OIDC RP pending login state (HA) | [#3613](https://github.com/ferrum-edge/ferrum-edge/issues/3613) | |
 | `ai_stream_router` Anthropic multimodal content | [#3616](https://github.com/ferrum-edge/ferrum-edge/issues/3616) | |
 | TCP outbound PROXY protocol v2 | [#3618](https://github.com/ferrum-edge/ferrum-edge/issues/3618) | |

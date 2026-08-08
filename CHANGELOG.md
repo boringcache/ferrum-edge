@@ -9,12 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Port-aware Gateway API HTTP-family route representation (issue #3612):
-  materialized proxies carry the admitting listener's `listen_port`, the router
-  selects by frontend port / TLS class (with HTTP/HTTPS protocol remap for the
-  common Service projection of :80/:443 onto the process binds), and cross-kind
-  arbitration retains healthy sibling `(parentRef, listener)` claims instead of
-  withdrawing the whole Route. Same-listener overlaps still fail closed.
+- Port-aware Gateway API HTTP-family route representation and real listener
+  binding (issue #3612). Materialized proxies carry the admitting listener's
+  `listen_port` plus a namespace-qualified TLS class, and a new
+  `GatewayListenerManager` binds a socket for every declared Gateway listener
+  port in `file`, `database`, and `dp` mode alongside the global proxy ports —
+  so two same-protocol listeners such as `:80` and `:8080`, and HTTP/HTTPS
+  listeners on distinct ports, all serve through the real binary. The listener
+  set is reconciled on every config publication (reload / update / delete /
+  withdrawal); a withdrawn listener stops routing at the config swap and its
+  socket then drains, and an unbindable port is reported on
+  `GatewayListenerManager::bind_failures` and retried rather than being fatal.
+  Cross-kind arbitration is keyed by the resolved Gateway listener identity, not
+  by port number, so it retains healthy sibling claims and sibling listeners
+  sharing a port cannot suppress or TLS-taint one another. A numeric port
+  claimed by incompatible listener shapes (plaintext vs TLS, or differing TLS
+  credentials) is refused at admission on both sides. Same-listener overlaps
+  still fail closed.
 
 - `ai_federation` incremental provider response streaming behind a new root
   `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat

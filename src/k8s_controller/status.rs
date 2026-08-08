@@ -1772,18 +1772,19 @@ fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
 
 fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
     // Gateway API v1.5.1 forbids merging between HTTPRoutes and GRPCRoutes on a
-    // shared listener. With port-aware route representation, the rejection is
-    // confined to the overlapping listener claim (listen_port when known).
+    // shared listener. With listener-aware route representation the rejection is
+    // confined to the overlapping listener claim; name that listener (and its
+    // port when known) so the operator can tell which sibling survived.
     if conflict.loser.kind != conflict.winner.kind {
-        let port = conflict
-            .key
-            .listen_port
-            .map(|port| format!(" listener_port={port}"))
-            .unwrap_or_default();
+        let listener = match (&conflict.key.listener, conflict.key.listen_port) {
+            (Some(listener), Some(port)) => format!(" listener={listener} port={port}"),
+            (Some(listener), None) => format!(" listener={listener}"),
+            (None, _) => String::new(),
+        };
         return format!(
-            "Ferrum rejected this route claim on parent={}{} because Gateway API forbids merging {} and {} rules on a shared listener and host={} overlaps; winner is {} {}/{}. Sibling listener claims on other ports are retained when port-aware representation applies.",
+            "Ferrum rejected this route claim on parent={}{} because Gateway API forbids merging {} and {} rules on a shared listener and host={} overlaps; winner is {} {}/{}. Claims this route holds on other listeners are retained.",
             conflict.key.parent_ref,
-            port,
+            listener,
             conflict.loser.kind,
             conflict.winner.kind,
             conflict.key.hostname,

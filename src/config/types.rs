@@ -2772,13 +2772,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
-    /// Gateway listener ports that terminate TLS on the frontend (HTTPS /
-    /// terminating TLS Gateway API listeners). HTTP-family proxies whose
-    /// `listen_port` is in this set match TLS frontends; other port-scoped
-    /// HTTP proxies match plaintext frontends. Empty for non-Kubernetes /
-    /// manually authored configs.
+    /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
+    /// TLS on the frontend.
+    ///
+    /// An HTTP-family proxy whose `(namespace, listen_port)` is in this set
+    /// matches TLS frontends; any other port-scoped HTTP proxy matches
+    /// plaintext frontends. Empty for non-Kubernetes / manually authored
+    /// configs.
+    ///
+    /// The key is **namespace-qualified on purpose**: two namespaces may each
+    /// own a `:443` listener, one terminating and one not, and a bare port set
+    /// would let either one silently reclassify the other's routes. The router
+    /// resolves the class once per candidate at route-table build time, so this
+    /// set is never consulted on the request path.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub http_tls_listen_ports: BTreeSet<u16>,
+    pub http_tls_listen_ports: BTreeSet<(String, u16)>,
     /// Authoritative mesh config revision for this snapshot (issue #2473).
     ///
     /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the

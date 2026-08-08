@@ -2398,6 +2398,13 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    // The Gateway-listener TLS classification is namespace-qualified, so drop
+    // other namespaces' entries with their proxies. Retaining them would leave
+    // this DP able to reclassify nothing (the key would never match), but
+    // dropping keeps the published snapshot minimal and self-consistent.
+    config
+        .http_tls_listen_ports
+        .retain(|(entry_namespace, _)| entry_namespace == namespace);
     let frontend_tls_filtered = filter_frontend_tls_sources_to_namespace(config, namespace);
     (pre.0 - config.proxies.len())
         + (pre.1 - config.consumers.len())

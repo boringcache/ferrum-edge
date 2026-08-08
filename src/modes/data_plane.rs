@@ -482,6 +482,33 @@ pub async fn run(
         info!("TLS not configured - HTTPS listener disabled");
     }
 
+    // ── Gateway API listener ports ───────────────────────────────────────
+    // A DP starts before its first CP snapshot, so the initial reconcile is
+    // usually a no-op; the supervisor binds the Gateway listener ports as soon
+    // as a config carrying them is published, and closes them on withdrawal.
+    // Bind failures are never fatal here — a data plane must not die on
+    // control-plane input.
+    let gateway_listeners = Arc::new(
+        crate::proxy::gateway_listener::GatewayListenerManager::new(
+            proxy_state.clone(),
+            env_config.proxy_socket_addr(0).ip(),
+            crate::proxy::gateway_listener::GatewayListenerTls {
+                static_config: tls_config.clone(),
+                reload_slot: proxy_frontend_tls_slot.clone(),
+            },
+        ),
+    );
+    gateway_listeners.reconcile().await;
+    {
+        let sh = shutdown_tx.subscribe();
+        let manager = gateway_listeners.clone();
+        listener_handles.push(tokio::spawn(async move {
+            if let Err(e) = manager.run(sh).await {
+                tracing::warn!("Gateway API listener supervisor failed: {e:#}");
+            }
+        }));
+    }
+
     // HTTP/3 (QUIC) listener.
     let mut h3_listener_started = false;
     if env_config.enable_http3 {

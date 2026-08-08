@@ -49,6 +49,7 @@ use crate::config::file_loader;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
+use crate::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls;
@@ -186,6 +187,10 @@ pub struct ServeHandles {
     /// load/apply failure; cleared on Applied/Unchanged. Lock-free reads
     /// via [`AtomicBool`].
     pub config_rejected: Arc<AtomicBool>,
+    /// Gateway API listener-port lifecycle. Exposed so in-process callers can
+    /// read the ports actually bound and any refusal / bind failure, rather
+    /// than inferring listener state from traffic.
+    pub gateway_listeners: Arc<GatewayListenerManager>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
@@ -1395,6 +1400,34 @@ pub async fn serve(
         info!("TLS not configured - HTTPS listener disabled");
     }
 
+    // ── Gateway API listener ports ───────────────────────────────────────
+    // Every HTTP-family proxy carrying a `listen_port` (Gateway API listener
+    // identity) gets a real socket here, in addition to the global proxy
+    // ports. Reconciled on every config publication, so SIGHUP reload and
+    // in-process `update_config` add/remove listeners without a restart.
+    let gateway_listeners = Arc::new(GatewayListenerManager::new(
+        proxy_state.clone(),
+        env_config.proxy_socket_addr(0).ip(),
+        GatewayListenerTls {
+            static_config: tls_config.clone(),
+            reload_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+        },
+    ));
+    gateway_listeners.reconcile().await;
+    {
+        let sh = shutdown_tx.subscribe();
+        let manager = gateway_listeners.clone();
+        let h = tokio::spawn(async move {
+            manager
+                .run(sh)
+                .await
+                .context("Gateway API listener supervisor failed")
+        });
+        handles.push(("Gateway API listener supervisor".to_string(), h));
+    }
+
     // Operator-visible warning when both HTTP and HTTPS proxy listeners
     // are off — only stream proxies (TCP/UDP) will serve traffic, which
     // is rarely the intent. Mirrors the same warn in `database.rs` and
@@ -1487,6 +1520,7 @@ pub async fn serve(
     let serve_handles = ServeHandles {
         proxy_state: proxy_state.clone(),
         config_rejected,
+        gateway_listeners: gateway_listeners.clone(),
         bound,
         listener_handles: handles,
         background_handles,
