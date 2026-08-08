@@ -2195,14 +2195,16 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
-| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies |
-| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for rotation |
+| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies |
+| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
 | `session.store` | String | Session backend; only `cookie` is implemented |
 | `session.cookie_name` | String | Session cookie name (default: `ferrum_session`) |
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
-| `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
 | `session.domain` | String (optional) | Domain for the durable session cookie only; short-lived correlation cookies always remain host-only |
+| `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
+| `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
 | `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
 

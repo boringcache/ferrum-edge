@@ -17,12 +17,12 @@ use super::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
     GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
     K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
-    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, route_backends_require_node_waypoint_authz,
+    UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
+    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
     route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route_with_session,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -198,6 +198,26 @@ pub(super) fn translate(
             // TLS and ignore hostname SNI selection.
             for mut proxy in l4_route_proxies(object, acc, BackendScheme::Tcp)? {
                 proxy.passthrough = true;
+                acc.upsert_proxy(proxy, SourceKind::GatewayApi);
+            }
+            Ok(true)
+        }
+        // UDPRoute shares the L4 materialization path with TCPRoute/TLSRoute:
+        // the route carries no request-level predicate, so the Gateway listener
+        // port is the entire match and the rule's `backendRefs` set is the
+        // weighted datagram peer set (see `udp_rule_backends`).
+        // The stream scheme is what makes the materialized proxy a UDP
+        // listener/relay rather than a TCP one; datagram semantics (no
+        // connection state, per-session idle expiry) are preserved by the
+        // existing UDP data path.
+        //
+        // The response-amplification guard is NOT engaged here: it is the
+        // opt-in per-proxy `udp_max_response_amplification_factor`, Gateway
+        // API defines no field that maps onto it, and `proxy_for_route`
+        // leaves it unset — the same default a hand-authored UDP proxy gets.
+        // Do not describe it as in force for a generated UDPRoute proxy.
+        "UDPRoute" => {
+            for proxy in l4_route_proxies(object, acc, BackendScheme::Udp)? {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
             Ok(true)
@@ -2419,11 +2439,12 @@ pub(crate) fn route_conflicts<'a>(
         Vec<GatewayApiRouteConflictCandidate>,
     > = HashMap::new();
     let mut route_entries: Vec<CrossKindRouteEntry> = Vec::new();
+    let mut udp_entries: Vec<UdpRouteConflictEntry> = Vec::new();
 
     for object in objects
         .into_iter()
         .filter(|object| super::includes_object_namespace(options, object))
-        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute" | "UDPRoute"))
     {
         let resource = K8sResourceKey::from_object(object);
         let creation_timestamp = object
@@ -2431,6 +2452,19 @@ pub(crate) fn route_conflicts<'a>(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp);
+        let candidate = GatewayApiRouteConflictCandidate {
+            resource: resource.clone(),
+            creation_timestamp,
+        };
+        if object.kind == "UDPRoute" {
+            // UDPRoute arbitration is listener-identity scoped (below), not
+            // keyed by the literal parentRef selector spelling.
+            udp_entries.push(UdpRouteConflictEntry {
+                candidate,
+                claims: udp_route_conflict_claims(object, acc),
+            });
+            continue;
+        }
         let key_set = route_conflict_key_set(object, acc);
         for key in &key_set.keys {
             candidates_by_key.entry(key.clone()).or_default().push(
@@ -2441,16 +2475,14 @@ pub(crate) fn route_conflicts<'a>(
             );
         }
         route_entries.push(CrossKindRouteEntry {
-            candidate: GatewayApiRouteConflictCandidate {
-                resource,
-                creation_timestamp,
-            },
+            candidate,
             keys: key_set.keys,
             listeners: key_set.listeners,
         });
     }
 
     let mut conflicts = cross_kind_route_conflicts(&route_entries);
+    conflicts.extend(udp_route_conflicts(&udp_entries));
     for (key, mut candidates) in candidates_by_key {
         candidates.sort_by(compare_conflict_candidates);
         candidates.dedup_by(|left, right| left.resource == right.resource);
@@ -2690,6 +2722,198 @@ fn cross_kind_hostnames_overlap(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -
     })
 }
 
+/// One UDPRoute participating in same-listener conflict resolution.
+///
+/// Claims carry both the status-facing conflict key (keyed by the authored
+/// parentRef spelling) and the concrete Gateway listener that parentRef
+/// resolved to. Arbitration runs on the listener identity; status and
+/// materialization suppression key on the conflict key.
+struct UdpRouteConflictEntry {
+    candidate: GatewayApiRouteConflictCandidate,
+    claims: Vec<(GatewayApiRouteConflictKey, GatewayApiListenerKey)>,
+}
+
+/// Resolve UDPRoute vs UDPRoute ownership of a concrete UDP Gateway listener.
+///
+/// A UDP listener has no hostname/SNI/path discriminator, so two UDPRoutes
+/// that attach to the same listener cannot both receive traffic. Gateway API
+/// picks the oldest `metadata.creationTimestamp`, then `{namespace}/{name}`.
+/// Ferrum materializes that decision fail-closed: the loser emits neither a
+/// stream proxy nor a generated upstream for the conflicted listener.
+/// Status distinguishes attachment from traffic ownership: both otherwise-valid
+/// routes report `Accepted=True`; the non-effective newer route reports
+/// `Programmed=False` with conflict evidence (and Ferrum's `Conflicted=True`
+/// extension). A multi-listener route that loses on only some listeners keeps
+/// `Accepted=True` / `Programmed=True` while still surfacing partial conflict.
+///
+/// Arbitration is scoped to resolved [`GatewayApiListenerKey`] identity, not
+/// the literal parentRef selector string, so a wildcard reference and a
+/// `sectionName` / `port` reference that name one listener contend with each
+/// other. Distinct listeners stay independent: a route that loses on one
+/// listener may still materialize on another non-conflicting listener.
+fn udp_route_conflicts(entries: &[UdpRouteConflictEntry]) -> Vec<GatewayApiRouteConflict> {
+    let mut claimants_by_listener: BTreeMap<
+        GatewayApiListenerKey,
+        Vec<(usize, GatewayApiRouteConflictKey)>,
+    > = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        for (key, listener) in &entry.claims {
+            claimants_by_listener
+                .entry(listener.clone())
+                .or_default()
+                .push((index, key.clone()));
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for claimants in claimants_by_listener.into_values() {
+        // Collapse one route that reaches the same listener through multiple
+        // parentRef spellings into a single ownership candidate, preserving
+        // every claim key so each losing parentRef reports Conflicted.
+        let mut by_resource: BTreeMap<K8sResourceKey, (usize, Vec<GatewayApiRouteConflictKey>)> =
+            BTreeMap::new();
+        for (index, key) in claimants {
+            let resource = entries[index].candidate.resource.clone();
+            let slot = by_resource
+                .entry(resource)
+                .or_insert_with(|| (index, Vec::new()));
+            slot.1.push(key);
+        }
+
+        let mut ordered = by_resource.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            compare_conflict_candidates(&entries[left.1.0].candidate, &entries[right.1.0].candidate)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let Some((_, (winner_index, _))) = ordered.first() else {
+            continue;
+        };
+        let winner = entries[*winner_index].candidate.resource.clone();
+        for (_, (index, keys)) in ordered.into_iter().skip(1) {
+            let mut keys = keys;
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                conflicts.push(GatewayApiRouteConflict {
+                    key,
+                    winner: winner.clone(),
+                    loser: entries[index].candidate.resource.clone(),
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+/// Conflict-key + concrete-listener claims for one UDPRoute.
+fn udp_route_conflict_claims(
+    object: &K8sObject,
+    acc: Option<&K8sAccumulator>,
+) -> Vec<(GatewayApiRouteConflictKey, GatewayApiListenerKey)> {
+    let Some(acc) = acc else {
+        // Without listener policy the concrete listener is unknown; fall back
+        // to a parentRef-shaped synthetic key so status still has a stable
+        // identity, matching the HTTP unresolved-parentRef fallback.
+        return route_parent_ref_keys(object)
+            .into_iter()
+            .map(|parent_ref| {
+                let listener = GatewayApiListenerKey {
+                    namespace: object.metadata.namespace.clone(),
+                    gateway: "*".to_string(),
+                    listener: parent_ref.clone(),
+                };
+                (
+                    udp_route_conflict_key(&parent_ref, &listener, None),
+                    listener,
+                )
+            })
+            .collect();
+    };
+
+    let mut claims = Vec::new();
+    for claim in udp_route_listener_claims(object, acc) {
+        claims.push((
+            udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port)),
+            claim.listener,
+        ));
+    }
+    claims.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    claims.dedup();
+    claims
+}
+
+fn udp_route_conflict_key(
+    parent_ref: &str,
+    listener: &GatewayApiListenerKey,
+    listen_port: Option<u16>,
+) -> GatewayApiRouteConflictKey {
+    GatewayApiRouteConflictKey {
+        route_family: "udproute".to_string(),
+        parent_ref: parent_ref.to_string(),
+        hostname: "*".to_string(),
+        listen_path: format!(
+            "udp-listener:{}/{}/{}",
+            listener.namespace, listener.gateway, listener.listener
+        ),
+        match_signature: String::new(),
+        // A missing port means this is the listener-shaped unresolved fallback
+        // used without an accumulator, not a resolved Gateway listener claim.
+        listener: listen_port.map(|_| listener.clone()),
+        listen_port,
+    }
+}
+
+/// One concrete UDP Gateway listener a UDPRoute attaches to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UdpListenerClaim {
+    parent_ref: String,
+    listener: GatewayApiListenerKey,
+    port: u16,
+}
+
+/// Resolve every materializable UDP listener a UDPRoute attaches to, preserving
+/// the authored parentRef spelling that selected it.
+fn udp_route_listener_claims(object: &K8sObject, acc: &K8sAccumulator) -> Vec<UdpListenerClaim> {
+    let mut claims = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        let Some(parent_gateway) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        if route_parent_ref_disallow_error(acc, object, parent_ref).is_some() {
+            continue;
+        }
+        let parent_ref_key = route_parent_ref_key_for_parent(object, parent_ref);
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
+                && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
+            {
+                claims.push(UdpListenerClaim {
+                    parent_ref: parent_ref_key.clone(),
+                    listener: key.clone(),
+                    port,
+                });
+            }
+        }
+    }
+    claims.sort();
+    claims.dedup();
+    claims
+}
+
 pub(crate) fn route_conflict_keys_for_acc(
     object: &K8sObject,
     acc: Option<&K8sAccumulator>,
@@ -2712,6 +2936,25 @@ struct RouteConflictKeySet {
 }
 
 fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> RouteConflictKeySet {
+    if object.kind == "UDPRoute" {
+        let claims = udp_route_conflict_claims(object, acc);
+        let mut keys = Vec::new();
+        let mut listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>> =
+            BTreeMap::new();
+        for (key, listener) in claims {
+            listeners
+                .entry(key.parent_ref.clone())
+                .or_default()
+                .entry(key.hostname.clone())
+                .or_default()
+                .insert(listener);
+            keys.push(key);
+        }
+        keys.sort();
+        keys.dedup();
+        return RouteConflictKeySet { keys, listeners };
+    }
+
     let requested_hostnames = route_hostnames(object);
     let hostnames = acc
         .and_then(|acc| {
@@ -6320,24 +6563,78 @@ fn l4_route_proxies(
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
     ensure_l4_parent_refs_are_same_namespace(object)?;
-    let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
-        object,
-        acc,
-        Some(&object.metadata.namespace),
-    );
-    let materialized_listener_bindings =
-        l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace));
-    let has_gateway_parent_ref = object
-        .spec
-        .get("parentRefs")
-        .and_then(Value::as_array)
-        .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway));
-    if has_gateway_parent_ref && materialized_listener_bindings.is_empty() {
-        // A parented L4 route has no standalone/default listener semantics.
-        // Falling back to backend_port here would expose traffic after its
-        // named Gateway listener was rejected or left unmaterialized.
+    let fallback_hosts = l4_route_hosts(object, scheme)?;
+    ensure_udp_route_rule_shape(object, scheme)?;
+    // A `UDPRoute` never carries hostnames (`l4_route_hosts` rejects the field
+    // fail closed), so its surviving listeners bind with an empty host set.
+    // `TCPRoute`/`TLSRoute` keep the shared binding resolver, which is where
+    // TLS SNI is bounded by the listener hostname.
+    let (materialized_listener_bindings, materialized_parent_refs) = if scheme.is_udp() {
+        let (ports, parent_refs) = udp_route_surviving_materialization(object, acc);
+        (
+            ports
+                .into_iter()
+                .map(|port| (port, Vec::new()))
+                .collect::<Vec<(u16, Vec<String>)>>(),
+            parent_refs,
+        )
+    } else {
+        (
+            l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace)),
+            route_materialized_parent_ref_keys_for_namespace(
+                object,
+                acc,
+                Some(&object.metadata.namespace),
+            ),
+        )
+    };
+
+    // Fail closed on a declared-but-unmatched Gateway parent.
+    //
+    // `materialized_listener_bindings` is the set of concrete listener ports
+    // that survived every gate: Gateway identity, `sectionName`/`port`
+    // selection, listener protocol and `allowedRoutes` kind, `allowedRoutes`
+    // namespace, listener materializability, and — for `TLSRoute` — a
+    // non-empty route/listener hostname intersection. A route that *declares*
+    // a Gateway parent and clears none of those gates has no listener to
+    // attach to, so it must open nothing — falling through to the backend port
+    // would bind an unintended OS listener while status correctly reports
+    // `NoMatchingParent` / `NotAllowedByListeners`. The backend-port fallback
+    // below is retained only for the parentless legacy shape (a bare
+    // TCPRoute/TLSRoute/UDPRoute supplied by a non-Kubernetes config source),
+    // which has no parent to contradict — see [`l4_route_declares_parent_ref`]
+    // for why a `UDPRoute` counts a *non-Gateway* parent as a declaration too.
+    //
+    // For UDPRoute this set is additionally filtered by same-listener conflict
+    // losers: a route that lost ownership of every declared listener opens
+    // nothing and creates no upstream, so duplicate OS binds cannot race.
+    if materialized_listener_bindings.is_empty() && l4_route_declares_parent_ref(object, scheme) {
+        if scheme.is_udp()
+            && acc
+                .gateway_api_conflict_losers
+                .contains_key(&K8sResourceKey::from_object(object))
+        {
+            acc.warnings.push(format!(
+                "{} {}/{} lost every claimed UDP listener to an older competing UDPRoute; \
+                 no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        } else if scheme.is_udp() && !route_declares_gateway_parent_ref(object) {
+            acc.warnings.push(format!(
+                "{} {}/{} declares parentRefs with no valid Gateway parent, which Ferrum does not implement \
+                 for UDPRoute; no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        } else {
+            acc.warnings.push(format!(
+                "{} {}/{} declares Gateway parentRefs but none resolved to a materializable listener; \
+                 no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        }
         return Ok(Vec::new());
     }
+
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -6347,36 +6644,48 @@ fn l4_route_proxies(
         .flatten()
         .enumerate()
     {
-        let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+        let Some(resolved) = l4_rule_backends(object, rule, acc, scheme)? else {
             continue;
         };
-        let backend_name = string_field(backend_ref, "name")
-            .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
-            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let raw_backend_port =
-            backend_ref
-                .get("port")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
-                })?;
-        let backend_port = port_from_u64(
-            object,
-            raw_backend_port,
-            "TCPRoute/TLSRoute backendRefs[].port",
-        )?;
 
         let listen_bindings = if materialized_listener_bindings.is_empty() {
-            vec![(backend_port, string_array(&object.spec, "hostnames"))]
+            vec![(resolved.fallback_listen_port, fallback_hosts.clone())]
         } else {
             materialized_listener_bindings.clone()
         };
+        let rule_suffix = l4_rule_suffix(scheme, rule_index);
+
+        // One leg dispatches directly; a set of legs becomes one namespaced
+        // upstream whose weighted targets preserve the declared relative
+        // weights. The upstream is listener-independent, so every listen port
+        // for this rule shares it. Create it only when at least one listen
+        // port survives — a UDPRoute conflict loser must not leave an orphan
+        // upstream behind.
+        let (backend_host, backend_port, upstream_id) = if resolved.backends.len() == 1 {
+            let Some(backend) = resolved.backends.into_iter().next() else {
+                continue;
+            };
+            (backend.host, backend.port, None)
+        } else {
+            let upstream_id = resource_id(
+                "gwapi-l4-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &rule_suffix,
+            );
+            acc.upsert_upstream(upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                resolved.backends,
+            ));
+            (String::new(), 0, Some(upstream_id))
+        };
+
         for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
             let suffix = if listen_bindings.len() == 1 {
-                rule_index.to_string()
+                rule_suffix.clone()
             } else {
-                format!("{rule_index}-{listen_port_index}")
+                format!("{rule_suffix}-{listen_port_index}")
             };
             proxies.push(proxy_for_route(RouteProxySpec {
                 id: resource_id(
@@ -6390,13 +6699,9 @@ fn l4_route_proxies(
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
-                backend_host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
+                backend_host: backend_host.clone(),
                 backend_port,
-                upstream_id: None,
+                upstream_id: upstream_id.clone(),
                 backend_scheme: scheme,
                 listen_port: Some(*listen_port),
                 retry: None,
@@ -6412,6 +6717,447 @@ fn l4_route_proxies(
     Ok(proxies)
 }
 
+/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+///
+/// Arbitration is per concrete listener: a route that loses on one listener may
+/// still keep another. ParentRefs that retain at least one surviving listener
+/// are recorded as materialized so status `Programmed` tracks live ownership.
+fn udp_route_surviving_materialization(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> (Vec<u16>, Vec<String>) {
+    let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
+        .gateway_api_conflict_losers
+        .get(&K8sResourceKey::from_object(object))
+        .into_iter()
+        .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
+        .collect();
+
+    let mut ports = Vec::new();
+    let mut parent_refs = Vec::new();
+    for claim in udp_route_listener_claims(object, acc) {
+        let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port));
+        if losing_conflict_keys.contains(&key) {
+            continue;
+        }
+        ports.push(claim.port);
+        parent_refs.push(claim.parent_ref);
+    }
+    ports.sort();
+    ports.dedup();
+    parent_refs.sort();
+    parent_refs.dedup();
+    (ports, parent_refs)
+}
+
+/// True when the route names at least one Gateway `parentRefs[]` entry.
+///
+/// A non-Gateway parent (a GAMMA `Service` parent, say) is not a listener
+/// declaration and must not arm the fail-closed listener gate.
+fn route_declares_gateway_parent_ref(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway))
+}
+
+/// True when the route declares a `parentRefs[]` entry that arms the
+/// fail-closed listener gate.
+///
+/// `TCPRoute`/`TLSRoute` keep their historical rule: only a **Gateway** parent
+/// counts as a listener declaration, so a route carrying just a GAMMA `Service`
+/// parent still reaches the backend-port fallback exactly as before.
+///
+/// A `UDPRoute` is stricter, because Ferrum implements **no** non-Gateway parent
+/// for it: any present declaration that resolves to no materializable listener
+/// — a `Service` parent, a mistyped `kind`, an unrecognized `group`, or a
+/// malformed/empty value that bypassed CRD admission — must open nothing rather
+/// than quietly bind a north-south UDP relay on the backend port. Such a route
+/// also names no managed Gateway, so it is not a status candidate and the
+/// fallback listener would be completely unannounced. The fallback survives
+/// only for a genuinely parentless route (the `parentRefs` field is absent),
+/// which is the non-Kubernetes config-source shape.
+fn l4_route_declares_parent_ref(object: &K8sObject, scheme: BackendScheme) -> bool {
+    if scheme.is_udp() {
+        return object.spec.get("parentRefs").is_some();
+    }
+    route_declares_gateway_parent_ref(object)
+}
+
+/// Proxy/upstream id suffix for one L4 rule.
+///
+/// `UDPRoute` ids are kind-scoped. The historical L4 id encodes only
+/// `(namespace, route name, rule index)`, so a `UDPRoute` and a same-named
+/// `TCPRoute` in one namespace would upsert over each other's proxy. Existing
+/// `TCPRoute`/`TLSRoute` ids stay byte-identical.
+fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
+    if scheme.is_udp() {
+        format!("udproute-{rule_index}")
+    } else {
+        rule_index.to_string()
+    }
+}
+
+/// Gateway API v1.5.1 bounds `UDPRouteSpec.rules` and `UDPRouteRule.backendRefs`
+/// at 16 entries each. A non-Kubernetes config source is not CRD-validated, so
+/// the cold path enforces the same ceiling rather than expanding an unbounded
+/// hostile fan-out.
+const MAX_UDP_ROUTE_RULES: usize = 16;
+const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
+/// Gateway API v1.5.1 `BackendRef.weight` upper bound. Ferrum stores target
+/// weights under [`MAX_TARGET_WEIGHT`], so accepted UDPRoute weights are
+/// normalized proportionally after the whole backend set is resolved.
+const GATEWAY_API_MAX_BACKEND_WEIGHT: u64 = 1_000_000;
+
+/// Ferrum's supported `UDPRouteSpec.rules` cardinality.
+///
+/// The pinned Gateway API v1.5.1 CRD accepts `1..=16` rules
+/// (`apis/v1alpha2/udproute_types.go`: `MinItems=1`, `MaxItems=16`,
+/// `listType=atomic`), so a 2..=16-rule object is **valid upstream** — Ferrum
+/// declines to serve it rather than calling it malformed, and says so in
+/// status with the upstream `UnsupportedValue` reason.
+const MAX_SUPPORTED_UDP_ROUTE_RULES: usize = 1;
+
+/// Reject a `UDPRoute` whose `spec.rules` shape is hostile or unrepresentable.
+///
+/// The CRD requires `rules` to be an array with `MinItems=1` / `MaxItems=16`.
+/// Missing, non-array, empty, and over-long shapes are rejected fail closed as
+/// `Invalid`. A CRD-valid `2..=16`-rule object remains
+/// [`UNSUPPORTED_SHAPE_MARKER`] / `UnsupportedValue` because Ferrum still
+/// cannot represent matchless competing rules on one listener.
+///
+/// `TCPRoute`/`TLSRoute` keep their historical behavior.
+fn ensure_udp_route_rule_shape(
+    object: &K8sObject,
+    scheme: BackendScheme,
+) -> Result<(), K8sTranslateError> {
+    if !scheme.is_udp() {
+        return Ok(());
+    }
+    let Some(rules_value) = object.spec.get("rules") else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules is required and must be an array with 1..={MAX_UDP_ROUTE_RULES} entries",
+                object.kind
+            ),
+        ));
+    };
+    let Some(rules) = rules_value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules must be an array with 1..={MAX_UDP_ROUTE_RULES} entries",
+                object.kind
+            ),
+        ));
+    };
+    if rules.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules must contain at least 1 entry (Gateway API MinItems=1)",
+                object.kind
+            ),
+        ));
+    }
+    if rules.len() > MAX_UDP_ROUTE_RULES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules supports at most {MAX_UDP_ROUTE_RULES} entries (got {})",
+                object.kind,
+                rules.len()
+            ),
+        ));
+    }
+    if rules.len() > MAX_SUPPORTED_UDP_ROUTE_RULES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.rules holds {} rules, which {UNSUPPORTED_SHAPE_MARKER}: \
+                 Gateway API v1.5.1 permits 1..={MAX_UDP_ROUTE_RULES} rules, but a UDPRouteRule carries only \
+                 `name` and `backendRefs` and so has no match predicate, leaving \
+                 {} indistinguishable rules on one listener port with no \
+                 standards-defined precedence and no cross-rule weight comparison; Ferrum \
+                 serves exactly {MAX_SUPPORTED_UDP_ROUTE_RULES} rule per UDPRoute",
+                object.kind,
+                rules.len(),
+                rules.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// One L4 rule's resolved backend set.
+struct L4RuleBackends {
+    /// Listen port used only by the parentless legacy shape. This is the
+    /// *declared* `backendRefs[].port`, never a resolved blackhole port.
+    fallback_listen_port: u16,
+    /// Weighted target set. Exactly one entry dispatches directly; more than
+    /// one becomes an upstream.
+    backends: Vec<RouteBackend>,
+}
+
+fn l4_rule_backends(
+    object: &K8sObject,
+    rule: &Value,
+    acc: &mut K8sAccumulator,
+    scheme: BackendScheme,
+) -> Result<Option<L4RuleBackends>, K8sTranslateError> {
+    if scheme.is_udp() {
+        return udp_rule_backends(object, rule, acc);
+    }
+
+    // TCPRoute / TLSRoute: unchanged first-non-zero-weight selection.
+    let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
+        return Ok(None);
+    };
+    let backend_name = string_field(backend_ref, "name")
+        .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
+    let backend_namespace =
+        checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+    // Field-specific diagnostics name the route's own kind: an operator
+    // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
+    let backend_port_field = format!("{} backendRefs[].port", object.kind);
+    let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
+        return Err(invalid_resource(
+            object,
+            format!("{backend_port_field} is required"),
+        ));
+    };
+    let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
+    Ok(Some(L4RuleBackends {
+        fallback_listen_port: backend_port,
+        backends: vec![RouteBackend {
+            host: service_dns_name(
+                backend_name,
+                &backend_namespace,
+                &acc.options.cluster_domain,
+            ),
+            port: backend_port,
+            weight: 1,
+            service_namespace: None,
+            service_name: None,
+            service_port: None,
+        }],
+    }))
+}
+
+/// Resolve one `UDPRouteRule`'s `backendRefs` **set**.
+///
+/// Pinned Gateway API v1.5.1 (`apis/v1alpha2/udproute_types.go`) makes
+/// `backendRefs` a set of up to 16 backends with Extended weight support, and
+/// requires that an invalid backend's share of traffic be dropped rather than
+/// handed to the valid backends: "if an invalid backend is requested to have
+/// 80% of the packets, then 80% of packets must be dropped instead."
+///
+/// Ferrum honors that by never renormalizing: an unserviceable leg keeps its
+/// declared weight and is pointed at the unresolvable blackhole host, so the
+/// sessions that select it fail closed instead of shifting onto a valid leg.
+/// Selection granularity is the UDP *session* (client 5-tuple), not the
+/// individual datagram — Ferrum's UDP data path selects a target once per
+/// session and reuses it for that session's lifetime.
+///
+/// Unsupported backend kinds and denied cross-namespace `ReferenceGrant`s stay
+/// whole-route hard errors (the strongest fail-closed outcome) rather than
+/// per-leg blackholes, matching `TCPRoute`/`TLSRoute`.
+fn udp_rule_backends(
+    object: &K8sObject,
+    rule: &Value,
+    acc: &mut K8sAccumulator,
+) -> Result<Option<L4RuleBackends>, K8sTranslateError> {
+    let Some(backend_refs_value) = rule.get("backendRefs") else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs is required and must be an array with 1..={MAX_UDP_ROUTE_BACKEND_REFS} entries",
+                object.kind
+            ),
+        ));
+    };
+    let Some(backend_refs) = backend_refs_value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs must be an array with 1..={MAX_UDP_ROUTE_BACKEND_REFS} entries",
+                object.kind
+            ),
+        ));
+    };
+    if backend_refs.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs must contain at least 1 entry (Gateway API MinItems=1)",
+                object.kind
+            ),
+        ));
+    }
+    if backend_refs.len() > MAX_UDP_ROUTE_BACKEND_REFS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} backendRefs supports at most {MAX_UDP_ROUTE_BACKEND_REFS} entries (got {})",
+                object.kind,
+                backend_refs.len()
+            ),
+        ));
+    }
+
+    let backend_port_field = format!("{} backendRefs[].port", object.kind);
+    let mut backends = Vec::new();
+    let mut fallback_listen_port = None;
+    let mut skipped_zero = 0usize;
+    let mut unserviceable = 0usize;
+    for backend_ref in backend_refs {
+        // Every entry's port is validated, including a zero-weight one: a
+        // malformed port is a spec error regardless of whether traffic would
+        // have selected that leg.
+        let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
+            return Err(invalid_resource(
+                object,
+                format!("{backend_port_field} is required"),
+            ));
+        };
+        let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
+        // Gateway API permits 0..=1,000,000. Parse that public boundary here;
+        // the complete set is normalized below to Ferrum's smaller target
+        // weight representation without changing relative proportions.
+        let weight = udp_backend_weight(object, backend_ref)?;
+        // Zero weight disables selection; it does not waive the BackendRef
+        // boundary. Validate the target identity, supported kind, namespace,
+        // and ReferenceGrant before filtering so an ignored leg cannot hide
+        // an unauthorized cross-namespace reference or unsupported target.
+        let backend_name = string_field(backend_ref, "name")
+            .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
+        let backend_namespace =
+            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+        if weight == 0 {
+            skipped_zero += 1;
+            continue;
+        }
+        fallback_listen_port.get_or_insert(backend_port);
+
+        // A missing Service, or a Service without the referenced port, is an
+        // unserviceable leg. It keeps its weight and becomes an explicit
+        // blackhole target so its share of sessions is dropped, never
+        // redistributed. The check is skipped entirely when no Service has
+        // been observed at all (a non-Kubernetes or not-yet-synced source),
+        // so a cold cache cannot blackhole a healthy route.
+        let serviceable = !acc.has_observed_services()
+            || (acc.service_exists(&backend_namespace, backend_name)
+                && acc.service_port_exists(&backend_namespace, backend_name, backend_port));
+        if serviceable {
+            backends.push(RouteBackend {
+                host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                port: backend_port,
+                weight,
+                service_namespace: Some(backend_namespace.clone()),
+                service_name: Some(backend_name.to_string()),
+                service_port: Some(backend_port),
+            });
+        } else {
+            unserviceable += 1;
+            backends.push(RouteBackend {
+                host: ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                port: ZERO_WEIGHT_BACKEND_PORT,
+                weight,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            });
+        }
+    }
+
+    if backends.is_empty() {
+        if skipped_zero > 0 {
+            acc.warnings.push(format!(
+                "{} rule has only zero-weight backendRefs; no proxy was materialized",
+                object.kind
+            ));
+        }
+        return Ok(None);
+    }
+    normalize_backend_weights_to_target_limit(&mut backends);
+    if skipped_zero > 0 {
+        acc.warnings.push(format!(
+            "{} skipped {} zero-weight backendRef(s)",
+            object.kind, skipped_zero
+        ));
+    }
+    if unserviceable > 0 {
+        acc.warnings.push(format!(
+            "{} {}/{} has {} unresolved backendRef(s); their declared weight is dropped fail \
+             closed and is not redistributed to the resolvable backends",
+            object.kind, object.metadata.namespace, object.metadata.name, unserviceable
+        ));
+    }
+
+    let Some(fallback_listen_port) = fallback_listen_port else {
+        return Ok(None);
+    };
+    Ok(Some(L4RuleBackends {
+        fallback_listen_port,
+        backends,
+    }))
+}
+
+/// Parse the Gateway API `BackendRef.weight` contract for UDPRoute.
+///
+/// The shared Ferrum target parser intentionally caps weights at 65,535, but
+/// Gateway API's public schema accepts values through 1,000,000. Rejecting the
+/// upper part of that range would make a CRD-valid UDPRoute inert. The caller
+/// normalizes the resolved set proportionally before it reaches an Upstream.
+fn udp_backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
+    let Some(value) = backend_ref.get("weight") else {
+        return Ok(1);
+    };
+    let Some(weight) = value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!("backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"),
+        ));
+    };
+    if weight > GATEWAY_API_MAX_BACKEND_WEIGHT {
+        return Err(invalid_resource(
+            object,
+            format!("backendRefs[].weight must be between 0 and {GATEWAY_API_MAX_BACKEND_WEIGHT}"),
+        ));
+    }
+    Ok(weight as u32)
+}
+
+/// Route-level hostnames an L4 route may carry.
+///
+/// `TLSRoute.spec.hostnames` selects by SNI, so it materializes onto the
+/// stream proxy. Gateway API defines **no** `hostnames` field on `UDPRoute`:
+/// a datagram carries no name to match on, so a hostname would be silently
+/// inert on the data path. Reject it fail closed with a field-specific
+/// diagnostic rather than accepting a selector Ferrum can never honor.
+/// `TCPRoute` keeps its historical behavior untouched.
+fn l4_route_hosts(
+    object: &K8sObject,
+    scheme: BackendScheme,
+) -> Result<Vec<String>, K8sTranslateError> {
+    if scheme.is_udp() && object.spec.get("hostnames").is_some() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{} spec.hostnames is not a Gateway API UDPRoute field and cannot be matched on a datagram listener",
+                object.kind
+            ),
+        ));
+    }
+    Ok(string_array(&object.spec, "hostnames"))
+}
+
 fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
     let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
         return Ok(());
@@ -6425,7 +7171,10 @@ fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8
             if parent_namespace != object.metadata.namespace {
                 return Err(invalid_resource(
                     object,
-                    "TCPRoute/TLSRoute cross-namespace parentRefs are not supported by Ferrum yet",
+                    format!(
+                        "{} cross-namespace parentRefs are not supported by Ferrum yet",
+                        object.kind
+                    ),
                 ));
             }
         }
@@ -6561,6 +7310,7 @@ fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str
         "GRPC" | "GRPCS" => vec!["GRPCRoute"],
         "TCP" => vec!["TCPRoute"],
         "TLS" => vec!["TLSRoute"],
+        "UDP" => vec!["UDPRoute"],
         _ => Vec::new(),
     }
 }
@@ -12800,10 +13550,7 @@ mod tests {
         )
         .expect_err("invalid L4 backend port must fail closed");
 
-        assert!(
-            err.to_string()
-                .contains("TCPRoute/TLSRoute backendRefs[].port")
-        );
+        assert!(err.to_string().contains("TCPRoute backendRefs[].port"));
         assert!(err.to_string().contains("70000"));
     }
 
