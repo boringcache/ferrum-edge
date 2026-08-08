@@ -4676,21 +4676,6 @@ fn http_route_resources(
             continue;
         };
         let conflict_hostnames = conflict_hostnames_for_proxy_hosts(&hostnames);
-        let parent_refs_by_hostname: HashMap<String, Vec<String>> = conflict_hostnames
-            .iter()
-            .map(|hostname| {
-                (
-                    hostname.clone(),
-                    route_allowed_parent_ref_keys_for_hostname(
-                        object,
-                        acc,
-                        &requested_hostnames,
-                        Some(config_namespace),
-                        hostname,
-                    ),
-                )
-            })
-            .collect();
         let route_namespace_suffix = (config_namespaces.len() > 1)
             .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
         let default_redirect_port = route_redirect_default_listener_port(

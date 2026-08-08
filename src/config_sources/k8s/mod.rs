@@ -1346,14 +1346,14 @@ impl K8sAccumulator {
         if !self.mesh.is_empty_overlay() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
-        let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
-        known_namespaces.sort();
-        self.config.known_namespaces.extend(known_namespaces);
-        self.config.normalize_fields();
         // Resolved last: a refusal only invalidates status once the whole pass
         // is known, because a later claim can still materialize the same
         // parentRef on a surviving listener.
         let refused_route_attachments = self.resolve_refused_route_attachments();
+        let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
+        known_namespaces.sort();
+        self.config.known_namespaces.extend(known_namespaces);
+        self.config.normalize_fields();
         K8sTranslation {
             config: self.config,
             warnings: self.warnings,
