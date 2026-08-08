@@ -865,19 +865,21 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             }
                             let replaced = {
                                 let mut set = store_set.lock().await;
-                                if set.replace_store_for_scope(Arc::clone(&store)) {
-                                    true
-                                } else {
-                                    // The scope was deregistered while this
-                                    // generation was listing. Re-register rather
-                                    // than leave the watcher feeding a store the
-                                    // reconciler cannot see.
-                                    set.add_store(store)
-                                }
+                                let replaced = set
+                                    .replace_or_add_store_for_scope_without_notify(store);
+                                // Commit the generation's revision evidence while
+                                // holding the SAME store-set lock that protects the
+                                // replacement. Reconciliation reads in this order
+                                // too (store set -> revision tracker), so it can see
+                                // neither the new store with the old watermark nor
+                                // the new watermark with the old store. Notify only
+                                // after the pair is coherent; a quiet relisted scope
+                                // may never produce another event to repair a missed
+                                // publication (issue #3611).
+                                revision.commit_list(&scope_key);
+                                set.notify_change();
+                                replaced
                             };
-                            // Strictly after the swap: until it lands the
-                            // evidence would describe a store no reader can see.
-                            revision.commit_list(&scope_key);
                             debug!(
                                 kind = %target.kind,
                                 api_version = %target.api_version,
@@ -896,18 +898,21 @@ pub(crate) async fn run_watcher_generations<S, F>(
                                  removing stale store so reprobe will restart",
                                 target.watcher_label
                             );
-                            let removed = store_set
-                                .lock()
-                                .await
-                                .remove_store_for_scope(
+                            let removed = {
+                                let mut set = store_set.lock().await;
+                                let removed = set.remove_store_for_scope(
                                     &target.api_version,
                                     &target.kind,
                                     &target.scope,
                                 );
-                            // The scope's objects leave the reconcile snapshot
-                            // with its store, so its convergence evidence leaves
-                            // too; the reprobe loop restores both together.
-                            revision.forget_scope(&scope_key);
+                                // Keep deregistration and evidence removal ordered
+                                // under the store-set lock. Otherwise a reprobe can
+                                // register and begin the replacement scope between
+                                // these operations, only for this old generation to
+                                // erase the new evidence afterward.
+                                revision.forget_scope(&scope_key);
+                                removed
+                            };
                             if !removed {
                                 debug!(
                                     kind = %target.kind,
