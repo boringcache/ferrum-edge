@@ -438,6 +438,61 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
+## Kubernetes Gateway API (`TCPRoute` / `UDPRoute`)
+
+Stream proxies can also be produced by the Kubernetes controller instead of
+being written by hand. A Gateway API `TCPRoute` attached to a `protocol: TCP`
+listener and a `UDPRoute` attached to a `protocol: UDP` listener each
+materialize one stream proxy per rule on the Gateway listener port. Everything
+on this page — session management, idle timeout, stream plugins, metrics —
+applies unchanged to those generated proxies; the route only decides the listen
+port and the backend.
+
+The one exception is the response amplification guard. It is opt-in through the
+per-proxy `udp_max_response_amplification_factor` above, Gateway API defines no
+field that maps onto it, and the translator leaves it unset — so a generated
+`UDPRoute` proxy runs without a response-size ceiling, and a hand-applied
+override cannot survive, because the proxy is regenerated from the route on
+every reconcile.
+
+For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
+serviceable leg becomes a direct backend
+(`<service>.<namespace>.svc.<cluster-domain>:<port>`); two or more
+non-zero-weight legs become a generated Ferrum upstream whose target weights are
+the declared Gateway API weights, so ordinary weighted round-robin selection
+applies. Selection happens **once per UDP session** (the client 5-tuple keyed
+above), not per datagram, so distribution converges over sessions. A leg whose
+`Service` is missing keeps its weight but points at an unresolvable target, so
+its share of sessions is dropped rather than handed to the healthy legs.
+
+Route admission is strict and fail closed (required `spec.rules` and
+`rules[].backendRefs` arrays with at least one entry each, required numeric
+`backendRefs[].port` on every entry, core `Service` backends only,
+`ReferenceGrant` for cross-namespace backends, no cross-namespace `parentRefs`,
+at most one *supported* rule per `UDPRoute`, same-listener UDPRoute ownership
+by oldest `creationTimestamp` then `{namespace}/{name}`, and no listener at all
+for a declared Gateway parent that matches nothing or lost every claimed
+listener). A `UDPRoute` whose `parentRefs` name only non-Gateway parents (a
+GAMMA `Service` parent, a mistyped `kind`) likewise opens nothing; present
+but malformed or explicitly empty `parentRefs` fail closed too. Ferrum
+implements no non-Gateway `UDPRoute` parent, that route is not a status
+candidate, and the backend-port fallback would be an unannounced listener bind.
+Only a `UDPRoute` with no `parentRefs` field at all keeps that fallback.
+Same-listener ownership suppresses **effective traffic** only: both
+otherwise-valid `UDPRoute`s stay `Accepted=True` (attached), the oldest alone
+is `Programmed`/effective, the shadowed newer route reports
+`Programmed=False` with conflict evidence, and listener `attachedRoutes`
+counts every accepted attached route — including a non-effective newer one. A
+multi-rule `UDPRoute` is valid under the upstream CRD but has no
+representable aggregate here, so it is refused as `Accepted=False` /
+`UnsupportedValue` on `spec.rules` rather than resolved by listener bind order.
+Missing/empty/non-array `rules` or `backendRefs` reject as `Invalid`.
+See [gateway_api_conformance.md](gateway_api_conformance.md) for the full field
+table, the exact support boundary, and the evidence that gates `UDPRoute` — CI
+Unit Tests for translation/status plus a live UDP data-path integration suite
+that serves a translated route through this page's UDP runtime (`TCPRoute` and
+`TLSRoute` retain Ferrum live black-box coverage).
+
 ## Compatible Plugins
 
 Each plugin declares which protocols it supports via `supported_protocols()`. Only plugins that declare `Tcp` or `Udp` support are invoked for stream connections — the gateway automatically skips HTTP-specific plugins (auth, CORS, body transformer, request/response transformer, etc.).
@@ -555,7 +610,45 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 - **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
 - **Shared (SNI-passthrough) ports must agree.** The PROXY header is read from the raw stream before the TLS ClientHello, so SNI-based proxy resolution has not happened yet — the accept loop applies one per-listener decision. Every passthrough proxy sharing a `listen_port` must set the same `stream_proxy_protocol` value; mixing is a validation error.
 - **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
-- **No outbound PROXY protocol.** Ferrum currently does not prepend PROXY headers to backend connections (outbound PROXY protocol support is a future enhancement).
+
+## Outbound PROXY Protocol
+
+Ferrum can prepend a [PROXY protocol v2](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) binary header on backend TCP connects so L4 backends (PostgreSQL, MySQL, Redis, MQTT, custom TCP) see the originating client identity instead of the gateway egress IP. HTTP paths already have `X-Forwarded-For` / `Forwarded`; this is the L4 equivalent.
+
+### Enabling outbound PROXY
+
+Set `backend_proxy_protocol: v2` on any `tcp` or `tcps` proxy:
+
+```yaml
+proxies:
+  - id: db-proxy
+    name: Postgres
+    backend_scheme: tcp
+    listen_port: 5432
+    targets:
+      - host: db.internal
+        port: 5432
+    backend_proxy_protocol: v2   # prepend PROXY v2 on every backend connect
+```
+
+The header is written **immediately after** the backend TCP connect and **before** any relayed application bytes — including before backend TLS handshake when originating TLS, and before splice/kTLS engagement on the Linux fast paths. Passthrough proxies are supported: the PROXY header precedes the client's encrypted ClientHello on the wire.
+
+### Address selection
+
+| Field | Value |
+|-------|-------|
+| Source IP / port | Trusted stream `client_ip` + port (after inbound PROXY trust gating when enabled; otherwise the accept-time socket peer) |
+| Destination IP / port | Trusted inbound-PROXY destination when present; otherwise the complete original destination (`SO_ORIGINAL_DST` / capture metadata), falling back to the accepted socket's local address. The original port is preserved and is never replaced by a transparent capture listener port. |
+
+IPv4 pairs encode as `AF_INET`; mixed or IPv6 pairs encode as `AF_INET6` (IPv4 addresses are promoted to IPv4-mapped form). There are no TLVs.
+
+Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferrum consumes the LB's header, then re-advertises the forwarded client identity to the backend.
+
+### Limitations (outbound)
+
+- **TCP and TCP+TLS only.** Setting `backend_proxy_protocol` on `udp`, `dtls`, or HTTP proxies is a validation error. UDP outbound PROXY is intentionally out of scope (session semantics differ).
+- **Opt-in per proxy.** There is no global `FERRUM_*` default; backends that do not expect PROXY framing must leave the field unset.
+- **Fail closed.** If outbound PROXY is enabled but the client or destination address cannot be resolved, the connection is rejected rather than dialing without a header or inventing addresses.
 
 ## Validation Rules
 
@@ -564,6 +657,7 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - HTTP proxies must not set `listen_port`
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
+- `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 
 ### Port Availability Enforcement

@@ -65,6 +65,17 @@ use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
 
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
+/// Marker phrase carried by a translation error for an object that is **valid**
+/// under the pinned Gateway API CRD schema but names a shape Ferrum does not
+/// implement.
+///
+/// The Gateway API status writer keys on it to report the upstream
+/// `UnsupportedValue` reason instead of the generic `Invalid`, so an operator
+/// can tell "this object is well formed and Ferrum will not serve it" from
+/// "this object is malformed". Emit it verbatim inside a diagnostic that also
+/// names the offending field.
+pub(crate) const UNSUPPORTED_SHAPE_MARKER: &str = "is not implemented by Ferrum";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
     #[serde(default)]
@@ -1294,7 +1305,9 @@ where
         // suppressed rather than just the colliding one. Because the
         // materialized route is port-agnostic, the rejection covers the whole
         // parentRef claim — including any other listener that claim reaches.
-        let skipped_reason = if conflict.loser.kind == conflict.winner.kind {
+        let skipped_reason = if conflict.loser.kind == "UDPRoute" {
+            "the conflicted UDP listener was not materialized"
+        } else if conflict.loser.kind == conflict.winner.kind {
             "the conflicting match was skipped"
         } else {
             "the whole route was withdrawn from that parentRef claim because Gateway API forbids \
@@ -1956,6 +1969,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,

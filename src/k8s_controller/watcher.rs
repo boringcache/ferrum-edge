@@ -188,6 +188,13 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
+        version: "v1alpha2",
+        kind: "UDPRoute",
+        plural: "udproutes",
+        namespaced: true,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
         version: "v1",
         kind: "ReferenceGrant",
         plural: "referencegrants",
