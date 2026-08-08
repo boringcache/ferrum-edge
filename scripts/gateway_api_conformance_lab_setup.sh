@@ -93,6 +93,7 @@ nodes:
         protocol: TCP
       - containerPort: ${TLS_BLACKBOX_NODEPORT_DELETE}
         hostPort: ${TLS_BLACKBOX_PORT_DELETE}
+        protocol: TCP
 YAML
   kind create cluster --name "$KIND_CLUSTER_NAME" --config "$(kind_config_path)" --wait 120s
   kind load docker-image "$FERRUM_IMAGE" --name "$KIND_CLUSTER_NAME"
