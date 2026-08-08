@@ -5760,7 +5760,11 @@ async fn pre_deferred_query_capture_would_leak_client_material_after_empty_commi
 /// original backend destination.
 #[tokio::test]
 async fn deferred_provider_claim_rebakes_proxy_path_and_query_before_dispatch() {
-    let plugin = build(openai_and_anthropic_config());
+    // Azure endpoint carries provider query in the URL; a claim folds it (and any
+    // client query) into the absolute override path, so the canonical backend
+    // query after claim is empty — unlike a plain OpenAI endpoint where the
+    // client-visible query would legitimately survive unchanged.
+    let plugin = build(azure_final_query_config());
     let mut proxy = create_test_proxy();
     proxy.backend_host = "backend.internal".to_string();
     proxy.backend_port = 8443;
@@ -5797,7 +5801,7 @@ async fn deferred_provider_claim_rebakes_proxy_path_and_query_before_dispatch() 
         !Arc::ptr_eq(&pre_claim_proxy, &rebound_proxy),
         "a deferred provider claim must move the baked proxy Arc"
     );
-    assert_eq!(rebound_proxy.backend_host, "api.openai.com");
+    assert_eq!(rebound_proxy.backend_host, "azure.example.com");
     assert_eq!(rebound_proxy.backend_port, 443);
     assert_eq!(rebound_proxy.dns_override, None);
     assert!(rebound_proxy.upstream_id.is_none());
@@ -5823,15 +5827,21 @@ async fn deferred_provider_claim_rebakes_proxy_path_and_query_before_dispatch() 
         "path-only or destination claims must not keep the pre-claim path"
     );
     assert!(ctx.route_override_path_is_absolute);
+    assert!(
+        claimed_path.contains("api-version=2024-06-01")
+            && claimed_path.contains("client_secret=leaked"),
+        "endpoint and client query must be folded into the committed path: {claimed_path}"
+    );
 
     let fresh_query = captured_backend_query(&ctx, raw);
     assert_ne!(
         pre_claim_query, fresh_query,
         "canonical query must be recomputed after the claim, never reused"
     );
+    assert_eq!(fresh_query, "");
     assert_eq!(
         headers.get("authorization").map(String::as_str),
-        Some("Bearer sk-openai-secret")
+        Some("Bearer sk-azure-secret")
     );
 }
 
