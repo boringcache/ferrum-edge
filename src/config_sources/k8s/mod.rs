@@ -374,6 +374,19 @@ pub struct K8sTranslation {
     /// `Accepted=True` / `NoConflicts`.
     pub listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Route claims this translation refused because two different Gateway API
+    /// listeners materialize one physical `(namespace, hosts, listen path,
+    /// listen port)` route slot. Runtime materialization is withdrawn on both
+    /// sides, so status must never report the claim as programmed.
+    ///
+    /// Entries are listener-exact, so the status writer can name the refused
+    /// listener without collapsing siblings that merely share a port. They mark
+    /// the parentRef `Conflicted`; whether that parentRef is also withdrawn
+    /// from `Accepted`/`Programmed` is decided by
+    /// [`Self::materialized_route_parents`], which still carries the parentRef
+    /// whenever it keeps serving through any other listener or claim. A refused
+    /// claim therefore never withdraws a surviving parent or listener.
+    pub refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
 }
 
 /// One refused Gateway API listener claim, in the shape
@@ -605,6 +618,21 @@ pub struct GatewayApiMaterializedRouteParent {
     pub parent_ref: String,
 }
 
+/// One Ferrum-managed route attachment: the exact `(route, parentRef,
+/// listener)` claim a single materialized HTTP-family route proxy occupies.
+///
+/// Identity is the resolved [`GatewayApiListenerKey`], never the numeric port,
+/// the route name, or the hostname: sibling listeners may share a port, so
+/// collapsing them would let one listener's refusal withdraw an unrelated
+/// claim. `listener` is `None` only when no listener policy resolved the
+/// parentRef (an unknown Gateway), which is a port-agnostic claim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GatewayApiRouteAttachment {
+    pub route: K8sResourceKey,
+    pub parent_ref: String,
+    pub listener: Option<GatewayApiListenerKey>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct K8sServiceKey {
     pub namespace: String,
@@ -763,6 +791,21 @@ pub(crate) struct K8sAccumulator {
     /// claimed them. Fail closed on both sides and stay refused for every later
     /// claim in the same pass, so the outcome does not depend on object order.
     pub(crate) gateway_api_refused_route_slots: HashSet<GatewayApiRouteSlot>,
+    /// The `(route, parentRef, listener)` claims each route proxy materializes,
+    /// recorded where the proxy is built. Forward-derived provenance: proxy ids
+    /// are operational names and must never be parsed back into their source
+    /// route or listener.
+    pub(crate) gateway_api_route_proxy_attachments:
+        HashMap<NamespacedResourceId, Vec<GatewayApiRouteAttachment>>,
+    /// Live materialization credit per attachment: the proxies that currently
+    /// serve that exact claim. A merged claim is credited to the proxy it
+    /// collapsed into, so withdrawing that proxy withdraws the merged claim
+    /// too. An attachment with an empty (or absent) proxy set serves nothing.
+    pub(crate) gateway_api_materialized_route_attachments:
+        HashMap<GatewayApiRouteAttachment, HashSet<NamespacedResourceId>>,
+    /// Claims refused for same-slot listener ambiguity. Resolved against the
+    /// credit map above in [`K8sAccumulator::resolve_refused_route_attachments`].
+    pub(crate) gateway_api_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     /// Listeners refused by physical same-port shape arbitration, with the
@@ -828,6 +871,9 @@ impl K8sAccumulator {
             gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_route_proxy_listeners: HashMap::new(),
             gateway_api_refused_route_slots: HashSet::new(),
+            gateway_api_route_proxy_attachments: HashMap::new(),
+            gateway_api_materialized_route_attachments: HashMap::new(),
+            gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
@@ -1089,6 +1135,13 @@ impl K8sAccumulator {
             self.proxy_sources.remove(&key);
             self.gateway_api_route_proxy_kinds.remove(&key);
             self.gateway_api_route_proxy_listeners.remove(&key);
+            // Uncredit every claim this proxy was serving, including claims
+            // merged into it. The build-time attachment record itself is
+            // provenance and is retained: the caller still needs it to report
+            // the withdrawn claim as refused.
+            for proxies in self.gateway_api_materialized_route_attachments.values_mut() {
+                proxies.remove(&key);
+            }
         }
     }
 
@@ -1119,6 +1172,116 @@ impl K8sAccumulator {
                 route: K8sResourceKey::from_object(route),
                 parent_ref,
             });
+    }
+
+    /// Record the `(route, parentRef, listener)` claims one route proxy would
+    /// materialize, keyed by that proxy's identity.
+    pub(crate) fn record_gateway_api_route_proxy_attachments(
+        &mut self,
+        proxy_key: NamespacedResourceId,
+        route: &K8sObject,
+        parent_refs: &[String],
+        listener: Option<&GatewayApiListenerKey>,
+    ) {
+        if parent_refs.is_empty() {
+            return;
+        }
+        let route_key = K8sResourceKey::from_object(route);
+        let attachments = parent_refs
+            .iter()
+            .map(|parent_ref| GatewayApiRouteAttachment {
+                route: route_key.clone(),
+                parent_ref: parent_ref.clone(),
+                listener: listener.cloned(),
+            })
+            .collect();
+        self.gateway_api_route_proxy_attachments
+            .insert(proxy_key, attachments);
+    }
+
+    /// The claims one route proxy was built to materialize, cloned so the
+    /// caller can mutate the accumulator while acting on them.
+    pub(crate) fn gateway_api_route_proxy_attachments_of(
+        &self,
+        proxy_key: &NamespacedResourceId,
+    ) -> Vec<GatewayApiRouteAttachment> {
+        self.gateway_api_route_proxy_attachments
+            .get(proxy_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every claim currently credited to one proxy — its own plus any claim
+    /// merged into it. Used before withdrawing that proxy, so the merged
+    /// claims are reported refused alongside the proxy's own.
+    pub(crate) fn gateway_api_route_attachments_materialized_by(
+        &self,
+        proxy_key: &NamespacedResourceId,
+    ) -> Vec<GatewayApiRouteAttachment> {
+        self.gateway_api_materialized_route_attachments
+            .iter()
+            .filter(|(_, proxies)| proxies.contains(proxy_key))
+            .map(|(attachment, _)| attachment.clone())
+            .collect()
+    }
+
+    /// Credit `proxy_key` as a live materialization of `attachments`.
+    pub(crate) fn record_gateway_api_materialized_route_attachments(
+        &mut self,
+        proxy_key: &NamespacedResourceId,
+        attachments: &[GatewayApiRouteAttachment],
+    ) {
+        for attachment in attachments {
+            self.gateway_api_materialized_route_attachments
+                .entry(attachment.clone())
+                .or_default()
+                .insert(proxy_key.clone());
+        }
+    }
+
+    /// Mark claims refused for same-slot listener ambiguity. Both sides of the
+    /// ambiguity are recorded, so the outcome cannot depend on which claim the
+    /// translator observed first.
+    pub(crate) fn record_gateway_api_refused_route_attachments(
+        &mut self,
+        attachments: Vec<GatewayApiRouteAttachment>,
+    ) {
+        self.gateway_api_refused_route_attachments.extend(attachments);
+    }
+
+    /// Project the same-slot listener-ambiguity refusals onto the status
+    /// boundary, and withdraw the materialized-parent records they invalidate.
+    ///
+    /// A materialized-parent record is withdrawn only when that parentRef has
+    /// no proxy left serving any of its claims: a Route that still serves
+    /// through a sibling parentRef, a sibling listener, or another claim on the
+    /// same listener keeps reporting programmed there, and only reports the
+    /// refusal as a conflict. Cold path, bounded by the number of route proxies
+    /// in the pass.
+    fn resolve_refused_route_attachments(&mut self) -> HashSet<GatewayApiRouteAttachment> {
+        if self.gateway_api_refused_route_attachments.is_empty() {
+            return HashSet::new();
+        }
+        let live_parents: HashSet<GatewayApiMaterializedRouteParent> = self
+            .gateway_api_materialized_route_attachments
+            .iter()
+            .filter(|(_, proxies)| !proxies.is_empty())
+            .map(|(attachment, _)| GatewayApiMaterializedRouteParent {
+                route: attachment.route.clone(),
+                parent_ref: attachment.parent_ref.clone(),
+            })
+            .collect();
+        let refused = std::mem::take(&mut self.gateway_api_refused_route_attachments);
+        for attachment in &refused {
+            let parent = GatewayApiMaterializedRouteParent {
+                route: attachment.route.clone(),
+                parent_ref: attachment.parent_ref.clone(),
+            };
+            if !live_parents.contains(&parent) {
+                self.gateway_api_materialized_route_parents.remove(&parent);
+            }
+        }
+        refused
     }
 
     fn finish(mut self) -> K8sTranslation {
@@ -1186,6 +1349,10 @@ impl K8sAccumulator {
         known_namespaces.sort();
         self.config.known_namespaces.extend(known_namespaces);
         self.config.normalize_fields();
+        // Resolved last: a refusal only invalidates status once the whole pass
+        // is known, because a later claim can still materialize the same
+        // parentRef on a surviving listener.
+        let refused_route_attachments = self.resolve_refused_route_attachments();
         K8sTranslation {
             config: self.config,
             warnings: self.warnings,
@@ -1193,6 +1360,7 @@ impl K8sAccumulator {
             materialized_route_parents: self.gateway_api_materialized_route_parents,
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,
+            refused_route_attachments,
         }
     }
 }

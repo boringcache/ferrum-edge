@@ -13,9 +13,9 @@ use crate::config_sources::k8s::backend_tls_policy::{
 };
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
-    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment, GatewayApiRouteConflict,
+    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
+    K8sTranslationOptions, backend_lb_policy_conflict_losers, backend_lb_policy_status,
     gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
     merge_backend_lb_policy_status, namespace_selector_matches,
     parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
@@ -1886,6 +1886,11 @@ fn route_status(
         ),
         Err(_) => HashSet::new(),
     };
+    // Claims the translator refused because two different Gateway API
+    // listeners materialize one physical route slot. The runtime withdrawal is
+    // fail-closed, so status must never report those claims programmed. Sorted
+    // for a stable condition message across reconciles.
+    let refused_attachments = refused_route_attachments_for_route(result, object);
     let (accepted, resolved_refs, programmed, accepted_reason, resolved_refs_reason, message) =
         match result {
             Ok(_) => {
@@ -1972,17 +1977,35 @@ fn route_status(
             .iter()
             .filter(|key| key.parent_ref == parent_ref_key)
             .collect();
-        let has_conflict = !parent_conflicts.is_empty();
-        let all_parent_matches_conflicted = has_conflict
+        // Listener-exact refusals under this parentRef.
+        let refused_claims: Vec<&GatewayApiRouteAttachment> = refused_attachments
+            .iter()
+            .copied()
+            .filter(|attachment| attachment.parent_ref == parent_ref_key)
+            .collect();
+        let parent_materialized = materialized_parent_refs.contains(&parent_ref_key);
+        // A refused claim on one listener is a conflict for this parentRef, but
+        // it only withdraws the parentRef when nothing under it still serves —
+        // a sibling listener that kept its claim keeps the parent programmed.
+        let all_parent_claims_refused = !refused_claims.is_empty() && !parent_materialized;
+        let cross_kind_conflict = !parent_conflicts.is_empty();
+        let has_conflict = cross_kind_conflict || !refused_claims.is_empty();
+        let all_parent_matches_conflicted = cross_kind_conflict
             && !parent_route_keys.is_empty()
             && parent_route_keys
                 .iter()
                 .all(|key| parent_conflict_keys.contains(key));
+        let parent_conflicted = all_parent_matches_conflicted || all_parent_claims_refused;
         let conflict_message = parent_conflicts
             .first()
-            .map(|conflict| route_conflict_message(conflict));
+            .map(|conflict| route_conflict_message(conflict))
+            .or_else(|| {
+                refused_claims
+                    .first()
+                    .map(|attachment| route_slot_ambiguity_message(attachment))
+            });
         let not_allowed_by_listener = accepted
-            && !all_parent_matches_conflicted
+            && !parent_conflicted
             && route_parent_ref_not_allowed_by_listener(object, parent_ref, indexes);
         let no_matching_parent = accepted
             && !not_allowed_by_listener
@@ -1992,11 +2015,11 @@ fn route_status(
             && !not_allowed_by_listener
             && !route_parent_ref_has_matching_listener(object, parent_ref, indexes);
         let accepted_for_parent = accepted
-            && !all_parent_matches_conflicted
+            && !parent_conflicted
             && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
-        let accepted_reason = if all_parent_matches_conflicted {
+        let accepted_reason = if parent_conflicted {
             "Conflicted"
         } else if not_allowed_by_listener {
             "NotAllowedByListeners"
@@ -2007,7 +2030,7 @@ fn route_status(
         } else {
             accepted_reason
         };
-        let accepted_message = if all_parent_matches_conflicted {
+        let accepted_message = if parent_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
             "Ferrum rejected this route attachment because it is not permitted by the target Gateway listener"
@@ -2018,16 +2041,15 @@ fn route_status(
         } else {
             &message
         };
-        let parent_materialized = materialized_parent_refs.contains(&parent_ref_key);
         let programmed_for_parent = programmed
             && parent_materialized
-            && !all_parent_matches_conflicted
+            && !parent_conflicted
             && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
         let programmed_reason = if programmed_for_parent {
             "Programmed"
-        } else if all_parent_matches_conflicted {
+        } else if parent_conflicted {
             "Conflicted"
         } else if not_allowed_by_listener {
             "NotAllowedByListeners"
@@ -2046,7 +2068,7 @@ fn route_status(
         };
         let programmed_message = if programmed_for_parent {
             "Ferrum programmed this route"
-        } else if all_parent_matches_conflicted {
+        } else if parent_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
             "Ferrum did not program this route because it is not permitted by the target Gateway listener"
@@ -2117,6 +2139,41 @@ fn route_status(
     let mut status = object.status.clone();
     ensure_status_object(&mut status).insert("parents".to_string(), Value::Array(parents));
     status
+}
+
+/// This route's refused same-slot claims, in a deterministic order.
+///
+/// Entries carry the exact [`GatewayApiRouteAttachment`] the translator
+/// withdrew — listener identity included — so status never has to reconstruct
+/// the claim from a proxy id, a numeric port, or a hostname.
+fn refused_route_attachments_for_route<'a>(
+    result: Result<&'a K8sTranslation, &K8sTranslateError>,
+    route: &K8sObject,
+) -> Vec<&'a GatewayApiRouteAttachment> {
+    let Ok(translation) = result else {
+        return Vec::new();
+    };
+    let route_key = K8sResourceKey::from_object(route);
+    let mut attachments: Vec<&GatewayApiRouteAttachment> = translation
+        .refused_route_attachments
+        .iter()
+        .filter(|attachment| attachment.route == route_key)
+        .collect();
+    attachments.sort();
+    attachments
+}
+
+/// Operator-facing reason one route claim was refused for same-slot listener
+/// ambiguity. Names the listener by identity, never by port alone.
+fn route_slot_ambiguity_message(attachment: &GatewayApiRouteAttachment) -> String {
+    let scope = match attachment.listener.as_ref() {
+        Some(listener) => format!(" on Gateway listener {listener}"),
+        None => String::new(),
+    };
+    format!(
+        "Ferrum refused this route claim{scope}: another Gateway API listener claims the same \
+         hosts, path, and listen port, so both claims fail closed"
+    )
 }
 
 fn materialized_route_parent_refs_for_route(

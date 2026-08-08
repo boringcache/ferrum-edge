@@ -2669,6 +2669,13 @@ fn upsert_http_route_resources(
             .and_then(|key| plugins_by_proxy.remove(&key))
             .unwrap_or_default();
         let proxy_key = namespaced_resource_key(&proxy.namespace, &proxy.id);
+        // The exact `(route, parentRef, listener)` claims this proxy carries.
+        // Both the refusal and the materialization branches below report
+        // through them, so the data plane and Route status can never disagree.
+        let attachments = proxy_key
+            .as_ref()
+            .map(|key| acc.gateway_api_route_proxy_attachments_of(key))
+            .unwrap_or_default();
         let slot = route_slot_of(&proxy);
         // A slot already refused for listener ambiguity stays refused for the
         // rest of this pass, so the outcome cannot depend on which claim the
@@ -2682,9 +2689,16 @@ fn upsert_http_route_resources(
             if let Some(key) = proxy_key {
                 acc.gateway_api_route_proxy_listeners.remove(&key);
             }
+            acc.record_gateway_api_refused_route_attachments(attachments);
             continue;
         }
-        if merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind) {
+        if let Some(merged_into) =
+            merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind)
+        {
+            // The claim materializes through the proxy it collapsed into, so
+            // credit that proxy: withdrawing the survivor must take the merged
+            // claim's status down with it.
+            acc.record_gateway_api_materialized_route_attachments(&merged_into, &attachments);
             continue;
         }
         if let Some(conflict) = conflicting_slot_claim(acc, &proxy) {
@@ -2699,10 +2713,18 @@ fn upsert_http_route_resources(
                  physically ambiguous, so both are refused (Conflicted)",
                 conflict.0, conflict.1, proxy.namespace, proxy.id, proxy.listen_port
             ));
+            // Everything the withdrawn side was serving — its own claims plus
+            // any claim merged into it — is refused too, captured before the
+            // withdrawal uncredits them.
+            let withdrawn = namespaced_resource_key(&conflict.0, &conflict.1)
+                .map(|key| acc.gateway_api_route_attachments_materialized_by(&key))
+                .unwrap_or_default();
             acc.withdraw_proxy(&conflict.0, &conflict.1);
             if let Some(key) = proxy_key {
                 acc.gateway_api_route_proxy_listeners.remove(&key);
             }
+            acc.record_gateway_api_refused_route_attachments(withdrawn);
+            acc.record_gateway_api_refused_route_attachments(attachments);
             acc.gateway_api_refused_route_slots.insert(slot);
             continue;
         }
@@ -2710,7 +2732,8 @@ fn upsert_http_route_resources(
         acc.config.plugin_configs.extend(route_plugins);
         if let Some(key) = proxy_key {
             acc.gateway_api_route_proxy_kinds
-                .insert(key, route_kind.to_string());
+                .insert(key.clone(), route_kind.to_string());
+            acc.record_gateway_api_materialized_route_attachments(&key, &attachments);
         }
     }
 
@@ -2719,19 +2742,24 @@ fn upsert_http_route_resources(
     }
 }
 
+/// Collapse one route proxy into a same-kind, same-listener sibling.
+///
+/// Returns the identity of the proxy the claim merged into, so the caller can
+/// credit the merged claim to the proxy that actually serves it; `None` when no
+/// merge happened and the caller must materialize the proxy itself.
 fn merge_http_route_proxy(
     acc: &mut K8sAccumulator,
     proxy: Proxy,
     route_plugins: &[PluginConfig],
     route_kind: &str,
-) -> bool {
+) -> Option<NamespacedResourceId> {
     let Some(existing_index) = acc
         .config
         .proxies
         .iter()
         .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy, route_kind))
     else {
-        return false;
+        return None;
     };
 
     let new_dispatch = route_plugins
@@ -2750,7 +2778,7 @@ fn merge_http_route_proxy(
         &existing_id,
     );
     if new_dispatch.is_none() && existing_dispatch_index.is_none() {
-        return false;
+        return None;
     }
 
     let new_has_default = dispatch_reject_unmatched(new_dispatch) == Some(false)
@@ -2805,7 +2833,9 @@ fn merge_http_route_proxy(
         acc.config.plugin_configs.extend(route_action_plugins);
     }
 
-    true
+    // The merge target came out of `acc.config.proxies`, which `upsert_proxy`
+    // only ever admits with a non-empty namespace and id.
+    namespaced_resource_key(&existing_namespace, &existing_id)
 }
 
 /// Only proxies from the same Gateway API route kind admitted on the **same
@@ -4886,7 +4916,16 @@ fn http_route_resources(
                     if let Some(key) = namespaced_resource_key(config_namespace, proxy_id.as_str())
                     {
                         acc.gateway_api_route_proxy_listeners
-                            .insert(key, host_scope.listener.clone());
+                            .insert(key.clone(), host_scope.listener.clone());
+                        // Recorded from the same scope, so a refused slot can
+                        // withdraw exactly the `(route, parentRef, listener)`
+                        // claims it takes down — and no sibling claim.
+                        acc.record_gateway_api_route_proxy_attachments(
+                            key,
+                            object,
+                            &host_scope.parent_refs,
+                            host_scope.listener.as_ref(),
+                        );
                     }
                     let mut proxy = proxy_for_route(RouteProxySpec {
                         id: proxy_id.clone(),
@@ -7782,6 +7821,18 @@ mod tests {
                     .any(|warning| warning.contains("physically ambiguous")),
                 "the refusal must be reported: {:?}",
                 result.warnings
+            );
+            // The refusal has to reach status too: a Route may not advertise a
+            // materialized Ferrum parent for a slot the data plane withdrew.
+            assert!(
+                result.materialized_route_parents.is_empty(),
+                "a refused claim must leave no materialized parent: {:?}",
+                result.materialized_route_parents
+            );
+            assert_eq!(
+                result.refused_route_attachments.len(),
+                2,
+                "both sides of the ambiguity must be reported to status"
             );
             assert!(
                 result.config.validate_unique_listen_paths().is_ok(),

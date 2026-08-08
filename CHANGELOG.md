@@ -29,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`PortUnavailable`) / `Programmed=False`. Same-kind route merging keys on the
   exact admitting listener, so two Gateways sharing a port never have their
   dispatch rules combined, and a host+path claimed by two different listeners on
-  one port is refused on both sides. When HTTP/3 is enabled, every TLS-class
+  one port is refused on both sides — in Route status as well as in the data
+  plane: the affected `status.parents[]` entries report `Conflicted=True`, and
+  `Accepted=False` / `Programmed=False` with `reason: Conflicted` once no claim
+  under that parentRef survives, while surviving parents and listeners keep
+  reporting programmed. When HTTP/3 is enabled, every TLS-class
   listener port also gets its own QUIC socket and `Alt-Svc` advertises HTTP/3
   only where one exists. Listener supervision reaps and rebinds a listener whose
   accept loop dies, and an HTTP↔HTTPS class flip retires the old accept loops

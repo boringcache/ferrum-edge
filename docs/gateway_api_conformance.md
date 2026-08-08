@@ -250,6 +250,17 @@ distinguishable both in the route table and on the wire:
   contracts — so **both** sides are refused with a translator warning rather
   than letting observation order decide. Same-port listeners with disjoint
   hostnames are unaffected and keep serving independently.
+- **That refusal is carried into Route status, not only into the data plane.**
+  Every refused claim marks its `status.parents[]` entry `Conflicted=True` with
+  a message naming the refused listener by identity. When the parentRef has no
+  surviving claim left — no other listener, no other rule or path — it also
+  reports `Accepted=False` and `Programmed=False` with `reason: Conflicted`, so
+  a Route can never advertise a materialized Ferrum parent for a slot the
+  translator withdrew. A parentRef that still serves through a sibling listener
+  or a sibling claim stays `Accepted=True` / `Programmed=True` and reports only
+  the conflict; other parentRefs of the same Route, and `status.parents[]`
+  entries owned by other controllers, are untouched. Both colliding Routes are
+  reported identically regardless of the order the objects are observed in.
 - A numeric port claimed by two listeners with incompatible physical shapes —
   one plaintext and one TLS-terminating, or two TLS listeners resolving to
   different credentials — is refused at admission. One socket cannot serve

@@ -1116,3 +1116,289 @@ fn compatible_same_port_listeners_report_no_conflict() {
         );
     }
 }
+
+/// A plaintext HTTP Gateway named `name` exposing one listener `http` on `port`.
+fn plain_gateway(name: &str, port: u16) -> K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        name,
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "http",
+                "port": port,
+                "protocol": "HTTP",
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    )
+}
+
+/// An HTTPRoute claiming `/api` on `app.example.com` through the `http`
+/// listener of every named Gateway.
+fn slot_claim_route(name: &str, gateways: &[&str]) -> K8sObject {
+    let parent_refs: Vec<Value> = gateways
+        .iter()
+        .map(|gateway| json!({"name": gateway, "sectionName": "http"}))
+        .collect();
+    object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        name,
+        "default",
+        json!({
+            "parentRefs": parent_refs,
+            "hostnames": ["app.example.com"],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "backendRefs": [{"name": "web", "port": 8080}]
+            }]
+        }),
+    )
+}
+
+fn route_update<'a>(
+    updates: &'a [GatewayApiStatusUpdate],
+    name: &str,
+) -> &'a GatewayApiStatusUpdate {
+    updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == name)
+        .unwrap_or_else(|| panic!("a status update for HTTPRoute {name}"))
+}
+
+/// One condition of the `status.parents[]` entry whose parentRef names
+/// `gateway`. Keyed on the parentRef the operator wrote, so a multi-parent
+/// Route can be asserted parent by parent.
+fn parent_condition<'a>(
+    update: &'a GatewayApiStatusUpdate,
+    gateway: &str,
+    condition_type: &str,
+) -> &'a Value {
+    let parent = update.status["parents"]
+        .as_array()
+        .expect("route parents")
+        .iter()
+        .find(|parent| parent["parentRef"]["name"].as_str() == Some(gateway))
+        .unwrap_or_else(|| panic!("a status.parents[] entry for {gateway}"));
+    parent["conditions"]
+        .as_array()
+        .expect("parent conditions")
+        .iter()
+        .find(|condition| condition["type"].as_str() == Some(condition_type))
+        .unwrap_or_else(|| panic!("a {condition_type} condition for {gateway}"))
+}
+
+fn assert_condition(condition: &Value, status: &str, reason: &str, context: &str) {
+    assert_eq!(
+        condition["status"].as_str(),
+        Some(status),
+        "{context}: {condition:?}"
+    );
+    assert_eq!(
+        condition["reason"].as_str(),
+        Some(reason),
+        "{context}: {condition:?}"
+    );
+}
+
+/// Two different Gateway API listeners materialize one physical
+/// `(namespace, hosts, listen path, listen port)` route slot. The translator
+/// refuses both claims fail closed, so neither Route may report a materialized
+/// Ferrum parent: a Route advertising `Programmed=True` for a slot the data
+/// plane withdrew is exactly the contradiction issue #3612 has to close.
+///
+/// Both observation orders are checked. The refusal is symmetric, so which
+/// claim the translator saw first must not decide what status reports.
+#[test]
+fn same_slot_listener_ambiguity_reports_both_routes_conflicted_in_status() {
+    let gateway_a = plain_gateway("edge-a", 8080);
+    let gateway_b = plain_gateway("edge-b", 8080);
+    let route_a = slot_claim_route("route-a", &["edge-a"]);
+    let route_b = slot_claim_route("route-b", &["edge-b"]);
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway_a.clone(),
+            gateway_b.clone(),
+            route_a.clone(),
+            route_b.clone(),
+        ],
+        vec![
+            gateway_class(),
+            gateway_b.clone(),
+            gateway_a.clone(),
+            route_b.clone(),
+            route_a.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+        assert!(
+            translation.config.proxies.is_empty(),
+            "an ambiguous same-slot claim must materialize nothing: {:?}",
+            translation.config.proxies
+        );
+        assert!(
+            translation.materialized_route_parents.is_empty(),
+            "a refused claim must leave no materialized parent behind: {:?}",
+            translation.materialized_route_parents
+        );
+
+        let mut refused: Vec<String> = Vec::new();
+        for attachment in &translation.refused_route_attachments {
+            let listener = match attachment.listener.as_ref() {
+                Some(listener) => listener.to_string(),
+                None => "<unresolved>".to_string(),
+            };
+            refused.push(format!("{} on {listener}", attachment.route.name));
+        }
+        refused.sort();
+        assert_eq!(
+            refused,
+            vec![
+                "route-a on default/edge-a#http".to_string(),
+                "route-b on default/edge-b#http".to_string(),
+            ],
+            "both claims must be refused, each named by its exact listener"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+        for (route, gateway) in [("route-a", "edge-a"), ("route-b", "edge-b")] {
+            let update = route_update(&updates, route);
+            assert_condition(
+                parent_condition(update, gateway, "Accepted"),
+                "False",
+                "Conflicted",
+                &format!("{route} must not report Accepted for a refused slot"),
+            );
+            assert_condition(
+                parent_condition(update, gateway, "Programmed"),
+                "False",
+                "Conflicted",
+                &format!("{route} must not report Programmed for a refused slot"),
+            );
+            let conflicted = parent_condition(update, gateway, "Conflicted");
+            assert_condition(
+                conflicted,
+                "True",
+                "Conflicted",
+                &format!("{route} must report the ambiguity as a conflict"),
+            );
+            let message = conflicted["message"].as_str().unwrap_or_default();
+            let expected = format!("default/{gateway}#http");
+            assert!(
+                message.contains(&expected),
+                "the conflict message must name the refused listener: {message}"
+            );
+        }
+    }
+}
+
+/// The refusal is confined to the exact listener-scoped claim. A Route with one
+/// refused parentRef and one surviving parentRef keeps serving — and keeps
+/// reporting `Accepted`/`Programmed` — on the survivor, while only the refused
+/// parentRef is withdrawn. Rejecting the whole Route here would take a healthy
+/// listener offline in status for a collision it never participated in.
+#[test]
+fn a_route_with_one_refused_and_one_surviving_parent_keeps_the_survivor() {
+    let gateway_a = plain_gateway("edge-a", 8080);
+    let gateway_b = plain_gateway("edge-b", 8080);
+    // A third listener on its own port: the contested claim cannot reach it.
+    let gateway_c = plain_gateway("edge-c", 9090);
+    let route_a = slot_claim_route("route-a", &["edge-a", "edge-c"]);
+    let route_b = slot_claim_route("route-b", &["edge-b"]);
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway_a.clone(),
+            gateway_b.clone(),
+            gateway_c.clone(),
+            route_a.clone(),
+            route_b.clone(),
+        ],
+        vec![
+            gateway_class(),
+            gateway_c.clone(),
+            gateway_b.clone(),
+            gateway_a.clone(),
+            route_b.clone(),
+            route_a.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+        let listen_ports: Vec<Option<u16>> = translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_port)
+            .collect();
+        assert_eq!(
+            listen_ports,
+            vec![Some(9090)],
+            "only the uncontested :9090 claim may materialize: {:?}",
+            translation.config.proxies
+        );
+
+        let parents: Vec<&str> = translation
+            .materialized_route_parents
+            .iter()
+            .filter(|entry| entry.route.name == "route-a")
+            .map(|entry| entry.parent_ref.as_str())
+            .collect();
+        assert!(
+            parents.iter().any(|parent| parent.contains("edge-c")),
+            "the surviving parentRef must keep its record: {parents:?}"
+        );
+        assert!(
+            !parents.iter().any(|parent| parent.contains("edge-a")),
+            "the refused parentRef must lose its record: {parents:?}"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+        let update = route_update(&updates, "route-a");
+        assert_condition(
+            parent_condition(update, "edge-c", "Accepted"),
+            "True",
+            "Accepted",
+            "the surviving parentRef must stay Accepted",
+        );
+        assert_condition(
+            parent_condition(update, "edge-c", "Programmed"),
+            "True",
+            "Programmed",
+            "the surviving parentRef must stay Programmed",
+        );
+        assert_condition(
+            parent_condition(update, "edge-c", "Conflicted"),
+            "False",
+            "NoConflicts",
+            "the surviving parentRef must report no conflict",
+        );
+        assert_condition(
+            parent_condition(update, "edge-a", "Accepted"),
+            "False",
+            "Conflicted",
+            "the refused parentRef must not report Accepted",
+        );
+        assert_condition(
+            parent_condition(update, "edge-a", "Programmed"),
+            "False",
+            "Conflicted",
+            "the refused parentRef must not report Programmed",
+        );
+
+        let other = route_update(&updates, "route-b");
+        assert_condition(
+            parent_condition(other, "edge-b", "Programmed"),
+            "False",
+            "Conflicted",
+            "the colliding Route must not report Programmed either",
+        );
+    }
+}
