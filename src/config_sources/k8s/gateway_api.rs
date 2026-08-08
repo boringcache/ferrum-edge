@@ -1573,10 +1573,10 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
                 // are already non-materializable at collection time.
                 _ => false,
             };
-        if clear_routes {
-            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
-                policy.routes_materializable = false;
-            }
+        if clear_routes
+            && let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key)
+        {
+            policy.routes_materializable = false;
         }
     }
 }
@@ -1607,12 +1607,13 @@ fn install_planned_gateway_frontend_tls_namespace_sources(
     acc.config
         .frontend_tls_namespace_sources
         .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
-        if let Some(source) = acc.config.frontend_tls_namespace_sources.first() {
-            acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
-            acc.config.frontend_tls_key_path = Some(source.key_path.clone());
-            acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
-        }
+    if acc.config.frontend_tls_cert_path.is_none()
+        && acc.config.frontend_tls_key_path.is_none()
+        && let Some(source) = acc.config.frontend_tls_namespace_sources.first()
+    {
+        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
+        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
+        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
     }
 }
 
@@ -3189,14 +3190,11 @@ fn merge_http_route_proxy(
     route_plugins: &[PluginConfig],
     route_kind: &str,
 ) -> Option<NamespacedResourceId> {
-    let Some(existing_index) = acc
+    let existing_index = acc
         .config
         .proxies
         .iter()
-        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy, route_kind))
-    else {
-        return None;
-    };
+        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy, route_kind))?;
 
     let new_dispatch = route_plugins
         .iter()
@@ -5312,17 +5310,17 @@ fn http_route_resources(
                         .map(|entry| entry.descriptor.clone())
                         .collect(),
                 );
-                let host_scopes = route_host_scopes_for_path(
+                let host_scopes = route_host_scopes_for_path(RouteHostScopeInputs {
                     object,
                     acc,
-                    &hostnames,
-                    &conflict_hostnames,
-                    &requested_hostnames,
+                    spec_hostnames: &hostnames,
+                    conflict_hostnames: &conflict_hostnames,
+                    requested_hostnames: &requested_hostnames,
                     config_namespace,
-                    &route_family,
-                    &descriptors_for_path,
-                    &losing_conflict_keys,
-                );
+                    route_family: &route_family,
+                    descriptors_for_path: &descriptors_for_path,
+                    losing_conflict_keys: &losing_conflict_keys,
+                });
                 if host_scopes.is_empty() {
                     continue;
                 }
@@ -5455,17 +5453,30 @@ fn http_route_resources(
     Ok((proxies, plugins))
 }
 
-fn route_host_scopes_for_path(
-    object: &K8sObject,
-    acc: &K8sAccumulator,
-    spec_hostnames: &[String],
-    conflict_hostnames: &[String],
-    requested_hostnames: &[String],
-    config_namespace: &str,
-    route_family: &str,
-    descriptors_for_path: &[RouteMatchDescriptor],
-    losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
-) -> Vec<RouteHostScope> {
+struct RouteHostScopeInputs<'a> {
+    object: &'a K8sObject,
+    acc: &'a K8sAccumulator,
+    spec_hostnames: &'a [String],
+    conflict_hostnames: &'a [String],
+    requested_hostnames: &'a [String],
+    config_namespace: &'a str,
+    route_family: &'a str,
+    descriptors_for_path: &'a [RouteMatchDescriptor],
+    losing_conflict_keys: &'a HashSet<GatewayApiRouteConflictKey>,
+}
+
+fn route_host_scopes_for_path(inputs: RouteHostScopeInputs<'_>) -> Vec<RouteHostScope> {
+    let RouteHostScopeInputs {
+        object,
+        acc,
+        spec_hostnames,
+        conflict_hostnames,
+        requested_hostnames,
+        config_namespace,
+        route_family,
+        descriptors_for_path,
+        losing_conflict_keys,
+    } = inputs;
     let mut scopes = Vec::new();
     for (host_index, hostname) in conflict_hostnames.iter().enumerate() {
         // Keep only references that actually resolved a listener. An entry
