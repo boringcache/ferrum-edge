@@ -277,14 +277,16 @@ streamPorts:
     service: true
 ```
 
-Gateway API `TCPRoute` / `TLSRoute` listeners materialize Ferrum stream proxies
-on the Gateway listener port itself (`TLSRoute` as SNI passthrough on
-`protocol: TLS` / `tls.mode: Passthrough`). `TLSRouteModeTerminate` is not
-implemented; non-Passthrough TLS listeners are rejected fail closed. Chart
-installs that expose north-south TCP or TLS passthrough must publish matching
-`streamPorts` (with
-`service: true` when the Service should expose them). The Gateway API
-conformance lab exercises both paths with dedicated NodePorts; see
+Gateway API `TCPRoute` / `TLSRoute` / `UDPRoute` listeners materialize Ferrum
+stream proxies on the Gateway listener port itself (`TLSRoute` as SNI
+passthrough on `protocol: TLS` / `tls.mode: Passthrough`; a `UDPRoute` on a
+`protocol: UDP` listener as a UDP datagram relay). `TLSRouteModeTerminate` is
+not implemented; non-Passthrough TLS listeners are rejected fail closed. Chart
+installs that expose north-south TCP, TLS passthrough, or UDP must publish
+matching `streamPorts` with the matching `protocol` (and `service: true` when
+the Service should expose them). The Gateway API conformance lab exercises the
+TCPRoute and TLSRoute paths with dedicated NodePorts; `UDPRoute` is covered by
+CI Unit Tests plus a live UDP data-path integration suite — see
 [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
 Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
