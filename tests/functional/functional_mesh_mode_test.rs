@@ -56,8 +56,9 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
     MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
     MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, ServiceTargetPort,
-    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -888,6 +889,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_ambient_cross_cluster_egress",
     "try_start_sidecar_cross_cluster_fixture",
     "try_start_ambient_cross_cluster_fixture",
+    "drive_waypoint_target_refs",
 ];
 
 /// Drivers that must void an attempt whose gateway died mid-run.
@@ -902,6 +904,7 @@ const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_cross_cluster_ws_egress",
     "drive_ambient_cross_cluster_ws_egress",
     "drive_ambient_cross_cluster_ws_path_egress",
+    "drive_waypoint_target_refs",
 ];
 
 /// Extract one top-level `async fn <name>` body from [`MESH_MODE_TEST_SOURCE`].
@@ -987,6 +990,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_grpc_trailers_echo_backend",
         "start_websocket_echo_backend",
         "start_websocket_path_echo_backend",
+        "start_loopback_tcp_echo",
     ] {
         let body = mesh_test_fn_body(name);
         assert!(
@@ -9622,6 +9626,549 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 }
 
 // ===================================================================
+// Issue #3226 — AuthorizationPolicy targetRefs live datapath
+// ===================================================================
+//
+// These drive a REAL byte-stream HBONE CONNECT at a spawned ServiceWaypoint
+// gateway and assert the request OUTCOME, not just a translation shape:
+//
+//   * a matching `targetRefs` Gateway/Service attachment actually denies (403)
+//     traffic that would otherwise be relayed (200 + echoed bytes);
+//   * a sibling service behind the SAME waypoint is unaffected;
+//   * the mixed `{Service reviews, Gateway other-waypoint}` case cannot broaden
+//     onto that sibling through its unmatched Gateway arm.
+//
+// The waypoint terminates HBONE on :15008 and transparently relays a route-miss
+// CONNECT to its authority, so two loopback TCP echoes on distinct ports stand
+// in for two distinct destination Services. `mesh_authz` runs in the authorize
+// phase, before the relay dials anything.
+
+const WAYPOINT_TARGET_REFS_NAME: &str = "reviews-waypoint";
+const WAYPOINT_TARGET_REFS_OTHER: &str = "other-waypoint";
+const WAYPOINT_TARGET_REFS_NAMESPACE: &str = "ferrum";
+
+/// Raw loopback TCP echo: the ServiceWaypoint byte-stream relay copies bytes
+/// straight through, so an echo proves the relay actually completed. The
+/// accepted-connection counter is what makes a DENY assertion real — a denied
+/// request must leave this backend with ZERO connections, because `mesh_authz`
+/// rejects in the authorize phase, before the relay dials anything.
+async fn start_loopback_tcp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind loopback TCP echo");
+    let port = listener.local_addr().expect("TCP echo address").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                }
+            });
+        }
+    });
+    (port, accepted, task)
+}
+
+/// Destination workload for one Service behind the waypoint. Each service gets
+/// its OWN loopback port so the two destinations are distinct backend keys, and
+/// deliberately IDENTICAL selector labels so a regression that matched on
+/// shared labels instead of exact Service identity would be caught.
+fn waypoint_destination_workload(service: &str, port: u16) -> Workload {
+    let spiffe = format!("spiffe://cluster.local/ns/{WAYPOINT_TARGET_REFS_NAMESPACE}/sa/{service}");
+    Workload {
+        spiffe_id: SpiffeId::new(&spiffe).expect("destination SPIFFE id"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+            namespace: Some(WAYPOINT_TARGET_REFS_NAMESPACE.to_string()),
+        },
+        service_name: service.to_string(),
+        service_namespace: None,
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![WorkloadPort {
+            port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some(service.to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+fn waypoint_destination_service(service: &str, port: u16) -> MeshService {
+    let spiffe = format!("spiffe://cluster.local/ns/{WAYPOINT_TARGET_REFS_NAMESPACE}/sa/{service}");
+    MeshService {
+        cluster_ips: Vec::new(),
+        name: service.to_string(),
+        namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        ports: vec![ServicePort {
+            port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: SpiffeId::new(&spiffe).expect("destination SPIFFE id"),
+        }],
+        protocol_overrides: HashMap::new(),
+    }
+}
+
+/// A ServiceWaypoint slice fronting two sibling Services (`reviews`,
+/// `ratings`), under STRICT PeerAuthentication, with ONE DENY policy whose
+/// `targetRefs` are supplied by the caller.
+fn target_refs_waypoint_slice(
+    node_id: &str,
+    reviews_port: u16,
+    ratings_port: u16,
+    attachments: Vec<PolicyTargetAttachment>,
+) -> MeshSlice {
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        version: Utc::now().to_rfc3339(),
+        // The DENY policy below is owned by this namespace, and one caller
+        // attaches a `GatewayClass` arm. GatewayClass is cluster-scoped, so
+        // only the Istio root namespace may own such a policy — declare this
+        // namespace as root so the fixture is a VALID config and the property
+        // under test stays "a non-matching class arm must not broaden", not
+        // "an unowned class arm is accepted". Blank root provenance would be
+        // normalized to `istio-system` and reject the policy.
+        //
+        // Inert otherwise on this DP path: the reconstructed root namespace is
+        // read only by GatewayClass ownership validation and DestinationRule
+        // tier arbitration, and this slice carries no DestinationRules.
+        istio_root_namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        waypoint_gateway_class: Some("istio-waypoint".to_string()),
+        workloads: vec![
+            waypoint_destination_workload("reviews", reviews_port),
+            waypoint_destination_workload("ratings", ratings_port),
+        ],
+        services: vec![
+            waypoint_destination_service("reviews", reviews_port),
+            waypoint_destination_service("ratings", ratings_port),
+        ],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        mesh_policies: vec![MeshPolicy {
+            name: "deny-targeted".to_string(),
+            namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            scope: PolicyScope::TargetRefs { attachments },
+            rules: vec![MeshRule {
+                action: PolicyAction::Deny,
+                ..MeshRule::default()
+            }],
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Read exactly `expected` bytes back off the relay tunnel. The relay keeps the
+/// response stream OPEN, so this stops at the expected length instead of
+/// draining to EOF. Deterministic: it waits for the bytes the echo owes us and
+/// fails on a closed stream — no sleeps, no retry-until-pass.
+async fn read_relayed_bytes(
+    body: &mut h2::RecvStream,
+    expected: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(timeout, async {
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() < expected {
+            match body.data().await {
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => return Err(format!("relay body error: {e}")),
+                None => return Err("relay body ended before the echoed bytes".to_string()),
+            }
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| "timed out reading relayed bytes".to_string())?
+}
+
+/// Open mTLS H2 to the waypoint, send a MARKER-LESS (byte-stream) HBONE CONNECT
+/// to `authority`, write `payload`, and return (status, echoed bytes).
+async fn drive_one_waypoint_byte_connect(
+    hbone_port: u16,
+    authority: &str,
+    client_svid: &GeneratedGatewaySvid,
+    payload: &[u8],
+) -> Result<(u16, Option<Vec<u8>>), String> {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+        .await
+        .map_err(|e| format!("connect waypoint: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
+    let server_name = rustls::pki_types::ServerName::IpAddress(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
+    );
+    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| "client TLS handshake timed out".to_string())?
+        .map_err(|e| format!("client TLS handshake: {e}"))?;
+    let (mut sender, conn) =
+        tokio::time::timeout(Duration::from_secs(10), h2::client::handshake(tls))
+            .await
+            .map_err(|_| "h2 handshake timed out".to_string())?
+            .map_err(|e| format!("h2 handshake: {e}"))?;
+    let conn_task = tokio::spawn(conn);
+
+    let req = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(authority)
+        .body(())
+        .map_err(|e| format!("build CONNECT: {e}"))?;
+    let (response_fut, mut send_body) = sender
+        .send_request(req, false)
+        .map_err(|e| format!("send CONNECT: {e}"))?;
+    // Keep the request stream OPEN so the relay stays alive for the echo.
+    let _ = send_body.send_data(bytes::Bytes::copy_from_slice(payload), false);
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), response_fut)
+        .await
+        .map_err(|_| "CONNECT response timed out".to_string())?
+        .map_err(|e| format!("CONNECT response: {e}"))?;
+    let status = resp.status().as_u16();
+
+    let echoed = if status == 200 {
+        let mut response_body = resp.into_body();
+        Some(
+            read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
+                .await
+                .map_err(|e| format!("read relayed bytes: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    conn_task.abort();
+    Ok((status, echoed))
+}
+
+/// The outcome of probing BOTH destinations behind one waypoint under one
+/// `targetRefs` policy: CONNECT status, echoed bytes, and how many connections
+/// that destination's backend actually accepted.
+struct WaypointDestinationOutcome {
+    status: u16,
+    echoed: Option<Vec<u8>>,
+    backend_connections: usize,
+}
+
+struct WaypointTargetRefsOutcome {
+    reviews: WaypointDestinationOutcome,
+    ratings: WaypointDestinationOutcome,
+}
+
+/// Spawn a ServiceWaypoint gateway fronting `reviews` + `ratings`, install one
+/// `targetRefs` DENY policy, and probe BOTH destinations through the real HBONE
+/// relay. The outer `Err` is a SETUP failure (gateway never built/bound after
+/// retries) and must never be read as a fail-closed pass; a spawn/bind flake is
+/// retried with fresh ports, the observations are made exactly once.
+async fn drive_waypoint_target_refs(
+    label: &str,
+    attachments: Vec<PolicyTargetAttachment>,
+) -> Result<WaypointTargetRefsOutcome, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum/sa/reviews-waypoint";
+    let client_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-target-refs-{label}-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let svids = generate_two_gateway_svids(temp.path(), client_spiffe, waypoint_spiffe);
+
+        let (reviews_port, reviews_hits, reviews_echo) = start_loopback_tcp_echo().await;
+        let (ratings_port, ratings_hits, ratings_echo) = start_loopback_tcp_echo().await;
+
+        let cp = start_static_mesh_cp(target_refs_waypoint_slice(
+            &node_id,
+            reviews_port,
+            ratings_port,
+            attachments.clone(),
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let hbone_port = ports.hbone;
+
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "service_waypoint",
+                waypoint_name: Some(WAYPOINT_TARGET_REFS_NAME),
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    (
+                        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                        waypoint_spiffe.to_string(),
+                    ),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, hbone_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("service waypoint HBONE listener", hbone_port),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            reviews_echo.abort();
+            ratings_echo.abort();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let reviews = drive_one_waypoint_byte_connect(
+            hbone_port,
+            &format!("127.0.0.1:{reviews_port}"),
+            &svids.a,
+            b"reviews-payload",
+        )
+        .await;
+        let ratings = drive_one_waypoint_byte_connect(
+            hbone_port,
+            &format!("127.0.0.1:{ratings_port}"),
+            &svids.a,
+            b"ratings-payload",
+        )
+        .await;
+
+        // An attempt whose gateway died mid-run is VOID: its transport errors
+        // are not authorization evidence. Retry with fresh ports/dirs/CP rather
+        // than reporting a dead-process reset as a datapath or fail-closed
+        // result (issue #2132).
+        let died = exited_gateway_diagnostic(&mut [("service waypoint", &mut child)]);
+        let logs = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        reviews_echo.abort();
+        ratings_echo.abort();
+
+        if let Some(diagnostic) = died {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        return match (reviews, ratings) {
+            (Ok((reviews_status, reviews_echoed)), Ok((ratings_status, ratings_echoed))) => {
+                Ok(WaypointTargetRefsOutcome {
+                    reviews: WaypointDestinationOutcome {
+                        status: reviews_status,
+                        echoed: reviews_echoed,
+                        backend_connections: reviews_hits.load(Ordering::SeqCst),
+                    },
+                    ratings: WaypointDestinationOutcome {
+                        status: ratings_status,
+                        echoed: ratings_echoed,
+                        backend_connections: ratings_hits.load(Ordering::SeqCst),
+                    },
+                })
+            }
+            (Err(e), _) | (_, Err(e)) => Err(format!(
+                "waypoint CONNECT failed against a healthy gateway: {e}\n--- waypoint ---\n{logs}"
+            )),
+        };
+    }
+
+    Err(format!(
+        "service waypoint never bound its HBONE listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+fn assert_relayed(outcome: &WaypointDestinationOutcome, payload: &[u8], what: &str) {
+    assert_eq!(outcome.status, 200, "{what} must be relayed (200)");
+    assert_eq!(
+        outcome.echoed.as_deref(),
+        Some(payload),
+        "{what} must echo its payload back through the relay byte-for-byte"
+    );
+    assert!(
+        outcome.backend_connections >= 1,
+        "{what} must actually reach its backend"
+    );
+}
+
+fn assert_denied(outcome: &WaypointDestinationOutcome, what: &str) {
+    assert_eq!(
+        outcome.status, 403,
+        "{what} must be denied by mesh_authz (403)"
+    );
+    assert_eq!(
+        outcome.backend_connections, 0,
+        "{what} must be denied BEFORE the relay dials — its backend must see no connection"
+    );
+}
+
+/// Baseline: with the DENY policy attached to ANOTHER waypoint, both
+/// destinations relay. This is the control that makes the deny assertions below
+/// meaningful — without it a 403 could just mean "the relay never worked".
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_waypoint_target_refs_non_matching_gateway_relays_both() {
+    let outcome = drive_waypoint_target_refs(
+        "other-gateway",
+        vec![PolicyTargetAttachment::Gateway {
+            namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            name: WAYPOINT_TARGET_REFS_OTHER.to_string(),
+        }],
+    )
+    .await
+    .expect("waypoint targetRefs setup");
+
+    assert_relayed(&outcome.reviews, b"reviews-payload", "reviews");
+    assert_relayed(&outcome.ratings, b"ratings-payload", "ratings");
+}
+
+/// A matching `Gateway` targetRef changes a real request outcome: every
+/// destination behind THIS waypoint is denied.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_waypoint_target_refs_matching_gateway_denies_every_destination() {
+    let outcome = drive_waypoint_target_refs(
+        "matching-gateway",
+        vec![PolicyTargetAttachment::Gateway {
+            namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            name: WAYPOINT_TARGET_REFS_NAME.to_string(),
+        }],
+    )
+    .await
+    .expect("waypoint targetRefs setup");
+
+    assert_denied(&outcome.reviews, "reviews");
+    assert_denied(&outcome.ratings, "ratings");
+}
+
+/// A matching `Service` targetRef denies only its own destination; the sibling
+/// service behind the same waypoint is unaffected.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_waypoint_target_refs_service_denies_only_its_destination() {
+    let outcome = drive_waypoint_target_refs(
+        "service",
+        vec![PolicyTargetAttachment::Service {
+            namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+    )
+    .await
+    .expect("waypoint targetRefs setup");
+
+    assert_denied(&outcome.reviews, "reviews");
+    assert_relayed(&outcome.ratings, b"ratings-payload", "ratings");
+}
+
+/// The live proof for the mixed-attachment scope bug: a policy listing BOTH a
+/// matching Service and a NON-matching Gateway is legitimately retained at this
+/// waypoint (its Service arm matches), and the unmatched Gateway arm must not
+/// widen it onto the sibling destination. Before the fix this returned 403 for
+/// `ratings` too.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_waypoint_mixed_target_refs_do_not_broaden_to_sibling() {
+    let outcome = drive_waypoint_target_refs(
+        "mixed",
+        vec![
+            PolicyTargetAttachment::Service {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            },
+            PolicyTargetAttachment::Gateway {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: WAYPOINT_TARGET_REFS_OTHER.to_string(),
+            },
+        ],
+    )
+    .await
+    .expect("waypoint targetRefs setup");
+
+    assert_denied(&outcome.reviews, "reviews");
+    assert_relayed(
+        &outcome.ratings,
+        b"ratings-payload",
+        "the sibling destination under a mixed-ref policy",
+    );
+}
+
+/// The same broadening guard for a mixed `{Service, non-matching GatewayClass}`
+/// policy: this waypoint's class is `istio-waypoint`, so the `ferrum-waypoint`
+/// arm must not attach.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_waypoint_mixed_gateway_class_target_refs_do_not_broaden_to_sibling() {
+    let outcome = drive_waypoint_target_refs(
+        "mixed-class",
+        vec![
+            PolicyTargetAttachment::Service {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            },
+            PolicyTargetAttachment::GatewayClass {
+                name: "ferrum-waypoint".to_string(),
+            },
+        ],
+    )
+    .await
+    .expect("waypoint targetRefs setup");
+
+    assert_denied(&outcome.reviews, "reviews");
+    assert_relayed(
+        &outcome.ratings,
+        b"ratings-payload",
+        "the sibling destination under a mixed class-ref policy",
+    );
+}
+
+// ===================================================================
 // Live source-capture e2e — root + Linux netns only (#2038)
 // ===================================================================
 
@@ -10163,6 +10710,11 @@ fn udp_fail_closed_guard_probe_literal_matches_source() {
 /// and binds capture/reply sockets inside the pod netns, and the captured flow
 /// traverses gateway A's HBONE datagram tunnel plus gateway B's real destination
 /// relay before returning from the original VIP:port.
+///
+/// Scope: source-capture producer + HBONE egress to a **host-loopback** UDP echo
+/// (`start_counting_udp_echo` on `127.0.0.1`). Does **not** exercise the
+/// enrolled-destination pod-netns relay path (destination workload inside its own
+/// pod netns with registry mapping and tc-inbound admit) — tracked on #3621.
 #[cfg(target_os = "linux")]
 #[ignore = "requires root + netns + iptables/TPROXY + iproute2"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

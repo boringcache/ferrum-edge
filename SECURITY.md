@@ -91,7 +91,7 @@ When security vulnerabilities are fixed, we will:
 ## Dependency & Supply-Chain Security
 
 Ferrum Edge gates its dependency tree and the vendored, patched upstream crates
-it carries in `vendor/**` (reqwest, h3, tungstenite, tokio-tungstenite). The
+it carries in `vendor/**` (reqwest, h3, tungstenite, tokio-tungstenite, dimpl). The
 full policy — vendored-patch inventory, owners, retirement triggers, the blocking
 advisory gate, time-boxed exception expiry, the vendor drift guard, and the
 **emergency security-update process for vendored crates** — lives in

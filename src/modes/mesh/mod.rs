@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1527,6 +1527,7 @@ fn scoped_policy_label(policy: &MeshPolicy) -> String {
         PolicyScope::MeshWide => "mesh-wide",
         PolicyScope::Namespace { .. } => "namespace",
         PolicyScope::WorkloadSelector { .. } => "selector",
+        PolicyScope::TargetRefs { .. } => "targetRefs",
     };
     format!("{}/{} ({scope})", policy.namespace, policy.name)
 }
@@ -1576,7 +1577,13 @@ fn project_mesh_source_locality(
     // mode's whole point is to govern the *absent-source-locality* case, so the
     // flag must reach upstreams that have no `source_locality` too. The load
     // balancer reads this at cache-build time (no per-request env lookup).
-    let strict = runtime.locality_lb_strict;
+    let locality = mesh_source_workload_locality_resolution(mesh_slice);
+    // A locality disagreement is materially different from locality metadata
+    // simply being absent. Fail closed to local endpoints for the ambiguous
+    // case even when the operator has not enabled the general strict-mode
+    // safety net; otherwise a same-SPIFFE sibling could clear the source rank
+    // and widen selection to directly discovered remote endpoints.
+    let strict = runtime.locality_lb_strict || locality.is_ambiguous();
     for upstream in &mut config.upstreams {
         if upstream.locality_lb_strict != strict {
             upstream.locality_lb_strict = strict;
@@ -1592,7 +1599,7 @@ fn project_mesh_source_locality(
         }
     }
 
-    let Some(locality) = mesh_source_workload_locality(mesh_slice) else {
+    let MeshSourceLocality::Resolved(locality) = locality else {
         return;
     };
     for upstream in &mut config.upstreams {
@@ -1750,7 +1757,31 @@ fn mesh_source_workload_candidates(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MeshSourceLocality<'a> {
+    Resolved(&'a str),
+    Absent,
+    Ambiguous,
+}
+
+impl<'a> MeshSourceLocality<'a> {
+    fn is_ambiguous(self) -> bool {
+        matches!(self, Self::Ambiguous)
+    }
+
+    fn resolved(self) -> Option<&'a str> {
+        match self {
+            Self::Resolved(locality) => Some(locality),
+            Self::Absent | Self::Ambiguous => None,
+        }
+    }
+}
+
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
+    mesh_source_workload_locality_resolution(mesh_slice).resolved()
+}
+
+fn mesh_source_workload_locality_resolution(mesh_slice: &MeshSlice) -> MeshSourceLocality<'_> {
     // The source workload is ALWAYS the LOCAL sidecar — never a remote-cluster
     // endpoint merged in by multi-cluster discovery (codex r6 [R6-3]). When remote
     // endpoint polling is active the slice now carries remote workloads, and a
@@ -1774,14 +1805,18 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
         if has_spiffe_local {
             let candidates = mesh_source_workload_candidates(mesh_slice);
             if candidates.is_empty() {
-                return None;
+                return MeshSourceLocality::Absent;
             }
             let locality = candidates[0].locality.as_deref();
             let agreed = candidates[1..]
                 .iter()
                 .all(|workload| workload.locality.as_deref() == locality);
             // Unanimous `None` is still authoritative (do not fall through).
-            return if agreed { locality } else { None };
+            return if agreed {
+                locality.map_or(MeshSourceLocality::Absent, MeshSourceLocality::Resolved)
+            } else {
+                MeshSourceLocality::Ambiguous
+            };
         }
         // No local SPIFFE match: fall through to the label-based heuristic.
     }
@@ -1814,10 +1849,10 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
         match matched_locality {
             None => matched_locality = Some(locality),
             Some(prev) if prev == locality => {}
-            Some(_) => return None,
+            Some(_) => return MeshSourceLocality::Ambiguous,
         }
     }
-    matched_locality
+    matched_locality.map_or(MeshSourceLocality::Absent, MeshSourceLocality::Resolved)
 }
 
 /// Preserve materialized-mesh upstream timestamps across re-applies of the same
@@ -2254,8 +2289,10 @@ fn gateway_config_from_mesh_slice_with_federation(
     let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
     let proxies = decode_virtual_service_l4_proxies(slice)?;
+    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
     let config = GatewayConfig {
         proxies,
+        upstreams,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -2289,6 +2326,11 @@ fn gateway_config_from_mesh_slice_with_federation(
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
+    let carried_upstream_ids: BTreeSet<&str> = slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .filter_map(|value| value.get("id").and_then(|id| id.as_str()))
+        .collect();
     slice
         .virtual_service_l4_proxies
         .iter()
@@ -2312,7 +2354,47 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
                     "Mesh slice VirtualService L4 proxy {index} has invalid ownership or matcher identity"
                 ));
             }
+            if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                && !carried_upstream_ids.contains(upstream_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 proxy {index} references missing upstream {upstream_id}"
+                ));
+            }
             Ok(proxy)
+        })
+        .collect()
+}
+
+fn decode_virtual_service_l4_upstreams(
+    slice: &MeshSlice,
+) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error> {
+    let referenced: BTreeSet<&str> = slice
+        .virtual_service_l4_proxies
+        .iter()
+        .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+        .collect();
+    slice
+        .virtual_service_l4_upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                    )
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !referenced.contains(upstream.id.as_str())
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice VirtualService L4 upstream {index} has invalid ownership or is unreferenced"
+                ));
+            }
+            Ok(upstream)
         })
         .collect()
 }
@@ -10035,7 +10117,7 @@ fn merge_applicable_telemetry(mesh_slice: &MeshSlice) -> MeshTelemetryConfig {
             let specificity = match &t.scope {
                 PolicyScope::MeshWide => 0,
                 PolicyScope::Namespace { .. } => 1,
-                PolicyScope::WorkloadSelector { .. } => 2,
+                PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
             };
             (
                 specificity,
@@ -23302,12 +23384,14 @@ mod tests {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
+            waypoint_gateway_class: None,
             istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
@@ -26271,6 +26355,46 @@ mod tests {
         };
 
         assert_eq!(mesh_source_workload_locality(&slice), None);
+        assert_eq!(
+            mesh_source_workload_locality_resolution(&slice),
+            MeshSourceLocality::Ambiguous
+        );
+    }
+
+    #[test]
+    fn ambiguous_same_spiffe_locality_forces_local_only_projection() {
+        let mut first = workload("reviews-1", "reviews");
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        let spiffe = first.spiffe_id.as_str().to_string();
+        let mut second = workload("reviews-2", "reviews");
+        second.spiffe_id = first.spiffe_id.clone();
+        second.locality = Some("us-west/us-west-1/b".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: Some(spiffe),
+            workloads: vec![first, second],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        config
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, chrono::Utc::now()));
+        let mut runtime = test_mesh_runtime_config();
+        runtime.locality_lb_strict = false;
+
+        project_mesh_source_locality(&mut config, &runtime, &slice);
+
+        assert_eq!(
+            mesh_source_workload_locality_resolution(&slice),
+            MeshSourceLocality::Ambiguous
+        );
+        assert_eq!(config.upstreams[0].source_locality, None);
+        assert!(
+            config.upstreams[0].locality_lb_strict,
+            "ambiguous source locality must restrict the load balancer to local endpoints"
+        );
     }
 
     #[test]

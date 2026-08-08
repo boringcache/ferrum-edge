@@ -197,15 +197,6 @@ need them, or because they are blocked upstream / architecturally:
   highest-precedence subset port-level tier is unsupported). Express per-port
   policy at top-level or via subset `connectionPool` fields; see `docs/mesh.md`.
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
-- **VirtualService `tcp[]` / `tls[]` weighted multi-destination splitting** —
-  `tls[]` SNI passthrough (`sniHosts` + port → passthrough stream proxy) and
-  plain `tcp[]` port routing **are supported**, including L4 match predicates
-  `sourceLabels` / `sourceSubnets` / `destinationSubnets` / `gateways` /
-  `sourceNamespace` via precomputed `Proxy.stream_match` (see `docs/mesh.md`
-  L4 routing and `tests/integration/mesh_l7_routing_tests.rs` /
-  `tests/conformance/istio_virtual_service.rs`). Residual fail-closed gap:
-  weighted multi-destination L4 splitting. Model splits with an upstream-backed
-  stream proxy — do not treat TLS-SNI or the L4 match predicates as roadmap work.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;
   targets verified-Beta, not GA.
 
@@ -224,8 +215,9 @@ ledger unless they change the support contract.
 | Deferral | Issue | Doc anchor |
 |---|---|---|
 | EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
+| Enrolled Ambient destination pod UDP round trip (source-capture → HBONE → destination pod-netns relay; tc-inbound admit + reply socket inside destination pod netns) | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | `docs/mesh.md` UDP TPROXY capture footnote [12] |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 
