@@ -1450,6 +1450,167 @@ pub(super) fn collect_gateway_listener_policy(
     Ok(())
 }
 
+/// Deterministic per-namespace frontend TLS serving slot chosen from collected
+/// listener policies.
+///
+/// Ferrum still serves one credential per Gateway namespace. The winner is the
+/// lexicographically first Gateway name that resolves to exactly one usable
+/// credential; Gateways with multiple distinct credentials are unsupported for
+/// serving and never win (or poison) the slot. Translation and status both use
+/// this plan so conflict admission cannot disagree with materialization and
+/// neither path depends on object or `HashMap` iteration order.
+#[derive(Debug, Clone, Default)]
+struct GatewayFrontendTlsNamespaceSlotPlan {
+    /// Gateway namespace → the single `(cert_path, key_path)` that namespace will
+    /// present on TLS-terminating sockets.
+    serving_by_namespace: BTreeMap<String, (String, String)>,
+    /// `(namespace, gateway)` identities that named more than one distinct
+    /// credential and therefore cannot occupy the namespace serving slot.
+    multi_cert_gateways: BTreeSet<(String, String)>,
+}
+
+/// Build the shared namespace TLS-slot plan from listener policies alone.
+fn plan_gateway_frontend_tls_namespace_slots(
+    acc: &K8sAccumulator,
+) -> GatewayFrontendTlsNamespaceSlotPlan {
+    // namespace → gateway → distinct credentials on that Gateway's materializable
+    // TLS listeners. BTree maps keep selection order-independent.
+    let mut credentials_by_gateway: BTreeMap<String, BTreeMap<String, BTreeSet<(String, String)>>> =
+        BTreeMap::new();
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        if !policy.materializable
+            || !policy.requires_frontend_tls
+            || !matches!(
+                policy.protocol.as_str(),
+                "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
+            )
+        {
+            continue;
+        }
+        let Some(source) = policy.frontend_tls_source.clone() else {
+            continue;
+        };
+        credentials_by_gateway
+            .entry(key.namespace.clone())
+            .or_default()
+            .entry(key.gateway.clone())
+            .or_default()
+            .insert(source);
+    }
+
+    let mut plan = GatewayFrontendTlsNamespaceSlotPlan::default();
+    for (namespace, gateways) in credentials_by_gateway {
+        let mut candidates: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for (gateway, sources) in gateways {
+            if sources.len() != 1 {
+                plan.multi_cert_gateways
+                    .insert((namespace.clone(), gateway));
+                continue;
+            }
+            if let Some(source) = sources.into_iter().next() {
+                candidates.insert(gateway, source);
+            }
+        }
+        // Lexicographically first Gateway name wins the namespace slot.
+        if let Some((_, source)) = candidates.into_iter().next() {
+            plan.serving_by_namespace.insert(namespace, source);
+        }
+    }
+    plan
+}
+
+/// Clear route materialization for listeners that cannot occupy their
+/// namespace's single serving credential (multi-cert Gateways, or a different
+/// credential than the planned winner). Listener status stays Accepted; only
+/// routes are withheld so traffic is never advertised under the wrong cert.
+fn apply_gateway_frontend_tls_namespace_slot_route_limits(
+    acc: &mut K8sAccumulator,
+    plan: &GatewayFrontendTlsNamespaceSlotPlan,
+) {
+    let keys: Vec<GatewayApiListenerKey> = acc.gateway_api_listener_policies.keys().cloned().collect();
+    for key in keys {
+        let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
+            continue;
+        };
+        if !policy.requires_frontend_tls || !policy.routes_materializable {
+            continue;
+        }
+        let clear_routes = plan
+            .multi_cert_gateways
+            .contains(&(key.namespace.clone(), key.gateway.clone()))
+            || match (
+                plan.serving_by_namespace.get(&key.namespace),
+                policy.frontend_tls_source.as_ref(),
+            ) {
+                (Some(serving), Some(source)) => serving != source,
+                // Multi-cert Gateways are cleared above. Unresolved TLS listeners
+                // are already non-materializable at collection time.
+                _ => false,
+            };
+        if clear_routes {
+            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
+                policy.routes_materializable = false;
+            }
+        }
+    }
+}
+
+/// Install the planned per-namespace serving credentials into the config so
+/// later Gateway translation cannot depend on object order to pick a winner.
+fn install_planned_gateway_frontend_tls_namespace_sources(
+    acc: &mut K8sAccumulator,
+    plan: &GatewayFrontendTlsNamespaceSlotPlan,
+) {
+    for (namespace, (cert_path, key_path)) in &plan.serving_by_namespace {
+        if acc
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .any(|source| source.namespace == *namespace)
+        {
+            continue;
+        }
+        acc.config
+            .frontend_tls_namespace_sources
+            .push(FrontendTlsNamespaceSource {
+                namespace: namespace.clone(),
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+            });
+    }
+    acc.config
+        .frontend_tls_namespace_sources
+        .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
+        if let Some(source) = acc.config.frontend_tls_namespace_sources.first() {
+            acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
+            acc.config.frontend_tls_key_path = Some(source.key_path.clone());
+            acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
+        }
+    }
+}
+
+fn listener_is_effective_tls_serving_claim(
+    key: &GatewayApiListenerKey,
+    policy: &GatewayApiListenerPolicy,
+    plan: &GatewayFrontendTlsNamespaceSlotPlan,
+) -> bool {
+    if !policy.requires_frontend_tls
+        || plan
+            .multi_cert_gateways
+            .contains(&(key.namespace.clone(), key.gateway.clone()))
+    {
+        return false;
+    }
+    match (
+        plan.serving_by_namespace.get(&key.namespace),
+        policy.frontend_tls_source.as_ref(),
+    ) {
+        (Some(serving), Some(source)) => serving == source,
+        _ => false,
+    }
+}
+
 /// Fail closed on Gateway listeners that claim one numeric port with
 /// physically incompatible shapes.
 ///
@@ -1458,42 +1619,52 @@ pub(super) fn collect_gateway_listener_policy(
 /// definitions can therefore be individually valid and jointly unservable.
 /// Only two shapes qualify:
 ///
-/// - **`ProtocolConflict`** — the port is claimed both plaintext and
-///   TLS-terminating. A socket is one or the other, so every claim on it is
-///   refused.
-/// - **`HostnameConflict`** — TLS-terminating claims on the port come from more
-///   than one Gateway namespace *and* name more than one distinct credential.
-///   Ferrum resolves one frontend TLS serving slot per Gateway namespace
-///   (`gateway_frontend_tls_namespace_source`), so listeners inside a single
-///   namespace always collapse onto one credential and never conflict here;
-///   across namespaces there is no such arbitration and the one socket would
-///   silently present a foreign Gateway's certificate.
+/// - **`ProtocolConflict`** — the port is claimed both plaintext and by an
+///   *effective* TLS-serving namespace slot. A socket is one or the other, so
+///   every physically competing claim on it is refused.
+/// - **`HostnameConflict`** — two or more Gateway namespaces have effective
+///   TLS serving slots on the port that resolve to different credentials.
+///   Ferrum serves one frontend TLS credential per Gateway namespace (see
+///   [`plan_gateway_frontend_tls_namespace_slots`]); a non-winning same-
+///   namespace credential is not an effective claim and must not manufacture a
+///   cross-namespace conflict. Across namespaces there is no further
+///   arbitration, so disagreeing effective slots would make one socket present
+///   a foreign Gateway's certificate.
 ///
-/// Differing `tls.certificateRefs` alone are deliberately **not** a conflict.
-/// Gateway API v1.5.1 defines listener distinctness on `(port, hostname)` for
-/// the HTTP family and states outright that "the `tls` field is not used for
-/// determining if a listener is distinct". Sibling HTTPS listeners with
-/// disjoint hostnames and different `certificateRefs` are therefore distinct
-/// and must stay Accepted; the listener whose credential does not win its
-/// namespace's serving slot already has `routes_materializable` cleared by
-/// [`disable_gateway_frontend_tls_route_materialization`], so it advertises no
-/// routes and cannot serve traffic under another listener's certificate.
+/// Differing raw `tls.certificateRefs` alone are deliberately **not** a
+/// conflict. Gateway API v1.5.1 defines listener distinctness on
+/// `(port, hostname)` for the HTTP family and states outright that "the `tls`
+/// field is not used for determining if a listener is distinct". Sibling
+/// HTTPS listeners with disjoint hostnames and different `certificateRefs`
+/// are therefore distinct and must stay Accepted; the listener whose
+/// credential does not win its namespace's serving slot has
+/// `routes_materializable` cleared by the shared slot plan, so it advertises
+/// no routes and cannot serve traffic under another listener's certificate.
+/// Unresolved or multi-cert Gateways that cannot serve also contribute no
+/// effective claim, so they cannot poison a healthy physical slot.
 ///
 /// Refusals are order-independent: they are decided from the fully collected
-/// listener-policy set, and both/every side of a conflict is refused rather
-/// than guessing a winner.
+/// listener-policy set via the shared namespace TLS-slot plan, and every
+/// physically competing effective claim is refused rather than guessing a
+/// winner. Translation and Gateway status both call this helper so they share
+/// one decision.
 ///
 /// Listeners that are already non-materializable contribute no claim and are
 /// ignored, so a broken sibling cannot take down a healthy listener.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
+    let plan = plan_gateway_frontend_tls_namespace_slots(acc);
+    apply_gateway_frontend_tls_namespace_slot_route_limits(acc, &plan);
+    install_planned_gateway_frontend_tls_namespace_sources(acc, &plan);
+
     #[derive(Default)]
     struct PortClaims {
         plaintext: Vec<GatewayApiListenerKey>,
-        tls: Vec<GatewayApiListenerKey>,
-        /// Gateway namespaces contributing a TLS-terminating claim.
-        tls_namespaces: BTreeSet<String>,
-        /// Distinct `(cert_path, key_path)` credentials those claims name.
-        tls_credentials: BTreeSet<(String, String)>,
+        /// TLS listeners that occupy their namespace's planned serving credential.
+        effective_tls: Vec<GatewayApiListenerKey>,
+        /// Namespaces with an effective TLS serving claim on this port.
+        effective_tls_namespaces: BTreeSet<String>,
+        /// Distinct planned serving credentials those effective claims use.
+        effective_tls_credentials: BTreeSet<(String, String)>,
     }
 
     let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
@@ -1515,10 +1686,12 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         };
         let claims = claims_by_port.entry(port).or_default();
         if policy.requires_frontend_tls {
-            claims.tls.push(key.clone());
-            claims.tls_namespaces.insert(key.namespace.clone());
-            if let Some(source) = policy.frontend_tls_source.clone() {
-                claims.tls_credentials.insert(source);
+            if listener_is_effective_tls_serving_claim(key, policy, &plan) {
+                claims.effective_tls.push(key.clone());
+                claims.effective_tls_namespaces.insert(key.namespace.clone());
+                if let Some(source) = plan.serving_by_namespace.get(&key.namespace) {
+                    claims.effective_tls_credentials.insert(source.clone());
+                }
             }
         } else {
             claims.plaintext.push(key.clone());
@@ -1528,12 +1701,12 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (port, claims) in claims_by_port {
-        let protocol_conflict = !claims.plaintext.is_empty() && !claims.tls.is_empty();
-        // One namespace always resolves to one serving credential, so only a
-        // cross-namespace disagreement can leave the socket unable to present
-        // every claimant's certificate.
-        let credential_conflict = claims.tls_namespaces.len() > 1
-            && claims.tls_credentials.len() > 1
+        let protocol_conflict =
+            !claims.plaintext.is_empty() && !claims.effective_tls.is_empty();
+        // Compare planned per-namespace serving credentials, not every raw
+        // certificateRef that will lose namespace-slot arbitration.
+        let credential_conflict = claims.effective_tls_namespaces.len() > 1
+            && claims.effective_tls_credentials.len() > 1
             && !protocol_conflict;
         if !protocol_conflict && !credential_conflict {
             continue;
@@ -1544,17 +1717,17 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                 claims
                     .plaintext
                     .iter()
-                    .chain(claims.tls.iter())
+                    .chain(claims.effective_tls.iter())
                     .cloned()
                     .collect::<Vec<_>>(),
-                "both plaintext and TLS-terminating (one socket is one or the other)",
+                "both plaintext and an effective TLS-serving claim (one socket is one or the other)",
             )
         } else {
             (
                 "HostnameConflict",
-                claims.tls,
-                "TLS-terminating claims from different Gateway namespaces naming different \
-                 credentials (one socket presents one certificate)",
+                claims.effective_tls,
+                "effective TLS serving slots from different Gateway namespaces resolve to \
+                 different credentials (one socket presents one certificate)",
             )
         };
         let listeners = refused_keys
@@ -1647,44 +1820,29 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         GatewayFrontendTlsSelection::None => return false,
     };
 
+    // Namespace serving slots were planned and installed by
+    // `refuse_incompatible_same_port_listeners` from the same deterministic
+    // rule translation and status share. Align this Gateway with that plan
+    // instead of letting object order mint a competing slot.
     let source_namespace = object.metadata.namespace.clone();
-    let source = gateway_frontend_tls_namespace_source(
-        acc,
-        object,
-        source_namespace,
-        cert_source,
-        key_source,
-    );
-
-    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
-        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
-        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
-        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
-    }
-    true
-}
-
-fn gateway_frontend_tls_namespace_source(
-    acc: &mut K8sAccumulator,
-    object: &K8sObject,
-    source_namespace: String,
-    cert_source: String,
-    key_source: String,
-) -> FrontendTlsNamespaceSource {
-    if let Some(existing) = acc
+    let Some(existing) = acc
         .config
         .frontend_tls_namespace_sources
         .iter()
         .find(|source| source.namespace == source_namespace)
         .cloned()
-    {
-        if existing.cert_path == cert_source && existing.key_path == key_source {
-            return existing;
-        }
+    else {
+        // No planned serving credential for this namespace (for example only
+        // multi-cert Gateways were observed). Keep listener status but do not
+        // invent a process-global cert from object order.
+        disable_gateway_frontend_tls_route_materialization(acc, object);
+        return false;
+    };
+    if existing.cert_path != cert_source || existing.key_path != key_source {
         // The current DP config has one frontend TLS serving slot per Gateway
-        // namespace. Keep that slot stable, but do not withdraw otherwise valid
-        // listeners solely because another Gateway in the namespace uses a
-        // different valid certificateRef.
+        // namespace. Keep that planned slot stable, but do not withdraw
+        // otherwise valid listeners solely because another Gateway in the
+        // namespace uses a different valid certificateRef.
         disable_gateway_frontend_tls_route_materialization(acc, object);
         acc.warnings.push(format!(
             "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
@@ -1694,21 +1852,13 @@ fn gateway_frontend_tls_namespace_source(
             source_namespace,
             existing.cert_path
         ));
-        return existing;
     }
-
-    let source = FrontendTlsNamespaceSource {
-        namespace: source_namespace,
-        cert_path: cert_source,
-        key_path: key_source,
-    };
-    acc.config
-        .frontend_tls_namespace_sources
-        .push(source.clone());
-    acc.config
-        .frontend_tls_namespace_sources
-        .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-    source
+    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
+        acc.config.frontend_tls_cert_path = Some(existing.cert_path.clone());
+        acc.config.frontend_tls_key_path = Some(existing.key_path.clone());
+        acc.config.frontend_tls_source_namespace = Some(existing.namespace.clone());
+    }
+    true
 }
 
 fn disable_gateway_frontend_tls_route_materialization(
@@ -6957,7 +7107,7 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.name == "edge-a-https-a")),
-            "the first valid TLS listener should stay materialized"
+            "the planned winning TLS listener should stay materialized"
         );
         assert!(
             result.config.mesh.as_ref().is_some_and(|mesh| mesh

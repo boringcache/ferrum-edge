@@ -394,9 +394,10 @@ pub struct K8sTranslation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayApiListenerConflict {
     /// Gateway API `ListenerConditionReason` for `Conflicted=True` —
-    /// `ProtocolConflict` when the port is claimed both plaintext and TLS,
-    /// `HostnameConflict` when TLS-terminating siblings resolve to different
-    /// certificates on one socket.
+    /// `ProtocolConflict` when the port is claimed both plaintext and an
+    /// effective TLS-serving namespace slot, `HostnameConflict` when effective
+    /// per-namespace TLS serving slots on one socket resolve to different
+    /// credentials.
     pub reason: &'static str,
     pub message: String,
 }
@@ -734,8 +735,10 @@ pub(crate) struct GatewayApiListenerPolicy {
     /// `None` for plaintext listeners and for TLS listeners whose
     /// `certificateRefs` did not resolve to exactly one usable credential.
     ///
-    /// Used to detect listeners that share a numeric port but demand
-    /// incompatible credential ownership — one socket cannot present two.
+    /// Same-port physical conflicts compare the *effective* per-namespace
+    /// serving credential from the shared TLS-slot plan, not every raw
+    /// value collected here — a non-winning same-namespace sibling must not
+    /// manufacture a cross-namespace `HostnameConflict`.
     pub frontend_tls_source: Option<(String, String)>,
 }
 
@@ -1445,8 +1448,8 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
         }
     }
     // Keep status-context listener admission identical to the translation
-    // pass, or a route's status would arbitrate against a listener the data
-    // plane refused.
+    // pass (shared namespace TLS-slot plan + same-port physical refusal), or a
+    // route's status would arbitrate against a listener the data plane refused.
     gateway_api::refuse_incompatible_same_port_listeners(acc);
 }
 
@@ -1572,9 +1575,10 @@ where
         }
     }
 
-    // Every listener policy is now known, so same-port physical compatibility
-    // can be decided before any route arbitrates or materializes against a
-    // listener that could never have been bound.
+    // Every listener policy is now known, so the shared namespace TLS-slot plan
+    // and same-port physical compatibility can be decided before any route
+    // arbitrates or materializes against a listener that could never have been
+    // bound or that cannot occupy its namespace serving credential.
     gateway_api::refuse_incompatible_same_port_listeners(&mut acc);
 
     let gateway_api_route_conflicts =
