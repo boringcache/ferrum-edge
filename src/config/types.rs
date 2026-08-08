@@ -3578,10 +3578,15 @@ impl GatewayConfig {
             });
         let mut seen_certificate_sources = HashSet::new();
         self.frontend_tls_certificate_sources.retain(|source| {
+            // `hostname` is part of the exact serialized claim even though it
+            // is not part of listener identity. Omitting it here would erase a
+            // contradictory claim before the data-plane runtime can reject the
+            // snapshot through `validate_explicit_listener_claims()`.
             seen_certificate_sources.insert((
                 source.namespace.clone(),
                 source.gateway.clone(),
                 source.listener.clone(),
+                source.hostname.clone(),
                 source.cert_path.clone(),
                 source.key_path.clone(),
             ))

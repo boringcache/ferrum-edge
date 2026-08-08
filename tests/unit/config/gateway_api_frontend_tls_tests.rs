@@ -847,6 +847,33 @@ fn native_normalization_preserves_oversized_certificate_sets_for_rejection() {
 }
 
 #[test]
+fn native_normalization_preserves_inconsistent_listener_hostname_claims_for_rejection() {
+    let mut config = GatewayConfig {
+        frontend_tls_certificate_sources: ["a.example.com", "b.example.com"]
+            .into_iter()
+            .map(|hostname| FrontendTlsCertificateSource {
+                namespace: "ferrum".to_string(),
+                gateway: "edge".to_string(),
+                listener: "https".to_string(),
+                hostname: Some(hostname.to_string()),
+                cert_path: "/certs/shared.crt".to_string(),
+                key_path: "/certs/shared.key".to_string(),
+                ..Default::default()
+            })
+            .collect(),
+        ..GatewayConfig::default()
+    };
+
+    config.normalize_fields();
+
+    assert_eq!(
+        config.frontend_tls_certificate_sources.len(),
+        2,
+        "normalization must not erase a contradictory listener hostname claim before the runtime rejects it"
+    );
+}
+
+#[test]
 fn namespace_filter_retains_the_whole_owning_namespace_set() {
     let mut config = translate(&[
         gateway(
