@@ -14,11 +14,10 @@
 //!
 //! # Lifecycle contract
 //!
-//! - **Startup.** The first reconcile runs before the mode reports readiness.
-//!   In `file` / `database` mode a bind failure there is fatal, matching the
-//!   stream-listener contract; in `dp` mode it is reported and retried on the
-//!   next publication, because a data plane must not die on control-plane
-//!   input.
+//! - **Startup.** The first reconcile runs inside the mode's serve path, before
+//!   it reports readiness, so a config present at startup is already listening.
+//!   A bind failure there is **not** fatal in any mode — see "Ports this
+//!   manager refuses" below.
 //! - **Update.** A port whose TLS class changed is closed and rebound, because
 //!   plaintext and TLS are different sockets.
 //! - **Removal / withdrawal.** Routes are withdrawn by the atomic
@@ -39,12 +38,18 @@
 //! skipped fail-closed, never stolen:
 //!
 //! - anything in [`ProxyState::reserved_gateway_ports`] (the global proxy and
-//!   admin HTTP/HTTPS ports and the CP gRPC port), and
-//! - any port claimed by a TCP/UDP stream proxy in the same config.
+//!   admin HTTP/HTTPS ports and the CP gRPC port),
+//! - any port claimed by a TCP/UDP stream proxy in the same config, and
+//! - any port two HTTP-family proxies claim with different TLS classes.
 //!
-//! A skipped port is recorded in [`GatewayListenerManager::bind_failures`] and
-//! logged, so the operator sees an unreachable listener instead of silently
-//! losing one Gateway's traffic to another listener's socket.
+//! A refusal — and any bind failure, such as `:80` without
+//! `CAP_NET_BIND_SERVICE` — is recorded in
+//! [`GatewayListenerManager::bind_failures`] and logged, then retried on a slow
+//! tick. It is deliberately never fatal: a Gateway listener port is
+//! control-plane input, and killing the process over one unbindable port would
+//! take down every healthy listener with it. Routes scoped to a listener that
+//! did not bind simply stay unreachable, which is the fail-closed outcome —
+//! they are never served somewhere else.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -222,8 +227,9 @@ impl GatewayListenerManager {
 
     /// Bind newly-declared Gateway listener ports and close withdrawn ones.
     ///
-    /// Returns the failures observed in this pass. Callers decide severity:
-    /// fatal at startup in file/database mode, advisory everywhere else.
+    /// Returns the failures observed in this pass, which are also published to
+    /// [`Self::bind_failures`] for operators. They are advisory: see the module
+    /// docs for why an unbindable listener port is never fatal.
     pub async fn reconcile(&self) -> Vec<GatewayListenerBindFailure> {
         let config = self.state.config.load_full();
         let plan =
@@ -257,7 +263,7 @@ impl GatewayListenerManager {
             if let Some(listener) = live.remove(&port) {
                 info!(
                     port,
-                    "Closing Gateway API {} listener — no longer declared by the published config",
+                    "Closing Gateway API {} listener — no longer declared by config",
                     listener.class.label()
                 );
                 let _ = listener.shutdown_tx.send(true);

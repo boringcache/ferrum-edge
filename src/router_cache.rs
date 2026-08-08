@@ -2599,7 +2599,8 @@ impl RouterCache {
             // Listener scope (port + TLS class) is resolved ONCE here, from
             // this proxy's own `(namespace, listen_port)` entry, so the request
             // path never re-derives it from a shared set.
-            let scoped = PortScopedProxy::new(Arc::clone(&arc_proxy), &config.http_tls_listen_ports);
+            let scoped =
+                PortScopedProxy::new(Arc::clone(&arc_proxy), &config.http_tls_listen_ports);
 
             let Some(listen_path) = proxy.listen_path.as_deref() else {
                 // Host-only proxy: matches any path under its hosts.
