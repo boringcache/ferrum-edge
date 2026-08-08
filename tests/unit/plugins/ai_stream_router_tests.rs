@@ -5801,14 +5801,17 @@ async fn deferred_provider_claim_rebakes_proxy_path_and_query_before_dispatch() 
     assert_eq!(rebound_proxy.backend_port, 443);
     assert_eq!(rebound_proxy.dns_override, None);
     assert!(rebound_proxy.upstream_id.is_none());
-    // Prefer the committed budgets over the placeholder proxy defaults.
+    // Prefer committed provider budgets when present; otherwise preserve the
+    // route's existing timeout defaults while rebaking the destination.
     assert_eq!(
-        Some(rebound_proxy.backend_connect_timeout_ms),
+        rebound_proxy.backend_connect_timeout_ms,
         ctx.route_override_backend_connect_timeout_ms
+            .unwrap_or(pre_claim_proxy.backend_connect_timeout_ms)
     );
     assert_eq!(
-        Some(rebound_proxy.backend_read_timeout_ms),
+        rebound_proxy.backend_read_timeout_ms,
         ctx.route_override_backend_read_timeout_ms
+            .unwrap_or(pre_claim_proxy.backend_read_timeout_ms)
     );
 
     let claimed_path = ctx
