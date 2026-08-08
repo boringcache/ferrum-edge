@@ -1952,7 +1952,7 @@ fn kubernetes_minimum_scope_watermark_cannot_displace_accepted_content() {
         tracker
     };
     let publish = |tracker: &K8sConfigRevisionTracker| {
-        let watermark = tracker.converged_watermark([&policies, &gateways].into_iter());
+        let watermark = tracker.converged_watermark([&policies, &gateways]);
         tracker.publish(watermark).expect("an authority is set")
     };
 
@@ -2239,7 +2239,7 @@ fn only_numeric_resource_versions_are_evidence() {
     tracker.observe_listed(&scope, Some("not-a-revision"));
     tracker.commit_list(&scope);
 
-    assert_eq!(tracker.converged_watermark([&scope].into_iter()), None);
+    assert_eq!(tracker.converged_watermark([&scope]), None);
     assert_eq!(tracker.publish(None), None);
     assert_eq!(tracker.stats().unparsable_resource_versions, 1);
     assert_eq!(tracker.stats().unsequenced_publications, 1);
@@ -2268,7 +2268,7 @@ fn the_kubernetes_sequence_is_the_minimum_across_watched_resource_types() {
     tracker.commit_list(&gateways);
     tracker.commit_list(&policies);
     assert_eq!(
-        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        tracker.converged_watermark([&gateways, &policies, &pods]),
         None,
         "a registered scope with no evidence withholds the whole watermark"
     );
@@ -2280,7 +2280,7 @@ fn the_kubernetes_sequence_is_the_minimum_across_watched_resource_types() {
 
     tracker.commit_list(&pods);
     assert_eq!(
-        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        tracker.converged_watermark([&gateways, &policies, &pods]),
         Some(5_000)
     );
 
@@ -2288,7 +2288,7 @@ fn the_kubernetes_sequence_is_the_minimum_across_watched_resource_types() {
     tracker.observe_applied(&pods, Some("9000"));
     tracker.observe_applied(&gateways, Some("7000"));
     assert_eq!(
-        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        tracker.converged_watermark([&gateways, &policies, &pods]),
         Some(5_000),
         "the least converged scope bounds the snapshot"
     );
@@ -2312,13 +2312,13 @@ fn deleting_the_highest_versioned_object_advances_the_kubernetes_watermark() {
     tracker.observe_listed(&scope, Some("100"));
     tracker.observe_listed(&scope, Some("200"));
     tracker.commit_list(&scope);
-    let watermark = tracker.converged_watermark([&scope].into_iter());
+    let watermark = tracker.converged_watermark([&scope]);
     assert_eq!(watermark, Some(200));
 
     // The object stamped 200 is deleted; the DELETED watch event carries the
     // deletion revision, not the object's old one.
     tracker.observe_applied(&scope, Some("300"));
-    let watermark = tracker.converged_watermark([&scope].into_iter());
+    let watermark = tracker.converged_watermark([&scope]);
     assert_eq!(watermark, Some(300), "a withdrawal advances the watermark");
 
     // A replica restarting after that deletion sees only the surviving object
@@ -2328,7 +2328,7 @@ fn deleting_the_highest_versioned_object_advances_the_kubernetes_watermark() {
     restarted.begin_generation(&scope, Some(301));
     restarted.observe_listed(&scope, Some("100"));
     restarted.commit_list(&scope);
-    let watermark = restarted.converged_watermark([&scope].into_iter());
+    let watermark = restarted.converged_watermark([&scope]);
     assert_eq!(
         watermark,
         Some(301),
@@ -2355,7 +2355,7 @@ fn two_kubernetes_replicas_order_by_the_shared_resource_version() {
     let replica_a = converge(4_100);
     let replica_b = converge(4_050);
     let publish = |tracker: &K8sConfigRevisionTracker| {
-        let watermark = tracker.converged_watermark([&scope].into_iter());
+        let watermark = tracker.converged_watermark([&scope]);
         tracker.publish(watermark).expect("an authority is set")
     };
 
@@ -2415,7 +2415,7 @@ fn incomplete_convergence_retains_the_last_kubernetes_revision() {
 
     tracker.begin_generation(&gateways, Some(8_000));
     tracker.commit_list(&gateways);
-    let watermark = tracker.converged_watermark([&gateways].into_iter());
+    let watermark = tracker.converged_watermark([&gateways]);
     let established = tracker
         .publish(watermark)
         .expect("the first convergence establishes a sequence");
@@ -2434,7 +2434,7 @@ fn incomplete_convergence_retains_the_last_kubernetes_revision() {
     tracker.begin_generation(&backend_tls, Some(6_000));
     tracker.commit_list(&backend_tls);
     assert_eq!(
-        tracker.converged_watermark([&gateways, &backend_tls].into_iter()),
+        tracker.converged_watermark([&gateways, &backend_tls]),
         Some(6_000)
     );
     assert_eq!(
@@ -2445,14 +2445,14 @@ fn incomplete_convergence_retains_the_last_kubernetes_revision() {
 
     // Once the new scope catches up, the sequence advances again.
     tracker.observe_applied(&backend_tls, Some("9500"));
-    let watermark = tracker.converged_watermark([&gateways, &backend_tls].into_iter());
+    let watermark = tracker.converged_watermark([&gateways, &backend_tls]);
     assert_eq!(
         tracker.publish(watermark),
         Some(revision("k8s", 8_000)),
         "the gateways scope is now the minimum"
     );
     tracker.observe_applied(&gateways, Some("9500"));
-    let watermark = tracker.converged_watermark([&gateways, &backend_tls].into_iter());
+    let watermark = tracker.converged_watermark([&gateways, &backend_tls]);
     assert_eq!(tracker.publish(watermark), Some(revision("k8s", 9_500)));
 }
 
@@ -2467,7 +2467,7 @@ fn a_disabled_authority_publishes_no_kubernetes_revision() {
     tracker.begin_generation(&scope, Some(1_000));
     tracker.commit_list(&scope);
 
-    let watermark = tracker.converged_watermark([&scope].into_iter());
+    let watermark = tracker.converged_watermark([&scope]);
     assert_eq!(watermark, Some(1_000));
     assert_eq!(tracker.publish(Some(1_000)), None);
 }
