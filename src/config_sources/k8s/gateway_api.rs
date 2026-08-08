@@ -7837,7 +7837,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_conflicts_keep_listener_status_but_do_not_materialize_routes() {
+    fn same_namespace_gateway_tls_slot_keeps_only_winner_materialized() {
         let mut gateway_a = object(
             "Gateway",
             serde_json::json!({
@@ -7897,11 +7897,11 @@ mod tests {
             "the planned winning TLS listener should stay materialized"
         );
         assert!(
-            result.config.mesh.as_ref().is_some_and(|mesh| mesh
+            result.config.mesh.as_ref().is_none_or(|mesh| mesh
                 .services
                 .iter()
-                .any(|service| service.name == "edge-b-https-b")),
-            "status-only later valid TLS listeners should not be withdrawn solely because the namespace already has a serving cert"
+                .all(|service| service.name != "edge-b-https-b")),
+            "the accepted non-winning TLS listener must not advertise a listener under the namespace winner's certificate"
         );
         assert!(
             result.config.proxies.is_empty(),
