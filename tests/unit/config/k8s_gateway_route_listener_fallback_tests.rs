@@ -391,11 +391,8 @@ fn httproute_and_grpcroute_on_absent_gateway_do_not_conflict() {
 /// route: no materialization, no Conflicted, attachment failure only.
 #[test]
 fn httproute_and_grpcroute_on_mismatched_listener_hostname_do_not_conflict() {
-    let mut http = http_route_with_hostname(
-        "web",
-        "shared.example.com",
-        Some(json!([{"name": "edge"}])),
-    );
+    let mut http =
+        http_route_with_hostname("web", "shared.example.com", Some(json!([{"name": "edge"}])));
     http.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
     let mut grpc = grpc_route_with_hostname(
         "grpc",
@@ -410,10 +407,7 @@ fn httproute_and_grpcroute_on_mismatched_listener_hostname_do_not_conflict() {
         http,
         grpc,
     ];
-    assert_unresolved_cross_kind_pair_is_attachment_failure(
-        &objects,
-        "NoMatchingListenerHostname",
-    );
+    assert_unresolved_cross_kind_pair_is_attachment_failure(&objects, "NoMatchingListenerHostname");
 }
 
 /// Parentless HTTPRoute vs GRPCRoute still contend on the listener-less global
