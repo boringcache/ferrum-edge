@@ -12713,10 +12713,19 @@ mod tests {
     /// implementation not to add entries once it is full. Foreign controller
     /// ownership therefore wins the capacity budget over Ferrum's desired
     /// entry; forced SSA must never evict a foreign status just to report ours.
-    /// Translation must still apply session persistence: `status.ancestors` is
-    /// mutable third-party state and must not gate the data plane.
-    fn full_foreign_ancestors() -> Vec<Value> {
-        (0..super::POLICY_ANCESTOR_MAX_ITEMS)
+    ///
+    /// Translation / Accepted semantics for a full foreign map are covered in
+    /// `tests/unit/gateway_core/gateway_backend_lb_policy_tests.rs`.
+    #[test]
+    fn backend_lb_policy_status_does_not_evict_a_full_foreign_ancestor_map() {
+        let mut policy = backend_lb_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+            }),
+        );
+        let foreign = (0..super::POLICY_ANCESTOR_MAX_ITEMS)
             .map(|index| {
                 serde_json::json!({
                     "ancestorRef": {
@@ -12729,11 +12738,8 @@ mod tests {
                     "conditions": []
                 })
             })
-            .collect()
-    }
-
-    fn assert_full_foreign_ancestors_apply_without_ferrum_status_write(mut policy: K8sObject) {
-        policy.status = serde_json::json!({ "ancestors": full_foreign_ancestors() });
+            .collect::<Vec<_>>();
+        policy.status = serde_json::json!({ "ancestors": foreign });
 
         let status = super::backend_lb_policy_status(&policy, false);
         let ancestors = status["ancestors"].as_array().expect("ancestors array");
@@ -12751,46 +12757,10 @@ mod tests {
             "a full foreign ancestor map must leave Ferrum with no status slot"
         );
 
-        let route = http_route_to_service("api");
-        let translated = translate_k8s_objects(&[policy, route], options()).expect(
-            "a full foreign ancestor map must not suppress session-persistence translation",
-        );
-        assert_eq!(translated.config.upstreams.len(), 1);
-        assert!(
-            translated.config.upstreams[0]
-                .hash_on
-                .as_deref()
-                .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-")),
-            "session persistence must still reach the data plane: {:?}",
-            translated.config.upstreams[0].hash_on
-        );
-
         // Applying a planner-produced document without a fresh live snapshot
         // still preserves its already-carried foreign entries.
         let again = super::merge_backend_lb_policy_status(&status, None);
         assert_eq!(again, status);
-    }
-
-    #[test]
-    fn backend_lb_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status() {
-        assert_full_foreign_ancestors_apply_without_ferrum_status_write(backend_lb_policy(
-            "sticky",
-            serde_json::json!({
-                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
-                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
-            }),
-        ));
-    }
-
-    #[test]
-    fn x_backend_traffic_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status() {
-        assert_full_foreign_ancestors_apply_without_ferrum_status_write(x_backend_traffic_policy(
-            "sticky",
-            serde_json::json!({
-                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
-                "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
-            }),
-        ));
     }
 
     #[test]
