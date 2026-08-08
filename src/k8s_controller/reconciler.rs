@@ -21,6 +21,7 @@ use crate::k8s_controller::ControllerTaskRegistry;
 use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates_budgeted};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
+use crate::k8s_controller::revision::K8sConfigRevisionTracker;
 use crate::k8s_controller::status::{
     GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
     gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
@@ -28,6 +29,7 @@ use crate::k8s_controller::status::{
 use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 use crate::modes::mesh::config::MeshConfig;
+use crate::modes::mesh::revision::MeshConfigRevision;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = DEFAULT_STATUS_PLAN_WORK_BUDGET;
@@ -44,6 +46,18 @@ const STATUS_PATCH_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct AcceptedK8sOverlay {
     pub translation: GatewayConfig,
     pub managed_namespaces: BTreeSet<String>,
+    /// Authoritative mesh config revision for this overlay (issue #3611).
+    ///
+    /// Lives on the overlay, not on the DB snapshot, because on a
+    /// Kubernetes-controller CP the mesh block is authored ENTIRELY by this
+    /// overlay — CP database full loads clear `mesh` unconditionally and re-merge
+    /// it from here (#2982). Anything else would let a DB reload publish a mesh
+    /// snapshot stamped with a revision that did not describe it, or (as before
+    /// this change) wipe the revision entirely on the next poll.
+    ///
+    /// `None` when revision publication is disabled or no convergence evidence
+    /// has ever been established.
+    pub mesh_revision: Option<MeshConfigRevision>,
 }
 
 /// Shared slot written by the K8s reconciler and read by CP DB publication.
@@ -120,6 +134,7 @@ pub fn store_accepted_k8s_overlay(
     slot: &K8sOverlaySlot,
     mut translation: GatewayConfig,
     managed_namespaces: BTreeSet<String>,
+    mesh_revision: Option<MeshConfigRevision>,
 ) {
     if !translation.k8s_mesh_overlay.is_authoritative()
         && translation.mesh.is_none()
@@ -130,6 +145,7 @@ pub fn store_accepted_k8s_overlay(
     slot.store(Arc::new(Some(AcceptedK8sOverlay {
         translation,
         managed_namespaces,
+        mesh_revision,
     })));
 }
 
@@ -144,7 +160,32 @@ pub fn compose_db_with_k8s_overlay(
     let Some(overlay) = slot.as_ref() else {
         return db_config.clone();
     };
-    merge_k8s_translation(db_config, &overlay.translation, &overlay.managed_namespaces)
+    let translation = &overlay.translation;
+    let managed = &overlay.managed_namespaces;
+    let mut composed = merge_k8s_translation(db_config, translation, managed);
+    apply_k8s_mesh_revision(&mut composed, overlay.mesh_revision.as_ref());
+    composed
+}
+
+/// Stamp the Kubernetes-authored mesh config revision onto a composed snapshot
+/// (issue #3611).
+///
+/// The single site both CP publishers use, so the DB poll loop and the
+/// reconciler can never stamp differently for the same overlay.
+///
+/// `None` leaves the snapshot's existing revision untouched rather than clearing
+/// it. Clearing would turn a *versioned* CP into an *unversioned* one mid-flight,
+/// and a data plane that has already accepted a revision quarantines the next
+/// unversioned slice (`missing_revision`) — so "no evidence right now" must not
+/// be published as "this authority has no ordering". The tracker's own
+/// retain-last-good rule normally makes this arm unreachable once a sequence is
+/// established; it stays fail-safe for the ordering in which a DB reload composes
+/// before the first reconcile has published anything.
+fn apply_k8s_mesh_revision(config: &mut GatewayConfig, revision: Option<&MeshConfigRevision>) {
+    let Some(revision) = revision else {
+        return;
+    };
+    config.mesh_revision = Some(revision.clone());
 }
 
 pub struct ReconcilerConfig {
@@ -197,6 +238,7 @@ pub(crate) fn spawn_reconcile_loop(
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     shutdown: watch::Receiver<bool>,
     registry: &ControllerTaskRegistry,
 ) -> bool {
@@ -215,6 +257,7 @@ pub(crate) fn spawn_reconcile_loop(
         gateway_status_writer,
         istio_status_writer,
         metrics,
+        revision,
         shutdown.clone(),
     );
 
@@ -231,6 +274,7 @@ async fn run_reconcile_loop(
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut change_rx = {
@@ -297,6 +341,7 @@ async fn run_reconcile_loop(
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
+            revision: Arc::clone(&revision),
         },
     )
     .await;
@@ -346,6 +391,7 @@ async fn run_reconcile_loop(
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
+                        revision: Arc::clone(&revision),
                     },
                 ).await;
             }
@@ -389,6 +435,7 @@ async fn run_reconcile_loop(
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
+                        revision: Arc::clone(&revision),
                     },
                 ).await;
             }
@@ -580,6 +627,9 @@ struct ReconcileContext {
     /// a no-op when None — every other code path stays unchanged.
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    /// Kubernetes `resourceVersion` convergence evidence and the authoritative
+    /// mesh config revision derived from it (issue #3611).
+    revision: Arc<K8sConfigRevisionTracker>,
 }
 
 fn namespaces_for_broadcast(
@@ -658,6 +708,7 @@ pub fn publish_k8s_reconcile(
     cp_scope: &CpScope,
     mesh_update_tx: &broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: &MeshNodeRegistry,
+    mesh_revision: Option<&MeshConfigRevision>,
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
         // Validate the exact composed candidate before retaining the overlay
@@ -685,8 +736,14 @@ pub fn publish_k8s_reconcile(
             overlay_slot,
             translation.clone(),
             managed_namespaces.clone(),
+            mesh_revision.cloned(),
         );
-        let new_config = swap_merged_k8s_translation(config_arc, translation, managed_namespaces)?;
+        let new_config = swap_merged_k8s_translation(
+            config_arc,
+            translation,
+            managed_namespaces,
+            mesh_revision,
+        )?;
 
         // Notify DPs and mesh subscribers of the config change.
         for namespace in
@@ -715,13 +772,24 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .reconciliations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let objects = {
+    let (revision_watermark, objects) = {
         // `lock_owned` keeps the guard from holding a `&Mutex<…>` borrow across
         // the `.await`, which would otherwise force rustc into an HRTB Send
         // analysis it can't satisfy when the future is `tokio::spawn`-ed.
         let set = Arc::clone(&store_set).lock_owned().await;
-        set.snapshot_all()
+        // Coherence point (issue #3611). The scope set is pinned under the same
+        // lock that materializes the snapshot, and the watermark is read FIRST:
+        // between the two reads a reflector store can only move forward, so the
+        // snapshot is never older than the sequence claims. Reading it after
+        // would allow the reverse — a sequence covering changes the snapshot
+        // does not contain.
+        let scopes = set.scope_keys();
+        let watermark = ctx.revision.converged_watermark(scopes.iter());
+        (watermark, set.snapshot_all())
     };
+    // Publication applies the in-process monotonic floor and the
+    // retain-last-good rule for incomplete evidence.
+    let mesh_revision = ctx.revision.publish(revision_watermark);
 
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
@@ -772,6 +840,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &ctx.cp_scope,
         &ctx.mesh_update_tx,
         &ctx.mesh_registry,
+        mesh_revision.as_ref(),
     );
     let Some(new_config) = published else {
         debug!("No config changes detected, skipping swap");
@@ -1060,15 +1129,21 @@ pub fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
     managed_namespaces: &BTreeSet<String>,
+    mesh_revision: Option<&MeshConfigRevision>,
 ) -> Option<Arc<GatewayConfig>> {
     let mut old_config = config_arc.load();
 
     loop {
-        let new_config = Arc::new(merge_k8s_translation(
-            old_config.as_ref(),
-            k8s_config,
-            managed_namespaces,
-        ));
+        let base = old_config.as_ref();
+        let mut merged = merge_k8s_translation(base, k8s_config, managed_namespaces);
+        apply_k8s_mesh_revision(&mut merged, mesh_revision);
+        let new_config = Arc::new(merged);
+        // `GatewayConfig.mesh_revision` is `#[serde(skip)]`, so the content
+        // comparison below does not see it. That is deliberate and matches the
+        // slice-level contract (`MeshSlice::content_eq` ignores `revision`): a
+        // revision-only change is not a config change and must not fan a frame
+        // out to every subscriber. The advanced sequence is still recorded on
+        // the overlay slot, so the next content change carries it.
         if !gateway_config_content_changed(&new_config, old_config.as_ref()) {
             return None;
         }

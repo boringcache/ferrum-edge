@@ -182,6 +182,26 @@ impl ResourceStoreSet {
         self.stores.clone()
     }
 
+    /// Identity of every currently registered scope.
+    ///
+    /// The revision tracker's aggregation set (issue #3611). Callers pin it and
+    /// read the watermark under the SAME lock they later call
+    /// [`Self::snapshot_all`] under, and in that order: between the two the
+    /// stores can only move forward, so the snapshot is never older than the
+    /// watermark claims.
+    pub fn scope_keys(&self) -> Vec<crate::k8s_controller::revision::K8sWatchScopeKey> {
+        self.stores
+            .iter()
+            .map(|store| {
+                crate::k8s_controller::revision::watch_scope_key(
+                    &store.api_version,
+                    &store.kind,
+                    &store.scope,
+                )
+            })
+            .collect()
+    }
+
     pub fn snapshot_all(&self) -> Vec<K8sObject> {
         let mut objects = Vec::new();
         let mut seen = HashSet::new();

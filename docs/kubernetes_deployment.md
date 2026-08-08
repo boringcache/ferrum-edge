@@ -639,6 +639,59 @@ For CP/DP mode, keep the Control Plane private and expose only the Data Plane pr
 > Omit the admin Service entirely if you only need in-pod (`kubectl exec`) admin
 > access; the gRPC Service (`50051`) is independent.
 
+### Mesh config ordering across CP replicas
+
+Mesh data planes list several control planes in `FERRUM_DP_CP_GRPC_URLS` and fail
+over between them. To stop a failover from applying an **older** control plane's
+slice — resurrecting withdrawn authorization policies, trust bundles, or
+workloads — every mesh slice carries an authoritative
+`(authority, sequence)` revision and the data plane refuses one that is not newer
+than the revision it already accepted. Both control-plane shapes publish one:
+
+| CP shape | authority | sequence |
+|---|---|---|
+| database-backed (`FERRUM_K8S_CONTROLLER_ENABLED=false`) | `FERRUM_MESH_CONFIG_AUTHORITY_ID` (default `db`) | the store's `config_changes` cursor |
+| Kubernetes CRD controller (`FERRUM_K8S_CONTROLLER_ENABLED=true`, the in-pod default) | `k8s`, or `k8s:<FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID>` | a Kubernetes `resourceVersion` convergence watermark |
+
+Nothing needs to be configured for the ordinary case: replicas of one control
+plane deployment watching one cluster already share the domain and derive the
+sequence from cluster state, so the gate engages by default. The operator-visible
+behaviour is:
+
+- **Every replica of a control plane deployment must agree on the authority.**
+  Set `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` (if you set it at all) on the
+  Deployment, never per pod. Two control planes watching *different* clusters
+  must use *different* values, or their sequences claim a comparability they do
+  not have.
+- **A restarted or freshly rolled replica is safe.** It re-derives the watermark
+  from a current cluster revision, which is at or above anything the previous
+  process observed, so a rollout cannot rewind the published revision.
+- **A replica whose watch is behind holds itself back.** The sequence is the
+  minimum over every watched scope, so a stalled or still-listing watcher stops
+  the revision advancing rather than overstating freshness. A data plane failing
+  over to such a replica quarantines its slice (`stale_revision` on
+  `GET /mesh/config-drift`), keeps serving its last-good configuration, and
+  recovers when that replica catches up — within about one
+  `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window (default 300 s) at worst, and
+  immediately on the next cluster change. Lower that interval if you want a
+  tighter bound. **Alert on `quarantine_active`**, not on individual
+  quarantines.
+- **After an etcd restore-from-backup**, Kubernetes `resourceVersion` can rewind.
+  That is never auto-adopted inside one authority (it is indistinguishable from a
+  rollback attack). Set `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` to a new value and
+  roll the control plane: data planes see a new ordering domain and adopt it
+  after `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`. `POST /mesh/config-revision/reset`
+  on each data plane is the per-DP alternative.
+- **`FERRUM_MESH_CONFIG_AUTHORITY_ID=`** (empty) disables revision publication
+  entirely, on either shape. Data planes then apply no cross-CP ordering — only
+  do this deliberately.
+
+The Kubernetes control plane costs one extra one-item list request per watch
+scope per relist window for this (the authoritative boundary read); it adds no
+request-path work and no per-object state. See
+[`docs/mesh.md`](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection)
+for the full contract.
+
 ### Control Plane
 
 - Container ports: `9000`, `9443`, `50051`

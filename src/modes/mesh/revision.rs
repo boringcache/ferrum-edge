@@ -26,6 +26,26 @@
 //!   treats as authoritative). It is NOT a process-local counter and NOT a
 //!   clock, so it survives CP restarts and is identical on every replica.
 //!
+//! # Ordering domains
+//!
+//! Two sequence spaces exist, and they are never comparable with each other:
+//!
+//! * the **change-log domain** — a DB-backed CP, authority
+//!   `FERRUM_MESH_CONFIG_AUTHORITY_ID` (default `db`), sequence
+//!   `config_changes.sequence`;
+//! * the **Kubernetes domain** — a CP running the CRD controller, authority
+//!   [`KUBERNETES_AUTHORITY_DOMAIN`] (optionally qualified, see
+//!   [`kubernetes_authority`]), sequence a Kubernetes `resourceVersion`
+//!   convergence watermark derived in [`crate::k8s_controller::revision`]
+//!   (issue #3611).
+//!
+//! The domain is carried in the authority string itself, so the existing
+//! `Incomparable` arm already keeps the two apart on the data plane. The control
+//! plane enforces the same split at both ends: `k8s` is a reserved authority a
+//! DB CP is refused at startup, and a change-log cursor may only reach a
+//! revision through [`MeshConfigRevision::advance_change_log_sequence`], which
+//! refuses a Kubernetes-domain revision.
+//!
 //! # Comparison contract
 //!
 //! [`MeshConfigRevision::compare`] is the single source of truth:
@@ -119,6 +139,58 @@ pub const DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS: u64 = 300;
 /// store, because the ordering domain is the STORE, not the process.
 pub const DEFAULT_CONFIG_AUTHORITY_ID: &str = "db";
 
+/// Reserved ordering-domain name for a Kubernetes-controller control plane
+/// (issue #3611).
+///
+/// A Kubernetes-controller CP sequences from the Kubernetes API server's
+/// `resourceVersion` space — etcd's cluster-global revision counter — while a
+/// DB-backed CP sequences from its store's `config_changes` change log. The two
+/// number spaces are unrelated: `config_changes.sequence` starts near zero and
+/// counts writes, an etcd revision starts high and counts *every* cluster
+/// mutation. Comparing them would silently order an unrelated pair of snapshots,
+/// so the domains must never share an authority string.
+///
+/// The separation is structural rather than advisory: a Kubernetes CP's
+/// authority is always this name (optionally qualified, see
+/// [`kubernetes_authority`]), a DB CP is refused at startup if it claims the
+/// reserved name, and every change-log advance runs through
+/// [`MeshConfigRevision::advance_change_log_sequence`], which refuses to touch a
+/// Kubernetes-domain revision.
+pub const KUBERNETES_AUTHORITY_DOMAIN: &str = "k8s";
+
+/// Separator between [`KUBERNETES_AUTHORITY_DOMAIN`] and an operator-supplied
+/// qualifier. Chosen because it cannot appear in a Kubernetes cluster name and
+/// makes the domain visible in every diagnostic that renders an authority.
+pub const KUBERNETES_AUTHORITY_SEPARATOR: char = ':';
+
+/// Build the authority a Kubernetes-controller CP advertises.
+///
+/// `qualifier` is `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID`; empty means "the
+/// cluster this CP watches", which is the common single-cluster case, so the
+/// authority is the bare reserved domain. A qualifier is how an operator names a
+/// NEW ordering domain after an etcd restore-from-backup (the one event that can
+/// rewind `resourceVersion` inside a cluster) or distinguishes two clusters
+/// whose CPs a single data plane lists in `FERRUM_DP_CP_GRPC_URLS`.
+pub fn kubernetes_authority(qualifier: &str) -> String {
+    if qualifier.is_empty() {
+        return KUBERNETES_AUTHORITY_DOMAIN.to_string();
+    }
+    format!("{KUBERNETES_AUTHORITY_DOMAIN}{KUBERNETES_AUTHORITY_SEPARATOR}{qualifier}")
+}
+
+/// Whether `authority` names the reserved Kubernetes ordering domain.
+///
+/// Matches the bare domain and any qualified form. Deliberately NOT a plain
+/// `starts_with("k8s")`: an operator authority id of `k8sconfig` is a distinct
+/// domain and must stay one.
+pub fn is_kubernetes_authority(authority: &str) -> bool {
+    match authority.strip_prefix(KUBERNETES_AUTHORITY_DOMAIN) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(KUBERNETES_AUTHORITY_SEPARATOR),
+        None => false,
+    }
+}
+
 /// Authoritative, replica-shared mesh config revision.
 ///
 /// Carried on [`crate::modes::mesh::slice::MeshSlice::revision`], duplicated on
@@ -165,6 +237,35 @@ impl MeshConfigRevision {
             && self.authority.trim() == self.authority
             && self.authority.len() <= MAX_AUTHORITY_LEN
             && !self.authority.chars().any(char::is_control)
+    }
+
+    /// Whether this revision belongs to the reserved Kubernetes ordering
+    /// domain (issue #3611). See [`KUBERNETES_AUTHORITY_DOMAIN`].
+    pub fn is_kubernetes_authority(&self) -> bool {
+        is_kubernetes_authority(&self.authority)
+    }
+
+    /// Advance this revision from a durable `config_changes` cursor, returning
+    /// whether it moved.
+    ///
+    /// The single seam through which a SQL/Mongo change-log cursor may touch a
+    /// published revision. It is a NO-OP for a Kubernetes-domain revision: a
+    /// change-log cursor is not comparable with a Kubernetes `resourceVersion`,
+    /// and folding one into the other with `max` would either be silently inert
+    /// (the usual case, because etcd revisions dwarf change-log sequences) or —
+    /// on a freshly bootstrapped cluster — advertise a Kubernetes snapshot as
+    /// newer on the strength of an unrelated database write. Both are wrong;
+    /// refusing is the only honest option.
+    ///
+    /// `max` (rather than assignment) is retained for the change-log domain so a
+    /// peer that sent no cursor (`0`) cannot move a per-stream base backwards.
+    pub fn advance_change_log_sequence(&mut self, cursor: u64) -> bool {
+        if self.is_kubernetes_authority() {
+            return false;
+        }
+        let advanced = cursor > self.sequence;
+        self.sequence = self.sequence.max(cursor);
+        advanced
     }
 
     /// Order `candidate` against `accepted`. See the module contract table.

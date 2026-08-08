@@ -1982,6 +1982,139 @@ fn test_env_config_cp_rejects_surrounding_whitespace_in_mesh_config_authority() 
     );
 }
 
+/// `k8s` (and any `k8s:...` form) names the Kubernetes `resourceVersion`
+/// ordering domain. A change-log control plane that claimed it would advertise
+/// `config_changes` sequences under a name Kubernetes data planes treat as
+/// comparable — a cross-domain ordering claim no gate can detect, because
+/// comparability is exactly what an equal authority asserts (issue #3611).
+#[test]
+fn test_env_config_cp_rejects_the_reserved_kubernetes_authority_domain() {
+    for reserved in ["k8s", "k8s:east-2"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "cp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "admin-secret-padding-32-chars!!!",
+                ),
+                ("FERRUM_DB_TYPE", "postgres"),
+                ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+                ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "grpc-secret-padding-32-char-min!",
+                ),
+                ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+                ("FERRUM_MESH_CONFIG_AUTHORITY_ID", reserved),
+            ],
+            || {
+                let error =
+                    EnvConfig::from_env().expect_err("the reserved domain must fail closed");
+                assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+                assert!(error.contains("reserved"));
+            },
+        );
+    }
+
+    // A merely similar id is a distinct, legitimate ordering domain.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", "k8sconfig"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a similar id is not the reserved domain");
+            assert_eq!(config.mesh_config_authority_id, "k8sconfig");
+        },
+    );
+}
+
+/// The Kubernetes domain is COMPOSED (`k8s:<qualifier>`), so it is validated
+/// through the composed value — that is what a data plane orders against and
+/// what the bounded diagnostics render (issue #3611).
+#[test]
+fn test_env_config_k8s_cp_validates_the_composed_kubernetes_authority() {
+    let oversized = "q".repeat(129);
+    for (qualifier, expected_fragment) in [
+        ("east\n2", "control-character-free"),
+        (" east-2", "no surrounding whitespace"),
+        (oversized.as_str(), "128 bytes"),
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "cp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "admin-secret-padding-32-chars!!!",
+                ),
+                ("FERRUM_DB_TYPE", "postgres"),
+                ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+                ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "grpc-secret-padding-32-char-min!",
+                ),
+                ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+                ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", qualifier),
+            ],
+            || {
+                let error = EnvConfig::from_env()
+                    .expect_err("an ill-formed Kubernetes authority must fail closed");
+                assert!(error.contains("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID"));
+                assert!(
+                    error.contains(expected_fragment),
+                    "expected {expected_fragment:?} in {error}"
+                );
+                assert!(
+                    !error.contains(qualifier.trim()),
+                    "the rejected value must not be echoed"
+                );
+            },
+        );
+    }
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east-2"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a well-formed qualifier is accepted");
+            assert_eq!(config.mesh_config_k8s_authority_id, "east-2");
+            // The change-log id keeps its default and stays the on/off switch.
+            assert_eq!(config.mesh_config_authority_id, "db");
+        },
+    );
+}
+
 #[test]
 fn test_env_config_cp_rejects_oversized_mesh_config_authority() {
     let oversized = "a".repeat(129);

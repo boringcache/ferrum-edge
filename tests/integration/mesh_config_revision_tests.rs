@@ -29,6 +29,14 @@
 //! 6. Bounding of the control-plane-supplied `authority` on every copy that
 //!    leaves the gate (diagnostics, the operator reset, and the log lines built
 //!    from them), while ordering keeps the raw value.
+//! 7. The Kubernetes ordering domain (issue #3611): a CRD-controller control
+//!    plane sequences from a `resourceVersion` convergence watermark instead of
+//!    a change-log cursor. Covers the domain separation, the evidence rules
+//!    (boundary adoption, buffered lists, deletion advancing rather than
+//!    rewinding, unparsable versions), the minimum-across-scopes coherence
+//!    point, retain-last-good on incomplete convergence, two replicas failing
+//!    over, and native/xDS parity — including a run of the production watcher
+//!    task over scripted reflector generations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
@@ -61,13 +69,18 @@ use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
 };
 use ferrum_edge::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
+use ferrum_edge::_test_support::{K8sWatchScopeForTest, k8s_watch_scope_with_revision_for_test};
+use ferrum_edge::k8s_controller::revision::{
+    K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version, watch_scope_key,
+};
 use ferrum_edge::modes::mesh::revision::{
-    MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder, MeshRevisionPolicy,
-    MeshRevisionRejectReason,
+    KUBERNETES_AUTHORITY_DOMAIN, MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder,
+    MeshRevisionPolicy, MeshRevisionRejectReason, is_kubernetes_authority, kubernetes_authority,
 };
 use ferrum_edge::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics;
+use kube::runtime::watcher::Event;
 
 const NODE_ID: &str = "dp-node-a";
 const NAMESPACE: &str = "alpha";
@@ -1840,4 +1853,546 @@ fn output_copies_of_the_authority_are_bounded_but_ordering_stays_exact() {
         .expect("the accepted revision is returned");
     assert_eq!(cleared.authority, bounded);
     assert_eq!(cleared.sequence, 7);
+}
+
+// ── Kubernetes ordering domain (issue #3611) ───────────────────────────────
+
+/// A Kubernetes-controller control plane sequences from `resourceVersion` —
+/// etcd's cluster-global revision counter — while a database-backed one
+/// sequences from its `config_changes` change log. The two number spaces are
+/// unrelated, so the domains must never be able to claim comparability.
+///
+/// The separation is structural, not advisory: the authority carries the
+/// domain, and the ONE seam through which a change-log cursor can reach a
+/// revision refuses a Kubernetes-domain one.
+#[test]
+fn the_kubernetes_domain_is_never_comparable_with_the_change_log_domain() {
+    assert_eq!(kubernetes_authority(""), KUBERNETES_AUTHORITY_DOMAIN);
+    assert_eq!(kubernetes_authority("east-2"), "k8s:east-2");
+
+    assert!(is_kubernetes_authority("k8s"));
+    assert!(is_kubernetes_authority("k8s:east-2"));
+    // A prefix match would be wrong: these are ordinary operator authority ids.
+    assert!(!is_kubernetes_authority("k8sconfig"));
+    assert!(!is_kubernetes_authority("db"));
+    assert!(!is_kubernetes_authority("my-k8s"));
+
+    // A change-log cursor may advance a change-log revision...
+    let mut change_log = revision("db", 10);
+    assert!(change_log.advance_change_log_sequence(42));
+    assert_eq!(change_log.sequence, 42);
+    // ...never moves backwards when a peer sends no cursor...
+    assert!(!change_log.advance_change_log_sequence(0));
+    assert_eq!(change_log.sequence, 42);
+    // ...and can never touch a Kubernetes-domain revision, in either direction.
+    let mut kubernetes = revision("k8s", 5_000_000);
+    assert!(!kubernetes.advance_change_log_sequence(42));
+    assert_eq!(kubernetes.sequence, 5_000_000);
+    let mut fresh_cluster = revision("k8s:east-2", 3);
+    assert!(!fresh_cluster.advance_change_log_sequence(9_000));
+    assert_eq!(
+        fresh_cluster.sequence, 3,
+        "a database write must never advertise a Kubernetes snapshot as newer, \
+         even on a cluster whose revisions are still small"
+    );
+
+    // And the data plane needs no new rule: distinct authorities are already
+    // incomparable, so a mixed fleet cannot silently order across domains.
+    let state = MeshRuntimeState::new();
+    assert!(
+        state
+            .install_slice(slice_at("k8s-1", Some(revision("k8s", 5_000_000))))
+            .installed()
+    );
+    assert_eq!(
+        state
+            .install_slice(slice_at("db-1", Some(revision("db", 5_000_001))))
+            .rejection()
+            .expect("a change-log slice cannot displace a Kubernetes one")
+            .reason(),
+        MeshRevisionRejectReason::IncomparableAuthority
+    );
+    assert_eq!(installed_version(&state).as_deref(), Some("k8s-1"));
+}
+
+/// `resourceVersion` is documented as opaque. Ferrum orders on it only when it
+/// parses as an unsigned integer (the etcd revision every supported API server
+/// mints); anything else is NO EVIDENCE, never zero and never a guess.
+#[test]
+fn only_numeric_resource_versions_are_evidence() {
+    assert_eq!(parse_resource_version("12345"), Some(12_345));
+    assert_eq!(parse_resource_version("0"), Some(0));
+
+    for rejected in [
+        "",
+        " 12",
+        "12 ",
+        "+12",
+        "-12",
+        "1.2",
+        "abc",
+        "12a",
+        // 21 digits: cannot be a `u64` revision.
+        "123456789012345678901",
+        // `u64::MAX + 1`.
+        "18446744073709551616",
+    ] {
+        assert_eq!(
+            parse_resource_version(rejected),
+            None,
+            "{rejected:?} must not be accepted as an orderable revision"
+        );
+    }
+
+    // A scope whose versions never parse establishes no evidence at all, so the
+    // control plane publishes nothing rather than ordering on a value it cannot
+    // interpret.
+    let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+    let scope = watch_scope_key("gateway.networking.k8s.io/v1", "Gateway", "all");
+    tracker.begin_generation(&scope, None);
+    tracker.observe_listed(&scope, Some("not-a-revision"));
+    tracker.commit_list(&scope);
+
+    assert_eq!(tracker.converged_watermark([&scope].into_iter()), None);
+    assert_eq!(tracker.publish(None), None);
+    assert_eq!(tracker.stats().unparsable_resource_versions, 1);
+    assert_eq!(tracker.stats().unsequenced_publications, 1);
+}
+
+/// The published sequence is the MINIMUM across watched scopes, because a
+/// reconcile snapshot is the union of independently converging reflectors: the
+/// strongest true statement is that it contains every change up to the least
+/// converged scope. A maximum would advertise a resource type's staleness away.
+#[test]
+fn the_kubernetes_sequence_is_the_minimum_across_watched_resource_types() {
+    let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+    let gateways = watch_scope_key("gateway.networking.k8s.io/v1", "Gateway", "all");
+    let policies = watch_scope_key(
+        "security.istio.io/v1beta1",
+        "AuthorizationPolicy",
+        "namespace:alpha",
+    );
+    let pods = watch_scope_key("v1", "Pod", "namespace:alpha");
+
+    for scope in [&gateways, &policies, &pods] {
+        tracker.begin_generation(scope, Some(5_000));
+    }
+    // Only two of the three have finished their initial list. A snapshot
+    // missing a whole resource type must not be stamped as complete.
+    tracker.commit_list(&gateways);
+    tracker.commit_list(&policies);
+    assert_eq!(
+        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        None,
+        "a registered scope with no evidence withholds the whole watermark"
+    );
+    assert_eq!(
+        tracker.publish(None),
+        None,
+        "nothing has ever been established, so the CP publishes no revision"
+    );
+
+    tracker.commit_list(&pods);
+    assert_eq!(
+        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        Some(5_000)
+    );
+
+    // A busy scope races ahead; the minimum stays on the quiet one.
+    tracker.observe_applied(&pods, Some("9000"));
+    tracker.observe_applied(&gateways, Some("7000"));
+    assert_eq!(
+        tracker.converged_watermark([&gateways, &policies, &pods].into_iter()),
+        Some(5_000),
+        "the least converged scope bounds the snapshot"
+    );
+
+    // An empty scope set is not a fully converged snapshot; it is no snapshot.
+    let none: [&K8sWatchScopeKey; 0] = [];
+    assert_eq!(tracker.converged_watermark(none.into_iter()), None);
+}
+
+/// Deleting the highest-versioned object must ADVANCE the watermark. This is
+/// the case that rules out ordering on live object metadata: a max over the
+/// surviving objects would drop, and a replica that restarted after the
+/// deletion would publish below its still-running peer — a rewind inside one
+/// authority, which the gate never auto-adopts.
+#[test]
+fn deleting_the_highest_versioned_object_advances_the_kubernetes_watermark() {
+    let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+    let scope = watch_scope_key("gateway.networking.k8s.io/v1", "Gateway", "all");
+
+    tracker.begin_generation(&scope, Some(100));
+    tracker.observe_listed(&scope, Some("100"));
+    tracker.observe_listed(&scope, Some("200"));
+    tracker.commit_list(&scope);
+    let watermark = tracker.converged_watermark([&scope].into_iter());
+    assert_eq!(watermark, Some(200));
+
+    // The object stamped 200 is deleted; the DELETED watch event carries the
+    // deletion revision, not the object's old one.
+    tracker.observe_applied(&scope, Some("300"));
+    let watermark = tracker.converged_watermark([&scope].into_iter());
+    assert_eq!(watermark, Some(300), "a withdrawal advances the watermark");
+
+    // A replica restarting after that deletion sees only the surviving object
+    // (100) — but its boundary read returns a CURRENT cluster revision, which
+    // is at or above everything already observed. No rewind.
+    let restarted = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+    restarted.begin_generation(&scope, Some(301));
+    restarted.observe_listed(&scope, Some("100"));
+    restarted.commit_list(&scope);
+    let watermark = restarted.converged_watermark([&scope].into_iter());
+    assert_eq!(
+        watermark,
+        Some(301),
+        "a restarted replica must not publish below its running peer"
+    );
+}
+
+/// Two replicas of one control plane deployment converge on the SAME sequence
+/// as soon as both have observed the same change, because event revisions are
+/// cluster-minted. A replica that has NOT seen it stays behind — and that is
+/// exactly what the data-plane gate is for: failing over to it must not roll
+/// the mesh back.
+#[test]
+fn two_kubernetes_replicas_order_by_the_shared_resource_version() {
+    let scope = watch_scope_key("security.istio.io/v1beta1", "AuthorizationPolicy", "all");
+    let converge = |boundary: u64| {
+        let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+        tracker.begin_generation(&scope, Some(boundary));
+        tracker.observe_listed(&scope, Some("4000"));
+        tracker.commit_list(&scope);
+        tracker
+    };
+    // The two replicas started at different times, so their boundaries differ.
+    let replica_a = converge(4_100);
+    let replica_b = converge(4_050);
+    let publish = |tracker: &K8sConfigRevisionTracker| {
+        let watermark = tracker.converged_watermark([&scope].into_iter());
+        tracker.publish(watermark).expect("an authority is set")
+    };
+
+    // A policy is withdrawn at revision 9000. Only replica A observes it.
+    replica_a.observe_applied(&scope, Some("9000"));
+    let fresh = publish(&replica_a);
+    let lagging = publish(&replica_b);
+    assert_eq!(fresh, revision("k8s", 9_000));
+    assert_eq!(lagging, revision("k8s", 4_050));
+
+    // The data plane accepts the fresh replica, then fails over to the lagging
+    // one: its slice is quarantined and the last-good keeps serving.
+    let state = MeshRuntimeState::new();
+    assert!(
+        state
+            .install_slice(slice_at("cp-a", Some(fresh.clone())))
+            .installed()
+    );
+    let rejection = state
+        .install_slice(slice_at("cp-b", Some(lagging)))
+        .rejection()
+        .expect("a lagging Kubernetes replica must be quarantined");
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
+    assert!(
+        rejection.terminates_stream(),
+        "the data plane must leave the lagging control plane"
+    );
+    assert_eq!(installed_version(&state).as_deref(), Some("cp-a"));
+    assert!(state.revision_diagnostics().quarantine_active);
+
+    // Replica B observes the same withdrawal and publishes the IDENTICAL
+    // sequence — cluster-minted event revisions are what make replicas
+    // convergent, not their independent boundary reads.
+    replica_b.observe_applied(&scope, Some("9000"));
+    assert_eq!(publish(&replica_b), fresh);
+
+    // A reconnect replays that same revision, which MUST install.
+    assert!(
+        state
+            .install_slice(slice_at("cp-b-replay", Some(fresh)))
+            .installed(),
+        "an equal revision is a reconnect replay, not a rollback"
+    );
+    assert_eq!(installed_version(&state).as_deref(), Some("cp-b-replay"));
+}
+
+/// Incomplete convergence retains the last published sequence rather than
+/// publishing an unsequenced (which a data plane would quarantine as
+/// `missing_revision`) or an optimistic frame. Publication is also monotonic
+/// against a scope set that GROWS, which is the one way the aggregate minimum
+/// can dip.
+#[test]
+fn incomplete_convergence_retains_the_last_kubernetes_revision() {
+    let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+    let gateways = watch_scope_key("gateway.networking.k8s.io/v1", "Gateway", "all");
+
+    tracker.begin_generation(&gateways, Some(8_000));
+    tracker.commit_list(&gateways);
+    let watermark = tracker.converged_watermark([&gateways].into_iter());
+    let established = tracker
+        .publish(watermark)
+        .expect("the first convergence establishes a sequence");
+    assert_eq!(established, revision("k8s", 8_000));
+
+    // A watcher restarts: its scope has no evidence for the new generation's
+    // store until `InitDone`. The published sequence holds.
+    assert_eq!(tracker.publish(None), Some(revision("k8s", 8_000)));
+    assert_eq!(tracker.stats().withheld_advances, 1);
+
+    // A CRD installed later registers a new scope whose evidence is younger, so
+    // the aggregate minimum dips. The in-process floor keeps publication
+    // monotonic; the data plane sees a replay, never a rewind.
+    let backend_tls = watch_scope_key("gateway.networking.k8s.io/v1", "BackendTLSPolicy", "all");
+    tracker.begin_generation(&backend_tls, Some(6_000));
+    tracker.commit_list(&backend_tls);
+    assert_eq!(
+        tracker.converged_watermark([&gateways, &backend_tls].into_iter()),
+        Some(6_000)
+    );
+    assert_eq!(
+        tracker.publish(Some(6_000)),
+        Some(revision("k8s", 8_000)),
+        "publication never emits a sequence below one it already published"
+    );
+
+    // Once the new scope catches up, the sequence advances again.
+    tracker.observe_applied(&backend_tls, Some("9500"));
+    let watermark = tracker.converged_watermark([&gateways, &backend_tls].into_iter());
+    assert_eq!(
+        tracker.publish(watermark),
+        Some(revision("k8s", 8_000)),
+        "the gateways scope is now the minimum"
+    );
+    tracker.observe_applied(&gateways, Some("9500"));
+    let watermark = tracker.converged_watermark([&gateways, &backend_tls].into_iter());
+    assert_eq!(tracker.publish(watermark), Some(revision("k8s", 9_500)));
+}
+
+/// With publication disabled (`FERRUM_MESH_CONFIG_AUTHORITY_ID=`) the tracker
+/// still gathers evidence but stamps nothing, restoring the pre-#3611 posture
+/// deliberately rather than by accident.
+#[test]
+fn a_disabled_authority_publishes_no_kubernetes_revision() {
+    let tracker = K8sConfigRevisionTracker::new(None);
+    assert!(!tracker.is_enabled());
+    let scope = watch_scope_key("v1", "Service", "all");
+    tracker.begin_generation(&scope, Some(1_000));
+    tracker.commit_list(&scope);
+
+    let watermark = tracker.converged_watermark([&scope].into_iter());
+    assert_eq!(watermark, Some(1_000));
+    assert_eq!(tracker.publish(Some(1_000)), None);
+}
+
+/// A Kubernetes revision rides the SAME envelope and the SAME centralized
+/// update validation as a change-log one — there is no separate data-plane
+/// gate for it. Native and xDS therefore stay at parity by construction.
+#[test]
+fn kubernetes_revisions_flow_through_the_shared_envelope_and_xds_paths() {
+    let request = client_config().subscribe_request(ferrum_edge::FERRUM_VERSION);
+    let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+    let slice = slice_at("k8s-4711000", Some(revision("k8s:east-2", 4_711_000)));
+
+    // Native: envelope↔slice agreement is enforced for this domain too.
+    validate_mesh_config_update(&update_for(&slice), &expected, MeshUpdateConsumer::Native)
+        .expect("a well-formed Kubernetes revision passes update validation");
+    let mismatched = MeshConfigUpdate {
+        config_sequence: 4_711_001,
+        ..update_for(&slice)
+    };
+    assert_eq!(
+        validate_mesh_config_update(&mismatched, &expected, MeshUpdateConsumer::Native)
+            .expect_err("a disagreeing envelope must be refused")
+            .reason(),
+        MeshUpdateRejectReason::EnvelopeRevisionMismatch
+    );
+
+    // xDS: the same gate, reached without update validation, terminates ADS on
+    // a stale Kubernetes revision exactly as it does on a stale change-log one.
+    let state = MeshRuntimeState::new();
+    let consumer = XdsConfigConsumer::new(
+        XdsClientConfig {
+            cp_urls: vec![
+                "http://cp-a:50051".to_string(),
+                "http://cp-b:50051".to_string(),
+            ],
+            node_id: NODE_ID.to_string(),
+            cluster: "default".to_string(),
+            namespace: NAMESPACE.to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
+            stream_channel_capacity: 32,
+            primary_retry_secs: 300,
+            connect_timeout_seconds: 10,
+            labels: BTreeMap::new(),
+        },
+        state.clone(),
+    );
+    consumer
+        .apply_slice(slice)
+        .expect("the fresh Kubernetes xDS baseline installs");
+    let stale = slice_at("k8s-4710000", Some(revision("k8s:east-2", 4_710_000)));
+    let rejection = consumer
+        .apply_slice(stale)
+        .expect_err("a stale Kubernetes xDS slice must close ADS");
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
+    assert!(rejection.terminates_stream());
+    assert_eq!(installed_version(&state).as_deref(), Some("k8s-4711000"));
+}
+
+// ── Kubernetes evidence through the production watcher task ────────────────
+
+const K8S_GROUP: &str = "gateway.networking.k8s.io";
+const K8S_VERSION: &str = "v1";
+const K8S_KIND: &str = "Gateway";
+const K8S_PLURAL: &str = "gateways";
+const K8S_SCOPE: &str = "namespace:alpha";
+const K8S_IDLE_RELIST_SECS: u64 = 60;
+
+fn k8s_scope(
+    generations: usize,
+    boundaries: Vec<Option<u64>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+    k8s_watch_scope_with_revision_for_test(
+        K8S_GROUP,
+        K8S_VERSION,
+        K8S_KIND,
+        K8S_PLURAL,
+        K8S_SCOPE,
+        K8S_IDLE_RELIST_SECS,
+        generations,
+        Some("k8s".to_string()),
+        boundaries,
+        shutdown,
+    )
+}
+
+/// Drive the PRODUCTION watcher task (`run_watcher_generations`) with scripted
+/// reflector generations and assert the evidence contract end to end:
+///
+/// * nothing is published before the initial list completes — the store is
+///   empty then, and a snapshot missing a resource type must not be stamped;
+/// * the pre-list boundary is adopted at `InitDone`, together with the listed
+///   objects the reflector publishes to its store at that same moment;
+/// * a `Delete` advances the watermark;
+/// * a make-before-break replacement generation does NOT advance the live
+///   watermark until its store is swapped in.
+#[tokio::test(start_paused = true)]
+async fn watch_evidence_is_only_adopted_when_the_store_can_serve_it() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Generation 0 reads boundary 1000; the relisted generation 1 reads 7000.
+    let (harness, task) = k8s_scope(2, vec![Some(1_000), Some(7_000)], shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let settle = Duration::from_millis(50);
+
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        None,
+        "the registered store is still empty; nothing may be stamped"
+    );
+    assert_eq!(
+        harness.publish_revision().await,
+        None,
+        "no sequence has ever been established"
+    );
+
+    // Initial list: objects are buffered by the reflector until `InitDone`.
+    harness.emit(0, Event::Init);
+    let edge = harness.object_at("alpha", "edge", "900");
+    harness.emit(0, Event::InitApply(edge));
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        None,
+        "a list in flight is not convergence"
+    );
+
+    harness.emit(0, Event::InitDone);
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(1_000),
+        "the pre-list boundary is adopted at InitDone, above the listed objects"
+    );
+    assert_eq!(harness.visible_names().await, vec!["edge".to_string()]);
+
+    // A deletion carries the DELETION revision and advances the watermark.
+    let withdrawn = harness.object_at("alpha", "edge", "4200");
+    harness.emit(0, Event::Delete(withdrawn));
+    tokio::time::sleep(settle).await;
+    assert_eq!(harness.revision_watermark().await, Some(4_200));
+    assert!(harness.visible_names().await.is_empty());
+    assert_eq!(
+        harness.publish_revision().await,
+        Some(MeshConfigRevision::new("k8s", 4_200))
+    );
+
+    // Go idle past the relist window: generation 1 starts and reads its own
+    // boundary, but the OLD store stays registered until `InitDone`.
+    tokio::time::sleep(Duration::from_secs(K8S_IDLE_RELIST_SECS * 2)).await;
+    harness.emit(1, Event::Init);
+    let relisted = harness.object_at("alpha", "relisted", "6500");
+    harness.emit(1, Event::InitApply(relisted));
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(4_200),
+        "a replacement generation must not advance the live watermark"
+    );
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "the previous store is still the registered one"
+    );
+
+    harness.emit(1, Event::InitDone);
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["relisted".to_string()],
+        "make-before-break swap"
+    );
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(7_000),
+        "the replacement's boundary is adopted only once its store is live"
+    );
+    assert_eq!(harness.revision_stats().unparsable_resource_versions, 0);
+
+    let _ = shutdown_tx.send(true);
+    let _ = watcher.await;
+}
+
+/// A watcher generation whose boundary read fails (or times out) yields no
+/// boundary. That only UNDERSTATES convergence: the scope still establishes
+/// evidence from the objects and events it actually processed, and the
+/// in-process floor keeps publication monotonic.
+#[tokio::test(start_paused = true)]
+async fn a_failed_boundary_read_understates_but_never_overstates() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (harness, task) = k8s_scope(1, vec![None], shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let settle = Duration::from_millis(50);
+
+    harness.emit(0, Event::Init);
+    let edge = harness.object_at("alpha", "edge", "2600");
+    harness.emit(0, Event::InitApply(edge));
+    harness.emit(0, Event::InitDone);
+    tokio::time::sleep(settle).await;
+
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(2_600),
+        "listed object revisions are a sound lower bound on the list revision"
+    );
+    assert_eq!(
+        harness.publish_revision().await,
+        Some(MeshConfigRevision::new("k8s", 2_600))
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = watcher.await;
 }
