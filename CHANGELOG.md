@@ -877,9 +877,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise ineligible declared parent previously could expose the backend on
   unrelated frontends while status correctly reported `NoMatchingParent` /
   `NotAllowedByListeners`; it now emits no proxy, upstream, plugin, or
-  materialized-parent record for that parent. The parentless legacy shape
-  (`spec.parentRefs` absent) and resolved listener port/TLS stamping are
-  unchanged.
+  materialized-parent record for that parent, and contributes no HTTP/gRPC
+  conflict key or cross-kind arbitration claim either — so two routes naming
+  the same unmaterializable parent keep the attachment-failure status rather
+  than inventing `Conflicted`. The parentless legacy shape (`spec.parentRefs`
+  absent) and resolved listener port/TLS stamping are unchanged.
 - Gateway API L4 routes (`TCPRoute`, `TLSRoute`, `UDPRoute`) no longer fall back
   to opening a listener on the **backend** port when they declare Gateway
   `parentRefs` that resolve to no materializable listener. An unknown,

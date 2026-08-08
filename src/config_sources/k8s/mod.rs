@@ -604,10 +604,11 @@ pub struct GatewayApiRouteConflictKey {
     pub listen_path: String,
     pub match_signature: String,
     /// The Gateway listener this claim attaches to. `None` for the deliberately
-    /// parentless legacy shape (and for arbitration identities that predate
-    /// listener resolution). Declared Gateway parents that resolve no concrete
-    /// listener must not materialize traffic; conflict keys may still carry the
-    /// literal parentRef identity alone.
+    /// parentless legacy shape (and for context-free helpers without an
+    /// accumulator). With a populated accumulator, a declared Gateway parent
+    /// that resolves no concrete listener contributes no conflict key at all —
+    /// it must not invent a traffic-ownership domain while status reports an
+    /// attachment failure.
     ///
     /// This is the identity, not `listen_port`: sibling listeners can share a
     /// numeric port, and collapsing them would make one listener's cross-kind

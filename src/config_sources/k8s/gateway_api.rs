@@ -2521,10 +2521,12 @@ struct CrossKindRouteEntry {
 
 impl CrossKindRouteEntry {
     /// The listeners this route attaches to for one `(parentRef, hostname)`
-    /// claim. When no Gateway listener policy resolved the reference — an
-    /// unknown Gateway, or a caller with no accumulator — the literal parentRef
-    /// remains the only available identity, which is the arbitration domain
-    /// that predates listener resolution.
+    /// claim. Resolved listeners are the arbitration domain. The literal
+    /// parentRef fallback is only for claims that legitimately lack listener
+    /// identity: the deliberately parentless legacy shape, or a context-free
+    /// (`acc: None`) helper call. A declared Gateway parent that resolves no
+    /// concrete listener contributes no conflict key at all when an
+    /// accumulator is present, so it never reaches this fallback.
     fn listeners_for(&self, parent_ref: &str, hostname: &str) -> BTreeSet<CrossKindListener> {
         match self
             .listeners
@@ -2573,7 +2575,9 @@ impl CrossKindRouteEntry {
 enum CrossKindListener {
     /// A concrete accepted Gateway listener the parentRef resolved to.
     Listener(GatewayApiListenerKey),
-    /// No listener policy resolved the reference; fall back to its literal key.
+    /// Listener-less claim identity: parentless legacy shape, or a context-free
+    /// helper without an accumulator. Not used for declared Gateways that fail
+    /// to resolve when translation/status has a populated accumulator.
     ParentRef(String),
 }
 
@@ -2623,7 +2627,9 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
 
     // Build each Route's concrete listener -> hostname claims once. Two
     // different parentRef shapes selecting one listener land in the same
-    // bucket; unresolved selectors retain their literal parentRef identity.
+    // bucket. Parentless / context-free listener-less keys keep a literal
+    // parentRef domain; declared Gateways that resolve no listener contribute
+    // no keys when an accumulator was present, so they never invent ownership.
     let route_claims = entries
         .iter()
         .map(|entry| {
@@ -2932,7 +2938,9 @@ pub(crate) fn route_conflict_keys_for_acc(
 struct RouteConflictKeySet {
     keys: Vec<GatewayApiRouteConflictKey>,
     /// parentRef key -> conflict hostname -> the accepted listeners behind it.
-    /// A pair with no entry had no listener policy resolve it.
+    /// A pair with no entry either resolved no listener (and, with an
+    /// accumulator, contributed no key for a declared Gateway) or is the
+    /// parentless / context-free listener-less shape.
     listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>>,
 }
 
@@ -2968,36 +2976,46 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
 
     // Attachment depends on the hostname, not on the rule or match, so resolve
     // each conflict hostname once instead of per rule x match.
+    //
+    // Mirror the materialization gate: with a real accumulator, only parentRefs
+    // that resolve concrete listeners contribute conflict keys / cross-kind
+    // claims. A declared Gateway that resolves nothing invents no ownership
+    // domain. Parentless legacy and `acc: None` keep listener-less keys.
     let mut parent_refs_by_hostname: HashMap<&str, Vec<String>> = HashMap::new();
     let mut listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>> =
         BTreeMap::new();
     for hostname in &hostnames {
-        let resolved = acc
-            .map(|acc| {
-                route_allowed_parent_listeners_for_hostname(
+        let parent_refs = match acc {
+            Some(acc) => {
+                let resolved = route_allowed_parent_listeners_for_hostname(
                     object,
                     acc,
                     &requested_hostnames,
                     None,
                     hostname,
-                )
-            })
-            .filter(|resolved| !resolved.is_empty());
-        let parent_refs = match resolved {
-            Some(resolved) => {
-                let parent_refs: Vec<String> = resolved.keys().cloned().collect();
-                for (parent_ref, listener_keys) in resolved {
-                    if listener_keys.is_empty() {
-                        continue;
+                );
+                let with_listeners: BTreeMap<String, BTreeSet<GatewayApiListenerKey>> = resolved
+                    .into_iter()
+                    .filter(|(_, listener_keys)| !listener_keys.is_empty())
+                    .collect();
+                if with_listeners.is_empty() {
+                    if route_declares_gateway_parent_ref(object) {
+                        Vec::new()
+                    } else {
+                        default_parent_refs.clone()
                     }
-                    listeners
-                        .entry(parent_ref)
-                        .or_default()
-                        .entry(hostname.clone())
-                        .or_default()
-                        .extend(listener_keys);
+                } else {
+                    let parent_refs: Vec<String> = with_listeners.keys().cloned().collect();
+                    for (parent_ref, listener_keys) in with_listeners {
+                        listeners
+                            .entry(parent_ref)
+                            .or_default()
+                            .entry(hostname.clone())
+                            .or_default()
+                            .extend(listener_keys);
+                    }
+                    parent_refs
                 }
-                parent_refs
             }
             None => default_parent_refs.clone(),
         };
@@ -3020,8 +3038,10 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
                 for parent_ref in parent_refs {
                     // One conflict key per resolved *listener*, not per port:
                     // sibling listeners sharing a numeric port stay independent
-                    // claims. The parentless legacy shape keeps a single
-                    // listener-less key that predates listener resolution.
+                    // claims. The parentless legacy shape (and `acc: None`)
+                    // keeps a single listener-less key that predates listener
+                    // resolution. Declared Gateways with no resolved listener
+                    // never reach here when an accumulator is present.
                     let resolved: Vec<Option<GatewayApiListenerKey>> = listeners
                         .get(parent_ref.as_str())
                         .and_then(|by_host| by_host.get(hostname.as_str()))
@@ -3283,9 +3303,10 @@ fn merge_http_route_proxy(
 /// Gateway's route contract. Same-kind, same-listener collapse still preserves
 /// rule ordering and fall-through within one listener.
 ///
-/// `None == None` (an unresolved/unknown Gateway parentRef) is a legitimate
-/// match: those claims are port-agnostic and carry no listener identity to
-/// distinguish, exactly as before port-aware representation.
+/// `None == None` is a legitimate match only for the deliberately parentless
+/// legacy shape: those claims are port-agnostic and carry no listener identity
+/// to distinguish. Declared Gateway parents that resolve no concrete listener
+/// never materialize a proxy, so they are not merge candidates.
 fn can_merge_http_route_proxy(
     acc: &K8sAccumulator,
     existing: &Proxy,

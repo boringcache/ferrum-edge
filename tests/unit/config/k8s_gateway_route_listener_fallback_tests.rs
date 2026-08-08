@@ -9,9 +9,12 @@
 //! listener-less claim would expose the backend on unrelated frontends while
 //! status reports `NoMatchingParent` / `NotAllowedByListeners`.
 //!
-//! The deliberately parentless legacy shape (`spec.parentRefs` absent) still
-//! materializes a listener-less, port-agnostic claim. Resolved listeners still
-//! stamp their own port.
+//! The same gate applies to conflict keys: an unmaterializable declared parent
+//! must not invent a cross-kind traffic-ownership domain. HTTPRoute + GRPCRoute
+//! on the same absent / hostname-mismatched Gateway keep the attachment-failure
+//! status (`Programmed=False`) and never report `Conflicted`. The deliberately
+//! parentless legacy shape (`spec.parentRefs` absent) still materializes a
+//! listener-less claim and still arbitrates cross-kind on that global claim.
 
 use std::collections::HashMap;
 
@@ -72,9 +75,33 @@ fn http_gateway(name: &str, port: u16) -> K8sObject {
     )
 }
 
+fn hostname_mismatched_gateway(name: &str, port: u16) -> K8sObject {
+    object(
+        "Gateway",
+        name,
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "http",
+                "port": port,
+                "protocol": "HTTP",
+                "hostname": "other.example.com",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            }]
+        }),
+    )
+}
+
 fn http_route(name: &str, parent_refs: Option<Value>) -> K8sObject {
+    http_route_with_hostname(name, "api.example.com", parent_refs)
+}
+
+fn http_route_with_hostname(name: &str, hostname: &str, parent_refs: Option<Value>) -> K8sObject {
     let mut spec = json!({
-        "hostnames": ["api.example.com"],
+        "hostnames": [hostname],
         "rules": [{
             "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
             "backendRefs": [{"name": "api", "port": 8080}]
@@ -87,8 +114,12 @@ fn http_route(name: &str, parent_refs: Option<Value>) -> K8sObject {
 }
 
 fn grpc_route(name: &str, parent_refs: Option<Value>) -> K8sObject {
+    grpc_route_with_hostname(name, "grpc.example.com", parent_refs)
+}
+
+fn grpc_route_with_hostname(name: &str, hostname: &str, parent_refs: Option<Value>) -> K8sObject {
     let mut spec = json!({
-        "hostnames": ["grpc.example.com"],
+        "hostnames": [hostname],
         "rules": [{
             "matches": [{"method": {"service": "example.Echo", "method": "Get"}}],
             "backendRefs": [{"name": "grpc-api", "port": 50051}]
@@ -133,6 +164,29 @@ fn assert_no_http_family_traffic(objects: &[K8sObject], kind: &str, name: &str) 
     );
 }
 
+fn parent_condition_status(
+    updates: &[ferrum_edge::k8s_controller::status::GatewayApiStatusUpdate],
+    kind: &str,
+    name: &str,
+    condition_type: &str,
+) -> Option<(String, String)> {
+    let route_update = updates
+        .iter()
+        .find(|update| update.kind == kind && update.name == name)?;
+    let parents = route_update.status["parents"].as_array()?;
+    let conditions = parents.first()?.get("conditions")?.as_array()?;
+    conditions.iter().find_map(|condition| {
+        if condition["type"].as_str() == Some(condition_type) {
+            Some((
+                condition["status"].as_str()?.to_string(),
+                condition["reason"].as_str()?.to_string(),
+            ))
+        } else {
+            None
+        }
+    })
+}
+
 fn assert_status_not_programmed(objects: &[K8sObject], kind: &str, name: &str, reason: &str) {
     let updates = plan_gateway_api_status_updates(objects, options(), &[]);
     let route_update = updates
@@ -164,6 +218,63 @@ fn assert_status_not_programmed(objects: &[K8sObject], kind: &str, name: &str, r
         programmed["reason"], "Programmed",
         "{kind}/{name} must not report Programmed while the declared parent resolves no listener"
     );
+}
+
+/// Shared assertion for HTTPRoute + GRPCRoute on an unmaterializable parent:
+/// neither route serves traffic, neither invents a Conflicted ownership loss,
+/// and both keep the attachment-failure reason with Programmed=False.
+fn assert_unresolved_cross_kind_pair_is_attachment_failure(
+    objects: &[K8sObject],
+    attachment_reason: &str,
+) {
+    let result = translate_k8s_objects(objects, options()).expect("translation succeeds");
+    assert!(
+        result.config.proxies.is_empty(),
+        "neither unresolved route may materialize a proxy: {:?}",
+        result.config.proxies
+    );
+    assert!(
+        result.materialized_route_parents.is_empty(),
+        "neither unresolved route may record a materialized parent: {:?}",
+        result.materialized_route_parents
+    );
+    assert!(
+        result.route_conflicts.is_empty(),
+        "unmaterializable parents must not invent route conflicts: {:?}",
+        result.route_conflicts
+    );
+
+    let updates = plan_gateway_api_status_updates(objects, options(), &result.route_conflicts);
+    for (kind, name) in [("HTTPRoute", "web"), ("GRPCRoute", "grpc")] {
+        let (accepted_status, accepted_reason) =
+            parent_condition_status(&updates, kind, name, "Accepted")
+                .unwrap_or_else(|| panic!("expected Accepted for {kind}/{name}"));
+        let (programmed_status, programmed_reason) =
+            parent_condition_status(&updates, kind, name, "Programmed")
+                .unwrap_or_else(|| panic!("expected Programmed for {kind}/{name}"));
+        assert_eq!(accepted_status, "False");
+        assert_eq!(
+            accepted_reason, attachment_reason,
+            "{kind}/{name} must keep the attachment-failure reason, not Conflicted"
+        );
+        assert_ne!(
+            accepted_reason, "Conflicted",
+            "{kind}/{name} must not report Accepted reason Conflicted"
+        );
+        assert_eq!(programmed_status, "False");
+        assert_ne!(
+            programmed_reason, "Programmed",
+            "{kind}/{name} must not report Programmed while attachment failed"
+        );
+        if let Some((conflicted_status, _)) =
+            parent_condition_status(&updates, kind, name, "Conflicted")
+        {
+            assert_eq!(
+                conflicted_status, "False",
+                "{kind}/{name} must not be Conflicted=True for an unmaterializable parent"
+            );
+        }
+    }
 }
 
 /// No `parentRefs` at all: the route still programs traffic, port-agnostically.
@@ -253,6 +364,103 @@ fn grpcroute_with_mismatched_gateway_listener_materializes_no_traffic() {
         "sample",
         "NoMatchingListenerHostname",
     );
+}
+
+/// HTTPRoute + GRPCRoute naming the same absent Gateway must not invent a
+/// cross-kind Conflicted loss: neither attaches, so both stay on the
+/// attachment-failure reason with Programmed=False.
+#[test]
+fn httproute_and_grpcroute_on_absent_gateway_do_not_conflict() {
+    let mut http = http_route_with_hostname(
+        "web",
+        "shared.example.com",
+        Some(json!([{"name": "missing-gateway"}])),
+    );
+    http.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc = grpc_route_with_hostname(
+        "grpc",
+        "shared.example.com",
+        Some(json!([{"name": "missing-gateway"}])),
+    );
+    grpc.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    assert_unresolved_cross_kind_pair_is_attachment_failure(&[http, grpc], "NoMatchingParent");
+}
+
+/// Same rule when the Gateway exists but its listener hostname matches neither
+/// route: no materialization, no Conflicted, attachment failure only.
+#[test]
+fn httproute_and_grpcroute_on_mismatched_listener_hostname_do_not_conflict() {
+    let mut http = http_route_with_hostname(
+        "web",
+        "shared.example.com",
+        Some(json!([{"name": "edge"}])),
+    );
+    http.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc = grpc_route_with_hostname(
+        "grpc",
+        "shared.example.com",
+        Some(json!([{"name": "edge"}])),
+    );
+    grpc.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    let objects = [
+        gateway_class(),
+        hostname_mismatched_gateway("edge", 8083),
+        http,
+        grpc,
+    ];
+    assert_unresolved_cross_kind_pair_is_attachment_failure(
+        &objects,
+        "NoMatchingListenerHostname",
+    );
+}
+
+/// Parentless HTTPRoute vs GRPCRoute still contend on the listener-less global
+/// claim: both would otherwise serve the same traffic.
+#[test]
+fn parentless_httproute_and_grpcroute_still_conflict_on_shared_hostname() {
+    let mut http = http_route_with_hostname("web", "shared.example.com", None);
+    http.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc = grpc_route_with_hostname("grpc", "shared.example.com", None);
+    grpc.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+    let objects = [http, grpc];
+
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    assert!(
+        result
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.winner.kind == "HTTPRoute"
+                && conflict.winner.name == "web"
+                && conflict.loser.kind == "GRPCRoute"
+                && conflict.loser.name == "grpc"),
+        "parentless cross-kind overlap must still conflict: {:?}",
+        result.route_conflicts
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_port == 8080),
+        "older parentless HTTPRoute must still materialize"
+    );
+    assert!(
+        !result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_port == 50051),
+        "newer parentless GRPCRoute must lose the listener-less claim"
+    );
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &result.route_conflicts);
+    let (accepted_status, accepted_reason) =
+        parent_condition_status(&updates, "GRPCRoute", "grpc", "Accepted")
+            .expect("losing GRPCRoute Accepted condition");
+    assert_eq!(accepted_status, "False");
+    assert_eq!(accepted_reason, "Conflicted");
 }
 
 /// Once the Gateway listener IS in the snapshot, the claim is stamped with
