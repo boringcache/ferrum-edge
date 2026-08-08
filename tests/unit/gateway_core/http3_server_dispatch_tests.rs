@@ -2499,8 +2499,7 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
              dispatchable transport exists"
         );
         assert!(
-            body.contains("transport_error.diagnostic().as_str()")
-                && body.contains("diagnostic,"),
+            body.contains("transport_error.diagnostic().as_str()") && body.contains("diagnostic,"),
             "the {path} H3→gRPC refusal warning must expose the redacted field/contract \
              diagnostic category (issue #3284)"
         );

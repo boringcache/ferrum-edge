@@ -2793,8 +2793,7 @@ const AMBIGUOUS_MESH_TRANSPORT: &str =
 /// Client-visible refusal for a cross-cluster Sidecar mesh-mTLS target whose
 /// east-west SNI / trust-domain metadata is incomplete. Fixed wording — which
 /// field failed is carried only by [`GrpcTransportDiagnostic`].
-const CROSS_CLUSTER_MALFORMED_METADATA: &str =
-    "gRPC over cross-cluster east-west routing requires a destination SNI override \
+const CROSS_CLUSTER_MALFORMED_METADATA: &str = "gRPC over cross-cluster east-west routing requires a destination SNI override \
      and a remote trust domain";
 
 /// Client-visible refusal for a cross-cluster target with no mesh transport tag.
