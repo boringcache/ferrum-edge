@@ -175,10 +175,7 @@ impl FetchLoopMetricsSource {
 
     fn set_ca_health(self, healthy: bool) {
         if matches!(self, Self::SpireAgent) {
-            crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                "spire_agent",
-                healthy,
-            );
+            crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", healthy);
         }
     }
 }
