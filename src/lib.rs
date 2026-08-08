@@ -128,6 +128,7 @@ pub mod _test_support {
             target,
             config,
         )
+        .expect("test cryptographic provider must initialize the sticky-session key")
     }
 
     /// Test-only view of the SINGLE sticky-affinity `Set-Cookie` mint site every

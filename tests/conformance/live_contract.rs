@@ -588,13 +588,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // Pin the real ga_contract.yaml against this validator: the Stable
     // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
     // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, SPIFFE
-    // identity plumbing, and the native MeshSubscribe config transport are
-    // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh. DestinationRule
-    // export visibility and lookup hierarchy remain deferred FOR THIS SUITE
-    // because Trusted Cross policy forbids changing its executable/configuration
-    // surfaces from this PR; their real multi-namespace datapath acceptance runs
-    // the shipped binary in tests/functional/functional_mesh_mode_test.rs
-    // instead, which is not a kind/SPIRE artifact this validator reads.
+    // identity plumbing, DestinationRule namespace security, and the native
+    // MeshSubscribe config transport are ENFORCED and emitted by
+    // tests/k8s/mesh_e2e_sidecar/run.sh.
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -619,6 +615,8 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.request_auth.missing_jwt_rejected",
         "sidecar.request_auth.invalid_jwt_rejected",
         "sidecar.destination_rule.tcp_connect_timeout",
+        "sidecar.destination_rule.export_to_namespace_visibility",
+        "sidecar.destination_rule.lookup_tier_client_wins",
         "sidecar.destination_rule.tcp_max_connections",
         "sidecar.virtual_service.cors_policy",
         "sidecar.config.native_subscribe_delivered",
@@ -633,13 +631,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         .filter(|capability| capability.live_deferred.is_some())
         .map(|capability| capability.id.as_str())
         .collect();
-    assert_eq!(
-        deferred,
-        vec![
-            "mesh.destination_rule.export_to_visibility",
-            "mesh.destination_rule.lookup_hierarchy",
-        ],
-        "only the Trusted-Cross-blocked DestinationRule rows may be live-deferred"
+    assert!(
+        deferred.is_empty(),
+        "no sidecar GA contract row may remain live-deferred (found: {deferred:?})"
     );
     for capability in sidecar_rows
         .iter()
