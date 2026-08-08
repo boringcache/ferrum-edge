@@ -67,16 +67,23 @@ use crate::util::body_limit::is_length_limit_error;
 /// HTTP/2 requires a structurally valid initial SETTINGS frame, so completing
 /// one and giving Hyper a final validation poll proves the peer preface even
 /// when MAX_CONCURRENT_STREAMS is zero.
-struct H2cSettingsIo {
-    inner: TcpStream,
+///
+/// Generic over the byte transport: the direct-dial gRPC pool wraps a
+/// [`TcpStream`], and the Ambient HBONE gRPC transport wraps the CONNECT byte
+/// tunnel it runs its NESTED cleartext HTTP/2 connection over (issue #3284).
+/// Both need the same proof for the same reason — cleartext HTTP/2 has no ALPN,
+/// so a peer that merely accepted the connection must not be mistaken for an
+/// HTTP/2 server.
+struct H2cSettingsIo<T> {
+    inner: T,
     settings_received: Arc<AtomicBool>,
     first_frame_header: [u8; 9],
     header_len: usize,
     frame_remaining: Option<usize>,
 }
 
-impl H2cSettingsIo {
-    fn new(inner: TcpStream, settings_received: Arc<AtomicBool>) -> Self {
+impl<T> H2cSettingsIo<T> {
+    fn new(inner: T, settings_received: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             settings_received,
@@ -139,7 +146,7 @@ impl H2cSettingsIo {
     }
 }
 
-impl AsyncRead for H2cSettingsIo {
+impl<T: AsyncRead + Unpin> AsyncRead for H2cSettingsIo<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -156,7 +163,7 @@ impl AsyncRead for H2cSettingsIo {
     }
 }
 
-impl AsyncWrite for H2cSettingsIo {
+impl<T: AsyncWrite + Unpin> AsyncWrite for H2cSettingsIo<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -183,6 +190,72 @@ impl AsyncWrite for H2cSettingsIo {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
+    }
+}
+
+/// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
+///
+/// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely accepts
+/// the connection must not be treated as an HTTP/2 server. `handshake()`
+/// resolves once the *client* preface is written; readiness is the peer's
+/// complete, structurally valid initial SETTINGS frame having been observed by
+/// the transport and accepted by a subsequent Hyper connection poll.
+///
+/// `conn` is hyper's connection-driver future. Polling it drives the peer's
+/// preface and SETTINGS processing and surfaces a protocol error or close, but
+/// the future does not resolve merely because SETTINGS arrived. The short
+/// timeout therefore supplies a bounded recheck cadence for the transport
+/// observation flag while also continuing to drive the connection.
+///
+/// There is no timeout here by design; every caller already runs inside a
+/// connect budget: the direct-dial pool inside `dns::connect_candidates`
+/// (whose per-candidate share of `backend_connect_timeout_ms` moves on to the
+/// next address), and the Ambient HBONE gRPC transport inside the whole-
+/// acquisition deadline `GrpcDispatchTransport::get_sender` applies.
+async fn await_h2c_peer_settings<T>(
+    conn: &mut http2::Connection<TokioIo<H2cSettingsIo<T>>, GrpcBody, TokioExecutor>,
+    settings_received: &AtomicBool,
+) -> Result<(), String>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // First re-read delay; the common case resolves on the first or second
+    // pass over a loopback or same-datacenter RTT.
+    const FIRST_RECHECK: Duration = Duration::from_millis(1);
+    // Ceiling for the doubling backoff, so a peer that accepts the connection
+    // and then stalls costs a bounded number of timer wakeups per candidate.
+    const MAX_RECHECK: Duration = Duration::from_millis(20);
+
+    let mut recheck = FIRST_RECHECK;
+    loop {
+        if settings_received.load(Ordering::Acquire) {
+            // The transport observer fires while Hyper is consuming the read.
+            // Poll the connection once more before accepting the peer so a
+            // protocol error discovered from that same frame wins over the raw
+            // readiness flag instead of leaving an invalid sender cached and
+            // suppressing DNS-candidate failover.
+            let post_observation = std::future::poll_fn(|cx| {
+                Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        Some(Err("h2c connection closed after peer SETTINGS".to_string()))
+                    }
+                    Poll::Ready(Err(error)) => Some(Err(format!("h2c handshake failed: {error}"))),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+            if let Some(result) = post_observation {
+                return result;
+            }
+            return Ok(());
+        }
+        match tokio::time::timeout(recheck, &mut *conn).await {
+            Ok(Ok(())) => {
+                return Err("h2c connection closed before peer SETTINGS".to_string());
+            }
+            Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
+            Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
+        }
     }
 }
 
@@ -1256,7 +1329,7 @@ impl GrpcPoolManager {
             )
         })?;
 
-        if let Err(message) = Self::await_h2c_peer_settings(&mut conn, &settings_received).await {
+        if let Err(message) = await_h2c_peer_settings(&mut conn, &settings_received).await {
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
@@ -1274,70 +1347,6 @@ impl GrpcPoolManager {
         });
 
         Ok(sender)
-    }
-
-    /// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
-    ///
-    /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
-    /// accepts TCP must not pin this pool to its DNS address. `handshake()`
-    /// resolves once the *client* preface is written; readiness is the peer's
-    /// complete, structurally valid initial SETTINGS frame having been observed
-    /// by the transport and accepted by a subsequent Hyper connection poll.
-    ///
-    /// `conn` is hyper's connection-driver future. Polling it drives the peer's
-    /// preface and SETTINGS processing and surfaces a protocol error or close,
-    /// but the future does not resolve merely because SETTINGS arrived. The
-    /// short timeout therefore supplies a bounded recheck cadence for the
-    /// transport observation flag while also continuing to drive the connection.
-    ///
-    /// There is no timeout here by design: the caller runs inside
-    /// `dns::connect_candidates`, whose per-candidate share of
-    /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
-    /// address.
-    async fn await_h2c_peer_settings(
-        conn: &mut http2::Connection<TokioIo<H2cSettingsIo>, GrpcBody, TokioExecutor>,
-        settings_received: &AtomicBool,
-    ) -> Result<(), String> {
-        // First re-read delay; the common case resolves on the first or second
-        // pass over a loopback or same-datacenter RTT.
-        const FIRST_RECHECK: Duration = Duration::from_millis(1);
-        // Ceiling for the doubling backoff, so a peer that accepts TCP and
-        // then stalls costs a bounded number of timer wakeups per candidate.
-        const MAX_RECHECK: Duration = Duration::from_millis(20);
-
-        let mut recheck = FIRST_RECHECK;
-        loop {
-            if settings_received.load(Ordering::Acquire) {
-                // The transport observer fires while Hyper is consuming the
-                // read. Poll the connection once more before accepting the peer
-                // so a protocol error discovered from that same frame wins over
-                // the raw readiness flag instead of leaving an invalid sender
-                // cached and suppressing DNS-candidate failover.
-                let post_observation = std::future::poll_fn(|cx| {
-                    Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
-                        Poll::Ready(Ok(())) => {
-                            Some(Err("h2c connection closed after peer SETTINGS".to_string()))
-                        }
-                        Poll::Ready(Err(error)) => {
-                            Some(Err(format!("h2c handshake failed: {error}")))
-                        }
-                        Poll::Pending => None,
-                    })
-                })
-                .await;
-                if let Some(result) = post_observation {
-                    return result;
-                }
-                return Ok(());
-            }
-            match tokio::time::timeout(recheck, &mut *conn).await {
-                Ok(Ok(())) => {
-                    return Err("h2c connection closed before peer SETTINGS".to_string());
-                }
-                Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
-                Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
-            }
-        }
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -3087,6 +3096,14 @@ fn hbone_dispatch_authority<'a>(
 /// connection: it lives for one RPC, and the outer pooled HBONE connection
 /// already carries the pool's keepalive.
 ///
+/// The inner connection is admitted only once the destination app's OWN HTTP/2
+/// connection preface has been observed ([`await_h2c_peer_settings`], shared
+/// with the direct-dial h2c pool). hyper's handshake resolves as soon as the
+/// CLIENT preface is written, and the outer CONNECT only proves the relay
+/// reached the app socket — so without that gate an app that is not an HTTP/2
+/// server would be misreported as an established sender and an app that answers
+/// nothing would stall the RPC outside the connect budget.
+///
 /// The asserted source identity is left `None`, which makes the CONNECT baggage
 /// carry this gateway's own SVID — the ambient-egress default. A gRPC request
 /// arriving on the H3 frontend is a north-south client, not an authenticated
@@ -3125,22 +3142,39 @@ async fn open_hbone_grpc_sender(
         builder.max_concurrent_streams(max_streams);
     }
 
-    let (sender, connection) = builder
-        .handshake(TokioIo::new(tunnel))
-        .await
-        .map_err(|error| {
-            let message =
-                format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {error}");
-            // The secured OUTER HBONE session is already established here;
-            // this is the cleartext h2c handshake with the destination app.
-            // Keep it distinct from an outer TLS/H2 handshake so retry and
-            // backend-health accounting classify the failure accurately.
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::H2cHandshake,
-                message,
-                error,
-            )
-        })?;
+    // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
+    // on the direct-dial h2c path — nothing about the outer hop proves the app
+    // speaks HTTP/2 at all: the destination relay byte-copies the tunnel to the
+    // app socket, so a successful CONNECT only proves the relay reached it.
+    // Observe the app's own connection preface before treating the sender as
+    // usable, so a non-HTTP/2 app is an `H2cHandshake` failure and a silent one
+    // is bounded by the caller's connect deadline instead of stalling the RPC.
+    let settings_received = Arc::new(AtomicBool::new(false));
+    let io = TokioIo::new(H2cSettingsIo::new(tunnel, Arc::clone(&settings_received)));
+    let (sender, mut connection) = builder.handshake(io).await.map_err(|error| {
+        let message =
+            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {error}");
+        // The secured OUTER HBONE session is already established here;
+        // this is the cleartext h2c handshake with the destination app.
+        // Keep it distinct from an outer TLS/H2 handshake so retry and
+        // backend-health accounting classify the failure accurately.
+        GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2cHandshake,
+            message,
+            error,
+        )
+    })?;
+
+    if let Err(message) = await_h2c_peer_settings(&mut connection, &settings_received).await {
+        let message =
+            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {message}");
+        return Err(GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2cHandshake,
+            message.clone(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        ));
+    }
+
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);

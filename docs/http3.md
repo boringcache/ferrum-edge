@@ -202,11 +202,19 @@ H3 client half-closes (true bidirectional streaming).
 
 HBONE sender acquisition, including the inner HTTP/2 handshake after CONNECT,
 is bounded by the destination policy port's effective backend connect timeout.
-A relayed app that accepts TCP but never sends HTTP/2 settings therefore cannot
-retain the RPC indefinitely when the client supplied no `grpc-timeout`. The
-outer HBONE hop is SVID-authenticated, while the nested application connection
-is h2c and carries `:scheme: http`; the gateway does not misrepresent the
-tunnel's outer TLS as end-to-end TLS to the application.
+The successful CONNECT only proves the destination's relay reached the app
+socket, and the nested connection is cleartext (no ALPN), so the sender is
+admitted only once the app's **own** HTTP/2 connection preface — a complete,
+structurally valid initial SETTINGS frame — has been observed. This is the same
+admission the direct-dial h2c gRPC pool applies, and it gives the two failure
+shapes their honest classifications: an app that answers the nested preface with
+something other than HTTP/2 is a distinct h2c-handshake failure (not an outer
+TLS/mesh failure), and a relayed app that accepts TCP but never sends settings
+cannot retain the RPC indefinitely when the client supplied no `grpc-timeout` —
+it is refused by that connect budget. The outer HBONE hop is SVID-authenticated,
+while the nested application connection is h2c and carries `:scheme: http`; the
+gateway does not misrepresent the tunnel's outer TLS as end-to-end TLS to the
+application.
 
 Everything undispatchable **fails closed** with a Trailers-Only gRPC
 `UNAVAILABLE`, before any dial:

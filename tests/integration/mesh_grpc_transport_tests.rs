@@ -414,6 +414,13 @@ struct ObservedConnect {
 /// CONNECT and byte-copying it to the CONNECT `:authority` — exactly what the
 /// destination-side transparent relay does. The inner HTTP/2 gRPC connection is
 /// therefore genuinely tunnelled.
+///
+/// The byte-copy loops are SPAWNED and the accepting task then keeps polling
+/// `h2::server::Connection::accept`: that call is the connection's ONLY I/O
+/// driver, so the CONNECT response, the tunnelled DATA in both directions, and
+/// flow control move only while it runs. Copying inline instead would freeze the
+/// connection the moment the first copy await parked — the relay would never
+/// even flush its `200`. (Same shape as `gateway_hbone_pool_tests`' echo relay.)
 async fn start_hbone_grpc_relay(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, oneshot::Receiver<ObservedConnect>) {
@@ -450,53 +457,62 @@ async fn start_hbone_grpc_relay(
         );
 
         let mut recv = request.into_body();
-        let mut send = respond
-            .send_response(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .body(())
-                    .expect("connect response"),
-                false,
-            )
-            .expect("send connect response");
-
-        let app = TcpStream::connect(authority)
-            .await
-            .expect("relay dials the destination app");
-        let _ = app.set_nodelay(true);
-        let (mut app_read, mut app_write) = tokio::io::split(app);
-
-        // tunnel → app
         tokio::spawn(async move {
-            while let Some(chunk) = recv.data().await {
-                let Ok(chunk) = chunk else { break };
-                let _ = recv.flow_control().release_capacity(chunk.len());
-                if app_write.write_all(&chunk).await.is_err() {
-                    break;
-                }
-            }
-            let _ = app_write.shutdown().await;
-        });
+            let mut send = respond
+                .send_response(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .expect("connect response"),
+                    false,
+                )
+                .expect("send connect response");
 
-        // app → tunnel. The fixture's frames are small (gRPC control frames and
-        // a few-byte message), so they always fit the default HTTP/2 window and
-        // no explicit capacity reservation is needed — the same simplification
-        // `gateway_hbone_pool_tests`' echo relay makes.
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match app_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if send
-                        .send_data(Bytes::copy_from_slice(&buf[..n]), false)
-                        .is_err()
-                    {
+            let app = TcpStream::connect(authority)
+                .await
+                .expect("relay dials the destination app");
+            let _ = app.set_nodelay(true);
+            let (mut app_read, mut app_write) = tokio::io::split(app);
+
+            // tunnel → app
+            tokio::spawn(async move {
+                while let Some(chunk) = recv.data().await {
+                    let Ok(chunk) = chunk else { break };
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                    if app_write.write_all(&chunk).await.is_err() {
                         break;
                     }
                 }
+                let _ = app_write.shutdown().await;
+            });
+
+            // app → tunnel. The fixture's frames are small (gRPC control frames
+            // and a few-byte message), so they always fit the default HTTP/2
+            // window and no explicit capacity reservation is needed — the same
+            // simplification `gateway_hbone_pool_tests`' echo relay makes.
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match app_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if send
+                            .send_data(Bytes::copy_from_slice(&buf[..n]), false)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = send.send_data(Bytes::new(), true);
+        });
+
+        // Keep driving the connection for the tunnel's lifetime (see above).
+        while let Some(next) = h2.accept().await {
+            if next.is_err() {
+                break;
             }
         }
-        let _ = send.send_data(Bytes::new(), true);
     });
 
     (addr, observed_rx)
@@ -615,6 +631,19 @@ fn grpc_request_headers() -> (hyper::HeaderMap, HashMap<String, String>) {
     (headers, proxy_headers)
 }
 
+/// Await one fixture observation under a bound.
+///
+/// An unbounded await on a channel that a broken datapath never fills turns a
+/// single failing assertion into a test that hangs until the CI job's own
+/// timeout kills the whole shard, so every observation in this module goes
+/// through here and fails as itself instead.
+async fn await_observation<T>(rx: oneshot::Receiver<T>, what: &str) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        .unwrap_or_else(|_| panic!("{what} was never observed; the fixture task ended first"))
+}
+
 /// A length-prefixed gRPC message (5-byte prefix + payload), the wire shape both
 /// directions carry.
 fn grpc_message(payload: &[u8]) -> Bytes {
@@ -692,7 +721,7 @@ async fn grpc_dispatches_over_sidecar_mesh_mtls_and_relays_status_trailers() {
         Some("ok")
     );
 
-    let observed = observed_rx.await.expect("server observed the request");
+    let observed = await_observation(observed_rx, "the sidecar peer's request").await;
     assert_eq!(
         observed.scheme, "https",
         "the SVID-mTLS hop must preserve HTTPS request semantics"
@@ -827,9 +856,7 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
         Some("ok")
     );
 
-    let connect = connect_observed_rx
-        .await
-        .expect("the relay observed the CONNECT");
+    let connect = await_observation(connect_observed_rx, "the relay's CONNECT").await;
     assert!(
         connect.peer_presented_client_cert,
         "the outer HBONE hop must present this gateway's client SVID"
@@ -840,7 +867,7 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
         "the CONNECT must pin the destination workload's app address:port"
     );
 
-    let observed = app_observed_rx.await.expect("the app observed the request");
+    let observed = await_observation(app_observed_rx, "the app's request").await;
     assert_eq!(
         observed.scheme, "http",
         "the authenticated outer HBONE hop must not mislabel the inner h2c app request as HTTPS"
@@ -1091,9 +1118,7 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
         response.trailers
     );
 
-    let connect = connect_observed_rx
-        .await
-        .expect("the east-west gateway observed the CONNECT");
+    let connect = await_observation(connect_observed_rx, "the east-west gateway's CONNECT").await;
     assert_eq!(
         connect.authority,
         format!("127.0.0.1:{}", app_addr.port()),
@@ -1101,7 +1126,7 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
          mesh.hbone_authority_host, never the scoped synthetic target host"
     );
 
-    let observed = app_observed_rx.await.expect("the app observed the request");
+    let observed = await_observation(app_observed_rx, "the app's request").await;
     assert_eq!(
         observed.scheme, "http",
         "cross-cluster HBONE still terminates in a plaintext h2c app request"
@@ -1206,7 +1231,7 @@ async fn grpc_streams_request_data_incrementally_over_ambient_hbone() {
         Some("0")
     );
 
-    let observed = app_observed_rx.await.expect("the app observed the request");
+    let observed = await_observation(app_observed_rx, "the app's request").await;
     assert_eq!(observed.path, "/reviews.Reviews/Chat");
     assert_eq!(observed.te.as_deref(), Some("trailers"));
 }
@@ -1258,7 +1283,7 @@ async fn grpc_over_ambient_hbone_honors_the_client_deadline() {
 
     // The deadline is also PROPAGATED: the destination saw a `grpc-timeout`
     // rewritten to the remaining budget, not the client's original value.
-    let observed = app_observed_rx.await.expect("the app observed the request");
+    let observed = await_observation(app_observed_rx, "the app's request").await;
     assert!(
         observed.grpc_timeout.is_some(),
         "the client deadline must be propagated to the destination as `grpc-timeout`"

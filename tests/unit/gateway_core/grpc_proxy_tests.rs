@@ -530,18 +530,18 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
 fn h2c_settings_observer_preserves_vectored_writes() {
     let source = include_str!("../../../src/proxy/grpc_proxy.rs");
     let start = source
-        .find("impl AsyncWrite for H2cSettingsIo")
+        .find("impl<T: AsyncWrite + Unpin> AsyncWrite for H2cSettingsIo<T>")
         .expect("H2cSettingsIo AsyncWrite implementation not found");
     let implementation = &source[start..];
     let end = implementation
-        .find("\n}\n\n/// Canonical terminal message")
+        .find("\n}\n\n/// Wait for positive proof")
         .expect("H2cSettingsIo AsyncWrite implementation end not found");
     let implementation = &implementation[..end];
 
     assert!(
         implementation.contains("fn poll_write_vectored(")
             && implementation.contains(".poll_write_vectored(cx, bufs)"),
-        "the lifetime h2c wrapper must forward TcpStream scatter/gather writes"
+        "the lifetime h2c wrapper must forward the inner transport's scatter/gather writes"
     );
     assert!(
         implementation.contains("fn is_write_vectored(&self)")
@@ -561,6 +561,46 @@ fn h2c_settings_observer_preserves_vectored_writes() {
         source.contains("let post_observation = std::future::poll_fn(|cx|")
             && source.contains("Pin::new(&mut *conn).poll(cx)"),
         "Hyper must receive one post-observation poll so a protocol error wins the readiness race"
+    );
+}
+
+/// The NESTED HTTP/2 connection the Ambient HBONE gRPC transport runs inside its
+/// CONNECT byte tunnel is cleartext h2c to the destination app, so it needs the
+/// SAME peer-preface admission the direct-dial h2c pool applies (issue #3284).
+///
+/// hyper's handshake resolves as soon as the CLIENT preface is written, and the
+/// outer CONNECT only proves the destination's relay reached the app socket —
+/// so without this an app that is not an HTTP/2 server looks like an established
+/// sender (and misclassifies as something other than an h2c handshake failure),
+/// and an app that answers nothing stalls the RPC past the connect budget.
+#[test]
+fn nested_hbone_grpc_transport_awaits_the_destination_apps_h2c_preface() {
+    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let start = source
+        .find("async fn open_hbone_grpc_sender(")
+        .expect("the Ambient HBONE gRPC sender must exist");
+    let body = &source[start..];
+    let end = body
+        .find("\n}\n")
+        .expect("the Ambient HBONE gRPC sender must terminate");
+    let body = &body[..end];
+
+    assert!(
+        body.contains("H2cSettingsIo::new(tunnel"),
+        "the nested HTTP/2 client must run over the shared h2c preface observer, \
+         not the bare tunnel"
+    );
+    assert!(
+        body.contains("await_h2c_peer_settings(&mut connection"),
+        "the nested sender must be admitted only after the destination app's own \
+         HTTP/2 connection preface"
+    );
+    assert_eq!(
+        body.matches("GrpcBackendUnavailableKind::H2cHandshake")
+            .count(),
+        2,
+        "both the client-side handshake failure and the peer-preface failure must \
+         classify as an h2c handshake failure, never as an outer TLS/mesh failure"
     );
 }
 

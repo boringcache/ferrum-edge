@@ -14271,6 +14271,11 @@ fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String
     block
 }
 
+/// The upstream id every H3 mesh gRPC config declares. Shared with
+/// `h3_mesh_reload`, which polls the admin projection of THIS upstream to prove a
+/// SIGHUP reload has been applied.
+const H3_MESH_UPSTREAM_ID: &str = "h3-mesh-grpc-upstream";
+
 /// File-mode YAML for ONE gRPC-serving proxy whose upstream carries the supplied
 /// target blocks. `dead_backend_port` is the proxy's own (unlistened) backend, so
 /// only a mesh dispatch can reach anything at all.
@@ -14291,12 +14296,12 @@ proxies:
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {dead_backend_port}
-    upstream_id: "h3-mesh-grpc-upstream"
+    upstream_id: "{H3_MESH_UPSTREAM_ID}"
     backend_connect_timeout_ms: 3000
     backend_read_timeout_ms: 8000
     backend_write_timeout_ms: 8000
 {retry_block}upstreams:
-  - id: "h3-mesh-grpc-upstream"
+  - id: "{H3_MESH_UPSTREAM_ID}"
     algorithm: round_robin
     targets:
 {targets}consumers: []
@@ -15204,11 +15209,8 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     peer_a.wait_for_rpc(Duration::from_secs(10)).await;
 
     // 1. UPDATE: re-point the mesh target at peer B (different pinned identity).
-    h3_mesh_reload(
-        &gateway,
-        config_for(&h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE)),
-    )
-    .await;
+    let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
+    h3_mesh_reload(&mut gateway, config_for(&peer_b_tags), &peer_b_tags).await;
     let retargeted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         retargeted.grpc_status().as_deref(),
@@ -15226,7 +15228,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     // 2. WITHDRAWAL: drop the mesh transport tags entirely. The target becomes an
     //    ordinary direct-dial one, so the mesh listener must stop being reached.
     let peer_b_accepts = peer_b.accept_count();
-    h3_mesh_reload(&gateway, config_for(&[])).await;
+    h3_mesh_reload(&mut gateway, config_for(&[]), &[]).await;
     let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_ne!(
         withdrawn.grpc_status().as_deref(),
@@ -15246,15 +15248,12 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     // 3. CORRUPTED UPDATE: restore the mesh transport with an unusable identity
     //    pin. It must fail closed, not fall back to a direct dial.
     let peer_a_accepts = peer_a.accept_count();
-    h3_mesh_reload(
-        &gateway,
-        config_for(&[
-            ("mesh.mtls", "true".to_string()),
-            ("mesh.mtls_port", peer_a.port.to_string()),
-            ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
-        ]),
-    )
-    .await;
+    let corrupted_tags = [
+        ("mesh.mtls", "true".to_string()),
+        ("mesh.mtls_port", peer_a.port.to_string()),
+        ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
+    ];
+    h3_mesh_reload(&mut gateway, config_for(&corrupted_tags), &corrupted_tags).await;
     let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
@@ -15273,14 +15272,29 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     gateway.shutdown();
 }
 
-/// Rewrite the running file-mode gateway's config and SIGHUP it, then give the
-/// reload time to swap the router/upstream caches.
-async fn h3_mesh_reload(gateway: &TestGateway, config_yaml: String) {
+/// Rewrite the running file-mode gateway's config, SIGHUP it, and WAIT until the
+/// gateway's OWN read-only admin projection proves the new upstream targets are
+/// the live ones.
+///
+/// A fixed sleep is not proof: on a loaded hosted runner the reload can land
+/// after it, and the very next RPC then exercises the PREVIOUS target — which
+/// reads as "the re-pointed peer was never dialed" instead of "the reload had
+/// not landed yet". Polling the applied config observes convergence directly and
+/// spends no datapath RPC, so each step's authoritative protocol / fail-closed
+/// observation is still made exactly once, against a known-converged gateway.
+/// The child is polled between probes so a gateway that died on the reload fails
+/// as itself rather than being waited out for the whole window.
+async fn h3_mesh_reload(
+    gateway: &mut TestGateway,
+    config_yaml: String,
+    expected_tags: &[(&'static str, String)],
+) {
     let config_path = gateway
         .config_path
         .as_ref()
-        .expect("file-mode harness must populate config_path");
-    std::fs::write(config_path, config_yaml).expect("rewrite H3 mesh config");
+        .expect("file-mode harness must populate config_path")
+        .clone();
+    std::fs::write(&config_path, config_yaml).expect("rewrite H3 mesh config");
     #[cfg(unix)]
     {
         let pid = gateway.pid().expect("gateway still running");
@@ -15288,5 +15302,53 @@ async fn h3_mesh_reload(gateway: &TestGateway, config_yaml: String) {
             .args(["-HUP", &pid.to_string()])
             .output();
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let expected: serde_json::Map<String, serde_json::Value> = expected_tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), serde_json::Value::String(value.clone())))
+        .collect();
+    let url = gateway.admin_url(&format!("/upstreams/{H3_MESH_UPSTREAM_ID}"));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("admin client");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::from("<no admin response yet>");
+    loop {
+        match client
+            .get(&url)
+            .header("Authorization", gateway.auth_header())
+            .send()
+            .await
+        {
+            Ok(response) => match response.json::<serde_json::Value>().await {
+                Ok(upstream) => {
+                    let tags = upstream
+                        .get("targets")
+                        .and_then(|targets| targets.as_array())
+                        .and_then(|targets| targets.first())
+                        .and_then(|target| target.get("tags"))
+                        .and_then(|tags| tags.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    if tags == expected {
+                        return;
+                    }
+                    last = format!("live target tags {tags:?}");
+                }
+                Err(error) => last = format!("unreadable admin response: {error}"),
+            },
+            Err(error) => last = format!("admin request failed: {error}"),
+        }
+        assert!(
+            gateway.is_running(),
+            "the gateway died while reloading the H3 mesh config ({last})"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the SIGHUP reload never applied the expected mesh target tags \
+             {expected:?} ({last})"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
