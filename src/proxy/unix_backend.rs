@@ -196,9 +196,7 @@ pub fn resolve_unix_socket_target<'a>(
         return None;
     }
     if target.tags.keys().any(|key| {
-        key.starts_with("mesh.")
-            && key != MESH_UNIX_SOCKET_TAG
-            && key != MESH_UNIX_SOCKET_H2C_TAG
+        key.starts_with("mesh.") && key != MESH_UNIX_SOCKET_TAG && key != MESH_UNIX_SOCKET_H2C_TAG
     }) {
         return Some(Err(UnixSocketPathRejection::ConflictingTransportTags));
     }
