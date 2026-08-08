@@ -1573,9 +1573,7 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
                 // are already non-materializable at collection time.
                 _ => false,
             };
-        if clear_routes
-            && let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key)
-        {
+        if clear_routes && let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
             policy.routes_materializable = false;
         }
     }
