@@ -155,8 +155,13 @@ pub(super) fn translate(
                 add_waypoint_binding(acc, object);
             }
             if acc.gateway_is_managed_by_ferrum(object) {
-                let terminating_tls_ready = materialize_gateway_frontend_tls(acc, object);
-                for service in mesh_services_from_gateway(acc, object, terminating_tls_ready)? {
+                // Align this Gateway with the deterministic namespace TLS-slot
+                // plan (warnings / global cert install). MeshService exposure
+                // consults the stored per-listener policy below, not a
+                // Gateway-wide readiness boolean that can disagree with that
+                // policy after same-port refusal or non-winning slot limits.
+                materialize_gateway_frontend_tls(acc, object);
+                for service in mesh_services_from_gateway(acc, object)? {
                     acc.mesh.services.push(service);
                 }
             }
@@ -1812,7 +1817,9 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
             return false;
         }
         GatewayFrontendTlsSelection::UnsupportedMultiple => {
-            disable_gateway_frontend_tls_route_materialization(acc, object);
+            // `apply_gateway_frontend_tls_namespace_slot_route_limits` already
+            // cleared `routes_materializable` for multi-cert Gateways via the
+            // shared slot plan; do not repeat that disable here.
             acc.warnings.push(format!(
                 "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
                 object.metadata.namespace, object.metadata.name
@@ -1844,7 +1851,9 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         // The current DP config has one frontend TLS serving slot per Gateway
         // namespace. Keep that planned slot stable, but do not withdraw
         // otherwise valid listeners solely because another Gateway in the
-        // namespace uses a different valid certificateRef.
+        // namespace uses a different valid certificateRef. Readiness is false
+        // for this non-winning Gateway so callers cannot treat a foreign
+        // credential as the installed serving source.
         disable_gateway_frontend_tls_route_materialization(acc, object);
         acc.warnings.push(format!(
             "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
@@ -1854,6 +1863,7 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
             source_namespace,
             existing.cert_path
         ));
+        return false;
     }
     if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
         acc.config.frontend_tls_cert_path = Some(existing.cert_path.clone());
@@ -4240,7 +4250,6 @@ fn compare_conflict_candidates(
 fn mesh_services_from_gateway(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
-    namespace_tls_ready: bool,
 ) -> Result<Vec<MeshService>, K8sTranslateError> {
     let mut services = Vec::new();
     object
@@ -4251,15 +4260,33 @@ fn mesh_services_from_gateway(
         .flatten()
         .try_for_each(|listener| {
             let listener_name = string_field(listener, "name").unwrap_or("listener");
-            if acc
+            let listener_key = GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            };
+            // Snapshot the post-admission policy flags before we may push
+            // warnings (which needs `&mut acc`).
+            let Some((
+                has_validation_error,
+                materializable,
+                requires_frontend_tls,
+                routes_materializable,
+            )) = acc
                 .gateway_api_listener_policies
-                .get(&GatewayApiListenerKey {
-                    namespace: object.metadata.namespace.clone(),
-                    gateway: object.metadata.name.clone(),
-                    listener: listener_name.to_string(),
+                .get(&listener_key)
+                .map(|policy| {
+                    (
+                        policy.validation_error.is_some(),
+                        policy.materializable,
+                        policy.requires_frontend_tls,
+                        policy.routes_materializable,
+                    )
                 })
-                .is_some_and(|policy| policy.validation_error.is_some())
-            {
+            else {
+                return Ok(());
+            };
+            if has_validation_error {
                 return Ok(());
             }
             if !listener_protocol_mode_is_supported(listener) {
@@ -4271,11 +4298,23 @@ fn mesh_services_from_gateway(
                 ));
                 return Ok(());
             }
-            if listener_requires_frontend_tls(listener)
-                && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
-            {
+            // Fail closed on the stored post-admission policy: same-port
+            // physical refusal clears `materializable`, and namespace-slot
+            // limits clear `routes_materializable` for TLS listeners that
+            // cannot occupy the installed serving credential. Re-checking
+            // raw certificate resolution here would re-admit those listeners.
+            if !materializable {
                 acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
+                    "Gateway API Gateway {}/{} listener {} is not materializable and will not be exposed",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    listener_name
+                ));
+                return Ok(());
+            }
+            if requires_frontend_tls && !routes_materializable {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} cannot occupy the namespace TLS serving source and will not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
                     listener_name

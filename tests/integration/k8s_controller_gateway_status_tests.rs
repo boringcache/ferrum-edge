@@ -1037,6 +1037,78 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     }
 }
 
+/// Physically refused same-port listeners must not be advertised as
+/// MeshServices. A healthy sibling on a different port must still be exposed.
+#[test]
+fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "plain",
+                    "port": 8443,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "secure",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "healthy",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "healthy.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    let services = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.services.as_slice())
+        .unwrap_or(&[]);
+    let names: Vec<&str> = services.iter().map(|service| service.name.as_str()).collect();
+    assert!(
+        !names.iter().any(|name| *name == "edge-plain" || *name == "edge-secure"),
+        "refused same-port listeners must not become MeshServices: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| *name == "edge-healthy"),
+        "healthy plaintext sibling on another port must remain exposed: {names:?}"
+    );
+    assert!(
+        services.iter().any(|service| {
+            service.name == "edge-healthy"
+                && service.ports.len() == 1
+                && service.ports[0].port == 8080
+        }),
+        "healthy winner must keep its listen port: {services:?}"
+    );
+}
+
 /// Gateway API v1.5.1 defines HTTP-family listener distinctness on
 /// `(port, hostname)` and states that "the `tls` field is not used for
 /// determining if a listener is distinct". Sibling HTTPS listeners with
@@ -1176,6 +1248,96 @@ fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted()
             "Gateway {gateway} listener must stay Programmed: {programmed:?}"
         );
     }
+}
+
+/// Two same-namespace Gateways with different credentials: only the planned
+/// lexicographic winner is exposed as a MeshService. The non-winning Gateway
+/// keeps Accepted listener status but must not advertise a listener under the
+/// wrong serving credential.
+#[test]
+fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            "default",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "cert-a"),
+        gateway_for("reference-grant-edge", "cert-b"),
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    let services = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.services.as_slice())
+        .unwrap_or(&[]);
+    let names: Vec<&str> = services.iter().map(|service| service.name.as_str()).collect();
+    assert!(
+        names.iter().any(|name| *name == "edge-https"),
+        "planned namespace TLS winner must remain exposed: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| *name == "reference-grant-edge-https"),
+        "non-winning same-namespace Gateway must not advertise a MeshService under the wrong serving slot: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|name| name.ends_with("-https")).count(),
+        1,
+        "exactly one TLS MeshService must be exposed for the namespace slot: {names:?}"
+    );
+    // Reversed object order must not promote the non-winner.
+    let mut reversed = objects.clone();
+    reversed.reverse();
+    let reversed_translation =
+        translate_k8s_objects(&reversed, options()).expect("reversed translation");
+    let reversed_names: Vec<&str> = reversed_translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| {
+            mesh.services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        reversed_names.iter().any(|name| *name == "edge-https"),
+        "order-independent winner exposure: {reversed_names:?}"
+    );
+    assert!(
+        !reversed_names
+            .iter()
+            .any(|name| *name == "reference-grant-edge-https"),
+        "order-independent non-winner refusal: {reversed_names:?}"
+    );
 }
 
 /// Across Gateway namespaces, physical compatibility is decided from each
