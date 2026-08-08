@@ -5917,12 +5917,8 @@ fn l4_route_proxies(
     let mut proxies = Vec::new();
     for config_namespace in &config_namespaces {
         if !scheme.is_udp()
-            && route_allowed_parent_ref_keys_for_namespace(
-                object,
-                acc,
-                Some(config_namespace),
-            )
-            .is_empty()
+            && route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace))
+                .is_empty()
         {
             continue;
         }
@@ -5964,11 +5960,7 @@ fn l4_route_proxies_for_namespace(
     } else {
         (
             l4_route_listener_bindings_for_namespace(object, acc, Some(config_namespace)),
-            route_materialized_parent_ref_keys_for_namespace(
-                object,
-                acc,
-                Some(config_namespace),
-            ),
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace)),
         )
     };
 
