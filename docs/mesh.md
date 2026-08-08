@@ -49,7 +49,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [Workload API JWT-SVID](#workload-api-jwt-svid)
     - [Serving the Workload API](#serving-the-workload-api)
     - [JWT signing material, restart, and HA](#jwt-signing-material-restart-and-ha)
-    - [SPIRE backend: bundles and validate work; mint is a terminal boundary](#spire-backend-bundles-and-validate-work-mint-is-a-terminal-boundary)
+    - [SPIRE backend: serving a Workload API is refused](#spire-backend-serving-a-workload-api-is-refused)
   - [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails)
 - [Node Agent Mode](#node-agent-mode)
 - [VirtualService Translation](#virtualservice-translation)
@@ -2811,11 +2811,13 @@ The SPIRE backend is the recommended production path for mesh identity. `interna
 
 Ferrum's Workload API serves JWT-SVIDs **when the selected CA backend owns a JWT signing authority**, and fails closed with gRPC `UNIMPLEMENTED` when it does not. Backend support today:
 
-| `FERRUM_MESH_CA_BACKEND` | `FetchJWTSVID` | `FetchJWTBundles` | `ValidateJWTSVID` |
-|---|---|---|---|
-| `internal` | ✅ mint | ✅ stream | ✅ validate |
-| `spire` | `UNIMPLEMENTED` (terminal — see the boundary below) | ✅ stream (from the agent's own `FetchJWTBundles`) | ✅ validate |
-| Vault PKI / cert-manager scaffolds | `UNIMPLEMENTED` | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+| `FERRUM_MESH_CA_BACKEND` | Can Ferrum serve a Workload API on it? | `FetchJWTSVID` | `FetchJWTBundles` | `ValidateJWTSVID` |
+|---|---|---|---|---|
+| `internal` | ✅ yes | ✅ mint | ✅ stream | ✅ validate |
+| `spire` | ❌ **refused at startup** (see the boundary below) | — | — | — |
+| Vault PKI / cert-manager scaffolds | ❌ no CA backend selection exists for them today | — | — | — |
+
+Under `spire`, Ferrum *consumes* SPIRE's X.509 and JWT trust material for peer verification and for `ValidateJWTSVID`-shaped checks it performs internally; what it cannot do is **serve** a Workload API to other workloads. That distinction is the whole of the boundary section below.
 
 #### Serving the Workload API
 
@@ -2823,13 +2825,28 @@ The JWT RPCs are reachable only through Ferrum's own in-process Workload API ser
 
 ```bash
 FERRUM_MESH_WORKLOAD_API_ENABLED=true
+FERRUM_MESH_CA_BACKEND=internal                                       # the only backend that can serve it
 FERRUM_MESH_WORKLOAD_API_SOCKET_PATH=/run/ferrum/workload-api/socket   # parent dir must already exist
 FERRUM_MESH_WORKLOAD_API_SOCKET_MODE=0660
 FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES=uid:1000=spiffe://example.org/ns/default/sa/app
 FERRUM_MESH_JWT_SIGNING_KEY_PEM_FILE=/etc/ferrum/jwt-signing-key.pem
 ```
 
-Startup is fail-closed at every step. The surface requires an active `FERRUM_MESH_CA_BACKEND` (it mints from the same runtime authority the mesh SVID rotation loop drives) and at least one attestor rule; a socket-contract, permission, or bind failure **fails startup** rather than leaving the surface silently unbound. The socket contract is validated before bind: the path must be absolute with no `.`/`..` component; the parent directory must already exist (Ferrum never creates it, so it cannot choose its owner or mode for you), must be a real directory rather than a symlink, must be owned by this process or root, and must not be world-writable without the sticky bit. A stale socket from a previous run is removed **only** when it is a socket owned by this process's uid — a regular file, a directory, a symlink, or another user's socket is refused rather than deleted. The configured mode is applied immediately after bind, and on shutdown the socket is unlinked only if it is still the exact inode Ferrum bound.
+Startup is fail-closed at every step. The surface requires `FERRUM_MESH_CA_BACKEND=internal` (it mints from the same runtime authority the mesh SVID rotation loop drives) and at least one attestor rule; a socket-contract, permission, or bind failure **fails startup** rather than leaving the surface silently unbound.
+
+The socket is a credential-adjacent surface — whoever can replace it can impersonate the endpoint workloads dial for their identity — so the contract below is validated **before** bind, and each clause is a guarantee Ferrum actually enforces rather than an aspiration:
+
+- the path must be absolute and contain no `.`/`..` component;
+- the parent directory must already exist. Ferrum never creates it, because creating it would mean choosing its owner and mode on the operator's behalf, and a directory created under a planted symlink is exactly the escape this refuses;
+- **every directory component from `/` down to that parent** is checked, not just the parent: whoever controls an ancestor can rename the whole subtree aside and substitute their own, so a pristine parent under a writable `/run` proves nothing. Each component must be
+  - a real directory — a **symlink component is refused, never followed**, because a link's owner rather than the directory's decides where the socket lands, and because a followed link means the path an operator reads in configuration and the path Ferrum binds are different objects;
+  - owned by this process's effective uid **or by root**. Ownership is checked independently of mode: a directory's owner may modify its entries whatever the permission bits say, so a `0700` directory belonging to another user is refused even though nothing in it looks writable;
+  - **not group- or world-writable** unless it carries the sticky bit. Group-writable counts: a member of that group is an untrusted actor exactly as a world user is. Sticky is what makes shared-writable safe (`/tmp`, `/run` on some distributions) — a non-owner can create entries but cannot unlink or rename ours. The directory's own owner is *not* constrained by sticky, which is why the ownership check above is not redundant with this one;
+- a stale socket from a previous run is removed **only** when it is a socket owned by this process's uid — a regular file, a directory, a symlink, or another user's socket is refused rather than deleted;
+- the configured mode is applied **through a temporarily narrowed umask at `bind`**, so the kernel creates the socket at exactly that mode and the endpoint never exists at whatever the process umask happened to be. Immediately afterwards the bound path is re-stat'ed and must be a socket owned by this process with exactly the configured mode; that `(device, inode)` becomes the **bound identity**. If it cannot be established, startup fails and the artifact is removed identity-checked;
+- on shutdown the socket is unlinked only if it is still the exact inode Ferrum bound, so a restarted peer's socket at the same path is never removed by a late shutdown of the previous process.
+
+**What is not claimed.** A POSIX Unix socket exposes no descriptor-based route to its bound filesystem inode — on Linux `fchmod(2)` on a socket fd addresses the anonymous `sockfs` inode, not the bound name — so these checks operate on pathnames and are not atomic with respect to a concurrent rename of an ancestor by a *trusted* actor (root, or the operator). What the ancestor walk removes is the ability of an **untrusted** actor to perform such a rename at all; the bound-identity verification and the inode-checked cleanup bound the damage otherwise. Ferrum never chmods or unlinks a path it has not just confirmed is the object it bound.
 
 Attestation is never permissive. `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` maps kernel-attested `SO_PEERCRED` evidence — `uid:<uid>=<spiffe-id>` or `sha256:<hex>=<spiffe-id>` (SHA-256 of the peer binary, Linux only) — to SPIFFE IDs in the local trust domain. A caller matching no rule is refused; the Workload API never invents an identity. With no rules and no dev-only `FERRUM_MESH_ALLOW_STATIC_ID`, enabling the surface fails startup rather than coming up able only to reject.
 
@@ -2857,21 +2874,29 @@ Because the published `kid` is the RFC 7638 thumbprint of the *public* key, the 
 
 Distribute the same secret to every replica of a trust domain. The key is never logged, never echoed in an error, and never appears in a `Debug` rendering; only the public `kid` does.
 
-**Rotating the signing key** without breaking live tokens is a two-step, two-key rolling change:
+**Rotation of configured material is EXTERNAL, and Ferrum will not do it in process.** This is a deliberate refusal, not a missing feature. A replacement key generated inside one process would be a different random key on every replica and would be lost on the next restart, so tokens minted from it would validate nowhere else and nowhere later — the precise failure stable signing material exists to prevent. Concretely, with `FERRUM_MESH_JWT_SIGNING_KEY_PEM` configured:
+
+- `FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS` must be `0`, and a nonzero value is **rejected at startup** rather than silently ignored, so an operator who thought a rotation was scheduled is told that it is not;
+- the scheduled rotation task is a permanent no-op for that authority;
+- an explicit rotation is refused, leaving the configured key active and every already-minted token verifiable.
+
+Rotate with a two-step, two-key rolling config change instead:
 
 1. Set `FERRUM_MESH_JWT_SIGNING_KEY_PEM` to the new key and `FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM` to the outgoing one. Roll the fleet. Both keys are published; new tokens use the new key, and tokens signed by the old one keep validating.
 2. Once the overlap has elapsed (the JWT-SVID ceiling plus clock-skew leeway — 1 h + 60 s), remove `FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM` and roll again.
 
-Setting the previous key without a primary is rejected: a retired key is published for verification only, so there would be nothing to mint with.
+A configured previous key is published for as long as it stays configured, deliberately **not** on a process-relative timer: a timer would make a replica started later advertise a key its peer had already dropped, so two replicas of one configuration would publish different JWKS. Setting the previous key without a primary is rejected — a retired key is published for verification only, so there would be nothing to mint with.
 
 `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY=true` accepts a **process-local** key when none is configured. It is dev/test only and refused under `FERRUM_MESH_PRODUCTION_MODE=true`: the key is lost on restart and differs per replica, so tokens minted moments earlier stop validating and two instances of one trust domain publish different JWKS. Without it, and without configured material, the surface refuses to start.
+
+In-process, time-based key rotation exists **only** for this ephemeral posture — an already-discontinuous key loses nothing by being replaced — which is why `FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS` is meaningful only alongside it.
 
 The `internal` CA loads that ES256 JWT signing key at startup. Behaviour:
 
 - **`FetchJWTSVID`** re-runs the attestor chain and mints **only** for the attested identity. The optional `spiffe_id` field is honoured only when byte-equal to the attested SPIFFE ID; any other value is `PERMISSION_DENIED`. At least one non-empty audience is required (max 32 audiences, 512 bytes each); duplicates collapse. Tokens carry `sub` (the SPIFFE ID), `aud`, `exp`, `iat`, `nbf`, and a unique `jti`, are signed `ES256` with a `kid` equal to the key's RFC 7638 JWK thumbprint, and are clamped to a 1 h ceiling (5 min default).
 - **`FetchJWTBundles`** streams a JWKS document per trust domain — always including the local one — and republishes on JWT key rotation, skipping rotation signals that did not change the authority set. It never emits an empty `bundles` map as success: SPIFFE Workload API §6.2.2 requires at least the local trust-domain bundle, so "no authorities" is reported as `UNIMPLEMENTED`, never as an empty map. Malformed or oversized authority material is refused rather than published.
 - **`ValidateJWTSVID`** verifies signature, key id, audience, subject SPIFFE syntax and trust domain, issuer (when present), `exp` (mandatory), `nbf`, and `iat`. It refuses `alg: none`, the HMAC family, unknown or ambiguous key ids, unknown trust domains, unknown critical headers, repeated JSON keys in the header or claims, and oversized tokens or claim documents. Rejection reasons are fixed strings — no token bytes, claim values, or key material appear in an error.
-- **Rotation overlap, and why it is provable.** A retired JWT signing key stays published for verification for the maximum token lifetime plus clock-skew leeway (1 h + 60 s), so a token minted an instant before a rotation remains verifiable for its whole bounded lifetime; after that window the key disappears. Retained keys are additionally capped, bounding memory and bundle size — and the cap and the cadence are made *consistent* rather than left to collide:
+- **Rotation overlap, and why it is provable.** This bounds the **ephemeral** posture's in-process rotation; configured material is rotated externally and its previous key is published for as long as it stays configured. A key retired in process stays published for verification for the maximum token lifetime plus clock-skew leeway (1 h + 60 s), so a token minted an instant before a rotation remains verifiable for its whole bounded lifetime; after that window the key disappears. Retained keys are additionally capped, bounding memory and bundle size — and the cap and the cadence are made *consistent* rather than left to collide:
   - a `FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS` shorter than the overlap divided by the published-authority budget is **refused at startup** (minimum `244` at the 1 h ceiling), because no cap within the 16-authority limit could hold every still-verifiable key;
   - the retention cap is **derived up** from the cadence, so the scheduled rotation never needs to evict anything;
   - a rotation that would nevertheless have to drop a key still inside its overlap — reachable only by driving rotation far faster than the schedule — is **refused**. The active key stays active and every minted token stays verifiable; Ferrum never trades a live token's validity for a cap.
@@ -2880,11 +2905,20 @@ The `internal` CA loads that ES256 JWT signing key at startup. Behaviour:
 
 Like `FetchX509Bundles`, the bundle and validate RPCs require the mandatory `workload.spiffe.io: true` metadata header but do not run the attestor chain — they consume public trust material and mint nothing. Private-key and token issuance stay gated on `FetchX509SVID` / `FetchJWTSVID`.
 
-#### SPIRE backend: bundles and validate work; mint is a terminal boundary
+#### SPIRE backend: serving a Workload API is refused
 
-Under `FERRUM_MESH_CA_BACKEND=spire`, Ferrum consumes the agent's own `FetchJWTBundles` stream, converts each JWKS document back into the SPKI-PEM form the identity subsystem speaks, and holds it to exactly the bounds a locally published bundle is held to. So `FetchJWTBundles` and `ValidateJWTSVID` are **fully available** there. The stream is independent of the X.509 SVID readiness gate and tolerant of an agent that does not serve the RPC (a SPIRE deployment with no JWT-SVID entries answers `UNIMPLEMENTED`, which is retried on the ordinary reconnect schedule, not treated as a startup failure). A malformed bundle is never installed — the last good snapshot is retained, so hostile or corrupt material can neither widen nor blank the trusted set. A trust domain the agent publishes no JWT keys for yields an empty set, which the Workload API reports as `UNIMPLEMENTED`, never as an empty (and therefore misleading) bundle map.
+**`FERRUM_MESH_WORKLOAD_API_ENABLED=true` together with `FERRUM_MESH_CA_BACKEND=spire` is refused at startup**, with a diagnostic naming both settings. This is a terminal capability boundary, not a deferral, and it applies to the *whole surface* rather than to the JWT RPCs alone.
 
-**`FetchJWTSVID` remains `UNIMPLEMENTED` under `spire`, and that is a terminal capability boundary, not a deferral.** A SPIRE agent authorizes `FetchJWTSVID` against the *calling process's* attested identity. If Ferrum proxied the ordinary agent Workload API, the returned token's `sub` would be Ferrum's own SPIFFE ID rather than the downstream workload's — a silent identity substitution, which is strictly worse for a relying party than an honest `UNIMPLEMENTED`. Minting for a delegated subject requires SPIRE's delegated-identity / admin API, an explicitly authorized integration that is out of scope for the Workload API surface Ferrum consumes. Until such an integration is configured, delegated minting stays fail-closed; Ferrum will not substitute its own identity to make the RPC "work". Workloads that need JWT-SVID *mint* under SPIRE should call their local SPIRE agent directly, or run `FERRUM_MESH_CA_BACKEND=internal` with configured JWT signing material.
+A SPIRE agent issues only the **calling process's own** attested identity. Ferrum's `SpireAgentCa` therefore fetches Ferrum's agent SVID and refuses every other subject, while a Workload API server exists precisely to issue for a *different*, locally attested downstream workload:
+
+- `FetchX509SVID` would ask that CA to issue for the attested caller's SPIFFE ID, which it cannot do — every request would fail;
+- `FetchJWTSVID` is authorized by SPIRE against the calling process too, so proxying the agent's own mint RPC would return a token whose `sub` is Ferrum's SPIFFE ID rather than the workload's. A silent identity substitution is strictly worse for a relying party than a refusal, so Ferrum does not do it and **must not** be "fixed" to.
+
+Minting for a delegated subject requires SPIRE's delegated-identity / admin API — an explicitly authorized integration outside the Workload API surface Ferrum consumes. Until such an integration exists, enabling the surface on this backend is refused rather than allowed to bind an endpoint that could only mis-issue or reject.
+
+**What still works under `spire` is consumption, which is a different capability.** Ferrum consumes the agent's X.509 trust bundles and its `FetchJWTBundles` stream, converting each JWKS document back into the SPKI-PEM form the identity subsystem speaks and holding it to exactly the bounds a locally published bundle is held to, so peer verification and Ferrum's own JWT-SVID validation have trust material. That stream is independent of the X.509 SVID readiness gate and tolerant of an agent that does not serve the RPC (a SPIRE deployment with no JWT-SVID entries answers `UNIMPLEMENTED`, retried on the ordinary reconnect schedule rather than failing startup), and a malformed bundle is never installed — the last good snapshot is retained, so hostile or corrupt material can neither widen nor blank the trusted set. None of that amounts to *issuance*, and the docs deliberately do not conflate the two.
+
+Workloads that need SVID mint alongside a SPIRE deployment should call their local SPIRE agent's Workload API directly — that is the socket SPIRE authorizes them on — or run `FERRUM_MESH_CA_BACKEND=internal` with configured JWT signing material.
 
 Mesh `RequestAuthentication` / `jwks_auth` continues to validate application JWTs via its own JWKS fetch and is unrelated to Workload API JWT-SVIDs. See [docs/spire_deployment.md](spire_deployment.md#jwt-svids).
 

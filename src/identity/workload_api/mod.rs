@@ -22,14 +22,15 @@ pub mod server;
 #[allow(unused_imports)]
 pub use client::{DEFAULT_WORKLOAD_API_SOCKET, WorkloadApiClient, WorkloadApiClientError};
 #[allow(unused_imports)]
-pub use listener::{
-    DEFAULT_FERRUM_WORKLOAD_API_SOCKET, DEFAULT_WORKLOAD_API_SOCKET_MODE, WorkloadApiListener,
-    WorkloadApiListenerError, WorkloadApiSocketConfig, serve_workload_api,
-};
-#[allow(unused_imports)]
 pub use fetch_loop::{
     FetchLoopConfig, FetchLoopError, SvidFetchHandle, spawn_fetch_loop,
     spawn_fetch_loop_with_handle,
+};
+#[allow(unused_imports)]
+pub use listener::{
+    DEFAULT_FERRUM_WORKLOAD_API_SOCKET, DEFAULT_WORKLOAD_API_SOCKET_MODE, DirectoryTrustVerdict,
+    WorkloadApiListener, WorkloadApiListenerError, WorkloadApiSocketConfig,
+    classify_directory_component, serve_workload_api,
 };
 #[allow(unused_imports)]
 pub use server::WorkloadApiService;

@@ -1622,3 +1622,234 @@ async fn workload_api_sources_avoid_unbounded_rotation_queues() {
         "client must not reintroduce unbounded relay queues"
     );
 }
+
+// ── Workload API socket boundary (issue #3617) ───────────────────────────
+//
+// The socket is a credential-adjacent surface: whoever can replace it can
+// impersonate the endpoint workloads dial for their identity. Two layers are
+// covered here — the pure directory-trust predicate (exhaustively, including
+// ownership shapes a non-root test process cannot create on disk) and the
+// filesystem walk over every component of a real path.
+
+#[cfg(unix)]
+mod socket_boundary {
+    use ferrum_edge::identity::workload_api::{
+        DirectoryTrustVerdict, WorkloadApiSocketConfig, classify_directory_component,
+    };
+    use std::path::{Path, PathBuf};
+
+    const EUID: u32 = 1000;
+    const OTHER_UID: u32 = 4242;
+    const ROOT: u32 = 0;
+
+    #[test]
+    fn the_directory_trust_predicate_refuses_every_untrusted_shape() {
+        use DirectoryTrustVerdict::*;
+
+        // (label, is_symlink, is_dir, uid, mode, expected)
+        let cases: &[(&str, bool, bool, u32, u32, DirectoryTrustVerdict)] = &[
+            ("own dir 0755", false, true, EUID, 0o755, Trusted),
+            ("own dir 0700", false, true, EUID, 0o700, Trusted),
+            ("root dir 0755", false, true, ROOT, 0o755, Trusted),
+            // Sticky rescues shared-writable: a non-owner can create entries but
+            // cannot unlink or rename ours (`/tmp`, `/run` semantics).
+            ("root sticky 1777", false, true, ROOT, 0o1777, Trusted),
+            ("own sticky 1775", false, true, EUID, 0o1775, Trusted),
+            // A symlink is refused, never followed — the LINK's owner, not the
+            // directory's, decides where the socket lands.
+            ("symlink", true, true, EUID, 0o755, Symlink),
+            ("symlink owned by root", true, true, ROOT, 0o755, Symlink),
+            ("regular file", false, false, EUID, 0o644, NotADirectory),
+            // A directory's OWNER may modify its entries whatever the mode says,
+            // so ownership is checked independently of permissions. This is the
+            // directory-owner exception the sticky bit does not constrain.
+            ("other-owned 0755", false, true, OTHER_UID, 0o755, UntrustedOwner),
+            ("other-owned 0700", false, true, OTHER_UID, 0o700, UntrustedOwner),
+            ("other-owned sticky", false, true, OTHER_UID, 0o1777, UntrustedOwner),
+            // Group-writable is an untrusted actor exactly as world-writable is.
+            ("group-writable 0775", false, true, EUID, 0o775, UntrustedlyWritable),
+            ("group-writable 0770", false, true, ROOT, 0o770, UntrustedlyWritable),
+            ("world-writable 0777", false, true, ROOT, 0o777, UntrustedlyWritable),
+            ("world-writable 0707", false, true, EUID, 0o707, UntrustedlyWritable),
+        ];
+
+        for (label, is_symlink, is_dir, uid, mode, expected) in cases {
+            assert_eq!(
+                classify_directory_component(*is_symlink, *is_dir, *uid, *mode, EUID),
+                *expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_is_checked_before_permissions_so_a_private_hostile_dir_is_refused() {
+        // A 0700 directory owned by another user is the case a mode-only check
+        // waves through: nothing is writable by "us", yet its owner can replace
+        // any entry at will.
+        assert_eq!(
+            classify_directory_component(false, true, OTHER_UID, 0o700, EUID),
+            DirectoryTrustVerdict::UntrustedOwner
+        );
+    }
+
+    /// A private per-test directory whose ancestors are all trusted, so a test
+    /// can introduce exactly one untrusted component.
+    struct Sandbox {
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(label: &str) -> Option<Self> {
+            // Canonicalized: on macOS `std::env::temp_dir()` sits under `/var`,
+            // which is itself a symlink — the very thing the walk refuses. The
+            // canonical form is what an operator would configure.
+            let base = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let root = base.join(format!("fe-wl-sb-{label}-{}", unique % 1_000_000_000));
+            std::fs::create_dir_all(&root).ok()?;
+            let sandbox = Self { root };
+            // If the ambient temp path is itself untrusted (an unusual CI image),
+            // every case below would pass for the wrong reason. Skip instead.
+            sandbox
+                .socket_in(&sandbox.root)
+                .validate()
+                .ok()
+                .map(|()| sandbox)
+        }
+
+        fn socket_in(&self, parent: &Path) -> WorkloadApiSocketConfig {
+            WorkloadApiSocketConfig::from_parts(parent.join("api.sock"), "0660")
+                .expect("mode parses")
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("test can chmod a directory it owns");
+    }
+
+    #[test]
+    fn a_group_writable_parent_directory_is_refused() {
+        let Some(sandbox) = Sandbox::new("grp") else {
+            return;
+        };
+        let parent = sandbox.root.join("parent");
+        std::fs::create_dir(&parent).expect("create parent");
+        set_mode(&parent, 0o775);
+
+        let error = sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect_err("a group-writable parent must be refused");
+        assert!(
+            error.to_string().contains("group- or world-writable"),
+            "unexpected reason: {error}"
+        );
+
+        // ...and the sticky bit makes the same mode acceptable, because a
+        // non-owner can then no longer unlink our socket.
+        set_mode(&parent, 0o1775);
+        sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect("sticky group-writable is the /tmp posture and is accepted");
+    }
+
+    #[test]
+    fn a_group_writable_ancestor_is_refused_even_with_a_pristine_parent() {
+        // The finding this closes: checking only the immediate parent proves
+        // nothing, because whoever controls an ancestor can rename the whole
+        // subtree aside and substitute their own.
+        let Some(sandbox) = Sandbox::new("anc") else {
+            return;
+        };
+        let ancestor = sandbox.root.join("ancestor");
+        let parent = ancestor.join("parent");
+        std::fs::create_dir_all(&parent).expect("create ancestor/parent");
+        set_mode(&parent, 0o700);
+        set_mode(&ancestor, 0o777);
+
+        let error = sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect_err("a world-writable ancestor must be refused");
+        assert!(
+            error.to_string().contains(&ancestor.display().to_string()),
+            "the diagnostic must name the offending ancestor, not the parent: {error}"
+        );
+
+        set_mode(&ancestor, 0o755);
+        sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect("a trusted ancestor chain is accepted");
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_refused_rather_than_followed() {
+        let Some(sandbox) = Sandbox::new("sym") else {
+            return;
+        };
+        let real = sandbox.root.join("real");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = sandbox.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("test can create a symlink");
+
+        // The symlink as the socket's own parent...
+        let error = sandbox
+            .socket_in(&link)
+            .validate()
+            .expect_err("a symlinked parent must be refused");
+        assert!(error.to_string().contains("symlink"), "reason: {error}");
+
+        // ...and as an ANCESTOR of it. Following either would mean the path the
+        // operator reviewed and the path Ferrum binds are different objects.
+        let under_real = real.join("nested");
+        std::fs::create_dir(&under_real).expect("create nested dir");
+        let error = sandbox
+            .socket_in(&link.join("nested"))
+            .validate()
+            .expect_err("a symlinked ancestor must be refused");
+        assert!(error.to_string().contains("symlink"), "reason: {error}");
+
+        // The same directory reached through its real path is fine, which is
+        // what makes the refusal about the link rather than the target.
+        sandbox
+            .socket_in(&under_real)
+            .validate()
+            .expect("the real path to the same directory is accepted");
+    }
+
+    #[test]
+    fn a_non_directory_component_is_refused() {
+        let Some(sandbox) = Sandbox::new("file") else {
+            return;
+        };
+        let file = sandbox.root.join("not-a-dir");
+        std::fs::write(&file, b"operator data").expect("write file");
+        let error = sandbox
+            .socket_in(&file)
+            .validate()
+            .expect_err("a regular file cannot be the socket's parent");
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "reason: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("the file survives"),
+            b"operator data",
+            "validation must never mutate the artifact it refuses"
+        );
+    }
+}

@@ -28,11 +28,14 @@
 //! 5. **Authority selection** — the `sub` trust domain must have a bundle;
 //!    `kid` must match exactly one authority in it (with no `kid`, the bundle
 //!    must hold exactly one authority, otherwise the token is ambiguous).
-//! 6. **Signature and time** — verified with the algorithm set implied by the
-//!    *authority's key type*, never the token's own `alg` claim, so `alg`
-//!    substitution and HMAC confusion cannot validate. `exp` validation is
-//!    mandatory; `nbf` is enforced when present; a future-dated `iat` is
-//!    refused.
+//! 6. **Signature and time** — verified with the algorithm set the *authority*
+//!    permits, never the token's own `alg` claim, so `alg` substitution and HMAC
+//!    confusion cannot validate. That set is the authority's declared `alg` when
+//!    it declared one, `RS256` alone for an undeclared RSA key, and otherwise
+//!    what the key type can produce (see
+//!    [`decoding_key_for_authority`](super::decoding_key_for_authority)). `exp`
+//!    validation is mandatory; `nbf` is enforced when present; a future-dated
+//!    `iat` is refused.
 //!
 //! No rejection reason ever contains token bytes, claim values, audiences, or
 //! key material.
@@ -124,10 +127,13 @@ pub fn validate_jwt_svid(
     // the peeked claims are the verified claims. Re-assert the binding anyway:
     // a mismatch would mean the two parses disagreed, which must fail closed
     // rather than resolve in favour of either one.
-    let verified_subject = verified
-        .get("sub")
-        .and_then(Value::as_str)
-        .ok_or(JwtSvidError::InvalidToken("verified claims have no subject"))?;
+    let verified_subject =
+        verified
+            .get("sub")
+            .and_then(Value::as_str)
+            .ok_or(JwtSvidError::InvalidToken(
+                "verified claims have no subject",
+            ))?;
     if verified_subject != spiffe_id.as_str() {
         return Err(JwtSvidError::InvalidToken(
             "verified subject does not match the presented subject",
@@ -468,9 +474,11 @@ fn map_decode_error(error: jsonwebtoken::errors::Error) -> JwtSvidError {
         ErrorKind::InvalidIssuer => JwtSvidError::InvalidToken("token issuer is not accepted"),
         ErrorKind::InvalidSubject => JwtSvidError::InvalidToken("token subject is not accepted"),
         ErrorKind::InvalidSignature => JwtSvidError::InvalidToken("token signature is invalid"),
-        ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => JwtSvidError::InvalidToken(
-            "token algorithm is not the one the signing authority's key permits",
-        ),
+        ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => {
+            JwtSvidError::InvalidToken(
+                "token algorithm is not the one the signing authority's key permits",
+            )
+        }
         ErrorKind::MissingRequiredClaim(_) => {
             JwtSvidError::InvalidToken("token is missing a required claim")
         }

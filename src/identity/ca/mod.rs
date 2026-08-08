@@ -86,6 +86,37 @@ pub struct PublishedJwtAuthority {
     pub trust_domain: TrustDomain,
     pub key_id: String,
     pub public_key_pem: String,
+    /// The signature algorithm this authority **declared** for itself, when it
+    /// declared one.
+    ///
+    /// Populated from a consumed JWKS entry's `alg` member
+    /// ([`crate::identity::jwt_svid::authorities_from_jwks`]). It is a
+    /// *narrowing* input to validation: an authority that says it signs `RS512`
+    /// must not also be accepted for `PS256` merely because both are compatible
+    /// with an RSA key. `None` means the authority declared nothing, and
+    /// validation then applies the conservative default documented on
+    /// [`crate::identity::jwt_svid::decoding_key_for_authority`].
+    ///
+    /// Never widens: a declared algorithm the key type cannot have produced is
+    /// rejected, not honoured.
+    pub declared_alg: Option<jsonwebtoken::Algorithm>,
+}
+
+impl PublishedJwtAuthority {
+    /// A published authority that declares no `alg` of its own — the shape a
+    /// CA that publishes SPKI PEMs (rather than JWKs) produces.
+    pub fn new(
+        trust_domain: TrustDomain,
+        key_id: impl Into<String>,
+        public_key_pem: impl Into<String>,
+    ) -> Self {
+        Self {
+            trust_domain,
+            key_id: key_id.into(),
+            public_key_pem: public_key_pem.into(),
+            declared_alg: None,
+        }
+    }
 }
 
 /// A certificate authority capable of issuing SVIDs and publishing trust

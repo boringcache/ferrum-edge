@@ -504,10 +504,12 @@ impl CertificateAuthority for SpireAgentCa {
         Ok(bundle
             .jwt_authorities
             .iter()
-            .map(|ja| PublishedJwtAuthority {
-                trust_domain: td.clone(),
-                key_id: ja.key_id.clone(),
-                public_key_pem: ja.public_key_pem.clone(),
+            .map(|ja| {
+                // The X.509 trust-bundle carrier holds a bare SPKI PEM with no
+                // `alg`, so nothing is declared here. Validation then applies the
+                // conservative undeclared-key policy rather than the key type's
+                // full family — see `jwt_svid::decoding_key_for_authority`.
+                PublishedJwtAuthority::new(td.clone(), ja.key_id.clone(), ja.public_key_pem.clone())
             })
             .collect())
     }

@@ -14,21 +14,45 @@
 //! private key and [`LocalJwtAuthorityConfig::retired_key_pems`] carries keys
 //! that are published for verification only. Two instances handed the same
 //! material publish the *same* `kid` and the *same* JWKS, and a restart keeps
-//! every token it minted moments earlier verifiable. Configuring the retired
-//! list is how a **rotation** stays safe across a rolling restart: the new
-//! primary goes in `signing_key_pem`, the outgoing one in `retired_key_pems`,
-//! and both are published until the outgoing key's overlap elapses.
+//! every token it minted moments earlier verifiable.
 //!
 //! An **ephemeral, process-local** key is generated only when
 //! [`LocalJwtAuthorityConfig::allow_ephemeral_key`] is explicitly set (dev and
 //! test). With it unset and no configured material, construction fails closed
 //! rather than silently minting tokens that no peer or restart can verify.
 //!
-//! ## Rotation overlap
+//! ## Rotation: configured material rotates *externally*
 //!
-//! Reads go through a lock-free [`ArcSwap`] snapshot; rotation is serialized
-//! by an async gate and never runs on a request path. When a key rotates the
-//! previous key is *retained for verification only* for
+//! There are two postures, and they rotate by different mechanisms because only
+//! one of them **can** rotate without destroying continuity.
+//!
+//! **Configured material (the production posture) is externally rotated.** A
+//! replacement key generated inside one process would be a different random key
+//! on every replica and would be lost on the next restart, so tokens minted from
+//! it would validate nowhere else and nowhere later — the precise failure this
+//! authority exists to prevent. Ferrum therefore never generates one:
+//!
+//! - `key_lifetime_secs` is **normalized to `0`** at construction for a
+//!   configured authority (an explicitly nonzero value is additionally rejected
+//!   at config-validation time, so an operator sees the misconfiguration rather
+//!   than a silent downgrade), so [`LocalJwtAuthority::rotate_if_due`] is a
+//!   permanent no-op;
+//! - an explicit [`LocalJwtAuthority::rotate`] is **refused** with
+//!   [`JwtSvidError::RotationRefused`].
+//!
+//! Rotation is instead a two-key rolling config change: the new primary goes in
+//! `signing_key_pem`, the outgoing one in `retired_key_pems`. Configured retired
+//! keys are published for verification for as long as they stay configured — not
+//! for a process-relative window — so two replicas of one trust domain publish a
+//! byte-identical JWKS at every instant and a restart republishes exactly the
+//! same set. The operator drops the previous key from configuration once the
+//! overlap ([`rotation_overlap_secs`]`(max_ttl_secs)`) has elapsed.
+//!
+//! **An ephemeral key may rotate in process**, because a process-local key is
+//! already discontinuous across a restart and identical to no replica: rotating
+//! it costs nothing that was not already lost. Reads go through a lock-free
+//! [`ArcSwap`] snapshot; rotation is serialized by an async gate and never runs
+//! on a request path. The replaced key is *retained for verification only* for
 //! [`rotation_overlap_secs`]`(max_ttl_secs)`. Because every minted token's
 //! lifetime is clamped to `max_ttl_secs`, a token minted one instant before a
 //! rotation stays verifiable for its whole bounded lifetime, and a retired key
@@ -69,9 +93,10 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use super::{
-    DEFAULT_JWT_KEY_LIFETIME_SECS, DEFAULT_JWT_SVID_TTL_SECS, JwtSvidError,
-    MAX_JWT_AUTHORITIES_PER_TRUST_DOMAIN, MAX_JWT_SVID_TTL_SECS, canonical_audiences, jwks,
-    min_key_lifetime_secs, required_retained_keys, rotation_overlap_secs,
+    DEFAULT_EPHEMERAL_JWT_KEY_LIFETIME_SECS, DEFAULT_JWT_KEY_LIFETIME_SECS,
+    DEFAULT_JWT_SVID_TTL_SECS, JwtSvidError, MAX_JWT_AUTHORITIES_PER_TRUST_DOMAIN,
+    MAX_JWT_SVID_TTL_SECS, canonical_audiences, jwks, min_key_lifetime_secs,
+    required_retained_keys, rotation_overlap_secs,
 };
 use crate::identity::ca::PublishedJwtAuthority;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -124,6 +149,10 @@ pub trait JwtSvidSigner: Send + Sync + 'static {
     /// Returns the new generation when a rotation happened. Driven from the
     /// background rotation task — key generation must never run on an RPC
     /// path.
+    ///
+    /// An authority built from operator-configured material never rotates in
+    /// process and always answers `Ok(None)`; it is rotated by rolling new
+    /// configuration. Only an ephemeral (dev/test) authority has a cadence.
     async fn rotate_if_due(&self) -> Result<Option<u64>, JwtSvidError>;
 }
 
@@ -166,9 +195,13 @@ pub struct LocalJwtAuthorityConfig {
     /// Hard ceiling on minted JWT-SVID lifetime. Also the basis of the
     /// rotation overlap.
     pub max_ttl_secs: u64,
-    /// How long a signing key stays active before [`LocalJwtAuthority::rotate_if_due`]
-    /// replaces it. `0` disables time-based rotation (explicit
-    /// [`LocalJwtAuthority::rotate`] still works).
+    /// How long an **ephemeral** signing key stays active before
+    /// [`LocalJwtAuthority::rotate_if_due`] replaces it. `0` disables
+    /// time-based rotation.
+    ///
+    /// Only meaningful together with [`Self::allow_ephemeral_key`]. For
+    /// operator-configured material this is normalized to `0` at construction
+    /// and in-process rotation is refused outright — see the module docs.
     pub key_lifetime_secs: u64,
     /// Upper bound on retained verification-only keys. Raised at construction
     /// to [`required_retained_keys`] when configured lower, so the scheduled
@@ -186,8 +219,12 @@ pub struct LocalJwtAuthorityConfig {
     ///
     /// Set the previous primary here across a rotation so tokens it signed stay
     /// verifiable for their whole permitted lifetime while the new primary takes
-    /// over. Each entry is published for
-    /// [`rotation_overlap_secs`]`(max_ttl_secs)` from process start.
+    /// over. A configured entry is published for as long as it stays configured
+    /// — deliberately **not** for a process-relative window, so two replicas of
+    /// one trust domain publish a byte-identical JWKS at every instant and a
+    /// restart republishes exactly the same set. The operator removes the entry
+    /// once [`rotation_overlap_secs`]`(max_ttl_secs)` has elapsed since the
+    /// rotation.
     pub retired_key_pems: Vec<Zeroizing<String>>,
     /// Permit generating an ephemeral, process-local signing key when no
     /// material is configured.
@@ -214,9 +251,10 @@ impl fmt::Debug for LocalJwtAuthorityConfig {
 }
 
 impl LocalJwtAuthorityConfig {
-    /// Defaults for a trust domain: 5 min tokens, 1 h ceiling, 24 h key
-    /// lifetime, 3 retained keys, **no** signing material and **no** ephemeral
-    /// fallback — a caller must supply one or the other explicitly.
+    /// Defaults for a trust domain: 5 min tokens, 1 h ceiling, **no** in-process
+    /// key rotation ([`DEFAULT_JWT_KEY_LIFETIME_SECS`] is `0`), 3 retained keys,
+    /// **no** signing material and **no** ephemeral fallback — a caller must
+    /// supply one or the other explicitly.
     pub fn new(trust_domain: TrustDomain) -> Self {
         Self {
             trust_domain,
@@ -251,8 +289,16 @@ impl LocalJwtAuthorityConfig {
 
     /// Dev/test escape hatch: generate a process-local key when nothing is
     /// configured. Documented as breaking restart/HA continuity.
+    ///
+    /// Because an ephemeral key has no continuity to preserve, in-process
+    /// rotation is available to it; this sets the default ephemeral cadence
+    /// ([`DEFAULT_EPHEMERAL_JWT_KEY_LIFETIME_SECS`]) unless the caller has
+    /// already chosen one.
     pub fn allowing_ephemeral_key(mut self) -> Self {
         self.allow_ephemeral_key = true;
+        if self.key_lifetime_secs == 0 {
+            self.key_lifetime_secs = DEFAULT_EPHEMERAL_JWT_KEY_LIFETIME_SECS;
+        }
         self
     }
 }
@@ -267,11 +313,29 @@ struct JwtSigningKey {
     public_key_pem: String,
 }
 
-/// A key kept for verification only through the rotation overlap.
+/// A key kept for verification only.
 struct RetiredJwtKey {
     key: Arc<JwtSigningKey>,
     /// Instant after which the key is dropped from published authorities.
-    verifiable_until: DateTime<Utc>,
+    ///
+    /// `None` for **operator-configured** retired material: its publication
+    /// window is owned by configuration, not by this process's uptime. Expiring
+    /// it on a process-relative clock would make two replicas started at
+    /// different times publish different JWKS for the same configuration, and a
+    /// restart resurrect a key the previous process had already dropped.
+    /// `Some(instant)` only for a key this process retired itself, which is
+    /// reachable only on the ephemeral (dev/test) rotation path.
+    verifiable_until: Option<DateTime<Utc>>,
+}
+
+impl RetiredJwtKey {
+    /// Whether this key is still published at `now`.
+    fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+        match self.verifiable_until {
+            None => true,
+            Some(until) => until > now,
+        }
+    }
 }
 
 /// Immutable snapshot swapped atomically on rotation.
@@ -296,6 +360,9 @@ pub struct LocalJwtAuthority {
     /// True when the active key was generated in-process because no material
     /// was configured. Public information (a boolean posture flag), never key
     /// material.
+    ///
+    /// It is also the **rotation gate**: only an ephemeral authority may
+    /// generate a replacement key in process. See the module docs.
     ephemeral_key: bool,
 }
 
@@ -320,6 +387,13 @@ impl LocalJwtAuthority {
     /// wrong-key-type material, a duplicate `kid` across the primary and retired
     /// keys, more retired keys than the published-authority cap allows, and a
     /// `key_lifetime_secs` too short for the overlap guarantee to be provable.
+    ///
+    /// For **configured** material `key_lifetime_secs` is normalized to `0`:
+    /// in-process rotation is unavailable to that posture at all, so accepting a
+    /// cadence here would only schedule a permanent no-op (or, worse, imply a
+    /// rotation that never happens). The env-config layer additionally rejects
+    /// an explicitly nonzero value so the operator is told rather than silently
+    /// overridden.
     pub fn new(config: LocalJwtAuthorityConfig) -> Result<Self, JwtSvidError> {
         let default_ttl_secs = if config.default_ttl_secs == 0 {
             DEFAULT_JWT_SVID_TTL_SECS
@@ -332,11 +406,21 @@ impl LocalJwtAuthority {
             config.max_ttl_secs.min(MAX_JWT_SVID_TTL_SECS)
         };
 
+        // Only an ephemeral authority can rotate in process, so only an
+        // ephemeral authority has a cadence at all. Determined here, before the
+        // cadence bounds below, because those bounds exist purely to make the
+        // *scheduled* rotation's retention provable.
+        let ephemeral_key = config.signing_key_pem.is_none() && config.allow_ephemeral_key;
+        let key_lifetime_secs = if ephemeral_key {
+            config.key_lifetime_secs
+        } else {
+            0
+        };
+
         // Refuse a cadence whose required retention cannot fit inside the
         // published-authority cap. Accepting it would force a choice between
         // over-publishing and evicting a key that can still validate a live
         // token — the exact conflict this check exists to remove.
-        let key_lifetime_secs = config.key_lifetime_secs;
         if key_lifetime_secs > 0 && key_lifetime_secs < min_key_lifetime_secs(max_ttl_secs) {
             return Err(JwtSvidError::InvalidSigningMaterial(
                 "JWT signing key lifetime is shorter than the rotation overlap permits; \
@@ -355,7 +439,10 @@ impl LocalJwtAuthority {
             ));
         }
 
-        let overlap = overlap_duration(max_ttl_secs)?;
+        // Validated here even though it is only consumed by `rotate_locked`:
+        // an out-of-range overlap must be a startup failure, not a surprise on
+        // the first rotation.
+        let _ = overlap_duration(max_ttl_secs)?;
         let now = Utc::now();
 
         // Retired material first: it is published for verification only, and a
@@ -376,13 +463,18 @@ impl LocalJwtAuthority {
             }
             retired.push(RetiredJwtKey {
                 key,
-                verifiable_until: now + overlap,
+                // Configured material: published for as long as it is
+                // configured. See `RetiredJwtKey::verifiable_until`.
+                verifiable_until: None,
             });
         }
 
-        let (active, source) = match config.signing_key_pem.as_ref() {
-            Some(pem) => (Arc::new(signing_key_from_pem(pem)?), "configured"),
-            None if config.allow_ephemeral_key => (Arc::new(generate_signing_key()?), "ephemeral"),
+        // Kept in step with `ephemeral_key` above by construction: that flag is
+        // exactly `signing_key_pem.is_none() && allow_ephemeral_key`, which is
+        // the arm this match takes.
+        let active = match config.signing_key_pem.as_ref() {
+            Some(pem) => Arc::new(signing_key_from_pem(pem)?),
+            None if config.allow_ephemeral_key => Arc::new(generate_signing_key()?),
             None => {
                 return Err(JwtSvidError::InvalidSigningMaterial(
                     "no JWT signing key is configured for this trust domain; configure stable \
@@ -390,13 +482,16 @@ impl LocalJwtAuthority {
                 ));
             }
         };
-        if retired.iter().any(|entry| entry.key.key_id == active.key_id) {
+        if retired
+            .iter()
+            .any(|entry| entry.key.key_id == active.key_id)
+        {
             return Err(JwtSvidError::InvalidSigningMaterial(
                 "the active JWT signing key is also configured as a retired key",
             ));
         }
 
-        if source == "ephemeral" {
+        if ephemeral_key {
             // Loud, because this posture cannot serve a restart or a second
             // replica. Only the public key id is named.
             warn!(
@@ -408,6 +503,15 @@ impl LocalJwtAuthority {
                  restart-surviving deployment"
             );
         } else {
+            if config.key_lifetime_secs != 0 {
+                // Normalized rather than honoured. Say so, so an operator who
+                // set a cadence does not believe a rotation is scheduled.
+                info!(
+                    trust_domain = %config.trust_domain,
+                    "configured JWT signing material rotates externally (new primary + previous \
+                     verification key); the in-process JWT key lifetime is normalized to 0"
+                );
+            }
             info!(
                 trust_domain = %config.trust_domain,
                 key_id = %active.key_id,
@@ -431,7 +535,7 @@ impl LocalJwtAuthority {
             max_ttl_secs,
             key_lifetime_secs,
             max_retained_keys,
-            ephemeral_key: source == "ephemeral",
+            ephemeral_key,
         })
     }
 
@@ -444,13 +548,31 @@ impl LocalJwtAuthority {
         self.ephemeral_key
     }
 
+    /// Whether this authority may generate a replacement signing key in
+    /// process.
+    ///
+    /// True only for an **ephemeral** (dev/test) authority. Operator-configured
+    /// material is rotated externally, because an unpersisted random
+    /// replacement would diverge across replicas and be lost on restart — see
+    /// the module docs.
+    pub fn allows_in_process_rotation(&self) -> bool {
+        self.ephemeral_key
+    }
+
     /// Replace the active signing key, retaining the previous one for
     /// verification through the overlap window.
     ///
     /// Returns the new generation. Key generation is deliberately done here
     /// and never on a mint path.
     ///
-    /// Refuses with [`JwtSvidError::RotationRefused`] rather than evicting a
+    /// **Refused outright for an operator-configured authority.** Generating an
+    /// unpersisted replacement would give each replica a different signing key
+    /// and lose the signer of every still-live token on the next restart, so the
+    /// only safe in-process answer is to keep the configured key and let the
+    /// operator roll new material. See the module docs for the two-key external
+    /// rotation procedure.
+    ///
+    /// Also refuses with [`JwtSvidError::RotationRefused`] rather than evicting a
     /// retired key that can still validate a token inside its permitted
     /// lifetime. The scheduled cadence cannot reach that refusal (construction
     /// derives the cap from it); driving `rotate` manually far faster than the
@@ -464,6 +586,17 @@ impl LocalJwtAuthority {
     /// read-modify-write of `state` below cannot interleave with another
     /// rotation.
     async fn rotate_locked(&self) -> Result<u64, JwtSvidError> {
+        if !self.ephemeral_key {
+            // The FIRST thing checked, before any state is read or any key is
+            // generated: for configured material there is no correct in-process
+            // rotation, so there is nothing to attempt.
+            return Err(JwtSvidError::RotationRefused(
+                "this JWT signing authority is operator-configured and rotates externally; \
+                 generating a process-local replacement would publish a different key on every \
+                 replica and lose the signer of every still-live token on restart. Roll a new \
+                 primary key with the previous one configured for verification instead",
+            ));
+        }
         let now = Utc::now();
         let overlap = overlap_duration(self.max_ttl_secs)?;
         let previous = self.state.load_full();
@@ -473,10 +606,10 @@ impl LocalJwtAuthority {
         let mut retained: Vec<RetiredJwtKey> = Vec::with_capacity(self.max_retained_keys);
         retained.push(RetiredJwtKey {
             key: Arc::clone(&previous.active),
-            verifiable_until: now + overlap,
+            verifiable_until: Some(now + overlap),
         });
         for entry in &previous.retired {
-            if entry.verifiable_until <= now {
+            if !entry.is_live_at(now) {
                 // Genuinely expired: no token it signed can still be live, so
                 // dropping it is not an eviction.
                 continue;
@@ -494,6 +627,9 @@ impl LocalJwtAuthority {
                 key: Arc::clone(&entry.key),
                 verifiable_until: entry.verifiable_until,
             });
+            // NOTE: a `None` window (configured material) is carried through
+            // unchanged, so an ephemeral rotation can never silently expire a
+            // key configuration still publishes.
         }
 
         let fresh = Arc::new(generate_signing_key()?);
@@ -616,13 +752,18 @@ impl JwtSvidSigner for LocalJwtAuthority {
             trust_domain: self.trust_domain.clone(),
             key_id: state.active.key_id.clone(),
             public_key_pem: state.active.public_key_pem.clone(),
+            // Ferrum's own authorities always declare their algorithm: we know
+            // exactly what they sign with, so leaving it unstated would only
+            // widen what a verifier accepts.
+            declared_alg: Some(state.active.algorithm),
         });
         for entry in &state.retired {
-            if entry.verifiable_until > now {
+            if entry.is_live_at(now) {
                 published.push(PublishedJwtAuthority {
                     trust_domain: self.trust_domain.clone(),
                     key_id: entry.key.key_id.clone(),
                     public_key_pem: entry.key.public_key_pem.clone(),
+                    declared_alg: Some(entry.key.algorithm),
                 });
             }
         }
@@ -634,7 +775,11 @@ impl JwtSvidSigner for LocalJwtAuthority {
     }
 
     async fn rotate_if_due(&self) -> Result<Option<u64>, JwtSvidError> {
-        if self.key_lifetime_secs == 0 {
+        // Configured material has no in-process cadence at all (construction
+        // normalizes `key_lifetime_secs` to 0). Checked explicitly as well as
+        // implicitly so a future caller that sets the field directly still gets
+        // a silent no-op rather than a scheduled refusal every tick.
+        if !self.ephemeral_key || self.key_lifetime_secs == 0 {
             return Ok(None);
         }
         // Cheap unlocked pre-check so the common "nothing due" tick never
@@ -722,9 +867,8 @@ fn signing_key_from_pem(pem: &Zeroizing<String>) -> Result<JwtSigningKey, JwtSvi
             "configured JWT signing key is not an ECDSA P-256 key; JWT-SVIDs are minted ES256",
         ));
     }
-    signing_key_from_key_pair(&key_pair).map_err(|_| {
-        JwtSvidError::InvalidSigningMaterial("configured JWT signing key is unusable")
-    })
+    signing_key_from_key_pair(&key_pair)
+        .map_err(|_| JwtSvidError::InvalidSigningMaterial("configured JWT signing key is unusable"))
 }
 
 /// Generate an ephemeral ES256 signing key. Dev/test only — see
@@ -768,8 +912,7 @@ fn random_token_id() -> Result<String, JwtSvidError> {
 
     let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut buf = [0u8; 16];
-    rng.fill(&mut buf).map_err(|_| {
-        JwtSvidError::Internal("JWT-SVID token id generation failed".to_string())
-    })?;
+    rng.fill(&mut buf)
+        .map_err(|_| JwtSvidError::Internal("JWT-SVID token id generation failed".to_string()))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }

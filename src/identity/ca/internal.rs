@@ -82,8 +82,14 @@ pub struct InternalCaConfig {
     /// JWT signing keys retained for **verification only**, newest first —
     /// normally the previous primary during a rotation.
     pub jwt_retired_key_pems: Vec<Zeroizing<String>>,
-    /// How long a JWT signing key stays active before the background rotation
-    /// task replaces it. `0` disables time-based JWT key rotation.
+    /// How long an **ephemeral** JWT signing key stays active before the
+    /// background rotation task replaces it. `0` disables time-based JWT key
+    /// rotation, and is the default.
+    ///
+    /// Ignored (normalized to `0`) when [`Self::jwt_signing_key_pem`] is set:
+    /// configured material is rotated externally, by rolling a new primary with
+    /// the outgoing key in [`Self::jwt_retired_key_pems`]. See
+    /// [`LocalJwtAuthority`].
     pub jwt_key_lifetime_secs: u64,
     /// Permit an ephemeral, process-local JWT signing key when none is
     /// configured. Dev/test only — it breaks restart and multi-replica
@@ -191,25 +197,24 @@ impl InternalCa {
         // generating a process-local key would mint tokens that no restart and no
         // sibling replica can verify. The dev opt-in
         // (`allow_ephemeral_jwt_key`) is the only way to get one.
-        let jwt_authority = if config.jwt_signing_key_pem.is_some()
-            || config.allow_ephemeral_jwt_key
-        {
-            let mut jwt_config = LocalJwtAuthorityConfig::new(config.trust_domain.clone());
-            jwt_config.signing_key_pem = config.jwt_signing_key_pem.clone();
-            jwt_config.retired_key_pems = config.jwt_retired_key_pems.clone();
-            jwt_config.key_lifetime_secs = config.jwt_key_lifetime_secs;
-            jwt_config.allow_ephemeral_key = config.allow_ephemeral_jwt_key;
-            Some(Arc::new(LocalJwtAuthority::new(jwt_config).map_err(|e| {
-                CaError::Config(format!("JWT-SVID authority setup failed: {e}"))
-            })?))
-        } else {
-            debug!(
-                trust_domain = %config.trust_domain,
-                "internal CA has no JWT signing material configured; JWT-SVID mint / bundles / \
-                 validate stay UNIMPLEMENTED on this backend"
-            );
-            None
-        };
+        let jwt_authority =
+            if config.jwt_signing_key_pem.is_some() || config.allow_ephemeral_jwt_key {
+                let mut jwt_config = LocalJwtAuthorityConfig::new(config.trust_domain.clone());
+                jwt_config.signing_key_pem = config.jwt_signing_key_pem.clone();
+                jwt_config.retired_key_pems = config.jwt_retired_key_pems.clone();
+                jwt_config.key_lifetime_secs = config.jwt_key_lifetime_secs;
+                jwt_config.allow_ephemeral_key = config.allow_ephemeral_jwt_key;
+                Some(Arc::new(LocalJwtAuthority::new(jwt_config).map_err(
+                    |e| CaError::Config(format!("JWT-SVID authority setup failed: {e}")),
+                )?))
+            } else {
+                debug!(
+                    trust_domain = %config.trust_domain,
+                    "internal CA has no JWT signing material configured; JWT-SVID mint / bundles / \
+                     validate stay UNIMPLEMENTED on this backend"
+                );
+                None
+            };
 
         info!(
             trust_domain = %config.trust_domain,

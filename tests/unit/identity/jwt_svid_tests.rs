@@ -65,7 +65,19 @@ fn config_with_key(pem: &str) -> LocalJwtAuthorityConfig {
     LocalJwtAuthorityConfig::new(td()).with_signing_key_pem(pem)
 }
 
-fn bundles_of(signer: &Arc<LocalJwtAuthority>) -> BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> {
+/// A base config for the **ephemeral** (dev/test) posture with bounds a test can
+/// tighten.
+///
+/// In-process key rotation exists only here. A configured authority is rotated
+/// externally (new primary + previous verification key), so every cadence /
+/// retention / `rotate()` test uses this rather than `config_with_key`.
+fn ephemeral_config() -> LocalJwtAuthorityConfig {
+    LocalJwtAuthorityConfig::new(td()).allowing_ephemeral_key()
+}
+
+fn bundles_of(
+    signer: &Arc<LocalJwtAuthority>,
+) -> BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> {
     let mut bundles = BTreeMap::new();
     bundles.insert(td(), signer.authorities());
     bundles
@@ -206,10 +218,7 @@ fn jwt_capable_service() -> (WorkloadApiService, Arc<LocalJwtAuthority>) {
         jwt: Arc::clone(&jwt),
     });
     let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id: workload_id() });
-    (
-        WorkloadApiService::new(vec![attestor], ca, td(), 600),
-        jwt,
-    )
+    (WorkloadApiService::new(vec![attestor], ca, td(), 600), jwt)
 }
 
 // ── forged-token machinery ───────────────────────────────────────────────
@@ -277,10 +286,7 @@ fn sign_compact(key: &ForgeKey, header_json: &str, claims_json: &str) -> String 
 }
 
 /// A bundle holding exactly one forged authority under `kid`.
-fn forged_bundles(
-    key: &ForgeKey,
-    kid: &str,
-) -> BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> {
+fn forged_bundles(key: &ForgeKey, kid: &str) -> BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> {
     let mut bundles = BTreeMap::new();
     bundles.insert(
         td(),
@@ -288,6 +294,7 @@ fn forged_bundles(
             trust_domain: td(),
             key_id: kid.to_string(),
             public_key_pem: key.public_key_pem.clone(),
+            declared_alg: None,
         }],
     );
     bundles
@@ -310,12 +317,8 @@ fn mint_and_validate_round_trip() {
         .mint(&workload_id(), &["spiffe://td.test/api".to_string()], 0)
         .expect("mint succeeds");
 
-    let validated = validate_jwt_svid(
-        &minted.token,
-        "spiffe://td.test/api",
-        &bundles_of(&signer),
-    )
-    .expect("round trip validates");
+    let validated = validate_jwt_svid(&minted.token, "spiffe://td.test/api", &bundles_of(&signer))
+        .expect("round trip validates");
 
     assert_eq!(validated.spiffe_id, workload_id());
     let claims = claims_of(&validated.claims_json);
@@ -357,9 +360,7 @@ fn mint_rejects_an_empty_audience_list() {
 fn mint_rejects_an_empty_audience_entry() {
     let signer = authority();
     assert!(
-        signer
-            .mint(&workload_id(), &[String::new()], 0)
-            .is_err(),
+        signer.mint(&workload_id(), &[String::new()], 0).is_err(),
         "an empty audience string must not reach a signed token"
     );
     assert!(
@@ -400,8 +401,7 @@ fn mint_collapses_duplicate_audiences_preserving_order() {
             0,
         )
         .expect("mint succeeds");
-    let validated =
-        validate_jwt_svid(&minted.token, "a", &bundles_of(&signer)).expect("validates");
+    let validated = validate_jwt_svid(&minted.token, "a", &bundles_of(&signer)).expect("validates");
     let claims = claims_of(&validated.claims_json);
     assert_eq!(claims["aud"], serde_json::json!(["b", "a"]));
 }
@@ -501,6 +501,7 @@ fn validate_rejects_an_unknown_trust_domain() {
             trust_domain: other,
             key_id: "k1".to_string(),
             public_key_pem: forge_key().public_key_pem,
+            declared_alg: None,
         }],
     );
 
@@ -515,8 +516,12 @@ fn validate_rejects_an_unknown_key_id() {
     let minted = signer
         .mint(&workload_id(), &["aud".to_string()], 0)
         .expect("mint succeeds");
-    let err = validate_jwt_svid(&minted.token, "aud", &forged_bundles(&forge_key(), "unrelated"))
-        .expect_err("an unknown kid must fail");
+    let err = validate_jwt_svid(
+        &minted.token,
+        "aud",
+        &forged_bundles(&forge_key(), "unrelated"),
+    )
+    .expect_err("an unknown kid must fail");
     assert!(err.to_string().contains("key id"));
 }
 
@@ -530,8 +535,12 @@ fn validate_rejects_a_signature_from_a_different_key_under_the_same_key_id() {
         .expect("mint succeeds");
     let real_kid = signer.authorities()[0].key_id.clone();
 
-    let err = validate_jwt_svid(&minted.token, "aud", &forged_bundles(&forge_key(), &real_kid))
-        .expect_err("a mismatched key must fail");
+    let err = validate_jwt_svid(
+        &minted.token,
+        "aud",
+        &forged_bundles(&forge_key(), &real_kid),
+    )
+    .expect_err("a mismatched key must fail");
     assert!(err.to_string().contains("signature"));
 }
 
@@ -623,6 +632,7 @@ fn validate_rejects_a_kidless_token_when_the_bundle_is_ambiguous() {
             trust_domain: td(),
             key_id: "k2".to_string(),
             public_key_pem: forge_key().public_key_pem,
+            declared_alg: None,
         });
     let err = validate_jwt_svid(&token, "aud", &ambiguous)
         .expect_err("an ambiguous kid-less token must fail");
@@ -850,11 +860,13 @@ fn jwks_document_rejects_duplicate_key_ids() {
             trust_domain: td(),
             key_id: "same".to_string(),
             public_key_pem: one.public_key_pem,
+            declared_alg: None,
         },
         PublishedJwtAuthority {
             trust_domain: td(),
             key_id: "same".to_string(),
             public_key_pem: two.public_key_pem,
+            declared_alg: None,
         },
     ])
     .expect_err("ambiguous key ids must be refused");
@@ -864,9 +876,17 @@ fn jwks_document_rejects_duplicate_key_ids() {
 #[test]
 fn jwks_document_rejects_malformed_authority_material() {
     for (name, key_id, pem) in [
-        ("empty kid", "", "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"),
+        (
+            "empty kid",
+            "",
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
+        ),
         ("not a pem", "k1", "hello"),
-        ("not base64", "k1", "-----BEGIN PUBLIC KEY-----\n!!!!\n-----END PUBLIC KEY-----"),
+        (
+            "not base64",
+            "k1",
+            "-----BEGIN PUBLIC KEY-----\n!!!!\n-----END PUBLIC KEY-----",
+        ),
         (
             "not an spki",
             "k1",
@@ -878,6 +898,7 @@ fn jwks_document_rejects_malformed_authority_material() {
                 trust_domain: td(),
                 key_id: key_id.to_string(),
                 public_key_pem: pem.to_string(),
+                declared_alg: None,
             }])
             .is_err(),
             "{name}: malformed authority material must not be published"
@@ -894,6 +915,7 @@ fn jwks_document_rejects_a_multi_block_pem() {
         trust_domain: td(),
         key_id: "k1".to_string(),
         public_key_pem: concatenated,
+        declared_alg: None,
     }])
     .expect_err("a concatenated PEM hides the second key behind one kid");
     assert!(err.to_string().contains("more than one block"));
@@ -939,7 +961,7 @@ async fn rapid_rotation_refuses_rather_than_evicting_a_still_live_key() {
     // in this test is still inside its overlap. Time-based rotation is disabled
     // (`0`) so the cap is not derived up from a cadence and the manual
     // over-rotation case is reachable at all.
-    let mut config = config_with_key(&signing_key_pem());
+    let mut config = ephemeral_config();
     config.default_ttl_secs = 1;
     config.max_ttl_secs = 1;
     config.key_lifetime_secs = 0;
@@ -953,7 +975,10 @@ async fn rapid_rotation_refuses_rather_than_evicting_a_still_live_key() {
         .expect("mint succeeds");
 
     signer.rotate().await.expect("first rotation succeeds");
-    signer.rotate().await.expect("second rotation fills the cap");
+    signer
+        .rotate()
+        .await
+        .expect("second rotation fills the cap");
     let generation_at_cap = signer.generation();
 
     let refused = signer
@@ -992,7 +1017,7 @@ async fn construction_refuses_a_cadence_shorter_than_the_overlap_permits() {
     // 1s tokens ⇒ 61s overlap ⇒ ceil(61 / 15 retained slots) = 5s minimum. A 1s
     // cadence could not retain every still-verifiable key inside the
     // published-authority cap, so it is refused rather than silently accepted.
-    let mut config = config_with_key(&signing_key_pem());
+    let mut config = ephemeral_config();
     config.max_ttl_secs = 1;
     config.key_lifetime_secs = 1;
     let error = LocalJwtAuthority::new(config).expect_err("too-short cadence is refused");
@@ -1010,7 +1035,7 @@ async fn a_scheduled_cadence_raises_the_retention_cap_so_rotation_never_refuses(
     // The cap is DERIVED from the cadence: overlap 61s / 5s lifetime ⇒ 13
     // required slots, even though 1 was configured. Rotating that many times
     // must therefore never hit the refusal path.
-    let mut config = config_with_key(&signing_key_pem());
+    let mut config = ephemeral_config();
     config.default_ttl_secs = 1;
     config.max_ttl_secs = 1;
     config.key_lifetime_secs = 5;
@@ -1048,7 +1073,7 @@ async fn rotate_if_due_is_a_no_op_while_the_key_is_young() {
 async fn rotate_if_due_rotates_once_the_lifetime_has_elapsed() {
     // 5s is the shortest cadence a 1s token ceiling permits (overlap 61s over 15
     // retained slots), so this is the fastest deterministic rotation available.
-    let mut config = config_with_key(&signing_key_pem());
+    let mut config = ephemeral_config();
     config.default_ttl_secs = 1;
     config.max_ttl_secs = 1;
     config.key_lifetime_secs = 5;
@@ -1257,9 +1282,7 @@ async fn fetch_jwt_bundles_is_unimplemented_without_a_jwt_authority() {
     use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use tonic::Code;
 
-    let ca: Arc<dyn CertificateAuthority> = Arc::new(JwtlessCa {
-        trust_domain: td(),
-    });
+    let ca: Arc<dyn CertificateAuthority> = Arc::new(JwtlessCa { trust_domain: td() });
     let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id: workload_id() });
     let svc = WorkloadApiService::new(vec![attestor], ca, td(), 600);
 
@@ -1498,6 +1521,167 @@ async fn a_configured_previous_key_keeps_pre_rotation_tokens_verifiable() {
         .expect("the new primary's token validates");
 }
 
+// ── configured material rotates EXTERNALLY, never in process ──────────────
+
+#[tokio::test]
+async fn configured_material_refuses_in_process_rotation() {
+    // The core continuity contract. An in-process replacement would be a
+    // different random key on every replica and would vanish on restart, so the
+    // authority refuses rather than silently destroying the trust domain's
+    // stable identity.
+    let pem = signing_key_pem();
+    let signer = authority_with_key(&pem);
+    assert!(!signer.allows_in_process_rotation());
+    let before = signer.generation();
+    let key_id_before = signer.active_key_id();
+
+    let refused = signer
+        .rotate()
+        .await
+        .expect_err("a configured authority must refuse to generate a replacement key");
+    assert!(
+        matches!(
+            refused,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::RotationRefused(_)
+        ),
+        "expected RotationRefused, got {refused:?}"
+    );
+    assert_eq!(
+        signer.generation(),
+        before,
+        "a refused rotation must not advance the generation"
+    );
+    assert_eq!(
+        signer.active_key_id(),
+        key_id_before,
+        "the configured key must still be the active signing key"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_cadence_is_normalized_away_rather_than_scheduled() {
+    // A caller that sets a lifetime on configured material gets NO scheduled
+    // rotation: `rotate_if_due` is a permanent no-op. (The env-config layer
+    // additionally refuses the setting outright, so an operator is told rather
+    // than silently overridden — see the mesh config tests.)
+    let mut config = config_with_key(&signing_key_pem());
+    config.key_lifetime_secs = 300;
+    let signer = Arc::new(LocalJwtAuthority::new(config).expect("authority builds"));
+    let before = signer.generation();
+
+    assert_eq!(
+        signer.rotate_if_due().await.expect("no-op succeeds"),
+        None,
+        "configured material must never rotate on a schedule"
+    );
+    assert_eq!(signer.generation(), before);
+}
+
+#[tokio::test]
+async fn two_replicas_of_one_configuration_agree_after_a_rotation_attempt() {
+    // The HA proof: two replicas handed the same primary + previous key publish
+    // a byte-identical JWKS, and a rotation attempt on one of them cannot make
+    // them diverge — because it is refused rather than applied.
+    let primary = signing_key_pem();
+    let previous = signing_key_pem();
+    let build = || {
+        Arc::new(
+            LocalJwtAuthority::new(
+                LocalJwtAuthorityConfig::new(td())
+                    .with_signing_key_pem(&primary)
+                    .with_retired_key_pems([previous.clone()]),
+            )
+            .expect("authority builds"),
+        )
+    };
+    let replica_a = build();
+    let replica_b = build();
+
+    assert!(
+        replica_a.rotate().await.is_err(),
+        "in-process rotation must be refused on configured material"
+    );
+
+    let left = jwks_document(&replica_a.authorities()).expect("replica A JWKS");
+    let right = jwks_document(&replica_b.authorities()).expect("replica B JWKS");
+    assert_eq!(
+        left, right,
+        "two replicas of one configuration must publish a byte-identical JWKS even after one of \
+         them was asked to rotate"
+    );
+
+    // And each replica validates the other's tokens, on BOTH the primary and
+    // the retired key.
+    let minted = replica_a
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+    validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&replica_b))
+        .expect("the peer replica validates the token");
+}
+
+#[tokio::test]
+async fn a_token_at_the_maximum_lifetime_survives_a_restart() {
+    // Restart continuity is asserted at the WORST case the contract covers: a
+    // token minted for the full JWT-SVID ceiling must still validate against a
+    // fresh authority built from the same material.
+    use ferrum_edge::identity::jwt_svid::MAX_JWT_SVID_TTL_SECS;
+
+    let pem = signing_key_pem();
+    let before_restart = authority_with_key(&pem);
+    let minted = before_restart
+        .mint(&workload_id(), &["aud-a".to_string()], MAX_JWT_SVID_TTL_SECS)
+        .expect("mint succeeds");
+    let lifetime = (minted.expires_at - minted.issued_at).num_seconds();
+    assert_eq!(lifetime, MAX_JWT_SVID_TTL_SECS as i64);
+    drop(before_restart);
+
+    let after_restart = authority_with_key(&pem);
+    validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&after_restart))
+        .expect("a maximum-lifetime token minted before the restart still validates after it");
+}
+
+#[tokio::test]
+async fn a_configured_retired_key_is_published_independently_of_process_uptime() {
+    // A configured retired key's publication window belongs to CONFIGURATION,
+    // not to this process's clock. Two authorities built at different moments
+    // from the same material must therefore publish the same set — otherwise a
+    // replica started later would advertise a key its peer had already dropped.
+    let primary = signing_key_pem();
+    let previous = signing_key_pem();
+    let build = || {
+        LocalJwtAuthority::new(
+            LocalJwtAuthorityConfig::new(td())
+                // A one-second ceiling makes the overlap 61s; if the retired key
+                // were expiring on a process-relative clock this would be the
+                // knob that made two builds disagree.
+                .with_signing_key_pem(&primary)
+                .with_retired_key_pems([previous.clone()]),
+        )
+        .expect("authority builds")
+    };
+    let early = build();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let late = build();
+    assert_eq!(early.authorities().len(), 2);
+    assert_eq!(
+        jwks_document(&early.authorities()).expect("early JWKS"),
+        jwks_document(&late.authorities()).expect("late JWKS"),
+        "a configured retired key must not expire on a process-relative clock"
+    );
+}
+
+#[tokio::test]
+async fn an_ephemeral_authority_may_still_rotate_in_process() {
+    // The negative control for the refusal above: the dev/test posture has no
+    // continuity to lose, so it keeps its in-process rotation.
+    let signer = authority();
+    assert!(signer.allows_in_process_rotation());
+    signer
+        .rotate()
+        .await
+        .expect("an ephemeral authority may rotate in process");
+}
+
 // ── misconfiguration fails closed ────────────────────────────────────────
 
 #[tokio::test]
@@ -1588,6 +1772,7 @@ fn distinct_authorities(n: usize) -> Vec<PublishedJwtAuthority> {
                 )
                 .expect("key id derives"),
                 public_key_pem: key.public_key_pem,
+                declared_alg: None,
             }
         })
         .collect()
@@ -1599,8 +1784,8 @@ fn validate_rejects_an_over_cap_authority_set_the_bundle_rpc_would_also_reject()
     // surfaces refuse it: previously `ValidateJWTSVID` scanned the set without a
     // cap while `FetchJWTBundles` refused it.
     let over_cap = distinct_authorities(17);
-    let publication = jwks_document(&over_cap)
-        .expect_err("publication must refuse an over-cap authority set");
+    let publication =
+        jwks_document(&over_cap).expect_err("publication must refuse an over-cap authority set");
     assert!(
         matches!(
             publication,
@@ -1689,6 +1874,7 @@ fn validate_rejects_malformed_authority_material_in_any_bundle() {
             key_id: "kid-federated".to_string(),
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nnot base64!!\n-----END PUBLIC KEY-----"
                 .to_string(),
+            declared_alg: None,
         }],
     );
     let error = validate_jwt_svid(&minted.token, "aud-a", &bundles)
@@ -1775,7 +1961,11 @@ fn jwks_conversion_refuses_an_over_cap_key_list_without_scanning_it() {
     // 17 syntactically-shaped entries. The cap is checked before per-key work,
     // so this is refused rather than parsed.
     let entries: Vec<String> = (0..17)
-        .map(|i| format!("{{\"kty\":\"EC\",\"kid\":\"k{i}\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}}"))
+        .map(|i| {
+            format!(
+                "{{\"kty\":\"EC\",\"kid\":\"k{i}\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}}"
+            )
+        })
         .collect();
     let document = format!("{{\"keys\":[{}]}}", entries.join(","));
     let error = authorities_from_jwks(&td(), document.as_bytes())
@@ -1787,6 +1977,204 @@ fn jwks_conversion_refuses_an_over_cap_key_list_without_scanning_it() {
         ),
         "expected InvalidAuthority, got {error:?}"
     );
+}
+
+// ── externally supplied JWK key policy is validated, never skimmed ────────
+
+/// One JWKS document holding a single P-256 key with the given extra members
+/// spliced in, so a test can vary exactly one policy member.
+fn ec_jwks_with(extra_members: &str) -> String {
+    let key = forge_key();
+    let recovered = ferrum_edge::identity::jwt_svid::authorities_from_jwks(
+        &td(),
+        format!(
+            "{{\"keys\":[{}]}}",
+            jwk_of(&key.public_key_pem, "k1", "")
+        )
+        .as_bytes(),
+    );
+    assert!(
+        recovered.is_ok(),
+        "the baseline key must be acceptable, otherwise the negative cases prove nothing"
+    );
+    format!(
+        "{{\"keys\":[{}]}}",
+        jwk_of(&key.public_key_pem, "k1", extra_members)
+    )
+}
+
+/// Render a P-256 SPKI PEM as a JWK object with `extra_members` spliced in.
+fn jwk_of(public_key_pem: &str, kid: &str, extra_members: &str) -> String {
+    // Recover x/y by round-tripping the PEM through the library's own publisher,
+    // so the fixture cannot drift from the encoding under test.
+    let published = jwks_document(&[PublishedJwtAuthority::new(td(), kid, public_key_pem)])
+        .expect("baseline JWKS builds");
+    let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
+    let jwk = parsed["keys"][0].as_object().expect("key object").clone();
+    let base = format!(
+        "\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":{},\"y\":{},\"kid\":{}",
+        jwk["x"], jwk["y"], jwk["kid"]
+    );
+    if extra_members.is_empty() {
+        format!("{{{base}}}")
+    } else {
+        format!("{{{base},{extra_members}}}")
+    }
+}
+
+#[test]
+fn jwks_conversion_rejects_malformed_or_contradictory_key_policy_members() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    for (label, extra) in [
+        // A present-but-non-string `use` must be a rejection, not an ignored
+        // member: skipping it is a trivial bypass of the signature-use gate.
+        ("non-string use", "\"use\":1"),
+        ("null use", "\"use\":null"),
+        ("object use", "\"use\":{\"v\":\"sig\"}"),
+        ("encryption use", "\"use\":\"enc\""),
+        // Same for `key_ops`: a bare string is not an array.
+        ("string key_ops", "\"key_ops\":\"verify\""),
+        ("non-array key_ops", "\"key_ops\":1"),
+        ("non-string key_ops entry", "\"key_ops\":[\"verify\",1]"),
+        ("key_ops without verify", "\"key_ops\":[\"sign\"]"),
+        ("empty key_ops", "\"key_ops\":[]"),
+        // RFC 7517 §4.3: `use` and `key_ops` must not contradict each other.
+        (
+            "sig use with an encryption operation",
+            "\"use\":\"sig\",\"key_ops\":[\"verify\",\"encrypt\"]",
+        ),
+        (
+            "sig use with a derivation operation",
+            "\"use\":\"sig\",\"key_ops\":[\"verify\",\"deriveKey\"]",
+        ),
+        // A declared algorithm must be a supported string the key type can
+        // actually produce.
+        ("non-string alg", "\"alg\":256"),
+        ("unknown alg", "\"alg\":\"ES256K\""),
+        ("symmetric alg", "\"alg\":\"HS256\""),
+        ("alg the curve cannot produce", "\"alg\":\"ES384\""),
+    ] {
+        let document = ec_jwks_with(extra);
+        let error = authorities_from_jwks(&td(), document.as_bytes())
+            .err()
+            .unwrap_or_else(|| panic!("{label}: a hostile key policy must be refused"));
+        assert!(
+            matches!(
+                error,
+                ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+            ),
+            "{label}: expected InvalidAuthority, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn jwks_conversion_accepts_consistent_key_policy_members() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    for (label, extra) in [
+        ("no policy members", ""),
+        ("sig use", "\"use\":\"sig\""),
+        ("verify key_ops", "\"key_ops\":[\"verify\"]"),
+        (
+            "consistent use and key_ops",
+            "\"use\":\"sig\",\"key_ops\":[\"verify\",\"sign\"]",
+        ),
+        ("matching alg", "\"alg\":\"ES256\""),
+    ] {
+        let document = ec_jwks_with(extra);
+        authorities_from_jwks(&td(), document.as_bytes())
+            .unwrap_or_else(|e| panic!("{label}: a consistent key policy must be accepted: {e}"));
+    }
+}
+
+#[test]
+fn a_declared_algorithm_narrows_validation_and_is_never_widened() {
+    use ferrum_edge::identity::jwt_svid::{authorities_from_jwks, decoding_key_for_authority};
+    use jsonwebtoken::Algorithm;
+
+    // A 2048-bit RSA key is compatible with the whole RS*/PS* family, which is
+    // exactly why an undeclared one must NOT be verified against all six.
+    let rsa_pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("RSA key generated")
+        .public_key_pem();
+
+    // Undeclared: the conservative RFC 7518 §3.1 default, RS256 alone.
+    let undeclared = PublishedJwtAuthority::new(td(), "rsa-1", rsa_pem.clone());
+    let (_, algs) = decoding_key_for_authority(&undeclared).expect("RSA authority is usable");
+    assert_eq!(
+        algs,
+        vec![Algorithm::RS256],
+        "an undeclared RSA authority must not be verifiable under the whole RSASSA family"
+    );
+
+    // Declared: exactly the declared algorithm, and nothing else in the family.
+    let declared = PublishedJwtAuthority {
+        declared_alg: Some(Algorithm::RS512),
+        ..PublishedJwtAuthority::new(td(), "rsa-1", rsa_pem.clone())
+    };
+    let (_, algs) = decoding_key_for_authority(&declared).expect("RSA authority is usable");
+    assert_eq!(algs, vec![Algorithm::RS512]);
+
+    // A declaration the key type cannot produce is an error, never a widening.
+    let impossible = PublishedJwtAuthority {
+        declared_alg: Some(Algorithm::ES256),
+        ..PublishedJwtAuthority::new(td(), "rsa-1", rsa_pem.clone())
+    };
+    let error = decoding_key_for_authority(&impossible)
+        .expect_err("an ES256 declaration on an RSA key must be refused");
+    assert!(matches!(
+        error,
+        ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+    ));
+    jwks_document(&[impossible]).expect_err("publication refuses it too");
+
+    // The declaration survives a JWKS round trip rather than being widened back
+    // to the key type's preferred algorithm.
+    let published = jwks_document(&[declared]).expect("JWKS builds");
+    let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
+    assert_eq!(parsed["keys"][0]["alg"], "RS512");
+    let recovered = authorities_from_jwks(&td(), &published).expect("JWKS parses back");
+    assert_eq!(recovered[0].declared_alg, Some(Algorithm::RS512));
+}
+
+#[test]
+fn an_authority_pem_must_contain_only_its_one_public_key_envelope() {
+    let key = forge_key();
+    let base = key.public_key_pem.trim();
+
+    // Surrounding whitespace is fine — it is not data.
+    jwks_document(&[PublishedJwtAuthority::new(
+        td(),
+        "k1",
+        format!("\n\n  {base}  \n\n"),
+    )])
+    .expect("surrounding whitespace must be accepted");
+
+    for (label, pem) in [
+        ("leading data", format!("attacker-note\n{base}")),
+        ("trailing data", format!("{base}\nattacker-note")),
+        (
+            "trailing certificate envelope",
+            format!("{base}\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ),
+        (
+            "leading private-key envelope",
+            format!("-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n{base}"),
+        ),
+    ] {
+        let error = jwks_document(&[PublishedJwtAuthority::new(td(), "k1", pem)])
+            .err()
+            .unwrap_or_else(|| panic!("{label}: extra PEM data must be refused"));
+        assert!(
+            matches!(
+                error,
+                ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+            ),
+            "{label}: expected InvalidAuthority, got {error:?}"
+        );
+    }
 }
 
 // ── Workload API socket contract ─────────────────────────────────────────

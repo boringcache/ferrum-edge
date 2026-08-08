@@ -12,7 +12,7 @@
 //! The allowed signature algorithms are derived from the **authority's own
 //! public key**, never from the token header:
 //!
-//! | Key | Allowed `alg` |
+//! | Key | Algorithms the key type can produce |
 //! |---|---|
 //! | EC P-256 (`prime256v1`) | `ES256` |
 //! | EC P-384 (`secp384r1`) | `ES384` |
@@ -22,6 +22,27 @@
 //! Ed25519, DSA, GOST, unknown SPKI — is refused rather than guessed at, and
 //! the HMAC family is never reachable, so `alg: HS256` signed with a public
 //! key (the classic algorithm-confusion attack) cannot validate.
+//!
+//! That table is the **ceiling**, not the answer. An authority that *declares*
+//! an `alg` is held to exactly that one
+//! ([`PublishedJwtAuthority::declared_alg`]); a declaration the key type cannot
+//! have produced is rejected rather than honoured. Where no declaration exists
+//! the key type has to decide, and it only genuinely decides for EC — a curve
+//! pins one algorithm. For RSA the conservative default is **`RS256` alone**:
+//! RFC 7518 §3.1 lists `RS256` as the only Recommended RSASSA algorithm, so a
+//! key that signs with anything else is expected to say so. Accepting all six
+//! for an undeclared RSA key would silently broaden every consumed bundle.
+//!
+//! ## Externally supplied key policy
+//!
+//! [`authorities_from_jwks`] consumes a bundle Ferrum did not produce, so JWK
+//! policy members are validated rather than skimmed: a present `use` must be a
+//! string and must be `sig`; a present `key_ops` must be an array of strings
+//! containing `verify`; the two must not contradict each other (RFC 7517 §4.3);
+//! and a present `alg` must be a string naming an algorithm the key type can
+//! produce. A **malformed** policy member is a rejection, never a fall-through
+//! to "unspecified" — a bundle that says something Ferrum cannot parse must not
+//! be trusted as if it had said nothing.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -102,7 +123,11 @@ impl JwkPublicKey {
     }
 
     /// The published JWK for this key, including `kid`, `alg`, and `use`.
-    fn to_jwk(&self, key_id: &str) -> Value {
+    ///
+    /// `declared_alg` is republished verbatim when the authority carried one, so
+    /// a consumed bundle's narrower declaration survives being re-served rather
+    /// than being widened back to this key type's preferred algorithm.
+    fn to_jwk(&self, key_id: &str, declared_alg: Option<Algorithm>) -> Value {
         let mut jwk = Map::new();
         jwk.insert("kty".to_string(), Value::String(self.kty.to_string()));
         for (name, value) in &self.members {
@@ -111,7 +136,7 @@ impl JwkPublicKey {
         jwk.insert("kid".to_string(), Value::String(key_id.to_string()));
         jwk.insert(
             "alg".to_string(),
-            Value::String(format!("{:?}", self.preferred_alg)),
+            Value::String(format!("{:?}", declared_alg.unwrap_or(self.preferred_alg))),
         );
         jwk.insert("use".to_string(), Value::String("sig".to_string()));
         Value::Object(jwk)
@@ -191,7 +216,17 @@ pub fn validate_published_authorities(
 
         let spki_der = spki_der_from_pem(&authority.public_key_pem)?;
         let key = jwk_public_key(&spki_der)?;
-        keys.push(key.to_jwk(&authority.key_id));
+        // A declaration the key type cannot have produced is refused here, at
+        // the single admission gate, so neither publication nor validation can
+        // act on it.
+        if let Some(declared) = authority.declared_alg
+            && !key.allowed_algs.contains(&declared)
+        {
+            return Err(JwtSvidError::InvalidAuthority(
+                "a JWT authority declares a signature algorithm its key type cannot produce",
+            ));
+        }
+        keys.push(key.to_jwk(&authority.key_id, authority.declared_alg));
     }
 
     let mut document = Map::new();
@@ -231,9 +266,23 @@ pub fn jwks_document(authorities: &[PublishedJwtAuthority]) -> Result<Vec<u8>, J
 /// `kid` is the peer's own, not recomputed, because that is what its tokens
 /// carry.
 ///
-/// Unknown JWK members are ignored (JWKS is an extensible document), but an
-/// entry whose `use` or `key_ops` says it is not for signature verification is
-/// refused rather than repurposed.
+/// Unknown JWK members are ignored (JWKS is an extensible document), but a
+/// *known policy member* is never ignored, and a malformed one is never treated
+/// as absent:
+///
+/// - `use`, if present, must be the string `sig`. A non-string `use` is a
+///   rejection, not an unspecified key.
+/// - `key_ops`, if present, must be an array whose entries are all strings and
+///   which contains `verify`. A non-array `key_ops` (including a bare string)
+///   is a rejection.
+/// - `use` and `key_ops` together must be consistent (RFC 7517 §4.3): with
+///   `use: "sig"` the only permitted operations are `sign` / `verify`, so a
+///   bundle asserting both signature use and an encryption operation is
+///   contradictory and refused.
+/// - `alg`, if present, must be a string naming a supported algorithm, and is
+///   carried onto [`PublishedJwtAuthority::declared_alg`] so validation is
+///   restricted to that one algorithm rather than to everything the key type
+///   could have produced.
 pub fn authorities_from_jwks(
     trust_domain: &crate::identity::spiffe::TrustDomain,
     document: &[u8],
@@ -285,27 +334,14 @@ pub fn authorities_from_jwks(
             }
         };
         validate_key_id(&key_id)?;
-        if let Some(Value::String(use_)) = jwk.get("use")
-            && use_ != "sig"
-        {
-            return Err(JwtSvidError::InvalidAuthority(
-                "JWT bundle JWKS key is not declared for signature use",
-            ));
-        }
-        if let Some(Value::Array(ops)) = jwk.get("key_ops")
-            && !ops
-                .iter()
-                .any(|op| op.as_str().is_some_and(|op| op == "verify"))
-        {
-            return Err(JwtSvidError::InvalidAuthority(
-                "JWT bundle JWKS key does not permit signature verification",
-            ));
-        }
+        check_jwk_key_policy(jwk)?;
+        let declared_alg = jwk_declared_alg(jwk)?;
         let public_key_pem = spki_pem_from_jwk(jwk)?;
         authorities.push(PublishedJwtAuthority {
             trust_domain: trust_domain.clone(),
             key_id,
             public_key_pem,
+            declared_alg,
         });
     }
 
@@ -313,6 +349,108 @@ pub fn authorities_from_jwks(
     // trust-domain binding, total JWKS size).
     validate_published_authorities(trust_domain, &authorities)?;
     Ok(authorities)
+}
+
+/// Operations RFC 7517 §4.3 admits alongside `use: "sig"`. Anything else in
+/// `key_ops` contradicts a signature key and is refused rather than reconciled.
+const SIGNATURE_KEY_OPS: &[&str] = &["sign", "verify"];
+
+/// Validate the `use` / `key_ops` policy members of an externally supplied JWK.
+///
+/// Each member is checked for **type** before value, so a hostile bundle cannot
+/// evade the policy by supplying `"use": 1` or `"key_ops": "verify"` and having
+/// the member skipped as "not the shape we look for". Absence is the only way to
+/// be unspecified.
+fn check_jwk_key_policy(jwk: &Map<String, Value>) -> Result<(), JwtSvidError> {
+    let declared_use = match jwk.get("use") {
+        None => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(JwtSvidError::InvalidAuthority(
+                "JWT bundle JWKS key member 'use' is not a string",
+            ));
+        }
+    };
+    if let Some(value) = declared_use
+        && value != "sig"
+    {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT bundle JWKS key is not declared for signature use",
+        ));
+    }
+
+    let key_ops = match jwk.get("key_ops") {
+        None => None,
+        Some(Value::Array(ops)) => Some(ops),
+        Some(_) => {
+            return Err(JwtSvidError::InvalidAuthority(
+                "JWT bundle JWKS key member 'key_ops' is not an array",
+            ));
+        }
+    };
+    let Some(ops) = key_ops else {
+        return Ok(());
+    };
+    let mut permits_verify = false;
+    for op in ops {
+        let op = op.as_str().ok_or(JwtSvidError::InvalidAuthority(
+            "JWT bundle JWKS key member 'key_ops' contains a non-string entry",
+        ))?;
+        if op == "verify" {
+            permits_verify = true;
+        }
+        // Contradiction check, not merely a presence check: a key that says
+        // `use: "sig"` while also claiming an encryption/derivation operation is
+        // describing two different keys, and guessing which one it meant is
+        // exactly what a fail-closed consumer must not do.
+        if declared_use == Some("sig") && !SIGNATURE_KEY_OPS.contains(&op) {
+            return Err(JwtSvidError::InvalidAuthority(
+                "JWT bundle JWKS key declares signature use with a contradictory key operation",
+            ));
+        }
+    }
+    if !permits_verify {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT bundle JWKS key does not permit signature verification",
+        ));
+    }
+    Ok(())
+}
+
+/// Read a JWK's declared `alg`, if any.
+///
+/// A present member must be a string naming one of the algorithms Ferrum can
+/// verify with. An unknown or symmetric name is refused rather than dropped:
+/// dropping it would silently promote an `HS256`-declared key to the whole
+/// asymmetric family its SPKI happens to support. Compatibility with the key's
+/// actual type is enforced later, in [`validate_published_authorities`], which
+/// is the single gate both publication and validation pass through.
+fn jwk_declared_alg(jwk: &Map<String, Value>) -> Result<Option<Algorithm>, JwtSvidError> {
+    let raw = match jwk.get("alg") {
+        None => return Ok(None),
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(JwtSvidError::InvalidAuthority(
+                "JWT bundle JWKS key member 'alg' is not a string",
+            ));
+        }
+    };
+    let alg = match raw {
+        "ES256" => Algorithm::ES256,
+        "ES384" => Algorithm::ES384,
+        "RS256" => Algorithm::RS256,
+        "RS384" => Algorithm::RS384,
+        "RS512" => Algorithm::RS512,
+        "PS256" => Algorithm::PS256,
+        "PS384" => Algorithm::PS384,
+        "PS512" => Algorithm::PS512,
+        _ => {
+            return Err(JwtSvidError::InvalidAuthority(
+                "JWT bundle JWKS key declares an algorithm this validator does not support",
+            ));
+        }
+    };
+    Ok(Some(alg))
 }
 
 /// Re-encode a JWK public key as an SPKI `PUBLIC KEY` PEM.
@@ -329,62 +467,61 @@ fn spki_pem_from_jwk(jwk: &Map<String, Value>) -> Result<String, JwtSvidError> {
         .ok_or(JwtSvidError::InvalidAuthority(
             "JWT bundle JWKS key entry has no 'kty'",
         ))?;
-    let spki_der = match kty {
-        "EC" => {
-            let crv = jwk
-                .get("crv")
-                .and_then(Value::as_str)
-                .ok_or(JwtSvidError::InvalidAuthority(
-                    "JWT bundle JWKS EC key names no curve",
-                ))?;
-            let (curve_oid, coordinate_bytes) = match crv {
-                "P-256" => (OID_BYTES_P256, 32usize),
-                "P-384" => (OID_BYTES_P384, 48usize),
-                _ => {
+    let spki_der =
+        match kty {
+            "EC" => {
+                let crv = jwk.get("crv").and_then(Value::as_str).ok_or(
+                    JwtSvidError::InvalidAuthority("JWT bundle JWKS EC key names no curve"),
+                )?;
+                let (curve_oid, coordinate_bytes) = match crv {
+                    "P-256" => (OID_BYTES_P256, 32usize),
+                    "P-384" => (OID_BYTES_P384, 48usize),
+                    _ => {
+                        return Err(JwtSvidError::InvalidAuthority(
+                            "unsupported JWT authority EC curve",
+                        ));
+                    }
+                };
+                let x = jwk_base64url_member(jwk, "x", coordinate_bytes)?;
+                let y = jwk_base64url_member(jwk, "y", coordinate_bytes)?;
+                let mut point = Vec::with_capacity(1 + 2 * coordinate_bytes);
+                point.push(0x04);
+                point.extend_from_slice(&x);
+                point.extend_from_slice(&y);
+                let algorithm =
+                    der_sequence(&[der_oid(OID_BYTES_EC_PUBLIC_KEY), der_oid(curve_oid)]);
+                der_sequence(&[algorithm, der_bit_string(&point)])
+            }
+            "RSA" => {
+                // `n` / `e` are unsigned big-endian with no leading zeros
+                // (RFC 7518 §6.3.1). The modulus bound is re-checked by
+                // `jwk_public_key` after the round trip; checking the raw length
+                // here keeps an oversized member from being DER-encoded at all.
+                let modulus = jwk_base64url_bounded(jwk, "n", MAX_SPKI_DER_BYTES)?;
+                let exponent = jwk_base64url_bounded(jwk, "e", MAX_RSA_EXPONENT_BYTES)?;
+                if modulus.len() < MIN_RSA_MODULUS_BYTES {
                     return Err(JwtSvidError::InvalidAuthority(
-                        "unsupported JWT authority EC curve",
+                        "JWT authority RSA public key is smaller than 2048 bits",
                     ));
                 }
-            };
-            let x = jwk_base64url_member(jwk, "x", coordinate_bytes)?;
-            let y = jwk_base64url_member(jwk, "y", coordinate_bytes)?;
-            let mut point = Vec::with_capacity(1 + 2 * coordinate_bytes);
-            point.push(0x04);
-            point.extend_from_slice(&x);
-            point.extend_from_slice(&y);
-            let algorithm = der_sequence(&[der_oid(OID_BYTES_EC_PUBLIC_KEY), der_oid(curve_oid)]);
-            der_sequence(&[algorithm, der_bit_string(&point)])
-        }
-        "RSA" => {
-            // `n` / `e` are unsigned big-endian with no leading zeros
-            // (RFC 7518 §6.3.1). The modulus bound is re-checked by
-            // `jwk_public_key` after the round trip; checking the raw length
-            // here keeps an oversized member from being DER-encoded at all.
-            let modulus = jwk_base64url_bounded(jwk, "n", MAX_SPKI_DER_BYTES)?;
-            let exponent = jwk_base64url_bounded(jwk, "e", MAX_RSA_EXPONENT_BYTES)?;
-            if modulus.len() < MIN_RSA_MODULUS_BYTES {
+                if exponent.is_empty() {
+                    return Err(JwtSvidError::InvalidAuthority(
+                        "JWT authority RSA public key has an empty exponent",
+                    ));
+                }
+                let rsa_public_key = der_sequence(&[
+                    der_positive_integer(&modulus),
+                    der_positive_integer(&exponent),
+                ]);
+                let algorithm = der_sequence(&[der_oid(OID_BYTES_RSA_ENCRYPTION), der_null()]);
+                der_sequence(&[algorithm, der_bit_string(&rsa_public_key)])
+            }
+            _ => {
                 return Err(JwtSvidError::InvalidAuthority(
-                    "JWT authority RSA public key is smaller than 2048 bits",
+                    "unsupported JWT authority key type",
                 ));
             }
-            if exponent.is_empty() {
-                return Err(JwtSvidError::InvalidAuthority(
-                    "JWT authority RSA public key has an empty exponent",
-                ));
-            }
-            let rsa_public_key = der_sequence(&[
-                der_positive_integer(&modulus),
-                der_positive_integer(&exponent),
-            ]);
-            let algorithm = der_sequence(&[der_oid(OID_BYTES_RSA_ENCRYPTION), der_null()]);
-            der_sequence(&[algorithm, der_bit_string(&rsa_public_key)])
-        }
-        _ => {
-            return Err(JwtSvidError::InvalidAuthority(
-                "unsupported JWT authority key type",
-            ));
-        }
-    };
+        };
     if spki_der.len() > MAX_SPKI_DER_BYTES {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority public key DER is empty or oversized",
@@ -525,13 +662,39 @@ fn der_positive_integer(unsigned_be: &[u8]) -> Vec<u8> {
 }
 
 /// Build a `jsonwebtoken` decoding key for a published authority, together
-/// with the algorithms that authority's key type is allowed to have used.
+/// with the algorithms that authority is permitted to have signed with.
+///
+/// The permitted set is the **narrowest** of three things, in order:
+///
+/// 1. the authority's own [`PublishedJwtAuthority::declared_alg`], when it
+///    declared one and the key type could have produced it (a declaration the
+///    key type cannot produce is an error, never a widening);
+/// 2. for an undeclared **RSA** key, `RS256` alone — RFC 7518 §3.1's only
+///    Recommended RSASSA algorithm. Accepting the whole RS*/PS* family for a key
+///    that said nothing would let a consumed bundle be verified under
+///    algorithms its publisher never intended;
+/// 3. otherwise the algorithms the key type can produce, which for the EC curves
+///    Ferrum supports is exactly one anyway.
+///
+/// The token header's `alg` is never an input.
 pub fn decoding_key_for_authority(
     authority: &PublishedJwtAuthority,
 ) -> Result<(DecodingKey, Vec<Algorithm>), JwtSvidError> {
     validate_key_id(&authority.key_id)?;
     let spki_der = spki_der_from_pem(&authority.public_key_pem)?;
     let key = jwk_public_key(&spki_der)?;
+    let allowed_algs = match authority.declared_alg {
+        Some(declared) => {
+            if !key.allowed_algs.contains(&declared) {
+                return Err(JwtSvidError::InvalidAuthority(
+                    "a JWT authority declares a signature algorithm its key type cannot produce",
+                ));
+            }
+            vec![declared]
+        }
+        None if key.kty == "RSA" => vec![Algorithm::RS256],
+        None => key.allowed_algs.clone(),
+    };
     let pem_bytes = authority.public_key_pem.as_bytes();
     let decoding = match key.kty {
         "EC" => DecodingKey::from_ec_pem(pem_bytes),
@@ -543,7 +706,7 @@ pub fn decoding_key_for_authority(
         }
     }
     .map_err(|_| JwtSvidError::InvalidAuthority("JWT authority public key is unusable"))?;
-    Ok((decoding, key.allowed_algs))
+    Ok((decoding, allowed_algs))
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), JwtSvidError> {
@@ -567,9 +730,17 @@ fn validate_key_id(key_id: &str) -> Result<(), JwtSvidError> {
 
 /// Decode exactly one `PUBLIC KEY` PEM block into SPKI DER.
 ///
-/// Rejects multi-block documents outright: an operator (or a federated peer)
-/// concatenating several keys under one `kid` would otherwise silently have
-/// only the first honoured.
+/// The document must contain **only** that block plus surrounding whitespace.
+/// Rejected outright, rather than skipped over:
+///
+/// - anything but whitespace before `-----BEGIN PUBLIC KEY-----` or after
+///   `-----END PUBLIC KEY-----`. Silently accepting arbitrary surrounding data
+///   means the bytes an operator reviewed and the bytes Ferrum trusts are not
+///   the same document — including a second, differently-labelled key envelope
+///   that a reader would reasonably assume was in use;
+/// - a second `PUBLIC KEY` block. An operator (or a federated peer)
+///   concatenating several keys under one `kid` would otherwise silently have
+///   only the first honoured.
 fn spki_der_from_pem(pem: &str) -> Result<Vec<u8>, JwtSvidError> {
     if pem.is_empty() {
         return Err(JwtSvidError::InvalidAuthority(
@@ -581,25 +752,44 @@ fn spki_der_from_pem(pem: &str) -> Result<Vec<u8>, JwtSvidError> {
             "JWT authority public key PEM is too large",
         ));
     }
-    let begin = pem.find(PEM_PUBLIC_KEY_BEGIN).ok_or(
-        JwtSvidError::InvalidAuthority("JWT authority public key is not a PUBLIC KEY PEM block"),
-    )?;
+    let begin = pem
+        .find(PEM_PUBLIC_KEY_BEGIN)
+        .ok_or(JwtSvidError::InvalidAuthority(
+            "JWT authority public key is not a PUBLIC KEY PEM block",
+        ))?;
+    // Only whitespace may precede the envelope.
+    if !pem[..begin].trim().is_empty() {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority public key PEM carries data before its PUBLIC KEY block",
+        ));
+    }
     let body_start = begin + PEM_PUBLIC_KEY_BEGIN.len();
     let rest = &pem[body_start..];
-    let end = rest.find(PEM_PUBLIC_KEY_END).ok_or(
-        JwtSvidError::InvalidAuthority("JWT authority public key PEM block is unterminated"),
-    )?;
+    let end = rest
+        .find(PEM_PUBLIC_KEY_END)
+        .ok_or(JwtSvidError::InvalidAuthority(
+            "JWT authority public key PEM block is unterminated",
+        ))?;
     let after_end = &rest[end + PEM_PUBLIC_KEY_END.len()..];
     if after_end.contains(PEM_PUBLIC_KEY_BEGIN) {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority public key PEM contains more than one block",
         ));
     }
+    // ...and only whitespace may follow it. This subsumes the multi-block check
+    // above for `PUBLIC KEY`, and additionally refuses a trailing envelope of
+    // any other label (`CERTIFICATE`, `EC PRIVATE KEY`, …) rather than ignoring
+    // material an operator would read as part of the document.
+    if !after_end.trim().is_empty() {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority public key PEM carries data after its PUBLIC KEY block",
+        ));
+    }
 
     let base64_body: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
-    let der = STANDARD
-        .decode(base64_body.as_bytes())
-        .map_err(|_| JwtSvidError::InvalidAuthority("JWT authority public key PEM is not base64"))?;
+    let der = STANDARD.decode(base64_body.as_bytes()).map_err(|_| {
+        JwtSvidError::InvalidAuthority("JWT authority public key PEM is not base64")
+    })?;
     if der.is_empty() || der.len() > MAX_SPKI_DER_BYTES {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority public key DER is empty or oversized",
@@ -696,9 +886,13 @@ struct EcCurve {
 /// brainpoolP256r1 has the same 32-byte coordinates as P-256 and must not be
 /// silently verified as `ES256`.
 fn ec_curve(spki: &SubjectPublicKeyInfo<'_>) -> Result<EcCurve, JwtSvidError> {
-    let parameters = spki.algorithm.parameters.as_ref().ok_or(
-        JwtSvidError::InvalidAuthority("JWT authority EC public key names no curve"),
-    )?;
+    let parameters = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .ok_or(JwtSvidError::InvalidAuthority(
+            "JWT authority EC public key names no curve",
+        ))?;
     if parameters.tag() != Tag::Oid {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority EC curve parameter is not an OID",

@@ -95,7 +95,22 @@ pub const MAX_JWT_SVID_TTL_SECS: u64 = 3600;
 /// top of [`MAX_JWT_SVID_TTL_SECS`] when computing the rotation overlap.
 pub const JWT_SVID_CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 /// Default lifetime of a local JWT signing key before it is rotated out.
-pub const DEFAULT_JWT_KEY_LIFETIME_SECS: u64 = 24 * 3600;
+///
+/// **`0` — in-process time-based rotation is off by default**, and it is only
+/// ever available to an *ephemeral* (dev/test) authority. Operator-configured
+/// signing material is rotated **externally**, by supplying a new
+/// `FERRUM_MESH_JWT_SIGNING_KEY_PEM` plus the outgoing key as
+/// `FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM`. An in-process replacement for
+/// configured material would be a *different random key per replica* that no
+/// restart can reload, which is exactly the continuity this authority exists to
+/// provide — see [`authority::LocalJwtAuthority`].
+pub const DEFAULT_JWT_KEY_LIFETIME_SECS: u64 = 0;
+
+/// Default lifetime of an **ephemeral** (dev/test) JWT signing key. Only
+/// meaningful when [`authority::LocalJwtAuthorityConfig::allow_ephemeral_key`]
+/// is set: a process-local key is already discontinuous across restart, so
+/// rotating it in process costs nothing that was not already lost.
+pub const DEFAULT_EPHEMERAL_JWT_KEY_LIFETIME_SECS: u64 = 24 * 3600;
 
 /// The rotation verification overlap: how long a retired signing key stays
 /// published after it is replaced.

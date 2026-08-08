@@ -85,12 +85,29 @@ fn signing_key_pem() -> String {
         .serialize_pem()
 }
 
+/// Which JWT signing posture a server instance runs.
+///
+/// The two are not interchangeable, and the difference is the point of several
+/// tests below: **configured** material is the production posture and rotates
+/// externally (Ferrum refuses to generate a process-local replacement for it),
+/// while **ephemeral** is the dev/test posture that has no continuity to lose
+/// and therefore keeps in-process rotation.
+#[derive(Clone)]
+enum JwtKeySource {
+    Configured(String),
+    Ephemeral,
+}
+
 /// Build an `internal` CA with a *configured* (stable) JWT signing key.
 ///
 /// The X.509 root is bootstrapped per call — it plays no part in the JWT
 /// assertions, which is itself the point: JWT signing material is separate from
 /// the certificate root, so a fresh root does not disturb JWT continuity.
 fn internal_ca_with_jwt_key(jwt_key_pem: &str) -> Arc<internal::InternalCa> {
+    internal_ca_with_jwt_source(&JwtKeySource::Configured(jwt_key_pem.to_string()))
+}
+
+fn internal_ca_with_jwt_source(source: &JwtKeySource) -> Arc<internal::InternalCa> {
     // `bootstrap_dev_root` is double-gated on these two reads. This process is a
     // test binary, never a serving gateway.
     //
@@ -103,6 +120,10 @@ fn internal_ca_with_jwt_key(jwt_key_pem: &str) -> Arc<internal::InternalCa> {
     }
     let root = bootstrap::bootstrap_dev_root(bootstrap::BootstrapConfig::new(trust_domain()))
         .expect("dev root bootstraps");
+    let (jwt_signing_key_pem, allow_ephemeral_jwt_key) = match source {
+        JwtKeySource::Configured(pem) => (Some(zeroize::Zeroizing::new(pem.clone())), false),
+        JwtKeySource::Ephemeral => (None, true),
+    };
     Arc::new(
         internal::InternalCa::new(internal::InternalCaConfig {
             root_cert_pem: root.root_cert_pem,
@@ -111,12 +132,12 @@ fn internal_ca_with_jwt_key(jwt_key_pem: &str) -> Arc<internal::InternalCa> {
             bundle_refresh_hint_secs: None,
             default_svid_ttl_secs: 600,
             max_svid_ttl_secs: 3600,
-            jwt_signing_key_pem: Some(zeroize::Zeroizing::new(jwt_key_pem.to_string())),
+            jwt_signing_key_pem,
             jwt_retired_key_pems: Vec::new(),
             // Rotation is driven explicitly in these tests; the scheduled cadence
             // is covered by unit tests.
             jwt_key_lifetime_secs: 0,
-            allow_ephemeral_jwt_key: false,
+            allow_ephemeral_jwt_key,
         })
         .expect("internal CA builds"),
     )
@@ -154,8 +175,10 @@ async fn connect(path: &Path) -> SpiffeWorkloadApiClient<Channel> {
 /// Every Workload API RPC must carry the mandatory metadata header.
 fn workload_request<T>(payload: T) -> Request<T> {
     let mut req = Request::new(payload);
-    req.metadata_mut()
-        .insert("workload.spiffe.io", AsciiMetadataValue::from_static("true"));
+    req.metadata_mut().insert(
+        "workload.spiffe.io",
+        AsciiMetadataValue::from_static("true"),
+    );
     req
 }
 
@@ -171,8 +194,12 @@ struct Harness {
 
 impl Harness {
     async fn start(label: &str, jwt_key_pem: &str) -> Self {
+        Self::start_with(label, JwtKeySource::Configured(jwt_key_pem.to_string())).await
+    }
+
+    async fn start_with(label: &str, source: JwtKeySource) -> Self {
         let path = socket_path(label);
-        let ca = internal_ca_with_jwt_key(jwt_key_pem);
+        let ca = internal_ca_with_jwt_source(&source);
         let rotation_signal = Arc::new(tokio::sync::watch::channel(0u64).0);
         let service = WorkloadApiService::with_rotation_signal(
             vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
@@ -297,7 +324,11 @@ async fn a_requested_spiffe_id_the_workload_is_not_entitled_to_is_denied() {
 
 #[tokio::test]
 async fn a_jwt_key_rotation_republishes_the_bundle_on_an_open_stream() {
-    let harness = Harness::start("rot", &signing_key_pem()).await;
+    // The EPHEMERAL posture, deliberately: it is the only one with in-process
+    // key rotation. Configured material rotates by rolling new configuration —
+    // covered by `a_configured_authority_refuses_in_process_rotation` below and
+    // by the restart-continuity test.
+    let harness = Harness::start_with("rot", JwtKeySource::Ephemeral).await;
     let mut client = connect(&harness.path).await;
 
     let mut bundles = client
@@ -482,4 +513,218 @@ async fn shutdown_removes_only_the_socket_ferrum_created() {
         "a foreign artifact must never be deleted"
     );
     std::fs::remove_file(&path).expect("test cleanup");
+}
+
+#[tokio::test]
+async fn a_configured_authority_refuses_in_process_rotation() {
+    // The P1 continuity contract, over the live surface: a server running on
+    // operator-configured signing material must not replace that material with
+    // a process-local key. Doing so would publish a different JWKS on every
+    // replica and lose the signer of every still-live token on restart.
+    let harness = Harness::start("noroti", &signing_key_pem()).await;
+    let authority = harness
+        .ca
+        .jwt_authority()
+        .expect("configured signing material yields a JWT authority");
+    assert!(
+        !authority.allows_in_process_rotation(),
+        "configured material must be externally rotated"
+    );
+
+    let key_id_before = authority.active_key_id();
+    let generation_before = authority.generation();
+    let refused = authority
+        .rotate()
+        .await
+        .expect_err("in-process rotation of configured material must be refused");
+    assert!(
+        matches!(
+            refused,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::RotationRefused(_)
+        ),
+        "expected RotationRefused, got {refused:?}"
+    );
+    assert_eq!(authority.generation(), generation_before);
+    assert_eq!(authority.active_key_id(), key_id_before);
+
+    // The scheduled path is a permanent no-op too, so a rotation task cannot
+    // reach the refusal on every tick.
+    assert_eq!(
+        authority.rotate_if_due().await.expect("no-op succeeds"),
+        None
+    );
+
+    // And the surface still mints and validates against the unchanged key.
+    let mut client = connect(&harness.path).await;
+    let minted = client
+        .fetch_jwtsvid(workload_request(JwtsvidRequest {
+            audience: vec!["spiffe://audience.test/api".to_string()],
+            spiffe_id: String::new(),
+        }))
+        .await
+        .expect("FetchJWTSVID still succeeds")
+        .into_inner();
+    client
+        .validate_jwtsvid(workload_request(ValidateJwtsvidRequest {
+            audience: "spiffe://audience.test/api".to_string(),
+            svid: minted.svids[0].svid.clone(),
+        }))
+        .await
+        .expect("the token validates against the unchanged authority");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_replicas_on_one_configuration_validate_each_others_tokens() {
+    // The HA half of the continuity contract: two independently started servers
+    // handed the SAME signing material are one trust-domain authority. A token
+    // minted by either must validate on the other, with no shared state.
+    let jwt_key = signing_key_pem();
+    let replica_a = Harness::start("repl-a", &jwt_key).await;
+    let replica_b = Harness::start("repl-b", &jwt_key).await;
+
+    let mut client_a = connect(&replica_a.path).await;
+    let minted = client_a
+        .fetch_jwtsvid(workload_request(JwtsvidRequest {
+            audience: vec!["spiffe://audience.test/api".to_string()],
+            spiffe_id: String::new(),
+        }))
+        .await
+        .expect("FetchJWTSVID succeeds on replica A")
+        .into_inner();
+
+    let mut client_b = connect(&replica_b.path).await;
+    let validated = client_b
+        .validate_jwtsvid(workload_request(ValidateJwtsvidRequest {
+            audience: "spiffe://audience.test/api".to_string(),
+            svid: minted.svids[0].svid.clone(),
+        }))
+        .await
+        .expect("replica B validates replica A's token")
+        .into_inner();
+    assert_eq!(validated.spiffe_id, workload_id().as_str());
+
+    // Their published bundles are byte-identical, which is what makes any
+    // relying party unable to tell the two replicas apart.
+    let jwks_of = |harness: &Harness| {
+        ferrum_edge::identity::jwt_svid::jwks_document(
+            &harness
+                .ca
+                .jwt_signer()
+                .expect("configured material yields a signer")
+                .authorities(),
+        )
+        .expect("JWKS builds")
+    };
+    assert_eq!(
+        jwks_of(&replica_a),
+        jwks_of(&replica_b),
+        "two replicas of one configuration must publish a byte-identical JWKS"
+    );
+
+    replica_a.shutdown().await;
+    replica_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_bound_socket_carries_the_configured_mode_and_is_owned_by_this_process() {
+    // The bound identity Ferrum verifies before serving: a socket, owned by this
+    // process, at exactly the configured mode. The mode is applied through the
+    // umask at `bind` and then VERIFIED, so a permissive ambient umask can
+    // neither widen the endpoint nor be served un-narrowed. (This asserts the
+    // end state; the umask here is process-global and other tests in this
+    // binary bind concurrently, so it is not a proof about the intermediate
+    // window — the module contract covers that.)
+    let previous = unsafe { libc::umask(0o000) };
+    let harness = Harness::start("mode", &signing_key_pem()).await;
+    unsafe {
+        libc::umask(previous);
+    }
+
+    let metadata = std::fs::symlink_metadata(&harness.path).expect("socket exists after bind");
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(
+            metadata.mode() & 0o777,
+            SOCKET_MODE,
+            "a permissive ambient umask must not widen the credential endpoint"
+        );
+        assert_eq!(
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            "the bound socket must be owned by this process"
+        );
+    }
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_does_not_unlink_an_artifact_that_replaced_our_socket() {
+    // The replacement race: if something takes over the path while Ferrum is
+    // serving, the inode-checked cleanup must leave the replacement alone rather
+    // than deleting an artifact Ferrum never created.
+    let harness = Harness::start("replace", &signing_key_pem()).await;
+    let path = harness.path.clone();
+    assert!(path.exists(), "the socket exists while serving");
+
+    // Replace the inode at the path (the shape a hostile or a restarted peer
+    // would produce), then shut down.
+    std::fs::remove_file(&path).expect("test removes the bound socket");
+    std::fs::write(&path, b"someone else's artifact").expect("test writes a replacement");
+    harness.shutdown().await;
+
+    assert_eq!(
+        std::fs::read(&path).expect("the replacement survives shutdown"),
+        b"someone else's artifact",
+        "cleanup must unlink only the exact inode Ferrum bound"
+    );
+    std::fs::remove_file(&path).expect("test cleanup");
+}
+
+#[tokio::test]
+async fn a_socket_path_under_an_untrusted_ancestor_is_refused_before_bind() {
+    // Validation covers every directory component, so a pristine parent under a
+    // world-writable ancestor is still refused — and nothing is created.
+    let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_nanos();
+    let ancestor = base.join(format!("fe-wl-anc-{}", unique % 1_000_000_000));
+    let parent = ancestor.join("p");
+    std::fs::create_dir_all(&parent).expect("create ancestor/parent");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod parent");
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod ancestor");
+    }
+    let socket = parent.join("api.sock");
+
+    let ca = internal_ca_with_jwt_key(&signing_key_pem());
+    let service = WorkloadApiService::new(
+        vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
+        ca as Arc<dyn CertificateAuthority>,
+        trust_domain(),
+        600,
+    );
+    let config =
+        WorkloadApiSocketConfig::from_parts(socket.clone(), "0660").expect("mode parses");
+    let refused = serve_workload_api(service, config)
+        .await
+        .expect_err("a world-writable ancestor must be refused before bind");
+    assert!(
+        refused.to_string().contains("group- or world-writable"),
+        "unexpected refusal reason: {refused}"
+    );
+    assert!(
+        !socket.exists(),
+        "a refused configuration must not have created a socket"
+    );
+
+    let _ = std::fs::remove_dir_all(&ancestor);
 }

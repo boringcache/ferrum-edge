@@ -12513,10 +12513,11 @@ fn configured_mesh_workload_spiffe_id(
 /// source of truth.
 struct MeshCaBackendSource {
     inbound_slot: tls::SharedBundleSlot,
-    /// `None` when the Workload API surface is disabled and the backend has no
-    /// other reason to hold a `CertificateAuthority` handle. The SPIRE backend in
-    /// particular opens its own agent streams, so it is constructed only when
-    /// something will actually read from it.
+    /// `None` when the backend cannot issue for an **attested downstream
+    /// workload**, which is the only issuance the Workload API surface needs.
+    /// The SPIRE backend is exactly that case: it fetches Ferrum's own agent
+    /// SVID and refuses every other subject, so it supplies no authority here
+    /// and enabling the surface against it is refused at config validation.
     ca: Option<crate::identity::ca::SharedCa>,
     workload_spiffe_id: crate::identity::SpiffeId,
     /// Bumped by the runtime authority path on SVID *and* JWT key rotation. The
@@ -12558,7 +12559,7 @@ async fn start_mesh_ca_backend_svid_source(
     let rotation_signal = Arc::new(proxy_state.backend_svid_rotation_tx.clone());
     match backend {
         CaBackend::SpireAgent => {
-            let (slot, ca) = start_spire_agent_mesh_svid_source(
+            let slot = start_spire_agent_mesh_svid_source(
                 proxy_state,
                 env_config,
                 &workload_spiffe_id,
@@ -12568,10 +12569,17 @@ async fn start_mesh_ca_backend_svid_source(
                 shutdown_rx,
             )
             .await?;
-            let ca = ca.map(|ca| ca as crate::identity::ca::SharedCa);
             Ok(Some(MeshCaBackendSource {
                 inbound_slot: slot,
-                ca,
+                // A SPIRE agent issues only the CALLING process's own identity:
+                // `SpireAgentCa::issue_svid` returns Ferrum's own agent SVID and
+                // refuses any other subject, and SPIRE authorizes `FetchJWTSVID`
+                // by the calling process too. There is therefore no authority
+                // here that could serve an attested downstream workload, so this
+                // backend supplies none — and `EnvConfig::validate` refuses the
+                // Workload-API-plus-spire combination outright rather than
+                // letting it bind a surface that could only mis-issue or refuse.
+                ca: None,
                 workload_spiffe_id,
                 rotation_signal,
             }))
@@ -12606,13 +12614,7 @@ async fn start_spire_agent_mesh_svid_source(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<
-    (
-        tls::SharedBundleSlot,
-        Option<Arc<crate::identity::ca::spire::SpireAgentCa>>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<tls::SharedBundleSlot, anyhow::Error> {
     let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
         proxy_state.gateway_svid_bundle.clone(),
     )
@@ -12694,28 +12696,13 @@ async fn start_spire_agent_mesh_svid_source(
             }
         }
     }));
-    // A `SpireAgentCa` alongside the fetch loop serves the Workload API surface's
-    // trust material (X.509 bundles, plus the agent's JWT bundles once it
-    // publishes them). It opens its OWN agent streams, so it is constructed only
-    // when the surface that reads it is actually enabled — an unconditional
-    // second pair of streams to the agent would be pure waste on every mesh that
-    // does not serve the Workload API. `SpireAgentCa::new` blocks only until its
-    // own initial SVID or a bounded timeout, and its JWT bundle stream is
-    // independent of that readiness.
-    let ca = if env_config.mesh_workload_api_enabled {
-        Some(Arc::new(
-            crate::identity::ca::spire::SpireAgentCa::new(
-                crate::identity::ca::spire::SpireAgentCaConfig {
-                    socket_path: env_config.mesh_spire_agent_socket.clone(),
-                    cert_ttl_secs: env_config.mesh_cert_ttl_seconds,
-                },
-            )
-            .await?,
-        ))
-    } else {
-        None
-    };
-    Ok((inbound_slot, ca))
+    // No `SpireAgentCa` is constructed here. It could only serve Ferrum's OWN
+    // agent-issued identity, never an attested downstream workload's, so it
+    // cannot back a Workload API surface — and `EnvConfig::validate` refuses
+    // that combination outright. Opening a second pair of agent streams for a
+    // capability nothing can use would be pure waste. Ferrum still CONSUMES
+    // SPIRE's trust material for peer verification through the fetch loop above.
+    Ok(inbound_slot)
 }
 
 async fn start_internal_mesh_svid_source(
@@ -12902,10 +12889,18 @@ async fn start_mesh_workload_api_server(
     source: &MeshCaBackendSource,
 ) -> Result<crate::identity::workload_api::WorkloadApiListener, anyhow::Error> {
     let trust_domain = source.workload_spiffe_id.trust_domain().clone();
+    // Defence in depth behind `EnvConfig::validate`'s backend gate: only a
+    // backend that can mint for an ATTESTED DOWNSTREAM identity supplies a
+    // `ca` here. The SPIRE backend deliberately supplies none — it can issue
+    // only Ferrum's own identity — so this is the same refusal, restated where
+    // the surface is actually stood up.
     let ca = source.ca.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "FERRUM_MESH_WORKLOAD_API_ENABLED=true but the selected FERRUM_MESH_CA_BACKEND \
-             supplied no certificate authority to mint from"
+             cannot issue for an attested downstream workload, so it supplies no certificate \
+             authority to mint from. Use FERRUM_MESH_CA_BACKEND=internal with \
+             FERRUM_MESH_JWT_SIGNING_KEY_PEM, or point workloads at their local SPIRE agent \
+             socket instead"
         )
     })?;
     let attestors = build_mesh_workload_api_attestors(env_config, &trust_domain)?;
@@ -13089,7 +13084,10 @@ fn parse_workload_api_unix_identity_rule(
 /// generation on a rotation.
 ///
 /// A backend with no JWT authority (SPIRE agent, the upstream scaffolds) returns
-/// `None` from `jwt_signer()` and this is a no-op.
+/// `None` from `jwt_signer()` and this is a no-op — and so is an authority built
+/// from **operator-configured** signing material, which rotates externally by
+/// rolling new configuration rather than in process. In practice only the
+/// dev/test ephemeral key ever rotates here.
 ///
 /// Neither failure mode loses anything: a **refused** rotation means the
 /// authority declined to evict a retired key that can still validate a live
