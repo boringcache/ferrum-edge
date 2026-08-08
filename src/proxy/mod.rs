@@ -5992,6 +5992,14 @@ fn gateway_svid_source_set_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
 /// baseline is taken from material at or before what the live slot ends up
 /// holding, so a startup-window change costs one redundant rotation instead of
 /// a silently stale identity.
+///
+/// A prime that cannot read every source is *not* necessarily fatal: the bundle
+/// load that follows re-reads the sources, so a transiently unavailable one can
+/// have recovered in between and construction succeeds with a live bundle this
+/// tracker never fingerprinted. `GatewaySvidSourceTracker::prime` latches a
+/// forced first publish for exactly that case, so the first complete
+/// fingerprint set is reloaded and published rather than adopted as a silent
+/// baseline.
 fn prime_gateway_svid_rotation_baseline(
     env_config: &EnvConfig,
 ) -> Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)> {
@@ -6000,9 +6008,11 @@ fn prime_gateway_svid_rotation_baseline(
     let mut tracker =
         GatewaySvidSourceTracker::new(&sources, GATEWAY_SVID_FILE_POLL_INTERVAL, provider_interval);
     if tracker.is_watchable() {
-        // An unreadable source simply leaves the baseline unset and the loop
-        // establishes it later; the startup bundle load immediately after this
-        // reports the real error and fails construction.
+        // An unreadable source leaves the baseline unset. If the bundle load
+        // immediately after this also fails, construction fails and nothing
+        // downstream runs; if it succeeds because the source recovered in
+        // between, the latched forced first publish makes the watcher's first
+        // complete read reload and publish instead of baselining silently.
         tracker.prime(std::time::Instant::now());
     }
     Some((sources, tracker))
