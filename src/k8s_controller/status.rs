@@ -485,7 +485,9 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                     );
                 }
                 "ServiceImport"
-                    if crate::config_sources::k8s::backend_ref::is_service_import_object(object) =>
+                    if crate::config_sources::k8s::backend_ref::is_service_import_object(
+                        object,
+                    ) =>
                 {
                     service_imports_by_ns_name.insert(
                         (

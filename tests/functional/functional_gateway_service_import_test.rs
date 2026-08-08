@@ -118,11 +118,9 @@ fn translated_config_yaml(backend_port: u16, protocol: &str) -> String {
         TrustDomain::new("cluster.local").expect("test trust domain"),
     )
     .with_pod_discovery_enabled(true);
-    let translated = translate_k8s_objects(
-        &service_import_snapshot(backend_port, protocol),
-        options,
-    )
-    .expect("ServiceImport snapshot should translate");
+    let translated =
+        translate_k8s_objects(&service_import_snapshot(backend_port, protocol), options)
+            .expect("ServiceImport snapshot should translate");
 
     if protocol == "TCP" {
         assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");

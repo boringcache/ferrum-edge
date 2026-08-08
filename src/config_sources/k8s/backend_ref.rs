@@ -259,9 +259,9 @@ pub(crate) fn service_import_port_error_message(
         (ServiceImportPortError::UnsupportedProtocol, None) => format!(
             "backendRef ServiceImport '{namespace}/{name}' does not expose a supported TCP port"
         ),
-        (ServiceImportPortError::BackendNotFound, Some(port)) => format!(
-            "backendRef ServiceImport '{namespace}/{name}' port {port} was not found"
-        ),
+        (ServiceImportPortError::BackendNotFound, Some(port)) => {
+            format!("backendRef ServiceImport '{namespace}/{name}' port {port} was not found")
+        }
         (ServiceImportPortError::BackendNotFound, None) => format!(
             "backendRef ServiceImport '{namespace}/{name}' must expose exactly one TCP port when backendRefs[].port is omitted"
         ),
@@ -386,11 +386,8 @@ where
 
     match backend_kind {
         BackendKind::Service => {
-            let backend_port = requested_port.unwrap_or(if route.kind == "GRPCRoute" {
-                50051
-            } else {
-                80
-            });
+            let backend_port =
+                requested_port.unwrap_or(if route.kind == "GRPCRoute" { 50051 } else { 80 });
             if !inventory.has_any_service {
                 return None;
             }

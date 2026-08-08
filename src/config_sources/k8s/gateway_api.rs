@@ -5487,13 +5487,13 @@ fn route_backends(
         let requested_port =
             optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?;
         let backend_port = match backend_kind {
-            super::backend_ref::BackendKind::Service => requested_port.unwrap_or(
-                if object.kind == "GRPCRoute" {
+            super::backend_ref::BackendKind::Service => {
+                requested_port.unwrap_or(if object.kind == "GRPCRoute" {
                     50051
                 } else {
                     80
-                },
-            ),
+                })
+            }
             super::backend_ref::BackendKind::ServiceImport => {
                 match super::backend_ref::resolve_service_import_port(
                     acc,

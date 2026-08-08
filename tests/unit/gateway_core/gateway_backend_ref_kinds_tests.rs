@@ -469,12 +469,7 @@ fn service_import_protocol_admission_is_fail_closed_with_status_parity() {
             "multicluster.x-k8s.io/v1alpha1",
             json!([{ "port": 8080, "protocol": protocol }]),
         );
-        let objects = vec![
-            ferrum_gateway_class(),
-            ferrum_gateway(),
-            route,
-            import,
-        ];
+        let objects = vec![ferrum_gateway_class(), ferrum_gateway(), route, import];
 
         let translation = translate_k8s_objects(&objects, options())
             .expect("unsupported transport should become a fail-closed HTTP route");
@@ -556,12 +551,7 @@ fn wrong_api_group_service_import_never_satisfies_backend_ref() {
         json!([{ "port": 8080, "protocol": "TCP" }]),
     );
 
-    let objects = vec![
-        ferrum_gateway_class(),
-        ferrum_gateway(),
-        route,
-        impostor,
-    ];
+    let objects = vec![ferrum_gateway_class(), ferrum_gateway(), route, impostor];
     let translation = translate_k8s_objects(&objects, options())
         .expect("wrong-group object should not satisfy the typed ref");
     assert_fault_route(&translation);
