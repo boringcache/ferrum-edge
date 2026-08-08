@@ -484,7 +484,9 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                         object,
                     );
                 }
-                "ServiceImport" => {
+                "ServiceImport"
+                    if crate::config_sources::k8s::backend_ref::is_service_import_object(object) =>
+                {
                     service_imports_by_ns_name.insert(
                         (
                             object.metadata.namespace.as_str(),
@@ -3042,6 +3044,9 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
                     message,
                 )
                 || crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message)
+                || crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_protocol(
+                    message,
+                )
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -3049,6 +3054,13 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
 
 fn reference_resolution_reason(error: &K8sTranslateError) -> &'static str {
     match error {
+        K8sTranslateError::InvalidResource { message, .. }
+            if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_protocol(
+                message,
+            ) =>
+        {
+            "UnsupportedProtocol"
+        }
         K8sTranslateError::InvalidResource { message, .. }
             if crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message) =>
         {

@@ -67,14 +67,40 @@ fn http_route_with_parent(name: &str, namespace: &str, backend_refs: Value) -> K
 }
 
 fn service_import(name: &str, namespace: &str, port: u16) -> K8sObject {
+    service_import_with_ports(
+        name,
+        namespace,
+        "multicluster.x-k8s.io/v1alpha1",
+        json!([{ "port": port, "protocol": "TCP" }]),
+    )
+}
+
+fn service_import_with_ports(
+    name: &str,
+    namespace: &str,
+    api_version: &str,
+    ports: Value,
+) -> K8sObject {
     object(
         "ServiceImport",
         name,
         namespace,
-        "multicluster.x-k8s.io/v1alpha1",
+        api_version,
         json!({
             "type": "ClusterSetIP",
-            "ports": [{ "port": port, "protocol": "TCP" }]
+            "ports": ports
+        }),
+    )
+}
+
+fn tcp_route(name: &str, namespace: &str, backend_refs: Value) -> K8sObject {
+    object(
+        "TCPRoute",
+        name,
+        namespace,
+        "gateway.networking.k8s.io/v1alpha2",
+        json!({
+            "rules": [{ "backendRefs": backend_refs }]
         }),
     )
 }
@@ -421,5 +447,177 @@ fn service_import_endpoint_slice_expansion_when_pod_discovery_enabled() {
     let translation = translate_k8s_objects(&[route, import, slice], opts)
         .expect("ServiceImport EndpointSlice expansion should translate");
     assert_eq!(translation.config.proxies[0].backend_host, "10.0.0.10");
+    assert_eq!(translation.config.proxies[0].backend_port, 8080);
+}
+
+#[test]
+fn service_import_protocol_admission_is_fail_closed_with_status_parity() {
+    for protocol in [json!("UDP"), json!("SCTP"), json!(7)] {
+        let route = http_route_with_parent(
+            "store",
+            "default",
+            json!([{
+                "group": "multicluster.x-k8s.io",
+                "kind": "ServiceImport",
+                "name": "store",
+                "port": 8080
+            }]),
+        );
+        let import = service_import_with_ports(
+            "store",
+            "default",
+            "multicluster.x-k8s.io/v1alpha1",
+            json!([{ "port": 8080, "protocol": protocol }]),
+        );
+        let objects = vec![
+            ferrum_gateway_class(),
+            ferrum_gateway(),
+            route,
+            import,
+        ];
+
+        let translation = translate_k8s_objects(&objects, options())
+            .expect("unsupported transport should become a fail-closed HTTP route");
+        assert_fault_route(&translation);
+
+        let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+        let route_update = updates
+            .iter()
+            .find(|update| update.kind == "HTTPRoute" && update.name == "store")
+            .expect("HTTPRoute status update");
+        let conditions = route_update.status["parents"][0]["conditions"]
+            .as_array()
+            .expect("route conditions");
+        let resolved = find_condition(conditions, "ResolvedRefs");
+        assert_eq!(resolved["status"], "False");
+        assert_eq!(resolved["reason"], "UnsupportedProtocol");
+    }
+}
+
+#[test]
+fn omitted_service_import_port_derives_only_one_tcp_candidate() {
+    let route = http_route(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store"
+        }]),
+    );
+    let one_tcp = service_import_with_ports(
+        "store",
+        "default",
+        "multicluster.x-k8s.io/v1alpha1",
+        json!([
+            { "port": 8080 },
+            { "port": 5353, "protocol": "UDP" }
+        ]),
+    );
+    let derived = translate_k8s_objects(&[route.clone(), one_tcp], options())
+        .expect("one default-TCP port should derive");
+    assert_eq!(derived.config.proxies[0].backend_port, 8080);
+
+    let ambiguous = service_import_with_ports(
+        "store",
+        "default",
+        "multicluster.x-k8s.io/v1alpha1",
+        json!([
+            { "port": 8080, "protocol": "TCP" },
+            { "port": 8443, "protocol": "TCP" }
+        ]),
+    );
+    let rejected = translate_k8s_objects(&[route, ambiguous], options())
+        .expect("ambiguous custom-backend port should fail closed");
+    assert_fault_route(&rejected);
+
+    let core_service = http_route("core", "default", json!([{ "name": "api" }]));
+    let historical = translate_k8s_objects(&[core_service], options())
+        .expect("core Service defaults are unchanged");
+    assert_eq!(historical.config.proxies[0].backend_port, 80);
+}
+
+#[test]
+fn wrong_api_group_service_import_never_satisfies_backend_ref() {
+    let route = http_route_with_parent(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store",
+            "port": 8080
+        }]),
+    );
+    let impostor = service_import_with_ports(
+        "store",
+        "default",
+        "example.test/v1alpha1",
+        json!([{ "port": 8080, "protocol": "TCP" }]),
+    );
+
+    let objects = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway(),
+        route,
+        impostor,
+    ];
+    let translation = translate_k8s_objects(&objects, options())
+        .expect("wrong-group object should not satisfy the typed ref");
+    assert_fault_route(&translation);
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    let route_update = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == "store")
+        .expect("HTTPRoute status update");
+    let conditions = route_update.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("route conditions");
+    let resolved = find_condition(conditions, "ResolvedRefs");
+    assert_eq!(resolved["status"], "False");
+    assert_eq!(resolved["reason"], "BackendNotFound");
+}
+
+#[test]
+fn stream_service_import_uses_stable_dns_and_derives_single_port() {
+    let route = tcp_route(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store"
+        }]),
+    );
+    let import = service_import("store", "default", 8080);
+    let mut slice = object(
+        "EndpointSlice",
+        "store-mcs",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({
+            "ports": [{ "port": 8080 }],
+            "endpoints": [
+                { "addresses": ["10.0.0.10"], "conditions": { "ready": true } },
+                { "addresses": ["10.0.0.11"], "conditions": { "ready": true } }
+            ]
+        }),
+    );
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+
+    let translation = translate_k8s_objects(
+        &[route, import, slice],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("stream ServiceImport should use a stable ClusterSet target");
+    assert_eq!(translation.config.proxies.len(), 1);
+    assert_eq!(
+        translation.config.proxies[0].backend_host,
+        "store.default.svc.clusterset.local"
+    );
     assert_eq!(translation.config.proxies[0].backend_port, 8080);
 }

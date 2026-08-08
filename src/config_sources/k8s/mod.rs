@@ -659,11 +659,12 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
-    /// MCS `ServiceImport` port inventory (`namespace → name → ports`) for
-    /// Gateway API `backendRef` resolution (GEP-1748). Presence of a key means
-    /// the import was observed; an empty port set still counts as existing so
+    /// MCS `ServiceImport` port inventory (`namespace → name → port → protocol`)
+    /// for Gateway API `backendRef` resolution (GEP-1748). Presence of a key
+    /// means the import was observed; an empty map still counts as existing so
     /// "import present, port unknown" is distinct from "import missing".
-    service_import_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
+    service_import_ports:
+        HashMap<String, HashMap<String, HashMap<u16, backend_ref::ServiceImportPortProtocol>>>,
     /// Bounded per-Service port metadata (`namespace → service → ports`) that
     /// retains the L4 transport of `spec.ports[].protocol`.
     ///
@@ -814,7 +815,7 @@ impl K8sAccumulator {
         &mut self,
         namespace: String,
         name: String,
-        ports: HashSet<u16>,
+        ports: HashMap<u16, backend_ref::ServiceImportPortProtocol>,
     ) {
         self.service_import_ports
             .entry(namespace)
@@ -822,22 +823,14 @@ impl K8sAccumulator {
             .insert(name, ports);
     }
 
-    pub(crate) fn service_import_exists(&self, namespace: &str, name: &str) -> bool {
-        self.service_import_ports
-            .get(namespace)
-            .is_some_and(|imports| imports.contains_key(name))
-    }
-
-    pub(crate) fn service_import_port_exists(
+    pub(crate) fn service_import_port_index(
         &self,
         namespace: &str,
         name: &str,
-        port: u16,
-    ) -> bool {
+    ) -> Option<&HashMap<u16, backend_ref::ServiceImportPortProtocol>> {
         self.service_import_ports
             .get(namespace)
             .and_then(|imports| imports.get(name))
-            .is_some_and(|ports| ports.contains(&port))
     }
 
     pub(crate) fn endpoint_route_backends_for_service(
@@ -1271,7 +1264,7 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
-        } else if object.kind == "ServiceImport" {
+        } else if backend_ref::is_service_import_object(object) {
             // GEP-1748: MCS ServiceImport as a Gateway API backendRef target.
             // EndpointSlices for imports are collected via the core EndpointSlice
             // path (`multicluster.kubernetes.io/service-name`) when pod discovery
@@ -1405,7 +1398,7 @@ where
 
         // MCS ServiceImport objects are consumed by the backendRef pre-pass;
         // they do not materialize as standalone Ferrum resources.
-        if object.kind == "ServiceImport" {
+        if backend_ref::is_service_import_object(object) {
             continue;
         }
 

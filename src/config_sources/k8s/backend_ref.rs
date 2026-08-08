@@ -4,6 +4,8 @@
 //! boundary so status cannot claim support that traffic does not receive.
 //! Resolution and materialization run at reconcile/load time only.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use super::{
@@ -18,6 +20,24 @@ pub(crate) const SERVICE_IMPORT_KIND: &str = "ServiceImport";
 /// Fixed MCS ClusterSet DNS suffix. Unlike cluster-local Services, this is not
 /// derived from `cluster_domain` — MCS DNS publishes `*.svc.clusterset.local`.
 pub(crate) const SERVICE_IMPORT_CLUSTERSET_DOMAIN: &str = "clusterset.local";
+
+/// L4 protocol admission retained from an MCS `ServiceImport` port.
+///
+/// Gateway API HTTP, gRPC, TCP, and TLS backends all require a TCP transport.
+/// Keep every other or malformed protocol as an explicit rejection instead of
+/// collapsing it into mere port existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceImportPortProtocol {
+    Tcp,
+    Unsupported,
+}
+
+/// Field-specific failure while resolving a `ServiceImport` backend port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceImportPortError {
+    BackendNotFound,
+    UnsupportedProtocol,
+}
 
 /// Supported Gateway API `backendRef` target kinds Ferrum can materialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +148,14 @@ fn api_group(api_version: &str) -> &str {
         .unwrap_or_default()
 }
 
+/// Whether this object is an MCS `ServiceImport` from the exact API group.
+///
+/// Version is deliberately independent, but a same-kind object from another
+/// API group must never satisfy target existence or status resolution.
+pub(crate) fn is_service_import_object(object: &K8sObject) -> bool {
+    object.kind == SERVICE_IMPORT_KIND && api_group(&object.api_version) == SERVICE_IMPORT_GROUP
+}
+
 /// DNS hostname for a resolved backend target.
 pub(crate) fn backend_dns_name(
     kind: BackendKind,
@@ -166,10 +194,84 @@ pub(crate) fn backend_target_missing(
                     || !acc.service_port_exists(namespace, name, port))
         }
         BackendKind::ServiceImport => {
-            !acc.service_import_exists(namespace, name)
-                || !acc.service_import_port_exists(namespace, name, port)
+            resolve_service_import_port(acc, namespace, name, Some(port)).is_err()
         }
     }
+}
+
+/// Resolve an explicit or derived TCP port for one collected `ServiceImport`.
+///
+/// A missing `backendRef.port` is accepted only when the import exposes exactly
+/// one valid TCP port. This follows the Gateway API custom-backend derivation
+/// contract without inheriting the core-Service HTTP/gRPC defaults.
+pub(crate) fn resolve_service_import_port(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    name: &str,
+    requested_port: Option<u16>,
+) -> Result<u16, ServiceImportPortError> {
+    let Some(ports) = acc.service_import_port_index(namespace, name) else {
+        return Err(ServiceImportPortError::BackendNotFound);
+    };
+    resolve_service_import_port_entries(ports, requested_port)
+}
+
+fn resolve_service_import_port_entries(
+    ports: &HashMap<u16, ServiceImportPortProtocol>,
+    requested_port: Option<u16>,
+) -> Result<u16, ServiceImportPortError> {
+    if let Some(requested_port) = requested_port {
+        return match ports.get(&requested_port) {
+            Some(ServiceImportPortProtocol::Tcp) => Ok(requested_port),
+            Some(ServiceImportPortProtocol::Unsupported) => {
+                Err(ServiceImportPortError::UnsupportedProtocol)
+            }
+            None => Err(ServiceImportPortError::BackendNotFound),
+        };
+    }
+
+    let mut tcp_ports = ports.iter().filter_map(|(port, protocol)| {
+        (*protocol == ServiceImportPortProtocol::Tcp).then_some(*port)
+    });
+    let Some(port) = tcp_ports.next() else {
+        return if ports.is_empty() {
+            Err(ServiceImportPortError::BackendNotFound)
+        } else {
+            Err(ServiceImportPortError::UnsupportedProtocol)
+        };
+    };
+    if tcp_ports.next().is_some() {
+        return Err(ServiceImportPortError::BackendNotFound);
+    }
+    Ok(port)
+}
+
+pub(crate) fn service_import_port_error_message(
+    namespace: &str,
+    name: &str,
+    requested_port: Option<u16>,
+    error: ServiceImportPortError,
+) -> String {
+    match (error, requested_port) {
+        (ServiceImportPortError::UnsupportedProtocol, Some(port)) => format!(
+            "backendRef ServiceImport '{namespace}/{name}' port {port} uses an unsupported protocol"
+        ),
+        (ServiceImportPortError::UnsupportedProtocol, None) => format!(
+            "backendRef ServiceImport '{namespace}/{name}' does not expose a supported TCP port"
+        ),
+        (ServiceImportPortError::BackendNotFound, Some(port)) => format!(
+            "backendRef ServiceImport '{namespace}/{name}' port {port} was not found"
+        ),
+        (ServiceImportPortError::BackendNotFound, None) => format!(
+            "backendRef ServiceImport '{namespace}/{name}' must expose exactly one TCP port when backendRefs[].port is omitted"
+        ),
+    }
+}
+
+pub(crate) fn message_is_unsupported_backend_protocol(message: &str) -> bool {
+    message.contains("backendRef ServiceImport")
+        && (message.contains("unsupported protocol")
+            || message.contains("does not expose a supported TCP port"))
 }
 
 /// Materialize one authorized, port-resolved backend into route backends.
@@ -277,14 +379,18 @@ where
         return Some("RefNotPermitted");
     }
 
-    let backend_port = backend_ref
+    let requested_port = backend_ref
         .get("port")
         .and_then(Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())
-        .unwrap_or(if route.kind == "GRPCRoute" { 50051 } else { 80 });
+        .and_then(|port| u16::try_from(port).ok());
 
     match backend_kind {
         BackendKind::Service => {
+            let backend_port = requested_port.unwrap_or(if route.kind == "GRPCRoute" {
+                50051
+            } else {
+                80
+            });
             if !inventory.has_any_service {
                 return None;
             }
@@ -311,13 +417,65 @@ where
             else {
                 return Some("BackendNotFound");
             };
-            if !object_has_numeric_port(import, backend_port) {
-                return Some("BackendNotFound");
+            match resolve_service_import_object_port(import, requested_port) {
+                Ok(_) => {}
+                Err(ServiceImportPortError::BackendNotFound) => return Some("BackendNotFound"),
+                Err(ServiceImportPortError::UnsupportedProtocol) => {
+                    return Some("UnsupportedProtocol");
+                }
             }
         }
     }
 
     None
+}
+
+fn resolve_service_import_object_port(
+    object: &K8sObject,
+    requested_port: Option<u16>,
+) -> Result<u16, ServiceImportPortError> {
+    let mut ports = HashMap::new();
+    for entry in object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(port) = entry
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+        else {
+            continue;
+        };
+        record_service_import_port(&mut ports, port, service_import_protocol(entry));
+    }
+    resolve_service_import_port_entries(&ports, requested_port)
+}
+
+fn service_import_protocol(port_entry: &Value) -> ServiceImportPortProtocol {
+    match port_entry.get("protocol") {
+        None => ServiceImportPortProtocol::Tcp,
+        Some(Value::String(protocol)) if protocol == "TCP" => ServiceImportPortProtocol::Tcp,
+        Some(_) => ServiceImportPortProtocol::Unsupported,
+    }
+}
+
+fn record_service_import_port(
+    ports: &mut HashMap<u16, ServiceImportPortProtocol>,
+    port: u16,
+    protocol: ServiceImportPortProtocol,
+) {
+    ports
+        .entry(port)
+        .and_modify(|existing| {
+            if *existing != protocol {
+                *existing = ServiceImportPortProtocol::Unsupported;
+            }
+        })
+        .or_insert(protocol);
 }
 
 fn object_has_numeric_port(object: &K8sObject, port: u16) -> bool {
@@ -341,14 +499,14 @@ pub(crate) fn collect_service_import(
         .and_then(Value::as_array)
         .map(|arr| arr.as_slice())
         .unwrap_or(&[]);
-    let mut port_numbers = std::collections::HashSet::new();
+    let mut port_numbers = HashMap::new();
     for port_entry in ports {
         let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
             continue;
         };
         // Reuse the same 1..=65535 port gate as Service collection.
         let port = super::port_from_u64(object, raw, "ServiceImport.spec.ports[].port")?;
-        port_numbers.insert(port);
+        record_service_import_port(&mut port_numbers, port, service_import_protocol(port_entry));
     }
     acc.record_service_import_ports(
         object.metadata.namespace.clone(),

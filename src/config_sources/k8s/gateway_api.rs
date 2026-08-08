@@ -93,6 +93,7 @@ struct RouteHostScope {
 enum BackendRefFaultReason {
     InvalidKind,
     BackendNotFound,
+    UnsupportedProtocol,
     RefNotPermitted,
     NoServiceableBackend,
     InvalidBackendTlsPolicy,
@@ -5284,6 +5285,9 @@ fn backend_ref_fault_value_with_percentage(
     let body = match reason {
         BackendRefFaultReason::InvalidKind => "Gateway API backendRef kind is unsupported",
         BackendRefFaultReason::BackendNotFound => "Gateway API backendRef target was not found",
+        BackendRefFaultReason::UnsupportedProtocol => {
+            "Gateway API backendRef target uses an unsupported protocol"
+        }
         BackendRefFaultReason::RefNotPermitted => {
             "Gateway API backendRef is not permitted by ReferenceGrant"
         }
@@ -5480,14 +5484,37 @@ fn route_backends(
                 }
                 Err(error) => return Err(error),
             };
-        let backend_port =
-            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
+        let requested_port =
+            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?;
+        let backend_port = match backend_kind {
+            super::backend_ref::BackendKind::Service => requested_port.unwrap_or(
                 if object.kind == "GRPCRoute" {
                     50051
                 } else {
                     80
                 },
-            );
+            ),
+            super::backend_ref::BackendKind::ServiceImport => {
+                match super::backend_ref::resolve_service_import_port(
+                    acc,
+                    &backend_namespace,
+                    backend_name,
+                    requested_port,
+                ) {
+                    Ok(port) => port,
+                    Err(super::backend_ref::ServiceImportPortError::BackendNotFound) => {
+                        fault_reason.get_or_insert(BackendRefFaultReason::BackendNotFound);
+                        invalid_weight = invalid_weight.saturating_add(weight);
+                        continue;
+                    }
+                    Err(super::backend_ref::ServiceImportPortError::UnsupportedProtocol) => {
+                        fault_reason.get_or_insert(BackendRefFaultReason::UnsupportedProtocol);
+                        invalid_weight = invalid_weight.saturating_add(weight);
+                        continue;
+                    }
+                }
+            }
+        };
         if super::backend_ref::backend_target_missing(
             acc,
             backend_kind,
@@ -5691,68 +5718,47 @@ fn l4_route_proxies(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let (backend_kind, backend_namespace) =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let raw_backend_port =
-            backend_ref
-                .get("port")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
-                })?;
-        let backend_port = port_from_u64(
-            object,
-            raw_backend_port,
-            "TCPRoute/TLSRoute backendRefs[].port",
-        )?;
-        if matches!(backend_kind, super::backend_ref::BackendKind::ServiceImport)
-            && super::backend_ref::backend_target_missing(
-                acc,
-                backend_kind,
-                &backend_namespace,
-                backend_name,
-                backend_port,
-            )
-        {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "backendRef ServiceImport '{backend_namespace}/{backend_name}' port {backend_port} was not found"
-                ),
-            ));
-        }
+        let requested_port =
+            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?;
+        let backend_port = match backend_kind {
+            super::backend_ref::BackendKind::Service => requested_port.ok_or_else(|| {
+                invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
+            })?,
+            super::backend_ref::BackendKind::ServiceImport => {
+                super::backend_ref::resolve_service_import_port(
+                    acc,
+                    &backend_namespace,
+                    backend_name,
+                    requested_port,
+                )
+                .map_err(|error| {
+                    invalid_resource(
+                        object,
+                        super::backend_ref::service_import_port_error_message(
+                            &backend_namespace,
+                            backend_name,
+                            requested_port,
+                            error,
+                        ),
+                    )
+                })?
+            }
+        };
 
         let listen_bindings = if materialized_listener_bindings.is_empty() {
             vec![(backend_port, string_array(&object.spec, "hostnames"))]
         } else {
             materialized_listener_bindings.clone()
         };
-        // L4 Service backends keep historical cluster-local DNS materialization
-        // (no EndpointSlice expansion). ServiceImport uses the shared adapter
-        // (ClusterSet DNS or MCS-labeled EndpointSlice addresses).
-        let (backend_host, resolved_port) = match backend_kind {
-            super::backend_ref::BackendKind::Service => (
-                super::backend_ref::backend_dns_name(
-                    backend_kind,
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
-                backend_port,
-            ),
-            super::backend_ref::BackendKind::ServiceImport => {
-                let backends = super::backend_ref::materialize_backend(
-                    acc,
-                    backend_kind,
-                    &backend_namespace,
-                    backend_name,
-                    backend_port,
-                    1,
-                );
-                let Some(primary) = backends.first() else {
-                    continue;
-                };
-                (primary.host.clone(), primary.port)
-            }
-        };
+        // Stream routes use one stable DNS target for both Services and
+        // ServiceImports. Expanding only the first EndpointSlice address would
+        // silently discard the rest and make the selected backend arbitrary.
+        let backend_host = super::backend_ref::backend_dns_name(
+            backend_kind,
+            backend_name,
+            &backend_namespace,
+            &acc.options.cluster_domain,
+        );
         for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
             let suffix = if listen_bindings.len() == 1 {
                 rule_index.to_string()
@@ -5772,7 +5778,7 @@ fn l4_route_proxies(
                 strip_listen_path: false,
                 preserve_host_header: false,
                 backend_host: backend_host.clone(),
-                backend_port: resolved_port,
+                backend_port,
                 upstream_id: None,
                 backend_scheme: scheme,
                 listen_port: Some(*listen_port),
