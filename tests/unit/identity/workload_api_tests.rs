@@ -910,6 +910,131 @@ async fn fetch_x509svid_rejects_missing_workload_metadata_before_attestation() {
 }
 
 #[tokio::test]
+async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::proto::{
+        JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
+    };
+    use tonic::Code;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(StubAttestor { id });
+    let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain, 600);
+
+    let mint_err = match svc
+        .fetch_jwtsvid(workload_request(JwtsvidRequest {
+            audience: vec!["aud".to_string()],
+            spiffe_id: String::new(),
+        }))
+        .await
+    {
+        Ok(_) => panic!("FetchJWTSVID must not succeed while deferred"),
+        Err(err) => err,
+    };
+    assert_eq!(mint_err.code(), Code::Unimplemented);
+    assert!(
+        mint_err.message().contains("JWT-SVID issuance"),
+        "mint error should name issuance deferral (got: {})",
+        mint_err.message()
+    );
+
+    // Critical: FetchJWTBundles must fail closed at the RPC boundary — never
+    // return Ok(stream) of empty maps that look like "zero JWT authorities".
+    let bundles_err = match svc
+        .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+        .await
+    {
+        Ok(_) => panic!("FetchJWTBundles must return UNIMPLEMENTED, not an empty bundle stream"),
+        Err(err) => err,
+    };
+    assert_eq!(bundles_err.code(), Code::Unimplemented);
+    assert!(
+        bundles_err.message().contains("JWT-SVID bundle"),
+        "bundles error should name bundle-stream deferral (got: {})",
+        bundles_err.message()
+    );
+
+    let validate_err = match svc
+        .validate_jwtsvid(workload_request(ValidateJwtsvidRequest {
+            audience: "aud".to_string(),
+            svid: "eyJhbGciOiJIUzI1NiJ9.e30.signature".to_string(),
+        }))
+        .await
+    {
+        Ok(_) => panic!("ValidateJWTSVID must not succeed while deferred"),
+        Err(err) => err,
+    };
+    assert_eq!(validate_err.code(), Code::Unimplemented);
+    assert!(
+        validate_err.message().contains("JWT-SVID validation"),
+        "validate error should name validation deferral (got: {})",
+        validate_err.message()
+    );
+}
+
+#[tokio::test]
+async fn jwt_svid_rpcs_reject_missing_workload_metadata_before_unimplemented() {
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::proto::{
+        JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
+    };
+    use tonic::Code;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(StubAttestor { id });
+    let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain, 600);
+
+    for (name, result) in [
+        (
+            "FetchJWTSVID",
+            svc.fetch_jwtsvid(Request::new(JwtsvidRequest {
+                audience: vec!["aud".to_string()],
+                spiffe_id: String::new(),
+            }))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "FetchJWTBundles",
+            svc.fetch_jwt_bundles(Request::new(JwtBundlesRequest {}))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "ValidateJWTSVID",
+            svc.validate_jwtsvid(Request::new(ValidateJwtsvidRequest {
+                audience: "aud".to_string(),
+                svid: "token".to_string(),
+            }))
+            .await
+            .map(|_| ()),
+        ),
+    ] {
+        let err = match result {
+            Ok(()) => panic!("{name}: missing workload metadata must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{name}: metadata failure must precede UNIMPLEMENTED"
+        );
+    }
+}
+
+#[tokio::test]
 async fn fetch_x509svid_rotation_task_exits_when_client_drops_stream() {
     use ferrum_edge::identity::workload_api::proto::X509svidRequest;
     use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;

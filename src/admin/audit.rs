@@ -1604,6 +1604,21 @@ pub fn note_fail_closed_rejection() {
     pipeline().note_fail_closed_rejection();
 }
 
+/// Sanitized request fields for read-only rejection logging.
+///
+/// Returns `None` outside an active admin request scope. Admission paths are
+/// always scoped, so observe-only gates never call this.
+pub fn read_only_rejection_log_context() -> Option<(String, String, String)> {
+    let slot = current_slot()?;
+    slot.with(|inner| {
+        (
+            inner.method.clone(),
+            inner.path.clone(),
+            inner.namespace.clone(),
+        )
+    })
+}
+
 /// Cheap availability check for callers that must not pay a backlog rescan
 /// (notably the unauthenticated `/health` tier). O(1): one atomic load.
 pub fn pipeline_available() -> bool {
