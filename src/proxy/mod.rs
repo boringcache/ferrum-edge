@@ -25952,7 +25952,6 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -25961,7 +25960,8 @@ async fn handle_proxy_request_inner(
     // downstream pool keys, capability-registry lookups, URL construction,
     // and circuit-breaker target keys all derive from the effective
     // destination (pool-poisoning invariant).
-    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    let mut proxy =
+        ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -25977,13 +25977,16 @@ async fn handle_proxy_request_inner(
     // override so finalized-egress plugins can recover the selected backend
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
-    let path = rebase_route_override_path(&mut ctx, path);
+    let mut path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
     // enables true PASSTHROUGH load balancing when the upstream's algorithm is
     // Passthrough; it is ignored for every other algorithm.
-    let selection = backend_dispatch::select_upstream_target(
+    // `selection` stays whole (fields are moved out with `Option::take`) because
+    // `balancer` / `is_fallback` / `sticky_cookie_needed` are read much later,
+    // after the deferred-override rebind below may have replaced it.
+    let mut selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -25991,9 +25994,9 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
+    let mut lb_hash_key = selection.lb_hash_key.take();
+    let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target.take(),
         request_host.as_deref(),
     );
 
@@ -26188,7 +26191,71 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         }
+
+        // A remaining deferred hook may commit a destination only after the
+        // original backend-effective path has passed policy (for example, an
+        // AI federation streaming claim). Rebind every dispatch input before
+        // credentials installed by that hook can reach a backend. Otherwise
+        // the headers can describe the claimed provider while `proxy`, `path`,
+        // and `upstream_target` still point at the pre-claim destination.
+        //
+        // Each rebind is gated on that input actually moving. Re-running
+        // load-balancer selection unconditionally would advance round-robin,
+        // re-read the health snapshot, and re-derive the hash key for every
+        // policy-bound request that never had a deferred override at all,
+        // perturbing target choice, retry rotation, and least-connections
+        // accounting well beyond the destinations this rebind exists to honor.
+        let previous_proxy = Arc::clone(&proxy);
+        proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+        // `apply_route_overrides_with_upstreams` is idempotent: it hands back
+        // the SAME `Arc` when the already-baked proxy reflects every override,
+        // so pointer identity against the retained pre-pass `Arc` is an exact,
+        // allocation-free "a deferred hook committed a new destination" test.
+        let destination_rebound = !Arc::ptr_eq(&previous_proxy, &proxy);
+        if destination_rebound {
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+        }
+        // A deferred hook can also rewrite only the backend path (the Istio
+        // `rewrite.uri` shape) without moving the destination. `path` and
+        // `ctx.path` already carry the rewrite bound before the deferred
+        // passes, so a divergence from the current override is exactly the
+        // case where re-basing changes what is dispatched.
+        let path_rebase_pending = ctx
+            .route_override_path
+            .as_deref()
+            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+        if path_rebase_pending {
+            path = rebase_route_override_path(&mut ctx, path);
+        }
+        if destination_rebound {
+            // Replace the whole selection rather than only the target:
+            // `balancer`, `is_fallback`, and `sticky_cookie_needed` are read
+            // after this point, so same-generation load-balancer accounting,
+            // the unhealthy-fallback warning, and sticky-cookie issuance must
+            // describe the target that is actually dialed.
+            selection = backend_dispatch::select_upstream_target(
+                &proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                ctx.orig_dst,
+            );
+            lb_hash_key = selection.lb_hash_key.take();
+            upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+                selection.target.take(),
+                request_host.as_deref(),
+            );
+        }
     }
+
+    // Capture the backend-visible query only after every deferred before_proxy
+    // pass and the gated destination rebinding above. A remaining deferred hook
+    // (for example `ai_federation` streaming) can commit an empty provider-owned
+    // query boundary while the client wire query still carries normal-backend
+    // material; capturing earlier would leak that stale query into backend URL
+    // construction, retry replay, and cache partitions.
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
@@ -37258,7 +37325,7 @@ fn buffered_collect_retain_failure(
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 ///
 /// The cookie value is the opaque backend-bound token from
-/// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
+/// [`crate::load_balancer::sticky_session_token`]: an HMAC-SHA-256 tag over the
 /// namespace-qualified upstream identity and the selected target's full sticky
 /// identity (dial `host:port`, per-port policy key, tags, locality, and path
 /// override), never the address itself. It therefore leaks no backend topology,
@@ -37284,19 +37351,32 @@ fn buffered_collect_retain_failure(
 /// backend that did not produce its response, and every retry-capable path can
 /// rotate off the target selection bound.
 ///
-/// The derivation is unkeyed and deterministic, so affinity survives a gateway
-/// restart and is identical across replicas of a horizontally scaled gateway.
+/// The derivation is keyed under a process-local authentication key, so a
+/// client cannot forge a binding from predictable route and endpoint metadata.
+/// Affinity survives a config reload; a gateway restart, or a request that
+/// reaches another replica, treats the cookie as stale and transparently
+/// re-pins the client through ordinary selection.
+///
+/// Minting and resolution therefore agree by construction rather than by
+/// coincidence: this site and the per-upstream binding index
+/// (`LoadBalancer::sticky_token_index`) both derive through the single public
+/// [`crate::load_balancer::sticky_session_token`], over the same
+/// namespace-qualified runtime key and the same CONFIGURED target identity.
+/// Deriving a token here from anything else — a per-request dial clone, or an
+/// upstream id that is not namespace-qualified — would produce a value absent
+/// from the index, so every returning client would miss and be re-issued a
+/// fresh cookie on every response.
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     namespace: &str,
     upstream_id: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
-) -> String {
+) -> Option<String> {
     let value = crate::load_balancer::sticky_session_token(
         &crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id),
         target,
-    );
+    )?;
     let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
     if !config.session_cookie {
         cookie.push_str("; Max-Age=");
@@ -37316,7 +37396,7 @@ pub(crate) fn build_sticky_cookie_header(
         cookie.push_str("; SameSite=");
         cookie.push_str(same_site);
     }
-    cookie
+    Some(cookie)
 }
 
 /// Append the gateway-authored Gateway API session-persistence `Set-Cookie` to
@@ -37394,13 +37474,15 @@ pub(crate) fn inject_sticky_affinity_cookie(
         .as_ref()
         .and_then(|u| u.hash_on_cookie_config.as_ref())
         .unwrap_or(&default_cc);
-    let cookie_val = build_sticky_cookie_header(
+    let Some(cookie_val) = build_sticky_cookie_header(
         cookie_name,
         &proxy.namespace,
         upstream_id,
         identity_target,
         cookie_config,
-    );
+    ) else {
+        return false;
+    };
     headers_mod::append_set_cookie_header(response_headers, cookie_val);
     true
 }

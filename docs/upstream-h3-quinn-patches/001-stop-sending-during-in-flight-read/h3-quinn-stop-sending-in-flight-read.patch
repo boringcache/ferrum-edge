@@ -1,0 +1,105 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,7 +6,9 @@
+ use std::{
+     convert::TryInto,
+     future::Future,
+-    pin::Pin,
++    // FERRUM PATCH: `pin!` stack-pins the per-poll `read_chunk` future so
++    // `RecvStream` can keep owning its `quinn::RecvStream` inline.
++    pin::{Pin, pin},
+     sync::Arc,
+     task::{self, Poll},
+ };
+@@ -26,7 +28,10 @@
+     error::Code,
+     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
+ };
+-use tokio_util::sync::ReusableBoxFuture;
++// FERRUM PATCH: `tokio_util::sync::ReusableBoxFuture` is no longer used —
++// `RecvStream` owns its `quinn::RecvStream` inline. The `tokio-util` dependency
++// is intentionally left in Cargo.toml so the resolved dependency graph (and
++// therefore Cargo.lock) is byte-identical to the published crate's.
+ 
+ #[cfg(feature = "tracing")]
+ use tracing::instrument;
+@@ -342,26 +347,23 @@
+ /// Quinn-backed receive stream
+ ///
+ /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
++///
++/// FERRUM PATCH (see `docs/upstream-h3-quinn-patches/`): the `quinn::RecvStream`
++/// is owned INLINE instead of being moved into a `ReusableBoxFuture` for the
++/// duration of a pending read. Upstream's shape leaves the field as `None`
++/// whenever `poll_data` has returned `Pending`, which makes `stop_sending`
++/// unreachable exactly when an HTTP/3 server most needs it — cancelling a
++/// request-body read to send `STOP_SENDING(H3_NO_ERROR)` once the response is
++/// complete. `quinn::RecvStream::read_chunk` is documented cancel-safe and its
++/// future holds no state beyond the `&mut` borrow, so constructing it per poll
++/// is equivalent to the boxed form (and allocates nothing).
+ pub struct RecvStream {
+-    stream: Option<quinn::RecvStream>,
+-    read_chunk_fut: ReadChunkFuture,
++    stream: quinn::RecvStream,
+ }
+ 
+-type ReadChunkFuture = ReusableBoxFuture<
+-    'static,
+-    (
+-        quinn::RecvStream,
+-        Result<Option<quinn::Chunk>, quinn::ReadError>,
+-    ),
+->;
+-
+ impl RecvStream {
+     fn new(stream: quinn::RecvStream) -> Self {
+-        Self {
+-            stream: Some(stream),
+-            // Should only allocate once the first time it's used
+-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+-        }
++        Self { stream }
+     }
+ }
+ 
+@@ -373,15 +375,12 @@
+         &mut self,
+         cx: &mut task::Context<'_>,
+     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+-        if let Some(mut stream) = self.stream.take() {
+-            self.read_chunk_fut.set(async move {
+-                let chunk = stream.read_chunk(usize::MAX, true).await;
+-                (stream, chunk)
+-            })
++        // FERRUM PATCH: poll a stack-pinned `read_chunk` future that BORROWS the
++        // stream, so the stream stays reachable while the read is in flight.
++        let chunk = {
++            let mut read_chunk_fut = pin!(self.stream.read_chunk(usize::MAX, true));
++            ready!(read_chunk_fut.as_mut().poll(cx))
+         };
+-
+-        let (stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
+-        self.stream = Some(stream);
+         Poll::Ready(Ok(chunk
+             .map_err(|e| convert_read_error_to_stream_error(e))?
+             .map(|c| c.bytes)))
+@@ -389,16 +388,16 @@
+ 
+     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+     fn stop_sending(&mut self, error_code: u64) {
++        // FERRUM PATCH: no `Option::unwrap` — this is now correct whether or not
++        // a `poll_data` is outstanding.
+         self.stream
+-            .as_mut()
+-            .unwrap()
+             .stop(VarInt::from_u64(error_code).expect("invalid error_code"))
+             .ok();
+     }
+ 
+     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+     fn recv_id(&self) -> StreamId {
+-        let num: u64 = self.stream.as_ref().unwrap().id().into();
++        let num: u64 = self.stream.id().into();
+ 
+         num.try_into().expect("invalid stream id")
+     }

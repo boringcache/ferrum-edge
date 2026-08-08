@@ -10,6 +10,7 @@ A comprehensive feature list for Ferrum Edge.
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 9220 §5 unmasked frames on the H3 hop, RFC 6455 masked frames on the H1.1 hop). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`)
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
 - **TCP** stream proxying with TLS termination, origination, passthrough, and configurable idle timeout
+- **Outbound PROXY protocol v2** on TCP/TCP+TLS stream proxies (`backend_proxy_protocol: v2`) so L4 backends receive the trusted client identity before any relayed bytes (including before backend TLS and splice/kTLS fast paths); see [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md)
 - **UDP** datagram proxying with DTLS support (frontend termination, backend origination, passthrough)
 - **TLS/DTLS passthrough** — forward encrypted bytes without termination, with SNI extraction for logging
 

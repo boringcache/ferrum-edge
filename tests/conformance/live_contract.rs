@@ -30,6 +30,8 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::process::Command;
 
 use super::contract::{Contract, ContractMaturity, load_contract};
 
@@ -588,13 +590,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // Pin the real ga_contract.yaml against this validator: the Stable
     // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
     // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, SPIFFE
-    // identity plumbing, and the native MeshSubscribe config transport are
-    // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh. DestinationRule
-    // export visibility and lookup hierarchy remain deferred FOR THIS SUITE
-    // because Trusted Cross policy forbids changing its executable/configuration
-    // surfaces from this PR; their real multi-namespace datapath acceptance runs
-    // the shipped binary in tests/functional/functional_mesh_mode_test.rs
-    // instead, which is not a kind/SPIRE artifact this validator reads.
+    // identity plumbing, DestinationRule namespace security, and the native
+    // MeshSubscribe config transport are ENFORCED and emitted by
+    // tests/k8s/mesh_e2e_sidecar/run.sh.
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -619,6 +617,8 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.request_auth.missing_jwt_rejected",
         "sidecar.request_auth.invalid_jwt_rejected",
         "sidecar.destination_rule.tcp_connect_timeout",
+        "sidecar.destination_rule.export_to_namespace_visibility",
+        "sidecar.destination_rule.lookup_tier_client_wins",
         "sidecar.destination_rule.tcp_max_connections",
         "sidecar.virtual_service.cors_policy",
         "sidecar.config.native_subscribe_delivered",
@@ -633,13 +633,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         .filter(|capability| capability.live_deferred.is_some())
         .map(|capability| capability.id.as_str())
         .collect();
-    assert_eq!(
-        deferred,
-        vec![
-            "mesh.destination_rule.export_to_visibility",
-            "mesh.destination_rule.lookup_hierarchy",
-        ],
-        "only the Trusted-Cross-blocked DestinationRule rows may be live-deferred"
+    assert!(
+        deferred.is_empty(),
+        "no sidecar GA contract row may remain live-deferred (found: {deferred:?})"
     );
     for capability in sidecar_rows
         .iter()
@@ -880,5 +876,66 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         missing_in_contract.is_empty(),
         "release gate requires assertion ids with no enforced GA-contract row \
          (add the row, or drop the --require): {missing_in_contract:?}"
+    );
+}
+
+/// Issue #3608 / PR #3668 hosted NodeWaypoint regression: the production SPIRE
+/// mesh path publishes `source="spire_agent"` identity telemetry, but the live
+/// harness historically grepped for the generic `workload_api` label and
+/// rejected scrapes that already contained the exact per-node SPIFFE ID under
+/// `spire_agent`. Keep the fixture bound to the fail-closed proof helper and
+/// execute that helper's static self-test in ordinary conformance CI.
+#[test]
+fn live_contract_node_waypoint_spire_agent_metric_proof_is_fail_closed() {
+    const RUN_SH: &str = include_str!("../k8s/node_waypoint_ebpf_live/run.sh");
+    const HELPER: &str = include_str!("../k8s/lib/spire_ambient_metrics.py");
+
+    assert!(
+        RUN_SH.contains("tests/k8s/lib/spire_ambient_metrics.py"),
+        "node_waypoint_ebpf_live must invoke the shared SPIRE ambient metrics proof helper"
+    );
+    assert!(
+        RUN_SH.contains("--expected-spiffe"),
+        "node_waypoint_ebpf_live must pass the exact per-node SPIFFE ID into the metrics proof"
+    );
+    assert!(
+        RUN_SH.contains("--trust-domain"),
+        "node_waypoint_ebpf_live must pass the trust domain into the metrics proof"
+    );
+    assert!(
+        !RUN_SH.contains("source=\\\"workload_api\\\""),
+        "node_waypoint_ebpf_live must not grep cert-expiry under the historical workload_api \
+         source label — production SPIRE mesh telemetry uses source=spire_agent"
+    );
+    assert!(
+        HELPER.contains("source") && HELPER.contains("spire_agent"),
+        "spire_ambient_metrics.py must require the spire_agent source label"
+    );
+    assert!(
+        HELPER.contains("ca_type") && HELPER.contains("ferrum_mesh_ca_health"),
+        "spire_ambient_metrics.py must require healthy ferrum_mesh_ca_health{{ca_type=spire_agent}}"
+    );
+    assert!(
+        HELPER.contains("ferrum_mesh_trust_bundle_version"),
+        "spire_ambient_metrics.py must require a spire_agent trust-bundle observation"
+    );
+    assert!(
+        HELPER.contains("must be > 0"),
+        "spire_ambient_metrics.py must reject non-positive certificate expiry"
+    );
+
+    let helper_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/k8s/lib/spire_ambient_metrics.py");
+    let output = Command::new("python3")
+        .arg("-I")
+        .arg(&helper_path)
+        .arg("--self-test")
+        .output()
+        .expect("spawn python3 for spire_ambient_metrics.py --self-test");
+    assert!(
+        output.status.success(),
+        "spire_ambient_metrics.py --self-test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
