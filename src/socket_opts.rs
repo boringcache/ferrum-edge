@@ -1557,11 +1557,12 @@ pub mod ktls {
 
     /// Current `SO_RCVBUF` for a socket, in bytes.
     ///
-    /// This is the kernel's `sk_rcvbuf`, already doubled for skb overhead, and
-    /// it is what caps how much unread wire data the socket may hold. On its
-    /// own it is **not** a stable bound: TCP receive autotuning rewrites it as
-    /// the connection runs. [`pin_socket_receive_buffer`] is what makes a
-    /// readback of this value hold still.
+    /// This is the kernel's `sk_rcvbuf`, already doubled for skb overhead. TCP
+    /// admits another skb only while the receive-memory charge is at or below
+    /// this value, so it bounds unread wire data together with one admitted-skb
+    /// overshoot. On its own it is **not** a stable bound: TCP receive
+    /// autotuning rewrites it as the connection runs.
+    /// [`pin_socket_receive_buffer`] is what makes a readback hold still.
     pub fn socket_receive_buffer_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1636,20 +1637,27 @@ pub mod ktls {
     /// the `getsockopt` readback afterwards *is* the answer, and it is the value
     /// the caller must bound with. `request_bytes` is only a request.
     ///
-    /// The request is floored at the socket's live `SO_RCVBUF` so pinning never
-    /// shrinks a buffer the connection has already earned. Even if the kernel
-    /// still lands below that (a small `rmem_max` against an already-autotuned
-    /// socket), no queued byte is lost: Linux keeps skbs that are already on the
-    /// receive queue and merely stops admitting more, and the caller bounds the
-    /// pre-existing queue separately with [`socket_receive_queue_bytes`].
+    /// The request is floored at half the socket's live `SO_RCVBUF`, converting
+    /// the doubled readback back into `setsockopt` request units so pinning does
+    /// not accidentally double an already-large buffer. If the kernel still
+    /// lands below the prior readback (a small `rmem_max` against an
+    /// already-autotuned socket), no queued byte is lost: Linux keeps skbs that
+    /// are already on the receive queue and merely stops admitting more, and
+    /// the caller bounds the pre-existing queue separately with
+    /// [`socket_receive_queue_bytes`].
     pub fn pin_socket_receive_buffer(
         fd: std::os::unix::io::RawFd,
         request_bytes: u64,
     ) -> std::io::Result<u64> {
-        let current = socket_receive_buffer_bytes(fd).unwrap_or(0);
+        let current = socket_receive_buffer_bytes(fd)?;
         // `sk_setsockopt` rejects a negative value and internally clamps to
-        // `INT_MAX / 2` before doubling, so saturate here rather than wrap.
-        let want = request_bytes.max(current).min(libc::c_int::MAX as u64 / 2) as libc::c_int;
+        // `INT_MAX / 2` before doubling, so saturate here rather than wrap. A
+        // getsockopt readback is already doubled; convert it back to request
+        // units before applying the throughput floor.
+        let current_request_units = current.div_ceil(2);
+        let want = request_bytes
+            .max(current_request_units)
+            .min(libc::c_int::MAX as u64 / 2) as libc::c_int;
         // SAFETY: `want` is a live `c_int` and `len` describes it exactly; `fd`
         // is borrowed from a live socket by the caller.
         let ret = unsafe {
@@ -2027,8 +2035,8 @@ pub mod ktls {
                 aes128gcm && probe_record_seq_observable(KtlsCipher::Aes128Gcm);
             let aes256gcm_record_seq =
                 aes256gcm && probe_record_seq_observable(KtlsCipher::Aes256Gcm);
-            let chacha20_poly1305_record_seq = chacha20_poly1305
-                && probe_record_seq_observable(KtlsCipher::Chacha20Poly1305);
+            let chacha20_poly1305_record_seq =
+                chacha20_poly1305 && probe_record_seq_observable(KtlsCipher::Chacha20Poly1305);
             KtlsAvailability {
                 aes128gcm,
                 aes256gcm,

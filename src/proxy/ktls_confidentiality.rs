@@ -139,11 +139,13 @@ pub const KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 /// Headroom added on top of the pinned buffer and the measured queue.
 ///
 /// Linux admits an incoming segment when the receive queue is *below*
-/// `sk_rcvbuf`, so the queue may end up one super-frame past it (GRO, and larger
-/// still with BIG TCP), and the kTLS strparser may hold one partial record in
-/// its anchor outside that accounting. One mebibyte covers both with room to
-/// spare. Overstating the ceiling only buys extra `getsockopt` calls;
-/// understating it would break the bound.
+/// `sk_rcvbuf`, so the queue may end up one super-frame past it. Linux caps a
+/// BIG TCP GRO frame at `GRO_MAX_SIZE = 8 * 65_535` bytes, and the kTLS
+/// strparser may additionally hold one partial record (at most a 2^14-byte TLS
+/// payload plus its page-sized workspace) outside that accounting. One
+/// mebibyte conservatively covers both current kernel bounds. Overstating the
+/// ceiling only buys extra `getsockopt` calls; understating it would break the
+/// confidentiality bound.
 pub const KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES: u64 = 1024 * 1024;
 
 /// Which traffic key a budget belongs to.

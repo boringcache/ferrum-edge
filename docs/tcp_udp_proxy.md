@@ -633,12 +633,16 @@ Ferrum therefore enforces the limit itself, per direction, in
   the old, unknowable size, so it is measured directly with `FIONREAD` **after**
   the pin and added on top, along with 1 MiB of headroom for the one super-frame
   Linux may admit past the limit and for the kTLS strparser's partial-record
-  anchor. Afterwards the kernel admits data only while the queue is below the
-  pinned size, so `queued <= max(queued_at_pin, pinned)` holds at every later
-  instant and the ceiling covers both terms. The request is floored at the
-  socket's live `SO_RCVBUF` so pinning never shrinks a buffer the connection
-  already earned, and a smaller readback still loses no data — Linux keeps the
-  skbs already queued and merely stops admitting more.
+  anchor. That headroom is tied to concrete upstream bounds: BIG TCP caps a GRO
+  frame at `8 * 65_535` bytes, while the parser anchor is bounded by a 2^14-byte
+  TLS payload plus its page workspace. Afterwards the kernel admits data only
+  while the queue is below the pinned size, so
+  `queued <= max(queued_at_pin, pinned)` holds at every later instant and the
+  ceiling covers both terms. Because `getsockopt(SO_RCVBUF)` returns the doubled
+  kernel value, the prior readback is first converted back to request units
+  before it floors the new request; this avoids accidentally doubling an
+  already-large receive buffer. A smaller readback still loses no data — Linux
+  keeps the skbs already queued and merely stops admitting more.
 
   That ceiling is computed exactly once, at handoff, and every later observation
   window uses it. An observation refreshes the record sequence number and

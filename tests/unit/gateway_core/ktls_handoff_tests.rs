@@ -940,7 +940,10 @@ mod confidentiality {
                 threshold: 1,
             };
             assert!(err.to_string().contains(direction.as_str()));
-            assert_eq!(direction.is_transmit(), direction == KtlsDirection::Transmit);
+            assert_eq!(
+                direction.is_transmit(),
+                direction == KtlsDirection::Transmit
+            );
         }
     }
 }

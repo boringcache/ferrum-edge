@@ -3095,7 +3095,7 @@ async fn handle_tcp_connection_inner(
                 backend_read_timeout,
                 backend_write_timeout,
                 buf_size,
-                false,
+                None,
             )
             .await
         };
@@ -3916,7 +3916,7 @@ async fn handle_tcp_connection_inner(
                                 backend_read_timeout,
                                 backend_write_timeout,
                                 buf_size,
-                                false,
+                                None,
                             )
                             .await
                         }
@@ -5455,7 +5455,10 @@ enum ClientRelayStream {
     /// confidentiality limit per direction from the kernel's own sequence
     /// numbers.
     #[cfg(target_os = "linux")]
-    Ktls(TcpStream, crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy),
+    Ktls(
+        TcpStream,
+        crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy,
+    ),
 }
 
 /// Outcome of the frontend TLS accept for a terminating TCP listener.
@@ -8634,7 +8637,9 @@ fn charge_ktls_receive(
     limits: &crate::proxy::ktls_confidentiality::KtlsSessionLimits,
     fd: std::os::unix::io::RawFd,
 ) -> Result<(), crate::proxy::ktls_confidentiality::KtlsConfidentialityError> {
-    use crate::proxy::ktls_confidentiality::{KtlsDirection, charge_or_observe, observe_record_seq};
+    use crate::proxy::ktls_confidentiality::{
+        KtlsDirection, charge_or_observe, observe_record_seq,
+    };
 
     let records = guard.step_records();
     charge_or_observe(guard, records, || {
@@ -8652,7 +8657,9 @@ fn charge_or_observe_one_receive_record(
     limits: &crate::proxy::ktls_confidentiality::KtlsSessionLimits,
     fd: std::os::unix::io::RawFd,
 ) -> Result<(), crate::proxy::ktls_confidentiality::KtlsConfidentialityError> {
-    use crate::proxy::ktls_confidentiality::{KtlsDirection, charge_or_observe, observe_record_seq};
+    use crate::proxy::ktls_confidentiality::{
+        KtlsDirection, charge_or_observe, observe_record_seq,
+    };
 
     charge_or_observe(guard, 1, || {
         observe_record_seq(fd, limits, KtlsDirection::Receive)
