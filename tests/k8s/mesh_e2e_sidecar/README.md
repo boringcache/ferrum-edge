@@ -41,6 +41,13 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   ConfigMap**: its inbound routes exist only if the CP-delivered
   MeshSubscribe slice materialized, which is the live proof for the native
   config-transport GA row (issue #2002).
+- **drsvc-a / drsvc-b** — DestinationRule visibility destinations: two
+  sidecar-backed workloads (`sa/drsvc-a`, `sa/drsvc-b`, inbound REDIRECT
+  `8080 -> :15006`, SPIRE, STRICT) behind MeshService `drsvc` owned by
+  namespace `beta`. Labelled echo bodies (`backend-a` / `backend-b`) prove
+  round-robin vs sticky DestinationRule outcomes on the captured client
+  egress path. Plain ServiceEntry endpoints are intentionally not used —
+  Sidecar outbound materialization only iterates MeshService workloads.
 
 ## What it asserts
 
@@ -57,7 +64,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.request_auth.valid_jwt_admitted` | RS256 JWT validated against the RequestAuthentication **inline JWKS** → 200 |
 | `sidecar.request_auth.missing_jwt_rejected` | token-less request on the gated path → 403 (RequestAuth is permissive; the authz `request_principals` ALLOW does not match) |
 | `sidecar.request_auth.invalid_jwt_rejected` | wrong-key signature → 401 `Invalid or unrecognized JWT` (`jwks_auth`) |
-| `sidecar.destination_rule.export_to_namespace_visibility` | captured client egress to a `beta`-owned MESH_EXTERNAL ServiceEntry with two labelled backends: a service-namespace sticky rule `exportTo: [.]` leaves round-robin (both backends), while an exported root-namespace sticky control pins one backend |
+| `sidecar.destination_rule.export_to_namespace_visibility` | captured client egress to a `beta`-owned MeshService (`drsvc`) with two labelled sidecar backends: a service-namespace sticky rule `exportTo: [.]` leaves round-robin (both backends), while an exported root-namespace sticky control pins one backend |
 | `sidecar.destination_rule.lookup_tier_client_wins` | three visible rules at client, service, and root tiers on that same live host; the client-tier round-robin rule wins over sticky lower-priority rules (both backends serve) |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |

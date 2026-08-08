@@ -68,6 +68,9 @@
 #              workload SPIFFE ID spiffe://<td>/ns/<ns>/sa/capp must equal the
 #              sidecar's FERRUM_MESH_WORKLOAD_SPIFFE_ID for
 #              resolve_local_workloads to anchor inbound routes)
+#   sa/drsvc-a / sa/drsvc-b
+#              DestinationRule visibility backends (beta-owned MeshService
+#              `drsvc`; each SA backs exactly one local service attachment)
 #   sa/ferrum-cp the control plane (K8s API access via the namespaced Role
 #              below; NOT a mesh workload — no SPIRE entry)
 #   (slowsvc has NO service account / SPIRE entry on purpose: its dial is
@@ -102,6 +105,18 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: rogue
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drsvc-a
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drsvc-b
   namespace: __NAMESPACE__
 ---
 # ── Destination service ─────────────────────────────────────────────────────
@@ -547,6 +562,11 @@ spec:
               value: /run/spire/sockets/agent.sock
             - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
               value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/client
+            # Cross-namespace MeshService + DestinationRule lookup (#2465/#2469)
+            # requires an applicable Sidecar egress scope; without it the file
+            # slice stays namespace-local and beta-owned services never materialize.
+            - name: FERRUM_MESH_SIDECAR_ENFORCED
+              value: "true"
             - name: FERRUM_MESH_OUTBOUND_LISTEN_ADDR
               value: 0.0.0.0:15001
             - name: FERRUM_ADMIN_HTTP_PORT
@@ -931,28 +951,104 @@ spec:
             path: /run/spire/sockets
             type: DirectoryOrCreate
 ---
-# ── DestinationRule visibility backends (MESH_EXTERNAL ServiceEntry ends) ──
-# Plain echo pods (no sidecar, no SPIRE). The client ConfigMap declares them as
-# static endpoints of a ServiceEntry owned by namespace `beta`, so DestinationRule
-# exportTo / lookup-tier probes can distinguish round-robin from consistent-hash
-# by observing which labelled body answers. Bodies are fixed markers, not the
-# shared __APP_BODY__, so they cannot collide with the svc STRICT-mTLS probes.
+# ── DestinationRule visibility destinations (beta-owned MeshService) ───────
+# Two sidecar-backed workloads behind MeshService `drsvc` owned by namespace
+# `beta`. Sidecar materialization only iterates MeshService workloads (not
+# ServiceEntry endpoints), so these pods must speak real inbound mesh-mTLS
+# (:15006 + SPIRE) for the client's captured :15001 egress. Bodies are fixed
+# markers (not __APP_BODY__) so they cannot collide with the svc STRICT probes.
+# FERRUM_NAMESPACE=beta so the dest file-slice keeps beta/drsvc visible without
+# a Sidecar on the destination; SPIFFE stays ns/__NAMESPACE__/sa/drsvc-* (the
+# real k8s SA / SPIRE selector). Each SA backs exactly one local service_name
+# so resolve_local_workloads cannot fail closed on ambiguity.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dr-backend-a
+  name: drsvc-a
   namespace: __NAMESPACE__
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dr-backend-a
+      app: drsvc-a
   template:
     metadata:
       labels:
-        app: dr-backend-a
+        app: drsvc-a
+        ferrum.io/mesh: enabled
     spec:
+      serviceAccountName: drsvc-a
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
       containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: file
+            - name: FERRUM_MESH_FILE_CONFIG_PATH
+              value: /etc/ferrum/mesh/mesh.yaml
+            - name: FERRUM_NAMESPACE
+              value: beta
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/drsvc-a
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: mesh-config
+              mountPath: /etc/ferrum/mesh
+              readOnly: true
         - name: app
           image: python:3.12-alpine
           ports:
@@ -990,23 +1086,103 @@ spec:
               threading.Thread(target=serve, daemon=True).start()
               while True:
                   time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: mesh-config
+          configMap:
+            name: ferrum-mesh-drsvc-a
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dr-backend-b
+  name: drsvc-b
   namespace: __NAMESPACE__
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dr-backend-b
+      app: drsvc-b
   template:
     metadata:
       labels:
-        app: dr-backend-b
+        app: drsvc-b
+        ferrum.io/mesh: enabled
     spec:
+      serviceAccountName: drsvc-b
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
       containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: file
+            - name: FERRUM_MESH_FILE_CONFIG_PATH
+              value: /etc/ferrum/mesh/mesh.yaml
+            - name: FERRUM_NAMESPACE
+              value: beta
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/drsvc-b
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: mesh-config
+              mountPath: /etc/ferrum/mesh
+              readOnly: true
         - name: app
           image: python:3.12-alpine
           ports:
@@ -1044,6 +1220,14 @@ spec:
               threading.Thread(target=serve, daemon=True).start()
               while True:
                   time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: mesh-config
+          configMap:
+            name: ferrum-mesh-drsvc-b
 ---
 # ── Rogue client pod (dest-side authz negative) ─────────────────────────────
 # Identical to the client but running as sa/rogue: it completes valid
@@ -1099,6 +1283,8 @@ spec:
               value: /run/spire/sockets/agent.sock
             - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
               value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/rogue
+            - name: FERRUM_MESH_SIDECAR_ENFORCED
+              value: "true"
             - name: FERRUM_MESH_OUTBOUND_LISTEN_ADDR
               value: 0.0.0.0:15001
             - name: FERRUM_ADMIN_HTTP_PORT

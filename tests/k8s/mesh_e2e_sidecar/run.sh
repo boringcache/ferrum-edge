@@ -61,8 +61,10 @@ set -euo pipefail
 #                                               received native slice
 #
 # DestinationRule exportTo / lookup probes drive captured client egress against
-# a MESH_EXTERNAL ServiceEntry owned by namespace `beta` with two labelled echo
-# backends. File-mode DestinationRule.namespace fields stand in for Istio CRDs
+# a beta-owned MeshService (`drsvc`) with two labelled sidecar backends. File-mode
+# DestinationRule.namespace / MeshService.namespace fields stand in for Istio
+# CRDs; a permissive Sidecar egress scope admits the cross-namespace service so
+# materialization can exercise exportTo and client > service > root lookup.
 # (CRD watching is disabled here). Applied vs ignored rules are distinguished
 # by consistent-hash (one backend) versus round-robin (both backends).
 #
@@ -115,12 +117,14 @@ SVC_HOST="svc.$NS.svc.cluster.local"
 SLOW_HOST="slowsvc.$NS.svc.cluster.local"
 WS_HOST="wssvc.$NS.svc.cluster.local"
 CAPP_HOST="capp.$NS.svc.cluster.local"
-# DestinationRule exportTo / lookup-tier live host (MESH_EXTERNAL ServiceEntry).
-# Declaring namespace `beta` owns the destination; client subscriber is `$NS`
+# DestinationRule exportTo / lookup-tier live host (beta-owned MeshService).
+# Declaring namespace `beta` owns MeshService `drsvc`; client subscriber is `$NS`
 # (ferrum); root tier is the default `istio-system`. Backend labels are the
-# observed wire evidence for applied vs ignored rules.
-DR_LIVE_HOST="dr-live-external.mesh-e2e.test"
+# observed wire evidence for applied vs ignored rules. Sidecar outbound
+# materialization requires MeshService/workload targets (not ServiceEntry ends).
+DR_SERVICE_NAME="drsvc"
 DR_SERVICE_NS="beta"
+DR_LIVE_HOST="$DR_SERVICE_NAME.$DR_SERVICE_NS.svc.cluster.local"
 DR_ROOT_NS="istio-system"
 DR_BACKEND_A_BODY="backend-a"
 DR_BACKEND_B_BODY="backend-b"
@@ -409,7 +413,7 @@ install_spire() {
 }
 
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp, drsvc-a/b)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -430,8 +434,9 @@ register_spire_workloads() {
     # completes a handshake, so no SVID is ever presented for it. capp (the
     # native-MeshSubscribe destination) needs one: its inbound terminates the
     # client's mesh-mTLS with a SPIRE SVID like every other destination. The
-    # ferrum-cp pod is NOT a mesh workload and gets no entry.
-    for sa in svc wssvc client rogue capp; do
+    # ferrum-cp pod is NOT a mesh workload and gets no entry. drsvc-a/b are the
+    # DestinationRule visibility backends and need SVIDs for mesh-mTLS.
+    for sa in svc wssvc client rogue capp drsvc-a drsvc-b; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -445,7 +450,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-wssvc-client-rogue-capp-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-capp-drsvc-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -651,6 +656,53 @@ YAML
 )"
 }
 
+# DestinationRule visibility destinations: each pod's file slice declares the
+# beta-owned MeshService `drsvc` with ONLY that pod's local workload (one
+# service_name per SPIFFE). FERRUM_NAMESPACE=beta on the pods keeps the
+# service visible without a Sidecar on the destination; SPIFFE / SA stay in
+# $NS so SPIRE selectors match the real k8s workload.
+render_drdest_config() {
+  local sa="$1" app_label="$2" cm_name="$3"
+  apply_configmap "$cm_name" "$(cat <<YAML
+mesh:
+  workloads:
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa
+      service_name: $DR_SERVICE_NAME
+      namespace: $DR_SERVICE_NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: $sa
+      addresses:
+        - 127.0.0.1
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      selector:
+        labels:
+          app: $app_label
+        namespace: $NS
+  services:
+    - name: $DR_SERVICE_NAME
+      namespace: $DR_SERVICE_NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa
+  peer_authentications:
+    - name: mesh-strict
+      namespace: $DR_SERVICE_NS
+      mtls_mode: strict
+YAML
+)"
+}
+
+render_drdest_configs() {
+  render_drdest_config drsvc-a drsvc-a ferrum-mesh-drsvc-a
+  render_drdest_config drsvc-b drsvc-b ferrum-mesh-drsvc-b
+}
+
 # Client/rogue sidecar mesh document: the svc workload at its REAL pod IP
 # (sidecar egress dials workload_address:15006 over mesh-mTLS) plus the
 # `slowsvc` workload at the black-holed IP with a DestinationRule
@@ -662,44 +714,81 @@ YAML
 # after the svc pod IP is known; a svc pod replacement would need a re-render
 # + client restart (this fixture never replaces svc).
 #
-# Optional DestinationRule visibility extras ($5/$6 = labelled MESH_EXTERNAL
-# backend pod IPs; $7 = additional destination_rules YAML for DR_LIVE_HOST).
-# Istio CRDs are disabled in this fixture, so declaring namespaces are expressed
-# as file-mode DestinationRule.namespace / ServiceEntry.namespace fields — the
-# same model the functional suite uses for issues #2465 / #2469.
+# Optional DestinationRule visibility extras ($5/$6 = labelled drsvc backend
+# pod IPs; $7 = additional destination_rules YAML for DR_LIVE_HOST). Cross-
+# namespace MeshService ownership (`beta`/`drsvc`) plus a permissive Sidecar
+# egress scope (`*/*`) are required: without an applicable Sidecar the file
+# slice stays namespace-local and beta services never materialize. Workloads
+# keep identity namespace `$NS` with `service_namespace: beta` so they remain
+# visible to the ferrum client while attaching to the beta-owned service.
+# Istio CRDs are disabled; declaring namespaces are file-mode fields — the
+# same model the functional/integration suites use for issues #2465 / #2469.
 render_client_config() {
   local svc_pod_ip="$1" wssvc_pod_ip="$2" capp_pod_ip="$3" slow_connect_timeout_ms="$4"
   local dra_ip="${5:-$DR_BACKEND_A_IP}"
   local drb_ip="${6:-$DR_BACKEND_B_IP}"
   local extra_dr_rules="${7:-}"
-  local service_entries_yaml=""
+  local drsvc_workloads_yaml=""
+  local drsvc_service_yaml=""
   if [[ -n "$dra_ip" && -n "$drb_ip" ]]; then
-    service_entries_yaml="$(cat <<YAML
-  service_entries:
-    - name: dr-live-external
-      namespace: $DR_SERVICE_NS
-      hosts:
-        - $DR_LIVE_HOST
-      resolution: static
-      location: mesh_external
-      export_to: ["*"]
+    drsvc_workloads_yaml="$(cat <<YAML
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/drsvc-a
+      service_name: $DR_SERVICE_NAME
+      service_namespace: $DR_SERVICE_NS
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: drsvc-a
+      addresses:
+        - "$dra_ip"
       ports:
-        - port: 80
+        - port: 8080
           protocol: http
           name: http
-      endpoints:
-        - address: "$dra_ip"
-          ports:
-            http: 8080
-        - address: "$drb_ip"
-          ports:
-            http: 8080
+      selector:
+        labels:
+          app: drsvc-a
+        namespace: $NS
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/drsvc-b
+      service_name: $DR_SERVICE_NAME
+      service_namespace: $DR_SERVICE_NS
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: drsvc-b
+      addresses:
+        - "$drb_ip"
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      selector:
+        labels:
+          app: drsvc-b
+        namespace: $NS
+YAML
+)"
+    drsvc_service_yaml="$(cat <<YAML
+    - name: $DR_SERVICE_NAME
+      namespace: $DR_SERVICE_NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/drsvc-a
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/drsvc-b
 YAML
 )"
   fi
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   istio_root_namespace: $DR_ROOT_NS
+  # Permissive Sidecar so cross-namespace MeshService `beta/drsvc` and its
+  # DestinationRules are admitted (integration suite pattern for #2465/#2469).
+  sidecars:
+    - name: client-egress
+      namespace: $NS
+      egress:
+        - hosts: ["*/*"]
   workloads:
     - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
       service_name: svc
@@ -753,6 +842,7 @@ mesh:
           name: http
       selector:
         namespace: $NS
+$drsvc_workloads_yaml
   services:
     - name: svc
       namespace: $NS
@@ -786,7 +876,7 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
-$service_entries_yaml
+$drsvc_service_yaml
   # VirtualService-derived CORS (issue #1973): Istio applies VS policy on the
   # CLIENT sidecar, so the policy rides the client slice and the sidecar
   # synthesizes a cors plugin onto its materialized svc outbound route. The
@@ -830,7 +920,7 @@ wait_for_rollouts() {
   # native-subscribe convergence; capp's POD readiness itself only requires
   # the app container (the sidecar container has no probe and counts as
   # ready while it waits for its first slice).
-  for deploy in ferrum-cp svc wssvc capp client rogue; do
+  for deploy in ferrum-cp svc wssvc capp client rogue drsvc-a drsvc-b; do
     kubectl --context "$CONTEXT" -n "$NS" rollout status "deploy/$deploy" --timeout=5m
   done
 }
@@ -1435,7 +1525,7 @@ sample_dr_live_backends() {
       want_b="$3"
       n="$4"
       labels=""
-      # Convergence: wait until the ServiceEntry route answers 200 with a
+      # Convergence: wait until the MeshService outbound route answers 200 with a
       # fixture label before counting authoritative samples.
       for _ in $(seq 1 30); do
         : >/tmp/drbody 2>/dev/null || true
@@ -1525,12 +1615,12 @@ probe_destination_rule_namespace_security() {
   if [[ "$phase1_ok" == "true" && "$phase2_ok" == "true" ]]; then
     visibility_ok=true
     record_live_assertion sidecar.destination_rule.export_to_namespace_visibility pass \
-      "client/$NS" "serviceentry/$DR_SERVICE_NS/dr-live-external" \
+      "client/$NS" "meshservice/$DR_SERVICE_NS/$DR_SERVICE_NAME" \
       "hidden-service-rule kept RR (2 backends); exported root control pinned (1 backend)" \
       "$(basename "$diagnostics")"
   else
     record_live_assertion sidecar.destination_rule.export_to_namespace_visibility fail \
-      "client/$NS" "serviceentry/$DR_SERVICE_NS/dr-live-external" \
+      "client/$NS" "meshservice/$DR_SERVICE_NS/$DR_SERVICE_NAME" \
       "exportTo visibility did not match expected LB outcomes phase1_ok=$phase1_ok phase2_ok=$phase2_ok" \
       "$(basename "$diagnostics")"
   fi
@@ -1544,12 +1634,12 @@ probe_destination_rule_namespace_security() {
   if [[ "$count" == "2" ]]; then
     lookup_ok=true
     record_live_assertion sidecar.destination_rule.lookup_tier_client_wins pass \
-      "client/$NS" "serviceentry/$DR_SERVICE_NS/dr-live-external" \
+      "client/$NS" "meshservice/$DR_SERVICE_NS/$DR_SERVICE_NAME" \
       "client-tier ROUND_ROBIN won; both backends served" \
       "$(basename "$diagnostics")"
   else
     record_live_assertion sidecar.destination_rule.lookup_tier_client_wins fail \
-      "client/$NS" "serviceentry/$DR_SERVICE_NS/dr-live-external" \
+      "client/$NS" "meshservice/$DR_SERVICE_NS/$DR_SERVICE_NAME" \
       "client-tier rule did not win; observed label count=$count sample=$sample" \
       "$(basename "$diagnostics")"
   fi
@@ -1637,7 +1727,7 @@ collect_diagnostics() {
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
   local deploy
-  for deploy in svc wssvc client rogue capp ferrum-cp dr-backend-a dr-backend-b; do
+  for deploy in svc wssvc client rogue capp ferrum-cp drsvc-a drsvc-b; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
@@ -1681,22 +1771,23 @@ main() {
   render_shared_secrets
   render_dest_config
   render_wsdest_config
+  render_drdest_configs
   apply_workloads
   register_spire_workloads
 
   # svc rolls out first (its ConfigMap exists); capp needs no ConfigMap (its
   # sidecar subscribes to the CP) and its pod Ready only requires the app
   # container; client/rogue block in ContainerCreating until the client
-  # ConfigMap — rendered with the discovered svc/wssvc/capp pod IPs — is
-  # applied. dr-backend-{a,b} are plain echo pods for DestinationRule LB
-  # observation (no sidecar, no SPIRE).
+  # ConfigMap — rendered with the discovered svc/wssvc/capp/drsvc pod IPs — is
+  # applied. drsvc-a/b are sidecar-backed MeshService endpoints for DestinationRule
+  # LB observation (inbound mesh-mTLS, SPIRE SVIDs).
   SVC_POD_IP="$(wait_for_pod_ip svc)"
   WSSVC_POD_IP="$(wait_for_pod_ip wssvc)"
   CAPP_POD_IP="$(wait_for_pod_ip capp)"
-  DR_BACKEND_A_IP="$(wait_for_pod_ip dr-backend-a)"
-  DR_BACKEND_B_IP="$(wait_for_pod_ip dr-backend-b)"
+  DR_BACKEND_A_IP="$(wait_for_pod_ip drsvc-a)"
+  DR_BACKEND_B_IP="$(wait_for_pod_ip drsvc-b)"
   log "svc pod IP=$SVC_POD_IP   wssvc pod IP=$WSSVC_POD_IP   capp pod IP=$CAPP_POD_IP"
-  log "dr-backend-a IP=$DR_BACKEND_A_IP   dr-backend-b IP=$DR_BACKEND_B_IP"
+  log "drsvc-a IP=$DR_BACKEND_A_IP   drsvc-b IP=$DR_BACKEND_B_IP"
   render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
   wait_for_rollouts
 
