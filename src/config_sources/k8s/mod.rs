@@ -1340,16 +1340,18 @@ impl K8sAccumulator {
         } else {
             crate::config::types::K8sMeshOverlay::NoAuthority
         };
-        // An empty mesh still serializes as `None` so `mesh.is_some()` keeps
-        // meaning "this deployment has mesh state" for every reader; the
-        // authority marker above, not `mesh`, is what carries the withdrawal.
-        if !self.mesh.is_empty_overlay() {
-            self.config.mesh = Some(Box::new(self.mesh));
-        }
         // Resolved last: a refusal only invalidates status once the whole pass
         // is known, because a later claim can still materialize the same
         // parentRef on a surviving listener.
         let refused_route_attachments = self.resolve_refused_route_attachments();
+        // An empty mesh still serializes as `None` so `mesh.is_some()` keeps
+        // meaning "this deployment has mesh state" for every reader; the
+        // authority marker above, not `mesh`, is what carries the withdrawal.
+        // Move it only after every resolver that borrows the accumulator has
+        // completed.
+        if !self.mesh.is_empty_overlay() {
+            self.config.mesh = Some(Box::new(self.mesh));
+        }
         let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
         known_namespaces.sort();
         self.config.known_namespaces.extend(known_namespaces);
