@@ -2089,10 +2089,7 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// Returns `None` when the cryptographic provider cannot initialize the
 /// process-local key. Callers fail closed by building no binding and emitting
 /// no cookie; the lazy initializer records one fixed diagnostic.
-pub fn sticky_session_token(
-    upstream_runtime_key: &str,
-    target: &UpstreamTarget,
-) -> Option<String> {
+pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> Option<String> {
     let mut hasher = STICKY_SESSION_TOKEN_KEY.as_ref()?.begin();
     hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
     hasher.update([0x1fu8]);
