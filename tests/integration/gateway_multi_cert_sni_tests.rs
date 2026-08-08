@@ -471,18 +471,8 @@ fn one_listener_identity_cannot_carry_inconsistent_hostnames() {
 
     let error = load_gateway_multi_cert_tls_config(
         &[
-            input(
-                &alpha,
-                "ferrum/edge/https",
-                Some("a.example.com"),
-                true,
-            ),
-            input(
-                &beta,
-                "ferrum/edge/https",
-                Some("b.example.com"),
-                false,
-            ),
+            input(&alpha, "ferrum/edge/https", Some("a.example.com"), true),
+            input(&beta, "ferrum/edge/https", Some("b.example.com"), false),
         ],
         None,
         None,

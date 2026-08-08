@@ -345,12 +345,7 @@ fn hostname_collision_fails_the_younger_listener_closed() {
 
 #[test]
 fn rejected_listener_cannot_win_a_certificate_hostname_collision() {
-    let mut rejected = https_listener(
-        "https",
-        443,
-        Some("shop.example.com"),
-        &["rejected-cert"],
-    );
+    let mut rejected = https_listener("https", 443, Some("shop.example.com"), &["rejected-cert"]);
     rejected["allowedRoutes"]["namespaces"]["from"] = json!("Invalid");
     let rejected_gateway = created_at(
         gateway("ferrum", "edge-rejected", vec![rejected]),
