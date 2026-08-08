@@ -2074,7 +2074,7 @@ fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
 
     // A root that does not contain the socket refuses it, even though the path
     // is perfectly well-formed.
-    assert_eq!(resolved.backend(&vec!["/run/ferrum".to_string()]), None);
+    assert_eq!(resolved.backend(&["/run/ferrum".to_string()]), None);
 }
 
 /// The declared listener protocol — not the endpoint string — decides the wire
