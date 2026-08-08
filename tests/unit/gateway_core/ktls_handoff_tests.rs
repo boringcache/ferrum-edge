@@ -578,8 +578,8 @@ async fn an_untouched_budget_still_grants_the_whole_configured_timeout() {
 
 mod confidentiality {
     use ferrum_edge::proxy::ktls_confidentiality::{
-        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES,
-        KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES, KtlsConfidentialityError, KtlsConfidentialityGuard,
+        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
+        KtlsConfidentialityError, KtlsConfidentialityGuard,
         KtlsConfidentialityPolicy, KtlsDirection, KtlsObservation, KtlsSessionLimits,
         MAX_TLS_PLAINTEXT_BYTES, MIN_TLS12_AEAD_RECORD_WIRE_BYTES, charge_or_observe,
         receive_record_bound, stable_receive_ceiling, transmit_record_bound,
@@ -676,7 +676,6 @@ mod confidentiality {
         // `net.core.rmem_max` and then doubles it, so the readback — modelled
         // here as an arbitrary pinned value unrelated to the request — is what
         // the ceiling is built from.
-        assert!(KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES > 0);
         let clamped_far_below_the_request = 64 * 1024u64;
         assert_eq!(
             stable_receive_ceiling(clamped_far_below_the_request, 0),
