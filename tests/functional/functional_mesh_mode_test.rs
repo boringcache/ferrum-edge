@@ -15313,8 +15313,8 @@ async fn h3_mesh_reload(
         .build()
         .expect("admin client");
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = String::from("<no admin response yet>");
     loop {
+        let last;
         match client
             .get(&url)
             .header("Authorization", gateway.auth_header())

@@ -5,10 +5,12 @@
 //! counter controls. All projections must share one sensitivity decision.
 
 use ferrum_edge::_test_support::clone_log_metadata;
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema};
 use ferrum_edge::plugins::utils::metadata_redaction::{
-    INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_internal_only_metadata_key,
-    is_sensitive_metadata_key_with_extras, parse_extras_list, strip_internal_only_metadata,
+    INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
+    is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key,
+    is_sensitive_metadata_key_with_extras, parse_extras_list, strip_dedup_internal_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
 use serde_json::{Map, Value, json};
@@ -48,6 +50,16 @@ const NON_SECRET_COUNTERS: &[&str] = &[
     "ai_completion_tokens",
     "cache_key",
     "routing_key",
+];
+
+const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str = "mesh.metrics.request_count.tag_overrides";
+
+const MESH_METRICS_COORDINATION_KEYS: &[&str] = &[
+    MESH_METRICS_DISABLED_METADATA,
+    "mesh.metrics.prometheus_metrics_observed",
+    MESH_REQUEST_COUNT_OVERRIDES_METADATA,
+    "Mesh.Metrics.Request_Duration.Tag_Overrides",
 ];
 
 fn planted_metadata() -> HashMap<String, String> {
@@ -194,9 +206,189 @@ fn clone_log_metadata_strips_all_four_legacy_dedup_fields() {
 }
 
 #[test]
-fn strip_internal_only_metadata_is_shared_fail_closed_filter() {
+fn classifier_splits_dedup_strip_from_mesh_metrics_serialization() {
+    for key in LEGACY_DEDUP_FIELDS {
+        assert!(
+            is_dedup_internal_metadata_key(key) && is_internal_only_metadata_key(key),
+            "{key} must be dedup-internal and serialization-internal"
+        );
+        assert!(
+            !is_mesh_metrics_internal_metadata_key(key),
+            "{key} must not be classified as mesh.metrics internal"
+        );
+    }
+    for key in MESH_METRICS_COORDINATION_KEYS {
+        assert!(
+            is_mesh_metrics_internal_metadata_key(key) && is_internal_only_metadata_key(key),
+            "{key} must be mesh-metrics internal and serialization-internal"
+        );
+        assert!(
+            !is_dedup_internal_metadata_key(key),
+            "{key} must not be stripped before in-process summary"
+        );
+    }
+    for key in NON_INTERNAL_DEDUP_CONTROLS {
+        assert!(
+            !is_dedup_internal_metadata_key(key) && !is_mesh_metrics_internal_metadata_key(key),
+            "{key} must remain observable"
+        );
+    }
+}
+
+#[test]
+fn clone_log_metadata_preserves_mesh_metrics_coordination_keys() {
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/orders".into());
+    ctx.metadata = planted_metadata();
+    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
+        ctx.metadata
+            .insert((*key).to_string(), format!("mesh-plan-{idx}"));
+    }
+
+    let logged = clone_log_metadata(&ctx);
+    for key in LEGACY_DEDUP_FIELDS {
+        assert!(
+            !logged.contains_key(*key),
+            "{key} survived clone_log_metadata"
+        );
+    }
+    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
+        assert_eq!(
+            logged.get(*key).map(String::as_str),
+            Some(format!("mesh-plan-{idx}").as_str()),
+            "{key} must survive production summary projection"
+        );
+    }
+}
+
+#[test]
+fn strip_dedup_internal_metadata_retains_mesh_metrics_plans() {
     let mut metadata = planted_metadata();
-    strip_internal_only_metadata(&mut metadata);
+    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
+        metadata.insert((*key).to_string(), format!("mesh-plan-{idx}"));
+    }
+    strip_dedup_internal_metadata(&mut metadata);
+    for key in LEGACY_DEDUP_FIELDS {
+        assert!(!metadata.contains_key(*key));
+    }
+    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
+        assert_eq!(
+            metadata.get(*key).map(String::as_str),
+            Some(format!("mesh-plan-{idx}").as_str())
+        );
+    }
+}
+
+#[test]
+fn native_summary_omits_mesh_metrics_coordination_keys() {
+    let mut metadata = planted_metadata();
+    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
+        metadata.insert((*key).to_string(), format!("mesh-plan-{idx}"));
+    }
+    let summary = summary_with(metadata);
+    let parsed = serialize_native(&summary);
+    let json = parsed.to_string();
+    let md = parsed
+        .get("metadata")
+        .and_then(Value::as_object)
+        .expect("native metadata object");
+
+    for key in MESH_METRICS_COORDINATION_KEYS {
+        assert!(
+            md.get(*key).is_none(),
+            "{key} must be omitted from serialized summary: {json}"
+        );
+    }
+    for idx in 0..MESH_METRICS_COORDINATION_KEYS.len() {
+        assert!(
+            !json.contains(&format!("mesh-plan-{idx}")),
+            "mesh coordination value leaked: {json}"
+        );
+    }
+    assert_eq!(
+        md.get("trace_id").and_then(Value::as_str),
+        Some("trace-visible")
+    );
+}
+
+#[test]
+fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projection() {
+    let mut ctx = RequestContext::new("10.0.0.1".into(), "GET".into(), "/orders".into());
+    ctx.metadata.extend([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "orders".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+        (
+            MESH_METRICS_DISABLED_METADATA.to_string(),
+            "request_count".to_string(),
+        ),
+        (
+            MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+            "s0,4:edge;r11;".to_string(),
+        ),
+    ]);
+
+    let projected = clone_log_metadata(&ctx);
+    assert_eq!(
+        projected
+            .get(MESH_METRICS_DISABLED_METADATA)
+            .map(String::as_str),
+        Some("request_count")
+    );
+    assert_eq!(
+        projected
+            .get(MESH_REQUEST_COUNT_OVERRIDES_METADATA)
+            .map(String::as_str),
+        Some("s0,4:edge;r11;")
+    );
+
+    let mut summary = TransactionSummary {
+        proxy_id: Some("orders".to_string()),
+        proxy_name: Some("orders".to_string()),
+        response_status_code: 200,
+        latency_total_ms: 12.0,
+        metadata: projected,
+        ..TransactionSummary::default()
+    };
+
+    let registry = MetricsRegistry::new();
+    registry.record(&summary);
+    assert!(
+        registry.mesh_request_counter.is_empty(),
+        "disable plan from projected summary must suppress request_count"
+    );
+    assert_eq!(registry.mesh_request_duration_buckets.len(), 1);
+
+    summary.metadata.remove(MESH_METRICS_DISABLED_METADATA);
+    summary.metadata.insert(
+        MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+        "s0,4:edge;r11;".to_string(),
+    );
+    let registry = MetricsRegistry::new();
+    registry.record(&summary);
+    let output = registry.render_uncached();
+    let counter = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter");
+    assert!(
+        counter.contains("source_workload=\"edge\""),
+        "tag override from projected summary must apply: {counter}"
+    );
+    assert!(!counter.contains("response_flags="), "{counter}");
+}
+
+#[test]
+fn strip_dedup_internal_metadata_is_shared_fail_closed_filter() {
+    let mut metadata = planted_metadata();
+    strip_dedup_internal_metadata(&mut metadata);
     for key in LEGACY_DEDUP_FIELDS {
         assert!(!metadata.contains_key(*key));
     }
