@@ -410,6 +410,16 @@ pub struct MeshRuntimeConfig {
     /// `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Each entry is either a bare
     /// Kubernetes service-account name or a full SPIFFE id.
     pub trusted_hbone_assertors: Vec<String>,
+    /// Containment roots admitted for a `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket (issue #3261). Sourced from
+    /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`; **empty means the feature is
+    /// OFF** and every `unix://` endpoint is deferred fail-closed. There is no
+    /// built-in allowance — see `crate::util::unix_socket`.
+    pub unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for such a socket. Empty admits only the Ferrum
+    /// process's own effective uid. Sourced from
+    /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS`.
+    pub unix_socket_allowed_uids: Vec<u32>,
     /// Workload labels for this mesh data plane. Used by `mesh_authz`'s
     /// PolicyScope filter (and by `MeshSlice::from_gateway_config`'s
     /// WorkloadSelector matching) to decide which policies apply to this
@@ -661,6 +671,17 @@ impl MeshRuntimeConfig {
         }
         let trusted_hbone_assertors = env_config.mesh_trusted_hbone_assertors.clone();
 
+        // Sidecar ingress Unix-socket containment (issue #3261). Validated here
+        // so a typo in a security allowlist fails startup loudly instead of
+        // silently narrowing (or widening) which local sockets an operator's
+        // `Sidecar` may point the proxy at. Empty is legal and means the
+        // feature is OFF — every `unix://` `defaultEndpoint` is then refused.
+        crate::util::unix_socket::validate_allowed_roots(
+            &env_config.mesh_unix_socket_allowed_roots,
+        )?;
+        let unix_socket_allowed_roots = env_config.mesh_unix_socket_allowed_roots.clone();
+        let unix_socket_allowed_uids = env_config.mesh_unix_socket_allowed_uids.clone();
+
         let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(DEFAULT_DNS_ENABLED);
@@ -742,6 +763,8 @@ impl MeshRuntimeConfig {
             xds_connect_timeout_seconds,
             trust_domain_aliases,
             trusted_hbone_assertors,
+            unix_socket_allowed_roots,
+            unix_socket_allowed_uids,
             workload_labels,
             workload_svid_cert_path,
             workload_svid_key_path,
@@ -1252,15 +1275,15 @@ fn prepare_normalized_gateway_config_for_mesh(
             .local_ingress_listeners
             .iter()
             .filter(|listener| {
-                if !listener.endpoint_is_valid() {
+                if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                     warn!(
                         listener_port = listener.port,
                         endpoint_host = %listener.endpoint_host,
                         endpoint_port = listener.endpoint_port,
                         has_unix_path = listener.endpoint_unix_path.is_some(),
                         "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                         (neither a loopback host:port nor an admissible unix socket path); failing \
-                         closed rather than routing it"
+                         (neither a loopback host:port nor a contained, admissible unix socket path); \
+                         failing closed rather than routing it"
                     );
                     return false;
                 }
@@ -4508,7 +4531,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         .local_ingress_listeners
         .iter()
         .filter(|listener| {
-            if !listener.endpoint_is_valid() {
+            if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                 warn!(
                     local_spiffe,
                     listener_port = listener.port,
@@ -4516,8 +4539,8 @@ fn materialize_sidecar_ingress_listener_proxies(
                     endpoint_port = listener.endpoint_port,
                     has_unix_path = listener.endpoint_unix_path.is_some(),
                     "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                     (neither a loopback host:port nor an admissible unix socket path); failing \
-                     closed rather than dialing it"
+                     (neither a loopback host:port nor a contained, admissible unix socket path); \
+                     failing closed rather than dialing it"
                 );
                 return false;
             }
@@ -4592,7 +4615,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         // listener above, so the two can never disagree about which shape this
         // entry is. `None` is unreachable here (the filter already ran) but is
         // handled by skipping rather than by an `expect`.
-        let Some(backend) = listener.backend() else {
+        let Some(backend) = listener.backend(&runtime.unix_socket_allowed_roots) else {
             continue;
         };
         let proxy_id = mesh_ingress_proxy_id(
@@ -4612,7 +4635,7 @@ fn materialize_sidecar_ingress_listener_proxies(
                     now,
                 )
             }
-            crate::modes::mesh::config::MeshIngressBackend::Unix { path } => {
+            crate::modes::mesh::config::MeshIngressBackend::Unix { path, h2c } => {
                 // The socket path rides a single-target upstream tag rather than
                 // a `Proxy` field: `UpstreamTarget.tags` is the established
                 // mesh transport-marker carrier (`mesh.hbone`, `mesh.mtls`), and
@@ -4642,6 +4665,7 @@ fn materialize_sidecar_ingress_listener_proxies(
                     &listener.owner_namespace,
                     listener.port,
                     path,
+                    *h2c,
                     now,
                 ));
                 proxy
@@ -4740,6 +4764,7 @@ fn mesh_ingress_unix_upstream(
     namespace: &str,
     listener_port: u16,
     socket_path: &str,
+    h2c: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     let mut tags = HashMap::new();
@@ -4747,6 +4772,17 @@ fn mesh_ingress_unix_upstream(
         crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG.to_string(),
         socket_path.to_string(),
     );
+    // The wire protocol is resolved once at translation from the declared
+    // `port.protocol` and carried explicitly. Dispatch NEVER infers it: an
+    // absent tag means HTTP/1.1, which is what an `http` listener declared, so
+    // a stripped tag degrades to the weaker-but-correct protocol rather than
+    // to a guessed h2c handshake the app would reject.
+    if h2c {
+        tags.insert(
+            crate::proxy::unix_backend::MESH_UNIX_SOCKET_H2C_TAG.to_string(),
+            "true".to_string(),
+        );
+    }
     Upstream {
         id: upstream_id.to_string(),
         name: Some(upstream_id.to_string()),
@@ -12301,7 +12337,7 @@ fn selectable_inbound_peer_auth_ports(
             .local_ingress_listeners
             .iter()
             .filter(|listener| {
-                listener.endpoint_is_valid()
+                listener.endpoint_shape_is_valid()
                     && !listener.owner_namespace.is_empty()
                     && !listener.owner_service.is_empty()
             })
@@ -12354,7 +12390,7 @@ fn selectable_inbound_peer_auth_ports(
         // A Unix-socket listener carries no backend PORT (`endpoint_port == 0`),
         // so it contributes nothing to the app-port PeerAuthentication domain —
         // the same `port != 0` filter the identity-less branch above applies.
-        if listener.endpoint_is_valid()
+        if listener.endpoint_shape_is_valid()
             && listener.endpoint_port != 0
             && !listener.owner_namespace.is_empty()
             && !listener.owner_service.is_empty()
@@ -12479,7 +12515,7 @@ fn resolve_inbound_app_ports_by_orig_dst_port(
         // Match the ingress materializer's carried-value boundary checks. A
         // malformed listener that cannot become a route must not influence the
         // TLS policy table.
-        if !listener.endpoint_is_valid()
+        if !listener.endpoint_shape_is_valid()
             || listener.owner_namespace.is_empty()
             || listener.owner_service.is_empty()
         {
@@ -15546,6 +15582,8 @@ pub mod startup_rollback_test_seams {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -16594,6 +16632,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -16708,6 +16748,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -32807,6 +32849,7 @@ mod tests {
             endpoint_host: host.to_string(),
             endpoint_port,
             endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: "default".to_string(),
             owner_service: "reviews".to_string(),
         }
@@ -32900,6 +32943,14 @@ mod tests {
         port: u16,
         socket_path: &str,
     ) -> crate::modes::mesh::config::ResolvedIngressListener {
+        unix_ingress_listener_with_protocol(port, socket_path, false)
+    }
+
+    fn unix_ingress_listener_with_protocol(
+        port: u16,
+        socket_path: &str,
+        h2c: bool,
+    ) -> crate::modes::mesh::config::ResolvedIngressListener {
         crate::modes::mesh::config::ResolvedIngressListener {
             port,
             // Vacant host:port is the Unix shape's invariant — a both-shapes
@@ -32907,8 +32958,22 @@ mod tests {
             endpoint_host: String::new(),
             endpoint_port: 0,
             endpoint_unix_path: Some(socket_path.to_string()),
+            endpoint_unix_h2c: h2c,
             owner_namespace: "default".to_string(),
             owner_service: "reviews".to_string(),
+        }
+    }
+
+    /// Containment root the unix-ingress tests admit sockets under. Nothing is
+    /// created on disk here — materialization is lexical; the filesystem checks
+    /// live at the dial (`util::unix_socket::admit_socket_for_connect`).
+    const TEST_UNIX_ROOT: &str = "/var/run/ferrum-test";
+
+    fn unix_ingress_runtime(spiffe: &str) -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            unix_socket_allowed_roots: vec![TEST_UNIX_ROOT.to_string()],
+            ..test_mesh_runtime_config()
         }
     }
 
@@ -32937,13 +33002,13 @@ mod tests {
     #[test]
     fn sidecar_ingress_unix_listener_materializes_tagged_upstream() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(spiffe.to_string()),
-            ..test_mesh_runtime_config()
-        };
+        let runtime = unix_ingress_runtime(spiffe);
         let slice = unix_ingress_slice(
             spiffe,
-            vec![unix_ingress_listener(8443, "/var/run/app.sock")],
+            vec![unix_ingress_listener(
+                8443,
+                "/var/run/ferrum-test/app.sock",
+            )],
         );
 
         let config =
@@ -32974,7 +33039,13 @@ mod tests {
                 .tags
                 .get(crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG)
                 .map(String::as_str),
-            Some("/var/run/app.sock")
+            Some("/var/run/ferrum-test/app.sock")
+        );
+        // An `http`-declared listener carries NO h2c marker, so dispatch dials
+        // HTTP/1.1 — the protocol is carried, never inferred.
+        assert!(
+            !crate::proxy::unix_backend::target_unix_backend_is_h2c(&upstream.targets[0]),
+            "an http-declared unix listener must not be marked h2c"
         );
         assert!(
             upstream.health_checks.is_none(),
@@ -32996,10 +33067,7 @@ mod tests {
     #[test]
     fn sidecar_ingress_unix_listener_update_and_delete_rebuild_cleanly() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(spiffe.to_string()),
-            ..test_mesh_runtime_config()
-        };
+        let runtime = unix_ingress_runtime(spiffe);
         let tagged_path = |config: &GatewayConfig| -> Option<String> {
             config
                 .upstreams
@@ -33014,23 +33082,35 @@ mod tests {
         };
 
         let first = gateway_config_from_mesh_slice(
-            &unix_ingress_slice(spiffe, vec![unix_ingress_listener(8443, "/var/run/a.sock")]),
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/ferrum-test/a.sock")],
+            ),
             &runtime,
             None,
             None,
         )
         .expect("first slice → config");
-        assert_eq!(tagged_path(&first).as_deref(), Some("/var/run/a.sock"));
+        assert_eq!(
+            tagged_path(&first).as_deref(),
+            Some("/var/run/ferrum-test/a.sock")
+        );
 
         // UPDATE: the same listener port re-pointed at a different socket.
         let updated = gateway_config_from_mesh_slice(
-            &unix_ingress_slice(spiffe, vec![unix_ingress_listener(8443, "/var/run/b.sock")]),
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/ferrum-test/b.sock")],
+            ),
             &runtime,
             None,
             None,
         )
         .expect("updated slice → config");
-        assert_eq!(tagged_path(&updated).as_deref(), Some("/var/run/b.sock"));
+        assert_eq!(
+            tagged_path(&updated).as_deref(),
+            Some("/var/run/ferrum-test/b.sock")
+        );
         assert_eq!(
             updated
                 .upstreams
@@ -33068,11 +33148,8 @@ mod tests {
     #[test]
     fn sidecar_ingress_unix_listener_with_a_smuggled_tcp_fallback_is_dropped() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(spiffe.to_string()),
-            ..test_mesh_runtime_config()
-        };
-        let mut hostile = unix_ingress_listener(8443, "/var/run/app.sock");
+        let runtime = unix_ingress_runtime(spiffe);
+        let mut hostile = unix_ingress_listener(8443, "/var/run/ferrum-test/app.sock");
         hostile.endpoint_host = "127.0.0.1".to_string();
         hostile.endpoint_port = 8080;
         let config = gateway_config_from_mesh_slice(
@@ -33104,14 +33181,14 @@ mod tests {
     #[test]
     fn sidecar_ingress_unix_listener_with_a_traversal_path_is_dropped() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let runtime = MeshRuntimeConfig {
-            workload_spiffe_id: Some(spiffe.to_string()),
-            ..test_mesh_runtime_config()
-        };
+        let runtime = unix_ingress_runtime(spiffe);
         let config = gateway_config_from_mesh_slice(
             &unix_ingress_slice(
                 spiffe,
-                vec![unix_ingress_listener(8443, "/var/../etc/passwd")],
+                vec![unix_ingress_listener(
+                    8443,
+                    "/var/run/ferrum-test/../../etc/passwd",
+                )],
             ),
             &runtime,
             None,
@@ -33124,6 +33201,124 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-ingress-")),
             "an inadmissible carried socket path is dropped fail-closed"
+        );
+    }
+
+    /// The containment allowlist is the whole local-privilege boundary, so its
+    /// DEFAULT (unset) must refuse every Unix listener. Without this, an
+    /// operator-authored `Sidecar` could point the proxy at
+    /// `/var/run/docker.sock`.
+    #[test]
+    fn sidecar_ingress_unix_listener_is_refused_when_containment_is_unconfigured() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        // NOTE: `test_mesh_runtime_config()` leaves `unix_socket_allowed_roots`
+        // empty, which is the shipped default.
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        assert!(
+            runtime.unix_socket_allowed_roots.is_empty(),
+            "the default posture under test is an EMPTY allowlist"
+        );
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/docker.sock")],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "no containment roots configured → every unix listener is refused"
+        );
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX)),
+            "a refused listener installs no tagged upstream"
+        );
+    }
+
+    /// A configured allowlist must not admit a privileged socket outside it —
+    /// and must not be defeated by a sibling directory that merely shares a
+    /// textual prefix with an allowed root.
+    #[test]
+    fn sidecar_ingress_unix_listener_outside_allowed_roots_is_refused() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        for hostile in [
+            // A genuinely privileged local socket.
+            "/var/run/docker.sock",
+            // Prefix-sibling: `/var/run/ferrum-testing` is NOT inside
+            // `/var/run/ferrum-test`, so a byte-prefix check would wrongly
+            // admit it.
+            "/var/run/ferrum-testing/app.sock",
+            // The allowed root itself is not a socket path (no component below
+            // it).
+            "/var/run/ferrum-test",
+        ] {
+            let config = gateway_config_from_mesh_slice(
+                &unix_ingress_slice(spiffe, vec![unix_ingress_listener(8443, hostile)]),
+                &runtime,
+                None,
+                None,
+            )
+            .expect("slice → config");
+            assert!(
+                !config
+                    .proxies
+                    .iter()
+                    .any(|p| p.id.starts_with("__mesh-ingress-")),
+                "{hostile} must be refused by the containment allowlist"
+            );
+        }
+    }
+
+    /// The declared listener protocol decides the socket's wire protocol, and it
+    /// is CARRIED on its own reserved tag so dispatch never guesses. An
+    /// `http2`/`grpc` listener is marked h2c, which is what carries gRPC
+    /// streaming, deadlines, and trailers over the socket.
+    #[test]
+    fn sidecar_ingress_unix_listener_carries_the_declared_h2c_protocol() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener_with_protocol(
+                    8443,
+                    "/var/run/ferrum-test/grpc.sock",
+                    true,
+                )],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("slice → config");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX))
+            .expect("an h2c unix listener materializes a tagged upstream");
+        assert!(
+            crate::proxy::unix_backend::target_unix_backend_is_h2c(&upstream.targets[0]),
+            "a grpc/http2-declared unix listener must carry the h2c marker"
+        );
+        assert_eq!(
+            upstream.targets[0]
+                .tags
+                .get(crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG)
+                .map(String::as_str),
+            Some("/var/run/ferrum-test/grpc.sock")
         );
     }
 
@@ -33231,6 +33426,7 @@ mod tests {
             endpoint_host: "127.0.0.1".to_string(),
             endpoint_port: 8080,
             endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: String::new(),
             owner_service: String::new(),
         };
@@ -33275,6 +33471,7 @@ mod tests {
             endpoint_host: "127.0.0.1".to_string(),
             endpoint_port: 9090,
             endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: String::new(),
             owner_service: String::new(),
         };

@@ -1073,6 +1073,7 @@ mod tests {
                 endpoint_host: "127.0.0.1".to_string(),
                 endpoint_port: 8080,
                 endpoint_unix_path: None,
+                endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "reviews".to_string(),
             }]),

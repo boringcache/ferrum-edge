@@ -2569,6 +2569,22 @@ pub enum GrpcMeshDispatch {
     /// H1/H2 frontend path (like `MeshMtls`); the H3 bridge and the gRPC
     /// retry loop still fail closed.
     MeshMtlsCrossCluster,
+    /// A Sidecar `ingress[]` **Unix-socket** backend whose listener declared an
+    /// h2c protocol (`http2` / `https` / `grpc`): dispatch through the generic
+    /// HTTP-family path, whose Unix branch reuses `proxy_to_backend_mesh_mtls`
+    /// over an h2c `UnixStream` — hyper h2 end-to-end, so gRPC request/response
+    /// streaming, deadlines, cancellation, and trailers ride it natively, the
+    /// same way [`MeshMtls`](Self::MeshMtls) does over TLS (issue #3261). Falls
+    /// through only on the H1/H2 frontend path; the H3 bridge and the direct
+    /// gRPC retry loop have no Unix transport and fail closed.
+    UnixSocketH2c,
+    /// A Sidecar `ingress[]` Unix-socket backend whose listener declared plain
+    /// **`http`**, i.e. HTTP/1.1 on the socket: refuse. gRPC requires HTTP/2
+    /// trailers, and downgrading it onto an HTTP/1.1 socket would silently
+    /// corrupt the RPC — the same reasoning as [`RefuseHbone`](Self::RefuseHbone).
+    /// Refused rather than dialed, and never downgraded to the target's
+    /// placeholder `host:port`.
+    RefuseUnixSocketHttp1,
     /// Cross-cluster Ambient `mesh.hbone` east-west target (or a corrupted
     /// target carrying BOTH transport tags): fail closed. The HBONE inner
     /// protocol is HTTP/1.1 over a byte tunnel and cannot carry the HTTP/2
@@ -2648,6 +2664,17 @@ pub fn classify_grpc_mesh_dispatch(
     if mesh_mtls {
         return GrpcMeshDispatch::MeshMtls;
     }
+    // A Unix-socket backend is checked LAST because it is a strictly local
+    // transport that never carries a cross-cluster or peer-identity tag; a
+    // target carrying BOTH a mesh transport tag and the Unix tag is corrupted
+    // and resolves to the stricter mesh transport above, never to the socket.
+    if crate::proxy::unix_backend::target_is_unix_backend(target) {
+        return if crate::proxy::unix_backend::target_unix_backend_is_h2c(target) {
+            GrpcMeshDispatch::UnixSocketH2c
+        } else {
+            GrpcMeshDispatch::RefuseUnixSocketHttp1
+        };
+    }
     GrpcMeshDispatch::Direct
 }
 
@@ -2686,9 +2713,19 @@ pub fn grpc_mesh_dispatch_falls_through(
     match dispatch {
         GrpcMeshDispatch::Direct => false,
         GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => true,
+        // The generic path's Unix branch IS the h2c dispatch, so it must be
+        // reached for every gRPC flavor — including wire-native
+        // `application/grpc` and plugin-translated gRPC-Web, whose responses
+        // both need the streaming trailer channel only that branch provides.
+        GrpcMeshDispatch::UnixSocketH2c => true,
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
-        GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
+        // A non-gRPC-content-type request on an HTTP/1.1 Unix socket is ordinary
+        // HTTP and rides the generic path (whose Unix branch dials HTTP/1.1); a
+        // genuine gRPC request must NOT, so it is refused by the caller instead.
+        GrpcMeshDispatch::RefuseCrossCluster
+        | GrpcMeshDispatch::RefuseHbone
+        | GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }
     }

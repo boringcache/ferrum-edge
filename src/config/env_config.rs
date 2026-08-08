@@ -1504,6 +1504,23 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
+    /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket may live (issue #3261). **No default: empty means the
+    /// feature is OFF and every `unix://` endpoint is refused.** There is
+    /// deliberately no built-in `/run` or `/var/run` allowance — a Sidecar is
+    /// operator-authored config, and an unconstrained path would let it point
+    /// the (often privileged) Ferrum process at any local socket, e.g.
+    /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
+    /// bare `/`; the socket must be a STRICT descendant. Enforced at
+    /// translation and re-enforced at dial (where symlink resolution must land
+    /// inside a root too) — see `crate::util::unix_socket`.
+    pub mesh_unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
+    /// (the default) admits ONLY the Ferrum process's own effective uid, so a
+    /// root-owned system socket that happens to sit inside an allowed root is
+    /// still refused for a non-root Ferrum. Set this when the co-located
+    /// application runs as a different uid than the sidecar.
+    pub mesh_unix_socket_allowed_uids: Vec<u32>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -2806,6 +2823,8 @@ impl Default for EnvConfig {
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
+            mesh_unix_socket_allowed_roots: Vec::new(),
+            mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -3321,6 +3340,8 @@ impl EnvConfig {
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
+            mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
+            mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -4067,6 +4088,8 @@ impl EnvConfig {
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
+            mesh_unix_socket_allowed_roots,
+            mesh_unix_socket_allowed_uids,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,

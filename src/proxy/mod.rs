@@ -26933,26 +26933,35 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Fail-closed gate for Unix-socket backends (a Sidecar `ingress[]`
+    // Fail-closed WebSocket gate for Unix-socket backends (a Sidecar `ingress[]`
     // `defaultEndpoint: unix://…`, carried on the selected target's reserved
-    // `mesh.unix_socket` tag). The Unix transport is HTTP/1.1 only, so neither
-    // the gRPC pool nor the WebSocket upgrade path — both of which branch below
-    // this point and dial TCP — can serve it. The target's `host:port` is a
-    // placeholder nothing listens on (and on a sidecar it is the gateway's own
-    // inbound listener port), so falling through would be strictly worse than
-    // refusing. Mirrors the `hbone_required` / `mesh_mtls_required` contract:
-    // a mesh-tagged target that cannot dispatch over its own transport is
-    // refused, never downgraded.
-    if upstream_target
-        .as_deref()
-        .is_some_and(unix_backend::target_is_unix_backend)
-        && (is_grpc_request || request_protocol == ProxyProtocol::WebSocket)
+    // `mesh.unix_socket` tag).
+    //
+    // **WebSocket over a Unix ingress socket is explicitly NOT supported.** The
+    // WebSocket dial machinery below is written against TCP/TLS and the mesh
+    // H2/HBONE CONNECT tunnels; it has no Unix transport, and the target's
+    // `host:port` is a placeholder nothing listens on (on a sidecar it is the
+    // gateway's OWN inbound listener port, so a fallback dial would loop the
+    // proxy back into itself). Refusing is therefore strictly better than
+    // falling through, and mirrors the `hbone_required` / `mesh_mtls_required`
+    // contract: a mesh-tagged target that cannot dispatch over its own
+    // transport is refused, never downgraded.
+    //
+    // gRPC is NOT gated here (issue #3261): an `http2`/`grpc`-declared listener
+    // dispatches natively over h2c through the generic path's Unix branch, and
+    // an `http`-declared (HTTP/1.1) one is refused with a clean gRPC
+    // UNAVAILABLE by the direct-dispatch mesh-transport screen further down
+    // (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), which produces a
+    // protocol-correct trailers response instead of this 502.
+    if request_protocol == ProxyProtocol::WebSocket
+        && upstream_target
+            .as_deref()
+            .is_some_and(unix_backend::target_is_unix_backend)
     {
         warn!(
             proxy_id = %proxy.id,
-            is_grpc_request,
-            "unix-socket backend target cannot serve gRPC or WebSocket dispatch; \
-             refusing rather than dialing the placeholder loopback address"
+            "unix-socket backend target cannot serve a WebSocket upgrade; refusing rather \
+             than dialing the placeholder loopback address"
         );
         // This refusal precedes any backend dispatch, so release a HALF_OPEN
         // probe slot `check_circuit_breaker` may have claimed — otherwise
@@ -26964,27 +26973,6 @@ async fn handle_proxy_request_inner(
             cb_target_key.as_deref(),
             cb_is_half_open_probe,
         );
-        if is_grpc_request {
-            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            let message = "unix-socket backend does not support gRPC dispatch";
-            if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(
-                    content_type,
-                    14,
-                    message,
-                    plugin_cache_view
-                        .initial_response_header_policy_plugins()
-                        .as_ref(),
-                ));
-            }
-            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                14, // UNAVAILABLE
-                message,
-                plugin_cache_view
-                    .initial_response_header_policy_plugins()
-                    .as_ref(),
-            ));
-        }
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -27188,6 +27176,18 @@ async fn handle_proxy_request_inner(
                 | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => {
                     Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
                 }
+                // An h2c Unix backend normally falls through to the generic
+                // path's Unix branch (issue #3261); refuse defensively here —
+                // this loop's direct `GrpcConnectionPool` dial has no Unix
+                // transport and would dial the placeholder loopback address.
+                grpc_proxy::GrpcMeshDispatch::UnixSocketH2c => {
+                    Some("gRPC to a unix-socket backend cannot be dialed directly")
+                }
+                grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => Some(
+                    "gRPC over an http-declared unix-socket ingress listener is not supported \
+                     (HTTP/1.1 cannot carry gRPC trailers); declare the listener protocol as \
+                     GRPC or HTTP2",
+                ),
             };
             if let Some(message) = refusal {
                 warn!(
@@ -34570,6 +34570,10 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // Mesh transport only: this helper is reached exclusively for
+            // `mesh.hbone`/`mesh.mtls` targets. A `mesh.unix_socket` target is
+            // refused before any retry dispatch.
+            None,
         )
         .await
     };
@@ -35397,12 +35401,29 @@ async fn proxy_to_backend(
     // loopback `host:port`. Same admission ordering as the HBONE / mesh-mTLS
     // branches below, and the same fail-closed contract — a tagged target that
     // cannot dispatch here is refused, never downgraded to TCP.
+    //
+    // TWO wire protocols, chosen by the carried `mesh.unix_socket_h2c` tag and
+    // never guessed (issue #3261):
+    //
+    //   * **HTTP/1.1** (`http`-declared listener) → `proxy_to_backend_unix`.
+    //   * **h2c prior-knowledge HTTP/2** (`http2` / `https` / `grpc`-declared)
+    //     → the SAME dispatch body the sidecar mesh-mTLS transport uses, with
+    //     the pooled TLS sender swapped for a 1:1 h2c `UnixStream` sender. That
+    //     reuse is what makes gRPC over the socket real rather than nominal:
+    //     request/response streaming, the receipt-anchored gRPC deadline,
+    //     cancellation, `te: trailers` regeneration, and terminal-trailer
+    //     forwarding are the identical code path on both transports.
     if let Some(unix_target) = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t)) {
-        let socket_path = match unix_backend::resolve_unix_socket_target(unix_target) {
+        let unix_h2c = unix_backend::target_unix_backend_is_h2c(unix_target);
+        let socket_path = match unix_backend::resolve_unix_socket_target(
+            unix_target,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+        ) {
             Some(Ok(path)) => path.to_string(),
             // The tag is present but its path failed re-admission at dial time.
             // Refuse: the carrier may have crossed a CP/DP or file boundary
-            // since translation admitted it.
+            // since translation admitted it, and the containment allowlist is a
+            // DATA-PLANE policy this process is the first to be able to apply.
             Some(Err(rejection)) => {
                 warn!(
                     proxy_id = %proxy.id,
@@ -35428,10 +35449,48 @@ async fn proxy_to_backend(
                 );
             }
         };
-        // 413 on an oversized declared Content-Length BEFORE admission, so a
+        // Flavor-aware declared-Content-Length check BEFORE admission, so a
         // capacity rejection cannot mask the size violation as a 503 (same
-        // ordering rationale as the HBONE branch).
-        if let Some(reject) = oversized_request_body_dispatch_reject(
+        // ordering rationale as the HBONE / mesh-mTLS branches). A gRPC-flavored
+        // request on the h2c socket is bounded by the gRPC receive limit, not
+        // the HTTP one, and gets the direct pool's Trailers-Only
+        // RESOURCE_EXHAUSTED shape — running the generic HTTP check first would
+        // reject an in-budget gRPC body with the wrong status AND the wrong
+        // framing whenever the HTTP limit is the smaller of the two.
+        let unix_grpc_flavored = unix_h2c
+            && headers
+                .get("content-type")
+                .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+        if unix_grpc_flavored {
+            // Route ceilings are protocol-agnostic client policy, so an active
+            // one narrows the selected gRPC receive limit too
+            // (`GHSA-xrfj-852f-645j`).
+            let grpc_limit = effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            );
+            if grpc_limit > 0
+                && request_may_have_body(method, headers)
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
+                    crate::util::body_limit::declared_content_length(headers)
+                && len > grpc_limit as u64
+            {
+                return backend_dispatch_response(
+                    grpc_proxy::grpc_request_body_too_large_backend_response(
+                        &proxy.id,
+                        resolved_ip.clone(),
+                        usize::try_from(len).ok(),
+                        grpc_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        } else if let Some(reject) = oversized_request_body_dispatch_reject(
             effective_max_request_body_size_bytes,
             method,
             headers,
@@ -35439,11 +35498,23 @@ async fn proxy_to_backend(
         ) {
             return reject;
         }
+        let unix_request_body_limit = if unix_grpc_flavored {
+            effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            )
+        } else {
+            effective_max_request_body_size_bytes
+        };
         let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
             headers,
-            effective_max_request_body_size_bytes,
+            unix_request_body_limit,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
             plugins,
@@ -35470,27 +35541,52 @@ async fn proxy_to_backend(
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
         *backend_admission_started_at = Instant::now();
-        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_unix(
-            state,
-            proxy,
-            &socket_path,
-            backend_url,
-            method,
-            headers,
-            unix_request_body,
-            plugins,
-            Some(request_ctx),
-            response_decision_ctx,
-            stream_response,
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            resolved_ip.clone(),
-            ctx_bytes_sent_observed,
-            effective_max_request_body_size_bytes,
-            effective_max_response_body_size_bytes,
-        )
-        .await;
+        let (backend_resp, body_bytes, request_body_exceeded) = if unix_h2c {
+            proxy_to_backend_mesh_mtls(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                upstream_target,
+                plugins,
+                request_ctx,
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+                Some(socket_path.as_str()),
+            )
+            .await
+        } else {
+            proxy_to_backend_unix(
+                state,
+                proxy,
+                &socket_path,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                plugins,
+                Some(request_ctx),
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                effective_max_request_body_size_bytes,
+                effective_max_response_body_size_bytes,
+            )
+            .await
+        };
         return BackendDispatchResult::Response {
             response: Box::new(backend_resp),
             retained_body: unix_retained_body.or(body_bytes),
@@ -35690,6 +35786,8 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // SVID-mTLS transport, not a unix socket.
+            None,
         )
         .await;
         return BackendDispatchResult::Response {
@@ -39714,10 +39812,13 @@ fn unix_backend_error_response(
 /// host, so the dial is a local `connect(2)` with no DNS, TCP handshake, or TLS;
 /// pooling is a documented follow-up rather than a correctness requirement.
 ///
-/// HTTP/1.1 is the wire protocol. An `http2`/`grpc`-declared listener whose app
-/// speaks h2c prior-knowledge over the socket is NOT covered — a gRPC-flavored
-/// request is refused before it reaches here (see the fail-closed gate in the
-/// request handler) rather than being downgraded.
+/// **HTTP/1.1 only.** This function serves an `http`-declared listener. An
+/// `http2` / `https` / `grpc`-declared listener carries the
+/// `mesh.unix_socket_h2c` tag and is dispatched by `proxy_to_backend_mesh_mtls`
+/// over an h2c `UnixStream` instead, which is what gives gRPC its trailers,
+/// deadlines, and bidirectional streaming. A gRPC-flavored request that reaches
+/// an `http`-declared socket is refused with a clean gRPC UNAVAILABLE before it
+/// gets here (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), never downgraded.
 ///
 /// The third return element is the client-upload overflow flag, returned — like
 /// the HBONE path — only alongside a streaming response so the caller can
@@ -39748,7 +39849,12 @@ async fn proxy_to_backend_unix(
     Option<Bytes>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let dial = unix_backend::dial_unix_backend(socket_path, proxy.backend_connect_timeout_ms);
+    let dial = unix_backend::dial_unix_backend(
+        socket_path,
+        proxy.backend_connect_timeout_ms,
+        &state.env_config.mesh_unix_socket_allowed_roots,
+        &state.env_config.mesh_unix_socket_allowed_uids,
+    );
     let stream = match dial.await {
         Ok(stream) => stream,
         Err(err) => {
@@ -40323,6 +40429,18 @@ async fn proxy_to_backend_mesh_mtls(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // `Some(path)` reuses this entire dispatch body for a Sidecar `ingress[]`
+    // **h2c Unix-socket** backend (issue #3261): the pooled SVID-mTLS sender is
+    // replaced by a 1:1 `UnixStream` h2c sender and the request `:scheme`
+    // becomes `http`, while everything else — gRPC flavor detection, the
+    // receipt-anchored deadline, `te: trailers`, the never-buffer-native-gRPC
+    // rule, streaming trailer forwarding, and the body ceilings — is the SAME
+    // code. Sharing it is deliberate: two copies of the gRPC-over-h2 contract
+    // would drift. On this path the target carries NO mesh transport tag, so the
+    // mesh-mTLS dial plan (pinned peer, trust domain, SNI) does not apply; the
+    // socket's containment allowlist, file type, owner uid, and mode are its
+    // identity boundary instead.
+    unix_socket_path: Option<&str>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -40374,12 +40492,29 @@ async fn proxy_to_backend_mesh_mtls(
     //     the destination service FQDN (`mesh.eastwest_sni`). A missing SNI or
     //     trust domain FAILS CLOSED (502) — never a fallback to the gateway
     //     address as SNI or any-federated verification.
+    //
+    // The h2c Unix transport has no TLS session at all, so it takes the vacant
+    // plan rather than resolving one: `MeshMtlsDialPlan::resolve` REQUIRES a
+    // pinned `mesh.spiffe_id`, which a Unix ingress target correctly never
+    // carries, and would fail the dispatch closed. Its security boundary is the
+    // socket-path containment gate already applied by the caller and re-applied
+    // at the dial.
+    let unix_dial_plan = mesh_mtls_pool::MeshMtlsDialPlan {
+        cross_cluster: false,
+        expected_peer: None,
+        expected_trust_domain: None,
+        sni_override: None,
+    };
     let mesh_mtls_pool::MeshMtlsDialPlan {
         cross_cluster,
         expected_peer,
         expected_trust_domain,
         sni_override,
-    } = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+    } = match if unix_socket_path.is_some() {
+        Ok(unix_dial_plan)
+    } else {
+        mesh_mtls_pool::MeshMtlsDialPlan::resolve(target)
+    } {
         Ok(plan) => plan,
         Err(mesh_mtls_pool::MeshMtlsDialError::PinnedPeer(err)) => {
             error!(
@@ -40458,7 +40593,8 @@ async fn proxy_to_backend_mesh_mtls(
             .map(|td| td.as_str())
             .unwrap_or(""),
         sni_override = sni_override.unwrap_or(""),
-        "Proxying request via sidecar SVID-mTLS HTTP/2"
+        unix_socket_backend = unix_socket_path.is_some(),
+        "Proxying request via sidecar HTTP/2 (SVID-mTLS, or h2c over a unix socket)"
     );
 
     // gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips the
@@ -40594,34 +40730,80 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
-    let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-    let get_sender = state.mesh_mtls_pool.get_sender(
-        proxy,
-        &target.host,
-        target.port,
-        target.dispatch_policy_port(),
-        mtls_port,
-        expected_peer.as_ref(),
-        expected_trust_domain.as_ref(),
-        sni_override,
-    );
-    let sender_result = if let Some(deadline) = client_grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, get_sender).await {
-            Ok(result) => result,
-            Err(_) => {
+    // Unix h2c: a fresh 1:1 socket per request, admitted at the TOCTOU boundary
+    // (containment, symlink-resolved containment, socket file type, owner uid,
+    // mode) and bounded by the proxy's connect timeout. Not pooled — the
+    // destination is a co-located app reached by a local `connect(2)` with no
+    // DNS, TCP handshake, or TLS; pooling is a documented performance follow-up,
+    // not a correctness requirement.
+    let sender_result = if let Some(socket_path) = unix_socket_path {
+        let dial = unix_backend::dial_unix_h2c_sender(
+            socket_path,
+            proxy.backend_connect_timeout_ms,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+            &state.env_config.mesh_unix_socket_allowed_uids,
+        );
+        // The client's end-to-end RPC deadline caps the dial exactly as it caps
+        // the pooled sender acquisition below: a wedged local app must not
+        // outlive the deadline the caller already committed to.
+        let dialed = if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, dial).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            dial.await
+        };
+        match dialed {
+            Ok(sender) => Ok(sender),
+            Err(err) => {
                 return (
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
+                    unix_backend_error_response(proxy, &err, resolved_ip),
                     None,
                     None,
                 );
             }
         }
     } else {
-        get_sender.await
+        let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+        let get_sender = state.mesh_mtls_pool.get_sender(
+            proxy,
+            &target.host,
+            target.port,
+            target.dispatch_policy_port(),
+            mtls_port,
+            expected_peer.as_ref(),
+            expected_trust_domain.as_ref(),
+            sni_override,
+        );
+        if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, get_sender).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            get_sender.await
+        }
     };
     let mut sender = match sender_result {
         Ok(sender) => sender,
@@ -40836,8 +41018,17 @@ async fn proxy_to_backend_mesh_mtls(
             authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
             authority_owned.as_str()
         };
+    // `:scheme` must describe the actual hop: `https` for the SVID-mTLS session,
+    // `http` for a plaintext h2c Unix socket. An `https` scheme on the socket
+    // would make the co-located app build absolute URLs / redirects claiming a
+    // TLS hop that does not exist.
+    let request_scheme = if unix_socket_path.is_some() {
+        "http"
+    } else {
+        "https"
+    };
     let tunneled_uri = match hyper::Uri::builder()
-        .scheme("https")
+        .scheme(request_scheme)
         .authority(authority)
         .path_and_query(path_and_query)
         .build()

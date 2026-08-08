@@ -1926,6 +1926,21 @@ pub struct ResolvedIngressListener {
     /// the field is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_unix_path: Option<String>,
+    /// Whether the Unix-stream backend speaks **h2c prior-knowledge** HTTP/2
+    /// rather than HTTP/1.1, derived from the declared `port.protocol`:
+    /// `http` → HTTP/1.1 (`false`); `http2`, `https` (which the Istio
+    /// translator maps to `Http2`), and `grpc` → h2c (`true`).
+    ///
+    /// This is the ONLY thing that decides which client handshake the dispatch
+    /// path performs on the socket, so it must never be guessed: an unmapped
+    /// protocol is refused at [`MeshSidecarIngress::resolve`] before a listener
+    /// exists. Meaningless — and never set — for a loopback-TCP listener, whose
+    /// protocol negotiation is the ordinary backend-capability machinery.
+    ///
+    /// `skip_serializing_if` keeps the wire shape byte-identical for the far
+    /// more common HTTP/1.1 listener.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub endpoint_unix_h2c: bool,
     /// Namespace of the local service whose host identity anchors the listener
     /// route. Carried so the materializer and the router/validator derive the
     /// SAME materialized proxy id forward (`mesh_ingress_proxy_id`) without
@@ -1948,8 +1963,10 @@ pub struct ResolvedIngressListener {
 pub enum MeshIngressBackend {
     /// A co-located loopback TCP backend (`127.0.0.1`/`::1` + nonzero port).
     Loopback { host: String, port: u16 },
-    /// A co-located Unix-domain STREAM socket at an admitted absolute path.
-    Unix { path: String },
+    /// A co-located Unix-domain STREAM socket at an admitted, CONTAINED
+    /// absolute path. `h2c` selects the client handshake performed on the
+    /// socket: prior-knowledge HTTP/2 when true, HTTP/1.1 when false.
+    Unix { path: String, h2c: bool },
 }
 
 impl ResolvedIngressListener {
@@ -1968,21 +1985,53 @@ impl ResolvedIngressListener {
     ///   * loopback host (`127.0.0.1`/`::1`, the only forms `resolve()` ever
     ///     emits after collapsing the instance-IP wildcards) + nonzero backend
     ///     port for the TCP shape;
-    ///   * an admitted absolute socket path AND a vacant `endpoint_host` /
-    ///     `endpoint_port` for the Unix shape, so a both-shapes carrier cannot
-    ///     smuggle a TCP fallback past the Unix dispatch gate.
+    ///   * an admitted, CONTAINED absolute socket path AND a vacant
+    ///     `endpoint_host` / `endpoint_port` for the Unix shape, so a
+    ///     both-shapes carrier cannot smuggle a TCP fallback past the Unix
+    ///     dispatch gate.
+    ///
+    /// `allowed_roots` is the data plane's configured Unix-socket containment
+    /// allowlist (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`). It is a DATA-PLANE
+    /// policy — a control plane does not share the workload's filesystem — so
+    /// containment is enforced here, at materialization, and again at dial,
+    /// rather than at CP-side `resolve()`. An EMPTY allowlist refuses every
+    /// Unix listener; loopback-TCP listeners are unaffected by it.
     ///
     /// `pub` (like `MeshSidecarIngress::resolve`) so it is testable from the
     /// external mesh-validation test crate; it is a pure, side-effect-free
     /// validator over already-public fields.
-    pub fn endpoint_is_valid(&self) -> bool {
-        self.backend().is_some()
+    pub fn endpoint_is_valid(&self, allowed_roots: &[String]) -> bool {
+        self.backend(allowed_roots).is_some()
+    }
+
+    /// The listener's backend SHAPE check, WITHOUT Unix-socket containment.
+    ///
+    /// Used only by the PeerAuthentication port-domain helpers, which care
+    /// solely about the backend app PORT (a Unix listener has none and is
+    /// filtered out by their own `endpoint_port != 0` rule). Never use it to
+    /// decide whether a listener may be materialized or dialed — that is
+    /// [`Self::endpoint_is_valid`]'s job, and only it applies containment.
+    pub fn endpoint_shape_is_valid(&self) -> bool {
+        self.backend_shape().is_some()
     }
 
     /// The typed backend this listener dials, or `None` when the carried fields
     /// fail the fail-closed admission rules described on
-    /// [`Self::endpoint_is_valid`].
-    pub fn backend(&self) -> Option<MeshIngressBackend> {
+    /// [`Self::endpoint_is_valid`] — INCLUDING containment inside
+    /// `allowed_roots` for the Unix shape.
+    pub fn backend(&self, allowed_roots: &[String]) -> Option<MeshIngressBackend> {
+        let backend = self.backend_shape()?;
+        if let MeshIngressBackend::Unix { path, .. } = &backend {
+            crate::util::unix_socket::admit_configured_path(path, allowed_roots).ok()?;
+        }
+        Some(backend)
+    }
+
+    /// Shape-only backend resolution: mutual exclusion, nonzero ports, loopback
+    /// host, and the SYNTACTIC socket-path rules. Deliberately does NOT apply
+    /// containment, so every containment decision has exactly one home
+    /// ([`Self::backend`]).
+    fn backend_shape(&self) -> Option<MeshIngressBackend> {
         if self.port == 0 {
             return None;
         }
@@ -1993,7 +2042,14 @@ impl ResolvedIngressListener {
             crate::util::unix_socket::validate_unix_socket_path(path).ok()?;
             return Some(MeshIngressBackend::Unix {
                 path: path.to_string(),
+                h2c: self.endpoint_unix_h2c,
             });
+        }
+        // A loopback-TCP listener must not carry the Unix-only protocol marker:
+        // a carrier that sets it is internally inconsistent, and admitting it
+        // would let a future reader treat a TCP listener as an h2c socket one.
+        if self.endpoint_unix_h2c {
+            return None;
         }
         if self.endpoint_port == 0 {
             return None;
@@ -2007,10 +2063,10 @@ impl ResolvedIngressListener {
         }
     }
 
-    /// The admitted Unix-socket path this listener dials, or `None` when it is a
-    /// loopback-TCP listener (or fails admission).
-    pub fn unix_socket_path(&self) -> Option<&str> {
-        if !self.endpoint_is_valid() {
+    /// The admitted, CONTAINED Unix-socket path this listener dials, or `None`
+    /// when it is a loopback-TCP listener (or fails admission).
+    pub fn unix_socket_path(&self, allowed_roots: &[String]) -> Option<&str> {
+        if !self.endpoint_is_valid(allowed_roots) {
             return None;
         }
         self.endpoint_unix_path.as_deref()
@@ -2038,6 +2094,32 @@ pub enum IngressListenerUnsupported {
     /// The listener protocol is stream-family (raw TCP / TLS / DB) — inbound
     /// raw-TCP has no Host/route and is not modeled here.
     NonHttpProtocol,
+    /// The listener protocol is HTTP-family but Ferrum cannot speak it over a
+    /// Unix stream, so a `unix://` `defaultEndpoint` for it is refused with a
+    /// field-specific reason rather than materialized into a listener that
+    /// would refuse every request at runtime (issue #3261).
+    UnixProtocolUnsupported,
+}
+
+/// Which HTTP wire protocol Ferrum speaks to a Unix-stream backend for a given
+/// declared listener protocol, or `None` when that protocol has no Unix-stream
+/// dispatch at all.
+///
+/// `Some(false)` = HTTP/1.1, `Some(true)` = h2c prior-knowledge HTTP/2 (which
+/// is what carries gRPC's request/response streaming, deadlines, cancellation,
+/// and trailers). The `Http2` arm also covers Istio's `https`, which the K8s
+/// ingress translator maps to `Http2`: a `defaultEndpoint` is a plaintext hop
+/// to a co-located app, so TLS is not re-originated onto the socket.
+///
+/// Kept as an explicit total match over the HTTP-family set — adding an
+/// `AppProtocol` variant must be a deliberate decision here, not a silent
+/// inherit of HTTP/1.1.
+pub(crate) fn unix_backend_wire_protocol(protocol: AppProtocol) -> Option<bool> {
+    match protocol {
+        AppProtocol::Http => Some(false),
+        AppProtocol::Http2 | AppProtocol::Grpc => Some(true),
+        _ => None,
+    }
 }
 
 impl MeshSidecarIngress {
@@ -2052,19 +2134,32 @@ impl MeshSidecarIngress {
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
         }
-        let (endpoint_host, endpoint_port, endpoint_unix_path) =
+        let (endpoint_host, endpoint_port, endpoint_unix_path, endpoint_unix_h2c) =
             match parse_ingress_default_endpoint(&self.default_endpoint)? {
-                MeshIngressBackend::Loopback { host, port } => (host, port, None),
+                MeshIngressBackend::Loopback { host, port } => (host, port, None, false),
                 // The host:port pair is left VACANT for a Unix backend so the
                 // carrier re-validation (`endpoint_is_valid`) can reject a
                 // both-shapes carrier outright.
-                MeshIngressBackend::Unix { path } => (String::new(), 0, Some(path)),
+                MeshIngressBackend::Unix { path, .. } => {
+                    // The wire protocol spoken on the socket is decided HERE,
+                    // from the declared `port.protocol`, and never guessed at
+                    // dispatch. `unix_backend_wire_protocol` returns `None` for
+                    // any HTTP-family protocol Ferrum cannot actually speak over
+                    // a Unix stream, which fails the entry closed with a
+                    // field-specific reason instead of materializing a listener
+                    // that would refuse every request at runtime.
+                    let Some(h2c) = unix_backend_wire_protocol(self.protocol) else {
+                        return Err(IngressListenerUnsupported::UnixProtocolUnsupported);
+                    };
+                    (String::new(), 0, Some(path), h2c)
+                }
             };
         Ok(ResolvedIngressListener {
             port: self.port,
             endpoint_host,
             endpoint_port,
             endpoint_unix_path,
+            endpoint_unix_h2c,
             // Stamped by the slice builder once the local service is known.
             owner_namespace: String::new(),
             owner_service: String::new(),
@@ -2141,6 +2236,9 @@ fn parse_ingress_default_endpoint(
         return match crate::util::unix_socket::validate_unix_socket_path(path) {
             Ok(()) => Ok(MeshIngressBackend::Unix {
                 path: path.to_string(),
+                // The wire protocol is not a property of the ENDPOINT string;
+                // `resolve` fills it in from the declared `port.protocol`.
+                h2c: false,
             }),
             Err(rejection) => Err(IngressListenerUnsupported::InvalidUnixSocketPath(rejection)),
         };

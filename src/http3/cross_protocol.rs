@@ -4504,6 +4504,14 @@ fn grpc_mesh_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'stat
             "gRPC over the Ambient HBONE mesh transport is not supported \
              (HBONE inner protocol cannot carry gRPC trailers)",
         ),
+        // The H3 bridge has no Unix-socket dispatch path either, so BOTH Unix
+        // classes fail closed here; the h2c Unix transport is supported only on
+        // the H1/H2 frontend (issue #3261). Mesh capture is TCP-only, so an H3
+        // frontend cannot reach a Sidecar ingress listener in practice.
+        grpc_proxy::GrpcMeshDispatch::UnixSocketH2c
+        | grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => Some(
+            "gRPC over a unix-socket backend is not supported on the HTTP/3 frontend",
+        ),
     }
 }
 

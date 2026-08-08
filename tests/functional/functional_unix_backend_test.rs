@@ -1,17 +1,29 @@
-//! Live data-path coverage for Unix-domain-socket backends (issue #3261).
+//! **Transport-level** coverage for Unix-domain-socket backends (issue #3261).
 //!
-//! An Istio `Sidecar` ingress `defaultEndpoint: unix:///path.sock` materializes
-//! into a route whose upstream target carries the reserved `mesh.unix_socket`
-//! tag; the HTTP dispatch path recognizes that tag and dials a
-//! `tokio::net::UnixStream` instead of TCP. These tests drive the REAL gateway
-//! binary over that path with real sockets on disk, so they fail if the
-//! transport regresses to a TCP dial, if the fail-closed gate is dropped, or if
-//! reload/update/delete stops re-materializing the backend.
+//! These tests exercise the dispatch half of the feature: given a route whose
+//! upstream target carries the reserved `mesh.unix_socket` tag, the HTTP path
+//! must dial a `tokio::net::UnixStream` (never the placeholder `host:port`),
+//! preserve the request target and headers, fail closed on an absent socket, and
+//! survive reload/update/delete. They express that runtime shape directly in
+//! file-mode config so a transport regression is caught without spawning a mesh
+//! control plane.
 //!
-//! The tag is the entire transport gate (exactly like `mesh.hbone` /
-//! `mesh.mtls`), so a plain file-mode config expresses the same runtime shape
-//! the mesh materializer emits — without needing a full mesh control plane in a
-//! functional test.
+//! **They are NOT the translation coverage.** Because they hand-author the
+//! reserved tag, they deliberately bypass the `Sidecar` `ingress[]` boundary. The
+//! end-to-end path — a real `Sidecar` `defaultEndpoint: unix://…` translated
+//! through the supported source, materialized, and then serving live HTTP/1.1,
+//! h2c, and gRPC traffic, plus the containment allowlist and the WebSocket /
+//! HTTP-1.1-gRPC refusals — is covered by
+//! `functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic` in
+//! `functional_mesh_mode_test.rs`. Keep both: this file pins the transport, that
+//! one pins the boundary.
+//!
+//! Every test configures `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` to its own temp
+//! directory. That is not incidental setup — with no roots configured the
+//! containment gate refuses every Unix backend, which is the shipped default.
+//! The temp path is canonicalized first because the dial-time gate compares the
+//! SYMLINK-RESOLVED path against the roots (macOS `/var` → `/private/var` would
+//! otherwise read as an escape).
 //!
 //! Unix-only: there is no Unix-domain socket transport (nor file-mode SIGHUP
 //! reload) on Windows.
@@ -170,6 +182,15 @@ async fn wait_for_body(
     }
 }
 
+/// The containment root for a test: the temp dir, CANONICALIZED so the
+/// dial-time symlink-resolved containment check agrees with the configured
+/// root on platforms where the temp dir sits behind a symlink.
+fn containment_root(temp: &TempDir) -> PathBuf {
+    temp.path()
+        .canonicalize()
+        .expect("canonicalize temp dir for the unix-socket containment root")
+}
+
 /// A loopback TCP port that is bound for the lifetime of the test but never
 /// served. Any request that reached it instead of the Unix socket would hang and
 /// then fail, making a silent TCP fallback impossible to mistake for success.
@@ -185,7 +206,8 @@ async fn reserve_placeholder_port() -> (u16, tokio::net::TcpListener) {
 #[ignore]
 async fn unix_socket_backend_serves_requests_over_a_real_socket() {
     let temp = TempDir::new().expect("temp dir");
-    let backend = UnixBackend::start(temp.path(), "app.sock", "alpha").await;
+    let root = containment_root(&temp);
+    let backend = UnixBackend::start(&root, "app.sock", "alpha").await;
     let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
 
     let config = build_config(
@@ -202,6 +224,12 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
         // Keep startup deterministic: the placeholder loopback port is bound but
         // never served, so a warmup dial against it would only add noise.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Containment is fail-closed with no configured roots, so the test's own
+        // socket directory has to be admitted explicitly.
+        .env(
+            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
+            root.to_str().expect("utf-8 containment root"),
+        )
         .spawn()
         .await
         .expect("start gateway");
@@ -239,10 +267,12 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
 #[ignore]
 async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
     let temp = TempDir::new().expect("temp dir");
+    let root = containment_root(&temp);
     // Deliberately never bound: `connect(2)` yields ENOENT, which must surface
     // as a pre-wire backend failure and NEVER as a fallback TCP dial to the
-    // placeholder port.
-    let missing = temp.path().join("absent.sock");
+    // placeholder port. The path IS inside the containment root, so the refusal
+    // under test is the absent socket rather than the allowlist.
+    let missing = root.join("absent.sock");
     let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
 
     let config = build_config(
@@ -259,6 +289,12 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
         // Keep startup deterministic: the placeholder loopback port is bound but
         // never served, so a warmup dial against it would only add noise.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Containment is fail-closed with no configured roots, so the test's own
+        // socket directory has to be admitted explicitly.
+        .env(
+            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
+            root.to_str().expect("utf-8 containment root"),
+        )
         .spawn()
         .await
         .expect("start gateway");
@@ -291,8 +327,9 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
 #[ignore]
 async fn unix_socket_backend_survives_reload_update_and_delete() {
     let temp = TempDir::new().expect("temp dir");
-    let alpha = UnixBackend::start(temp.path(), "alpha.sock", "alpha").await;
-    let beta = UnixBackend::start(temp.path(), "beta.sock", "beta").await;
+    let root = containment_root(&temp);
+    let alpha = UnixBackend::start(&root, "alpha.sock", "alpha").await;
+    let beta = UnixBackend::start(&root, "beta.sock", "beta").await;
     let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
 
     let alpha_path = alpha.path.to_str().expect("utf-8 socket path").to_string();
@@ -307,6 +344,12 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
         // Keep startup deterministic: the placeholder loopback port is bound but
         // never served, so a warmup dial against it would only add noise.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Containment is fail-closed with no configured roots, so the test's own
+        // socket directory has to be admitted explicitly.
+        .env(
+            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
+            root.to_str().expect("utf-8 containment root"),
+        )
         .spawn()
         .await
         .expect("start gateway");

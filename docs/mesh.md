@@ -1702,8 +1702,8 @@ The resolved listeners that ride the slice are **re-validated before dialing**: 
 | `127.0.0.1:PORT`, `[::1]:PORT` (loopback) | Modeled; dials that loopback address + port (address family preserved). |
 | `0.0.0.0:PORT`, `[::]:PORT` (instance IP) | Modeled; mapped to loopback (`127.0.0.1` / `::1`) — the sidecar app shares the pod network namespace. |
 | Recognized HTTP-family `port.protocol` (`http`/`http2`/`grpc`/`grpc-web`/`https`) | Modeled — `https` is a TLS-terminated HTTP-family listener and is materialized. |
-| `unix:///absolute/path.sock` | Modeled — dispatched over a `tokio::net::UnixStream` to the co-located socket (see "Unix-socket backends" below). |
-| `unix://` with an inadmissible path (relative, `.`/`..` component, `//`, trailing `/`, NUL / control character, > 103 bytes, surrounding whitespace) | **Deferred** — the `deferred_fields` entry names the exact rule that was broken; the operator-supplied path is never echoed back. |
+| `unix:///absolute/path.sock` | Modeled **only when the path sits under a configured `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` entry** (default: none, so refused). Dispatched over a `tokio::net::UnixStream` — HTTP/1.1 or h2c per the declared `port.protocol` (see "Unix-socket backends" below). |
+| `unix://` with an inadmissible path (relative, `.`/`..` component, `//`, trailing `/`, NUL / control character, > 103 bytes, surrounding whitespace) | **Deferred** — the `deferred_fields` entry names the exact rule that was broken; the operator-supplied path is never echoed back. A path that is *syntactically* fine but outside the data plane's containment roots is refused at materialization instead (the control plane cannot see the data plane's allowlist). |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
 | Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
 | Missing or **unrecognized** `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — a custom inbound listener routes only *recognized* HTTP-family protocols; a missing protocol (Istio defaults an unset port to TCP) or a mistyped string is **not** guessed as HTTP and is reported as a deferred non-HTTP listener, so it is never exposed on the HTTP request path. (The service-port default path keeps the `unknown → HTTP` convention for auto-discovered ports; this stricter rule applies only to explicitly declared `ingress[]` listeners. On the native source a mistyped `protocol` fails deserialization outright.) |
@@ -1715,15 +1715,62 @@ The status writer reports the count of modeled listeners as `status.ferrum.trans
 
 A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a fresh `tokio::net::UnixStream` instead of a TCP connection.
 
-**Path admission** (`crate::util::unix_socket::validate_unix_socket_path`, applied at translation *and* re-applied at dial time, since the value may have crossed a CP/DP or file boundary in between). A path is admitted only when it is absolute; free of `.`, `..`, and empty (`//`) components; not a directory (no trailing `/`); free of NUL bytes, ASCII control characters, and surrounding whitespace; and at most **103 bytes** — the usable `sockaddr_un.sun_path` budget on the smallest supported platform (macOS/BSD reserve 104 including the terminating NUL; Linux allows 108), so a path admitted on one platform always dials on another. Nothing is normalized or trimmed: the byte sequence dialed is exactly the one written. Abstract (Linux `\0`-prefixed) and `@`-prefixed sockets are refused — Istio does not define them for `defaultEndpoint`.
+#### Containment is mandatory and off by default
 
-**File type, ownership, and permissions** are the kernel's to enforce at `connect(2)`: a path naming a directory or a regular file fails `ECONNREFUSED`/`ENOTSOCK`, an unreadable parent directory fails `EACCES`, and a missing socket fails `ENOENT`. Ferrum deliberately does **not** `stat()` first — that would be a TOCTOU race reporting a different fact than the dial. Every such outcome is a pre-wire connect failure: a `502` with `ErrorClass::ConnectionRefused`, so the circuit breaker and passive health see an ordinary backend-down signal.
+A `Sidecar` is operator-authored config, and the socket path names a local filesystem object the Ferrum process — often the most privileged process in the pod — would connect to. An unconstrained path is therefore a **local privilege boundary**: `unix:///var/run/docker.sock` would hand every request-path client the container runtime's API.
 
-**Timeouts and lifecycle.** The connect is bounded by the proxy's `backend_connect_timeout_ms` (5s for a materialized ingress listener), falling back to 5s if unset; exceeding it yields a `504` with `ErrorClass::ConnectionTimeout`. Read/write bounds and request/response body ceilings are the same ones the loopback-TCP path applies. Connections are **not pooled** — each request dials its own socket and closes it when the response completes. The destination is a local app reached by a plain `connect(2)` with no DNS, TCP handshake, or TLS, so pooling is a performance follow-up rather than a correctness requirement. A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing and a re-pointed one dials the new socket with no restart.
+So the feature is gated on an explicit allowlist with **no default**:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` | *empty* | Absolute directories a socket may live under. **Empty refuses every `unix://` endpoint.** No built-in `/run` or `/var/run` allowance. |
+| `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` | *empty* | Admitted owner uids. Empty admits **only** the Ferrum process's own effective uid. |
+
+A root must be absolute, normalized, and not bare `/` (which would contain everything and make the allowlist a no-op); a malformed entry **fails startup** rather than being silently skipped. Containment is a whole-**component** match and requires a strict descendant, so `/var/runner/app.sock` is *not* inside `/var/run`, and the root directory itself is never dialable.
+
+#### The two-stage gate
+
+**Translation / materialization** (`crate::util::unix_socket::admit_configured_path`) applies syntax plus containment, with no filesystem I/O — a control plane does not share the workload's filesystem, so the *syntax* half runs CP-side (`MeshSidecarIngress::resolve`, and the `Sidecar` status writer's `deferred_fields` classification) while **containment is a data-plane policy** applied by `ResolvedIngressListener::endpoint_is_valid`/`backend` when the slice is materialized. A path is syntactically admitted only when it is absolute; free of `.`, `..`, and empty (`//`) components; not a directory (no trailing `/`); free of NUL bytes, ASCII control characters, and surrounding whitespace; and at most **103 bytes** — the usable `sockaddr_un.sun_path` budget on the smallest supported platform (macOS/BSD reserve 104 including the terminating NUL; Linux allows 108), so a path admitted on one platform always dials on another. Nothing is normalized or trimmed: the byte sequence dialed is exactly the one written. Abstract (Linux `\0`-prefixed) and `@`-prefixed sockets are refused — Istio does not define them for `defaultEndpoint`.
+
+Because the CP-side `ingress_modeled` count cannot see the data plane's allowlist, a listener reported as modeled by the `Sidecar` status writer is still subject to data-plane containment; a refusal there is logged by the data plane and the listener simply never materializes.
+
+**Dial time** (`admit_socket_for_connect`) re-runs the whole gate — the value may have crossed a CP/DP, file, or xDS boundary since — and adds the facts that only exist at connect:
+
+- the path is `canonicalize`d, which fully resolves symlinks, `..`, and mount points, and the **resolved** path must land inside an allowed root as well. This is what stops a symlink planted inside an allowed directory from redirecting the dial to `/var/run/docker.sock`; a symlink that stays *inside* a root is fine.
+- the resolved object must be a Unix-domain **socket** (a regular file, directory, or FIFO is refused);
+- its owner uid must be admitted — `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` when set, otherwise the Ferrum process's own effective uid;
+- the socket must not be world-writable, and its parent directory must not be world-writable without the sticky bit — that combination is the ordinary way to obtain the ability to unlink the socket and bind another in its place.
+
+**TOCTOU.** A filesystem check and the subsequent `connect(2)` cannot be made atomic through the POSIX path API, so the resolve-to-connect window is inherently racy. The **containment allowlist is what bounds the damage**: an attacker who could win the race must already be able to create the swapped object *inside an allowed root*, and the parent-directory rule removes the normal way to get that. The dial-time re-validation narrows the window; it does not claim to close it.
+
+Every refusal is a pre-wire, gateway-side policy decision: `ErrorClass::DispatchPolicyRejected` (health-neutral, not retried), surfaced as a `502` whose body never echoes the operator-supplied path. A genuine dial failure — missing socket, wedged app, `ECONNREFUSED` — stays an ordinary backend-down signal (`ConnectionRefused` / `ConnectionTimeout`), so the circuit breaker and passive health see it.
+
+#### Protocol matrix
+
+The wire protocol is resolved **once at translation** from the declared `port.protocol` and carried on its own reserved tag (`mesh.unix_socket_h2c`). Dispatch never infers it; an absent tag means HTTP/1.1, which is exactly what an `http` listener declared.
+
+| Declared `port.protocol` | Socket wire protocol | Status |
+|---|---|---|
+| `http` | HTTP/1.1 | Supported. Streaming request and response bodies, size ceilings, and timeouts are the loopback-TCP path's. |
+| `http2`, `https` | h2c prior-knowledge HTTP/2 | Supported. (`https` is mapped to `Http2` by the Istio translator; a `defaultEndpoint` is a plaintext hop to a co-located app, so TLS is not re-originated onto the socket and the request `:scheme` is `http`.) |
+| `grpc` | h2c prior-knowledge HTTP/2 | Supported, natively: full request/response streaming, the receipt-anchored client deadline, upstream cancellation on deadline expiry, `te: trailers` regeneration, and terminal `grpc-status`/`grpc-message` **trailers**. |
+| gRPC request to an `http`-declared socket | — | **Refused** with gRPC `UNAVAILABLE` (14). HTTP/1.1 cannot carry gRPC trailers, and a downgrade would silently corrupt the RPC. Declare the listener `GRPC` or `HTTP2`. |
+| WebSocket upgrade to any Unix-backed listener | — | **Refused** `502`. The WebSocket dial machinery is written against TCP/TLS and the mesh CONNECT tunnels and has no Unix transport; the target's `host:port` is the gateway's own inbound listener port, so a fallback would loop the proxy into itself. |
+| Retry dispatch (reqwest-backed) | — | **Refused** `502`. The materialized ingress proxies configure no retry policy, so this is a defensive gate, not a live limitation. |
+| HTTP/3 frontend | — | **Refused.** The H3 bridge has no Unix transport; mesh capture is TCP-only, so an H3 frontend cannot reach a Sidecar ingress listener in practice. |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/…) | — | Deferred before any listener exists (raw-TCP inbound has no Host/route). |
+
+The h2c path is not a second implementation of the gRPC-over-HTTP/2 contract: it reuses `proxy_to_backend_mesh_mtls`'s dispatch body with the pooled SVID-mTLS sender swapped for a 1:1 h2c `UnixStream` sender, so gRPC flavor detection, deadline handling, the never-buffer-native-gRPC rule, and streaming trailer forwarding are literally the same code on both transports and cannot drift. Every h2c buffer is bounded: a 1 MiB initial stream window, a 2 MiB connection window, a 16 KiB max frame size, and a capped reset-stream table, on top of the request/response body ceilings the caller already applies.
+
+#### Timeouts, lifecycle, and the transport gate
+
+The connect is bounded by the proxy's `backend_connect_timeout_ms` (5s for a materialized ingress listener), falling back to 5s if unset; exceeding it yields a `504` with `ErrorClass::ConnectionTimeout`. Read/write bounds and request/response body ceilings are the same ones the loopback-TCP path applies.
+
+Connections are **not pooled** — each request dials its own socket and closes it when the response completes. The destination is a local app reached by a plain `connect(2)` with no DNS, TCP handshake, or TLS, so pooling is a performance follow-up rather than a correctness requirement.
+
+A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing (leaving no orphaned upstream) and a re-pointed one dials the new socket with no restart.
 
 **Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
-
-**Not covered.** The Unix transport speaks HTTP/1.1. A gRPC-flavored request or a WebSocket upgrade to a Unix-backed ingress listener is **refused** (gRPC `UNAVAILABLE`, or `502` for the upgrade) rather than being dialed over TCP — an `http2`/`grpc`-declared listener whose app speaks h2c prior-knowledge over the socket is a follow-up. Retry dispatch (reqwest-backed) likewise refuses; the materialized ingress proxies configure no retry policy, so this is a defensive gate rather than a live limitation.
 
 ### `bind` and `captureMode` limitations
 

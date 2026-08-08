@@ -17,6 +17,12 @@ use ferrum_edge::modes::mesh::config::{
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+/// The SHIPPED DEFAULT Unix-socket containment allowlist: empty, which refuses
+/// every `unix://` ingress `defaultEndpoint`. Passed explicitly wherever a test
+/// asserts the default posture, and to loopback-TCP assertions to prove
+/// containment governs Unix sockets only (issue #3261).
+const NO_ROOTS: &[String] = &[];
+
 fn fresh_workload() -> Workload {
     let td = TrustDomain::new("prod.example.com").unwrap();
     Workload {
@@ -1965,16 +1971,26 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
         endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
-    assert!(valid.endpoint_is_valid(), "loopback v4 host:port is valid");
+    // An EMPTY containment allowlist is the shipped default. A loopback-TCP
+    // listener must be completely unaffected by it — containment governs unix
+    // sockets only.
+    assert!(
+        valid.endpoint_is_valid(NO_ROOTS),
+        "loopback v4 host:port is valid regardless of unix containment"
+    );
 
     let v6 = ResolvedIngressListener {
         endpoint_host: "::1".to_string(),
         ..valid.clone()
     };
-    assert!(v6.endpoint_is_valid(), "loopback v6 host:port is valid");
+    assert!(
+        v6.endpoint_is_valid(NO_ROOTS),
+        "loopback v6 host:port is valid"
+    );
 
     // Codex round-2 P2: a carried OFF-BOX host must fail re-validation.
     let off_box = ResolvedIngressListener {
@@ -1982,7 +1998,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         ..valid.clone()
     };
     assert!(
-        !off_box.endpoint_is_valid(),
+        !off_box.endpoint_is_valid(NO_ROOTS),
         "an off-box backend host must fail re-validation"
     );
 
@@ -1991,27 +2007,32 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         endpoint_port: 0,
         ..valid.clone()
     };
-    assert!(!zero_backend.endpoint_is_valid());
+    assert!(!zero_backend.endpoint_is_valid(NO_ROOTS));
 
     // A carried `:0` listener port fails.
     let zero_listener = ResolvedIngressListener {
         port: 0,
         ..valid.clone()
     };
-    assert!(!zero_listener.endpoint_is_valid());
+    assert!(!zero_listener.endpoint_is_valid(NO_ROOTS));
 
     // A non-IP / unparseable host fails.
     let bogus_host = ResolvedIngressListener {
         endpoint_host: "example.com".to_string(),
         ..valid.clone()
     };
-    assert!(!bogus_host.endpoint_is_valid());
+    assert!(!bogus_host.endpoint_is_valid(NO_ROOTS));
 }
 
 #[test]
 fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
     // Issue #3261: a `unix://` defaultEndpoint materializes a routable
     // Unix-stream backend instead of being deferred as unrepresentable.
+    //
+    // `resolve()` is the CP-side, syntax-only half of the gate: a control plane
+    // does not share the workload's filesystem, so containment is a DATA-PLANE
+    // policy applied by `endpoint_is_valid`/`backend` at materialization and
+    // again at the dial.
     let resolved = ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock")
         .resolve()
         .expect("an absolute unix socket path resolves");
@@ -2024,16 +2045,87 @@ fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
     // both-shapes carrier (a smuggled TCP fallback).
     assert_eq!(resolved.endpoint_host, "");
     assert_eq!(resolved.endpoint_port, 0);
-    assert!(resolved.endpoint_is_valid());
-    assert_eq!(resolved.unix_socket_path(), Some("/var/run/app.sock"));
+    // An `http` listener is HTTP/1.1: no h2c marker.
+    assert!(!resolved.endpoint_unix_h2c);
+
+    // With NO containment roots configured (the default) the listener is refused
+    // outright — this is the whole local-privilege boundary.
+    assert!(
+        !resolved.endpoint_is_valid(NO_ROOTS),
+        "an unconfigured containment allowlist must refuse every unix listener"
+    );
+    assert_eq!(resolved.unix_socket_path(NO_ROOTS), None);
+    assert_eq!(resolved.backend(NO_ROOTS), None);
+
+    // Inside a configured root it resolves to a routable Unix backend.
+    let allowed = vec!["/var/run".to_string()];
+    assert!(resolved.endpoint_is_valid(&allowed));
     assert_eq!(
-        resolved.backend(),
+        resolved.unix_socket_path(&allowed),
+        Some("/var/run/app.sock")
+    );
+    assert_eq!(
+        resolved.backend(&allowed),
         Some(
             ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
-                path: "/var/run/app.sock".to_string()
+                path: "/var/run/app.sock".to_string(),
+                h2c: false,
             }
         )
     );
+
+    // A root that does not contain the socket refuses it, even though the path
+    // is perfectly well-formed.
+    assert_eq!(resolved.backend(&vec!["/run/ferrum".to_string()]), None);
+}
+
+/// The declared listener protocol — not the endpoint string — decides the wire
+/// protocol on the socket, and `http2`/`grpc` must resolve to h2c so gRPC gets
+/// real trailers, streaming, and deadlines rather than an HTTP/1.1 downgrade.
+#[test]
+fn ingress_resolve_maps_declared_protocol_to_the_unix_wire_protocol() {
+    let allowed = vec!["/var/run".to_string()];
+    for (protocol, expected_h2c) in [
+        (AppProtocol::Http, false),
+        (AppProtocol::Http2, true),
+        (AppProtocol::Grpc, true),
+    ] {
+        let resolved = ingress_entry(8443, protocol, "unix:///var/run/app.sock")
+            .resolve()
+            .unwrap_or_else(|e| panic!("{protocol:?} must resolve over a unix socket: {e:?}"));
+        assert_eq!(
+            resolved.endpoint_unix_h2c, expected_h2c,
+            "{protocol:?} must map to h2c={expected_h2c}"
+        );
+        assert_eq!(
+            resolved.backend(&allowed),
+            Some(
+                ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+                    path: "/var/run/app.sock".to_string(),
+                    h2c: expected_h2c,
+                }
+            )
+        );
+    }
+}
+
+/// A carrier that marks a loopback-TCP listener as h2c is internally
+/// inconsistent — the marker is Unix-only — and is refused rather than reused
+/// to reinterpret the transport.
+#[test]
+fn ingress_carrier_rejects_an_h2c_marker_on_a_tcp_listener() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let hostile = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: true,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(!hostile.endpoint_is_valid(NO_ROOTS));
+    assert!(!hostile.endpoint_shape_is_valid());
 }
 
 #[test]
@@ -2071,15 +2163,21 @@ fn ingress_resolve_rejects_hostile_unix_socket_paths() {
 #[test]
 fn ingress_carrier_revalidates_unix_socket_shape() {
     use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    // `/var/run` is the configured containment root for this carrier fixture.
+    let unix_roots = vec!["/var/run".to_string()];
     let base = ResolvedIngressListener {
         port: 8443,
         endpoint_host: String::new(),
         endpoint_port: 0,
         endpoint_unix_path: Some("/var/run/app.sock".to_string()),
+        endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
-    assert!(base.endpoint_is_valid(), "an admitted unix carrier is valid");
+    assert!(
+        base.endpoint_is_valid(&unix_roots),
+        "an admitted unix carrier is valid"
+    );
 
     // A hostile carrier that sets BOTH shapes is refused outright: accepting it
     // would let a TCP fallback ride alongside the socket path.
@@ -2088,22 +2186,30 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
         endpoint_port: 8080,
         ..base.clone()
     };
-    assert!(!both.endpoint_is_valid());
-    assert_eq!(both.unix_socket_path(), None);
+    assert!(!both.endpoint_is_valid(&unix_roots));
+    assert_eq!(both.unix_socket_path(&unix_roots), None);
 
     // A traversal-like path decoded straight from wire JSON never reaches a dial.
     let traversal = ResolvedIngressListener {
         endpoint_unix_path: Some("/var/../etc/passwd".to_string()),
         ..base.clone()
     };
-    assert!(!traversal.endpoint_is_valid());
+    assert!(!traversal.endpoint_is_valid(&unix_roots));
 
     // A zero LISTENER port is invalid on the unix shape too.
     let zero_listener = ResolvedIngressListener {
         port: 0,
         ..base.clone()
     };
-    assert!(!zero_listener.endpoint_is_valid());
+    assert!(!zero_listener.endpoint_is_valid(&unix_roots));
+
+    // And a socket OUTSIDE the configured roots is refused even though the
+    // carrier itself is well-formed — containment is re-applied here, not just
+    // at translation.
+    assert!(
+        !base.endpoint_is_valid(&["/run/ferrum".to_string()]),
+        "an out-of-root carried socket path must be refused"
+    );
 }
 
 #[test]

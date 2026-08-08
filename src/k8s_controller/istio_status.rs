@@ -1639,9 +1639,17 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
             continue;
         }
         // A `unix://` endpoint IS modeled (Unix-stream backend) as long as its
-        // path passes the same admission rules `MeshSidecarIngress::resolve`
-        // applies. Only an inadmissible path is deferred, and the reason echoes
-        // the specific rule it broke — never the operator-supplied path itself.
+        // path passes the same SYNTACTIC admission rules
+        // `MeshSidecarIngress::resolve` applies. Only an inadmissible path is
+        // deferred, and the reason echoes the specific rule it broke — never the
+        // operator-supplied path itself.
+        //
+        // Containment (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`) is deliberately
+        // NOT applied here: it is a DATA-PLANE policy and a control plane does
+        // not share the workload's filesystem, so a listener counted as modeled
+        // is still subject to the data plane's allowlist (and to the file-type /
+        // ownership / mode checks at the dial). Applying a CP-local allowlist
+        // would report a decision the data plane does not make.
         if let Some(socket_path) = endpoint.strip_prefix("unix://") {
             if let Err(rejection) = crate::util::unix_socket::validate_unix_socket_path(socket_path)
             {
