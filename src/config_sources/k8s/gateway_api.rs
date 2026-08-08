@@ -5003,23 +5003,43 @@ fn route_host_scopes_for_path(
 ) -> Vec<RouteHostScope> {
     let mut scopes = Vec::new();
     for (host_index, hostname) in conflict_hostnames.iter().enumerate() {
-        let resolved = route_allowed_parent_listeners_for_hostname(
-            object,
-            acc,
-            requested_hostnames,
-            Some(config_namespace),
-            hostname,
-        );
+        // Keep only references that actually resolved a listener. An entry
+        // with an EMPTY listener set is the resolver's "known-good parentRef,
+        // unknown Gateway" signal, not a listener claim; iterating it below
+        // would emit no scope at all and silently drop the whole route.
+        let resolved: Vec<(String, BTreeSet<GatewayApiListenerKey>)> =
+            route_allowed_parent_listeners_for_hostname(
+                object,
+                acc,
+                requested_hostnames,
+                Some(config_namespace),
+                hostname,
+            )
+            .into_iter()
+            .filter(|(_, listener_keys)| !listener_keys.is_empty())
+            .collect();
         if resolved.is_empty() {
             // Unknown Gateway: keep a listener-less, port-agnostic claim so
             // status still reports the authored parentRef.
-            let parent_refs = route_allowed_parent_ref_keys_for_hostname(
+            let mut parent_refs = route_allowed_parent_ref_keys_for_hostname(
                 object,
                 acc,
                 requested_hostnames,
                 Some(config_namespace),
                 hostname,
             );
+            if parent_refs.is_empty() {
+                // The hostname-scoped view drops a parentRef whose Gateway is
+                // absent from this snapshot. Fall back to the route's authored,
+                // namespace-scoped parentRefs — the pre-port-aware identity —
+                // so an unresolvable parent still materializes a listener-less
+                // claim instead of losing the route.
+                parent_refs = route_allowed_parent_ref_keys_for_namespace(
+                    object,
+                    acc,
+                    Some(config_namespace),
+                );
+            }
             if parent_refs.is_empty() {
                 continue;
             }
@@ -7937,12 +7957,14 @@ mod tests {
             }),
         );
 
-        let result =
-            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+        // An explicit `sectionName` that names no listener is operator error,
+        // not an unknown-Gateway selector: the route is refused fail-closed at
+        // admission, which is strictly stronger than materializing nothing.
+        let error = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("an unknown sectionName must be refused fail-closed");
         assert!(
-            result.config.proxies.is_empty(),
-            "unknown sectionName must not program traffic: {:?}",
-            result.config.proxies
+            format!("{error:?}").contains("does not match any known Gateway listener"),
+            "unknown sectionName must not program traffic: {error:?}"
         );
     }
 
@@ -11576,19 +11598,27 @@ mod tests {
                 .any(|proxy| { proxy.backend_port == 50051 && proxy.listen_port == Some(80) }),
             "the shared-listener GRPCRoute claim must still be withdrawn"
         );
+        // A single unweighted backendRef resolves to a direct backend, not an
+        // Upstream, so the retained claim's destination lives on the proxy.
         assert!(
-            result
-                .config
-                .upstreams
-                .iter()
-                .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
-            "the retained GRPCRoute claim must keep its upstream"
+            result.config.proxies.iter().any(|proxy| {
+                proxy.listen_port == Some(8080)
+                    && proxy.backend_port == 50051
+                    && !proxy.backend_host.is_empty()
+            }),
+            "the retained GRPCRoute claim must keep its backend destination: {:?}",
+            result.config.proxies
         );
     }
 
-    /// A Route that loses on one listener retains sibling claims, but those
-    /// retained claims must not suppress a later Route that does not share the
-    /// same listen path / conflict key on another listener.
+    /// A Route that loses on one listener retains sibling claims, and its
+    /// withdrawn claim must not go on occupying the listener it lost on: a
+    /// later Route of the *winning* kind still materializes there.
+    ///
+    /// Cross-kind arbitration is scoped to `(listener, hostname)`, so the later
+    /// Route has to share the losing listener and the winner's kind for this to
+    /// exercise the withdrawal — a newer HTTPRoute on the listener the GRPCRoute
+    /// still holds would legitimately lose to it.
     #[test]
     fn a_partial_loss_does_not_displace_a_later_route_elsewhere() {
         let gateway = cross_kind_gateway(serde_json::json!([
@@ -11627,7 +11657,7 @@ mod tests {
         ]);
 
         let mut later_http = cross_kind_http_route(
-            serde_json::json!({"name": "edge", "sectionName": "second"}),
+            serde_json::json!({"name": "edge", "sectionName": "first"}),
             Some(serde_json::json!([{
                 "path": {"type": "PathPrefix", "value": "/survivor"}
             }])),
@@ -11652,7 +11682,7 @@ mod tests {
                 .materialized_route_parents
                 .iter()
                 .any(|entry| { entry.route.kind == "HTTPRoute" && entry.route.name == "survivor" }),
-            "the later HTTPRoute on the second listener must still materialize"
+            "the later HTTPRoute on the listener the GRPCRoute lost must still materialize"
         );
         assert!(
             !result.warnings.iter().any(|warning| {
