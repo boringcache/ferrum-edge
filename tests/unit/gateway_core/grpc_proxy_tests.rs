@@ -2710,8 +2710,8 @@ impl TransportTestPools {
     }
 }
 
-#[test]
-fn grpc_transport_for_untagged_and_absent_targets_is_the_direct_pool() {
+#[tokio::test]
+async fn grpc_transport_for_untagged_and_absent_targets_is_the_direct_pool() {
     let pools = TransportTestPools::new();
     let direct = pools
         .resolve(None)
@@ -2725,8 +2725,8 @@ fn grpc_transport_for_untagged_and_absent_targets_is_the_direct_pool() {
     assert_eq!(direct.label(), "direct");
 }
 
-#[test]
-fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
+#[tokio::test]
+async fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
     let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (
@@ -2748,8 +2748,8 @@ fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
     );
 }
 
-#[test]
-fn grpc_transport_for_wellformed_cross_cluster_mesh_mtls_resolves_the_sidecar_transport() {
+#[tokio::test]
+async fn grpc_transport_for_wellformed_cross_cluster_mesh_mtls_resolves_the_sidecar_transport() {
     let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (
@@ -2778,8 +2778,8 @@ fn grpc_transport_for_wellformed_cross_cluster_mesh_mtls_resolves_the_sidecar_tr
 // Issue #3284 requires BOTH mesh transports, same-cluster and cross-cluster.
 // A `mesh.hbone` target must therefore resolve the nested-HTTP/2 HBONE
 // transport, never the direct-dial pool and never a silent refusal.
-#[test]
-fn grpc_transport_for_same_cluster_hbone_resolves_the_ambient_transport() {
+#[tokio::test]
+async fn grpc_transport_for_same_cluster_hbone_resolves_the_ambient_transport() {
     let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
@@ -2798,8 +2798,8 @@ fn grpc_transport_for_same_cluster_hbone_resolves_the_ambient_transport() {
     );
 }
 
-#[test]
-fn grpc_transport_for_wellformed_cross_cluster_hbone_resolves_the_ambient_transport() {
+#[tokio::test]
+async fn grpc_transport_for_wellformed_cross_cluster_hbone_resolves_the_ambient_transport() {
     let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
@@ -2830,8 +2830,8 @@ fn grpc_transport_for_wellformed_cross_cluster_hbone_resolves_the_ambient_transp
     assert_eq!(transport.label(), "hbone");
 }
 
-#[test]
-fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
+#[tokio::test]
+async fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
     let pools = TransportTestPools::new();
     // Same-cluster `mesh.mtls` REQUIRES a resolvable `mesh.spiffe_id` pin; a
     // corrupt one must refuse before any dial rather than downgrade to
@@ -2865,8 +2865,8 @@ fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
 // A `mesh.hbone` target whose dial metadata is corrupt must fail closed at
 // materialization, exactly like the mesh-mTLS arm — never dial the synthetic
 // cross-cluster identity, never downgrade a corrupt pin to unpinned.
-#[test]
-fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
+#[tokio::test]
+async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
     let pools = TransportTestPools::new();
     let hbone = ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
     let xc = ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG;
@@ -2936,8 +2936,8 @@ fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
     }
 }
 
-#[test]
-fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadata_free_message() {
+#[tokio::test]
+async fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadata_free_message() {
     let pools = TransportTestPools::new();
     let mtls = ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG;
     let hbone = ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
