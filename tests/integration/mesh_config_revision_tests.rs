@@ -37,6 +37,14 @@
 //!    point, retain-last-good on incomplete convergence, two replicas failing
 //!    over, and native/xDS parity — including a run of the production watcher
 //!    task over scripted reflector generations.
+//! 8. The equal-revision CONTENT BINDING (issue #3611): a `Same` revision
+//!    installs only for identical semantic content, so a producer whose scalar
+//!    revision is not content-unique — a Kubernetes CP publishing the MINIMUM
+//!    per-scope watermark while serving a latest-only snapshot — cannot roll a
+//!    data plane back through a lagging replica at an equal sequence. Covers
+//!    the local runtime and xDS paths, the exact-content replay that must keep
+//!    installing, revision/identity pairing across rollback and reset, and the
+//!    multi-scope Kubernetes counterexample itself.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
@@ -74,8 +82,9 @@ use ferrum_edge::modes::mesh::config_consumer::update_validation::{
 };
 use ferrum_edge::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use ferrum_edge::modes::mesh::revision::{
-    KUBERNETES_AUTHORITY_DOMAIN, MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder,
-    MeshRevisionPolicy, MeshRevisionRejectReason, is_kubernetes_authority, kubernetes_authority,
+    KUBERNETES_AUTHORITY_DOMAIN, MeshConfigRevision, MeshRevisionContentIdentity, MeshRevisionGate,
+    MeshRevisionOrder, MeshRevisionPolicy, MeshRevisionRejectReason, is_kubernetes_authority,
+    kubernetes_authority,
 };
 use ferrum_edge::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -92,6 +101,14 @@ fn revision(authority: &str, sequence: u64) -> MeshConfigRevision {
     MeshConfigRevision::new(authority, sequence)
 }
 
+/// A distinct, stable content identity per `tag`. Direct `MeshRevisionGate`
+/// tests exercise the ORDERING contract, so they pass one identity unless the
+/// case under test is specifically about divergent content at an equal
+/// revision — where two different tags stand in for two producers' snapshots.
+fn cid(tag: u8) -> MeshRevisionContentIdentity {
+    MeshRevisionContentIdentity::from_digest([tag; 32])
+}
+
 /// A slice bound to the test subscription at a given authoritative revision.
 ///
 /// `version` is deliberately decoupled from `sequence` so the tests can prove
@@ -104,6 +121,23 @@ fn slice_at(version: &str, revision: Option<MeshConfigRevision>) -> MeshSlice {
         revision,
         ..MeshSlice::default()
     }
+}
+
+/// A slice whose semantic CONTENT varies with `marker`.
+///
+/// `version` cannot stand in for a content difference: the canonical content
+/// identity clears it (it renders the serving CP's local wall clock and is
+/// observability-only), which is precisely what lets a replay served by a
+/// different replica still count as identical. A real slice field has to
+/// differ — `labels` is the smallest one that rides every producer path.
+fn slice_with_content(
+    version: &str,
+    revision: Option<MeshConfigRevision>,
+    marker: &str,
+) -> MeshSlice {
+    let mut slice = slice_at(version, revision);
+    slice.labels = BTreeMap::from([("mesh-content".to_string(), marker.to_string())]);
+    slice
 }
 
 fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
@@ -660,7 +694,7 @@ fn admit_refuses_present_malformed_revision_even_on_bootstrap() {
     let now = Utc::now();
 
     assert_eq!(
-        gate.admit(None, now),
+        gate.admit(None, cid(1), now),
         Ok(MeshRevisionOrder::Bootstrap),
         "a genuinely absent revision still bootstraps"
     );
@@ -674,7 +708,7 @@ fn admit_refuses_present_malformed_revision_even_on_bootstrap() {
             revision("db\n2026-07-26 WARN forged", 1),
         ),
     ] {
-        let rejection = gate.admit(Some(&forged), now).unwrap_err();
+        let rejection = gate.admit(Some(&forged), cid(1), now).unwrap_err();
         assert_eq!(
             rejection.reason(),
             MeshRevisionRejectReason::MalformedRevision,
@@ -692,19 +726,19 @@ fn maximum_sequence_orders_without_wrapping() {
     let gate = MeshRevisionGate::new();
     let now = Utc::now();
 
-    gate.admit(Some(&revision("db", u64::MAX - 1)), now)
+    gate.admit(Some(&revision("db", u64::MAX - 1)), cid(1), now)
         .expect("the penultimate sequence establishes the baseline");
     assert_eq!(
-        gate.admit(Some(&revision("db", u64::MAX)), now),
+        gate.admit(Some(&revision("db", u64::MAX)), cid(2), now),
         Ok(MeshRevisionOrder::Newer)
     );
     assert_eq!(
-        gate.admit(Some(&revision("db", u64::MAX)), now),
+        gate.admit(Some(&revision("db", u64::MAX)), cid(2), now),
         Ok(MeshRevisionOrder::Same),
         "a replay at the maximum sequence remains installable"
     );
     assert_eq!(
-        gate.admit(Some(&revision("db", u64::MAX - 1)), now)
+        gate.admit(Some(&revision("db", u64::MAX - 1)), cid(1), now)
             .expect_err("the maximum sequence must not wrap to a lower value")
             .reason(),
         MeshRevisionRejectReason::StaleRevision
@@ -721,11 +755,11 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
         .single()
         .expect("fixture time");
 
-    gate.admit(Some(&revision("db", 100)), now)
+    gate.admit(Some(&revision("db", 100)), cid(1), now)
         .expect("bootstrap installs");
 
     let rejection = gate
-        .admit(Some(&revision("db", 99)), now)
+        .admit(Some(&revision("db", 99)), cid(2), now)
         .expect_err("an older revision is quarantined");
     assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
     assert!(
@@ -740,7 +774,7 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
 
     // Repeated quarantines of the same pair accumulate, and the diagnostics
     // never echo raw slice content.
-    gate.admit(Some(&revision("db", 98)), now)
+    gate.admit(Some(&revision("db", 98)), cid(3), now)
         .expect_err("still stale");
     let diagnostics = gate.diagnostics();
     assert!(diagnostics.quarantine_active);
@@ -749,7 +783,7 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
     assert_eq!(quarantined.reason, "stale_revision");
 
     // Failback: the primary catches up and installs, clearing the quarantine.
-    gate.admit(Some(&revision("db", 101)), now)
+    gate.admit(Some(&revision("db", 101)), cid(4), now)
         .expect("a newer revision installs");
     assert_eq!(gate.accepted().map(|r| r.sequence), Some(101));
     let diagnostics = gate.diagnostics();
@@ -776,11 +810,11 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
         .single()
         .expect("fixture time");
 
-    gate.admit(Some(&revision("db", 100)), t0)
+    gate.admit(Some(&revision("db", 100)), cid(1), t0)
         .expect("bootstrap installs");
 
     let rejection = gate
-        .admit_at(Some(&revision("db-restored", 1)), t0, monotonic_t0)
+        .admit_at(Some(&revision("db-restored", 1)), cid(2), t0, monotonic_t0)
         .expect_err("a foreign authority is quarantined on first sight");
     assert_eq!(
         rejection.reason(),
@@ -790,6 +824,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     // Still inside the grace window.
     gate.admit_at(
         Some(&revision("db-restored", 2)),
+        cid(2),
         t0 + chrono::Duration::days(30),
         monotonic_t0 + std::time::Duration::from_secs(299),
     )
@@ -800,12 +835,14 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     // flapping set of foreign CPs cannot accumulate grace.
     gate.admit_at(
         Some(&revision("db-other", 7)),
+        cid(3),
         t0 + chrono::Duration::seconds(300),
         monotonic_t0 + std::time::Duration::from_secs(300),
     )
     .expect_err("a different foreign authority restarts the window");
     gate.admit_at(
         Some(&revision("db-restored", 3)),
+        cid(2),
         t0 + chrono::Duration::seconds(301),
         monotonic_t0 + std::time::Duration::from_secs(301),
     )
@@ -814,6 +851,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     let order = gate
         .admit_at(
             Some(&revision("db-restored", 4)),
+            cid(2),
             t0 + chrono::Duration::seconds(601),
             monotonic_t0 + std::time::Duration::from_secs(601),
         )
@@ -838,10 +876,11 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
         .single()
         .expect("fixture time");
 
-    gate.admit(Some(&revision("db", 100)), t0)
+    gate.admit(Some(&revision("db", 100)), cid(1), t0)
         .expect("bootstrap installs");
     gate.admit(
         Some(&revision("db-restored", 1)),
+        cid(2),
         t0 + chrono::Duration::days(30),
     )
     .expect_err("adoption disabled: a foreign authority stays quarantined forever");
@@ -852,16 +891,24 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 1,
     });
-    gate.admit(Some(&revision("db", 5)), t0 + chrono::Duration::days(60))
-        .expect_err("a same-authority rewind is never auto-adopted");
+    gate.admit(
+        Some(&revision("db", 5)),
+        cid(3),
+        t0 + chrono::Duration::days(60),
+    )
+    .expect_err("a same-authority rewind is never auto-adopted");
 
     // The operator reset clears the accepted revision, and the next slice from
     // any authority establishes a new baseline.
     let cleared = gate.reset().expect("the accepted revision is returned");
     assert_eq!(cleared, revision("db", 100));
     assert!(gate.diagnostics().quarantined.is_none());
-    gate.admit(Some(&revision("db", 5)), t0 + chrono::Duration::days(61))
-        .expect("after a reset the rewound revision installs");
+    gate.admit(
+        Some(&revision("db", 5)),
+        cid(3),
+        t0 + chrono::Duration::days(61),
+    )
+    .expect("after a reset the rewound revision installs");
     assert_eq!(gate.accepted(), Some(revision("db", 5)));
 }
 
@@ -1712,6 +1759,236 @@ fn an_equal_revision_replay_commits_the_applied_watermark() {
     );
     assert!(state.record_rejected_slice(&state.snapshot()));
     assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+}
+
+// ── Equal-revision content binding (issue #3611) ────────────────────────────
+//
+// A scalar revision only orders snapshots if one `(authority, sequence)` names
+// exactly one content. The Kubernetes domain does not guarantee that on its own
+// (see the multi-scope counterexample at the end of this section), so the gate
+// binds a semantic content identity to every accepted and applied revision.
+
+/// The core invariant: an equal revision carrying DIFFERENT content is
+/// quarantined with a bounded reason, and the last-good slice keeps serving.
+#[test]
+fn equal_revision_with_divergent_content_is_quarantined_and_last_good_retained() {
+    let state = MeshRuntimeState::new();
+    let accepted = slice_with_content("v-100", Some(revision("db", 100)), "authz-withdrawn");
+    assert!(state.install_slice(accepted).installed());
+    let installed_at = state.last_install_at().expect("first install stamps");
+
+    let divergent = slice_with_content("v-100-b", Some(revision("db", 100)), "authz-live");
+    let outcome = state.install_slice(divergent);
+    let rejection = outcome
+        .rejection()
+        .expect("divergent content at an equal revision must not install");
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert_eq!(rejection.reason().as_metric_label(), "divergent_content");
+    assert!(
+        rejection.terminates_stream(),
+        "an inconsistent producer's whole view is suspect; the stream must fail over"
+    );
+    assert!(
+        !rejection.detail().contains("authz"),
+        "the diagnostic must never echo slice content: {}",
+        rejection.detail()
+    );
+
+    assert_eq!(installed_version(&state).as_deref(), Some("v-100"));
+    assert_eq!(
+        state.last_install_at(),
+        Some(installed_at),
+        "a quarantined candidate must not advance the receive timestamp"
+    );
+    assert_eq!(state.accepted_revision(), Some(revision("db", 100)));
+    assert!(state.revision_diagnostics().quarantine_active);
+}
+
+/// The behavior the binding must NOT break: an exact-content replay at the same
+/// revision is every ordinary reconnect, so it still installs — even when the
+/// observability-only `version` differs, which is exactly the case of a replay
+/// served by a DIFFERENT replica of the same control plane.
+#[test]
+fn equal_revision_exact_content_replay_still_installs() {
+    let state = MeshRuntimeState::new();
+    let first = slice_with_content("v-10-cp-a", Some(revision("db", 10)), "same-content");
+    assert!(state.install_slice(first).installed());
+
+    // Same content, same revision, different `version` — a replay served by
+    // another replica of the same control plane.
+    let replay = slice_with_content("v-10-cp-b", Some(revision("db", 10)), "same-content");
+    assert!(
+        state.install_slice(replay).installed(),
+        "identical semantic content at an equal revision is a replay, not a rollback"
+    );
+    assert_eq!(installed_version(&state).as_deref(), Some("v-10-cp-b"));
+    assert!(!state.revision_diagnostics().quarantine_active);
+}
+
+/// xDS installs through the same `MeshRuntimeState` gate, so it inherits the
+/// binding — and, like every revision quarantine there, must close ADS so
+/// multi-CP rotation moves off the inconsistent control plane.
+#[test]
+fn xds_consumer_surfaces_divergent_equal_revision_content_as_stream_terminal() {
+    let state = MeshRuntimeState::new();
+    let consumer = XdsConfigConsumer::new(
+        XdsClientConfig {
+            cp_urls: vec![
+                "http://cp-a:50051".to_string(),
+                "http://cp-b:50051".to_string(),
+            ],
+            node_id: NODE_ID.to_string(),
+            cluster: "default".to_string(),
+            namespace: NAMESPACE.to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
+            stream_channel_capacity: 32,
+            primary_retry_secs: 300,
+            connect_timeout_seconds: 10,
+            labels: BTreeMap::new(),
+        },
+        state.clone(),
+    );
+
+    let baseline = slice_with_content("xds-v100", Some(revision("k8s", 100)), "authz-withdrawn");
+    consumer
+        .apply_slice(baseline)
+        .expect("the fresh xDS baseline installs");
+
+    let divergent = slice_with_content("xds-v100-b", Some(revision("k8s", 100)), "authz-live");
+    let rejection = consumer
+        .apply_slice(divergent)
+        .expect_err("divergent equal-revision content must close ADS");
+
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert!(rejection.terminates_stream());
+    assert_eq!(installed_version(&state).as_deref(), Some("xds-v100"));
+
+    // The exact-content replay an ordinary reconnect produces still installs.
+    let replay = slice_with_content("xds-replay", Some(revision("k8s", 100)), "authz-withdrawn");
+    consumer
+        .apply_slice(replay)
+        .expect("an exact-content replay is not a rollback");
+    assert_eq!(installed_version(&state).as_deref(), Some("xds-replay"));
+}
+
+/// The received/applied slots keep revision and content identity PAIRED across
+/// the whole lifecycle: a runtime rejection restores the applied revision
+/// together with the identity it was applied with, so the equal-revision check
+/// afterwards is evaluated against the last-good content, not the refused one.
+#[test]
+fn rollback_restores_the_applied_revision_and_its_bound_content_together() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+    let applied = slice_with_content("v-10", Some(revision("db", 10)), "good");
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+    assert_eq!(state.applied_revision(), Some(revision("db", 10)));
+
+    // A newer candidate is received and then REFUSED by the proxy runtime.
+    let refused = slice_with_content("v-20", Some(revision("db", 20)), "bad");
+    assert!(state.install_slice(refused).installed());
+    assert!(state.record_rejected_slice(&state.snapshot()));
+    assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+
+    // The restored pair is the APPLIED one: divergent content at revision 10 is
+    // still quarantined, and the exact applied content still replays.
+    let divergent = slice_with_content("v-10-x", Some(revision("db", 10)), "other");
+    assert_eq!(
+        state
+            .install_slice(divergent)
+            .rejection()
+            .expect("the rolled-back slot must still bind the applied content")
+            .reason(),
+        MeshRevisionRejectReason::DivergentContent
+    );
+    let replay = slice_with_content("v-10-replay", Some(revision("db", 10)), "good");
+    assert!(
+        state.install_slice(replay).installed(),
+        "the identity restored by the rollback must be the one that was applied"
+    );
+
+    // An operator reset drops both slots, so any content installs at any
+    // revision afterwards.
+    let cleared = state
+        .reset_accepted_revision()
+        .expect("the accepted revision is returned for the audit log");
+    assert_eq!(cleared, revision("db", 10));
+    let post_reset = slice_with_content("v-10-new", Some(revision("db", 10)), "new");
+    assert!(
+        state.install_slice(post_reset).installed(),
+        "a reset clears the bound identity along with the watermarks"
+    );
+}
+
+/// The Kubernetes counterexample this repair exists for. A controller CP
+/// publishes the MINIMUM per-scope convergence watermark, but serves a
+/// latest-only reflector snapshot — so replica A at scope watermarks
+/// `[110, 100]` and replica B at `[100, 100]` BOTH publish sequence 100 while
+/// only A's snapshot carries the change made at 110. Without the content
+/// binding a data plane that accepted A could fail over to B and install the
+/// older content at the same sequence: the exact rollback #3611 closes.
+#[test]
+fn kubernetes_minimum_scope_watermark_cannot_displace_accepted_content() {
+    let policies = watch_scope_key("security.istio.io/v1beta1", "AuthorizationPolicy", "all");
+    let gateways = watch_scope_key("gateway.networking.k8s.io/v1", "Gateway", "all");
+
+    let converged = |policy_revision: &str| {
+        let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
+        for scope in [&policies, &gateways] {
+            tracker.begin_generation(scope, Some(100));
+            tracker.observe_listed(scope, Some("100"));
+            tracker.commit_list(scope);
+        }
+        tracker.observe_applied(&policies, Some(policy_revision));
+        tracker
+    };
+    let publish = |tracker: &K8sConfigRevisionTracker| {
+        let watermark = tracker.converged_watermark([&policies, &gateways].into_iter());
+        tracker.publish(watermark).expect("an authority is set")
+    };
+
+    // A has applied the AuthorizationPolicy withdrawal at 110; B has not. The
+    // published sequence is the minimum over scopes, so both advertise 100.
+    let replica_a = converged("110");
+    let replica_b = converged("100");
+    assert_eq!(publish(&replica_a), revision("k8s", 100));
+    assert_eq!(
+        publish(&replica_b),
+        revision("k8s", 100),
+        "equal sequences from divergent snapshots are the whole problem"
+    );
+
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+    let from_a = slice_with_content("cp-a", Some(publish(&replica_a)), "authz-withdrawn");
+    assert!(state.install_slice(from_a.clone()).installed());
+    state.record_applied_slice(&from_a);
+
+    let from_b = slice_with_content("cp-b", Some(publish(&replica_b)), "authz-still-live");
+    let rejection = state
+        .install_slice(from_b)
+        .rejection()
+        .expect("a lagging replica must not displace accepted content at an equal sequence");
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert!(rejection.terminates_stream());
+    assert_eq!(installed_version(&state).as_deref(), Some("cp-a"));
+    assert_eq!(state.applied_revision(), Some(revision("k8s", 100)));
+
+    // B observes the same withdrawal. Its published sequence is UNCHANGED — the
+    // minimum was never the lagging scope — but its content now matches, so the
+    // reconnect replay installs. Recovery does not depend on the sequence
+    // moving, which is what makes the binding safe to fail closed on.
+    replica_b.observe_applied(&policies, Some("110"));
+    assert_eq!(publish(&replica_b), revision("k8s", 100));
+    let caught_up = slice_with_content("cp-b-ok", Some(publish(&replica_b)), "authz-withdrawn");
+    assert!(
+        state.install_slice(caught_up).installed(),
+        "once B carries the same content, its equal-revision slice is a replay"
+    );
+    assert_eq!(installed_version(&state).as_deref(), Some("cp-b-ok"));
 }
 
 /// The operator reset clears the APPLIED watermark as well. Leaving it would

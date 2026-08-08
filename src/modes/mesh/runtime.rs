@@ -22,8 +22,8 @@ use crate::modes::mesh::config::{
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
 use crate::modes::mesh::revision::{
-    MeshConfigRevision, MeshRevisionApplyToken, MeshRevisionDiagnostics, MeshRevisionGate,
-    MeshRevisionPolicy, MeshRevisionRejection,
+    MeshConfigRevision, MeshRevisionApplyToken, MeshRevisionContentIdentity,
+    MeshRevisionDiagnostics, MeshRevisionGate, MeshRevisionPolicy, MeshRevisionRejection,
 };
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
@@ -494,10 +494,20 @@ impl MeshRuntimeState {
     /// slice. The watermark is finalized by [`Self::record_applied_slice`] when
     /// the proxy runtime accepts it, or returned to the last applied generation
     /// by [`Self::record_rejected_slice`] when the runtime refuses it.
+    ///
+    /// The candidate's semantic content identity (`slice_content_identity`)
+    /// is bound to its revision inside the gate (issue #3611), so an equal
+    /// revision installs only when it carries identical content. That is what
+    /// makes a producer whose scalar revision is not content-unique — a
+    /// Kubernetes controller CP publishing the MINIMUM per-scope convergence
+    /// watermark while its reflector snapshot already holds later changes from
+    /// another scope — unable to roll this data plane back through a lagging
+    /// replica at the same sequence.
     pub fn install_slice(&self, slice: MeshSlice) -> MeshSliceInstall {
+        let content = slice_content_identity(&slice);
         if let Err(rejection) = self
             .revision_gate
-            .admit(slice.revision.as_ref(), Utc::now())
+            .admit(slice.revision.as_ref(), content, Utc::now())
         {
             return MeshSliceInstall::Quarantined(rejection);
         }
@@ -523,7 +533,7 @@ impl MeshRuntimeState {
     /// Committing first means any observer woken by the applied-slice watcher
     /// already sees a watermark consistent with the slice it is about to read.
     pub fn record_applied_slice(&self, slice: &MeshSlice) {
-        let token = self.revision_gate.begin_apply(slice.revision.as_ref());
+        let token = self.begin_revision_apply(slice);
         self.record_applied_slice_with_token(slice, token);
     }
 
@@ -531,7 +541,8 @@ impl MeshRuntimeState {
     /// preparation begins. A concurrent operator reset invalidates the token,
     /// so completion of pre-reset work cannot restore the cleared watermark.
     pub(crate) fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
-        self.revision_gate.begin_apply(slice.revision.as_ref())
+        self.revision_gate
+            .begin_apply(slice.revision.as_ref(), slice_content_identity(slice))
     }
 
     /// Commit a runtime-accepted slice with the capability captured before its
@@ -542,9 +553,10 @@ impl MeshRuntimeState {
         token: Option<MeshRevisionApplyToken>,
     ) {
         if let Some(token) = token {
+            let content = slice_content_identity(slice);
             let _ = self
                 .revision_gate
-                .commit_applied(slice.revision.as_ref(), token);
+                .commit_applied(slice.revision.as_ref(), content, token);
         }
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
         // acceptance. Rejected slices must not mutate live log/transformer
@@ -594,7 +606,7 @@ impl MeshRuntimeState {
             return false;
         }
         self.revision_gate
-            .rollback_rejected(slice.revision.as_ref())
+            .rollback_rejected(slice.revision.as_ref(), slice_content_identity(slice))
     }
 
     /// Resolve once the initial mesh slice is available.
@@ -611,6 +623,33 @@ impl MeshRuntimeState {
             return;
         }
         notified.await;
+    }
+}
+
+/// Deterministic semantic content identity of a slice, bound to its config
+/// revision by the freshness gate (issue #3611).
+///
+/// Reuses the canonical CP-side digest
+/// ([`crate::grpc::mesh_slice_drift::slice_content_digest`]): it clears the
+/// observability-only `version` and the ordering-only `revision`, then
+/// canonicalizes the JSON (recursively sorting object keys while preserving
+/// array order), so two slices that are semantically identical always produce
+/// the same identity regardless of map iteration order or which control plane
+/// serialized them. That is what makes a reconnect replay from a DIFFERENT CP
+/// replica still count as identical content at an equal revision.
+///
+/// Both installers — the native `MeshSubscribe` client and the xDS ADS client —
+/// reach the gate through [`MeshRuntimeState::install_slice`], so both bind the
+/// same identity and neither can be made to disagree with the other.
+///
+/// A digest failure yields [`MeshRevisionContentIdentity::Unavailable`], which
+/// the gate refuses (`unidentified_content`): the error is discarded here
+/// precisely so no payload fragment can reach a log line or an admin surface.
+/// This is cold path — a config change, never a request.
+pub(crate) fn slice_content_identity(slice: &MeshSlice) -> MeshRevisionContentIdentity {
+    match crate::grpc::mesh_slice_drift::slice_content_digest(slice) {
+        Ok(digest) => MeshRevisionContentIdentity::from_digest(digest),
+        Err(_) => MeshRevisionContentIdentity::Unavailable,
     }
 }
 

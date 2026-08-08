@@ -71,7 +71,8 @@ use crate::modes::mesh::config_consumer::common::{
     next_backoff_secs as common_next_backoff_secs,
 };
 use crate::modes::mesh::revision::{
-    DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate, MeshRevisionPolicy,
+    DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionContentIdentity, MeshRevisionGate,
+    MeshRevisionPolicy,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
@@ -1689,6 +1690,36 @@ pub struct RemoteClusterPollContext {
     pub revision_gate: Arc<MeshRevisionGate>,
 }
 
+/// Semantic content identity of the remote-cluster endpoints a poll will
+/// install, bound to that poll's config revision by the per-cluster
+/// [`MeshRevisionGate`] (issue #3611).
+///
+/// The remote CP's revision has the same content-uniqueness problem as the
+/// local one: a Kubernetes-controller CP publishes the MINIMUM per-scope
+/// convergence watermark, so two replicas can advertise one sequence for two
+/// different views. Without a binding, a one-shot reconnect poll against a
+/// lagging replica would replace live remote endpoints with an older set at an
+/// equal revision.
+///
+/// The digest covers exactly the workloads and services that become the stored
+/// entry — computed AFTER `validate_remote_endpoints`,
+/// `enforce_remote_trust_domain`, and `tag_remote_workloads` — and deliberately
+/// nothing else from the fetched slice, since every other field is discarded
+/// before install and would make identical installed content look divergent.
+/// Cold path: once per poll interval, over a payload the store already clones
+/// and compares in full on install. Nothing on the request path calls it.
+fn remote_endpoints_content_identity(
+    endpoints: &RemoteClusterEndpoints,
+) -> MeshRevisionContentIdentity {
+    let projection = (&endpoints.workloads, &endpoints.services);
+    match crate::grpc::mesh_slice_drift::canonical_content_digest(&projection) {
+        Ok(digest) => MeshRevisionContentIdentity::from_digest(digest),
+        // Discarded rather than logged: the error must not become a channel for
+        // remote endpoint data. The gate refuses an unavailable identity.
+        Err(_) => MeshRevisionContentIdentity::Unavailable,
+    }
+}
+
 async fn remote_discovery_loop(
     ctx: RemoteClusterPollContext,
     source: Arc<dyn RemoteServiceSource>,
@@ -1717,18 +1748,25 @@ async fn remote_discovery_loop(
                 &ctx.cluster_name,
                 ctx.network.as_deref(),
             );
+            // Bind the content identity of what will ACTUALLY be installed:
+            // computed after validation, trust-domain enforcement, and workload
+            // tagging, because those steps mutate the endpoint set. Binding the
+            // raw fetched slice instead would let two different installed
+            // endpoint sets share one identity (issue #3611).
+            let content = remote_endpoints_content_identity(&candidate.endpoints);
             ctx.revision_gate
-                .admit(candidate.revision.as_ref(), chrono::Utc::now())
+                .admit(candidate.revision.as_ref(), content, chrono::Utc::now())
                 .map_err(|rejection| {
                     format!("remote MeshSubscribe revision rejected: {rejection}")
                 })?;
-            Ok(candidate)
+            Ok((candidate, content))
         });
 
         let (succeeded, sleep_duration) = match result {
-            Ok(candidate) => {
-                let revision_apply_token =
-                    ctx.revision_gate.begin_apply(candidate.revision.as_ref());
+            Ok((candidate, content)) => {
+                let revision_apply_token = ctx
+                    .revision_gate
+                    .begin_apply(candidate.revision.as_ref(), content);
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
                 let workload_count = candidate.endpoints.workloads.len();
                 let entry = RemoteClusterEntry::new(
@@ -1755,7 +1793,7 @@ async fn remote_discovery_loop(
                     if let Some(token) = revision_apply_token {
                         let _ = ctx
                             .revision_gate
-                            .commit_applied(candidate.revision.as_ref(), token);
+                            .commit_applied(candidate.revision.as_ref(), content, token);
                     }
                 } else {
                     // Admission was provisional. A retired generation installed
@@ -1765,7 +1803,7 @@ async fn remote_discovery_loop(
                     // replacement poller.
                     let _ = ctx
                         .revision_gate
-                        .rollback_rejected(candidate.revision.as_ref());
+                        .rollback_rejected(candidate.revision.as_ref(), content);
                 }
                 if outcome.installed() {
                     info!(
@@ -4786,16 +4824,17 @@ mod tests {
             .fetch()
             .await
             .expect("the fresh remote baseline must be fetched");
+        let fresh_content = remote_endpoints_content_identity(&fresh.endpoints);
         ctx.revision_gate
-            .admit(fresh.revision.as_ref(), chrono::Utc::now())
+            .admit(fresh.revision.as_ref(), fresh_content, chrono::Utc::now())
             .expect("the fresh remote baseline must pass the shared gate");
         let token = ctx
             .revision_gate
-            .begin_apply(fresh.revision.as_ref())
+            .begin_apply(fresh.revision.as_ref(), fresh_content)
             .expect("the admitted remote baseline has an apply token");
         assert!(
             ctx.revision_gate
-                .commit_applied(fresh.revision.as_ref(), token)
+                .commit_applied(fresh.revision.as_ref(), fresh_content, token)
         );
 
         // Preserve the source (and therefore its accepted watermark) while
@@ -4805,9 +4844,10 @@ mod tests {
             .fetch()
             .await
             .expect("the lagging replica's structurally valid slice is fetched");
+        let stale_content = remote_endpoints_content_identity(&stale.endpoints);
         let error = ctx
             .revision_gate
-            .admit(stale.revision.as_ref(), chrono::Utc::now())
+            .admit(stale.revision.as_ref(), stale_content, chrono::Utc::now())
             .expect_err("a reconnect must not roll remote endpoints backwards");
         assert!(
             error.to_string().contains("stale_revision"),
@@ -4816,6 +4856,136 @@ mod tests {
 
         fresh_handle.shutdown().await;
         stale_handle.shutdown().await;
+    }
+
+    /// Remote discovery carries the same equal-revision content binding as the
+    /// local slice gate (issue #3611). A remote Kubernetes-controller CP
+    /// publishes the MINIMUM per-scope watermark, so two of its replicas can
+    /// advertise ONE revision for two different endpoint views; without the
+    /// binding, a one-shot reconnect poll against the lagging one would replace
+    /// live remote endpoints with the older set at an equal revision.
+    ///
+    /// The identity is bound to what will actually be INSTALLED — after
+    /// validation, trust-domain enforcement, and workload tagging — so this
+    /// drives the exact sequence `remote_discovery_loop` runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_discovery_refuses_divergent_endpoints_at_an_equal_revision() {
+        let secret = GrpcJwtSecret::new("multicluster-content-secret-000000".to_string());
+        let shared = crate::modes::mesh::revision::MeshConfigRevision::new("k8s", 100);
+
+        let mut full_slice = remote_slice_with_endpoints();
+        full_slice.version = "v-remote-full".to_string();
+        full_slice.revision = Some(shared.clone());
+        let full_handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(full_slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        // The lagging replica has not yet observed the second workload, but its
+        // minimum-over-scopes watermark is the SAME sequence.
+        let mut partial_slice = remote_slice_with_endpoints();
+        partial_slice.version = "v-remote-partial".to_string();
+        partial_slice.workloads.truncate(1);
+        partial_slice.revision = Some(shared.clone());
+        let partial_handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(partial_slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(
+            &full_handle.url,
+            Some(secret.clone()),
+            Duration::from_secs(5),
+        );
+        let mut source = NativeRemoteSource::new(&ctx, secret);
+
+        // The same preparation the poll loop performs before admission.
+        let prepare = |mut candidate: RemoteDiscoveryCandidate| {
+            validate_remote_endpoints(&ctx.cluster_name, &candidate.endpoints)
+                .expect("the stub endpoints are structurally valid");
+            enforce_remote_trust_domain(
+                &mut candidate.endpoints,
+                &ctx.trust_domain,
+                &ctx.cluster_name,
+            );
+            tag_remote_workloads(
+                &mut candidate.endpoints,
+                &ctx.cluster_name,
+                ctx.network.as_deref(),
+            );
+            let content = remote_endpoints_content_identity(&candidate.endpoints);
+            (candidate, content)
+        };
+
+        let (full, full_content) = prepare(
+            source
+                .fetch()
+                .await
+                .expect("the complete remote baseline must be fetched"),
+        );
+        ctx.revision_gate
+            .admit(full.revision.as_ref(), full_content, chrono::Utc::now())
+            .expect("the complete remote baseline establishes the watermark");
+        let token = ctx
+            .revision_gate
+            .begin_apply(full.revision.as_ref(), full_content)
+            .expect("the admitted baseline has an apply token");
+        assert!(
+            ctx.revision_gate
+                .commit_applied(full.revision.as_ref(), full_content, token)
+        );
+
+        // Reconnect to the lagging replica: same revision, fewer workloads.
+        source.control_plane_url = partial_handle.url.clone();
+        let (partial, partial_content) = prepare(
+            source
+                .fetch()
+                .await
+                .expect("the lagging replica's slice is structurally valid"),
+        );
+        assert_eq!(partial.revision, full.revision, "the sequences are equal");
+        assert_ne!(
+            partial_content, full_content,
+            "the installed endpoint sets differ, which is what the binding sees"
+        );
+        let error = ctx
+            .revision_gate
+            .admit(
+                partial.revision.as_ref(),
+                partial_content,
+                chrono::Utc::now(),
+            )
+            .expect_err("a lagging remote replica must not replace live endpoints");
+        assert!(
+            error.to_string().contains("divergent_content"),
+            "expected a bounded divergent-content rejection, got: {error}"
+        );
+        assert_eq!(
+            ctx.revision_gate.applied(),
+            Some(shared),
+            "the last-good remote generation is retained"
+        );
+
+        // An exact-content replay from the complete replica still installs, so
+        // ordinary reconnects keep working.
+        source.control_plane_url = full_handle.url.clone();
+        let (replay, replay_content) = prepare(
+            source
+                .fetch()
+                .await
+                .expect("the complete replica is reachable again"),
+        );
+        assert_eq!(replay_content, full_content);
+        ctx.revision_gate
+            .admit(replay.revision.as_ref(), replay_content, chrono::Utc::now())
+            .expect("an exact-content replay at an equal revision is not a rollback");
+
+        full_handle.shutdown().await;
+        partial_handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
