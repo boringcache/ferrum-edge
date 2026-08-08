@@ -22,8 +22,11 @@ fn squeeze(source: &str) -> String {
 #[test]
 fn h3_terminal_final_body_dispatch_follows_path_policy_and_precedes_breaker() {
     let source = include_str!("../../../src/http3/server.rs");
+    // Match without the `let` binder: the initial selection is now `let mut
+    // selection` so the deferred-override rebind can replace it wholesale. The
+    // first occurrence is still the pre-deferred lookup this ordering pins.
     let selection = source
-        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 backend selection must remain present");
     let path_policy = source[selection..]
         .find("if backend_path_is_policy_bound {")
@@ -60,16 +63,104 @@ fn h3_terminal_final_body_dispatch_follows_path_policy_and_precedes_breaker() {
     assert!(terminal_gate < breaker);
 }
 
+/// A RemainingDeferred provider claim can rewrite destination/path after the
+/// initial H3 selection. Native H3 must rebind every destination-dependent
+/// dispatch input before query capture, terminal egress, admission, or dial —
+/// matching the H1/H2 ladder — and must gate reselection on actual movement.
+#[test]
+fn h3_deferred_destination_override_is_rebound_before_dispatch() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let handler = source
+        .split_once("async fn handle_h3_request(")
+        .map(|(_, handler)| handler)
+        .expect("native H3 request handler must remain present");
+    let deferred = handler
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred pass must remain present");
+    let after_deferred = &handler[deferred..];
+    let rebind = after_deferred
+        .find("routing_proxy = ctx")
+        .and_then(|offset| {
+            after_deferred[offset..]
+                .find("apply_route_overrides_with_upstreams(")
+                .map(|inner| offset + inner)
+        })
+        .expect("deferred destination overrides must rebind the routing-base proxy");
+    let moved = after_deferred
+        .find("let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);")
+        .expect("the rebind must detect a committed destination by routing-proxy identity");
+    let rebase = after_deferred
+        .find("path = crate::proxy::rebase_route_override_path(&mut ctx, path);")
+        .expect("deferred destination overrides must rebase the dispatch path");
+    let reselect = after_deferred
+        .find("upstream_target =")
+        .and_then(|offset| {
+            after_deferred[offset..]
+                .find("concretize_wildcard_target_for_request(")
+                .map(|inner| offset + inner)
+        })
+        .expect("deferred destination overrides must replace the pinned target");
+    let query_capture = after_deferred
+        .find("effective_backend_query_string_with_raw(&ctx, &query_string)")
+        .expect("backend query must be captured after the remaining deferred pass");
+    let terminal = after_deferred
+        .find("if final_body_before_backend_dispatch {")
+        .expect("terminal final-body dispatch gate must remain present");
+
+    assert!(
+        rebind < moved
+            && moved < rebase
+            && rebase < reselect
+            && reselect < query_capture
+            && query_capture < terminal,
+        "H3 must rebind/rebase/reselect before query capture and terminal egress"
+    );
+
+    let gate = after_deferred[..reselect]
+        .rfind("if destination_rebound {")
+        .expect("deferred re-selection must be gated on the destination having moved");
+    assert!(gate > rebase);
+
+    // Whole selection replace, not target-only: balancer + sticky ride `selection`.
+    let whole = after_deferred
+        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .expect("the gated rebind must re-run upstream selection wholesale");
+    let sticky = after_deferred
+        .find("let sticky_cookie_needed = selection.sticky_cookie_needed;")
+        .expect("sticky accounting must still read the live selection");
+    assert!(
+        whole < sticky,
+        "re-selection must overwrite `selection` before sticky accounting consumes it"
+    );
+
+    // DestinationRule overlays must be rebuilt for the rebound destination so
+    // TLS/timeouts/pool keys cannot keep describing the pre-claim target.
+    let recap = after_deferred[reselect..]
+        .find("selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(")
+        .expect("rebound destinations must re-cap the selected base proxy");
+    let reresolve = after_deferred[reselect..]
+        .find("resolve_effective_proxy_for_target(")
+        .expect("rebound destinations must re-resolve the effective proxy");
+    assert!(recap < reresolve);
+    assert!(
+        after_deferred[reselect..]
+            .contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
+        "matched_proxy must describe the rebound selected base"
+    );
+}
+
 #[test]
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = squeeze(include_str!("../../../src/http3/server.rs"));
+    // `selection` is mutable so a deferred destination claim can replace it;
+    // the first occurrence is still the pre-deferred lookup pinned here.
     let selection = source
-        .find("letselection=crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("letmutselection=crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
 
     let cap = after_selection
-        .find("letselected_base_proxy=crate::proxy::cap_proxy_retry_for_target(")
+        .find("letmutselected_base_proxy=crate::proxy::cap_proxy_retry_for_target(")
         .expect("H3 frontend must cap retry policy by selected target");
     let effective = after_selection
         .find("leteffective_proxy=crate::proxy::resolve_effective_proxy_for_target(")
@@ -296,7 +387,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
         .expect("H3 must load the prefiltered backend-path policy list");
     let selection = source
-        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     assert!(
         backend_path_plugins < selection,

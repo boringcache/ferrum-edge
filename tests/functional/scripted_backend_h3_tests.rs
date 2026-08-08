@@ -3485,6 +3485,128 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
     );
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #3283 — FULL BIDIRECTIONAL streaming over a native H3 backend.
+//
+// The scripted H3 backend reads ONE request message and answers immediately,
+// without waiting for request EOF. The client never half-closes until it has
+// the complete response. Before the duplex relay this deadlocked: the gateway
+// drained the client request stream and FINished the backend send side before
+// it ever read response headers, so neither side could make progress.
+//
+// A successful round-trip additionally PROVES native H3 dispatch — the scripted
+// backend speaks only QUIC, so the cross-protocol H2 gRPC bridge could never
+// reach it.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_bidi_server_responds_before_client_half_close() {
+    let ca = TestCa::new("phase-h3-grpc-bidi").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let reply_frame = grpc_frame(b"bidi-early-reply");
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        // Consume the first client message, then answer while the request
+        // direction is still open — the defining bidi shape.
+        .step(H3Step::ReadRequestData)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from(reply_frame.clone())))
+        .step(H3Step::RespondTrailers(vec![
+            ("grpc-status", "0".to_string()),
+            ("grpc-message", "OK".to_string()),
+        ]))
+        .step(H3Step::StallFor(Duration::from_secs(1)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the gRPC request uses the native H3 backend path; \
+         entry: {entry:#?}"
+    );
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Bidi");
+    let mut stream = client
+        .open_grpc_stream(&url)
+        .await
+        .expect("open native H3 gRPC stream");
+
+    // Send one request message and DELIBERATELY do not finish: the request
+    // stream stays open, exactly like a bidi client awaiting the server's reply.
+    stream
+        .send_message(b"bidi-hello")
+        .await
+        .expect("send request message");
+
+    // On the old drain-then-read relay this block never completes.
+    let (status, body, trailers) = tokio::time::timeout(Duration::from_secs(15), async {
+        let (status, _headers) = stream.recv_response().await.expect("recv response");
+        let (body, trailers) = stream
+            .recv_body_and_trailers()
+            .await
+            .expect("recv body + trailers");
+        (status, body, trailers)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "native H3 gRPC backend must respond BEFORE the client half-closes\n\
+             --- logs ---\n{logs}"
+        )
+    });
+
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        body.as_ref(),
+        reply_frame.as_slice(),
+        "the server-streamed message must reach the client before half-close"
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0"),
+        "terminal grpc-status must be forwarded on the duplex relay; \
+         trailers: {trailers:#?}"
+    );
+
+    // The reply followed observed request DATA, so the request direction really
+    // did flow to an H3-only backend before EOF — not merely request headers.
+    let received = h3_backend.received_requests().await;
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert!(
+        received.iter().any(|r| r.method == "POST"
+            && r.path.ends_with("/echo.Echo/Bidi")
+            && r.body == grpc_frame(b"bidi-hello")),
+        "the H3-only backend must have received the pre-half-close request \
+         message; recorded: {received:#?}\n--- logs ---\n{logs}"
+    );
+
+    // Best effort: once the RPC completed the gateway STOP_SENDINGs the request
+    // upload, so a late `finish()` may legitimately see a closed stream.
+    let _ = stream.finish().await;
+}
+
 async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_terminal: bool) {
     let ca = TestCa::new("phase-h3-grpc-trailers-only").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
