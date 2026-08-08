@@ -264,6 +264,14 @@ impl DeferredTransactionLogger {
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
         summary.bytes_received = outcome.bytes_streamed;
+        summary.grpc_request_messages = ctx
+            .grpc_request_messages_observed
+            .load(Ordering::Acquire)
+            .max(summary.grpc_request_messages);
+        summary.grpc_response_messages = ctx
+            .grpc_response_messages_observed
+            .load(Ordering::Acquire)
+            .max(summary.grpc_response_messages);
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());

@@ -87,7 +87,9 @@ CRDs plus the xDS type URLs Ferrum subscribes to.
 - **`istio_service_entry_egress`** — `location: MESH_EXTERNAL` vs
   `MESH_INTERNAL`, HTTP-family + stream-family egress materialization
   (T5-A, PR #907), `outboundTrafficPolicy: REGISTRY_ONLY` injection
-  (T5-B, PR #893), hostname normalization.
+  (T5-B, PR #893), workload-scoped `Sidecar.outboundTrafficPolicy`
+  override in both directions plus its fail-closed unsupported variants
+  (issue #3262), hostname normalization.
 - **`xds_type_urls`** — every type URL Ferrum subscribes to in
   `XDS_TYPE_URLS` (CDS, EDS, LDS, RDS, SDS, ECDS, RTDS) plus the ECDS
   DR-carrier inner
@@ -179,14 +181,26 @@ who want to investigate a specific feature can
 
 ## Deferred entries
 
+This section summarizes the in-process suite's `deferred` rows. The
+**authoritative** matrix is the generated artifact from
+`cargo test --test conformance_tests` → `target/conformance/coverage.md`
+(and `coverage.json`); when this page and the generated file disagree, trust
+the generated output from the latest green `main` run.
+
 The current run records these `deferred` entries:
 
 - `istio_destination_rule` —
-  `trafficPolicy.connectionPool.http.{http1MaxPendingRequests, maxRetries,
-  h2UpgradePolicy}` are projected and enforced at top-level /
-  `portLevelSettings` (F5.1 — all three now `supported`); they remain deferred
-  ONLY when set inside a `subsets[].trafficPolicy` (the subset apply path builds
-  a `SubsetTrafficPolicy` that carries no `connectionPool.http`).
+  `trafficPolicy.connectionPool.http.maxRequestsPerConnection` is parsed and
+  validated but not enforced (close-after-N backend requests unsupported) at
+  any scope.
+- `istio_destination_rule` —
+  `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
+  are validated like their top-level forms but dropped by the subset apply
+  layer (`ResolvedSubsetTrafficPolicy` carries only `h2UpgradePolicy`,
+  `maxRetries`, and `http1MaxPendingRequests`); set those fields at
+  `trafficPolicy` or `portLevelSettings` scope instead. The three shipped
+  subset fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`)
+  are `supported` at subset scope (PR #3547).
 
 Previously deferred and now flipped to `supported`:
 

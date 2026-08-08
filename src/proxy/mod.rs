@@ -987,6 +987,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::PortExhaustion
                     | retry::ErrorClass::ProtocolError
                     | retry::ErrorClass::DispatchPolicyRejected
+                    | retry::ErrorClass::BackendConnectionLimit
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )
@@ -2612,32 +2613,34 @@ pub(crate) fn can_use_direct_http2_pool(
 /// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
 ///
 /// `get_sender()` may dial or probe the backend, so callers must use this
-/// stricter predicate before opening an H2 sender. When body-size limits are
-/// enabled, ordinary (non-SNI) requests stay on the reqwest path so local
-/// request-size checks and deferred backend admission run before any backend
-/// interaction. Backend TLS SNI overrides cannot use reqwest, so callers that
-/// require direct-H2 for SNI should consult [`can_use_direct_http2_pool`]
-/// instead and enforce limits in-path (413 / 502) on the H2 sender.
+/// predicate before opening an H2 sender. Body-size limits are enforced
+/// in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
+/// frame-by-frame when `Content-Length` is absent — so nonzero
+/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
+/// (non-SNI) routes from the multiplexed pool. The retained size-limit
+/// parameters keep call-site signatures stable; they do not gate
+/// dispatch. Retry body replay and request-body-buffering plugins still
+/// force the reqwest path via [`can_use_direct_http2_pool`].
 pub(crate) fn can_dispatch_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
     requires_request_body_buffering: bool,
-    max_request_body_size_bytes: usize,
-    max_response_body_size_bytes: usize,
+    _max_request_body_size_bytes: usize,
+    _max_response_body_size_bytes: usize,
 ) -> bool {
     can_use_direct_http2_pool(
         enable_http2,
         retain_request_body,
         requires_request_body_buffering,
-    ) && max_request_body_size_bytes == 0
-        && max_response_body_size_bytes == 0
+    )
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
-/// `can_dispatch` is the body/limit/`enable_http2` gate
+/// `can_dispatch` is the body-compat/`enable_http2` gate
 /// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
@@ -3078,9 +3081,13 @@ fn backend_tls_sni_requires_direct_h2_response(
         status_code: 502,
         body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
         headers,
-        // reqwest cannot apply per-request backend SNI. Mark this terminal
-        // gateway policy response as non-retryable so a 502 retry policy
-        // cannot amplify it or trip the backend circuit breaker repeatedly.
+        // Terminal gateway policy: the requested backend TLS server name could
+        // be honored on neither the direct-H2 pool nor the reqwest/H1 dial (see
+        // `backend_tls_sni_reqwest_dial` for what makes the latter impossible —
+        // an unresolvable target, or a backend URL whose authority is not the
+        // selected target). Mark it non-retryable so a 502 retry policy cannot
+        // amplify it or trip the backend circuit breaker repeatedly. The
+        // constant's name is kept as the stable `gateway-error-reason` token.
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
@@ -3504,6 +3511,18 @@ async fn prepare_mesh_request_body(
         }
     };
     let body = Bytes::from(body);
+    // Authoritative gRPC request messages are counted from the backend-visible
+    // body: `apply_request_body_plugins_with_context` above is where gRPC-Web
+    // text base64 is decoded and the terminal trailer frame is split off. A
+    // prepared buffer already went through that phase upstream, so counting it
+    // here is the same representation; `fetch_max` keeps replays idempotent.
+    if let Some(request_ctx) = ctx.as_deref() {
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &request_ctx.metadata,
+            &request_ctx.grpc_request_messages_observed,
+            &body,
+        );
+    }
     let retained = (retain_request_body && !body.is_empty()).then(|| body.clone());
     let trailers = ctx
         .as_deref()
@@ -5735,19 +5754,49 @@ pub struct ProxyState {
     #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Per-destination open-connection limiter enforcing DestinationRule
-    /// `connectionPool.tcp.maxConnections` for the HTTP-family WebSocket
-    /// dispatch path (H1/H2 here and H3 in `src/http3/websocket.rs`). A
-    /// proxied WebSocket session opens one dedicated, non-pooled backend
-    /// connection whose lifetime equals the session, so an RAII
-    /// [`crate::backend_conn_limit::BackendConnectionGuard`] held for the
-    /// session bounds concurrent open connections per `(host, port)` —
-    /// matching Envoy `maxConnections` semantics and the raw-TCP path's
-    /// `BackendInflightGuard`. The pooled, multiplexed HTTP-family
-    /// transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not
-    /// consume this limiter; see `docs/mesh.md` and the module docs in
-    /// `src/backend_conn_limit.rs` for why their pool-internal connection
-    /// lifecycle makes a request-keyed counter the wrong control.
+    /// `connectionPool.tcp.maxConnections` across EVERY backend transport
+    /// whose physical connection lifecycle Ferrum owns: raw TCP/TCP+TLS,
+    /// WebSocket (H1/H2 here and H3 in `src/http3/websocket.rs`), the pooled
+    /// multiplexed transports (direct H2, gRPC, native H3, HBONE, mesh-mTLS),
+    /// and the reqwest transports (admitted through
+    /// [`crate::backend_conn_limit::ReqwestConnectionAdmission`] below).
+    /// A dedicated session holds an RAII
+    /// [`crate::backend_conn_limit::BackendConnectionGuard`] for the session;
+    /// a pooled connection holds a
+    /// [`crate::backend_conn_limit::SharedBackendConnectionGuard`] handed to
+    /// its own connection driver, so the slot retires exactly when the socket
+    /// dies (handshake failure, idle eviction, pool drain, reload/delete, SVID
+    /// drain, shutdown) and reuse/multiplexing takes no extra slot. One shared
+    /// instance means the ceiling is per destination `(host, policy port)`, not
+    /// per transport.
+    ///
+    /// "Shared" is literal and has to stay that way. Raw TCP reaches this exact
+    /// `Arc` through `TcpProxyMetrics.backend_inflight`, which the stream
+    /// listener manager is handed via `attach_backend_conn_limit` right after
+    /// construction and before the first `reconcile()` — if a stream listener
+    /// ever built its own limiter instead, a destination's effective ceiling
+    /// would become `cap` per listener plus another `cap` for the HTTP family.
+    /// The host component of the key is normalized inside the limiter, not at
+    /// the callers, because the callers disagree on spelling (configured host
+    /// vs. reqwest's URL-normalized authority).
+    ///
+    /// See `docs/mesh.md` and the module docs in `src/backend_conn_limit.rs`.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
+    /// Gateway-wide `connectionPool.tcp.maxConnections` admission hook for the
+    /// reqwest transports (HTTP/1.1 and ALPN-negotiated HTTP/2).
+    ///
+    /// reqwest owns its socket pool internally, so the cap is enforced at its
+    /// connector — the one place a NEW physical socket is dialed — through the
+    /// vendored `ClientBuilder::connection_admission` hook. Pooled reuse and
+    /// multiplexed H2 streams never reach it, and the admitted token is owned
+    /// by the connection object, so an idle socket reqwest retains after a
+    /// request still holds its slot. The dispatch path binds the destination
+    /// lane (dial `(host, port)` -> policy port + cap) to its own dispatch with
+    /// an RAII
+    /// [`crate::backend_conn_limit::ReqwestLaneLease`] held across `send()`, and
+    /// only when a cap is configured — so a lane is live exactly while a capped
+    /// request can cause a dial, and a removed cap drains with its requests.
+    pub reqwest_conn_admission: Arc<crate::backend_conn_limit::ReqwestConnectionAdmission>,
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
     /// backend-dispatch path. Bounds how many requests can be simultaneously
@@ -6085,6 +6134,13 @@ fn push_tls_material_source(
         return;
     };
     let source = CertSource::parse(value.to_string(), kind);
+    // `system://` names the compiled-in webpki roots: there is no material to
+    // fetch, and enrolling it would make `material_set_fingerprint` fail the
+    // whole watched set with `UnsupportedScheme`, disabling rotation detection
+    // for every other backend source alongside it.
+    if source.is_system_trust_roots() {
+        return;
+    }
     if seen.insert((kind, source.pool_key_component())) {
         sources.push(
             crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
@@ -6995,6 +7051,22 @@ impl ProxyState {
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
+        // ONE `connectionPool.tcp.maxConnections` counter for the whole
+        // gateway: raw TCP, WebSocket, and every pooled multiplexed transport
+        // admit on the same per-`(host, policy port)` lane, so a destination's
+        // ceiling is a real per-destination ceiling rather than one ceiling per
+        // transport. Constructed before the pools so each can be handed a
+        // reference at construction time (see `attach_backend_conn_limit`).
+        let backend_conn_limit = Arc::new(
+            crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
+                pool_shard_amount,
+            ),
+        );
+        let reqwest_conn_admission =
+            Arc::new(crate::backend_conn_limit::ReqwestConnectionAdmission::new(
+                backend_conn_limit.clone(),
+                pool_shard_amount,
+            ));
         let grpc_pool = Arc::new(
             GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
                 global_pool_config.clone(),
@@ -7053,6 +7125,14 @@ impl ProxyState {
             dns_cache.clone(),
             backend_svid_generation.clone(),
         ));
+        // Wire the shared destination ceiling into every socket-owning pool.
+        // Additive and idempotent (`OnceLock::set`): a pool constructed without
+        // it (focused tests, standalone callers) simply never enforces a cap.
+        grpc_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        http2_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
@@ -7065,6 +7145,9 @@ impl ProxyState {
             shared_crls.clone(),
             backend_svid_generation.clone(),
         ));
+        // Same shared ceiling for the reqwest transports, installed on every
+        // client this pool builds (see `ReqwestConnectionAdmission`).
+        connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
         // the RouterCache constructor resolves the auto sentinel (single source of truth).
@@ -7343,6 +7426,14 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
+        // relay session, so they must admit on the SAME per-destination lane as
+        // WebSocket, the pooled multiplexed transports, and reqwest. Attached
+        // here — after construction, before any `reconcile()` — so every spawned
+        // listener's `TcpProxyMetrics` carries this exact `Arc` instead of a
+        // private per-listener limiter (which would make the effective ceiling
+        // `cap` per listener plus another `cap` for the whole HTTP family).
+        stream_listener_manager.attach_backend_conn_limit(backend_conn_limit.clone());
 
         let state = Self {
             config: config_arc,
@@ -7435,11 +7526,8 @@ impl ProxyState {
             backend_svid_rotation_tx,
             backend_svid_generation,
             bpf_metrics_state,
-            backend_conn_limit: Arc::new(
-                crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
-                    pool_shard_amount,
-                ),
-            ),
+            backend_conn_limit,
+            reqwest_conn_admission,
             backend_pending_limit: Arc::new(
                 crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
                     pool_shard_amount,
@@ -8122,7 +8210,14 @@ impl ProxyState {
                 // `record.last_probe_error` directly instead — the outer
                 // function merges this into the combined error string.
                 let class = http2_pool::classify_http2_pool_error(&err);
-                let preserve = is_transient_capability_probe_failure(class);
+                // Same reasoning as the H3 probe: a `maxConnections` refusal is
+                // a gateway-side ceiling, not evidence the backend lost H2. This
+                // arm already probes `Unknown`, so preserving is all that is
+                // needed to keep a prior `Supported` from being erased whenever
+                // the refresh happens to run while the cap is saturated.
+                use http2_pool::Http2PoolError;
+                let refused_by_cap = matches!(err, Http2PoolError::MaxConnectionsExceeded { .. });
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 record.plain_http.h2_tls =
                     backend_capabilities::merge_protocol_probe_classification(
                         previous_h2_tls,
@@ -8328,10 +8423,25 @@ impl ProxyState {
             },
             Ok(Err(err)) => {
                 let class = crate::http3::client::classify_http3_error(err.as_ref());
-                let preserve = is_transient_capability_probe_failure(class);
+                // A `connectionPool.tcp.maxConnections` refusal is the GATEWAY
+                // declining to open one more socket to a destination that is at
+                // its ceiling — the probe never dialed, so it carries ZERO
+                // evidence about the backend's H3 support. Reading it as
+                // `Unsupported` would durably downgrade a perfectly healthy H3
+                // backend (and route every subsequent request through reqwest)
+                // simply because live traffic had the cap saturated when the
+                // refresh ran. Probe `Unknown` + preserve, so a prior
+                // `Supported` survives and a first probe stays undecided.
+                let refused_by_cap = crate::pool::is_max_connections_refusal(err.as_ref());
+                let probed = if refused_by_cap {
+                    ProtocolSupport::Unknown
+                } else {
+                    ProtocolSupport::Unsupported
+                };
+                let preserve = refused_by_cap || is_transient_capability_probe_failure(class);
                 let h3 = backend_capabilities::merge_protocol_probe_classification(
                     previous_h3,
-                    ProtocolSupport::Unsupported,
+                    probed,
                     preserve,
                 );
                 if preserve && matches!(h3, ProtocolSupport::Supported) {
@@ -9652,6 +9762,13 @@ impl ProxyState {
                 self.router_cache.clear_lookup_caches();
             }
         }
+        // No withdrawal pass is needed for the reqwest `maxConnections` admission
+        // lanes: a lane exists only while some capped dispatch holds a lease
+        // across its `send()`, so a cap this publication REMOVED stops applying
+        // as soon as the requests dispatched under the old configuration drain,
+        // and the registry drains with them. A cap this publication CHANGED is
+        // replaced wholesale by the first dispatch carrying the newer generation
+        // (see `ReqwestConnectionAdmission`).
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
         self.consumer_index
@@ -12749,6 +12866,45 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether everything left of the rendered host, to the END of the authority,
+/// is a port and nothing else: either empty, or `:` followed by one or more
+/// ASCII digits.
+///
+/// This is the host-boundary proof for [`rewrite_backend_url_authority_host`],
+/// and it is deliberately a whole-remainder test rather than a leading-byte
+/// test. `:` alone establishes nothing about the host: an authority's userinfo
+/// runs to the LAST `@`, so `foo.example:443@evil.test` names the host
+/// `evil.test` while presenting a `:`-led remainder, and `:443x` is not an
+/// authority whose host can be identified at all. Rejecting both leaves the
+/// rewrite defined only where the source host really is the authority's host.
+/// Allocation-free: a byte scan over a borrowed slice.
+fn authority_remainder_is_port_only(remainder: &str) -> bool {
+    match remainder.strip_prefix(':') {
+        None => remainder.is_empty(),
+        Some(port) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
+/// Whether the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` URL is
+/// exactly `host`, under the same host-boundary proof
+/// [`rewrite_backend_url_authority_host`] applies.
+///
+/// Exists so a caller can assert the property positively instead of inferring
+/// it from "the rewrite changed nothing, and the two names happened to match".
+/// Allocation-free: borrowed slices and a byte scan.
+fn backend_url_authority_host_is(url: &str, host: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end_rel = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end_rel];
+    let rendered = url_render_host(host);
+    authority
+        .strip_prefix(rendered.as_ref())
+        .is_some_and(authority_remainder_is_port_only)
+}
+
 /// Rewrite the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` backend URL,
 /// replacing the rendered `from_host` (in the authority position only) with the
 /// rendered `to_host`. Used by the CROSS-CLUSTER HBONE dispatch to turn a URL
@@ -12760,6 +12916,20 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
 /// no `://` or the authority does not start with the rendered `from_host`, the
 /// URL is returned unchanged (defensive; the caller still fails closed on a
 /// subsequent parse error).
+///
+/// The prefix match additionally requires a **complete host boundary**: what
+/// follows the rendered source host must be the whole remainder of the
+/// authority, and that remainder must be either empty or `:` plus a nonempty
+/// decimal port ([`authority_remainder_is_port_only`]). Without that,
+/// `from_host = "foo.example"` also matched the authority `foo.example.evil`
+/// and rewrote a *different* host's URL. Accepting any `:`-led remainder was
+/// not enough either: URL userinfo is everything before the last `@`, so
+/// `foo.example:443@evil.test` has host `evil.test` while still "starting with
+/// a colon", and `:443x` / `:` are not authorities this helper can reason about
+/// at all. The callers here build exact authorities, but a security helper must
+/// not depend on its callers for the property it exists to provide. Bracketed
+/// IPv6 is unaffected: the closing `]` is part of the rendered host, so the
+/// remainder is `` or `:{port}` exactly as for a DNS name.
 fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -12772,7 +12942,10 @@ fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str)
     let suffix = &rest[authority_end_rel..];
     let rendered_from = url_render_host(from_host);
     // The authority is `{rendered_host}:{port}` (or bare `{rendered_host}`).
-    if let Some(after_host) = authority.strip_prefix(rendered_from.as_ref()) {
+    if let Some(after_host) = authority
+        .strip_prefix(rendered_from.as_ref())
+        .filter(|after_host| authority_remainder_is_port_only(after_host))
+    {
         let rendered_to = url_render_host(to_host);
         format!(
             "{}{}{}{}",
@@ -12784,6 +12957,157 @@ fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str)
     } else {
         url.to_string()
     }
+}
+
+/// Reqwest dial identity that carries an overridden backend TLS server name.
+///
+/// # Why the URL authority
+///
+/// reqwest derives the rustls server name from the request URL's host and
+/// exposes no per-request server-name hook — the vendored connector builds
+/// `ServerName::try_from(dst.host())`
+/// (`vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs`). So the only way to
+/// present an overridden server name on the reqwest path is to put the override
+/// in the URL authority. The socket must nevertheless land on the
+/// load-balanced target, which is what the returned proxy's `dns_override`
+/// guarantees: [`crate::dns::DnsCacheResolver::with_dns_override`] answers
+/// **every** name with the pinned address, so the SNI hostname is never itself
+/// resolved and a request host can never redirect the dial. `backend_tls_sni` is
+/// separately validated to be a DNS hostname and never an IP literal
+/// ([`crate::config::types::validate_backend_tls_sni`]), so it also cannot
+/// become a hyper-util URL-literal dial that would bypass the resolver.
+///
+/// # What this preserves by construction
+///
+/// * **Backend-visible authority.** ALPN is restricted to `http/1.1`, so the
+///   backend reads the authority from the `Host` header — which dispatch sets
+///   explicitly from the effective target host, and which hyper-util preserves
+///   (`headers_mut().entry(HOST).or_insert_with(..)`) rather than deriving from
+///   the URL. HTTP/2 would take `:authority` from the URL, i.e. from the server
+///   name, which is precisely why h2 must not be negotiated here. H2-capable
+///   targets are unaffected: they keep using the direct-H2 pool, which owns its
+///   own handshake and sets the server name natively while keeping the real
+///   backend authority.
+/// * **Pool partitioning.** `dns_override` and the force-H1 `h1` discriminator
+///   both enter the reqwest pool key, and `resolved_tls.sni` (plus CA / SAN
+///   digest / mTLS / verification) already do. The client is therefore keyed per
+///   (server name, pinned target, ALPN) and can be shared neither with a default
+///   h2-capable client nor with another target's pin.
+/// * **Egress screening.** `ConnectionPool::create_client` screens the pinned
+///   `dns_override` against the backend egress policy before building the
+///   client, and the pin is the address dispatch already resolved *and* screened
+///   for the selected target.
+/// * **Retries, timeouts, streaming bodies.** Nothing else about the dial
+///   changes, so the ordinary reqwest path's per-request connect/read timeouts,
+///   body streaming, and retry replay all apply unchanged.
+///
+/// # Cost
+///
+/// Pinning to one resolved address partitions the reqwest client per target
+/// (a Service with N endpoints materializes up to N clients for an SNI-override
+/// route) and gives up in-client multi-address failover for that dial. Both are
+/// inherent to expressing a server name through the URL, and both are bounded by
+/// the existing pool cleanup. Only SNI-override routes pay it.
+///
+/// # Allocation
+///
+/// The dial identity is taken as a [`Cow<Proxy>`](std::borrow::Cow) and mutated
+/// through `to_mut()`, so a caller that already owns a target-effective proxy
+/// (`resolve_backend_connection_proxy_for_target` clones whenever the selected
+/// target's host/port differ from the route template, i.e. on every
+/// load-balanced request) hands that clone over and pays **nothing** extra.
+/// Only a caller holding a borrowed proxy pays the one unavoidable clone.
+/// Taking `&Proxy` here made every SNI request on the H1 fallback clone the
+/// whole `Proxy` a second time on a hot path.
+///
+/// Returns `None` when the override cannot be honored on this path; the caller
+/// keeps its terminal 502 rather than dialing with the wrong server name.
+pub(crate) fn backend_tls_sni_reqwest_dial<'a>(
+    proxy: std::borrow::Cow<'a, Proxy>,
+    backend_url: &str,
+    effective_host: &str,
+    resolved_ip: Option<&str>,
+) -> Option<(std::borrow::Cow<'a, Proxy>, String)> {
+    let dial =
+        resolve_backend_tls_sni_reqwest_dial(&proxy, backend_url, effective_host, resolved_ip)?;
+    Some(apply_backend_tls_sni_reqwest_dial(proxy, dial))
+}
+
+/// The dial-identity deltas an SNI reqwest dial applies, resolved WITHOUT
+/// cloning the proxy.
+///
+/// Split from [`apply_backend_tls_sni_reqwest_dial`] so a caller that must
+/// decide "can this route take the reqwest SNI dial?" at several forks (see
+/// `proxy_to_backend`'s direct-H2 block) answers the question with borrows only
+/// and materializes the owned dial proxy exactly once, at the point where it can
+/// hand over an effective proxy it already owns.
+pub(crate) struct BackendTlsSniReqwestDial {
+    /// Address the pooled client's resolver must answer EVERY name with, so the
+    /// SNI hostname in the URL is never itself resolved.
+    pinned_ip: std::net::IpAddr,
+    /// Backend URL whose authority is the overridden TLS server name.
+    url: String,
+}
+
+/// Decide whether an SNI reqwest dial can be built, and with what deltas.
+/// See [`backend_tls_sni_reqwest_dial`] for the full rationale.
+pub(crate) fn resolve_backend_tls_sni_reqwest_dial(
+    proxy: &Proxy,
+    backend_url: &str,
+    effective_host: &str,
+    resolved_ip: Option<&str>,
+) -> Option<BackendTlsSniReqwestDial> {
+    let sni = proxy.resolved_tls.sni.as_deref()?;
+    // Only a TLS backend has a server name to override.
+    if !proxy
+        .backend_scheme
+        .is_some_and(|scheme| scheme.is_tls_backend())
+    {
+        return None;
+    }
+    // The pin must be the address the gateway already resolved and
+    // egress-screened for the SELECTED target. Without it nothing keeps the
+    // socket on that target, and letting reqwest resolve the SNI hostname
+    // instead would be exactly the request-host DNS escape this must not allow.
+    // When the operator also configured `dns_override`, that override is what
+    // produced `resolved_ip`, so pinning the result honors it and narrows it.
+    let pinned: std::net::IpAddr = resolved_ip?.parse().ok()?;
+    let url = rewrite_backend_url_authority_host(backend_url, effective_host, sni);
+    // `rewrite_backend_url_authority_host` returns its input unchanged when the
+    // authority is not exactly the rendered `effective_host` (optionally with a
+    // port). An unchanged URL would hand rustls the target's own name as the
+    // server name, so fail closed unless the authority ALREADY is the server
+    // name. Asserted positively against the URL rather than inferred from
+    // `effective_host == sni`: the callers here build the authority from
+    // `effective_host`, but a dial that decides which name rustls verifies must
+    // read that name off the URL it is about to hand reqwest, not off a
+    // separate argument that is only expected to agree with it.
+    if url == backend_url && !backend_url_authority_host_is(backend_url, sni) {
+        return None;
+    }
+    Some(BackendTlsSniReqwestDial {
+        pinned_ip: pinned,
+        url,
+    })
+}
+
+/// Materialize the dial identity onto an effective proxy.
+///
+/// `proxy` is a `Cow` on purpose: `to_mut()` mutates an already-owned
+/// target-effective proxy in place, so the common load-balanced case pays no
+/// clone at all.
+pub(crate) fn apply_backend_tls_sni_reqwest_dial<'a>(
+    mut proxy: std::borrow::Cow<'a, Proxy>,
+    dial: BackendTlsSniReqwestDial,
+) -> (std::borrow::Cow<'a, Proxy>, String) {
+    let owned = proxy.to_mut();
+    owned.dns_override = Some(dial.pinned_ip.to_string());
+    // Restrict this client's ALPN to `http/1.1` and mark it `h1` in the pool
+    // key. `BackendTlsConfigBuilder::build_reqwest_with_http2_enabled` reads
+    // `forces_backend_http1_only()` regardless of the resolved `enable_http2`,
+    // so this is load-bearing, not a hint.
+    owned.h2_upgrade_policy = Some(crate::config::types::H2UpgradePolicy::DoNotUpgrade);
+    (proxy, dial.url)
 }
 
 /// Host used for WebSocket transaction-log DNS resolution. Load-balanced
@@ -19086,6 +19410,17 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // ORIGIN response-header boundary. Runs before every other response hook so
+    // a plugin that routed this request to a third-party destination can bound
+    // what that destination contributed WITHOUT discarding the gateway
+    // decorations (CORS at 100, tracing, correlation, rate-limit headers) that
+    // the `after_proxy` chain adds afterwards. Synchronous, non-rejecting, and
+    // idempotent by contract.
+    for plugin in plugins {
+        if plugin.enforces_origin_response_header_policy(ctx) {
+            plugin.enforce_origin_response_header_policy(ctx, response_status, response_headers);
+        }
+    }
     // Establish backend provenance before the first trusted response hook can
     // mutate the map. A later deadline or representation-error replacement
     // retains only mutations from hooks that completed, never backend fields
@@ -23951,6 +24286,7 @@ async fn handle_proxy_request_inner(
 
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
+    ctx.config_generation = epoch.config_generation;
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
@@ -27087,6 +27423,16 @@ async fn handle_proxy_request_inner(
                 )
                 .await,
             );
+            // Count gRPC messages from the transformed, backend-visible body —
+            // NOT the client wire bytes recorded into `bytes_sent_observed`
+            // above. A translated gRPC-Web request only becomes native
+            // length-prefixed framing after the transform decodes text-mode
+            // base64 and strips the terminal trailer frame.
+            crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+                &ctx.metadata,
+                &ctx.grpc_request_messages_observed,
+                &grpc_req_body,
+            );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
@@ -27434,6 +27780,7 @@ async fn handle_proxy_request_inner(
                     upload_observer,
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
+                    Some(Arc::clone(&ctx.grpc_request_messages_observed)),
                 )
                 .await;
                 (result, Bytes::new())
@@ -27477,6 +27824,17 @@ async fn handle_proxy_request_inner(
                         ctx.bytes_sent_observed.fetch_max(
                             grpc_req_body.len() as u64,
                             std::sync::atomic::Ordering::Release,
+                        );
+                        // This arm is reached only when the body needs no hook
+                        // pass (`!requires_request_body_buffering`, so no
+                        // gRPC-Web translation is configured) or when an earlier
+                        // terminal preparation already ran the transforms
+                        // (`request_body_prepared`). Either way `grpc_req_body`
+                        // is already the backend-visible native representation.
+                        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+                            &ctx.metadata,
+                            &ctx.grpc_request_messages_observed,
+                            &grpc_req_body,
                         );
                         backend_admission_permits =
                             match backend_dispatch::run_backend_admission_plugins(
@@ -27718,12 +28076,22 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, grpc_cb_probe_slot);
+                    // A `maxConnections` refusal is retryable (pre-wire, so the
+                    // loop may rotate to another target) but carries no backend
+                    // signal — the ceiling is the gateway's own policy. Settle
+                    // the breaker neutrally instead of opening it on a healthy
+                    // destination whose cap simply saturated.
+                    if backend_dispatch::client_side_no_backend_signal(grpc_retry_error_class) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, true, grpc_cb_probe_slot);
+                    }
                     // This intermediate failure consumes the probe slot (if any);
                     // the post-dispatch record must not decrement it again.
                     grpc_cb_probe_slot = false;
                     // The probe slot this guard would release on drop has now
-                    // been released by record_failure above, so disarm it.
+                    // been released by the record above (failure or neutral —
+                    // both consume it), so disarm it.
                     // Otherwise a future dropped during the retry backoff/next
                     // attempt would call record_neutral on the same breaker and
                     // release a second slot (over-admitting probes when
@@ -28095,7 +28463,18 @@ async fn handle_proxy_request_inner(
                             ..
                         }
                     );
-                    cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    // A DestinationRule `maxConnections` refusal is a
+                    // gateway-side ceiling, not a backend fault: no socket was
+                    // opened. Settle NEUTRAL, the same posture the raw-TCP
+                    // over-cap path and `apply_circuit_breaker_outcome` take,
+                    // so a saturated cap cannot open the breaker on a healthy
+                    // destination.
+                    let grpc_error_class = retry::classify_grpc_proxy_error(e);
+                    if backend_dispatch::client_side_no_backend_signal(Some(grpc_error_class)) {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                    }
                 }
             }
         }
@@ -28522,6 +28901,12 @@ async fn handle_proxy_request_inner(
                         response_streamed: streamed,
                         error_class: final_error_class,
                         bytes_sent,
+                        grpc_request_messages: ctx
+                            .grpc_request_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        grpc_response_messages: ctx
+                            .grpc_response_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
                         metadata,
                         ai_usage_export: ctx.ai_usage_export.clone(),
                         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -28803,6 +29188,20 @@ async fn handle_proxy_request_inner(
                             grpc_streaming.request_body_exceeded.clone(),
                         );
                 }
+                // Attach BEFORE the optional gRPC-Web adapter so the scanner sees
+                // the backend's native length-prefixed DATA frames. The adapter
+                // wraps this body and re-frames the client-visible bytes
+                // (terminal trailer frame, and base64 in text mode), which are
+                // not native gRPC messages. Attached independently of whether a
+                // deferred logger is present so message metrics are not silently
+                // zero when plugins are absent.
+                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                    &ctx.metadata,
+                ) {
+                    body = body.with_grpc_message_counter(Arc::clone(
+                        &ctx.grpc_response_messages_observed,
+                    ));
+                }
                 if let Some(content_type) = grpc_web_streaming_content_type {
                     body = body.into_grpc_web_streaming(
                         content_type,
@@ -28860,6 +29259,16 @@ async fn handle_proxy_request_inner(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                // Count the backend's native length-prefixed frames here, before
+                // the response-body pipeline runs. A gRPC-Web transform appends a
+                // terminal trailer frame and, in text mode, base64-armours the
+                // whole body — neither is a native gRPC message. Recording
+                // in place avoids cloning the buffered body on the hot path.
+                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+                    &ctx.metadata,
+                    &ctx.grpc_response_messages_observed,
+                    &response_body,
+                );
                 if let Some(grpc_status) =
                     grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                 {
@@ -29495,6 +29904,9 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
+                    // `grpc_response_messages_observed` was populated from the
+                    // backend's native body before the response-body pipeline
+                    // ran; `response_body` here may already be gRPC-Web framed.
                     let bytes_received = response_body.len() as u64;
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
@@ -29519,6 +29931,12 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         bytes_sent,
                         bytes_received,
+                        grpc_request_messages: ctx
+                            .grpc_request_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        grpc_response_messages: ctx
+                            .grpc_response_messages_observed
+                            .load(std::sync::atomic::Ordering::Acquire),
                         metadata: clone_log_metadata(&ctx),
                         ai_usage_export: ctx.ai_usage_export.clone(),
                         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -30312,11 +30730,25 @@ async fn handle_proxy_request_inner(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(
-                    result.status_code,
-                    result.connection_error,
-                    cb_retry_probe_slot_available,
-                );
+                // A retryable outcome that carries NO backend-health signal must
+                // settle the breaker NEUTRALLY here, not as a failure. Until
+                // `BackendConnectionLimit` there was no such class — every other
+                // `client_side_no_backend_signal` class is rejected by
+                // `should_retry`, so this arm only ever saw genuine backend
+                // failures. A `maxConnections` refusal is pre-wire (so the loop
+                // may rotate to another target) but is the operator's own
+                // gateway-side ceiling, so charging it would open the breaker on
+                // a healthy destination. Mirrors `apply_circuit_breaker_outcome`
+                // and the raw-TCP over-cap path's `record_cb_neutral`.
+                if backend_dispatch::client_side_no_backend_signal(result.error_class) {
+                    cb.record_neutral(cb_retry_probe_slot_available);
+                } else {
+                    cb.record_failure(
+                        result.status_code,
+                        result.connection_error,
+                        cb_retry_probe_slot_available,
+                    );
+                }
                 cb_retry_probe_slot_available = false;
             }
 
@@ -30708,6 +31140,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             };
+            // Retry helpers can reject the selected target before dialing it
+            // (most notably when the egress policy blocks its resolved
+            // address). Do not let the response path mistake that target for
+            // the backend that served the response and mint affinity for it.
+            sticky_dispatch_refused = matches!(
+                result.error_class,
+                Some(retry::ErrorClass::DispatchPolicyRejected)
+            );
             // If H3 was attempted and produced a transport-level failure,
             // downgrade the cached capability so subsequent requests (and
             // any future retry that rotates BACK to this target) skip the
@@ -30849,6 +31289,19 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Authoritative gRPC response messages for a buffered backend body are
+    // counted here, from the backend's native length-prefixed representation and
+    // before the response-body pipeline can re-frame it (a gRPC-Web transform
+    // appends a terminal trailer frame and base64-armours text mode). Streaming
+    // bodies are counted frame-by-frame by the scanner attached below, also
+    // ahead of the gRPC-Web adapter.
+    if let ResponseBody::Buffered(backend_native_body) = &response_body {
+        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+            &ctx.metadata,
+            &ctx.grpc_response_messages_observed,
+            backend_native_body,
+        );
+    }
     // Record original backend response invariants before any `after_proxy` hook
     // can rewrite headers. Compression preserves these markers even if an earlier
     // hook strips/renames `Content-Range` or `Cache-Control`.
@@ -31699,6 +32152,17 @@ async fn handle_proxy_request_inner(
                 ResponseBody::Buffered(v) => v.len() as u64,
                 _ => 0,
             };
+            // Message counters are populated from the native gRPC
+            // representations (request: post-transform backend-visible body;
+            // response: the backend body captured before the response pipeline,
+            // or the streaming scanner). Never recount `response_body` here — by
+            // this point a gRPC-Web transform may have re-framed it.
+            let grpc_request_messages = ctx
+                .grpc_request_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire);
+            let grpc_response_messages = ctx
+                .grpc_response_messages_observed
+                .load(std::sync::atomic::Ordering::Acquire);
             let summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -31724,6 +32188,8 @@ async fn handle_proxy_request_inner(
                 error_class: backend_error_class,
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
+                grpc_request_messages,
+                grpc_response_messages,
                 metadata: clone_log_metadata(&ctx),
                 ai_usage_export: ctx.ai_usage_export.clone(),
                 proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -32003,7 +32469,7 @@ async fn handle_proxy_request_inner(
     // atomic. A deferred task reads it after read_timeout + 5s to emit a
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
-    let body = match response_body {
+    let mut body = match response_body {
         ResponseBody::Streaming {
             response,
             reqwest_backend_guard,
@@ -32455,6 +32921,20 @@ async fn handle_proxy_request_inner(
             ProxyBody::full(data)
         }
     };
+    // Attach native gRPC message scanning before the optional gRPC-Web adapter.
+    // Text-mode gRPC-Web base64 and its body-framed terminal metadata are not
+    // native length-prefixed messages; the inner body still sees the original
+    // DATA/trailer split and updates the shared RequestContext counter.
+    //
+    // Gated on `body_will_stream` rather than `is_streaming_response`: a plugin
+    // reject can replace a streaming backend body with a gateway-authored
+    // buffered one, which carries no backend gRPC messages. Genuinely buffered
+    // backend bodies were already counted from `backend_resp.body` above.
+    if body_will_stream
+        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+    {
+        body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
+    }
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(
             &content_type,
@@ -33094,12 +33574,19 @@ pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
     if let Some(target) = upstream_target {
         let policy_port = target.dispatch_policy_port();
         if policy_port != target.port
-            && let Some(policy_override) = effective
+            && let Some(mut policy_override) = effective
                 .dispatch_port_overrides
                 .as_ref()
                 .and_then(|overrides| overrides.get(&policy_port))
                 .cloned()
         {
+            // Stamp the service port the policy came from. The pools read this
+            // entry by dial port, so without the stamp the
+            // `connectionPool.tcp.maxConnections` counter lane would key on the
+            // workload port while WebSocket/raw-TCP sessions to the same
+            // destination key on the service port — two lanes, so an effective
+            // 2×cap ceiling. See `ResolvedPortOverride::policy_port`.
+            policy_override.policy_port = Some(policy_port);
             // Direct H2 and gRPC pools receive only this effective proxy, then
             // look up socket keepalive by `proxy.backend_port`. Mirror the selected
             // service-port policy onto that dial port in the per-dispatch clone so
@@ -33182,18 +33669,33 @@ pub(crate) async fn proxy_to_backend_retry(
         return backend_egress_denied_response(effective_host);
     }
 
-    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+    // Whether this retry attempt will actually build a backend-TLS-SNI dial.
+    //
+    // Scoped to a TLS backend, matching the first attempt (`proxy_to_backend`
+    // reads the override only under `DispatchKind::HttpsPool`) and the H3→HTTP
+    // bridge (`run_plain_attempt_local_policy_or_reject`). A stray `sni` on a
+    // PLAINTEXT backend has no server name to override on any path, so the
+    // first attempt dispatches it normally; failing the retry closed would turn
+    // one transient backend failure into a terminal, non-retryable 502 for a
+    // configuration that otherwise works.
+    let requires_sni_dial = proxy.resolved_tls.sni.is_some()
+        && proxy
+            .backend_scheme
+            .is_some_and(|scheme| scheme.is_tls_backend());
+
+    // A backend TLS SNI dial is exempt: its URL authority carries the
+    // overridden server name, which `validate_backend_tls_sni` guarantees is a
+    // DNS hostname and never an IP literal, so reqwest's resolver IS consulted
+    // and the pinned address IS what the socket dials. See
+    // `backend_tls_sni_reqwest_dial` and the identical exemption on the
+    // first-attempt path — which keys off the resolved dial, not off a bare
+    // `sni` field, so an override that will never be applied cannot waive this
+    // guard either.
+    if !requires_sni_dial
+        && let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy)
+    {
         warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
         return backend_dns_override_literal_conflict_response(conflict);
-    }
-
-    if proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %proxy.id,
-            backend_tls_sni = ?proxy.resolved_tls.sni,
-            "Backend TLS SNI override cannot be replayed through reqwest retry path; returning 502"
-        );
-        return backend_tls_sni_requires_direct_h2_response(None);
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup).
@@ -33223,9 +33725,47 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
+    // Honor a backend TLS SNI override on the retry path exactly as the first
+    // attempt does: the overridden server name goes in the URL authority and the
+    // client's resolver is pinned to THIS retry target's resolved address, so an
+    // LB rotation between attempts still dials the newly selected target. Retry
+    // body replay is precisely the case the direct-H2 sender cannot serve, so
+    // rejecting here would make every retry-enabled BackendTLSPolicy route a
+    // guaranteed 502 on its second attempt.
+    let sni_reqwest_dial = if requires_sni_dial {
+        // `effective_proxy` is borrowed for the rest of this function (logging,
+        // timeouts, headers), so the dial gets the one clone it needs and no
+        // more — `resolve_effective_proxy_for_target` returns a borrow unless a
+        // per-port override actually differs.
+        match backend_tls_sni_reqwest_dial(
+            std::borrow::Cow::Borrowed(proxy),
+            backend_url,
+            effective_host,
+            resolved_ip.as_deref(),
+        ) {
+            Some(dial) => Some(dial),
+            None => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_tls_sni = ?proxy.resolved_tls.sni,
+                    "Backend TLS SNI override cannot be expressed on the reqwest retry path; returning 502"
+                );
+                return backend_tls_sni_requires_direct_h2_response(resolved_ip);
+            }
+        }
+    } else {
+        None
+    };
+    // Only the dial is rewritten; the logging sites below keep naming the real
+    // backend target the socket reaches.
+    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
+        Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
+        None => (proxy, backend_url),
+    };
+
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
-        state.connection_pool.get_client(proxy),
+        state.connection_pool.get_client(dial_proxy),
     )
     .await;
     let client = match client_result {
@@ -33269,7 +33809,7 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
-    let mut req_builder = client.request(req_method, backend_url);
+    let mut req_builder = client.request(req_method, dial_url);
 
     // Per-request timeout overrides. The shared `reqwest::Client` intentionally
     // has no client-level connect or read timeout (see
@@ -33347,6 +33887,18 @@ pub(crate) async fn proxy_to_backend_retry(
     }
     if let Some(value) = remaining_grpc_timeout_header {
         req_builder = req_builder.header("grpc-timeout", value);
+    }
+    // A backend TLS SNI override moved the server name into the URL authority,
+    // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
+    // `Host` from the *server name* for a request that carried none — an
+    // HTTP/1.0 request, or any request whose frontend could not synthesize an
+    // authority. Every other request already had an explicit effective `Host`
+    // in the loop above: either the preserved/rewritten request authority or,
+    // when preservation is disabled, `effective_host`. Hyper-util keeps that
+    // value. The backend must never see the TLS server name merely because it
+    // was used for SNI.
+    if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
+        req_builder = req_builder.header("Host", effective_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -33442,6 +33994,23 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     };
 
+    // Lease the `connectionPool.tcp.maxConnections` lane for this retry
+    // attempt's destination. The retry may target a DIFFERENT LB target than the
+    // initial attempt, so the lane for that host must be live before the dial
+    // this attempt can cause. Enforcement itself lives in reqwest's connector
+    // (see `proxy_to_backend`); a retry that reuses an idle socket never reaches
+    // the connector and takes no slot at all.
+    let retry_conn_lane_lease =
+        resolve_backend_max_connections(proxy, retry_policy_port).map(|cap| {
+            state.reqwest_conn_admission.lease_lane(
+                request_ctx.config_generation,
+                effective_host,
+                retry_dial_port,
+                retry_policy_port,
+                cap,
+            )
+        });
+
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let send_result = match crate::plugins::await_grpc_deadline(
@@ -33465,6 +34034,10 @@ pub(crate) async fn proxy_to_backend_retry(
     // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
     // the drop is a no-op.
     drop(retry_pending_slot);
+    // Same join point for this attempt's `maxConnections` lane lease — see
+    // `proxy_to_backend` for why `send()` resolving is the last moment a new
+    // physical dial can be caused.
+    drop(retry_conn_lane_lease);
     match send_result {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -33633,6 +34206,29 @@ pub(crate) async fn proxy_to_backend_retry(
             }
         }
         Err(e) => {
+            // Gateway-side `maxConnections` refusal on the retry dial: neutral
+            // 503, exactly as on the initial attempt. Classifying it as a
+            // connect failure would let the retry loop keep re-dialing a
+            // destination that is at its ceiling.
+            if crate::backend_conn_limit::is_backend_connection_limit_error(&e) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = retry_dial_port,
+                    max_connections_policy_port = retry_policy_port,
+                    "Refusing new backend connection on retry: DestinationRule maxConnections reached for destination"
+                );
+                return retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                };
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
@@ -34944,6 +35540,16 @@ async fn proxy_to_backend(
         return backend_dispatch_response(resp, body_bytes, backend_admission_permits);
     }
 
+    // Set when a backend TLS SNI override could not take the direct-H2 pool and
+    // must instead be honored on the reqwest/HTTP-1.1 path. Carries the
+    // target-pinned, ALPN-restricted effective proxy the pool must key and build
+    // on, plus the backend URL whose authority is the overridden TLS server name.
+    // See `backend_tls_sni_reqwest_dial`.
+    //
+    // A `Cow` so the direct-H2 block below can hand over the target-effective
+    // proxy it ALREADY owns instead of cloning a second one per request.
+    let mut sni_reqwest_dial: Option<(std::borrow::Cow<'_, Proxy>, String)> = None;
+
     // Use the direct HTTP/2 pool only when the capability registry has already
     // classified this concrete backend target as H2-capable and the request
     // body path is compatible with the hyper sender.
@@ -34955,6 +35561,10 @@ async fn proxy_to_backend(
             resolve_backend_connection_proxy_for_target(proxy, upstream_target);
         let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
         let requires_direct_h2_for_sni = direct_h2_proxy.resolved_tls.sni.is_some();
+        // Resolved (without cloning the proxy) at whichever fork below decides
+        // the SNI override must be honored on reqwest/H1. Materialized onto
+        // `direct_h2_effective_proxy` exactly once, at the end of this block.
+        let mut sni_dial: Option<BackendTlsSniReqwestDial> = None;
         let direct_h2_capability = get_backend_capability_for_target(
             state.backend_capabilities.as_ref(),
             direct_h2_proxy,
@@ -34966,26 +35576,17 @@ async fn proxy_to_backend(
         let direct_h2_supports = direct_h2_capability
             .as_ref()
             .is_some_and(|record| record.plain_http.h2_tls.is_supported());
-        let direct_h2_compatible = can_use_direct_http2_pool(
+        // Body-size limits are enforced in-path on the direct-H2 sender /
+        // response collectors (413 / 502), including for ordinary
+        // (non-SNI) routes — same semantics as the SNI arm and the
+        // reqwest path's ErrorClass / connection_error contracts.
+        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
+            effective_max_request_body_size_bytes,
+            effective_max_response_body_size_bytes,
         );
-        // Backend TLS SNI cannot fall back to reqwest. Body-size limits are
-        // enforced in-path on the direct-H2 sender / response collectors
-        // (413 / 502), so nonzero FERRUM_MAX_*_BODY_SIZE_BYTES must not
-        // disqualify SNI routes the way they do for ordinary H2 preference.
-        let direct_h2_can_dispatch = if requires_direct_h2_for_sni {
-            direct_h2_compatible
-        } else {
-            can_dispatch_direct_http2_pool(
-                pool_config.enable_http2,
-                retain_request_body,
-                requires_request_body_buffering,
-                effective_max_request_body_size_bytes,
-                effective_max_response_body_size_bytes,
-            )
-        };
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
@@ -34999,22 +35600,45 @@ async fn proxy_to_backend(
             direct_h2_proxy.h2_upgrade_policy,
         );
         if requires_direct_h2_for_sni && direct_h2_known_unsupported {
-            debug!(
-                proxy_id = %proxy.id,
-                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                "H2 pool required for backend TLS SNI override but capability registry already marks this backend target H2/TLS unsupported"
-            );
-            return backend_dispatch_response(
-                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                None,
-                None,
-            );
+            // A backend proven to speak only HTTP/1.1 over TLS is the ordinary
+            // BackendTLSPolicy case, not an error: honor the overridden TLS
+            // server name on the reqwest/H1 path instead of failing the request.
+            match resolve_backend_tls_sni_reqwest_dial(
+                direct_h2_proxy,
+                backend_url,
+                effective_host,
+                resolved_ip.as_deref(),
+            ) {
+                Some(dial) => {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        "Backend target is known H2/TLS-unsupported; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                    );
+                    sni_dial = Some(dial);
+                }
+                None => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        "H2 pool required for backend TLS SNI override, capability registry marks this backend target H2/TLS unsupported, and the override cannot be expressed on the reqwest path"
+                    );
+                    return backend_dispatch_response(
+                        backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                        None,
+                        None,
+                    );
+                }
+            }
         }
+        // A resolved reqwest/H1 SNI dial supersedes the direct-H2 fork: the
+        // registry already proved this target cannot serve h2 over TLS.
+        let direct_h2_dispatch = direct_h2_dispatch && sni_dial.is_none();
         if direct_h2_dispatch {
             // 413 on an oversized declared Content-Length BEFORE dial/admission,
-            // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
-            // size violation — especially important for SNI routes that must
-            // stay on direct-H2 under nonzero body limits.
+            // matching HBONE/mesh-mTLS / reqwest ordering so a capacity 503
+            // cannot mask a size violation on direct-H2 under nonzero body
+            // limits (ordinary routes and SNI alike).
             if let Some(reject) = oversized_request_body_dispatch_reject(
                 effective_max_request_body_size_bytes,
                 method,
@@ -35071,34 +35695,54 @@ async fn proxy_to_backend(
                             upstream_target,
                         );
                         if requires_direct_h2_for_sni {
-                            if downgraded {
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    error = %e,
-                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest; marking backend H2/TLS unsupported and returning 502"
-                                );
-                            } else {
-                                debug!(
-                                    proxy_id = %proxy.id,
-                                    error = %e,
-                                    backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                                    "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
-                                );
+                            match resolve_backend_tls_sni_reqwest_dial(
+                                direct_h2_proxy,
+                                backend_url,
+                                effective_host,
+                                resolved_ip.as_deref(),
+                            ) {
+                                Some(dial) => {
+                                    debug!(
+                                        proxy_id = %proxy.id,
+                                        error = %e,
+                                        capability_downgraded = downgraded,
+                                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                        "HTTP/2 pool negotiated HTTP/1.1 backend; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                                    );
+                                    sni_dial = Some(dial);
+                                    // ALPN negotiated H1 — a capability mismatch,
+                                    // not a backend failure. Leave
+                                    // `h2_admission_permits` to drop on
+                                    // fall-through so the reqwest path re-admits
+                                    // and records the real backend outcome there.
+                                    None
+                                }
+                                None => {
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        error = %e,
+                                        capability_downgraded = downgraded,
+                                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                                        "HTTP/2 pool negotiated HTTP/1.1 backend and the backend TLS SNI override cannot be expressed on the reqwest path; returning 502"
+                                    );
+                                    // The override cannot be honored anywhere, so
+                                    // this request terminates at the H2 pool:
+                                    // record the pool failure so the adaptive
+                                    // limiter learns it.
+                                    record_h2_pool_admission_failure(
+                                        &mut h2_admission_permits,
+                                        backend_admission_started_at,
+                                        &e,
+                                    );
+                                    return backend_dispatch_response(
+                                        backend_tls_sni_requires_direct_h2_response(
+                                            resolved_ip.clone(),
+                                        ),
+                                        None,
+                                        None,
+                                    );
+                                }
                             }
-                            // SNI override cannot fall back to reqwest, so this
-                            // request terminates at the H2 pool: record the pool
-                            // failure so the adaptive limiter learns it.
-                            record_h2_pool_admission_failure(
-                                &mut h2_admission_permits,
-                                backend_admission_started_at,
-                                &e,
-                            );
-                            return backend_dispatch_response(
-                                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                                None,
-                                None,
-                            );
                         } else {
                             debug!(
                                 proxy_id = %proxy.id,
@@ -35185,31 +35829,45 @@ async fn proxy_to_backend(
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
             // after its own request-body collection / final-body hooks.
-        } else if direct_h2_compatible
-            && !direct_h2_can_dispatch
-            && (direct_h2_supports || requires_direct_h2_for_sni)
-        {
-            debug!(
-                proxy_id = %proxy.id,
-                max_request_body_size_bytes = effective_max_request_body_size_bytes,
-                max_response_body_size_bytes = effective_max_response_body_size_bytes,
-                "H2 pool bypassed because body-size limits are enabled"
-            );
         }
-        if requires_direct_h2_for_sni {
-            warn!(
-                proxy_id = %proxy.id,
-                backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
-                retain_request_body = retain_request_body,
-                requires_request_body_buffering = requires_request_body_buffering,
-                enable_http2 = pool_config.enable_http2,
-                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
-            );
-            return backend_dispatch_response(
-                backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
-                None,
-                None,
-            );
+        if requires_direct_h2_for_sni && sni_dial.is_none() {
+            // Retry body replay, a request-body-buffering plugin, or
+            // `pool_enable_http2: false` makes this request incompatible with the
+            // direct-H2 sender. The reqwest/H1 path supports all three, so honor
+            // the overridden TLS server name there rather than failing closed.
+            match resolve_backend_tls_sni_reqwest_dial(
+                direct_h2_proxy,
+                backend_url,
+                effective_host,
+                resolved_ip.as_deref(),
+            ) {
+                Some(dial) => {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        retain_request_body = retain_request_body,
+                        requires_request_body_buffering = requires_request_body_buffering,
+                        enable_http2 = pool_config.enable_http2,
+                        "Request is not compatible with direct H2 dispatch; honoring the backend TLS SNI override on the reqwest HTTP/1.1 path"
+                    );
+                    sni_dial = Some(dial);
+                }
+                None => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
+                        retain_request_body = retain_request_body,
+                        requires_request_body_buffering = requires_request_body_buffering,
+                        enable_http2 = pool_config.enable_http2,
+                        "H2 pool required for backend TLS SNI override, request is not compatible with direct H2 dispatch, and the override cannot be expressed on the reqwest path"
+                    );
+                    return backend_dispatch_response(
+                        backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                        None,
+                        None,
+                    );
+                }
+            }
         }
         if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
@@ -35219,6 +35877,17 @@ async fn proxy_to_backend(
                 "H2 pool bypassed for request buffering support — using reqwest (ALPN HTTP/2)"
             );
         }
+        // Materialize the SNI dial identity exactly once, and onto the effective
+        // proxy this block already resolved: `to_mut()` mutates it in place when
+        // it is owned (the load-balanced case), so the reqwest SNI fallback adds
+        // no second full `Proxy` clone to the request path. Last statement in the
+        // block so the `direct_h2_proxy` borrow has ended.
+        if let Some(dial) = sni_dial {
+            sni_reqwest_dial = Some(apply_backend_tls_sni_reqwest_dial(
+                direct_h2_effective_proxy,
+                dial,
+            ));
+        }
     }
 
     // hyper-util bypasses reqwest's custom resolver for URL-literal hosts. A
@@ -35226,7 +35895,15 @@ async fn proxy_to_backend(
     // telemetry but not used for the socket dial. Direct H2/H3/HBONE branches
     // above resolve independently and may honor that combination; reject only
     // now that dispatch has fallen through to reqwest.
-    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+    //
+    // A resolved backend TLS SNI dial is exempt because the premise does not
+    // hold for it: its URL authority carries the overridden server name, which
+    // `validate_backend_tls_sni` guarantees is a DNS hostname and never an IP
+    // literal, so the resolver IS consulted and the pinned address IS what the
+    // socket dials.
+    if sni_reqwest_dial.is_none()
+        && let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy)
+    {
         warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
         return backend_dispatch_response(
             backend_dns_override_literal_conflict_response(conflict),
@@ -35234,6 +35911,15 @@ async fn proxy_to_backend(
             None,
         );
     }
+
+    // A backend TLS SNI override dials through a target-pinned, ALPN-restricted
+    // client and a URL whose authority is the overridden TLS server name. Only
+    // the dial is rewritten: the logging/telemetry sites below keep using
+    // `backend_url`, which names the real backend target the socket reaches.
+    let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
+        Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
+        None => (proxy, backend_url),
+    };
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
@@ -35253,7 +35939,7 @@ async fn proxy_to_backend(
     // `proxy_to_backend_retry` rebinds identically for the retry path.
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
-        state.connection_pool.get_client(proxy),
+        state.connection_pool.get_client(dial_proxy),
     )
     .await;
     let client = match client_result {
@@ -35312,7 +35998,7 @@ async fn proxy_to_backend(
         }
     };
 
-    let mut req_builder = client.request(req_method, backend_url);
+    let mut req_builder = client.request(req_method, dial_url);
 
     // Per-request timeout overrides. The shared `reqwest::Client` intentionally
     // has no client-level connect or read timeout (see
@@ -35388,6 +36074,18 @@ async fn proxy_to_backend(
     }
     if let Some(value) = remaining_grpc_timeout_header {
         req_builder = req_builder.header("grpc-timeout", value);
+    }
+    // A backend TLS SNI override moved the server name into the URL authority,
+    // so hyper-util's `headers_mut().entry(HOST).or_insert_with(..)` would derive
+    // `Host` from the *server name* for a request that carried none — an
+    // HTTP/1.0 request, or any request whose frontend could not synthesize an
+    // authority. Every other request already had an explicit effective `Host`
+    // in the loop above: either the preserved/rewritten request authority or,
+    // when preservation is disabled, `effective_host`. Hyper-util keeps that
+    // value. The backend must never see the TLS server name merely because it
+    // was used for SNI.
+    if sni_reqwest_dial.is_some() && !headers.contains_key("host") {
+        req_builder = req_builder.header("Host", effective_host);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -35505,6 +36203,16 @@ async fn proxy_to_backend(
                     }
                     body_bytes
                 };
+                // Backend-visible representation: gRPC-Web text base64 is
+                // decoded and any terminal trailer frame stripped by the
+                // transform above (or by the terminal preparation that set
+                // `request_body_prepared`). `fetch_max` keeps a replayed buffer
+                // from inflating the count across retries.
+                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+                    &request_ctx.metadata,
+                    &request_ctx.grpc_request_messages_observed,
+                    &body_bytes,
+                );
                 if !body_bytes.is_empty() {
                     // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
                     // the Vec without copying). The optional clone below is then
@@ -35531,6 +36239,16 @@ async fn proxy_to_backend(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let limited =
+                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                            &request_ctx.metadata,
+                        ) {
+                            limited.with_grpc_message_counter(Arc::clone(
+                                &request_ctx.grpc_request_messages_observed,
+                            ))
+                        } else {
+                            limited
+                        };
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
                     // No size limit — stream body directly. Wrap in
@@ -35542,6 +36260,16 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    let counting =
+                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                            &request_ctx.metadata,
+                        ) {
+                            counting.with_grpc_message_counter(Arc::clone(
+                                &request_ctx.grpc_request_messages_observed,
+                            ))
+                        } else {
+                            counting
+                        };
                     req_builder = req_builder.body(counting.into_reqwest_body());
                 }
             }
@@ -35659,6 +36387,13 @@ async fn proxy_to_backend(
                     body_bytes,
                 )
                 .await;
+                // gRPC message accounting uses the transformed, backend-visible
+                // body; `bytes_sent` above stays the raw client-wire length.
+                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
+                    &request_ctx.metadata,
+                    &request_ctx.grpc_request_messages_observed,
+                    &body_bytes,
+                );
                 match run_final_request_body_hooks(
                     plugins,
                     ctx,
@@ -35785,6 +36520,34 @@ async fn proxy_to_backend(
         }
     };
 
+    // DestinationRule `connectionPool.tcp.maxConnections` on the reqwest path.
+    //
+    // reqwest fully owns and hides its socket pool, so the cap is NOT enforced
+    // here: a request-lifetime slot would read zero while reqwest still holds
+    // the socket idle (and would count H2 streams, not connections). It is
+    // enforced inside reqwest's connector instead — the one place a NEW
+    // physical socket is dialed — via the vendored `connection_admission` hook
+    // installed on every pooled client. All this dispatch does is publish the
+    // destination lane the connector will look the cap up in, and only when a
+    // cap is actually configured; an uncapped destination touches nothing.
+    //
+    // The lane is keyed by the DIAL `(host, port)` (what the connector sees in
+    // the URI) but COUNTS on the DestinationRule policy port, so a `targetPort`
+    // remap, a WebSocket session, and a raw-TCP session to the same destination
+    // all share one ceiling. The lease is taken BEFORE `send()` and released
+    // after it resolves — exactly the window in which this request can cause a
+    // dial — so the lane is live for every dial it causes and for no longer. A
+    // `maxConnections` an operator removed stops applying as soon as the
+    // requests dispatched under it drain, with no epoch registry to sweep.
+    let conn_lane_lease = resolve_backend_max_connections(proxy, pending_policy_port).map(|cap| {
+        state.reqwest_conn_admission.lease_lane(
+            request_ctx.config_generation,
+            effective_host,
+            pending_dial_port,
+            pending_policy_port,
+            cap,
+        )
+    });
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
@@ -35833,6 +36596,12 @@ async fn proxy_to_backend(
     // point (admission reject); this explicit drop covers the response-handling
     // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
     drop(pending_slot);
+    // Same join point for the `maxConnections` lane lease: `send()` resolving is
+    // the last moment this request can cause a NEW physical dial (redirects and
+    // connection establishment all happen inside it; the response body streams
+    // on the socket that is already open). Holding it longer would only keep a
+    // retired policy alive after a reload. RAII covers the early returns above.
+    drop(conn_lane_lease);
     let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
@@ -36202,6 +36971,36 @@ async fn proxy_to_backend(
                 );
             }
 
+            // A dial this gateway refused because the destination is at its
+            // DestinationRule `maxConnections` ceiling is NOT a backend fault:
+            // no socket was opened and the backend never saw the request. Answer
+            // with the same neutral 503 / `DispatchPolicyRejected` posture as the
+            // `http1MaxPendingRequests` shed — no health charge, no circuit
+            // breaker, no adaptive-concurrency shrink, and not retried as a
+            // connect failure (which would just re-refuse and amplify).
+            if crate::backend_conn_limit::is_backend_connection_limit_error(&e) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = pending_dial_port,
+                    max_connections_policy_port = pending_policy_port,
+                    "Refusing new backend connection: DestinationRule maxConnections reached for destination"
+                );
+                return backend_dispatch_response(
+                    retry::BackendResponse {
+                        status_code: 503,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    },
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
@@ -38248,6 +39047,18 @@ async fn proxy_to_backend_hbone(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            let body = match ctx {
+                Some(c)
+                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &c.metadata,
+                    ) =>
+                {
+                    body.with_grpc_message_counter(Arc::clone(
+                        &c.grpc_request_messages_observed,
+                    ))
+                }
+                _ => body,
+            };
             (parts, http_body_util::Either::Left(body))
         }
         MeshClientRequestBody::Replayable {
@@ -39175,6 +39986,15 @@ async fn proxy_to_backend_mesh_mtls(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &request_ctx.metadata,
+            ) {
+                body.with_grpc_message_counter(Arc::clone(
+                    &request_ctx.grpc_request_messages_observed,
+                ))
+            } else {
+                body
+            };
             (parts, http_body_util::Either::Left(body))
         }
         MeshClientRequestBody::Replayable {
@@ -39802,30 +40622,36 @@ async fn proxy_to_backend_http2(
     // completion channel (and therefore the response gate) is limit-gated.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
+    let observe_grpc = ctx.and_then(|c| {
+        crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
+            .then(|| Arc::clone(&c.grpc_request_messages_observed))
+    });
     let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        (
-            body::SizeLimitedIncoming::new_with_counter_and_completion(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-                completion_tx,
-                cancel_rx,
-            ),
-            Some(completion_rx),
-        )
+        let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
+            body,
+            max_request_body_size,
+            Arc::clone(&body_size_exceeded),
+            Arc::clone(ctx_bytes_sent_observed),
+            completion_tx,
+            cancel_rx,
+        );
+        if let Some(messages) = observe_grpc.clone() {
+            body = body.with_grpc_message_counter(messages);
+        }
+        (body, Some(completion_rx))
     } else {
-        (
-            body::SizeLimitedIncoming::new_with_counter(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-            )
-            .with_cancel(cancel_rx),
-            None,
+        let mut body = body::SizeLimitedIncoming::new_with_counter(
+            body,
+            max_request_body_size,
+            Arc::clone(&body_size_exceeded),
+            Arc::clone(ctx_bytes_sent_observed),
         )
+        .with_cancel(cancel_rx);
+        if let Some(messages) = observe_grpc {
+            body = body.with_grpc_message_counter(messages);
+        }
+        (body, None)
     };
 
     // Set the URI
@@ -40100,12 +40926,11 @@ async fn proxy_to_backend_http2(
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
     //
-    // The channel is installed only when `max_request_body_size_bytes > 0`, and
-    // limits-on requests reach direct-H2 only through a backend TLS SNI override
-    // (`can_dispatch_direct_http2_pool` requires a zero limit otherwise). So the
-    // gate — and the interleaving it gives up, a genuinely full-duplex non-gRPC
-    // H2 app now sees response headers withheld until its upload terminates —
-    // is scoped to SNI-override routes that have a request-size limit set.
+    // The channel is installed only when `max_request_body_size_bytes > 0`.
+    // Ordinary and SNI direct-H2 routes both enforce nonzero request limits
+    // in-path, so the gate — and the interleaving it gives up, a genuinely
+    // full-duplex non-gRPC H2 app now sees response headers withheld until
+    // its upload terminates — applies whenever a request-size limit is set.
     if let Some(body_completion_rx) = body_completion_rx {
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
@@ -40613,26 +41438,46 @@ async fn proxy_to_backend_http3(
                 let h3_result = if let Some(target) = upstream_target {
                     let target_host = target.host.clone();
                     let target_port = target.port;
+                    // DestinationRule policy port for `maxConnections` admission.
+                    // Differs from `target_port` only under a `targetPort` remap;
+                    // passing the dial port would resolve no cap at all.
+                    let target_policy_port = target.dispatch_policy_port();
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
+                    let grpc_messages = response_decision_ctx
+                        .filter(|c| {
+                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                                &c.metadata,
+                            )
+                        })
+                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
                     state
                         .h3_pool
                         .request_with_target_streaming_incoming_body(
                             proxy,
                             &target_host,
                             target_port,
+                            target_policy_port,
                             method,
                             backend_url,
                             &http3_headers,
                             body,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
+                            grpc_messages,
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
                         .await
                 } else {
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
+                    let grpc_messages = response_decision_ctx
+                        .filter(|c| {
+                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                                &c.metadata,
+                            )
+                        })
+                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
                     state
                         .h3_pool
                         .request_streaming_incoming_body(
@@ -40643,6 +41488,7 @@ async fn proxy_to_backend_http3(
                             body,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
+                            grpc_messages,
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
                         .await
@@ -40928,6 +41774,19 @@ async fn proxy_to_backend_http3(
         ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
     }
 
+    // Captured before the transform because `ctx` is consumed by the final-body
+    // hooks below; the counter is recorded against the transformed,
+    // backend-visible body so a translated gRPC-Web request counts native
+    // length-prefixed frames rather than base64 or a terminal trailer frame.
+    let grpc_request_messages = response_decision_ctx
+        .or(ctx.as_deref())
+        .filter(|request_ctx| {
+            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                &request_ctx.metadata,
+            )
+        })
+        .map(|request_ctx| Arc::clone(&request_ctx.grpc_request_messages_observed));
+
     let request_body = if request_body_prepared {
         request_body
     } else {
@@ -40952,6 +41811,12 @@ async fn proxy_to_backend_http3(
         }
         request_body
     };
+    if let Some(counter) = grpc_request_messages.as_ref() {
+        crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
+            counter,
+            &request_body,
+        );
+    }
 
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
@@ -40986,6 +41851,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -40994,6 +41863,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41090,6 +41960,10 @@ async fn proxy_to_backend_http3(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             let connection_pool = state.connection_pool.clone();
             let proxy_clone = proxy.clone();
             state
@@ -41098,6 +41972,7 @@ async fn proxy_to_backend_http3(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41682,12 +42557,17 @@ async fn proxy_to_backend_http3_retry(
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
+            // DestinationRule policy port for `maxConnections` admission.
+            // Differs from `target_port` only under a `targetPort` remap;
+            // passing the dial port would resolve no cap at all.
+            let target_policy_port = target.dispatch_policy_port();
             state
                 .h3_pool
                 .request_with_target_streaming(
                     proxy,
                     &target_host,
                     target_port,
+                    target_policy_port,
                     method,
                     backend_url,
                     &http3_headers,
@@ -41818,12 +42698,17 @@ async fn proxy_to_backend_http3_retry(
     let h3_result = if let Some(target) = upstream_target {
         let target_host = target.host.clone();
         let target_port = target.port;
+        // DestinationRule policy port for `maxConnections` admission. Differs
+        // from `target_port` only under a `targetPort` remap; passing the dial
+        // port would resolve no cap at all.
+        let target_policy_port = target.dispatch_policy_port();
         state
             .h3_pool
             .request_with_target(
                 proxy,
                 &target_host,
                 target_port,
+                target_policy_port,
                 method,
                 backend_url,
                 &http3_headers,
@@ -42252,6 +43137,150 @@ mod tests {
             rewrite_backend_url_authority_host("http://other-host:80/p", synth, "10.0.0.1"),
             "http://other-host:80/p"
         );
+    }
+
+    /// The prefix match is a HOST match, not a string prefix: the remainder of
+    /// the authority must be empty or the `:port` separator. Otherwise a source
+    /// host of `foo.example` also rewrote `foo.example.evil` — a different host
+    /// entirely — which on the backend-TLS-SNI dial would have moved a server
+    /// name onto a URL whose authority the gateway never selected.
+    #[test]
+    fn rewrite_backend_url_authority_host_requires_a_host_boundary() {
+        let from = "foo.example";
+        let to = "sni.example.com";
+
+        // Sibling-suffix authority: not this host, so not rewritten.
+        let sibling = "https://foo.example.evil:8443/p";
+        let out = rewrite_backend_url_authority_host(sibling, from, to);
+        assert_eq!(out, sibling);
+
+        // Same, with no port at all.
+        let sibling_no_port = "https://foo.example.evil/p";
+        let out = rewrite_backend_url_authority_host(sibling_no_port, from, to);
+        assert_eq!(out, sibling_no_port);
+
+        // A userinfo-style authority is likewise not a host match.
+        let userinfo = "https://foo.example@evil.test/p";
+        let out = rewrite_backend_url_authority_host(userinfo, from, to);
+        assert_eq!(out, userinfo);
+
+        // ...including the `:`-led userinfo form, whose remainder starts with
+        // the port separator but whose real host (userinfo runs to the LAST
+        // `@`) is `evil.test`. Accepting any `:`-led remainder admitted this.
+        for userinfo_port in [
+            "https://foo.example:443@evil.test/p",
+            "https://foo.example:443@evil.test:8443/p",
+            "https://foo.example:@evil.test/p",
+        ] {
+            let out = rewrite_backend_url_authority_host(userinfo_port, from, to);
+            assert_eq!(
+                out, userinfo_port,
+                "userinfo authority must not be rewritten: {userinfo_port}"
+            );
+        }
+
+        // A malformed / non-decimal / empty port is not an authority whose host
+        // can be identified, so it is not rewritten either.
+        for malformed in [
+            "https://foo.example:443x/p",
+            "https://foo.example:/p",
+            "https://foo.example:80a80/p",
+            "https://foo.example: 443/p",
+            "https://foo.example:+443/p",
+            "https://foo.example:443:8443/p",
+        ] {
+            let out = rewrite_backend_url_authority_host(malformed, from, to);
+            assert_eq!(
+                out, malformed,
+                "malformed port suffix must not be rewritten: {malformed}"
+            );
+        }
+
+        // The exact host, with and without a port, still rewrites.
+        let exact = "https://foo.example:8443/p?q=1";
+        let out = rewrite_backend_url_authority_host(exact, from, to);
+        assert_eq!(out, "https://sni.example.com:8443/p?q=1");
+
+        let exact_no_port = "https://foo.example/p";
+        let out = rewrite_backend_url_authority_host(exact_no_port, from, to);
+        assert_eq!(out, "https://sni.example.com/p");
+
+        // Bracketed IPv6 keeps working: `]` belongs to the rendered host, so
+        // the remainder is exactly `` or `:{port}`.
+        let v6 = "https://[fd00::1]:8443/p";
+        let out = rewrite_backend_url_authority_host(v6, "fd00::1", "sni.example");
+        assert_eq!(out, "https://sni.example:8443/p");
+
+        let v6_no_port = "https://[fd00::1]/p";
+        let out = rewrite_backend_url_authority_host(v6_no_port, "fd00::1", "sni.example");
+        assert_eq!(out, "https://sni.example/p");
+
+        // ...and an IPv6 authority that merely starts with the rendered host is
+        // not a match either.
+        let v6_sibling = "https://[fd00::1]x:8443/p";
+        let out = rewrite_backend_url_authority_host(v6_sibling, "fd00::1", "sni.example");
+        assert_eq!(out, v6_sibling);
+
+        // Ordinary decimal ports rewrite whatever terminates the authority —
+        // `/`, `?`, `#`, or end of string.
+        for (input, expected) in [
+            ("https://foo.example:1/p", "https://sni.example.com:1/p"),
+            (
+                "https://foo.example:65535/p",
+                "https://sni.example.com:65535/p",
+            ),
+            ("https://foo.example:8443", "https://sni.example.com:8443"),
+            (
+                "https://foo.example:8443?q=1",
+                "https://sni.example.com:8443?q=1",
+            ),
+            (
+                "https://foo.example:8443#frag",
+                "https://sni.example.com:8443#frag",
+            ),
+            ("https://foo.example", "https://sni.example.com"),
+        ] {
+            let out = rewrite_backend_url_authority_host(input, from, to);
+            assert_eq!(out, expected, "expected rewrite for {input}");
+        }
+
+        // A bracketed IPv6 port suffix is held to the same rule.
+        let v6_bad_port = "https://[fd00::1]:443@evil.test/p";
+        let out = rewrite_backend_url_authority_host(v6_bad_port, "fd00::1", "sni.example");
+        assert_eq!(out, v6_bad_port);
+    }
+
+    /// The port-suffix predicate that supplies the host boundary, pinned
+    /// directly so the rewrite's negatives cannot be satisfied by accident.
+    #[test]
+    fn authority_remainder_is_port_only_accepts_only_empty_or_decimal_port() {
+        for accepted in ["", ":1", ":80", ":8443", ":65535", ":000"] {
+            assert!(
+                authority_remainder_is_port_only(accepted),
+                "expected accepted remainder: {accepted:?}"
+            );
+        }
+        for rejected in [
+            ":",
+            ":x",
+            ":443x",
+            ":443@evil.test",
+            ":@evil.test",
+            ": 443",
+            ":+443",
+            ":-1",
+            ":443:8443",
+            "x",
+            ".evil",
+            "@evil.test",
+            // Non-ASCII digits: `is_ascii_digit`, not `is_numeric`.
+            ":４４３",
+        ] {
+            assert!(
+                !authority_remainder_is_port_only(rejected),
+                "expected rejected remainder: {rejected:?}"
+            );
+        }
     }
 
     #[test]
@@ -45436,21 +46465,36 @@ mod tests {
         ));
     }
 
+    /// A stray backend TLS SNI override on a PLAINTEXT backend has no server
+    /// name to override, so the retry path must treat it exactly as the first
+    /// attempt and the H3 bridge do: ignore it.
+    ///
+    /// Two regressions in one, both deterministic and dial-free:
+    ///
+    /// * the retry must not answer with the SNI dispatch-policy rejection
+    ///   (`gateway-error-reason: backend_tls_sni_requires_direct_h2`), which
+    ///   would turn one transient backend failure into a terminal,
+    ///   non-retryable 502 for a configuration whose first attempt succeeds;
+    /// * the `dns_override` / literal-target guard must still run for it. That
+    ///   exemption belongs to a dial that actually carries the server name in
+    ///   its URL authority, and this one never builds such a dial — so the
+    ///   conflicting override must be reported here rather than silently
+    ///   ignored while reqwest dials the URL literal.
     #[tokio::test]
-    async fn backend_tls_sni_retry_path_fails_closed_before_reqwest() {
+    async fn reqwest_retry_ignores_a_backend_tls_sni_override_on_a_plaintext_backend() {
         let state = make_test_proxy_state(GatewayConfig::default());
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
-        proxy.backend_scheme = Some(BackendScheme::Https);
+        proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = "127.0.0.1".to_string();
         proxy.backend_port = 1;
-        proxy.dns_override = Some("127.0.0.1".to_string());
+        proxy.dns_override = Some("127.0.0.2".to_string());
         proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
         let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
 
         let resp = proxy_to_backend_retry(
             &state,
             &proxy,
-            "https://127.0.0.1:1/",
+            "http://127.0.0.1:1/",
             "GET",
             &HashMap::new(),
             None,
@@ -45460,21 +46504,24 @@ mod tests {
             &ctx,
             "127.0.0.1",
             "127.0.0.1",
-            true,
-            hyper::Version::HTTP_2,
+            false,
+            hyper::Version::HTTP_11,
         )
         .await;
 
         assert_eq!(resp.status_code, 502);
-        assert!(!resp.connection_error);
+        assert!(
+            !resp.headers.contains_key("gateway-error-reason"),
+            "a plaintext backend must not take the backend-TLS-SNI rejection"
+        );
         assert_eq!(
             resp.error_class,
             Some(retry::ErrorClass::DispatchPolicyRejected)
         );
-        assert_eq!(resp.backend_resolved_ip, None);
         assert_eq!(
-            resp.headers.get("gateway-error-reason").map(String::as_str),
-            Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+            resp.backend_resolved_ip.as_deref(),
+            Some("127.0.0.2"),
+            "the dns_override literal-target guard must still apply"
         );
     }
 
@@ -52428,6 +53475,185 @@ mod tests {
             },
         )]));
         proxy
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend TLS SNI override on the reqwest / HTTP-1.1 dial.
+    //
+    // `backend_tls_sni_reqwest_dial` is `pub(crate)`, so these stay inline.
+    // -----------------------------------------------------------------------
+
+    fn sni_dial_proxy(sni: &str) -> Proxy {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.backend_scheme = Some(crate::config::types::BackendScheme::Https);
+        proxy.resolved_tls.sni = Some(sni.to_string());
+        proxy
+    }
+
+    /// Borrowed-input convenience wrapper for the assertions below. Production
+    /// callers hand over an owned effective proxy wherever they already have one.
+    fn sni_dial_borrowed<'a>(
+        proxy: &'a Proxy,
+        backend_url: &str,
+        effective_host: &str,
+        resolved_ip: Option<&str>,
+    ) -> Option<(std::borrow::Cow<'a, Proxy>, String)> {
+        backend_tls_sni_reqwest_dial(
+            std::borrow::Cow::Borrowed(proxy),
+            backend_url,
+            effective_host,
+            resolved_ip,
+        )
+    }
+
+    #[test]
+    fn sni_reqwest_dial_moves_the_server_name_into_the_url_authority() {
+        let proxy = sni_dial_proxy("secure.example.com");
+        let url_in = "https://10.4.1.9:8443/api/test?q=1";
+        let dial = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", Some("10.4.1.9"));
+        let (effective, url) = dial.expect("an HTTPS backend with a resolved target dials");
+
+        // reqwest derives the rustls server name from the URL host, so the
+        // override has to land in the authority — path and query untouched.
+        assert_eq!(url, "https://secure.example.com:8443/api/test?q=1");
+        // ...while the socket still goes to the selected target.
+        assert_eq!(effective.dns_override.as_deref(), Some("10.4.1.9"));
+        // ...over HTTP/1.1 only, so `:authority` can never carry the server name.
+        assert!(
+            effective.forces_backend_http1_only(),
+            "an SNI dial must restrict ALPN to http/1.1"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_pins_the_resolved_target_not_the_request_host() {
+        // The dial address comes from the address dispatch already resolved and
+        // egress-screened for the SELECTED target. A different target host in
+        // the URL must not change where the socket lands.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let url_in = "https://pod-a.internal:8443/";
+        let dial = sni_dial_borrowed(&proxy, url_in, "pod-a.internal", Some("10.4.1.42"));
+        let (effective, url) = dial.expect("dial");
+        assert_eq!(url, "https://secure.example.com:8443/");
+        assert_eq!(
+            effective.dns_override.as_deref(),
+            Some("10.4.1.42"),
+            "the pin must be the resolved target address, never the URL host"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_fails_closed_without_a_resolved_target_address() {
+        // With nothing to pin, reqwest would resolve the SNI hostname itself —
+        // the request-host DNS escape this must never allow.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let url_in = "https://10.4.1.9:8443/";
+        let unresolved = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", None);
+        assert!(unresolved.is_none());
+        // A non-IP "resolved" value is equally unusable as a pin.
+        let not_an_ip = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", Some("nope"));
+        assert!(not_an_ip.is_none());
+    }
+
+    #[test]
+    fn sni_reqwest_dial_fails_closed_when_the_authority_cannot_be_rewritten() {
+        // The URL authority is not `effective_host`, so the rewrite is a no-op
+        // and the dial would present the target's own name as the server name.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let other = "https://other.host:8443/";
+        let dial = sni_dial_borrowed(&proxy, other, "10.4.1.9", Some("10.4.1.9"));
+        assert!(dial.is_none());
+        // A sibling-suffix authority is a DIFFERENT host, so it is also a
+        // fail-closed no-op rather than a rewrite of someone else's URL.
+        let sibling = "https://pod-a.internal.evil:8443/";
+        let host = "pod-a.internal";
+        let sibling_dial = sni_dial_borrowed(&proxy, sibling, host, Some("10.4.1.9"));
+        assert!(sibling_dial.is_none());
+        // ...and the "already named by the override" escape is proven against
+        // the URL, not against `effective_host`. Here the two arguments agree
+        // with each other but NOT with the authority the dial would present, so
+        // accepting it would hand rustls `other.host` as the server name for a
+        // route that mandates `secure.example.com`.
+        let disagreeing = sni_dial_borrowed(
+            &proxy,
+            "https://other.host:8443/",
+            "secure.example.com",
+            Some("10.4.1.9"),
+        );
+        assert!(
+            disagreeing.is_none(),
+            "an unrewritten authority that is not the server name must fail closed"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_is_only_for_tls_backends() {
+        let mut proxy = sni_dial_proxy("secure.example.com");
+        proxy.backend_scheme = Some(crate::config::types::BackendScheme::Http);
+        let url_in = "http://10.4.1.9:8080/";
+        let dial = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", Some("10.4.1.9"));
+        assert!(
+            dial.is_none(),
+            "a plaintext backend has no server name to override"
+        );
+    }
+
+    #[test]
+    fn sni_reqwest_dial_is_absent_without_an_override() {
+        let mut proxy = sni_dial_proxy("secure.example.com");
+        proxy.resolved_tls.sni = None;
+        let url_in = "https://10.4.1.9:8443/";
+        let dial = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", Some("10.4.1.9"));
+        assert!(dial.is_none());
+    }
+
+    #[test]
+    fn sni_reqwest_dial_admits_a_target_already_named_by_the_override() {
+        // `effective_host == sni`: the rewrite is a no-op but the server name is
+        // already correct, so this must NOT be treated as the fail-closed case.
+        let proxy = sni_dial_proxy("secure.example.com");
+        let url_in = "https://secure.example.com:8443/";
+        let host = "secure.example.com";
+        let dial = sni_dial_borrowed(&proxy, url_in, host, Some("10.4.1.9"));
+        let (effective, url) = dial.expect("an already-matching authority is a valid dial");
+        assert_eq!(url, "https://secure.example.com:8443/");
+        assert_eq!(effective.dns_override.as_deref(), Some("10.4.1.9"));
+    }
+
+    #[test]
+    fn sni_reqwest_dial_leaves_the_source_proxy_untouched() {
+        let proxy = sni_dial_proxy("secure.example.com");
+        let url_in = "https://10.4.1.9:8443/";
+        let dial = sni_dial_borrowed(&proxy, url_in, "10.4.1.9", Some("10.4.1.9"));
+        assert!(dial.is_some());
+        assert!(proxy.dns_override.is_none(), "source proxy is not mutated");
+        assert!(!proxy.forces_backend_http1_only());
+    }
+
+    /// Finding 5: an owned effective proxy is mutated in place, so the reqwest
+    /// SNI fallback does not clone a second full `Proxy` per request.
+    #[test]
+    fn sni_reqwest_dial_reuses_an_already_owned_effective_proxy() {
+        let proxy = sni_dial_proxy("secure.example.com");
+        // Stamp a field the dial does not touch, then prove the returned value
+        // is THIS allocation carried through rather than a fresh clone of a
+        // pristine proxy.
+        let mut owned = proxy.clone();
+        owned.backend_host = "pod-a.internal".to_string();
+        let dial = backend_tls_sni_reqwest_dial(
+            std::borrow::Cow::Owned(owned),
+            "https://pod-a.internal:8443/",
+            "pod-a.internal",
+            Some("10.4.1.42"),
+        );
+        let (effective, _url) = dial.expect("dial");
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "an owned input must stay owned rather than being re-cloned"
+        );
+        assert_eq!(effective.backend_host, "pod-a.internal");
+        assert_eq!(effective.dns_override.as_deref(), Some("10.4.1.42"));
+        assert!(effective.forces_backend_http1_only());
     }
 
     #[test]

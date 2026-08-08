@@ -1,10 +1,15 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+use ferrum_edge::PluginCache;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
 use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, priority,
+};
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -191,7 +196,6 @@ fn test_streaming_config_fields_rejected() {
 
     for config in [
         json!({"providers": [valid_provider.clone()], "stream": false}),
-        json!({"providers": [valid_provider.clone()], "streaming": true}),
         json!({"providers": [valid_provider.clone()], "streaming_enabled": true}),
         json!({"providers": [{
             "name": "openai",
@@ -213,6 +217,2312 @@ fn test_streaming_config_fields_rejected() {
             err.contains("streaming") && err.contains("unsupported"),
             "streaming config should be explicitly rejected, got: {err}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3298: incremental provider streaming
+// ---------------------------------------------------------------------------
+
+/// The root `streaming` key is the ONE supported spelling and must be an object.
+/// A scalar is a shape error, not silent acceptance.
+#[test]
+fn streaming_block_must_be_an_object_at_root_and_absent_per_provider() {
+    let provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test-key"
+    });
+
+    let err = ai_federation::AiFederation::new(
+        &json!({"providers": [provider.clone()], "streaming": true}),
+        create_test_http_client(),
+    )
+    .err()
+    .expect("scalar streaming must be rejected");
+    assert!(
+        err.contains("streaming") && err.contains("must be an object"),
+        "unexpected diagnostic: {err}"
+    );
+
+    let err = ai_federation::AiFederation::new(
+        &json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "streaming": {"enabled": true}
+        }]}),
+        create_test_http_client(),
+    )
+    .err()
+    .expect("per-provider streaming must be rejected");
+    assert!(
+        err.contains("provider[0]") && err.contains("streaming"),
+        "unexpected diagnostic: {err}"
+    );
+}
+
+#[test]
+fn streaming_block_rejects_unknown_keys_and_out_of_range_event_ceilings() {
+    let provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test-key"
+    });
+    let (default_bytes, min_bytes, max_bytes, max_read_timeout) =
+        test_helpers::streaming_bounds_for_test();
+
+    for streaming in [
+        json!({"enabeld": true}),
+        json!({"enabled": true, "max_event_bytes": min_bytes - 1}),
+        json!({"enabled": true, "max_event_bytes": max_bytes + 1}),
+        json!({"enabled": true, "max_event_bytes": 0}),
+        json!({"enabled": true, "read_timeout_seconds": max_read_timeout + 1}),
+        json!({"enabled": true, "read_timeout_seconds": "60"}),
+    ] {
+        assert!(
+            ai_federation::AiFederation::new(
+                &json!({"providers": [provider.clone()], "streaming": streaming}),
+                create_test_http_client(),
+            )
+            .is_err(),
+            "streaming block {streaming} should be rejected"
+        );
+    }
+
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [provider.clone()], "streaming": {"enabled": true}}),
+        create_test_http_client(),
+    )
+    .expect("valid streaming block");
+    assert_eq!(
+        test_helpers::streaming_policy_for_test(&plugin),
+        (true, default_bytes)
+    );
+
+    // Absent block keeps the pre-#3298 behavior exactly.
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [provider]}),
+        create_test_http_client(),
+    )
+    .expect("config without streaming block");
+    assert_eq!(
+        test_helpers::streaming_policy_for_test(&plugin),
+        (false, default_bytes)
+    );
+}
+
+fn streaming_enabled_plugin() -> ai_federation::AiFederation {
+    let config = json!({
+        "streaming": {"enabled": true},
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap()
+}
+
+/// A streaming request is claimed and route-overridden to the provider, and no
+/// buffered provider I/O is performed for it.
+#[tokio::test]
+async fn streaming_request_commits_provider_route_and_skips_buffered_egress() {
+    let plugin = streaming_enabled_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer client-secret".to_string(),
+    );
+    headers.insert("cookie".to_string(), "session=abc".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "streaming claim must continue to normal dispatch, got {result:?}"
+    );
+    assert!(test_helpers::has_provider_claim_for_test(&ctx));
+    let (provider, path, _query) =
+        test_helpers::owned_stream_claim_for_test(&plugin, &ctx).expect("claim owned by plugin");
+    assert_eq!(provider, "openai");
+    assert_eq!(path, "/v1/chat/completions");
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("api.openai.com")
+    );
+    assert_eq!(ctx.route_override_backend_port, Some(443));
+    assert!(ctx.route_override_path_is_absolute);
+    assert!(ctx.route_override_upstream_id.is_none());
+
+    // Client credentials never cross the provider boundary; the provider's own
+    // credential is installed instead.
+    assert!(!headers.contains_key("cookie"));
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-test")
+    );
+    assert_eq!(
+        headers.get("accept").map(String::as_str),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("api.openai.com")
+    );
+
+    // The buffered terminate-and-respond path must stand down entirely.
+    let result = run_federation_final_body(&plugin, &mut ctx, &headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "buffered egress must not run for a claimed stream, got {result:?}"
+    );
+}
+
+/// A later header transform cannot substitute a credential or repoint the
+/// destination: the final backend-header policy re-asserts the boundary.
+#[tokio::test]
+async fn final_backend_header_policy_reasserts_provider_boundary() {
+    let plugin = streaming_enabled_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // Simulate a later generic header rule.
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer normal-backend-secret".to_string(),
+    );
+    headers.insert("x-consumer-username".to_string(), "alice".to_string());
+    headers.insert("host".to_string(), "attacker.example".to_string());
+
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-test")
+    );
+    assert!(!headers.contains_key("x-consumer-username"));
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("api.openai.com")
+    );
+}
+
+/// The final backend-visible body must still be the committed generation and
+/// still request a stream.
+#[tokio::test]
+async fn final_request_body_revalidation_fails_closed_on_model_and_destination_drift() {
+    let plugin = streaming_enabled_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // Unchanged body passes.
+    let final_body = serde_json::to_vec(&body).unwrap();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &final_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A rewritten model is refused with a fixed-cardinality diagnostic that
+    // never echoes the offending value.
+    let swapped = serde_json::to_vec(&json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    }))
+    .unwrap();
+    match plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &swapped)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], "model_policy_violation");
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                !message.contains("gpt-4o-mini"),
+                "diagnostic must not echo the model: {message}"
+            );
+        }
+        other => panic!("expected model policy rejection, got {other:?}"),
+    }
+
+    // Dropping `stream` after the claim is also refused.
+    let unstreamed = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}]
+    }))
+    .unwrap();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &unstreamed)
+            .await,
+        PluginResult::RejectBinary { .. }
+    ));
+
+    // A repointed destination is refused even with an intact body.
+    ctx.route_override_backend_host = Some("attacker.example".to_string());
+    match plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &final_body)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 500);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], "provider_policy_violation");
+        }
+        other => panic!("expected destination policy rejection, got {other:?}"),
+    }
+}
+
+/// Providers with a provider-native streaming representation or a non-static
+/// credential are fail-closed with a field-specific 501, never relayed raw.
+#[tokio::test]
+async fn streaming_ineligible_providers_fail_closed_with_field_specific_diagnostics() {
+    for (provider_type, provider_config, model, expected_code) in [
+        (
+            "anthropic",
+            json!({
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["claude-*"]
+            }),
+            "claude-3-sonnet",
+            "streaming_provider_representation_unsupported",
+        ),
+        (
+            "cohere",
+            json!({
+                "name": "cohere",
+                "provider_type": "cohere",
+                "api_key": "cohere-test",
+                "model_patterns": ["command-*"]
+            }),
+            "command-r-plus",
+            "streaming_provider_representation_unsupported",
+        ),
+        (
+            "aws_bedrock",
+            json!({
+                "name": "bedrock",
+                "provider_type": "aws_bedrock",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "test-secret",
+                "model_patterns": ["bedrock-*"],
+                "model_mapping": {"bedrock-claude": "anthropic.claude-3-sonnet-20240229-v1:0"}
+            }),
+            "bedrock-claude",
+            "streaming_provider_representation_unsupported",
+        ),
+    ] {
+        let plugin = ai_federation::AiFederation::new(
+            &json!({"streaming": {"enabled": true}, "providers": [provider_config]}),
+            create_test_http_client(),
+        )
+        .unwrap();
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": true
+        });
+        let mut ctx = post_json_ctx(&body);
+        let mut headers = json_headers();
+
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 501, "{provider_type} must fail closed");
+                let parsed: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["error"]["param"], "stream");
+                assert_eq!(parsed["error"]["code"], expected_code);
+            }
+            other => panic!("{provider_type}: expected 501, got {other:?}"),
+        }
+        assert!(
+            !test_helpers::has_provider_claim_for_test(&ctx),
+            "{provider_type} must not commit a claim"
+        );
+    }
+}
+
+/// AWS SigV4 signs the exact final body and Google OAuth2 refreshes a token, so
+/// neither can be committed at claim time.
+#[test]
+fn non_static_credentials_are_streaming_ineligible() {
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"streaming": {"enabled": true}, "providers": [{
+            "name": "bedrock",
+            "provider_type": "aws_bedrock",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "test-secret",
+            "model_patterns": ["bedrock-*"]
+        }]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    // Representation is checked first for bedrock; the auth class is proven by
+    // the code for a provider whose representation IS OpenAI-shaped.
+    assert_eq!(
+        test_helpers::stream_ineligibility_code_for_test(&plugin, 0, "bedrock-x"),
+        Some("streaming_provider_representation_unsupported")
+    );
+
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"streaming": {"enabled": true}, "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    assert_eq!(
+        test_helpers::stream_ineligibility_code_for_test(&plugin, 0, "gpt-4o"),
+        None
+    );
+}
+
+/// Pre-commit fallback: an ineligible higher-priority provider yields to an
+/// eligible lower-priority one, and this is the ONLY place fallback happens.
+#[tokio::test]
+async fn streaming_falls_back_across_providers_only_before_commit() {
+    let plugin = ai_federation::AiFederation::new(
+        &json!({
+            "streaming": {"enabled": true},
+            "providers": [
+                {
+                    "name": "claude",
+                    "provider_type": "anthropic",
+                    "api_key": "sk-ant",
+                    "priority": 1,
+                    "model_patterns": ["shared-*"]
+                },
+                {
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "priority": 2,
+                    "model_patterns": ["shared-*"]
+                }
+            ]
+        }),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let body = json!({
+        "model": "shared-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (provider, _, _) =
+        test_helpers::owned_stream_claim_for_test(&plugin, &ctx).expect("committed provider");
+    assert_eq!(
+        provider, "openai",
+        "must fall back to the eligible provider"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_federation.streaming_provider_attempts")
+            .map(String::as_str),
+        Some("2")
+    );
+}
+
+/// A second claim never re-routes an already committed provider request.
+#[tokio::test]
+async fn a_second_instance_does_not_reclaim_a_committed_stream() {
+    let first = streaming_enabled_plugin();
+    let second = streaming_enabled_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    assert!(matches!(
+        first.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(test_helpers::owned_stream_claim_for_test(&first, &ctx).is_some());
+    assert!(
+        test_helpers::owned_stream_claim_for_test(&second, &ctx).is_none(),
+        "the losing instance must not own the claim"
+    );
+    // A non-owner must not install a boundary header set either.
+    let mut probe = json_headers();
+    second.enforce_final_backend_header_policy(&ctx, &mut probe);
+    assert!(!probe.contains_key("authorization"));
+}
+
+/// Non-streaming federation behavior is untouched by the streaming block.
+#[tokio::test]
+async fn non_streaming_requests_are_untouched_by_the_streaming_path() {
+    let plugin = streaming_enabled_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !test_helpers::has_provider_claim_for_test(&ctx),
+        "a non-streaming request must never be claimed"
+    );
+    assert!(ctx.route_override_backend_host.is_none());
+    assert!(!headers.contains_key("authorization"));
+}
+
+// --- SSE contract guard ----------------------------------------------------
+
+async fn drive_guard(
+    guard: &mut Box<dyn ResponseStreamInspector>,
+    chunks: &[&str],
+) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        match guard.on_chunk(chunk.as_bytes()).await {
+            ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes {
+                    out.extend_from_slice(&bytes);
+                }
+                return (out, true);
+            }
+        }
+    }
+    match guard.on_end().await {
+        ResponseStreamAction::Forward(bytes) => {
+            out.extend_from_slice(&bytes);
+            (out, false)
+        }
+        ResponseStreamAction::Terminate(bytes) => {
+            if let Some(bytes) = bytes {
+                out.extend_from_slice(&bytes);
+            }
+            (out, true)
+        }
+    }
+}
+
+/// A well-formed stream is forwarded verbatim, in order, with its terminal usage
+/// chunk intact — the first token is released before the stream ends, and the
+/// provider's ORIGINAL terminal event is released verbatim at EOF, which is the
+/// only point that proves it was the provider's last event.
+#[tokio::test]
+async fn sse_guard_forwards_events_incrementally_and_preserves_terminal_usage() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut probe = test_helpers::SseGuardProbe::new(default_bytes);
+
+    // Time to first token: the first complete event is released on its own
+    // chunk, before any later byte exists.
+    let (mut out, terminated) = probe
+        .on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n")
+        .await;
+    assert!(!terminated, "a well-formed event must not cut the stream");
+    assert!(
+        !out.is_empty(),
+        "the first complete event must be released immediately"
+    );
+
+    for chunk in [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
+    ] {
+        let (bytes, terminated) = probe.on_chunk(chunk.as_bytes()).await;
+        assert!(!terminated, "a well-formed event must not cut the stream");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            chunk,
+            "ordinary events are released verbatim as they complete"
+        );
+        out.extend_from_slice(&bytes);
+    }
+
+    // The terminal event is HELD rather than forwarded: a client following the
+    // OpenAI contract may stop reading at `[DONE]`, so it may not see one until
+    // upstream EOF proves nothing else is coming.
+    let (held, terminated) = probe.on_chunk(b"data: [DONE]\n\n").await;
+    assert!(!terminated, "a valid terminal must not cut the stream");
+    assert!(
+        held.is_empty(),
+        "the terminal marker must not be released before EOF: {}",
+        String::from_utf8_lossy(&held)
+    );
+    assert_eq!(
+        probe.retained_bytes(),
+        0,
+        "no partial event is outstanding beside the held terminal"
+    );
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "exactly the terminal event is retained"
+    );
+
+    // Clean EOF releases the provider's original terminal event verbatim.
+    let (tail, terminated) = probe.on_end().await;
+    assert!(!terminated, "a well-formed stream must not be truncated");
+    let released = String::from_utf8(tail.clone()).unwrap();
+    assert_eq!(released, "data: [DONE]\n\n");
+    out.extend_from_slice(&tail);
+
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\"total_tokens\":7"),
+        "usage must survive: {text}"
+    );
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "terminal marker: {text}"
+    );
+    assert_eq!(text.matches("[DONE]").count(), 1);
+}
+
+/// A terminal event split across transport reads is reassembled, still held, and
+/// released exactly once — verbatim — at EOF.
+#[tokio::test]
+async fn sse_guard_holds_a_split_terminal_event_until_eof() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut probe = test_helpers::SseGuardProbe::new(default_bytes);
+
+    let (out, terminated) = probe.on_chunk(b"data: [DO").await;
+    assert!(!terminated);
+    assert!(out.is_empty(), "a partial event must not be released");
+
+    let (out, terminated) = probe.on_chunk(b"NE]\n\n").await;
+    assert!(!terminated);
+    assert!(
+        out.is_empty(),
+        "a reassembled terminal event is still held until EOF: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(probe.retained_bytes(), 0);
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "the reassembled terminal event is the whole retained state"
+    );
+
+    let (tail, terminated) = probe.on_end().await;
+    assert!(!terminated, "a split terminal completes cleanly");
+    assert_eq!(String::from_utf8(tail).unwrap(), "data: [DONE]\n\n");
+}
+
+/// A partial event that arrives across reads is held, not released early.
+#[tokio::test]
+async fn sse_guard_holds_partial_events_until_complete() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+
+    match guard.on_chunk(b"data: {\"choices\":[{\"del").await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert!(bytes.is_empty(), "a partial event must not be released")
+        }
+        other => panic!("expected hold, got {other:?}"),
+    }
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["ta\":{\"content\":\"hi\"}}]}\n\n", "data: [DONE]\n\n"],
+    )
+    .await;
+    assert!(!terminated);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("data: {\"choices\":[{\"delta\""), "{text}");
+}
+
+/// Exactly one terminal marker may reach the client, and because the marker is
+/// withheld until EOF, a DUPLICATE marker and any data after the marker fail
+/// closed with ZERO `[DONE]` reaching the client — the documented behavior in
+/// `docs/plugins.md` and the changelog. A normal OpenAI client is allowed to
+/// stop reading at `[DONE]`, so releasing one and appending an error afterwards
+/// would let it accept a completion the gateway went on to refuse.
+#[tokio::test]
+async fn sse_guard_enforces_exactly_one_terminal_marker() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &[
+            "data: {\"a\":1}\n\n",
+            "data: [DONE]\n\n",
+            "data: [DONE]\n\n",
+        ],
+    )
+    .await;
+    assert!(
+        terminated,
+        "a duplicated terminal marker must fail closed, not be silently dropped"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        0,
+        "no completion marker may reach the client on a duplicate: {text}"
+    );
+    assert!(text.contains("event: error"), "{text}");
+    assert!(
+        text.starts_with("data: {\"a\":1}\n\n"),
+        "events released before the terminal are still delivered: {text}"
+    );
+
+    // Same violation inside ONE transport chunk: refused by event admission
+    // rather than by the next-chunk guard.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let one_chunk = ["data: [DONE]\n\ndata: [DONE]\n\n"];
+    let (out, terminated) = drive_guard(&mut guard, &one_chunk).await;
+    assert!(
+        terminated,
+        "a duplicated terminal marker in one chunk must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(text.contains("event: error"), "{text}");
+
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["data: [DONE]\n\n", "data: {\"smuggled\":true}\n\n"],
+    )
+    .await;
+    assert!(
+        terminated,
+        "data after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("smuggled"),
+        "post-terminal data leaked: {text}"
+    );
+    assert_eq!(
+        text.matches("[DONE]").count(),
+        0,
+        "no completion marker may reach the client on post-terminal data: {text}"
+    );
+    assert!(text.contains("upstream_error"), "{text}");
+}
+
+/// NOTHING may follow the retained terminal event — not a comment, not a
+/// trailing partial line, not an oversized block, not undecidable bytes. Each is
+/// refused BEFORE `[DONE]` is released, so the client sees the gateway-authored
+/// error and no completion marker at all.
+#[tokio::test]
+async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
+    let (default_bytes, min_bytes, _, _) = test_helpers::streaming_bounds_for_test();
+
+    // A keep-alive comment carries no data, but it is still provider output past
+    // a completion the provider itself framed.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let chunks = ["data: [DONE]\n\n", ": keep-alive\n\n"];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "a non-data event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(
+        text.contains("after the terminal completion marker"),
+        "{text}"
+    );
+
+    // Bytes that never complete an event are refused as soon as they arrive, so
+    // the terminal is never held beside a partial event while awaiting EOF.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let chunks = ["data: [DONE]\n\ndata: {\"partial\""];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "a partial event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(!text.contains("partial"), "provider bytes leaked: {text}");
+
+    // An oversized block after the marker is refused by the ceiling, still with
+    // no completion marker and no echoed provider bytes.
+    let mut guard = test_helpers::sse_guard_for_test(min_bytes);
+    let filler = "A".repeat(min_bytes + 1024);
+    let oversized = format!("data: [DONE]\n\ndata: {filler}\n\n");
+    let chunks = [oversized.as_str()];
+    let (out, terminated) = drive_guard(&mut guard, &chunks).await;
+    assert!(
+        terminated,
+        "an oversized event after the terminal marker must fail closed"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("[DONE]").count(), 0, "{text}");
+    assert!(text.contains("oversized"), "{text}");
+    assert!(!text.contains("AAAA"), "provider bytes leaked: {text}");
+
+    // Undecidable bytes after the marker: still refused with the terminal held.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let ResponseStreamAction::Forward(held) = guard.on_chunk(b"data: [DONE]\n\n").await else {
+        panic!("a valid terminal event must be held, not terminate the stream");
+    };
+    assert!(
+        held.is_empty(),
+        "the terminal marker must not be released before EOF"
+    );
+    let mut hostile = b"data: ".to_vec();
+    hostile.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    hostile.extend_from_slice(b"\n\n");
+    let action = guard.on_chunk(&hostile).await;
+    let ResponseStreamAction::Terminate(Some(bytes)) = action else {
+        panic!("post-terminal undecidable bytes must terminate the stream, got {action:?}");
+    };
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert!(
+        text.contains("after the terminal completion marker"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{fffd}'), "provider bytes leaked: {text}");
+}
+
+/// SSE concatenates every `data` line of one event, so `data: [DONE]` followed
+/// by another data line is NOT the terminal event and must not pass as
+/// completion (root finding 6).
+#[tokio::test]
+async fn sse_guard_rejects_a_terminal_marker_with_extra_data_lines() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+
+    // The combined payload is "[DONE]\n{...}", which is ordinary data. It is
+    // forwarded as data, so the stream is still missing a real terminal marker
+    // and must be reported as truncated at EOF rather than completed.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) =
+        drive_guard(&mut guard, &["data: [DONE]\ndata: {\"smuggled\":1}\n\n"]).await;
+    assert!(
+        terminated,
+        "a multi-data event containing [DONE] must not complete the stream"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("before the terminal completion marker"),
+        "expected a truncation terminal, got: {text}"
+    );
+
+    // A real terminal event after it is still accepted exactly once.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["data: [DONE]\ndata: {\"a\":1}\n\n", "data: [DONE]\n\n"],
+    )
+    .await;
+    assert!(!terminated, "the real terminal event completes the stream");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+
+    // Extra whitespace is not the marker either: the spec strips exactly one
+    // leading space from a data value.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (_, terminated) = drive_guard(&mut guard, &["data:  [DONE]\n\n"]).await;
+    assert!(terminated, "'data:  [DONE]' is not the terminal marker");
+}
+
+/// CR, LF, CRLF, and the legal mixed blank-line forms all delimit events.
+#[tokio::test]
+async fn sse_guard_handles_cr_lf_and_crlf_event_boundaries() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+
+    for terminator in ["\n\n", "\r\n\r\n", "\r\r", "\r\n\n", "\n\r\n"] {
+        let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+        let stream = format!("data: {{\"a\":1}}{terminator}data: [DONE]{terminator}");
+        let (out, terminated) = drive_guard(&mut guard, &[&stream]).await;
+        assert!(
+            !terminated,
+            "terminator {terminator:?} must delimit a complete stream"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, stream, "events must be relayed verbatim and in order");
+    }
+
+    // A boundary split across transport reads is still recognized.
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) = drive_guard(
+        &mut guard,
+        &["data: {\"a\":1}\r", "\n\r\ndata: [DONE]\r\n\r\n"],
+    )
+    .await;
+    assert!(!terminated, "a split CRLFCRLF boundary must be recognized");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.ends_with("data: [DONE]\r\n\r\n"), "{text}");
+}
+
+/// A non-UTF-8 event is structurally undecidable, so it fails closed instead of
+/// being forwarded.
+#[tokio::test]
+async fn sse_guard_fails_closed_on_non_utf8_event() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let mut chunk = b"data: ".to_vec();
+    chunk.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    chunk.extend_from_slice(b"\n\n");
+    let action = guard.on_chunk(&chunk).await;
+    let ResponseStreamAction::Terminate(Some(bytes)) = action else {
+        panic!("a non-UTF-8 event must terminate the stream, got {action:?}");
+    };
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("malformed"), "{text}");
+    assert!(!text.contains('\u{fffd}'), "provider bytes leaked: {text}");
+}
+
+/// A truncated stream (clean EOF with no terminal marker) fails closed with one
+/// gateway-authored error event and never a success-shaped terminal marker.
+#[tokio::test]
+async fn sse_guard_fails_closed_on_truncated_stream() {
+    let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut guard = test_helpers::sse_guard_for_test(default_bytes);
+    let (out, terminated) = drive_guard(&mut guard, &["data: {\"a\":1}\n\n"]).await;
+    assert!(terminated);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("event: error"), "{text}");
+    assert!(
+        !text.contains("[DONE]"),
+        "a truncated stream is not complete: {text}"
+    );
+}
+
+/// An event larger than the configured ceiling fails closed instead of growing
+/// the carry buffer without bound, and never echoes provider bytes.
+#[tokio::test]
+async fn sse_guard_fails_closed_on_oversized_event() {
+    let (_, min_bytes, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut guard = test_helpers::sse_guard_for_test(min_bytes);
+    let oversized = format!("data: {}", "A".repeat(min_bytes + 1024));
+    let (out, terminated) = drive_guard(&mut guard, &[&oversized]).await;
+    assert!(terminated, "oversized event must fail closed");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("oversized"), "{text}");
+    assert!(!text.contains("AAAA"), "provider bytes leaked: {text}");
+}
+
+/// An oversized event that arrives COMPLETE (terminator included) is refused
+/// too: draining a complete event before checking the ceiling would forward it
+/// (root finding 5).
+#[tokio::test]
+async fn sse_guard_refuses_a_complete_oversized_event() {
+    let (_, min_bytes, _, _) = test_helpers::streaming_bounds_for_test();
+    let mut guard = test_helpers::sse_guard_for_test(min_bytes);
+    let oversized = format!("data: {}\n\n", "A".repeat(min_bytes + 1024));
+    let (out, terminated) = drive_guard(&mut guard, &[&oversized]).await;
+    assert!(
+        terminated,
+        "a complete oversized event must be refused, not forwarded"
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("oversized"), "{text}");
+    assert!(!text.contains("AAAA"), "provider bytes leaked: {text}");
+}
+
+/// Retained state never exceeds the ceiling even for a single hostile transport
+/// chunk far larger than it, and many events in one chunk are all released in
+/// order without a quadratic front-drain (root finding 5).
+#[tokio::test]
+async fn sse_guard_retained_state_is_bounded_and_release_is_linear() {
+    let (_, min_bytes, _, _) = test_helpers::streaming_bounds_for_test();
+
+    // One hostile chunk, 64x the ceiling, with no event terminator at all.
+    let mut probe = test_helpers::SseGuardProbe::new(min_bytes);
+    let hostile = vec![b'A'; min_bytes * 64];
+    let (out, terminated) = probe.on_chunk(&hostile).await;
+    assert!(
+        terminated,
+        "an unterminated oversized event must fail closed"
+    );
+    assert_eq!(
+        probe.retained_bytes(),
+        0,
+        "refused bytes must not stay retained"
+    );
+    assert!(
+        probe.retained_capacity() <= min_bytes,
+        "refusal must not leave an over-ceiling allocation: {}",
+        probe.retained_capacity()
+    );
+    assert!(!String::from_utf8_lossy(&out).contains("AAAA"));
+
+    // 2,000 complete events in ONE chunk: all released, in order, and nothing
+    // is retained afterwards.
+    let mut probe = test_helpers::SseGuardProbe::new(min_bytes);
+    let mut many = String::new();
+    for index in 0..2_000 {
+        many.push_str(&format!("data: {{\"i\":{index}}}\n\n"));
+    }
+    let events = many.clone();
+    many.push_str("data: [DONE]\n\n");
+    let (out, terminated) = probe.on_chunk(many.as_bytes()).await;
+    assert!(!terminated, "a well-formed batch must not be cut");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        events,
+        "every event but the held terminal is released in order"
+    );
+    assert_eq!(probe.retained_bytes(), 0);
+    assert_eq!(
+        probe.retained_terminal_bytes(),
+        "data: [DONE]\n\n".len(),
+        "retained state after a 2,000-event chunk is exactly the terminal event"
+    );
+    let (tail, terminated) = probe.on_end().await;
+    assert!(!terminated, "the batch ended with a valid terminal marker");
+    assert_eq!(String::from_utf8(tail).unwrap(), "data: [DONE]\n\n");
+}
+
+// --- Streaming lifecycle: concurrency, circuit, model, timeouts, headers ----
+
+fn streaming_plugin_with(config: Value) -> ai_federation::AiFederation {
+    ai_federation::AiFederation::new(&config, create_test_http_client())
+        .expect("streaming config should be valid")
+}
+
+fn streaming_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    })
+}
+
+fn openai_provider(extra: Value) -> Value {
+    let mut provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test",
+        "model_patterns": ["gpt-*"]
+    });
+    if let (Some(base), Some(extra)) = (provider.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    provider
+}
+
+async fn claim_stream(
+    plugin: &ai_federation::AiFederation,
+    body: &Value,
+) -> (RequestContext, HashMap<String, String>, PluginResult) {
+    let mut ctx = post_json_ctx(body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (ctx, headers, result)
+}
+
+fn reject_status(result: &PluginResult) -> Option<(u16, String)> {
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => Some((*status_code, String::from_utf8_lossy(body).to_string())),
+        _ => None,
+    }
+}
+
+fn event_stream_response_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    headers
+}
+
+fn placeholder_proxy() -> ferrum_edge::config::types::Proxy {
+    serde_json::from_value(json!({
+        "id": "proxy-1",
+        "namespace": "default",
+        "backend_host": "backend.local",
+        "backend_port": 8080
+    }))
+    .expect("minimal proxy should deserialize")
+}
+
+/// `max_concurrent_requests` covers the streaming route too (root finding 1):
+/// a claimed stream takes exactly one non-queuing permit, holds it past the
+/// response headers, and returns it exactly once at terminal completion.
+#[tokio::test]
+async fn streaming_claim_consumes_and_returns_one_concurrency_permit() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "providers": [openai_provider(json!({}))]
+    }));
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        0,
+        "a claimed stream must hold a permit"
+    );
+
+    // Non-queuing: the second stream is refused immediately with the same
+    // diagnostic the buffered path uses.
+    let (second_ctx, _second_headers, second) =
+        claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    let (status, body) = reject_status(&second).expect("expected a rejection");
+    assert_eq!(status, 503);
+    assert!(body.contains("provider_concurrency_exhausted"), "{body}");
+    assert!(
+        !test_helpers::has_provider_claim_for_test(&second_ctx),
+        "a refused stream must not leave a claim behind"
+    );
+
+    // Response headers alone are not terminal proof, so the permit stays held.
+    let mut response_headers = event_stream_response_headers();
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+    assert_eq!(test_helpers::stream_outcome_for_test(&plugin, &ctx), None);
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("a claimed 2xx event stream installs the guard");
+    let (_out, terminated) =
+        drive_guard(&mut inspector, &["data: {\"a\":1}\n\n", "data: [DONE]\n\n"]).await;
+    assert!(!terminated);
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "terminal completion must return the permit"
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+
+    // Dropping the inspector and the request afterwards must not double-release.
+    drop(inspector);
+    drop(ctx);
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+}
+
+/// Cancellation before any response byte — a dropped request context — returns
+/// the permit without scoring the provider circuit.
+#[tokio::test]
+async fn streaming_permit_is_returned_on_pre_header_cancellation() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 2,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30}
+        }))]
+    }));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+
+    drop(ctx);
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        2,
+        "a cancelled stream must return its permit"
+    );
+    // A closed circuit must not have been opened by a cancellation.
+    let (again, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    drop(again);
+}
+
+/// A fail-closed final-body rejection hands the reservation back at once rather
+/// than holding it for the rest of the request.
+#[tokio::test]
+async fn streaming_permit_is_returned_on_final_body_rejection() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "providers": [openai_provider(json!({}))]
+    }));
+    let body = streaming_body("gpt-4o");
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+
+    // Destination drift after the claim.
+    ctx.route_override_backend_host = Some("attacker.example".to_string());
+    let refused = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            serde_json::to_vec(&body).unwrap().as_slice(),
+        )
+        .await;
+    let (status, text) = reject_status(&refused).expect("destination drift must fail closed");
+    assert_eq!(status, 500);
+    assert!(text.contains("provider_policy_violation"), "{text}");
+    assert!(!text.contains("attacker.example"), "value echoed: {text}");
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "a pre-dispatch rejection must release the permit immediately"
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("released"),
+        "a gateway-side refusal is not a provider verdict"
+    );
+}
+
+/// Provider circuit admission is real on the streaming route (root finding 2):
+/// a half-open circuit grants exactly ONE concurrent probe.
+#[tokio::test]
+async fn streaming_half_open_admits_exactly_one_probe() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 8,
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
+        }))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+
+    let (mut first, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true),
+        "the committed stream must hold the single half-open probe"
+    );
+
+    let (_second, _headers, second) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    let (status, text) = reject_status(&second).expect("a concurrent probe must be refused");
+    assert_eq!(status, 503);
+    assert!(text.contains("provider_circuit_open"), "{text}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true),
+        "the refused request must not have taken or released the probe"
+    );
+
+    // The probe resolves only on terminal proof, and a success closes the
+    // circuit so the next request is admitted normally.
+    let mut response_headers = event_stream_response_headers();
+    let after = plugin
+        .after_proxy(&mut first, 200, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true),
+        "a 2xx header alone must not resolve the probe"
+    );
+
+    let mut inspector = plugin
+        .response_stream_inspector(&first, 200, Some("text/event-stream"))
+        .expect("guard");
+    let (_out, terminated) = drive_guard(&mut inspector, &["data: [DONE]\n\n"]).await;
+    assert!(!terminated);
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(false),
+        "terminal proof must resolve the probe exactly once"
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &first),
+        Some("succeeded")
+    );
+}
+
+/// Cancelling a half-open probe frees the single slot without scoring it.
+#[tokio::test]
+async fn streaming_cancellation_frees_the_half_open_probe_slot() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
+        }))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true)
+    );
+
+    drop(ctx);
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(false),
+        "cancellation must free the probe slot"
+    );
+
+    // The slot is genuinely reusable.
+    let (next, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    drop(next);
+}
+
+/// Circuit outcomes match the buffered path exactly: a configured fallback
+/// status and a redirect are failures, an ordinary non-fallback 4xx is not, and
+/// an unusable 2xx representation is (root finding 2).
+///
+/// Non-2xx verdicts are staged at headers and applied at body termination so the
+/// concurrency permit covers the whole error body.
+#[tokio::test]
+async fn streaming_circuit_outcome_matches_the_buffered_status_policy() {
+    async fn outcome_for(status: u16, content_type: &str) -> (Option<&'static str>, Option<u16>) {
+        let plugin = streaming_plugin_with(json!({
+            "streaming": {"enabled": true},
+            "fallback_on_status_codes": [429],
+            "providers": [openai_provider(json!({
+                "circuit_breaker": {"failure_threshold": 3, "cooldown_seconds": 30}
+            }))]
+        }));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), content_type.to_string());
+        let after = plugin
+            .after_proxy(&mut ctx, status, &mut response_headers)
+            .await;
+        let rejected = reject_status(&after).map(|(status, _)| status);
+        if rejected.is_none() && !(200..300).contains(&status) {
+            // Non-2xx is staged until the body ends.
+            assert_eq!(
+                test_helpers::stream_outcome_for_test(&plugin, &ctx),
+                None,
+                "non-2xx headers must not resolve the reservation early"
+            );
+            plugin
+                .on_response_stream_terminated(&mut ctx, status, &BodyOutcome::success(0))
+                .await;
+        }
+        (
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            rejected,
+        )
+    }
+
+    assert_eq!(
+        outcome_for(404, "application/json").await,
+        (Some("succeeded"), None),
+        "an ordinary non-fallback 4xx is a provider that answered"
+    );
+    assert_eq!(
+        outcome_for(429, "application/json").await,
+        (Some("failed"), None),
+        "a configured fallback status is a provider fault"
+    );
+    assert_eq!(
+        outcome_for(302, "text/html").await,
+        (Some("failed"), None),
+        "a redirect is a provider fault, exactly as on the buffered path"
+    );
+    assert_eq!(
+        outcome_for(200, "application/json").await,
+        (Some("failed"), Some(502)),
+        "a 2xx that is not an event stream is a refused provider representation"
+    );
+}
+
+/// Ordinary non-2xx holds the concurrency permit past response headers and
+/// returns it exactly once when the streamed error body ends.
+#[tokio::test]
+async fn streaming_non_2xx_holds_permit_until_body_termination() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "fallback_on_status_codes": [429],
+        "providers": [openai_provider(json!({}))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 404, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        0,
+        "non-2xx headers must keep the whole-response concurrency permit"
+    );
+    assert_eq!(test_helpers::stream_outcome_for_test(&plugin, &ctx), None);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("succeeded"),
+        "ordinary non-fallback 4xx is staged as provider success"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 404, Some("application/json"))
+            .is_none(),
+        "non-2xx must not install the SSE contract guard"
+    );
+
+    // A second claim is still refused while the error body is in flight.
+    let (_second, _headers, second) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    let (status, body) = reject_status(&second).expect("capacity must stay exhausted");
+    assert_eq!(status, 503);
+    assert!(body.contains("provider_concurrency_exhausted"), "{body}");
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 404, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "error-body termination must return the permit exactly once"
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        None,
+        "staging is consumed by the single resolve"
+    );
+
+    // Terminal hook is exact-once: a second termination must not double-score.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 404, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+}
+
+/// Fallback / redirect non-2xx statuses stage a failure and apply it at body end.
+#[tokio::test]
+async fn streaming_fallback_non_2xx_stages_failure_until_body_end() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "fallback_on_status_codes": [429],
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30}
+        }))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 429, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 0);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "headers alone must not open the circuit yet"
+    );
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 429, &BodyOutcome::success(8))
+        .await;
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false),
+        "fallback status must open the circuit exactly once at body end"
+    );
+}
+
+/// Client disconnect after non-2xx headers releases capacity and preserves the
+/// already-known provider verdict instead of converting it to Released.
+#[tokio::test]
+async fn streaming_non_2xx_client_disconnect_preserves_staged_provider_verdict() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 2,
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1}
+        }))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true)
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 404, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 1);
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true),
+        "probe stays reserved while the non-2xx body is still live"
+    );
+
+    // Client gone after headers: Drop must apply the staged success, not Released.
+    drop(ctx);
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        2,
+        "disconnect must return the concurrency permit"
+    );
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(false)
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "staged ordinary 4xx must close the half-open probe as success, not release it"
+    );
+
+    // The closed circuit admits a normal claim again.
+    let (next, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    drop(next);
+}
+
+/// A truncated body is a provider FAILURE even though the headers were a 2xx.
+#[tokio::test]
+async fn streaming_truncation_scores_a_circuit_failure_after_a_2xx_header() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30}
+        }))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("guard");
+    let (out, terminated) = drive_guard(&mut inspector, &["data: {\"a\":1}\n\n"]).await;
+    assert!(
+        terminated,
+        "a stream without a terminal marker is truncated"
+    );
+    assert!(!String::from_utf8_lossy(&out).contains("[DONE]"));
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+}
+
+/// `model_mapping` / `default_model` reach the provider (root finding 3): the
+/// claim owner rewrites the final provider-visible `model` and the final
+/// revalidation then accepts, where the un-rewritten body is refused.
+#[tokio::test]
+async fn streaming_rewrites_the_provider_visible_model_from_model_mapping() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "model_mapping": {"gpt-4o": "gpt-4o-2024-11-20"}
+        }))]
+    }));
+    let body = streaming_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &original,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("a configured mapping must rewrite the provider-visible model");
+    let value: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(value["model"], "gpt-4o-2024-11-20");
+    assert_eq!(value["stream"], true, "the stream flag must survive");
+
+    let accepted = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+        .await;
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "the rewritten body must satisfy the final revalidation, got {accepted:?}"
+    );
+
+    // Without the rewrite this claim would be a deterministic fail-closed
+    // rejection — the regression this repairs.
+    let refused = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &original)
+        .await;
+    let (status, text) = reject_status(&refused).expect("an unmapped model must fail closed");
+    assert_eq!(status, 400);
+    assert!(text.contains("model_policy_violation"), "{text}");
+    assert!(
+        !text.contains("gpt-4o"),
+        "the model must never be echoed: {text}"
+    );
+}
+
+/// `default_model` is the same resolution path and is applied identically.
+#[tokio::test]
+async fn streaming_rewrites_the_provider_visible_model_from_default_model() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({"default_model": "gpt-4o-mini"}))]
+    }));
+    let body = streaming_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &original,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("default_model must rewrite the provider-visible model");
+    let value: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(value["model"], "gpt-4o-mini");
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// With no mapping the body is left byte-identical: the rewrite costs nothing
+/// on the ordinary path.
+#[tokio::test]
+async fn streaming_model_rewrite_is_skipped_when_the_generation_is_unchanged() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({}))]
+    }));
+    let body = streaming_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+    let (mut ctx, headers, _) = claim_stream(&plugin, &body).await;
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an unchanged generation must not be reserialized"
+    );
+}
+
+/// A duplicate JSON member is NOT normalized away by the rewrite — collapsing it
+/// would hand the provider an unambiguous body the gateway never proved — and
+/// the final hook still fails it closed.
+#[tokio::test]
+async fn streaming_duplicate_json_members_are_not_rewritten_and_still_fail_closed() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "model_mapping": {"gpt-4o": "gpt-4o-2024-11-20"}
+        }))]
+    }));
+    let raw = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true,"model":"gpt-4o"}"#;
+    let mut ctx = post_json_ctx_with_raw_body(raw.to_string());
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            raw.as_bytes(),
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(
+        rewritten.is_none(),
+        "an ambiguous body must be left exactly as received"
+    );
+
+    let refused = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, raw.as_bytes())
+        .await;
+    let (status, text) = reject_status(&refused).expect("ambiguity must fail closed");
+    assert_eq!(status, 400);
+    assert!(text.contains("ambiguous duplicate JSON members"), "{text}");
+}
+
+/// A losing `ai_federation` instance never rewrites another owner's provider
+/// body, even when both carry the same provider name.
+#[tokio::test]
+async fn a_losing_instance_does_not_rewrite_another_owners_stream_body() {
+    let winner = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "model_mapping": {"gpt-4o": "winner-model"}
+        }))]
+    }));
+    let loser = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "model_mapping": {"gpt-4o": "loser-model"}
+        }))]
+    }));
+
+    let body = streaming_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+    let (mut ctx, headers, result) = claim_stream(&winner, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    assert!(
+        loser
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "a non-owning instance must not rewrite the provider body"
+    );
+    let rewritten = winner
+        .transform_request_body_with_context(
+            &mut ctx,
+            &original,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("the owner rewrites");
+    let value: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(value["model"], "winner-model");
+
+    // The loser also stands down on every other claim-owned phase.
+    assert!(matches!(
+        loser
+            .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        loser
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none()
+    );
+    assert!(test_helpers::stream_outcome_for_test(&loser, &ctx).is_none());
+}
+
+/// The SELECTED provider's dispatch budgets govern the streaming route, not the
+/// placeholder proxy's (root finding 4), and they reach the effective proxy.
+#[tokio::test]
+async fn streaming_claim_applies_the_selected_provider_dispatch_budgets() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "connect_timeout_seconds": 3,
+            "read_timeout_seconds": 600
+        }))]
+    }));
+    assert_eq!(
+        test_helpers::streaming_dispatch_budgets_for_test(&plugin, 0),
+        Some((3_000, 600_000))
+    );
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.route_override_backend_connect_timeout_ms, Some(3_000));
+    assert_eq!(ctx.route_override_backend_read_timeout_ms, Some(600_000));
+
+    // The placeholder proxy's defaults (5s connect / 30s whole-exchange) must be
+    // replaced on the effective proxy the dispatch path actually uses.
+    let base = placeholder_proxy();
+    assert_eq!(base.backend_connect_timeout_ms, 5_000);
+    assert_eq!(base.backend_read_timeout_ms, 30_000);
+    let effective = ctx.apply_route_overrides(Arc::new(base));
+    assert_eq!(effective.backend_connect_timeout_ms, 3_000);
+    assert_eq!(effective.backend_read_timeout_ms, 600_000);
+    assert_eq!(effective.backend_host, "api.openai.com");
+    assert_eq!(effective.backend_port, 443);
+}
+
+/// `streaming.read_timeout_seconds` overrides the whole-exchange budget for
+/// streams only, and `0` removes the gateway-imposed bound.
+#[tokio::test]
+async fn streaming_read_timeout_override_replaces_the_provider_budget() {
+    let unbounded = streaming_plugin_with(json!({
+        "streaming": {"enabled": true, "read_timeout_seconds": 0},
+        "providers": [openai_provider(json!({"read_timeout_seconds": 60}))]
+    }));
+    assert_eq!(
+        test_helpers::streaming_read_timeout_seconds_for_test(&unbounded),
+        Some(0)
+    );
+    let (ctx, _headers, result) = claim_stream(&unbounded, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        ctx.route_override_backend_read_timeout_ms,
+        Some(0),
+        "0 removes the gateway-imposed whole-exchange bound"
+    );
+    let effective = ctx.apply_route_overrides(Arc::new(placeholder_proxy()));
+    assert_eq!(effective.backend_read_timeout_ms, 0);
+
+    let bounded = streaming_plugin_with(json!({
+        "streaming": {"enabled": true, "read_timeout_seconds": 1800},
+        "providers": [openai_provider(json!({"read_timeout_seconds": 60}))]
+    }));
+    let (ctx, _headers, _) = claim_stream(&bounded, &streaming_body("gpt-4o")).await;
+    assert_eq!(ctx.route_override_backend_read_timeout_ms, Some(1_800_000));
+}
+
+/// The committed dispatch budgets are part of the destination witness, so a
+/// later plugin cannot re-time the credential-bearing request.
+#[tokio::test]
+async fn streaming_dispatch_budget_drift_fails_the_destination_witness() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({}))]
+    }));
+    let body = streaming_body("gpt-4o");
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    ctx.route_override_backend_connect_timeout_ms = Some(1);
+    let refused = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &bytes)
+        .await;
+    let (status, text) = reject_status(&refused).expect("budget drift must fail closed");
+    assert_eq!(status, 500);
+    assert!(text.contains("destination changed"), "{text}");
+}
+
+/// Provider response headers on a claimed stream are reduced to the bounded
+/// safe set (root finding 7). Hostile third-party metadata never reaches the
+/// client.
+#[test]
+fn provider_stream_response_headers_are_reduced_to_the_bounded_safe_set() {
+    let mut headers = HashMap::new();
+    for (name, value) in [
+        ("Set-Cookie", "sid=abc; Path=/; HttpOnly"),
+        ("location", "https://attacker.example/"),
+        ("www-authenticate", "Basic realm=\"provider\""),
+        ("proxy-authenticate", "Basic realm=\"provider\""),
+        ("etag", "\"v1\""),
+        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("content-digest", "sha-256=:deadbeef:"),
+        ("digest", "SHA-256=deadbeef"),
+        ("alt-svc", "h3=\":443\""),
+        ("link", "<https://attacker.example/>; rel=preconnect"),
+        ("transfer-encoding", "chunked"),
+        ("connection", "keep-alive"),
+        ("vary", "Origin"),
+        ("server", "provider/1.0"),
+        ("x-provider-internal", "leaky"),
+        ("retry-after", "3"),
+        ("x-ratelimit-remaining-requests", "9"),
+        ("openai-request-id", "req_abc"),
+        ("Content-Type", "text/event-stream"),
+        ("content-length", "12"),
+    ] {
+        headers.insert(name.to_string(), value.to_string());
+    }
+    // Over-long and control-character values are refused even on allowlisted
+    // names.
+    headers.insert("x-ratelimit-huge".to_string(), "z".repeat(4096));
+    headers.insert(
+        "x-ratelimit-injected".to_string(),
+        "1\r\nX-Injected: yes".to_string(),
+    );
+
+    test_helpers::reduce_provider_stream_response_headers_for_test(&mut headers);
+
+    for dropped in [
+        "set-cookie",
+        "location",
+        "www-authenticate",
+        "proxy-authenticate",
+        "etag",
+        "last-modified",
+        "content-digest",
+        "digest",
+        "alt-svc",
+        "link",
+        "transfer-encoding",
+        "connection",
+        "vary",
+        "server",
+        "x-provider-internal",
+        "x-ratelimit-huge",
+        "x-ratelimit-injected",
+    ] {
+        assert!(
+            !headers.contains_key(dropped),
+            "'{dropped}' survived the origin reduction: {headers:?}"
+        );
+    }
+    assert_eq!(headers.get("retry-after").map(String::as_str), Some("3"));
+    assert_eq!(
+        headers
+            .get("x-ratelimit-remaining-requests")
+            .map(String::as_str),
+        Some("9")
+    );
+    assert_eq!(
+        headers.get("openai-request-id").map(String::as_str),
+        Some("req_abc")
+    );
+    // Representation fields survive so `after_proxy` can still decide on them.
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("12")
+    );
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.chars().any(|c| c.is_ascii_uppercase())),
+        "names must be normalized: {headers:?}"
+    );
+}
+
+/// Two case variants of one allowlisted name cannot both survive as an
+/// ambiguous duplicate.
+#[test]
+fn provider_stream_response_headers_collapse_case_variant_duplicates() {
+    let mut headers = HashMap::new();
+    headers.insert("Retry-After".to_string(), "9".to_string());
+    headers.insert("retry-after".to_string(), "3".to_string());
+    test_helpers::reduce_provider_stream_response_headers_for_test(&mut headers);
+    assert_eq!(headers.len(), 1, "{headers:?}");
+    assert_eq!(headers.get("retry-after").map(String::as_str), Some("3"));
+}
+
+/// `after_proxy` authors the client-visible representation of a relayed 2xx.
+#[tokio::test]
+async fn streaming_after_proxy_authors_the_event_stream_representation() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({}))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    );
+    response_headers.insert("content-length".to_string(), "999".to_string());
+    let after = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        response_headers.get("cache-control").map(String::as_str),
+        Some("no-cache")
+    );
+    assert!(!response_headers.contains_key("content-length"));
+}
+
+/// The reduction runs BEFORE the `after_proxy` chain, so gateway response
+/// plugins on both sides of `ai_federation`'s priority still decorate normally.
+#[tokio::test]
+async fn origin_header_reduction_precedes_gateway_response_decorations() {
+    let federation: Arc<dyn Plugin> = Arc::new(streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({}))]
+    })));
+    let early: Arc<dyn Plugin> = Arc::new(ResponseDecorator {
+        priority: 100,
+        name: "x-early-gateway",
+    });
+    let late: Arc<dyn Plugin> = Arc::new(ResponseDecorator {
+        priority: 4090,
+        name: "x-late-gateway",
+    });
+    let plugins = vec![
+        Arc::clone(&early),
+        Arc::clone(&federation),
+        Arc::clone(&late),
+    ];
+
+    let mut ctx = post_json_ctx(&streaming_body("gpt-4o"));
+    let mut request_headers = json_headers();
+    let claim = federation
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+    assert!(matches!(claim, PluginResult::Continue), "{claim:?}");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    response_headers.insert("set-cookie".to_string(), "sid=abc".to_string());
+    response_headers.insert("x-provider-internal".to_string(), "leaky".to_string());
+
+    let rejected = ferrum_edge::_test_support::run_after_proxy_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        &mut response_headers,
+    )
+    .await;
+    assert!(!rejected, "a well-formed event stream must not be rejected");
+
+    assert!(
+        !response_headers.contains_key("set-cookie"),
+        "provider cookie survived: {response_headers:?}"
+    );
+    assert!(!response_headers.contains_key("x-provider-internal"));
+    assert_eq!(
+        response_headers.get("x-early-gateway").map(String::as_str),
+        Some("1"),
+        "a gateway decorator at a LOWER priority must survive: {response_headers:?}"
+    );
+    assert_eq!(
+        response_headers.get("x-late-gateway").map(String::as_str),
+        Some("1"),
+        "a gateway decorator at a HIGHER priority must survive: {response_headers:?}"
+    );
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+}
+
+// --- Reload / update / delete acceptance (root finding 8) ------------------
+
+fn federation_cache_config(
+    enabled: bool,
+    plugin_config: Value,
+) -> ferrum_edge::config::types::GatewayConfig {
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [{
+            "id": "proxy-1",
+            "namespace": "default",
+            "listen_path": "/",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "plugins": [{"plugin_config_id": "fed-1"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "fed-1",
+            "namespace": "default",
+            "plugin_name": "ai_federation",
+            "scope": "proxy",
+            "proxy_id": "proxy-1",
+            "enabled": enabled,
+            "config": plugin_config
+        }]
+    }))
+    .expect("federation cache config should deserialize")
+}
+
+fn streaming_generation(provider_type: &str, api_key: &str) -> Value {
+    json!({
+        "streaming": {"enabled": true},
+        "providers": [{
+            "name": "primary",
+            "provider_type": provider_type,
+            "api_key": api_key,
+            "model_patterns": ["gpt-*"]
+        }]
+    })
+}
+
+fn federation_plugin_from(cache: &PluginCache) -> Arc<dyn Plugin> {
+    cache
+        .get_plugins("default", "proxy-1")
+        .iter()
+        .find(|plugin| plugin.name() == "ai_federation")
+        .cloned()
+        .expect("the cache generation should carry an ai_federation instance")
+}
+
+/// A published plugin-cache generation changes the streaming provider and
+/// credential for NEW requests, while an in-flight stream stays pinned to the
+/// generation that claimed it and never reads the replacement's credential.
+#[tokio::test]
+async fn streaming_provider_and_credential_follow_the_published_generation() {
+    let first = federation_cache_config(true, streaming_generation("openai", "sk-first"));
+    let cache = PluginCache::new(&first).expect("initial cache should build");
+    let old_plugin = federation_plugin_from(&cache);
+
+    // An in-flight stream claimed under the FIRST generation.
+    let mut in_flight = post_json_ctx(&streaming_body("gpt-4o"));
+    let mut in_flight_headers = json_headers();
+    let claim = old_plugin
+        .before_proxy(&mut in_flight, &mut in_flight_headers)
+        .await;
+    assert!(matches!(claim, PluginResult::Continue), "{claim:?}");
+    assert_eq!(
+        in_flight.route_override_backend_host.as_deref(),
+        Some("api.openai.com")
+    );
+    assert_eq!(
+        in_flight_headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-first")
+    );
+
+    // Publish a new generation with a different provider AND credential.
+    let second = federation_cache_config(true, streaming_generation("mistral", "sk-second"));
+    cache
+        .rebuild(&second)
+        .expect("an updated federation generation should rebuild");
+    let new_plugin = federation_plugin_from(&cache);
+
+    // NEW requests follow the new generation.
+    let mut fresh = post_json_ctx(&streaming_body("gpt-4o"));
+    let mut fresh_headers = json_headers();
+    let claim = new_plugin
+        .before_proxy(&mut fresh, &mut fresh_headers)
+        .await;
+    assert!(matches!(claim, PluginResult::Continue), "{claim:?}");
+    assert_eq!(
+        fresh.route_override_backend_host.as_deref(),
+        Some("api.mistral.ai"),
+        "a new request must use the updated provider"
+    );
+    assert_eq!(
+        fresh_headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-second")
+    );
+
+    // The in-flight stream keeps its pinned destination, and the REPLACEMENT
+    // instance does not own it: re-asserting the backend boundary with the new
+    // generation must not install the new credential or repoint the request.
+    new_plugin.enforce_final_backend_header_policy(&in_flight, &mut in_flight_headers);
+    assert_eq!(
+        in_flight_headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-first"),
+        "a replacement generation must never re-credential a pinned stream"
+    );
+    assert!(
+        new_plugin
+            .response_stream_inspector(&in_flight, 200, Some("text/event-stream"))
+            .is_none(),
+        "a replacement generation must not adopt another generation's stream"
+    );
+
+    // The claiming generation still owns it and re-asserts its OWN credential.
+    in_flight_headers.insert("authorization".to_string(), "Bearer tampered".to_string());
+    old_plugin.enforce_final_backend_header_policy(&in_flight, &mut in_flight_headers);
+    assert_eq!(
+        in_flight_headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-first")
+    );
+    assert_eq!(
+        in_flight.route_override_backend_host.as_deref(),
+        Some("api.openai.com"),
+        "a pinned stream never switches provider mid-flight"
+    );
+}
+
+/// Disabling or deleting the instance stops NEW streaming claims, and the
+/// in-flight stream pinned to the retired generation still terminates cleanly
+/// through the instance that claimed it.
+#[tokio::test]
+async fn disabling_or_deleting_the_instance_stops_new_streaming_claims() {
+    let config = federation_cache_config(true, streaming_generation("openai", "sk-first"));
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_plugin = federation_plugin_from(&cache);
+
+    let mut in_flight = post_json_ctx(&streaming_body("gpt-4o"));
+    let mut in_flight_headers = json_headers();
+    assert!(matches!(
+        old_plugin
+            .before_proxy(&mut in_flight, &mut in_flight_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(test_helpers::has_provider_claim_for_test(&in_flight));
+
+    // Disable the instance.
+    let disabled = federation_cache_config(false, streaming_generation("openai", "sk-first"));
+    cache
+        .rebuild(&disabled)
+        .expect("disabling the instance should rebuild");
+    assert!(
+        cache
+            .get_plugins("default", "proxy-1")
+            .iter()
+            .all(|plugin| plugin.name() != "ai_federation"),
+        "a disabled instance must not be effective"
+    );
+
+    // Delete it outright.
+    let mut deleted = config.clone();
+    deleted.plugin_configs.clear();
+    deleted.proxies[0].plugins.clear();
+    cache
+        .rebuild(&deleted)
+        .expect("deleting the instance should rebuild");
+    assert!(
+        cache
+            .get_plugins("default", "proxy-1")
+            .iter()
+            .all(|plugin| plugin.name() != "ai_federation"),
+        "a deleted instance must not be effective"
+    );
+
+    // The retired generation still terminates its own stream cleanly: it keeps
+    // its pinned destination, accepts its own final body, and completes on the
+    // terminal marker instead of being orphaned.
+    let body = serde_json::to_vec(&streaming_body("gpt-4o")).unwrap();
+    let accepted = old_plugin
+        .on_final_request_body_with_context(&mut in_flight, &in_flight_headers, &body)
+        .await;
+    assert!(matches!(accepted, PluginResult::Continue), "{accepted:?}");
+
+    let mut response_headers = event_stream_response_headers();
+    let after = old_plugin
+        .after_proxy(&mut in_flight, 200, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+    let mut inspector = old_plugin
+        .response_stream_inspector(&in_flight, 200, Some("text/event-stream"))
+        .expect("the claiming generation still guards its own stream");
+    let (out, terminated) =
+        drive_guard(&mut inspector, &["data: {\"a\":1}\n\n", "data: [DONE]\n\n"]).await;
+    assert!(
+        !terminated,
+        "a retired generation's in-flight stream must still complete cleanly"
+    );
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
+}
+
+/// Minimal stand-in for the gateway response plugins that decorate around
+/// `ai_federation`'s priority (CORS at 100, `security_headers` at 4080).
+struct ResponseDecorator {
+    priority: u16,
+    name: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ResponseDecorator {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ferrum_edge::plugins::ProxyProtocol] {
+        HTTP_ONLY_PROTOCOLS
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert(self.name.to_string(), "1".to_string());
+        PluginResult::Continue
     }
 }
 

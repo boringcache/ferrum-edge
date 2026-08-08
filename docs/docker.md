@@ -407,8 +407,8 @@ docker run \
 
 **Prometheus Metrics**:
 ```bash
-# Metrics available at Admin API
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/admin/metrics
+# Metrics available at Admin API (requires observability auth)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/metrics
 ```
 
 **Health Monitoring**:

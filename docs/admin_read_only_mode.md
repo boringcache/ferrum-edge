@@ -55,24 +55,23 @@ With HTTP status code `403 Forbidden`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode (DP mode defaults to `true`) |
+| `FERRUM_ADMIN_READ_ONLY` | `false` | Opt in to read-only mode for `database` and `cp`. `file`, `dp`, `mesh`, and the optional `node_agent` admin listener are always read-only regardless of this value. |
 
 ### Mode-Specific Behavior
 
-#### Control Plane (CP) Mode
+#### Database and Control Plane (CP) Modes
 - **Respects** the `FERRUM_ADMIN_READ_ONLY` environment variable
 - **Default**: Read-write (unless explicitly set to read-only)
-- **Use Case**: Central configuration management where you may want to restrict changes
+- **Use Case**: Configuration-management modes where operators may want to restrict changes
 
-#### Data Plane (DP) Mode
+#### File, Data Plane (DP), and Mesh Modes
 - **Always** read-only regardless of environment variable
-- **Reasoning**: Data plane nodes should not modify configuration
-- **Security**: Ensures configuration changes only happen through the control plane
+- **Reasoning**: These modes consume configuration from a file or management plane rather than persisting Admin API mutations
+- **Security**: Setting the variable to `false` cannot enable writes in these modes
 
-#### Database/File Modes
-- **Respect** the `FERRUM_ADMIN_READ_ONLY` environment variable
-- **Default**: Read-write (unless explicitly set to read-only)
-- **Use Case**: Single-node deployments where you may want to restrict changes
+#### Node Agent Mode
+- **Always** read-only when its opt-in admin listener is enabled
+- **Scope**: The listener exposes operational health and metrics surfaces, not configuration mutation APIs
 
 ## Use Cases
 
@@ -85,7 +84,7 @@ FERRUM_ADMIN_READ_ONLY=true
 Prevents accidental configuration changes that could cause service disruptions.
 
 ### Data Plane Security
-Data plane nodes automatically run in read-only mode, ensuring they cannot modify their own configuration. This maintains the security boundary between control and data planes.
+File, data-plane, mesh, and node-agent admin surfaces automatically run in read-only mode, ensuring they cannot persist configuration mutations. This maintains the security boundary between configuration owners and consumers.
 
 ### Compliance
 Meet security and compliance requirements for immutable infrastructure:
@@ -152,12 +151,12 @@ The read-only mode is implemented through:
 1. **Configuration Layer**: `FERRUM_ADMIN_READ_ONLY` environment variable parsed into `EnvConfig`
 2. **State Management**: `read_only` field added to `AdminState` struct
 3. **Handler Protection**: All write handlers check `state.read_only` before processing
-4. **Mode Integration**: DP mode always sets `read_only: true`, CP mode uses environment variable
+4. **Mode Integration**: `file`, `dp`, `mesh`, and `node_agent` set `read_only: true`; `database` and `cp` use the environment variable
 
 ### Security Considerations
-- **JWT Authentication**: Required for all Admin API access
+- **Authentication**: Management endpoints require an admin JWT. Observability endpoints retain their documented tiering: `/live` is minimal and unauthenticated; `/health`, `/status`, and `/overload` expose only coarse unauthenticated state; `/metrics` and detailed diagnostics require an accepted admin or metrics credential/policy.
 - **Network Isolation**: Read-only mode is enforced at the application level
-- **Audit Logging**: All blocked write attempts are logged
+- **Sensitive Reads**: Read-only mode blocks mutations only; it does not make management-plane reads, diagnostics, or bearer tokens safe to expose on an untrusted network
 - **Graceful Degradation**: Read operations continue to work during read-only enforcement
 
 ## Testing
@@ -171,7 +170,7 @@ The feature includes comprehensive tests:
 ## Migration Guide
 
 ### Existing Deployments
-No changes required for existing deployments. The feature defaults to read-write mode for all modes except Data Plane.
+No changes are required for existing deployments. `database` and `cp` default to read-write; `file`, `dp`, `mesh`, and the optional `node_agent` admin listener remain unconditionally read-only.
 
 ### Enabling Read-Only
 1. Set `FERRUM_ADMIN_READ_ONLY=true` in your environment
@@ -180,13 +179,16 @@ No changes required for existing deployments. The feature defaults to read-write
 4. Verify read operations still work (should return 200)
 
 ### Disabling Read-Only
-1. Set `FERRUM_ADMIN_READ_ONLY=false` in your environment
+1. In `database` or `cp` mode, set `FERRUM_ADMIN_READ_ONLY=false` in your environment
 2. Restart the gateway service
 3. Verify all operations work normally
+
+This setting cannot enable mutations in `file`, `dp`, `mesh`, or `node_agent` mode.
 
 ## Troubleshooting
 
 ### Write Operations Still Work
+- Confirm the gateway is running in `database` or `cp` mode; those are the only modes where the variable can enable or disable mutations
 - Check if `FERRUM_ADMIN_READ_ONLY=false` is set
 - Verify the gateway process was restarted after changing the variable
 - Check logs for read-only mode activation
@@ -203,9 +205,9 @@ No changes required for existing deployments. The feature defaults to read-write
 
 ## Best Practices
 
-1. **Production**: Always enable read-only mode in production environments
+1. **Production**: Enable read-only mode for production `database`/`cp` deployments that must not accept configuration mutations; the consuming modes enforce it automatically
 2. **Development**: Keep read-write mode for development and testing
-3. **Data Plane**: Rely on the automatic read-only behavior, don't set the variable
+3. **File/Data Plane/Mesh/Node Agent**: Rely on the automatic read-only behavior; the variable cannot make these modes writable
 4. **Control Plane**: Use environment variables, not code changes, to control read-only mode
 5. **Monitoring**: Set up monitoring to alert on write attempts in read-only mode
 6. **Documentation**: Document your read-only mode configuration in runbooks

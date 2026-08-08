@@ -254,7 +254,13 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
 /// port — `Stream listener bind failed: …`, `Stream listener(s) failed to
 /// bind:…`, `Stream listener failed to bind on config reload: …`, or `Proxy
 /// listener bind failed: …` chained through a listener task's outer context.
-const LISTENER_BIND_FAILURE_MARKERS: [&str; 2] = ["bind failed", "failed to bind"];
+/// `"listener failed"` covers the ADMIN listener, whose message never contains
+/// the word "bind": it reads `Admin HTTP listener failed: Address already in
+/// use (os error 98)`, unlike the stream/proxy listeners this list was first
+/// written for. Without it a lost admin-port race was classified non-retryable
+/// and failed the run outright (issue #3660).
+const LISTENER_BIND_FAILURE_MARKERS: [&str; 3] =
+    ["bind failed", "failed to bind", "listener failed"];
 
 /// Fragments naming the kernel condition a lost bind race actually produces.
 const ADDRESS_IN_USE_MARKERS: [&str; 3] = [
@@ -402,6 +408,19 @@ mod gateway_startup_classifier_tests {
         )));
     }
 
+    /// Issue #3660. The ADMIN listener's message never contains "bind" — it
+    /// reads `<name> failed: Address already in use` — so the original
+    /// `["bind failed", "failed to bind"]` conjunction classified a lost
+    /// admin-port race as non-retryable and failed the whole run. This is the
+    /// exact `fields.message` the gateway emitted on PRs #3599, #3607, #3636,
+    /// and #3653.
+    #[test]
+    fn accepts_a_structured_admin_listener_bind_race() {
+        assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(
+            r#"{"timestamp":"2026-08-07T10:16:03Z","level":"ERROR","fields":{"message":"Gateway listener task 'Admin HTTP listener' failed: Admin HTTP listener failed: Address already in use (os error 98)"},"target":"ferrum_edge::modes::file"}"#
+        )));
+    }
+
     #[test]
     fn accepts_a_non_json_bootstrap_line_carrying_the_whole_conjunction() {
         assert!(gateway_startup_failure_is_bind_race(
@@ -433,9 +452,10 @@ mod gateway_startup_classifier_tests {
         )));
     }
 
-    /// `await_fallible_listener_handles` logs the full anyhow chain so a real
-    /// bind race exposes the OS "Address already in use" source; the outer
-    /// context alone must stay non-retryable.
+    /// File mode logs the full gateway-authored anyhow chain for a fallible
+    /// listener task. The explicit bind context plus the OS cause is enough to
+    /// classify the ephemeral-port race without broadening retry eligibility to
+    /// arbitrary task failures that merely mention address-in-use text.
     #[test]
     fn accepts_gateway_listener_task_bind_race_with_full_error_chain() {
         assert!(gateway_startup_failure_is_bind_race(&diagnostic_with(

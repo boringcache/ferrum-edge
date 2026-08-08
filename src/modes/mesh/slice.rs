@@ -11,11 +11,12 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
     MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
     OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
+    SidecarHostPattern, TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels,
     destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
-    workload_selector_matches,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload,
+    virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -232,6 +233,14 @@ pub struct MeshSlice {
     /// so consumers can identify the binding the projection narrowed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_name: Option<String>,
+    /// Authoritative `Gateway.spec.gatewayClassName` for [`Self::waypoint_name`],
+    /// stamped from [`crate::modes::mesh::config::MeshWaypointBinding::gateway_class_name`]
+    /// at slice build. Required for exact `GatewayClass` `targetRefs` matching
+    /// so an `istio-waypoint` policy never attaches to a `ferrum-waypoint`
+    /// Gateway (and vice versa). Absent when not a ServiceWaypoint slice or
+    /// when the binding has no class yet (Service-only shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waypoint_gateway_class: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
@@ -262,6 +271,15 @@ pub struct MeshSlice {
     /// stale route or stale materialized local-workload selector decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_l4_proxies: Vec<serde_json::Value>,
+    /// Weighted multi-destination upstreams referenced by
+    /// [`Self::virtual_service_l4_proxies`]. Ordinary `GatewayConfig.upstreams`
+    /// do not ride `MeshSlice`, so translator-owned `istio-vs-l4-upstream-*`
+    /// objects are serialized beside the L4 proxies and decoded into
+    /// `GatewayConfig.upstreams` at apply time. Slice content equality includes
+    /// this field so weight/target updates and deletions cannot retain a stale
+    /// load-balancer set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -426,6 +444,27 @@ pub struct MeshSlice {
     /// `workloads.addresses`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+    /// Workload-scoped outbound traffic policy resolved from the local
+    /// workload's applicable Istio `Sidecar.outboundTrafficPolicy` (issue #3262).
+    ///
+    /// Resolved CP-side at slice build (raw `MeshSidecar` records do not ride the
+    /// slice — only this resolved view does, mirroring `local_ingress_listeners`)
+    /// under the SAME gate as ingress materialization,
+    /// `sidecar_enforced && !sidecar_dry_run`: applying a workload-scoped policy
+    /// changes data-plane behavior, so dry-run must not.
+    ///
+    /// `Some` OVERRIDES the mesh-wide [`Self::outbound_traffic_policy`]; `None`
+    /// inherits it (and then the `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` default).
+    /// Both directions of the override are honored — a Sidecar `REGISTRY_ONLY`
+    /// tightens a mesh that is `ALLOW_ANY`, and a Sidecar `ALLOW_ANY` relaxes the
+    /// registry gate for exactly the workloads that Sidecar selects, matching
+    /// Istio. Relaxing the registry gate does NOT relax anything else: Sidecar
+    /// `egress` narrowing, `mesh_authz`, PeerAuthentication/mTLS posture, the
+    /// HBONE open-relay guard, and topology transport gates are independent and
+    /// still apply. Resolve the effective value through
+    /// [`Self::effective_outbound_traffic_policy`] — never read this field alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_outbound_traffic_policy: Option<OutboundTrafficPolicy>,
     /// Cold-path operator view of the Sidecar egress scope that was applied,
     /// or would have been applied when dry-run is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -662,6 +701,7 @@ impl MeshSlice {
             && self.istio_root_namespace == other.istio_root_namespace
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
+            && self.waypoint_gateway_class == other.waypoint_gateway_class
             && self.labels == other.labels
             // The ambiguous-labels marker can flip independently of `labels`
             // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
@@ -671,6 +711,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
+            && self.virtual_service_l4_upstreams == other.virtual_service_l4_upstreams
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
@@ -714,9 +755,59 @@ impl MeshSlice {
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
             && self.outbound_traffic_policy == other.outbound_traffic_policy
+            // The workload-scoped Sidecar policy (issue #3262) flips independently
+            // of every other field: an operator editing ONLY
+            // `Sidecar.outboundTrafficPolicy.mode` (or deleting the Sidecar that
+            // carried it) leaves services/egress scope byte-identical. Omitting it
+            // from slice equality would let MeshSubscribe/update dedupe suppress
+            // the frame, so the DP would keep the stale registry gate — serving
+            // `ALLOW_ANY` passthrough after the operator moved to REGISTRY_ONLY.
+            && self.sidecar_outbound_traffic_policy == other.sidecar_outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
             && self.extension_configs == other.extension_configs
             && self.runtime_overlay == other.runtime_overlay
+    }
+
+    /// Resolve the EFFECTIVE outbound traffic policy for this slice's workload
+    /// (issue #3262).
+    ///
+    /// Precedence, most specific first — this mirrors Istio, where a `Sidecar`
+    /// resource's `outboundTrafficPolicy` replaces `MeshConfig`'s for exactly the
+    /// workloads it selects:
+    ///
+    /// 1. [`Self::sidecar_outbound_traffic_policy`] — the applicable Istio
+    ///    `Sidecar.outboundTrafficPolicy.mode` (only ever populated under
+    ///    `FERRUM_MESH_SIDECAR_ENFORCED` without dry-run).
+    /// 2. [`Self::outbound_traffic_policy`] — the mesh-wide
+    ///    `MeshConfig.outboundTrafficPolicy.mode` carried on the slice.
+    /// 3. `runtime_default` — `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` (`allow_any`).
+    ///
+    /// This is the ONE place the precedence lives. Both consumers — HTTP-family
+    /// `mesh_outbound_registry` plugin injection and the stream-family
+    /// `MeshOutboundEnforcement` slot — call it, so the two transport families
+    /// can never disagree about whether the registry gate is ARMED. It runs at
+    /// slice apply only (cold path): the result is materialized into the injected
+    /// plugin config and the `ArcSwap` enforcement slot, never re-derived or
+    /// re-parsed per request.
+    ///
+    /// Scope note: the shared input is the armed/disarmed DECISION, not the
+    /// admitted registry CONTENTS. The two lanes build their registries from
+    /// different slice values on the multicluster path — HTTP-family injection
+    /// runs against the merged materialization slice (`merged_slice`, which
+    /// unions poller-discovered remote workloads/services into
+    /// `workloads`/`services`), while `refresh_mesh_outbound_enforcement` runs
+    /// against the un-merged base slice — so a remote-cluster destination can be
+    /// admitted on HTTP while a stream connect to the same destination is
+    /// refused. That asymmetry is a registry-membership property, and it fails
+    /// CLOSED on the stream side; do not restate it as "the two lanes are
+    /// identical".
+    pub fn effective_outbound_traffic_policy(
+        &self,
+        runtime_default: OutboundTrafficPolicy,
+    ) -> OutboundTrafficPolicy {
+        self.sidecar_outbound_traffic_policy
+            .or(self.outbound_traffic_policy)
+            .unwrap_or(runtime_default)
     }
 
     /// Build the set of known mesh destinations from this slice. Used by
@@ -953,17 +1044,36 @@ impl MeshSlice {
                         .is_some_and(|criteria| !criteria.is_empty())
             })
             .collect();
+        let virtual_service_l4_upstream_candidates: Vec<&crate::config::types::Upstream> = {
+            let referenced: BTreeSet<&str> = virtual_service_l4_proxy_candidates
+                .iter()
+                .filter_map(|proxy| proxy.upstream_id.as_deref())
+                .collect();
+            config
+                .upstreams
+                .iter()
+                .filter(|upstream| {
+                    upstream.namespace == request.namespace
+                        && referenced.contains(upstream.id.as_str())
+                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                })
+                .collect()
+        };
 
         let Some(mesh) = config.mesh.as_ref() else {
             let virtual_service_l4_proxies =
                 serialize_virtual_service_l4_proxies(virtual_service_l4_proxy_candidates);
+            let virtual_service_l4_upstreams =
+                serialize_virtual_service_l4_upstreams(virtual_service_l4_upstream_candidates);
             return Self {
                 node_id: request.node_id,
                 namespace: request.namespace,
                 workload_spiffe_id: request.workload_spiffe_id,
                 waypoint_name: request.waypoint_name,
+                waypoint_gateway_class: None,
                 labels: request.labels,
                 virtual_service_l4_proxies,
+                virtual_service_l4_upstreams,
                 version,
                 revision,
                 ..Self::default()
@@ -1122,29 +1232,70 @@ impl MeshSlice {
             resolved_sidecar
         };
 
-        // Resolve the local workload's custom inbound listeners from the
-        // applicable Sidecar's `ingress[]`. Gated like egress narrowing: only
-        // under enforcement (NOT dry-run, which reports but changes nothing —
-        // materializing inbound listeners is a behavior change). Resolution
-        // follows the SAME tier precedence as egress, then keeps only the
-        // routable entries (loopback host:port HTTP listeners); unsupported
-        // shapes are dropped here and reported as deferred by the K8s status
-        // writer. Carried on the slice so the DP materializer never re-resolves
-        // raw `MeshSidecar` records (they do not ride the slice), mirroring the
-        // `local_inbound_services` pattern.
-        let (
-            mut local_ingress_listeners,
-            sidecar_ingress_declared,
-            mut declared_ingress_http_ports,
-        ): (Vec<ResolvedIngressListener>, bool, usize) = if sidecar_enforced && !sidecar_dry_run {
-            resolve_applicable_sidecar_ingress(
+        // ONE `select_applicable_sidecar` scan, shared by the two consumers that
+        // need the workload's single applicable Sidecar under the SAME gate and
+        // the SAME tier precedence: `ingress[]` materialization and the
+        // workload-scoped `outboundTrafficPolicy` below. Gated like ingress
+        // materialization, NOT like egress narrowing: only under enforcement and
+        // NOT under dry-run, which reports but changes nothing. (Egress keeps its
+        // own scan — `resolve_applicable_sidecar_egress` walks the
+        // `inherits_defaults` chain under the looser `enforced || dry_run` gate,
+        // so its result is not interchangeable with this one.)
+        let selected_sidecar: Option<&MeshSidecar> = if sidecar_enforced && !sidecar_dry_run {
+            select_applicable_sidecar(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
                 mesh.istio_root_namespace.as_str(),
             )
         } else {
-            (Vec::new(), false, 0)
+            None
+        };
+
+        // Resolve the local workload's custom inbound listeners from the selected
+        // Sidecar's `ingress[]`, keeping only the routable entries (loopback
+        // host:port HTTP listeners); unsupported shapes are dropped here and
+        // reported as deferred by the K8s status writer. Carried on the slice so
+        // the DP materializer never re-resolves raw `MeshSidecar` records (they
+        // do not ride the slice), mirroring the `local_inbound_services` pattern.
+        let (
+            mut local_ingress_listeners,
+            sidecar_ingress_declared,
+            mut declared_ingress_http_ports,
+        ): (Vec<ResolvedIngressListener>, bool, usize) =
+            resolve_selected_sidecar_ingress(selected_sidecar);
+
+        // Workload-scoped `Sidecar.outboundTrafficPolicy` (issue #3262). Gated
+        // exactly like ingress materialization — NOT like egress narrowing, which
+        // also runs under dry-run: dry-run is defined as "report the scope that
+        // WOULD apply, change nothing", and arming (or disarming) the outbound
+        // registry gate is a live behavior change. `None` here therefore means
+        // both "no Sidecar declared one" and "the gate is off", and both fall
+        // back to the mesh-wide policy in
+        // `effective_outbound_traffic_policy` — never to a weaker one.
+        //
+        // SECURITY: on a `labels_ambiguous` slice `effective_labels` is only the
+        // INTERSECTION of several same-SPIFFE workloads' divergent label sets, so
+        // a workload-scoped Sidecar that really does select one of them can fail
+        // to match it — which would silently fall through to a laxer namespace
+        // default. The extra candidate label sets are therefore passed in (empty
+        // unless ambiguous) and the resolution folds them fail-closed. See
+        // `resolve_applicable_sidecar_outbound_policy`.
+        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
+            &policy_candidate_labels
+        } else {
+            &[]
+        };
+        let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
+            resolve_applicable_sidecar_outbound_policy(
+                &mesh.sidecars,
+                effective_namespace,
+                mesh.istio_root_namespace.as_str(),
+                selected_sidecar,
+                ambiguous_policy_candidates,
+            )
+        } else {
+            None
         };
 
         // Host-scoping indexes for policy narrowing. These two indexes are the
@@ -1184,32 +1335,58 @@ impl MeshSlice {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
                     };
-                    let host_scope = policy_host_scope(
-                        &proxy.backend_host,
-                        &proxy.namespace,
-                        &cluster_domain,
-                        &mesh_service_identities,
-                        &service_entry_hosts,
-                    );
-                    // Egress scope matching needs a concrete namespace, so this
-                    // uses `scope_namespace` (which falls back to the proxy's
-                    // own namespace) rather than the evidence-backed
-                    // `service_namespace`. Sidecar egress is a reachability
-                    // filter, not an ownership decision — ownership only gates
-                    // the DestinationRule / CORS lookup tiers.
-                    let host_refs: Vec<&str> = host_scope
-                        .host_candidates
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    sidecar_egress_includes_service(
-                        sidecar.namespace,
-                        sidecar.egress,
-                        &host_scope.scope_namespace,
-                        &host_refs,
-                        Some(&[proxy.backend_port]),
-                    )
+                    let upstream = proxy.upstream_id.as_deref().and_then(|upstream_id| {
+                        virtual_service_l4_upstream_candidates
+                            .iter()
+                            .copied()
+                            .find(|upstream| upstream.id == upstream_id)
+                    });
+                    let destinations: Vec<(String, u16)> = if let Some(upstream) = upstream {
+                        upstream
+                            .targets
+                            .iter()
+                            .map(|target| (target.host.clone(), target.port))
+                            .collect()
+                    } else {
+                        vec![(proxy.backend_host.clone(), proxy.backend_port)]
+                    };
+                    // Fail closed: every weighted destination must be admitted
+                    // by Sidecar egress before the L4 proxy rides the slice.
+                    destinations.iter().all(|(host, port)| {
+                        let host_scope = policy_host_scope(
+                            host,
+                            &proxy.namespace,
+                            &cluster_domain,
+                            &mesh_service_identities,
+                            &service_entry_hosts,
+                        );
+                        // Egress scope matching needs a concrete namespace, so this
+                        // uses `scope_namespace` rather than the evidence-backed
+                        // `service_namespace`. Sidecar egress is a reachability
+                        // filter, not an ownership decision.
+                        let host_refs: Vec<&str> = host_scope
+                            .host_candidates
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        sidecar_egress_includes_service(
+                            sidecar.namespace,
+                            sidecar.egress,
+                            &host_scope.scope_namespace,
+                            &host_refs,
+                            Some(&[*port]),
+                        )
+                    })
                 }),
+        );
+        let admitted_upstream_ids: BTreeSet<&str> = virtual_service_l4_proxies
+            .iter()
+            .filter_map(|value| value.get("upstream_id").and_then(|id| id.as_str()))
+            .collect();
+        let virtual_service_l4_upstreams = serialize_virtual_service_l4_upstreams(
+            virtual_service_l4_upstream_candidates
+                .into_iter()
+                .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
 
         let services: Vec<MeshService> = mesh
@@ -1353,15 +1530,38 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                (!ambient_udp_policy_candidates.is_empty()
-                    && ambient_udp_policy_candidates
+                let waypoint = request.waypoint_name.as_deref();
+                let waypoint_class = waypoint.and_then(|name| {
+                    mesh.waypoint_bindings
                         .iter()
-                        .any(|(candidate_namespace, labels)| {
+                        .find(|binding| {
+                            binding.name == name && binding.namespace == effective_namespace
+                        })
+                        .and_then(|binding| binding.gateway_class_name.as_deref())
+                });
+                let waypoint_match = policy_scope_applies_with_waypoint(
+                    policy,
+                    effective_namespace,
+                    &effective_labels,
+                    waypoint,
+                    waypoint_class,
+                ) || (waypoint.is_some()
+                    && target_refs_attach_to_waypoint_services(
+                        policy,
+                        mesh,
+                        waypoint,
+                        effective_namespace,
+                    ));
+                let candidate_match = (!ambient_udp_policy_candidates.is_empty()
+                    && ambient_udp_policy_candidates.iter().any(
+                        |(candidate_namespace, labels)| {
                             policy_scope_applies_to_workload(policy, candidate_namespace, labels)
-                        }))
+                        },
+                    ))
                     || policy_candidate_labels.iter().any(|labels| {
                         policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                    })
+                    });
+                waypoint_match || candidate_match
             })
             .cloned()
             .collect();
@@ -1583,6 +1783,12 @@ impl MeshSlice {
         // happens once per slice; the alternative (reordering field
         // initialization) is fragile across future struct changes.
         let request_namespace = request.namespace;
+        let waypoint_gateway_class = request.waypoint_name.as_deref().and_then(|name| {
+            mesh.waypoint_bindings
+                .iter()
+                .find(|binding| binding.name == name && binding.namespace == request_namespace)
+                .and_then(|binding| binding.gateway_class_name.clone())
+        });
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
@@ -1593,9 +1799,11 @@ impl MeshSlice {
             istio_root_namespace: mesh.istio_root_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
+            waypoint_gateway_class,
             labels: effective_labels,
             labels_ambiguous,
             virtual_service_l4_proxies,
+            virtual_service_l4_upstreams,
             version,
             revision,
             workloads,
@@ -1626,6 +1834,7 @@ impl MeshSlice {
                 scoped
             }),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
+            sidecar_outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
             // The canonical GatewayConfig has no declarative RTDS surface.
@@ -1686,6 +1895,41 @@ fn resource_namespace_visible(
         })
 }
 
+/// Admit Service `targetRefs` whose named destination is bound to this waypoint
+/// — exact `(namespace, name)` membership, never shared-label broadening.
+///
+/// ADMISSION ONLY: which destination the policy actually governs is re-decided
+/// per request against the exact destination service identity.
+fn target_refs_attach_to_waypoint_services(
+    policy: &MeshPolicy,
+    mesh: &MeshConfig,
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> bool {
+    let Some(waypoint_name) = waypoint_name else {
+        return false;
+    };
+    let Some(binding) = mesh
+        .waypoint_bindings
+        .iter()
+        .find(|binding| binding.name == waypoint_name && binding.namespace == waypoint_namespace)
+    else {
+        return false;
+    };
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments.iter().any(|attachment| {
+        binding.services.iter().any(|service| {
+            policy_target_attachment_applies_to_service(
+                attachment,
+                &service.namespace,
+                &service.name,
+            )
+        })
+    })
+}
+
 fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
@@ -1702,12 +1946,19 @@ fn narrow_for_service_waypoint(
     };
     if binding.waypoint_for.eq_ignore_ascii_case("none") {
         // Operator explicitly opted out — narrow to an empty admitted set.
+        // Targeted policies go with it: an attachment scope with no admitted
+        // destination has nothing to attach to, and carrying it would leave a
+        // Gateway/GatewayClass arm live on a waypoint the operator disabled.
         return ServiceWaypointNarrowingResources {
             services: Vec::new(),
             service_entries: Vec::new(),
             destination_rules: Vec::new(),
             workloads: Vec::new(),
-            mesh_policies: resources.mesh_policies,
+            mesh_policies: resources
+                .mesh_policies
+                .into_iter()
+                .filter(|policy| !matches!(policy.scope, PolicyScope::TargetRefs { .. }))
+                .collect(),
         };
     }
 
@@ -1771,7 +2022,37 @@ fn narrow_for_service_waypoint(
         service_entries: admitted_service_entries,
         destination_rules: admitted_destination_rules,
         workloads: admitted_workloads,
-        mesh_policies: resources.mesh_policies,
+        mesh_policies: resources
+            .mesh_policies
+            .into_iter()
+            .filter(|policy| {
+                match &policy.scope {
+                    // OR admission over the attachment list. The non-matching
+                    // arms are deliberately NOT pruned (the slice must stay a
+                    // faithful copy of the operator's policy), so every runtime
+                    // consumer re-checks the exact attachment — see
+                    // `PolicyScopeCache::policy_applies_for_destination`.
+                    PolicyScope::TargetRefs { attachments } => {
+                        let waypoint = WaypointAttachment {
+                            namespace: waypoint_namespace,
+                            name: Some(waypoint_name),
+                            gateway_class: binding.gateway_class_name.as_deref(),
+                        };
+                        attachments.iter().any(|attachment| {
+                            waypoint.matches(attachment)
+                                || bound.iter().any(|(ns, svc)| {
+                                    policy_target_attachment_applies_to_service(attachment, ns, svc)
+                                })
+                        })
+                    }
+                    // Selector / namespace / mesh-wide policies stay; Istio
+                    // ambient ignores selector policies at waypoints, but
+                    // Ferrum continues to evaluate them for Sidecar-parity
+                    // source scoping already applied above.
+                    _ => true,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -2328,6 +2609,26 @@ fn serialize_virtual_service_l4_proxies<'a>(
                     error = %error,
                     "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
                      dropping the route fail-closed"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn serialize_virtual_service_l4_upstreams<'a>(
+    upstreams: impl IntoIterator<Item = &'a crate::config::types::Upstream>,
+) -> Vec<serde_json::Value> {
+    upstreams
+        .into_iter()
+        .filter_map(|upstream| match serde_json::to_value(upstream) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(
+                    upstream_id = %upstream.id,
+                    error = %error,
+                    "Failed to serialize a VirtualService L4 upstream into the mesh slice; \
+                     dropping the upstream fail-closed"
                 );
                 None
             }
@@ -3006,6 +3307,32 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
 /// redirects which Sidecar's *egress scope* applies, while *ingress* listeners
 /// are always taken from the selected Sidecar's own `ingress[]` (an omitted
 /// `ingress` simply means "no custom listeners").
+///
+/// # Divergence from Istio: root workload-scoped outranks a namespace default
+///
+/// Istio resolves a workload's Sidecar as "a selector-bearing Sidecar in the
+/// workload's own namespace, else any Sidecar in the workload's own namespace,
+/// else the root-namespace Sidecar" — the workload's namespace wins the whole
+/// comparison before the root namespace is consulted at all. Ferrum instead
+/// interleaves by SPECIFICITY: a root-namespace Sidecar that carries an explicit
+/// `workloadSelector` matching this workload outranks a selector-less default in
+/// the workload's own namespace.
+///
+/// This is intentional and security-oriented. The root namespace is the mesh
+/// operator's namespace; a tenant cannot write there. Ordering the root
+/// *targeted* rule above the tenant-namespace *catch-all* means a mesh-wide
+/// operator policy aimed at specific workloads cannot be displaced by a tenant
+/// dropping a permissive namespace default into their own namespace. A tenant
+/// can still override with an equally specific rule — a `workloadSelector`
+/// Sidecar in their own namespace still wins the top tier.
+///
+/// Since issue #3262 this ordering also decides the workload-scoped
+/// `outboundTrafficPolicy` (via
+/// [`resolve_applicable_sidecar_outbound_policy`]), i.e. whether the outbound
+/// registry gate is armed — so the divergence is load-bearing for egress
+/// enforcement, not only for scoping. It is documented for operators in
+/// `docs/mesh.md` ("Sidecar Outbound Traffic Policy" → precedence). Do not
+/// "align with Istio" here without re-deciding that trade-off.
 fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
     workload_namespace: &str,
@@ -3064,9 +3391,126 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
         .or(root_namespace_default)
 }
 
-/// Resolve the routable custom inbound listeners from a workload's applicable
-/// `Sidecar.ingress[]`, returning `(resolved_listeners, ingress_declared,
+/// Conservative strictness rank used to fold candidate-resolved outbound
+/// policies under label ambiguity (issue #3262). Higher is stricter, so a fold
+/// takes the MAXIMUM and can only ever tighten.
+///
+/// `None` sits BETWEEN the two concrete modes on purpose: it means "inherit the
+/// mesh-wide / env tier", which may itself be `RegistryOnly`, so it must not be
+/// collapsed with the definitely-permissive `AllowAny`.
+fn outbound_policy_strictness(policy: Option<OutboundTrafficPolicy>) -> u8 {
+    match policy {
+        Some(OutboundTrafficPolicy::RegistryOnly) => 2,
+        None => 1,
+        Some(OutboundTrafficPolicy::AllowAny) => 0,
+    }
+}
+
+/// Resolve the workload-scoped outbound traffic policy from the applicable
+/// `Sidecar.outboundTrafficPolicy` (issue #3262).
+///
+/// `selected` is the Sidecar [`select_applicable_sidecar`] chose for the slice's
+/// `effective_labels` — the SAME tier precedence as ingress (workload-scoped →
+/// root workload-scoped → namespace default → root-namespace default,
+/// ASCII-smallest `name` tiebreak), reusing that one scan rather than repeating
+/// it. It deliberately does NOT walk the egress `inherits_defaults` chain. That
+/// walk exists because Istio's `egress` has an explicit "omitted means inherit
+/// the namespace scope" rule; the outbound traffic policy has no such rule. Istio
+/// resolves exactly ONE Sidecar per workload, and a Sidecar that omits
+/// `outboundTrafficPolicy` simply leaves the mesh-wide `MeshConfig` value in
+/// force — it does not consult a less-specific Sidecar. Returning `None` here
+/// expresses precisely that inheritance.
+///
+/// # Ambiguous workload labels resolve fail-closed (security)
+///
+/// `ambiguous_candidate_labels` is EMPTY on an unambiguous slice, and then this
+/// is exactly `selected`'s own policy. It is non-empty only when the slice is
+/// `labels_ambiguous`: several workloads share the request's SPIFFE id with
+/// DIVERGENT label sets, so `effective_labels` is merely their INTERSECTION and
+/// is not any real workload's labels. A `workloadSelector` Sidecar that genuinely
+/// selects one of those workloads can then fail to match the intersection, and
+/// selection would silently fall through to a less specific tier — turning a
+/// tenant's `REGISTRY_ONLY` into a namespace-default `ALLOW_ANY` and DISARMING
+/// the outbound registry gate.
+///
+/// So under ambiguity every candidate label set is resolved on its own and the
+/// results are folded by [`outbound_policy_strictness`], keeping the strictest.
+/// Properties this buys:
+///   - **Never relaxes.** The fold includes the intersection-derived answer, so
+///     the result is always at least as strict as the unambiguous resolution.
+///   - **Deterministic.** `max` is order-independent, so the outcome does not
+///     depend on workload or Sidecar emission order.
+///   - **Bounded.** Cold path, once per slice build: `candidates × sidecars`,
+///     where candidates are only the workloads sharing this request's SPIFFE id.
+///     Nothing is re-derived per request — the result is materialized into the
+///     injected plugin config and the enforcement slot.
+///
+/// The right long-term fix is unambiguous labels (explicit
+/// `FERRUM_MESH_WORKLOAD_LABELS` / distinct SPIFFE ids); the fold is what keeps
+/// the gate safe until then, and it warns when ambiguity actually changed the
+/// outcome.
+fn resolve_applicable_sidecar_outbound_policy(
+    sidecars: &[MeshSidecar],
+    workload_namespace: &str,
+    istio_root_namespace: &str,
+    selected: Option<&MeshSidecar>,
+    ambiguous_candidate_labels: &[&BTreeMap<String, String>],
+) -> Option<OutboundTrafficPolicy> {
+    let selected_policy = selected.and_then(|sidecar| sidecar.outbound_traffic_policy);
+
+    if ambiguous_candidate_labels.is_empty() {
+        if let Some(sidecar) = selected
+            && let Some(policy) = selected_policy
+        {
+            debug!(
+                sidecar = %sidecar.name,
+                namespace = %sidecar.namespace,
+                policy = ?policy,
+                "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
+            );
+        }
+        return selected_policy;
+    }
+
+    let mut resolved = selected_policy;
+    for labels in ambiguous_candidate_labels {
+        let chosen =
+            select_applicable_sidecar(sidecars, workload_namespace, *labels, istio_root_namespace);
+        let policy = chosen.and_then(|sidecar| sidecar.outbound_traffic_policy);
+        if outbound_policy_strictness(policy) > outbound_policy_strictness(resolved) {
+            resolved = policy;
+        }
+    }
+
+    if resolved == selected_policy {
+        debug!(
+            candidates = ambiguous_candidate_labels.len(),
+            policy = ?resolved,
+            "Ambiguous workload labels did not change the Sidecar-scoped outboundTrafficPolicy"
+        );
+    } else {
+        warn!(
+            namespace = %workload_namespace,
+            candidates = ambiguous_candidate_labels.len(),
+            intersection_policy = ?selected_policy,
+            resolved_policy = ?resolved,
+            "Workload labels are ambiguous (several workloads share this SPIFFE id with divergent \
+             labels); resolving the Sidecar-scoped outboundTrafficPolicy to the strictest policy \
+             any candidate could select. Set explicit workload labels to resolve it exactly"
+        );
+    }
+    resolved
+}
+
+/// Resolve the routable custom inbound listeners from the workload's applicable
+/// `Sidecar`'s `ingress[]`, returning `(resolved_listeners, ingress_declared,
 /// declared_http_ports)`.
+///
+/// `selected` is the Sidecar [`select_applicable_sidecar`] already chose for this
+/// workload — the caller performs that scan ONCE and shares it with the
+/// workload-scoped `outboundTrafficPolicy` resolution, which uses the identical
+/// tier precedence under the identical enforcement gate. `None` (no applicable
+/// Sidecar, or the gate is off) resolves to "no custom listeners declared".
 ///
 /// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
 /// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
@@ -3094,18 +3538,10 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
 /// resolved would collapse to a single-listener no-signal pass-through and route
 /// the skipped port's traffic to the surviving sibling. Deduped by port to match
 /// the resolved-set dedup below.
-fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
-    sidecars: &[MeshSidecar],
-    workload_namespace: &str,
-    workload_labels: &L,
-    istio_root_namespace: &str,
+fn resolve_selected_sidecar_ingress(
+    selected: Option<&MeshSidecar>,
 ) -> (Vec<ResolvedIngressListener>, bool, usize) {
-    let Some(sidecar) = select_applicable_sidecar(
-        sidecars,
-        workload_namespace,
-        workload_labels,
-        istio_root_namespace,
-    ) else {
+    let Some(sidecar) = selected else {
         return (Vec::new(), false, 0);
     };
     // Per Istio, declaring `ingress[]` REPLACES the default per-service-port
@@ -3581,7 +4017,9 @@ fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
     match pc.scope {
         PolicyScope::MeshWide => 0,
         PolicyScope::Namespace { .. } => 1,
-        PolicyScope::WorkloadSelector { .. } => 2,
+        // TargetRefs is AuthorizationPolicy-only; treat as workload-specific
+        // so a mis-authored native ProxyConfig cannot outrank selectors.
+        PolicyScope::WorkloadSelector { .. } | PolicyScope::TargetRefs { .. } => 2,
     }
 }
 
@@ -3601,6 +4039,8 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
                 PeerAuthScope::MeshWide
             }
             PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
+            // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
+            PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
         };
     }
 
@@ -3898,6 +4338,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -3958,6 +4399,7 @@ mod tests {
                 name: "waypoint".into(),
                 namespace: "infra".into(),
                 waypoint_for: "service".into(),
+                gateway_class_name: None,
                 services: vec![MeshWaypointServiceRef {
                     namespace: "default".into(),
                     name: "reviews".into(),
@@ -4150,6 +4592,7 @@ mod tests {
         let slice = MeshSlice {
             node_id: "n1".into(),
             namespace: "ns".into(),
+            waypoint_gateway_class: None,
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
             labels_ambiguous: false,
@@ -4172,12 +4615,14 @@ mod tests {
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
+            virtual_service_l4_upstreams: Vec::new(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
             outbound_traffic_policy: None,
+            sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
             runtime_overlay: MeshRuntimeOverlay::default(),
@@ -5850,7 +6295,9 @@ mod tests {
     ) -> PeerAuthentication {
         let selector = match &scope {
             PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-            PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+            PolicyScope::MeshWide
+            | PolicyScope::Namespace { .. }
+            | PolicyScope::TargetRefs { .. } => None,
         };
         PeerAuthentication {
             name: name.to_string(),
@@ -6894,6 +7341,7 @@ mod tests {
                 .collect(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6910,6 +7358,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -7469,6 +7918,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         };
         sidecar.ingress = vec![MeshSidecarIngress {
             port: 8443,
@@ -8978,6 +9428,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
             ],
             service_entries: vec![
@@ -9058,6 +9509,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
                 make_inheriting_sidecar(
                     "frontend-ingress-only",
@@ -9173,6 +9625,7 @@ mod tests {
                 egress: Vec::new(),
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             service_entries: vec![make_se_with_host(
                 "reviews",
@@ -9505,6 +9958,7 @@ mod tests {
                 ],
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             services: vec![
                 make_service("alpha", "reviews"),

@@ -12,11 +12,12 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::backend_conn_limit::{PooledConnectionAdmission, SharedBackendConnectionLimiter};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
@@ -49,10 +50,11 @@ thread_local! {
 
 /// Multiplexed hyper H2 sender for the plain-HTTPS direct pool.
 ///
-/// Body type is [`SizeLimitedIncoming`] so SNI-required (and any other)
-/// direct-H2 dispatches can enforce `max_request_body_size_bytes` while
-/// streaming the client upload — mirroring the mesh-mTLS / HBONE pools.
-/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`).
+/// Body type is [`SizeLimitedIncoming`] so ordinary and SNI direct-H2
+/// dispatches can enforce `max_request_body_size_bytes` while streaming
+/// the client upload — mirroring the mesh-mTLS / HBONE pools.
+/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`);
+/// note the adapter itself treats `max_bytes = 0` as deny-all.
 pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
 
 /// Terminal protocol outcome for one DNS candidate.
@@ -169,6 +171,12 @@ struct Http2PoolManager {
     tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
+    /// Shared gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
+    /// counter. Installed once by `ProxyState` via
+    /// [`Http2ConnectionPool::attach_backend_conn_limit`]; unset for focused
+    /// tests and standalone callers, in which case no cap is ever enforced.
+    /// Read only on the cold connection-establishment path.
+    backend_conn_limit: OnceLock<SharedBackendConnectionLimiter>,
 }
 
 impl Http2PoolManager {
@@ -209,11 +217,48 @@ impl Http2PoolManager {
             .as_ref()
             .and_then(|m| m.get(&port))
             .and_then(|o| o.tcp_keepalive.as_ref());
+        // DestinationRule `connectionPool.tcp.maxConnections`. Reserve the
+        // physical-connection slot BEFORE any dial so an over-cap destination
+        // never opens the socket, then hand the reservation to the spawned
+        // connection driver: the slot is released when THIS H2 connection
+        // closes (idle eviction, pool drain/clear, SVID drain, reload/delete,
+        // shutdown, peer GOAWAY), not when the request that created it ends.
+        // Reuse of the pooled connection takes no slot, so unlimited
+        // multiplexed streams ride one admitted connection.
+        //
+        // Cap lookup is keyed by `proxy.backend_port` because
+        // `resolve_backend_connection_proxy_for_target` mirrors a
+        // `targetPort`-remapped service-port policy onto the dial port; the
+        // counter lane still keys on the service port it stamped.
+        let conn_admission = PooledConnectionAdmission::resolve(
+            self.backend_conn_limit.get().map(|limiter| &**limiter),
+            proxy,
+            host,
+            port,
+        );
+        let conn_slot = match conn_admission {
+            Some(admission) => match admission.acquire() {
+                Ok(slot) => Some(slot),
+                Err(limit) => {
+                    return Err(Http2PoolError::MaxConnectionsExceeded {
+                        message: format!(
+                            "direct HTTP/2 pool: {limit} for backend {}:{}",
+                            admission.host(),
+                            admission.policy_port()
+                        ),
+                    });
+                }
+            },
+            None => None,
+        };
 
         crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
             let connector = connector.clone();
             let server_name = server_name.clone();
             let pool_config = &pool_config;
+            // One reservation, cloned per candidate attempt: a failed attempt
+            // drops its clone, so only an established connection keeps the slot.
+            let conn_slot = conn_slot.clone();
             async move {
                 let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                     .await
@@ -269,6 +314,9 @@ impl Http2PoolManager {
 
                 // ALPN has already proved H2 for this TLS candidate.
                 tokio::spawn(async move {
+                    // The `maxConnections` slot lives exactly as long as the
+                    // connection driver, i.e. as long as the socket is open.
+                    let _conn_slot = conn_slot;
                     if let Err(e) = conn.await {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
@@ -572,12 +620,21 @@ impl Http2ConnectionPool {
             tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
+            backend_conn_limit: OnceLock::new(),
         });
 
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
+    }
+
+    /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
+    /// this pool's physical H2 connections are admitted against the same
+    /// per-destination ceiling as WebSocket, raw-TCP, and the other pooled
+    /// transports. Idempotent; later calls are ignored.
+    pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
+        let _ = self.pool.manager().backend_conn_limit.set(limiter);
     }
 
     pub fn pool_size(&self) -> usize {
@@ -877,6 +934,19 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
         return ErrorClass::ProtocolError;
     }
 
+    // 0b. `maxConnections` refusal: the gateway declined to open a NEW socket
+    //     for a destination already at its DestinationRule ceiling. Nothing was
+    //     dialed, so this is a pre-wire refusal — `retry_on_connect_failure` may
+    //     rotate to another LB target, exactly what the raw-TCP over-cap path
+    //     already does. It is deliberately NOT the generic `ConnectionPoolError`:
+    //     that class is a backend-health signal, and charging a gateway-side
+    //     ceiling against the destination would trip its circuit breaker /
+    //     passive health whenever live traffic saturated the cap.
+    //     `BackendConnectionLimit` is pre-wire AND health-neutral.
+    if matches!(err, Http2PoolError::MaxConnectionsExceeded { .. }) {
+        return ErrorClass::BackendConnectionLimit;
+    }
+
     // 1. Walk the typed source chain first — covers io::Error, hyper::Error,
     //    rustls::Error anywhere in the nested chain.
     if let Some(cls) = classify_typed_chain(err) {
@@ -921,6 +991,7 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
         Http2PoolError::Internal { message, .. } => message.as_str(),
         // Already returned above — keep match exhaustive.
         Http2PoolError::BackendSelectedHttp1 { .. } => return ErrorClass::ProtocolError,
+        Http2PoolError::MaxConnectionsExceeded { .. } => return ErrorClass::BackendConnectionLimit,
     };
     let lower = message.to_ascii_lowercase();
 
@@ -956,6 +1027,7 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
         }
         Http2PoolError::Internal { .. } => ErrorClass::ConnectionPoolError,
         Http2PoolError::BackendSelectedHttp1 { .. } => ErrorClass::ProtocolError,
+        Http2PoolError::MaxConnectionsExceeded { .. } => ErrorClass::BackendConnectionLimit,
     }
 }
 
@@ -1189,6 +1261,16 @@ pub enum Http2PoolError {
     /// it and the pool can cache the negative result to short-circuit
     /// future attempts to the same backend.
     BackendSelectedHttp1 { pool_key: String },
+    /// The destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
+    /// connection may be opened. Classified
+    /// [`crate::retry::ErrorClass::BackendConnectionLimit`] — pre-wire AND
+    /// health-neutral, matching the raw-TCP path where an over-cap dial fails
+    /// before relay, records `cb.record_neutral()`, and `retry_on_connect_failure`
+    /// may rotate to another LB target (with its own lane). `get_sender()` first
+    /// falls back to any already-established shard, so a capped destination
+    /// keeps serving by multiplexing rather than failing.
+    MaxConnectionsExceeded { message: String },
 }
 
 /// Typed source for `Http2PoolError::BackendUnavailable` so classification can
@@ -1324,6 +1406,7 @@ impl std::fmt::Display for Http2PoolError {
                 "backend negotiated http/1.1 via ALPN (pool key: {}); falling back to reqwest",
                 redact_pool_key_tls_material(pool_key)
             ),
+            Self::MaxConnectionsExceeded { message } => write!(f, "{}", message),
         }
     }
 }
@@ -1341,6 +1424,7 @@ impl std::error::Error for Http2PoolError {
                 .as_ref()
                 .map(|s| s as &(dyn std::error::Error + 'static)),
             Self::BackendSelectedHttp1 { .. } => None,
+            Self::MaxConnectionsExceeded { .. } => None,
         }
     }
 }
@@ -1357,6 +1441,7 @@ impl Http2PoolError {
             // message. The dispatching caller routes via reqwest on this
             // variant rather than surfacing the message to clients.
             Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
+            Self::MaxConnectionsExceeded { message } => message,
         }
     }
 }
@@ -1378,6 +1463,13 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
             SharedPoolCreateKind::NegotiatedHttp1 => Self::BackendSelectedHttp1 {
                 pool_key: err.detail().unwrap_or(err.message()).to_string(),
             },
+            // Coalesced waiters must see the SAME typed over-cap refusal the
+            // creator produced, so `get_sender`'s already-established-shard
+            // fallback and `classify_http2_pool_error`'s pre-wire
+            // `ConnectionPoolError` apply to them identically. Reconstructing it
+            // as `BackendUnavailable` would keep the ErrorClass but lose the
+            // structural signal.
+            SharedPoolCreateKind::MaxConnections => Self::MaxConnectionsExceeded { message },
             SharedPoolCreateKind::Dns
             | SharedPoolCreateKind::Tls
             | SharedPoolCreateKind::ConnectionRefused
@@ -1424,6 +1516,17 @@ impl crate::pool::ShareablePoolCreateError for Http2PoolError {
             Self::Internal { message, .. } => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Coalesced waiters must see the same over-cap refusal rather than
+            // each redialing a destination that is already at its ceiling. The
+            // dedicated kind survives the fan-out (the typed source chain does
+            // not), so `From<SharedPoolCreateError>` can rebuild the exact
+            // variant.
+            Self::MaxConnectionsExceeded { message } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::MaxConnections,
                 error_class,
                 None,
             ),

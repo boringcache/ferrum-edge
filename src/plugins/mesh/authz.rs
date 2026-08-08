@@ -53,10 +53,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
+    MeshPolicy, PolicyAction, PolicyScope, WaypointAttachment, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload, resolve_target_port,
-    validate_mesh_condition_ip_block, workload_selector_matches,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    resolve_target_port, validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -141,6 +142,15 @@ pub struct MeshAuthz {
     /// avoid building the full attribute namespace per request.
     condition_keys: ConditionAttributeKeys,
     relay_policy_superset_condition_keys: ConditionAttributeKeys,
+    /// Authoritative waypoint identity of THIS proxy, captured from the slice
+    /// at construction: `(slice.namespace, slice.waypoint_name,
+    /// slice.waypoint_gateway_class)`. Every `targetRefs` Gateway/GatewayClass
+    /// decision re-checks against it — retention alone never proves which
+    /// attachment matched (issue #3226). `waypoint_name: None` means this is
+    /// not a waypoint proxy and no targeted attachment can apply.
+    waypoint_namespace: String,
+    waypoint_name: Option<String>,
+    waypoint_gateway_class: Option<String>,
     /// Monotonic-ms of the last emitted `principal_pod_mismatch` warning, or
     /// `0` before the first. Gates a rate-limited operator warning when the
     /// node-agent-derived HBONE source SPIFFE fails to byte-match the CP-derived
@@ -487,7 +497,14 @@ fn destination_policy_scopes_for_service_port(
         if app_port == 0 {
             continue;
         }
-        let workload_scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        // Stamp the DESTINATION service identity from the Service this index is
+        // keyed by — not from `Workload.service_name`, which names one
+        // projection and cannot disambiguate a pod several Services select.
+        let workload_scope = crate::modes::mesh::runtime::PolicyScopeCache::for_destination_service(
+            workload,
+            &service.namespace,
+            &service.name,
+        );
         scopes.push(workload_scope.clone());
         for address in &workload.addresses {
             if let Some(key) = DestinationBackendKey::new(address, app_port) {
@@ -803,6 +820,7 @@ fn destination_policy_scope_index(
 fn evaluate_destination_policy_scopes(
     policies: &[MeshPolicy],
     scopes: &[crate::modes::mesh::runtime::PolicyScopeCache],
+    waypoint: WaypointAttachment<'_>,
     request: &MeshAuthzRequest,
 ) -> MeshAuthzDecision {
     let mut audit_policy = None;
@@ -810,7 +828,7 @@ fn evaluate_destination_policy_scopes(
         let decision = evaluate_mesh_authorization_policies(
             policies
                 .iter()
-                .filter(|policy| scope.policy_applies(policy)),
+                .filter(|policy| scope.policy_applies_for_destination(policy, waypoint)),
             request,
         );
         match decision {
@@ -1022,6 +1040,9 @@ fn ambient_udp_source_scope_index(
             std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &candidate => {
                 // Kubernetes may project one pod through multiple Services.
                 // Identical attestations are one scope, not an ambiguity.
+                // (`PolicyScopeCache::from_workload` leaves the destination
+                // service fields empty precisely so those projections still
+                // compare equal here.)
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
                 entry.remove();
@@ -1113,6 +1134,7 @@ impl MeshAuthz {
         }
 
         validate_policy_ip_inputs(&slice.mesh_policies)?;
+        validate_waypoint_target_ref_evidence(&slice)?;
 
         let per_pod_policy_scoping = config
             .get("per_pod_policy_scoping")
@@ -1133,6 +1155,10 @@ impl MeshAuthz {
             HashMap::new()
         };
 
+        let waypoint_namespace = slice.namespace.clone();
+        let waypoint_name = slice.waypoint_name.clone();
+        let waypoint_gateway_class = slice.waypoint_gateway_class.clone();
+
         if !per_pod_policy_scoping {
             validate_scope_filter_identity(&slice, from_slice)?;
 
@@ -1142,10 +1168,29 @@ impl MeshAuthz {
             // smaller list. Skipped in node-waypoint mode because one listener
             // serves many pods — filtering happens per request using the
             // pod-scoped cache set on RequestContext.
-            let proxy_namespace = slice.namespace.clone();
+            //
+            // `targetRefs` retention is OR over the attachment list and does NOT
+            // narrow the list, so this is admission only: every retained
+            // targeted policy is re-checked against the exact destination /
+            // waypoint identity on the request path
+            // (`PolicyScopeCache::policy_applies_for_destination`).
+            //
+            // The Service arm is gated on THIS being a waypoint proxy. Istio
+            // applies `targetRefs` policies at waypoints only, and
+            // `slice.services` is the egress-narrowed DESTINATION view on a
+            // Sidecar — keeping a Service-targeted policy there would enforce a
+            // destination's policy on an unrelated source workload's own
+            // inbound traffic.
             let proxy_labels = slice.labels.clone();
+            let is_waypoint = waypoint_name.is_some();
             slice.mesh_policies.retain(|policy| {
-                policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
+                policy_scope_applies_with_waypoint(
+                    policy,
+                    &waypoint_namespace,
+                    &proxy_labels,
+                    waypoint_name.as_deref(),
+                    waypoint_gateway_class.as_deref(),
+                ) || (is_waypoint && target_refs_attach_to_slice_services(policy, &slice.services))
             });
         }
 
@@ -1223,8 +1268,22 @@ impl MeshAuthz {
             has_scoped_policies,
             condition_keys,
             relay_policy_superset_condition_keys,
+            waypoint_namespace,
+            waypoint_name,
+            waypoint_gateway_class,
             udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// This proxy's authoritative waypoint identity for `targetRefs` matching.
+    /// Borrowed and `Copy` — no per-request allocation.
+    #[inline]
+    fn waypoint_attachment(&self) -> WaypointAttachment<'_> {
+        WaypointAttachment {
+            namespace: &self.waypoint_namespace,
+            name: self.waypoint_name.as_deref(),
+            gateway_class: self.waypoint_gateway_class.as_deref(),
+        }
     }
 
     /// Emit a rate-limited (one per ~30s) structured warning when an Ambient
@@ -1614,6 +1673,73 @@ fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
 }
 
+/// Refuse a waypoint slice that carries an ENFORCING GatewayClass-targeted
+/// policy without the authoritative `Gateway.spec.gatewayClassName` stamp.
+///
+/// Silently dropping such a policy at the retain step would turn a DENY (or an
+/// ALLOW policy's implicit deny) into allow-by-default. Returning `Err` here
+/// makes the whole plugin generation invalid, so the DP rejects the slice and
+/// keeps serving the last good one instead. This is the protocol-agnostic
+/// backstop: the xDS reverse-translation boundary rejects the same incoherence
+/// earlier (`validate_waypoint_gateway_class_carrier`), and this covers the
+/// native `MeshSubscribe`, file, and embedded-`mesh_slice` sources too.
+///
+/// Audit-only policies do not affect authorization and so do not make the stamp
+/// mandatory. A Gateway- or Service-targeted policy that simply does not name
+/// this waypoint / a bound Service is a legitimate non-match, not missing
+/// evidence.
+fn validate_waypoint_target_ref_evidence(slice: &MeshSlice) -> Result<(), String> {
+    if slice.waypoint_name.is_none() || slice.waypoint_gateway_class.is_some() {
+        return Ok(());
+    }
+    let offender = slice.mesh_policies.iter().find(|policy| {
+        let targets_class = matches!(
+            &policy.scope,
+            PolicyScope::TargetRefs { attachments }
+                if attachments.iter().any(|attachment| matches!(
+                    attachment,
+                    crate::modes::mesh::config::PolicyTargetAttachment::GatewayClass { .. }
+                ))
+        );
+        targets_class && policy_has_enforcing_rule(policy)
+    });
+    match offender {
+        Some(policy) => Err(format!(
+            "mesh_authz: waypoint slice carries an enforcing GatewayClass-targeted policy \
+             '{}/{}' but no authoritative waypoint gateway class; refusing the slice rather \
+             than dropping the policy into allow-by-default",
+            policy.namespace, policy.name
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Admit Service `targetRefs` policies whose named Service is in this waypoint
+/// slice, so destination-scope evaluation can still see them (the waypoint pod's
+/// own labels have nothing to do with the Service's pod selector).
+///
+/// ADMISSION ONLY — never a match. The retained policy is re-checked per
+/// request against the exact destination service identity in
+/// [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`].
+/// Callers must gate this on the slice actually being a waypoint slice.
+fn target_refs_attach_to_slice_services(
+    policy: &MeshPolicy,
+    services: &[crate::modes::mesh::config::MeshService],
+) -> bool {
+    let PolicyScope::TargetRefs { attachments } = &policy.scope else {
+        return false;
+    };
+    attachments.iter().any(|attachment| {
+        services.iter().any(|service| {
+            policy_target_attachment_applies_to_service(
+                attachment,
+                &service.namespace,
+                &service.name,
+            )
+        })
+    })
+}
+
 fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
@@ -1628,6 +1754,13 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         policy.name
                     ));
                 }
+            }
+            PolicyScope::TargetRefs { .. } => {
+                // Gateway / GatewayClass attachments are decided against the
+                // slice's own waypoint name/class, and Service attachments
+                // against exact destination service membership. Neither reads
+                // proxy labels, so a missing/ambiguous label set cannot make a
+                // targeted policy unevaluable the way a selector policy can.
             }
             PolicyScope::WorkloadSelector { selector } => {
                 if let Some(selector_namespace) = selector.namespace.as_ref() {
@@ -2042,11 +2175,12 @@ impl Plugin for MeshAuthz {
                 authorized_destination =
                     Some(destination_scope_match.authorized_destination.clone());
                 let destination_scopes = destination_scope_match.scopes;
+                let waypoint = self.waypoint_attachment();
                 evaluate_mesh_authorization_policies(
                     self.relay_policy_superset.iter().filter(|policy| {
                         let destination_applies = destination_scopes
                             .iter()
-                            .any(|scope| scope.policy_applies(policy));
+                            .any(|scope| scope.policy_applies_for_destination(policy, waypoint));
                         let source_applies = source_scope.map_or_else(
                             || matches!(policy.scope, PolicyScope::MeshWide),
                             |scope| scope.policy_applies(policy),
@@ -2097,6 +2231,7 @@ impl Plugin for MeshAuthz {
                 evaluate_destination_policy_scopes(
                     &self.slice.mesh_policies,
                     destination_scope_match.scopes,
+                    self.waypoint_attachment(),
                     &request,
                 )
             } else {

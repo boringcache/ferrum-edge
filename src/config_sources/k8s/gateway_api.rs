@@ -40,6 +40,12 @@ const GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY: &str =
 /// honored so operators migrating from Istio do not have to retag.
 const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoint"];
 
+pub(crate) fn is_supported_waypoint_gateway_class(name: &str) -> bool {
+    WAYPOINT_GATEWAY_CLASS_NAMES
+        .iter()
+        .any(|expected| expected.eq_ignore_ascii_case(name))
+}
+
 /// Service label naming the GAMMA Waypoint a Service routes through.
 /// `None` (the literal string) opts the Service out of any inherited
 /// namespace-level waypoint binding. Annotations are accepted as a
@@ -89,6 +95,7 @@ enum BackendRefFaultReason {
     BackendNotFound,
     RefNotPermitted,
     NoServiceableBackend,
+    InvalidBackendTlsPolicy,
 }
 
 #[derive(Default)]
@@ -182,7 +189,7 @@ pub(super) fn translate(
             }
             Ok(true)
         }
-        "ReferenceGrant" => Ok(true),
+        "ReferenceGrant" | "BackendTLSPolicy" => Ok(true),
         // Collected in the pre-pass; acknowledged here so the main translate
         // loop does not warn about an "unsupported" kind.
         "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
@@ -2000,6 +2007,7 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
     let waypoint_for = metadata_key(object, KEY_WAYPOINT_FOR)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "service".to_string());
+    let gateway_class_name = string_field(&object.spec, "gatewayClassName").map(ToOwned::to_owned);
     if let Some(existing) = acc
         .mesh
         .waypoint_bindings
@@ -2010,11 +2018,15 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
         // defaults because the Gateway is the canonical owner of the
         // waypoint identity.
         existing.waypoint_for = waypoint_for;
+        if gateway_class_name.is_some() {
+            existing.gateway_class_name = gateway_class_name;
+        }
     } else {
         acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
             name: object.metadata.name.clone(),
             namespace: object.metadata.namespace.clone(),
             waypoint_for,
+            gateway_class_name,
             services: Vec::new(),
         });
     }
@@ -2056,6 +2068,7 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         name: waypoint_name,
         namespace: waypoint_namespace,
         waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
+        gateway_class_name: None,
         services: vec![service_ref],
     });
 }
@@ -3636,12 +3649,17 @@ fn route_materialized_parent_ref_keys_for_namespace(
     refs
 }
 
-fn l4_route_listener_ports_for_namespace(
+fn l4_route_listener_bindings_for_namespace(
     object: &K8sObject,
     acc: &K8sAccumulator,
     namespace_filter: Option<&str>,
-) -> Vec<u16> {
-    let mut ports = Vec::new();
+) -> Vec<(u16, Vec<String>)> {
+    let requested_hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| normalize_gateway_hostname(&hostname))
+        .collect();
+    let route_hostnames = hostnames_for_listener_intersection(&requested_hostnames);
+    let mut bindings: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for parent_ref in object
         .spec
         .get("parentRefs")
@@ -3665,13 +3683,24 @@ fn l4_route_listener_ports_for_namespace(
                 && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
                 && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
             {
-                ports.push(port);
+                let hosts = bindings.entry(port).or_default();
+                if object.kind == "TLSRoute" {
+                    let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+                    hosts.extend(route_hostnames.iter().filter_map(|route_hostname| {
+                        intersect_hostnames(route_hostname, listener_hostname)
+                    }));
+                }
             }
         }
     }
-    ports.sort();
-    ports.dedup();
-    ports
+    bindings
+        .into_iter()
+        .filter_map(|(port, mut hosts)| {
+            hosts.sort();
+            hosts.dedup();
+            (object.kind != "TLSRoute" || !hosts.is_empty()).then_some((port, hosts))
+        })
+        .collect()
 }
 
 fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -4381,7 +4410,32 @@ fn http_route_resources(
 
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
-            let backend_resolution = route_backends(object, rule, acc)?;
+            let mut backend_resolution = route_backends(object, rule, acc)?;
+            let backend_tls_policy = super::backend_tls_policy::resolve_backends_tls_policy(
+                acc,
+                &backend_resolution.backends,
+            );
+            let backend_tls_overlay = match backend_tls_policy {
+                super::backend_tls_policy::BackendTlsPolicyLookup::None => None,
+                super::backend_tls_policy::BackendTlsPolicyLookup::Apply(overlay) => Some(overlay),
+                super::backend_tls_policy::BackendTlsPolicyLookup::Fault { .. } => {
+                    // Fail closed: drop backends and force an HTTP 500 fault so
+                    // traffic never reaches a Service under a broken TLS policy.
+                    let fault_weight = backend_resolution
+                        .backends
+                        .iter()
+                        .fold(0u32, |sum, backend| sum.saturating_add(backend.weight));
+                    backend_resolution.invalid_weight = backend_resolution
+                        .invalid_weight
+                        .saturating_add(fault_weight);
+                    backend_resolution.valid_weight = 0;
+                    backend_resolution.backends.clear();
+                    backend_resolution
+                        .fault_reason
+                        .get_or_insert(BackendRefFaultReason::InvalidBackendTlsPolicy);
+                    None
+                }
+            };
             let session_persistence = resolve_rule_session_persistence(
                 object,
                 rule,
@@ -4407,6 +4461,7 @@ fn http_route_resources(
                 upstream_id,
                 mut pending_upstream,
                 requires_node_waypoint_authz,
+                backend_scheme,
             ) = if backend_resolution.backends.is_empty() {
                 if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
                     continue;
@@ -4417,8 +4472,12 @@ fn http_route_resources(
                     None,
                     None,
                     false,
+                    BackendScheme::Http,
                 )
-            } else if backend_resolution.backends.len() == 1 && session_persistence.is_none() {
+            } else if backend_resolution.backends.len() == 1
+                && backend_tls_overlay.is_none()
+                && session_persistence.is_none()
+            {
                 let Some(backend) = backend_resolution.backends.into_iter().next() else {
                     continue;
                 };
@@ -4430,8 +4489,13 @@ fn http_route_resources(
                     None,
                     None,
                     requires_node_waypoint_authz,
+                    BackendScheme::Http,
                 )
             } else {
+                // Multi-backend rules, BackendTLSPolicy overlays, and session
+                // persistence use an Upstream so SNI/SAN/CA and sticky cookies
+                // can be projected (direct proxies have no serialized
+                // backend_tls_sni field).
                 let requires_node_waypoint_authz =
                     route_backends_require_node_waypoint_authz(&backend_resolution.backends);
                 let route_suffix = route_scoped_suffix(
@@ -4446,18 +4510,25 @@ fn http_route_resources(
                     &object.metadata.name,
                     &route_suffix,
                 );
-                let upstream = upstream_for_route_with_session(
+                let mut upstream = upstream_for_route_with_session(
                     upstream_id.clone(),
                     config_namespace.clone(),
                     backend_resolution.backends,
                     session_persistence.as_ref(),
                 );
+                let backend_scheme = if let Some(overlay) = backend_tls_overlay.as_ref() {
+                    super::backend_tls_policy::apply_to_upstream(&mut upstream, overlay);
+                    BackendScheme::Https
+                } else {
+                    BackendScheme::Http
+                };
                 (
                     String::new(),
                     0,
                     Some(upstream_id),
                     Some(upstream),
                     requires_node_waypoint_authz,
+                    backend_scheme,
                 )
             };
 
@@ -4517,7 +4588,7 @@ fn http_route_resources(
                         backend_host: backend_host.clone(),
                         backend_port,
                         upstream_id: upstream_id.clone(),
-                        backend_scheme: BackendScheme::Http,
+                        backend_scheme,
                         listen_port: None,
                         retry: None,
                         backend_read_timeout_ms: None,
@@ -5219,6 +5290,9 @@ fn backend_ref_fault_value_with_percentage(
         BackendRefFaultReason::NoServiceableBackend => {
             "Gateway API rule has no serviceable backendRefs"
         }
+        BackendRefFaultReason::InvalidBackendTlsPolicy => {
+            "Gateway API BackendTLSPolicy for backend Service is invalid or conflicting"
+        }
     };
     serde_json::json!({
         "abort": {
@@ -5598,14 +5672,14 @@ fn l4_route_proxies(
         acc,
         Some(&object.metadata.namespace),
     );
-    let materialized_listener_ports =
-        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
+    let materialized_listener_bindings =
+        l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace));
     let has_gateway_parent_ref = object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
         .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway));
-    if has_gateway_parent_ref && materialized_listener_ports.is_empty() {
+    if has_gateway_parent_ref && materialized_listener_bindings.is_empty() {
         // A parented L4 route has no standalone/default listener semantics.
         // Falling back to backend_port here would expose traffic after its
         // named Gateway listener was rejected or left unmaterialized.
@@ -5640,13 +5714,13 @@ fn l4_route_proxies(
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
 
-        let listen_ports = if materialized_listener_ports.is_empty() {
-            vec![backend_port]
+        let listen_bindings = if materialized_listener_bindings.is_empty() {
+            vec![(backend_port, string_array(&object.spec, "hostnames"))]
         } else {
-            materialized_listener_ports.clone()
+            materialized_listener_bindings.clone()
         };
-        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
-            let suffix = if listen_ports.len() == 1 {
+        for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
+            let suffix = if listen_bindings.len() == 1 {
                 rule_index.to_string()
             } else {
                 format!("{rule_index}-{listen_port_index}")
@@ -5659,7 +5733,7 @@ fn l4_route_proxies(
                     &suffix,
                 ),
                 namespace: object.metadata.namespace.clone(),
-                hosts: string_array(&object.spec, "hostnames"),
+                hosts: hosts.clone(),
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
@@ -5671,7 +5745,7 @@ fn l4_route_proxies(
                 backend_port,
                 upstream_id: None,
                 backend_scheme: scheme,
-                listen_port: Some(listen_port),
+                listen_port: Some(*listen_port),
                 retry: None,
                 backend_read_timeout_ms: None,
             }));
@@ -11398,6 +11472,71 @@ mod tests {
         assert!(
             !proxy.frontend_tls,
             "passthrough and frontend_tls are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tls_route_is_bounded_by_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["evil.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+    }
+
+    #[test]
+    fn tls_route_without_hostnames_inherits_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].hosts,
+            vec!["allowed.example.com".to_string()]
         );
     }
 

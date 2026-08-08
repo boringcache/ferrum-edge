@@ -98,6 +98,12 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^proto/",
         r"^ferrum\.conf$",
         r"^src/config/",
+        # The poller-partition fixture sharing this suite filter runs a real
+        # CP with Kubernetes discovery enabled. Changes to any leg of that
+        # CP watch/translate pipeline must therefore re-run the live gate.
+        r"^src/modes/control_plane\.rs$",
+        r"^src/k8s_controller/",
+        r"^src/config_sources/k8s/",
         r"^src/modes/mesh/",
         r"^src/grpc/",
         r"^src/identity/",
@@ -259,6 +265,9 @@ def self_test() -> int:
         ("mesh-federation", [".github/scripts/live_suite_path_filter.py"], True),
         ("mesh-federation", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("mesh-federation", ["src/service_discovery/kubernetes.rs"], True),
+        ("mesh-federation", ["src/modes/control_plane.rs"], True),
+        ("mesh-federation", ["src/k8s_controller/reconciler.rs"], True),
+        ("mesh-federation", ["src/config_sources/k8s/core.rs"], True),
         ("mesh-federation", ["charts/ferrum-mesh/values.yaml"], False),
         ("mesh-federation", ["docs/spire_deployment.md"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),

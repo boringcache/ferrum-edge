@@ -5,7 +5,7 @@ A comprehensive feature list for Ferrum Edge.
 ## Protocol Support
 
 - **HTTP/1.1** with keep-alive connection pooling
-- **HTTP/2** via ALPN negotiation on TLS connections
+- **HTTP/2** via ALPN negotiation on TLS connections; H2-capable HTTPS backends use the multiplexed direct-H2 pool with in-path body-size enforcement (default nonzero limits no longer force the reqwest path)
 - **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 9220 §5 unmasked frames on the H3 hop, RFC 6455 masked frames on the H1.1 hop). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`)
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
@@ -67,7 +67,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Config consumption** — native `MeshSubscribe` gRPC (Ferrum-native), standard xDS ADS (CDS/EDS/LDS/RDS/SDS) with multi-CP failover and jittered exponential backoff, or a localized mesh config file (`FERRUM_MESH_FILE_CONFIG_PATH`, fail-closed startup + SIGHUP reload, no control plane)
 - **SPIFFE identity** — extracted from mTLS peer certificates and HBONE W3C Baggage headers with trust-domain aliasing for federated multi-cluster
 - **Mesh authorization** — identity-based `MeshPolicy` with `PolicyScope` filtering (MeshWide / Namespace / WorkloadSelector), DENY-first evaluation, Istio-compatible implicit deny semantics, principal/request/condition matching with glob patterns
-- **Outbound traffic policy** — `REGISTRY_ONLY` auto-injects `mesh_outbound_registry` on outbound capture listeners to reject HTTP-family destinations outside known services, ServiceEntries, wildcard hosts, and workload addresses. `ALLOW_ANY` remains the default.
+- **Outbound traffic policy** — `REGISTRY_ONLY` auto-injects `mesh_outbound_registry` on outbound capture listeners to reject HTTP-family destinations outside known services, ServiceEntries, wildcard hosts, and workload addresses, and arms the matching stream-family gate. Resolved per workload as Istio `Sidecar.outboundTrafficPolicy` → mesh-wide `MeshConfig.outboundTrafficPolicy` → `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`; a present object with omitted/null `mode` uses Istio's documented `ALLOW_ANY` default, while an unrepresentable Sidecar block (unsupported `egressProxy`, unknown/non-string `mode`) fails closed to `REGISTRY_ONLY` with field-specific CRD status. `ALLOW_ANY` gates nothing else — egress scope, authorization, mTLS identity, and relay guards still apply.
 - **RequestAuthentication** — declares valid JWTs per workload scope (permissive: valid-not-required, matching Istio semantics). Auto-injects `jwks_auth` plugin from `MeshJwtRule` definitions
 - **PeerAuthentication** — per-workload mTLS mode (strict/permissive/disable) with per-port overrides
 - **Transparent DNS proxy** — resolves mesh ServiceEntry hosts and MeshService names to workload IPs, supports wildcard hosts, forwards non-mesh queries upstream (UDP/TCP, A/AAAA, EDNS(0))
@@ -92,6 +92,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - Multi-authentication mode with first-match consumer identification
 - Multi-credential rotation — consumers can have multiple active credentials of the same type (e.g., two API keys, two JWT secrets) for zero-downtime key rotation, configurable via `FERRUM_MAX_CREDENTIALS_PER_TYPE`
 - Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB uses idempotent index creation instead of SQL migrations
+- MySQL identity-collation startup probe — after core migrations in `database` / `cp` / `migrate`, warns (never refuses startup) when Ferrum identity-bearing columns are not `utf8mb4_0900_bin`, with exact `ALTER TABLE ... CONVERT TO` remediation for upgraded deployments; no-op on PostgreSQL, SQLite, and MongoDB
 
 ### Authentication Plugins
 

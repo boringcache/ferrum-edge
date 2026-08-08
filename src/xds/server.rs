@@ -2525,6 +2525,7 @@ mod tests {
                     name: "waypoint".to_string(),
                     namespace: "infra".to_string(),
                     waypoint_for: "service".to_string(),
+                    gateway_class_name: None,
                     services: vec![MeshWaypointServiceRef {
                         namespace: "default".to_string(),
                         name: service_name.to_string(),
@@ -2878,6 +2879,7 @@ mod tests {
                     }],
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -2914,6 +2916,7 @@ mod tests {
                     }],
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 }],
                 ..MeshConfig::default()
             })),

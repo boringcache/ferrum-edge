@@ -148,23 +148,21 @@ under `pull_request_target` and rejects any change to
   against its own base before being queued, which is what keeps the payload
   base usable as a trusted baseline.
 
-**Admin / no-bypass intent (settings owned by root, not this workflow change):**
-apply rules to administrators, block force pushes and branch deletion, require
-up-to-date merge-queue results, and document any narrowly scoped automation
-bypass. This repository change only prepares workflow triggers and contracts;
-it does **not** enable the merge queue or mutate branch protection.
+**Live admin / no-bypass posture (root-owned repository settings; verified
+2026-08-05):** classic branch protection and ruleset `20208307` both require all
+seven GitHub Actions checks above. Classic protection enforces administrators.
+The active ruleset has no bypass actors, blocks force pushes and deletion,
+requires one approval with stale approvals dismissed on push, resolves review
+threads, and validates the combined result through the merge queue. The owner
+intentionally disabled GitHub's "approval of the most recent reviewable push by
+someone other than the pusher" rule (`require_last_push_approval=false`), so do
+not document or re-enable that distinct restriction without an explicit settings
+decision.
 
-**Staged enablement (root-owned after this prerequisite merges):**
-
-1. Merge the workflow/`docs/ci_cd.md` prerequisite so all seven owners report on
-   `merge_group`.
-2. Enable the `main` ruleset / branch protection with the seven required checks
-   above, merge queue enabled, admin enforcement as intended.
-3. Open a throwaway test PR, enqueue it, confirm each required check runs on
-   the synthesized SHA (not a stale PR SHA), and confirm release automation
-   still has only the permissions it needs.
-4. Only after that live exercise should closing language such as
-   `Closes #2458` be used on the settings follow-up.
+After any future settings edit, re-query both protection APIs and confirm the
+seven exact check names, GitHub Actions app id `15368`, admin enforcement, empty
+bypass list, pull-request parameters, and merge-queue parameters. Exercise a
+queued PR to prove every required owner reports on the synthesized SHA.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
@@ -1933,21 +1931,25 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 ## Root Merge Gate Attestation
 
-`root-merge-gate-attestation.yml` is a prerequisite for the forthcoming no-bypass
+`root-merge-gate-attestation.yml` supplies the approval for the active no-bypass
 `main` ruleset. The repository currently has a single human administrator, so the
 ruleset's one-approval requirement is satisfied only after that human has
 independently reviewed one exact PR head and then dispatches this workflow with
 matching inputs.
 
-This workflow is **not** a ruleset bypass. The planned ruleset will have **no
+This workflow is **not** a ruleset bypass. The active ruleset has **no
 bypass actors**. The workflow only supplies the required approval for **one
 exact root-reviewed head SHA**. All other protections still apply:
 
 - required hosted CI checks (including coverage and release-critical live checks)
 - every review thread resolved
 - stale approvals dismissed on material pushes
-- last-push approval required
 - merge-queue validation of the combined result before landing
+
+`require_last_push_approval` is intentionally `false`: the owner removed the
+separate requirement that the latest reviewable push be approved by someone
+other than its pusher. Exact-head attestation, stale-review dismissal, hosted CI,
+thread resolution, and merge-queue checks remain mandatory.
 
 ### Security and audit contract
 

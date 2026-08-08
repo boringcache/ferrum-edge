@@ -555,7 +555,6 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     for plugin_source in [
         include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/serverless_function.rs"),
-        include_str!("../../../src/plugins/ai_federation.rs"),
     ] {
         assert!(plugin_source.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
         assert!(plugin_source.contains("async fn dispatch_finalized_request_egress("));
@@ -565,6 +564,17 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
                 .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
         );
     }
+
+    // Streaming federation performs only reversible provider selection in
+    // `before_proxy`; it opts into the post-backend-path-policy pass. Actual
+    // provider I/O remains in finalized request egress after final-body policy.
+    let federation = include_str!("../../../src/plugins/ai_federation.rs");
+    assert!(federation.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
+    assert!(federation.contains("async fn dispatch_finalized_request_egress("));
+    assert!(federation.contains("    async fn before_proxy("));
+    assert!(
+        federation.contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+    );
 }
 
 #[test]
@@ -3560,25 +3570,39 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
 }
 
 #[test]
-fn test_direct_http2_pool_dispatch_disabled_by_body_limits() {
+fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
+    // Issue #3622: nonzero body limits are enforced in-path on direct-H2
+    // (413 / 502), so they must not disqualify ordinary dispatch.
     assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
-    assert!(!can_dispatch_direct_http2_pool(true, false, false, 1, 0));
-    assert!(!can_dispatch_direct_http2_pool(true, false, false, 0, 1));
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 0));
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 1));
+    assert!(can_dispatch_direct_http2_pool(
+        true, false, false, 10_485_760, 10_485_760
+    ));
+    // Retry body replay / request-body buffering still force reqwest.
     assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
+    assert!(!can_dispatch_direct_http2_pool(
+        true, false, true, 10_485_760, 10_485_760
+    ));
+    assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
 }
 
 #[test]
-fn test_direct_http2_sni_uses_body_compat_gate_not_body_limit_gate() {
-    // Issue #2954: SNI cannot fall back to reqwest, so nonzero body limits
-    // must not disqualify direct-H2 when retries/buffering are absent.
-    // Callers use can_use_direct_http2_pool for the SNI path.
-    assert!(can_use_direct_http2_pool(true, false, false));
-    assert!(!can_use_direct_http2_pool(true, true, false));
-    assert!(!can_use_direct_http2_pool(true, false, true));
-    // Ordinary preference still requires both body limits at 0.
-    assert!(!can_dispatch_direct_http2_pool(
-        true, false, false, 10_485_760, 10_485_760
-    ));
+fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
+    // Ordinary and SNI routes share the same body-compat gate; body-size
+    // limits no longer fork the predicate.
+    assert_eq!(
+        can_use_direct_http2_pool(true, false, false),
+        can_dispatch_direct_http2_pool(true, false, false, 10_485_760, 10_485_760)
+    );
+    assert_eq!(
+        can_use_direct_http2_pool(true, true, false),
+        can_dispatch_direct_http2_pool(true, true, false, 0, 0)
+    );
+    assert_eq!(
+        can_use_direct_http2_pool(true, false, true),
+        can_dispatch_direct_http2_pool(true, false, true, 0, 0)
+    );
 }
 
 #[test]

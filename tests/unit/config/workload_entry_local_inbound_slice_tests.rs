@@ -84,6 +84,7 @@ fn egress_narrowing_sidecar(namespace: &str) -> MeshSidecar {
         }],
         ingress_declared: false,
         ingress: Vec::new(),
+        outbound_traffic_policy: None,
     }
 }
 
