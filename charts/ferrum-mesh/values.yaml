@@ -544,9 +544,19 @@ nodeAgent:
     # because Helm's hook wait only watches Job and Pod kinds — a hook
     # DaemonSet alone would be fire-and-forget. So a node that cannot be
     # cleaned fails the uninstall visibly instead of silently stranding a
-    # chained conflist that points at a dead socket. The wait Job's Role
-    # grants exactly `get` on that one DaemonSet by name; the cleanup pods
-    # themselves get no token at all.
+    # chained conflist that points at a dead socket. Once every node has
+    # reported success the Job deletes the cleanup DaemonSet itself and waits
+    # until the API server no longer serves it. Its Role grants exactly `get`
+    # and `delete` on that one DaemonSet by name (plus `get` on its status);
+    # the cleanup pods themselves get no token at all.
+    #
+    # The cleanup ServiceAccounts, Role and RoleBinding are ordinary release
+    # resources, not hook resources, and the cleanup DaemonSet carries no
+    # `hook-succeeded` deletion policy: when a hook fails, Helm deletes the
+    # earlier hooks that carry that policy, so a failed wait would otherwise
+    # take the identity, the RBAC and the evidence with it. As written, a
+    # failed uninstall leaves the DaemonSet, its logs and its identity in
+    # place, and re-running `helm uninstall` retries cleanly.
     #
     # Cleanup is scoped by the ownership marker written at install time and
     # is a no-op for artifacts owned by a different release. It runs on

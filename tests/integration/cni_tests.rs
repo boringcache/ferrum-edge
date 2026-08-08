@@ -1430,7 +1430,8 @@ mod install_lifecycle {
         CniUninstallReport, FERRUM_MANAGED_BY, OWNERSHIP_MANIFEST_FILE_NAME, install, uninstall,
     };
     use ferrum_edge::cni::lifecycle::{
-        RollbackWatchConfig, RollbackWatchOutcome, run_rollback_watch,
+        RollbackWatchConfig, RollbackWatchOutcome, clear_stale_ready_marker, ready_marker_present,
+        run_rollback_watch, write_ready_marker,
     };
     use serde_json::Value;
 
@@ -1879,6 +1880,170 @@ mod install_lifecycle {
         assert_eq!(outcome, RollbackWatchOutcome::NeverPublished);
         assert!(node.conf_path().exists());
         assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn a_status_probe_before_publication_can_never_disarm_the_rollback() {
+        // The STATUS socket is a node-scoped path that outlives any one
+        // install: a previous node-agent generation (or a socket left behind
+        // by one) can answer `Ok` for a chain THIS generation has not written
+        // yet. Accepting that answer as readiness would return `Ready`, hold
+        // for the lifetime of the pod, and leave the rollback permanently
+        // disarmed while the installer went on to publish. Publication is the
+        // only thing that may end phase 1, so the probe must not be consulted
+        // at all before it.
+        let node = Node::new();
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(
+            outcome,
+            RollbackWatchOutcome::NeverPublished,
+            "an always-ready probe must not turn an install that never published into `Ready`"
+        );
+        assert_eq!(
+            probes, 0,
+            "readiness must not be probed before this generation's conflist is on disk"
+        );
+        assert!(!node.conf_path().exists());
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn a_ready_probe_does_not_adopt_another_generations_published_chain() {
+        // Same fail-open shape, one step further along: a stale STATUS `Ok`
+        // arrives while a DIFFERENT generation owns the chain. This watcher
+        // still published nothing of its own, so it must report exactly that
+        // and leave the other generation's artifacts alone.
+        let node = Node::new();
+        node.install(OWNER, "gen-2");
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::NeverPublished);
+        assert_eq!(probes, 0);
+        assert!(node.conf_path().exists());
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-2",
+            "the other generation's chain must survive untouched"
+        );
+    }
+
+    #[test]
+    fn readiness_observed_after_publication_still_retains_the_chain() {
+        // The other half of the same rule: once THIS generation's conflist is
+        // on disk, a STATUS `Ok` is genuine evidence and must still disarm the
+        // rollback. Phase 1 is a gate on publication, not a delay.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::Ready);
+        assert_eq!(probes, 1, "phase 2 must probe as soon as it starts");
+        assert!(node.conf_path().exists());
+    }
+
+    #[test]
+    fn a_ready_marker_from_a_previous_container_start_is_retracted() {
+        // /tmp is an emptyDir that survives a container restart, so a marker
+        // published by an earlier run would make the readiness probe pass for
+        // work the CURRENT run has not done. It has to be gone before this
+        // invocation starts.
+        let root = tempfile::tempdir().expect("tempdir");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        let marker = marker.display().to_string();
+        write_ready_marker(&marker).expect("a first run publishes readiness");
+        assert!(ready_marker_present(&marker));
+
+        clear_stale_ready_marker(&marker).expect("a stale marker is retractable");
+        assert!(!ready_marker_present(&marker), "the next run starts un-ready");
+        // Retracting an absent marker is the state this is trying to reach.
+        clear_stale_ready_marker(&marker).expect("retraction is idempotent");
+
+        write_ready_marker(&marker).expect("this run publishes its own readiness");
+        assert!(ready_marker_present(&marker));
+        assert_eq!(
+            fs::symlink_metadata(&marker).expect("marker stat").len(),
+            b"ferrum-cni cleanup complete\n".len() as u64
+        );
+    }
+
+    #[test]
+    fn a_symlinked_ready_marker_is_refused_and_never_followed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"someone else's file").expect("write victim");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        std::os::unix::fs::symlink(&victim, &marker).expect("plant symlink");
+        let marker_arg = marker.display().to_string();
+
+        // Retraction refuses rather than deleting somebody else's object, and
+        // reports it as an unsafe marker rather than an ordinary IO error.
+        let err = clear_stale_ready_marker(&marker_arg).expect_err("a symlink must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnsafeReadyMarker { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&marker)
+                .expect("symlink stat")
+                .file_type()
+                .is_symlink(),
+            "the planted link must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read(&victim).expect("victim still readable"),
+            b"someone else's file",
+            "the symlink target must never be read, written or removed"
+        );
+
+        // A symlink is not readiness either, so the probe cannot be satisfied
+        // through one even if retraction were bypassed.
+        assert!(!ready_marker_present(&marker_arg));
+
+        // Publishing through the same path replaces the LINK, never its
+        // target: `rename` does not traverse.
+        write_ready_marker(&marker_arg).expect("publish over a planted link");
+        assert!(
+            fs::symlink_metadata(&marker)
+                .expect("marker stat")
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(&victim).expect("victim still readable"),
+            b"someone else's file",
+            "publishing replaces the link, never what it pointed at"
+        );
+    }
+
+    #[test]
+    fn a_non_regular_ready_marker_path_is_refused_without_deletion() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        fs::create_dir(&marker).expect("plant a directory at the marker path");
+        let marker_arg = marker.display().to_string();
+        let err = clear_stale_ready_marker(&marker_arg).expect_err("a directory must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnsafeReadyMarker { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(marker.is_dir(), "nothing may be removed recursively");
+        assert!(!ready_marker_present(&marker_arg));
     }
 
     #[test]

@@ -164,6 +164,23 @@ mod cni_main {
     /// success for it would let `helm uninstall` declare a clean removal that
     /// silently strands the node.
     fn run_uninstall() -> ExitCode {
+        // Retract any marker a PREVIOUS start of this container published,
+        // before touching the node. `/tmp` is an emptyDir that outlives a
+        // container restart, so a marker left by an earlier run would make the
+        // readiness probe pass for work this invocation has not done yet.
+        // Holding is opt-in: absent `READY_MARKER_PATH` this is a plain
+        // one-shot cleanup (manual runs, Jobs) with no marker at all.
+        let marker_path = lifecycle::ready_marker_path_from_env().ok();
+        if let Some(marker_path) = marker_path.as_deref()
+            && let Err(err) = lifecycle::clear_stale_ready_marker(marker_path)
+        {
+            eprintln!(
+                "ferrum-cni: refusing to run: the cleanup readiness marker from a previous \
+                 start could not be retracted: {err}"
+            );
+            return ExitCode::from(1);
+        }
+
         let report = match install::uninstall_from_env() {
             Ok(report) => report,
             Err(err) => {
@@ -195,13 +212,12 @@ mod cni_main {
             );
         }
 
-        // Holding is opt-in. Absent `READY_MARKER_PATH` this is a plain
-        // one-shot cleanup (manual runs, Jobs); with it set the process stays
-        // up so a DaemonSet-shaped Helm hook can become Ready exactly once
-        // the work on this node is done.
-        match lifecycle::ready_marker_path_from_env() {
-            Err(_) => ExitCode::SUCCESS,
-            Ok(marker_path) => {
+        // Readiness is published only now, by THIS invocation, after its own
+        // cleanup succeeded. With the marker set the process then stays up so
+        // a DaemonSet-shaped Helm hook can observe readiness.
+        match marker_path {
+            None => ExitCode::SUCCESS,
+            Some(marker_path) => {
                 if let Err(err) = lifecycle::write_ready_marker(&marker_path) {
                     eprintln!(
                         "ferrum-cni: cleanup succeeded but the readiness marker at \
@@ -238,7 +254,10 @@ mod cni_main {
     /// Helm's hook wait only watches `Job` and `Pod` kinds, so a hook
     /// DaemonSet alone would be fire-and-forget and the release could be torn
     /// down while cleanup was still starting on some nodes. This runs as a
-    /// later-weighted hook Job and blocks until every cleanup pod is Ready.
+    /// later-weighted hook Job, blocks until every cleanup pod is Ready, and
+    /// then deletes the cleanup DaemonSet and confirms it is gone — the
+    /// DaemonSet carries no `hook-succeeded` policy precisely so that a
+    /// failure here leaves it, and its logs, in place for the retry.
     fn run_await_cleanup() -> ExitCode {
         let config = match CleanupWaitConfig::from_env() {
             Ok(config) => config,
@@ -257,7 +276,7 @@ mod cni_main {
                 return ExitCode::from(1);
             }
         };
-        match runtime.block_on(lifecycle::await_cleanup_daemonset(&config)) {
+        match runtime.block_on(lifecycle::run_cleanup_phase(&config)) {
             Ok(report) if report.scheduled_nowhere() => {
                 eprintln!(
                     "ferrum-cni: the cleanup DaemonSet scheduled onto no node, so no node was \

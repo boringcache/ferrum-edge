@@ -19,27 +19,46 @@
     while cleanup pods were still starting. The Job blocks on the DaemonSet's
     ready count and gives the phase a completion boundary Helm understands.
     A node that cannot be cleaned fails the uninstall visibly instead of
-    reporting a clean removal.
+    reporting a clean removal. Once every node has reported success the Job
+    deletes the cleanup DaemonSet itself (foreground propagation) and does
+    not report success until the API server no longer serves it — so no
+    cleanup pod is left running when the release goes away.
   * `pre-delete`, so all of this happens while the node-agent and its socket
     are still part of the release.
   * `pre-delete` ONLY. `helm upgrade` and `helm rollback` do not fire it, so a
     routine rolling pod replacement never removes CNI state that is still
     required.
-  * Narrow identities. The cleanup pods do pure host-filesystem work: their
-    ServiceAccount has no role and their token is not mounted at all. Only
-    the wait Job talks to the API, and its Role grants exactly `get` on the
-    one DaemonSet by name.
+  * Narrow identities, held OUTSIDE this hook. The cleanup ServiceAccounts,
+    Role and RoleBinding are ordinary release resources in
+    cni-cleanup-rbac.yaml, not hook resources — see the long explanation
+    there. In short: when a hook fails, Helm deletes the earlier hooks that
+    carry `hook-succeeded`, so identity and RBAC held that way would vanish
+    exactly when a retry needs them.
+  * Deletion policies are asymmetric, on purpose:
+      - the DaemonSet gets `before-hook-creation` ONLY. Helm's hook wait
+        understands neither DaemonSets nor readiness of their pods, so a
+        `hook-succeeded` policy would delete it the instant it was created,
+        and would also delete it (together with any other succeeded hook) if
+        the wait Job later failed. The wait Job removes it explicitly instead,
+        after every node has reported success.
+      - the wait Job may keep `hook-succeeded`: it is the last hook in the
+        phase, and everything a retry depends on — the ServiceAccounts, the
+        Role, the RoleBinding, and (on failure) the DaemonSet itself — is
+        durable independently of it.
   * Removal itself is ownership-scoped in the binary — only artifacts carrying
     this release's `managedBy`/`owner` marker are touched, and only after
     symlink/hard-link/size/content checks. Another product's CNI config, or
     another Ferrum release's, is left exactly as it was.
 
-  Failure is deliberately loud: a cleanup container exits non-zero, its pod
-  restarts, readiness never flips, the wait Job times out, and
-  `helm uninstall` fails with every hook resource still present for
-  `kubectl logs`. Helm's `hook-succeeded` deletion only runs after the whole
-  phase succeeds, so nothing is cleaned up out from under an investigation.
-  Recover with the manual steps in docs/node_agent.md "Recovering a node".
+  Failure is deliberately loud AND recoverable: a cleanup container exits
+  non-zero, its pod restarts, readiness never flips, the wait Job times out,
+  and `helm uninstall` fails. The cleanup DaemonSet, its pods and its logs
+  survive that failure (no `hook-succeeded` policy), as do the release-owned
+  ServiceAccounts and RBAC, so `kubectl -n <ns> logs
+  daemonset/ferrum-mesh-cni-cleanup` still works and re-running
+  `helm uninstall` re-creates the DaemonSet (`before-hook-creation`) and
+  drives the same wait again. Recover a node that cannot be cleaned at all
+  with the manual steps in docs/node_agent.md "Recovering a node".
 */ -}}
 {{- $cni := .Values.nodeAgent.cni }}
 {{- $uninstall := dict "enabled" false }}
@@ -53,75 +72,6 @@
 {{- $image := printf "%s:%s" $imageRepository $imageTag -}}
 {{- $ownerId := printf "%s/%s" .Release.Namespace .Release.Name -}}
 {{- $readyMarker := "/tmp/ferrum-cni-uninstall.ready" -}}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ferrum-mesh-cni-cleanup
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: ferrum-mesh-cni-cleanup
-    app.kubernetes.io/instance: {{ .Release.Name }}
-  annotations:
-    "helm.sh/hook": pre-delete
-    "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
-automountServiceAccountToken: false
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ferrum-mesh-cni-cleanup-wait
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
-    app.kubernetes.io/instance: {{ .Release.Name }}
-  annotations:
-    "helm.sh/hook": pre-delete
-    "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ferrum-mesh-cni-cleanup-wait
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
-    app.kubernetes.io/instance: {{ .Release.Name }}
-  annotations:
-    "helm.sh/hook": pre-delete
-    "helm.sh/hook-weight": "-9"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
-rules:
-  # The narrowest grant that can answer "did cleanup finish on every node":
-  # read the status of exactly one DaemonSet, by name, in this namespace.
-  # No list, no watch (neither can be restricted by resourceNames), no write.
-  - apiGroups: ["apps"]
-    resources: ["daemonsets", "daemonsets/status"]
-    resourceNames: ["ferrum-mesh-cni-cleanup"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ferrum-mesh-cni-cleanup-wait
-  namespace: {{ .Release.Namespace }}
-  labels:
-    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
-    app.kubernetes.io/instance: {{ .Release.Name }}
-  annotations:
-    "helm.sh/hook": pre-delete
-    "helm.sh/hook-weight": "-9"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: ferrum-mesh-cni-cleanup-wait
-subjects:
-  - kind: ServiceAccount
-    name: ferrum-mesh-cni-cleanup-wait
-    namespace: {{ .Release.Namespace }}
----
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -133,7 +83,12 @@ metadata:
   annotations:
     "helm.sh/hook": pre-delete
     "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- /* before-hook-creation ONLY — the wait Job owns the deletion. See
+           the header: a hook-succeeded policy here would delete this
+           DaemonSet immediately (Helm cannot wait on the kind) and would
+           also delete it if the wait Job later failed, destroying both the
+           evidence and the retry. */}}
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   selector:
     matchLabels:
@@ -238,6 +193,9 @@ metadata:
     "helm.sh/hook": pre-delete
     {{- /* Later than the DaemonSet so it waits on an object that exists. */}}
     "helm.sh/hook-weight": "10"
+    {{- /* Safe to delete on success: this is the last hook in the phase, and
+           everything a retry needs (the ServiceAccounts, the Role, the
+           RoleBinding, and on failure the cleanup DaemonSet) outlives it. */}}
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   {{- /* One attempt. A retry would restart the wait budget and hide a node

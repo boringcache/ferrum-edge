@@ -22,6 +22,17 @@ name: CNI Install Lifecycle Live
 #      the primary CNI configuration is byte-identical to what it was before
 #      any of this ran, and proves pod creation still works afterwards.
 #
+# A final step then drives the CHART's own cleanup manifests (rendered by
+# `helm template`, with no substitution beyond the binary path this image
+# uses) across both nodes, and proves the three properties the resource graph
+# exists for: a node that cannot be cleaned fails the wait Job; that failure
+# leaves the cleanup DaemonSet, its logs and its release-owned identity/RBAC
+# in place so the retry works; and a successful wait deletes the cleanup
+# DaemonSet itself and does not report success until the API server no longer
+# serves it. Helm's own hook ORCHESTRATION is still not exercised here (see
+# "Known limits" in docs/node_agent.md) — the resources, their annotations and
+# their behaviour are.
+#
 # Every lifecycle pod uses hostNetwork, because a pod that needed its own CNI
 # sandbox could not start on a node whose chain is broken — the same reason
 # the chart's cleanup hook is hostNetwork.
@@ -40,6 +51,7 @@ on:
       - "src/bin/ferrum-cni.rs"
       - "src/cni/**"
       - "charts/ferrum-mesh/templates/cni-uninstall-hook.yaml"
+      - "charts/ferrum-mesh/templates/cni-cleanup-rbac.yaml"
       - "charts/ferrum-mesh/templates/node-agent-daemonset.yaml"
       - "docs/node_agent.md"
       - "docs/node_agent_security.md"
@@ -414,6 +426,126 @@ jobs:
           fi
           echo "Confirmed live: after uninstall the node creates pods normally (recovered-pod reached '$phase')."
 
+      - name: Prove the chart's cleanup resource graph, its deletion, and its retry path
+        run: |
+          set -euo pipefail
+          worker="${KIND_CLUSTER}-worker"
+          ns=default
+          # A DISTINCT conflist name, deliberately sorting AFTER the cluster's
+          # own config. This step obstructs cleanup on purpose, and kubelet
+          # selects the lexicographically first config in the directory — a
+          # foreign file planted under the real `00-` name would become the
+          # node's network and could take the node NotReady, which would then
+          # be the reason the wait Job failed rather than the one under test.
+          probe_conf=99-ferrum-cleanup-probe.conflist
+
+          # Render the chart's OWN cleanup manifests. The only substitution is
+          # the binary path: the shared packaging action always lands the
+          # supplied binary at /app/ferrum-edge, while the chart invokes
+          # /app/ferrum-cni. Everything that this step is actually asserting —
+          # the resource graph, the hook annotations, the RBAC, hostNetwork,
+          # the security context, the env wiring — stays chart-authored.
+          render() {
+            helm template ferrum ./charts/ferrum-mesh --namespace "$ns" \
+              --set nodeAgent.enabled=true \
+              --set nodeAgent.cni.enabled=true \
+              --set nodeAgent.captureMode=iptables \
+              --set image.repository="${FERRUM_IMAGE_REPOSITORY}" \
+              --set image.tag="${FERRUM_IMAGE_TAG}" \
+              --set image.pullPolicy=Never \
+              --set nodeAgent.cni.confFileName="${probe_conf}" \
+              --set nodeAgent.cni.uninstall.timeoutSeconds=90 \
+              --show-only "templates/$1" \
+              | sed 's#/app/ferrum-cni#/app/ferrum-edge#'
+          }
+          render cni-cleanup-rbac.yaml > cleanup-rbac.yaml
+          render cni-uninstall-hook.yaml > cleanup-hook.yaml
+
+          # The identity and RBAC are ordinary release resources: they must
+          # carry no hook annotation at all, or Helm would delete them the
+          # moment a later hook in the phase failed.
+          if grep -Fq 'helm.sh/hook' cleanup-rbac.yaml; then
+            echo "::error title=Cleanup identity is a hook resource::a failed wait Job would delete the SA/RBAC a retry needs"
+            exit 1
+          fi
+          kubectl apply -n "$ns" -f cleanup-rbac.yaml
+
+          # Split the hook file so the DaemonSet and the wait Job can be
+          # driven independently — Helm's own weight ordering does exactly
+          # this, one hook at a time.
+          python3 - <<'PY'
+          import re
+          docs = [d for d in re.split(r'(?m)^---$', open('cleanup-hook.yaml').read()) if d.strip()]
+          ds = [d for d in docs if 'kind: DaemonSet' in d]
+          job = [d for d in docs if 'kind: Job' in d]
+          assert len(ds) == 1 and len(job) == 1, f"expected one DaemonSet and one Job, got {len(ds)}/{len(job)}"
+          open('cleanup-daemonset.yaml', 'w').write(ds[0])
+          open('cleanup-wait-job.yaml', 'w').write(job[0])
+          PY
+
+          wait_for_job() {
+            local deadline=$((SECONDS + ${2:-240})) phase=""
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              phase="$(kubectl -n "$ns" get pods -l "job-name=$1" \
+                -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+              case "$phase" in
+                Succeeded|Failed) break ;;
+              esac
+              sleep 5
+            done
+            echo "--- $1 logs (phase=$phase) ---"
+            kubectl -n "$ns" logs "job/$1" --all-containers --tail=200 || true
+            [ "$phase" = "Succeeded" ]
+          }
+
+          # -----------------------------------------------------------------
+          # A. Failure path. A foreign conflist at the configured name is not
+          #    this release's to remove, so `uninstall` refuses it and the
+          #    worker's cleanup pod never becomes Ready.
+          # -----------------------------------------------------------------
+          docker exec -i "$worker" sh -c "cat > /etc/cni/net.d/${probe_conf}" <<'JSON'
+          {"cniVersion":"1.0.0","name":"operator-authored","plugins":[{"type":"ferrum-cni","ferrum":{"socketPath":"/custom.sock"}}]}
+          JSON
+          kubectl apply -n "$ns" -f cleanup-daemonset.yaml
+          kubectl apply -n "$ns" -f cleanup-wait-job.yaml
+          if wait_for_job ferrum-mesh-cni-cleanup-wait 240; then
+            echo "::error title=Wait Job passed with an uncleaned node::a node that cannot be cleaned must fail the uninstall"
+            exit 1
+          fi
+          # Everything a retry depends on has to have survived that failure.
+          kubectl -n "$ns" get daemonset ferrum-mesh-cni-cleanup
+          kubectl -n "$ns" get serviceaccount ferrum-mesh-cni-cleanup
+          kubectl -n "$ns" get serviceaccount ferrum-mesh-cni-cleanup-wait
+          kubectl -n "$ns" get role ferrum-mesh-cni-cleanup-wait
+          kubectl -n "$ns" get rolebinding ferrum-mesh-cni-cleanup-wait
+          echo "Confirmed live: a failed cleanup leaves the DaemonSet, its logs and its identity in place."
+
+          # -----------------------------------------------------------------
+          # B. Retry path. Remove the obstruction, restart the cleanup pods,
+          #    and re-run the wait Job with the identity that survived.
+          # -----------------------------------------------------------------
+          docker exec "$worker" rm -f "/etc/cni/net.d/${probe_conf}"
+          kubectl -n "$ns" delete pod -l app.kubernetes.io/name=ferrum-mesh-cni-cleanup --wait=true
+          kubectl -n "$ns" delete job ferrum-mesh-cni-cleanup-wait --wait=true
+          kubectl apply -n "$ns" -f cleanup-wait-job.yaml
+          if ! wait_for_job ferrum-mesh-cni-cleanup-wait 240; then
+            echo "::error title=Retry did not succeed::cleanup should have completed on every node after the obstruction was removed"
+            exit 1
+          fi
+          # The wait Job owns the DaemonSet's removal, and reports success only
+          # once the API server no longer serves it.
+          if kubectl -n "$ns" get daemonset ferrum-mesh-cni-cleanup 2>/dev/null; then
+            echo "::error title=Cleanup DaemonSet still present::the wait Job must delete it and verify it is gone before reporting success"
+            exit 1
+          fi
+          if [ -n "$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=ferrum-mesh-cni-cleanup -o name)" ]; then
+            echo "::error title=Cleanup pods still running::foreground deletion must have reaped them before success was reported"
+            exit 1
+          fi
+          echo "Confirmed live: the wait Job deleted the cleanup DaemonSet and proved it was gone."
+
+          kubectl delete -n "$ns" -f cleanup-rbac.yaml --ignore-not-found
+
       - name: Collect diagnostics
         if: always()
         run: |
@@ -424,9 +556,14 @@ jobs:
           kubectl get pods -A -o wide > "$results/pods.txt" 2>&1
           kubectl get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
           kubectl describe pods > "$results/pods-describe.txt" 2>&1
-          for job in cni-install cni-rollback cni-reinstall cni-uninstall cni-uninstall-repeat; do
+          for job in cni-install cni-rollback cni-reinstall cni-uninstall cni-uninstall-repeat \
+            ferrum-mesh-cni-cleanup-wait; do
             kubectl logs "job/$job" --all-containers --tail=500 > "$results/$job.log" 2>&1
           done
+          kubectl logs daemonset/ferrum-mesh-cni-cleanup --all-containers --tail=500 \
+            > "$results/cni-cleanup-daemonset.log" 2>&1
+          kubectl get daemonset,job,serviceaccount,role,rolebinding -o wide \
+            > "$results/cleanup-graph.txt" 2>&1
           {
             echo "=== /etc/cni/net.d ==="
             docker exec "${KIND_CLUSTER}-worker" ls -la /etc/cni/net.d

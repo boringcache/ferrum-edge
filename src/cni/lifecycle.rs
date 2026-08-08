@@ -38,7 +38,12 @@
 //!    the node now depends on the node-agent. An installer that never
 //!    publishes never created a dependency, so there is nothing to roll back
 //!    and the watcher reports [`RollbackWatchOutcome::NeverPublished`].
-//! 2. **Readiness.** Only now does the budget start.
+//! 2. **Readiness.** Only now does the budget start, and only now is STATUS
+//!    probed at all. A STATUS answer observed *before* publication says
+//!    nothing about this generation — the socket path is node-scoped and a
+//!    previous node-agent generation can still be answering on it — so
+//!    treating it as readiness would permanently disarm the rollback for a
+//!    chain that had not been written yet.
 //!
 //! Cleanup additionally takes the node's install lock
 //! ([`crate::cni::install::INSTALL_LOCK_FILE_NAME`]) for its whole run, and
@@ -174,11 +179,18 @@ pub fn run_rollback_watch(
     // Phase 1 — publication. The budget below must not start while the
     // installer may still be working, and cleanup must never run against an
     // install that has not completed.
+    //
+    // Readiness is deliberately NOT probed here. The STATUS socket is a
+    // node-scoped path that outlives any one install: a still-running previous
+    // node-agent generation, or a socket left behind by one, answers `Ok` for
+    // a chain this generation has not published yet. Accepting that answer
+    // would return `Ready` and disarm the rollback permanently — the watcher
+    // then holds until the pod dies while the generation it is scoped to goes
+    // on to publish a conflist nothing is left to remove. The only thing that
+    // may end this phase is *this* generation's own publication marker, or the
+    // publish deadline.
     let publish_deadline = Instant::now() + config.publish_timeout;
     loop {
-        if probe() {
-            return Ok(RollbackWatchOutcome::Ready);
-        }
         if this_generation_is_published(config) {
             break;
         }
@@ -336,9 +348,10 @@ impl CleanupWaitReport {
     }
 }
 
-/// Block until every node's cleanup pod is Ready — that is, until
-/// `ferrum-cni uninstall` has succeeded on each node the DaemonSet scheduled
-/// onto.
+/// Run the whole Helm `pre-delete` completion boundary: block until every
+/// node's cleanup pod is Ready — that is, until `ferrum-cni uninstall` has
+/// succeeded on each node the DaemonSet scheduled onto — then remove the
+/// cleanup DaemonSet and prove it is gone.
 ///
 /// This exists because Helm's hook wait only watches `Job` and `Pod` kinds: a
 /// hook DaemonSet is created and then immediately left behind, which would let
@@ -347,15 +360,13 @@ impl CleanupWaitReport {
 /// phase a completion boundary Helm does understand, and makes a node that
 /// cannot be cleaned fail the uninstall instead of passing silently.
 ///
-/// Completion requires the DaemonSet controller to have observed the object
-/// (`status.observedGeneration >= metadata.generation`; a status that carries
-/// no observed generation at all is treated as unobserved, never as
-/// observed-and-idle). An all-zero status additionally has to persist for
-/// [`ZERO_DESIRED_SETTLE`], so a freshly created DaemonSet's initial `0/0`
-/// snapshot can never be mistaken for "nothing to do".
-pub async fn await_cleanup_daemonset(
-    config: &CleanupWaitConfig,
-) -> Result<CleanupWaitReport, String> {
+/// The DaemonSet is deleted here rather than by a Helm `hook-succeeded`
+/// policy because that policy would also delete it the moment the *DaemonSet*
+/// hook "succeeded" — which for a non-waitable kind is immediately — and,
+/// worse, Helm deletes every previously succeeded `hook-succeeded` resource
+/// when a later hook in the same phase fails. Owning the deletion here is what
+/// lets a failed wait leave the DaemonSet, its logs, and its pods in place.
+pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWaitReport, String> {
     use k8s_openapi::api::apps::v1::DaemonSet;
     use kube::Api;
 
@@ -364,6 +375,26 @@ pub async fn await_cleanup_daemonset(
         .map_err(|err| format!("could not build a Kubernetes client: {err}"))?;
     let api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
 
+    let report = await_cleanup_daemonset(&api, config).await?;
+    // The cleanup DaemonSet is a `pre-delete` hook that deliberately carries
+    // NO `hook-succeeded` deletion policy, so Helm leaves it alone. Removing
+    // it is this Job's job, and it happens only after every node reported
+    // success: while it exists, the pods it owns keep holding, and the release
+    // is not yet allowed to disappear underneath them.
+    delete_cleanup_daemonset(&api, config).await?;
+    Ok(report)
+}
+
+/// Completion requires the DaemonSet controller to have observed the object
+/// (`status.observedGeneration >= metadata.generation`; a status that carries
+/// no observed generation at all is treated as unobserved, never as
+/// observed-and-idle). An all-zero status additionally has to persist for
+/// [`ZERO_DESIRED_SETTLE`], so a freshly created DaemonSet's initial `0/0`
+/// snapshot can never be mistaken for "nothing to do".
+async fn await_cleanup_daemonset(
+    api: &kube::Api<k8s_openapi::api::apps::v1::DaemonSet>,
+    config: &CleanupWaitConfig,
+) -> Result<CleanupWaitReport, String> {
     let deadline = Instant::now() + config.timeout;
     let mut last = CleanupWaitReport {
         desired: 0,
@@ -431,26 +462,152 @@ pub async fn await_cleanup_daemonset(
     }
 }
 
-/// Write the marker the Helm pre-delete hook's readiness probe reads.
+/// Delete the cleanup DaemonSet and do not return until the API server no
+/// longer serves it.
+///
+/// Foreground propagation is deliberate: the object survives its own delete
+/// call until the garbage collector has removed the pods it owns, so a `404`
+/// here is proof that no cleanup pod is still running anywhere on the cluster.
+/// Only then may `helm uninstall` proceed to delete the node-agent.
+///
+/// Failing to delete fails the whole phase. That is the fail-closed direction:
+/// the release-owned identity and RBAC this Job runs as are ordinary release
+/// resources, not hook resources, so they are still there for a retry, and a
+/// re-run of `helm uninstall` re-creates the DaemonSet
+/// (`before-hook-creation`) and drives the same wait again.
+async fn delete_cleanup_daemonset(
+    api: &kube::Api<k8s_openapi::api::apps::v1::DaemonSet>,
+    config: &CleanupWaitConfig,
+) -> Result<(), String> {
+    use kube::api::{DeleteParams, PropagationPolicy};
+
+    let deadline = Instant::now() + config.timeout;
+    let params = DeleteParams {
+        propagation_policy: Some(PropagationPolicy::Foreground),
+        ..DeleteParams::default()
+    };
+    match api.delete(&config.daemonset_name, &params).await {
+        Ok(_) => {}
+        // Already gone (a concurrent retry, an operator) is the state this
+        // function is trying to reach, so it is a success, not an error.
+        Err(kube::Error::Api(err)) if err.code == 404 => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "cleanup finished on every node but DaemonSet {} could not be deleted: {err}. \
+                 The cleanup pods are still running; re-run `helm uninstall` once the API error \
+                 is resolved.",
+                config.daemonset_name
+            ));
+        }
+    }
+
+    loop {
+        match api.get_opt(&config.daemonset_name).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
+            Err(err) => {
+                // Never read an API failure as "it is gone".
+                eprintln!(
+                    "ferrum-cni: could not confirm DaemonSet {} was deleted; retrying: {err}",
+                    config.daemonset_name
+                );
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "cleanup finished on every node but DaemonSet {} was still present {}s after it \
+                 was deleted. Its pods may still be terminating; inspect `kubectl -n {} get \
+                 daemonset {}` and re-run `helm uninstall`.",
+                config.daemonset_name,
+                config.timeout.as_secs(),
+                config.namespace,
+                config.daemonset_name
+            ));
+        }
+        tokio::time::sleep(config.poll_interval.min(deadline - now)).await;
+    }
+}
+
+/// Contents of the readiness marker. Purely diagnostic — readiness is the
+/// existence of the file, not anything inside it.
+const READY_MARKER_CONTENTS: &[u8] = b"ferrum-cni cleanup complete\n";
+
+/// Retract any readiness marker left behind by an EARLIER start of this
+/// container, before the current invocation does any work.
+///
+/// The cleanup container restarts after a failed run and its marker lives in
+/// an `emptyDir`, which survives that restart. A marker from a previous start
+/// would make the `exec` readiness probe pass while the *current* invocation
+/// had not cleaned anything yet — Helm would read "cleanup finished on this
+/// node" from a run that had barely begun, and delete the node-agent out from
+/// under a node whose chain is still installed.
+///
+/// Nothing is followed and nothing is traversed. The path is inspected with
+/// `symlink_metadata`, and only a plain regular file is unlinked; `remove_file`
+/// unlinks the directory entry itself, so even if the entry were swapped for a
+/// symlink between the stat and the unlink, the target is never reached.
+/// Anything else at that path — a symlink, a directory, a device — is refused
+/// rather than deleted: a cleanup run that cannot own its own marker must fail
+/// loudly instead of publishing readiness through someone else's file.
+pub fn clear_stale_ready_marker(path: &str) -> Result<(), CniInstallError> {
+    let marker = Path::new(path);
+    let meta = match std::fs::symlink_metadata(marker) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(CniInstallError::Io {
+                path: path.to_string(),
+                source,
+            });
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Err(CniInstallError::UnsafeReadyMarker {
+            path: path.to_string(),
+        });
+    }
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CniInstallError::Io {
+            path: path.to_string(),
+            source,
+        }),
+    }
+}
+
+/// Publish the marker the Helm pre-delete hook's readiness probe reads.
 ///
 /// The hook pod cannot report "cleanup finished" by exiting — Helm waits for
 /// the hook resource to become ready, and a DaemonSet pod that exits is
 /// restarted. So the container completes its cleanup, drops this marker, and
 /// stays up; readiness then flips exactly once the work is done, and a failed
 /// cleanup never publishes it.
-pub fn write_ready_marker(path: &str) -> io::Result<()> {
-    let path = Path::new(path);
-    if let Some(parent) = path.parent()
+///
+/// The write goes through the installer's atomic publish: an unguessable
+/// `O_EXCL | O_NOFOLLOW` sibling renamed into place. A probe therefore never
+/// observes a partially written marker, and the publish never follows a
+/// symlink planted at the marker path.
+pub fn write_ready_marker(path: &str) -> Result<(), CniInstallError> {
+    let marker = Path::new(path);
+    if let Some(parent) = marker.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|source| CniInstallError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
-    std::fs::write(path, b"ferrum-cni cleanup complete\n")
+    install::atomic_write_file(marker, READY_MARKER_CONTENTS, Some(0o600))
 }
 
-/// True when a previous run in this container published the marker.
+/// True when THIS invocation published the marker.
+///
+/// `symlink_metadata` plus a regular-file check, so a symlink at the marker
+/// path is never readiness — only the file this run wrote is.
 pub fn ready_marker_present(path: &str) -> bool {
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Marker path for the cleanup hold/readiness pair. Shared by the cleanup

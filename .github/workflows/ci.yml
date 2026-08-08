@@ -2123,10 +2123,51 @@ jobs:
             echo "::error title=CNI cleanup pods are not hostNetwork::cleanup would deadlock behind the chain it removes"
             exit 1
           fi
-          # The wait Job's RBAC must stay a single read verb on one named object.
-          if ! grep -A2 'resourceNames: \["ferrum-mesh-cni-cleanup"\]' "$cni_out" \
-            | grep -Fq 'verbs: ["get"]'; then
-            echo "::error title=CNI cleanup RBAC widened::the wait Job may only 'get' the named cleanup DaemonSet"
+          # Hook deletion policies are asymmetric and load-bearing. Helm
+          # deletes every earlier `hook-succeeded` hook when a later hook in
+          # the same phase fails (pkg/action/hooks.go, v3 and v4), so the
+          # cleanup DaemonSet must NOT carry that policy: the wait Job deletes
+          # it explicitly, and a failed wait has to leave it for the retry.
+          if [ "$(grep -c '"helm.sh/hook-delete-policy": before-hook-creation$' "$cni_hook_out")" -ne 1 ]; then
+            echo "::error title=CNI cleanup DaemonSet deletion policy changed::the cleanup DaemonSet must carry before-hook-creation only, so a failed wait leaves it for the retry"
+            exit 1
+          fi
+          if [ "$(grep -c '"helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded$' "$cni_hook_out")" -ne 1 ]; then
+            echo "::error title=CNI cleanup wait Job deletion policy changed::exactly the wait Job may be deleted on success"
+            exit 1
+          fi
+          # Identity and RBAC must be ORDINARY release resources. As hook
+          # resources they would be deleted by the failure path above, exactly
+          # when a retry needs them.
+          cni_rbac_out="$RUNNER_TEMP/ferrum-helm-results/cni-cleanup-rbac.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --show-only templates/cni-cleanup-rbac.yaml > "$cni_rbac_out"
+          if grep -Fq 'helm.sh/hook' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup identity is a hook resource::Helm deletes succeeded hooks when a later hook fails; the cleanup SA/Role/RoleBinding must be ordinary release resources"
+            exit 1
+          fi
+          for needle in 'kind: ServiceAccount' 'kind: Role' 'kind: RoleBinding' \
+            'automountServiceAccountToken: false' \
+            'resourceNames: ["ferrum-mesh-cni-cleanup"]'; do
+            if ! grep -Fq "$needle" "$cni_rbac_out"; then
+              echo "::error title=CNI cleanup identity missing::expected ${needle} in the release-owned cleanup RBAC (#3609)"
+              exit 1
+            fi
+          done
+          # The wait Job's RBAC must stay the two named-object verbs it needs
+          # (read the status, then retire the DaemonSet) and nothing more.
+          if ! grep -Fq 'verbs: ["get", "delete"]' "$cni_rbac_out" \
+            || ! grep -Fq 'verbs: ["get"]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC verbs changed::the wait Job needs exactly get+delete on the named DaemonSet and get on its status"
+            exit 1
+          fi
+          if grep -E 'verbs: \[.*(list|watch|create|update|patch|"\*").*\]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC widened::no list/watch/write access may be granted to the cleanup wait identity"
+            exit 1
+          fi
+          if grep -Fq 'resources: ["daemonsets", "daemonsets/status"]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC collapsed::daemonsets and daemonsets/status must stay separate rules so delete is not granted on the status subresource"
             exit 1
           fi
           # The rollback watcher must be ordered BEFORE the installer, or it

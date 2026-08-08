@@ -379,6 +379,11 @@ pub enum CniInstallError {
         name: &'static str,
         expected: &'static str,
     },
+    #[error(
+        "{path} exists but is not a plain regular file; refusing to reuse it \
+         as this run's cleanup readiness marker"
+    )]
+    UnsafeReadyMarker { path: String },
 }
 
 pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
@@ -1555,7 +1560,14 @@ fn copy_and_hash(
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn atomic_write_file(
+/// Publish `contents` at `target` in one step: write an unguessable
+/// `O_EXCL | O_NOFOLLOW` sibling, then `rename` it into place.
+///
+/// A reader therefore never observes a half-written file, and the publish
+/// itself never follows a symlink sitting at `target` — `rename` replaces the
+/// link, it does not traverse it. Shared with the cleanup readiness marker so
+/// there is exactly one implementation of this rule.
+pub(crate) fn atomic_write_file(
     target: &Path,
     contents: &[u8],
     mode: Option<u32>,
