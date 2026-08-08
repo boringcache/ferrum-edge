@@ -5,7 +5,7 @@ A comprehensive feature list for Ferrum Edge.
 ## Protocol Support
 
 - **HTTP/1.1** with keep-alive connection pooling
-- **HTTP/2** via ALPN negotiation on TLS connections
+- **HTTP/2** via ALPN negotiation on TLS connections; H2-capable HTTPS backends use the multiplexed direct-H2 pool with in-path body-size enforcement (default nonzero limits no longer force the reqwest path)
 - **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 9220 §5 unmasked frames on the H3 hop, RFC 6455 masked frames on the H1.1 hop). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`)
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
