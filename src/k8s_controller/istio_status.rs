@@ -1638,23 +1638,28 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
             );
             continue;
         }
-        if endpoint.starts_with("unix://") {
-            push_unique(
-                &mut deferred,
-                "unix:// defaultEndpoint not representable (host:port backends only)",
+        // A `unix://` endpoint IS modeled (Unix-stream backend) as long as its
+        // path passes the same admission rules `MeshSidecarIngress::resolve`
+        // applies. Only an inadmissible path is deferred, and the reason echoes
+        // the specific rule it broke — never the operator-supplied path itself.
+        if let Some(socket_path) = endpoint.strip_prefix("unix://") {
+            if let Err(rejection) = crate::util::unix_socket::validate_unix_socket_path(socket_path)
+            {
+                push_unique(&mut deferred, rejection.reason());
+                continue;
+            }
+        } else {
+            let endpoint_ok = matches!(
+                endpoint.parse::<std::net::SocketAddr>(),
+                Ok(addr) if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified())
             );
-            continue;
-        }
-        let endpoint_ok = matches!(
-            endpoint.parse::<std::net::SocketAddr>(),
-            Ok(addr) if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified())
-        );
-        if !endpoint_ok {
-            push_unique(
-                &mut deferred,
-                "defaultEndpoint must be a loopback/instance-IP host:port",
-            );
-            continue;
+            if !endpoint_ok {
+                push_unique(
+                    &mut deferred,
+                    "defaultEndpoint must be a loopback/instance-IP host:port",
+                );
+                continue;
+            }
         }
         // The entry would resolve. Reserve its listener port; a later supported
         // entry on the same port is dropped by the slice resolver, so report it
@@ -3809,9 +3814,10 @@ mod tests {
 
     #[test]
     fn sidecar_unsupported_ingress_surfaces_deferred_field() {
-        // Unix-socket and non-HTTP-family listeners stay deferred even though
-        // the resource is accepted; a supported sibling is still counted as
-        // modeled.
+        // An ADMISSIBLE unix:// listener is modeled alongside the loopback one;
+        // an INADMISSIBLE socket path and a non-HTTP-family listener stay
+        // deferred with field-specific reasons even though the resource is
+        // accepted.
         let obj = object(
             "networking.istio.io/v1",
             "Sidecar",
@@ -3820,6 +3826,7 @@ mod tests {
                 "ingress": [
                     { "port": { "number": 9080, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
                     { "port": { "number": 7000, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/grpc.sock" },
+                    { "port": { "number": 7100, "protocol": "GRPC" }, "defaultEndpoint": "unix://../etc/passwd" },
                     { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" }
                 ]
             }),
@@ -3828,8 +3835,8 @@ mod tests {
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
-            Some(1),
-            "only the loopback HTTP listener is modeled"
+            Some(2),
+            "the loopback HTTP listener and the admissible unix:// listener are modeled"
         );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -3838,8 +3845,8 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("unix://")),
-            "unix-socket listener must be deferred, got {deferred:?}"
+            deferred.iter().any(|f| f.contains("not absolute")),
+            "inadmissible unix-socket path must be deferred, got {deferred:?}"
         );
         assert!(
             deferred.iter().any(|f| f.contains("non-HTTP-family")),

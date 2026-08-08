@@ -404,8 +404,9 @@ pub struct MeshSlice {
     /// Count of DISTINCT HTTP-family `ingress[]` listener ports the local
     /// workload's applicable Sidecar DECLARED (F6 §6.2), independent of how many
     /// resolved into `local_ingress_listeners`. It can EXCEED the resolved count
-    /// when an HTTP-family entry's `defaultEndpoint` is omitted / `unix://` /
-    /// off-box (the entry still declared a distinct listener port). The router
+    /// when an HTTP-family entry's `defaultEndpoint` is omitted / an
+    /// inadmissible `unix://` path / off-box (the entry still declared a
+    /// distinct listener port). The router
     /// uses it as the ingress group's `declared_http_ports` so a partially
     /// materialized group stays AMBIGUOUS to an orig-dst-less request — without
     /// it, two declared listeners with one resolved collapse to the single-listener
@@ -3531,8 +3532,8 @@ fn resolve_applicable_sidecar_outbound_policy(
 /// `declared_http_ports` is the count of DISTINCT HTTP-family listener ports the
 /// Sidecar declared (`MeshSidecarIngress::is_declared_http_family_listener`),
 /// whether or not each one's `defaultEndpoint` resolved — so it can EXCEED
-/// `resolved_listeners.len()` when an HTTP-family entry has an omitted / `unix://`
-/// / off-box endpoint. The router uses it as the ingress group's
+/// `resolved_listeners.len()` when an HTTP-family entry has an omitted / an
+/// inadmissible `unix://` / an off-box endpoint. The router uses it as the ingress group's
 /// `declared_http_ports` so a partially materialized group stays ambiguous to an
 /// orig-dst-less request (F6 §6.2): without it, two declared listeners with one
 /// resolved would collapse to a single-listener no-signal pass-through and route
@@ -3556,7 +3557,7 @@ fn resolve_selected_sidecar_ingress(
     let ingress_declared = sidecar.ingress_declared || !sidecar.ingress.is_empty();
     // Distinct HTTP-family listener ports the operator declared, counted BEFORE
     // endpoint resolution so an HTTP-family entry whose `defaultEndpoint` is
-    // omitted / `unix://` / off-box still contributes its port. Deduped by port,
+    // omitted / inadmissible `unix://` / off-box still contributes its port. Deduped by port,
     // mirroring `seen_ports` for the resolved set, so the count is over distinct
     // ports (two entries on the same port count once, like the resolver keeps the
     // first). Drives the router's fail-closed ingress port ambiguity (F6 §6.2).
@@ -7839,7 +7840,10 @@ mod tests {
                 protocol: AppProtocol::Grpc,
                 name: None,
                 bind: None,
-                default_endpoint: "unix:///var/run/grpc.sock".to_string(),
+                // An INADMISSIBLE unix path (relative), so it still fails
+                // closed. An absolute one would resolve into a Unix-stream
+                // backend (issue #3261).
+                default_endpoint: "unix://relative/grpc.sock".to_string(),
             },
         ];
         let mesh = MeshConfig {
@@ -7861,7 +7865,8 @@ mod tests {
         assert_eq!(
             slice.local_ingress_listeners.len(),
             1,
-            "only the supported loopback HTTP listener resolves; the unix-socket entry is dropped"
+            "only the supported loopback HTTP listener resolves; the inadmissible unix-socket \
+             entry is dropped"
         );
         let listener = &slice.local_ingress_listeners[0];
         assert_eq!(listener.port, 8443);
@@ -7877,15 +7882,15 @@ mod tests {
             "the applicable Sidecar declared a non-empty ingress[]"
         );
         // Codex round-4 P2: BOTH entries are HTTP-family on distinct ports (8443
-        // http + 9000 grpc), so the DECLARED count is 2 even though the unix://
-        // gRPC entry did not resolve. This is what keeps the router's ingress
+        // http + 9000 grpc), so the DECLARED count is 2 even though the
+        // inadmissible unix:// gRPC entry did not resolve. That keeps the router's ingress
         // group ambiguous (it exceeds the 1 resolved listener), so an
         // orig-dst-less request fails closed instead of routing the skipped
         // listener's traffic to the survivor.
         assert_eq!(
             slice.declared_ingress_http_ports, 2,
-            "both HTTP-family ingress ports are DECLARED even though the unix:// gRPC entry \
-             produced no resolved listener"
+            "both HTTP-family ingress ports are DECLARED even though the inadmissible unix:// \
+             gRPC entry produced no resolved listener"
         );
     }
 
@@ -8041,13 +8046,14 @@ mod tests {
                 bind: None,
                 default_endpoint: "127.0.0.1:5000".to_string(),
             },
-            // HTTP-family (gRPC) but unroutable endpoint → declared, NOT resolved.
+            // HTTP-family (gRPC) but unroutable endpoint (a traversal-like
+            // unix path fails admission) → declared, NOT resolved.
             MeshSidecarIngress {
                 port: 8443,
                 protocol: AppProtocol::Grpc,
                 name: None,
                 bind: None,
-                default_endpoint: "unix:///var/run/grpc.sock".to_string(),
+                default_endpoint: "unix:///var/../escape.sock".to_string(),
             },
             // Duplicate of the first listener port → does NOT add a distinct port.
             MeshSidecarIngress {

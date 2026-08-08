@@ -65,6 +65,7 @@ pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_proxy;
+pub mod unix_backend;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -26932,6 +26933,64 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
+    // Fail-closed gate for Unix-socket backends (a Sidecar `ingress[]`
+    // `defaultEndpoint: unix://…`, carried on the selected target's reserved
+    // `mesh.unix_socket` tag). The Unix transport is HTTP/1.1 only, so neither
+    // the gRPC pool nor the WebSocket upgrade path — both of which branch below
+    // this point and dial TCP — can serve it. The target's `host:port` is a
+    // placeholder nothing listens on (and on a sidecar it is the gateway's own
+    // inbound listener port), so falling through would be strictly worse than
+    // refusing. Mirrors the `hbone_required` / `mesh_mtls_required` contract:
+    // a mesh-tagged target that cannot dispatch over its own transport is
+    // refused, never downgraded.
+    if upstream_target
+        .as_deref()
+        .is_some_and(unix_backend::target_is_unix_backend)
+        && (is_grpc_request || request_protocol == ProxyProtocol::WebSocket)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            is_grpc_request,
+            "unix-socket backend target cannot serve gRPC or WebSocket dispatch; \
+             refusing rather than dialing the placeholder loopback address"
+        );
+        // This refusal precedes any backend dispatch, so release a HALF_OPEN
+        // probe slot `check_circuit_breaker` may have claimed — otherwise
+        // repeated refusals leak `half_open_in_flight` slots and wedge the
+        // breaker (same reason the HBONE / mesh-mTLS refusals do it).
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        if is_grpc_request {
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+            let message = "unix-socket backend does not support gRPC dispatch";
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    14,
+                    message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                ));
+            }
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                14, // UNAVAILABLE
+                message,
+                plugin_cache_view
+                    .initial_response_header_policy_plugins()
+                    .as_ref(),
+            ));
+        }
+        record_request(&state, 502);
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"unix-socket backend does not support WebSocket dispatch"}"#,
+        ));
+    }
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -33714,6 +33773,16 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
+    // A `mesh.unix_socket` target is a Unix-stream backend, and this retry path
+    // is reqwest-only (no Unix transport). Refuse rather than dial the target's
+    // placeholder loopback `host:port`, which nothing listens on — the same
+    // fail-closed contract the HBONE / mesh-mTLS transports enforce. Unreachable
+    // for the materialized Sidecar ingress proxies (they configure no retry
+    // policy), so this is a defensive gate, not a live limitation.
+    if upstream_target.is_some_and(unix_backend::target_is_unix_backend) {
+        return unix_backend_dispatch_unavailable_response(proxy, "retry");
+    }
+
     // A retry attempt must be admitted under the same effective ceiling as the
     // first attempt: the route policy is request-scoped, so a replay cannot
     // widen back to the global allowance (`GHSA-xrfj-852f-645j`).
@@ -35321,6 +35390,115 @@ async fn proxy_to_backend(
             }
         }
     };
+
+    // Sidecar `ingress[]` Unix-socket backend: the selected target carries the
+    // reserved `mesh.unix_socket` tag, so this request is dialed over a
+    // `tokio::net::UnixStream` and NEVER over the target's placeholder
+    // loopback `host:port`. Same admission ordering as the HBONE / mesh-mTLS
+    // branches below, and the same fail-closed contract — a tagged target that
+    // cannot dispatch here is refused, never downgraded to TCP.
+    if let Some(unix_target) = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t)) {
+        let socket_path = match unix_backend::resolve_unix_socket_target(unix_target) {
+            Some(Ok(path)) => path.to_string(),
+            // The tag is present but its path failed re-admission at dial time.
+            // Refuse: the carrier may have crossed a CP/DP or file boundary
+            // since translation admitted it.
+            Some(Err(rejection)) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    rejection = rejection.reason(),
+                    "Refusing unix-socket backend dispatch: tagged path failed admission"
+                );
+                return backend_dispatch_response(
+                    unix_backend_error_response(
+                        proxy,
+                        &unix_backend::UnixBackendError::InadmissiblePath(rejection),
+                        resolved_ip.clone(),
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // Unreachable: `target_is_unix_backend` already proved the tag.
+            None => {
+                return backend_dispatch_response(
+                    unix_backend_dispatch_unavailable_response(proxy, "missing_tag"),
+                    None,
+                    None,
+                );
+            }
+        };
+        // 413 on an oversized declared Content-Length BEFORE admission, so a
+        // capacity rejection cannot mask the size violation as a 503 (same
+        // ordering rationale as the HBONE branch).
+        if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
+            return reject;
+        }
+        let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
+            client_request_body,
+            method,
+            headers,
+            effective_max_request_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+            request_ctx.grpc_deadline_at(),
+            plugins,
+            ctx.as_deref_mut(),
+            stream_request_body,
+            request_body_prepared,
+            retain_request_body,
+            ctx_bytes_sent_observed,
+            resolved_ip.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return backend_dispatch_response(response, None, None),
+        };
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
+        *backend_admission_started_at = Instant::now();
+        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_unix(
+            state,
+            proxy,
+            &socket_path,
+            backend_url,
+            method,
+            headers,
+            unix_request_body,
+            plugins,
+            Some(request_ctx),
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip.clone(),
+            ctx_bytes_sent_observed,
+            effective_max_request_body_size_bytes,
+            effective_max_response_body_size_bytes,
+        )
+        .await;
+        return BackendDispatchResult::Response {
+            response: Box::new(backend_resp),
+            retained_body: unix_retained_body.or(body_bytes),
+            backend_admission_permits,
+            request_body_exceeded,
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+        };
+    }
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -39453,6 +39631,652 @@ async fn proxy_to_backend_hbone(
             None,
             None,
         )
+    }
+}
+
+/// Refusal response for a `mesh.unix_socket` target on a dispatch path that has
+/// no Unix transport (the reqwest-backed retry path, or a corrupted tag).
+///
+/// Fail-closed by construction: the alternative would be dialing the target's
+/// placeholder loopback `host:port`, which nothing listens on and which — on a
+/// sidecar — is the gateway's own inbound listener port. `DispatchPolicyRejected`
+/// keeps it health-neutral and non-retryable: replaying it would resolve the
+/// same way.
+fn unix_backend_dispatch_unavailable_response(
+    proxy: &Proxy,
+    stage: &'static str,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        stage,
+        "Refusing unix-socket backend dispatch on a path with no unix transport; \
+         failing closed rather than dialing the placeholder loopback address"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend dispatch unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: true,
+        backend_resolved_ip: None,
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+/// Backend response for a failed Unix dial (path rejected, connect error,
+/// connect timeout, or an unsupported platform).
+///
+/// The operator-supplied socket path is deliberately NOT echoed into the client
+/// body — it is a filesystem location on the workload host — while the log line
+/// carries the concrete reason for diagnosis.
+fn unix_backend_error_response(
+    proxy: &Proxy,
+    err: &unix_backend::UnixBackendError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = err.error_class();
+    warn!(
+        proxy_id = %proxy.id,
+        error = %err,
+        "Unix-socket backend dispatch failed"
+    );
+    let status_code = if matches!(
+        error_class,
+        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout
+    ) {
+        504
+    } else {
+        502
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+/// HTTP-family dispatch to a co-located Unix-domain STREAM socket
+/// (Istio `Sidecar` `ingress[].defaultEndpoint: unix:///path`).
+///
+/// Mirrors [`proxy_to_backend_hbone`]'s contract — an HTTP/1.1 client handshake
+/// over an arbitrary byte stream, the same header regeneration, size-limit and
+/// timeout handling, and the same streaming-vs-buffered response decision — but
+/// the stream is a fresh `UnixStream` instead of a pooled HBONE tunnel.
+///
+/// **Not pooled.** Each request dials its own socket and drops the connection
+/// when the response completes. The destination is a co-located app on the same
+/// host, so the dial is a local `connect(2)` with no DNS, TCP handshake, or TLS;
+/// pooling is a documented follow-up rather than a correctness requirement.
+///
+/// HTTP/1.1 is the wire protocol. An `http2`/`grpc`-declared listener whose app
+/// speaks h2c prior-knowledge over the socket is NOT covered — a gRPC-flavored
+/// request is refused before it reaches here (see the fail-closed gate in the
+/// request handler) rather than being downgraded.
+///
+/// The third return element is the client-upload overflow flag, returned — like
+/// the HBONE path — only alongside a streaming response so the caller can
+/// reclassify a post-header upload overflow as neutral `RequestBodyTooLarge`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
+async fn proxy_to_backend_unix(
+    state: &ProxyState,
+    proxy: &Proxy,
+    socket_path: &str,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    let dial = unix_backend::dial_unix_backend(socket_path, proxy.backend_connect_timeout_ms);
+    let stream = match dial.await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return (
+                unix_backend_error_response(proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(err) => {
+            return (
+                unix_hyper_error_response(proxy, err, resolved_ip, false),
+                None,
+                None,
+            );
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("unix_backend: connection closed: {}", e);
+        }
+    });
+
+    // Only `path_and_query` is read out of the computed backend URL — a Unix
+    // socket has no network authority, so the request target is origin-form and
+    // the Host header (below) carries the authority the app sees.
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid unix backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    let backend_authority = uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| "localhost".to_string());
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    let origin_form_uri = hyper::Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .unwrap_or_else(|_| hyper::Uri::from_static("/"));
+
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if effective_request_body_size_limit > 0 {
+        effective_request_body_size_limit
+    } else {
+        usize::MAX
+    };
+    let request_body_replayable = matches!(
+        &client_request_body,
+        MeshClientRequestBody::Replayable { .. }
+    );
+    let (mut parts, body) = match client_request_body {
+        MeshClientRequestBody::Streaming(request) => {
+            let (parts, body) = request.into_parts();
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            );
+            let body = match ctx {
+                Some(c)
+                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &c.metadata,
+                    ) =>
+                {
+                    body.with_grpc_message_counter(Arc::clone(
+                        &c.grpc_request_messages_observed,
+                    ))
+                }
+                _ => body,
+            };
+            (parts, http_body_util::Either::Left(body))
+        }
+        MeshClientRequestBody::Replayable {
+            body,
+            headers,
+            trailers,
+        } => {
+            let (mut parts, ()) = Request::new(()).into_parts();
+            parts.headers = headers;
+            (
+                parts,
+                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+            )
+        }
+    };
+    parts.uri = origin_form_uri;
+    parts.version = hyper::Version::HTTP_11;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "unix", method);
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    headers_mod::merge_proxy_headers_preserving_repeated(&mut parts.headers, headers);
+    headers_mod::strip_backend_request_headers(&mut parts.headers);
+    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    if !proxy.preserve_host_header {
+        parts.headers.remove(hyper::header::HOST);
+    }
+    if !proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST) {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "backend_host",
+            "host",
+            &backend_authority,
+        );
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if request_is_secure { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
+    }
+    if let Some(ref via) = state.via_header_http11 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "configured_via",
+            "via",
+            via,
+        );
+    }
+    if state.add_forwarded_header {
+        let proto_str = if request_is_secure { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "Unix backend read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    if effective_max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > effective_max_response_body_size_bytes
+    {
+        return (
+            unix_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                effective_max_response_body_size_bytes,
+            ),
+            None,
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        response_decision_ctx,
+        status,
+        &resp_headers,
+    );
+
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            Some(body_size_exceeded),
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            effective_max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    unix_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        effective_max_response_body_size_bytes,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "unix"),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, false),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "Unix backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            None,
+        )
+    }
+}
+
+/// Non-Unix build stub. Sidecar mesh deployments are Linux-only, so this is
+/// unreachable in practice; it exists so the Windows build keeps the same
+/// fail-closed refusal instead of losing the transport gate at compile time.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(unix))]
+async fn proxy_to_backend_unix(
+    _state: &ProxyState,
+    proxy: &Proxy,
+    _socket_path: &str,
+    _backend_url: &str,
+    _method: &str,
+    _headers: &HashMap<String, String>,
+    _client_request_body: MeshClientRequestBody,
+    _plugins: &[Arc<dyn crate::plugins::Plugin>],
+    _ctx: Option<&RequestContext>,
+    _response_decision_ctx: Option<&RequestContext>,
+    _stream_response: bool,
+    _client_ip: &str,
+    _xff_append_ip: &str,
+    _request_is_secure: bool,
+    resolved_ip: Option<String>,
+    _ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    _effective_request_body_size_limit: usize,
+    _effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    (
+        unix_backend_error_response(
+            proxy,
+            &unix_backend::UnixBackendError::PlatformUnsupported,
+            resolved_ip,
+        ),
+        None,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn unix_hyper_error_response(
+    proxy: &Proxy,
+    err: hyper::Error,
+    resolved_ip: Option<String>,
+    request_body_replayable: bool,
+) -> retry::BackendResponse {
+    error!(proxy_id = %proxy.id, error = %err, "Unix backend HTTP request failed");
+    // Same pre-wire/post-wire split the HBONE arm uses: a canceled dispatch with
+    // an immutable body proves the request never reached the app.
+    let error_class = if request_body_replayable && err.is_canceled() {
+        retry::ErrorClass::ConnectionPoolError
+    } else {
+        retry::ErrorClass::ProtocolError
+    };
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+#[cfg(unix)]
+fn unix_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        max_request_body_size_bytes = max_size,
+        "Unix backend streaming request body exceeded configured size limit"
+    );
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+#[cfg(unix)]
+fn unix_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
     }
 }
 

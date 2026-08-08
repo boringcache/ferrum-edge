@@ -1964,6 +1964,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         port: 8443,
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
+        endpoint_unix_path: None,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
@@ -2008,11 +2009,101 @@ fn ingress_resolved_listener_endpoint_revalidation() {
 }
 
 #[test]
-fn ingress_resolve_rejects_unix_socket_endpoint() {
+fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
+    // Issue #3261: a `unix://` defaultEndpoint materializes a routable
+    // Unix-stream backend instead of being deferred as unrepresentable.
+    let resolved = ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock")
+        .resolve()
+        .expect("an absolute unix socket path resolves");
+    assert_eq!(resolved.port, 8443);
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock").resolve(),
-        Err(IngressListenerUnsupported::UnixSocketEndpoint)
+        resolved.endpoint_unix_path.as_deref(),
+        Some("/var/run/app.sock")
     );
+    // The host:port pair stays VACANT so the carrier re-validation can reject a
+    // both-shapes carrier (a smuggled TCP fallback).
+    assert_eq!(resolved.endpoint_host, "");
+    assert_eq!(resolved.endpoint_port, 0);
+    assert!(resolved.endpoint_is_valid());
+    assert_eq!(resolved.unix_socket_path(), Some("/var/run/app.sock"));
+    assert_eq!(
+        resolved.backend(),
+        Some(
+            ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+                path: "/var/run/app.sock".to_string()
+            }
+        )
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_hostile_unix_socket_paths() {
+    // Every rejection is FIELD-SPECIFIC: the operator learns which rule the
+    // path broke, not just that it was refused.
+    use ferrum_edge::util::unix_socket::UnixSocketPathRejection as R;
+    let cases: &[(&str, R)] = &[
+        ("unix://", R::Empty),
+        ("unix://relative/app.sock", R::NotAbsolute),
+        ("unix://@abstract", R::NotAbsolute),
+        ("unix:///var/../../etc/passwd", R::TraversalComponent),
+        ("unix:///var/./app.sock", R::TraversalComponent),
+        ("unix:///var//run/app.sock", R::EmptyComponent),
+        ("unix:///var/run/", R::TrailingSlash),
+        ("unix:///", R::TrailingSlash),
+        ("unix:///var/run/a\u{0}b.sock", R::InteriorNul),
+        ("unix:///var/run/a\u{7}b.sock", R::ControlCharacter),
+    ];
+    for (endpoint, expected) in cases {
+        assert_eq!(
+            ingress_entry(8443, AppProtocol::Http, endpoint).resolve(),
+            Err(IngressListenerUnsupported::InvalidUnixSocketPath(*expected)),
+            "endpoint {endpoint:?} must fail closed with its specific reason"
+        );
+    }
+    // Over the portable `sockaddr_un` budget.
+    let long = format!("unix:///{}", "a".repeat(200));
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, &long).resolve(),
+        Err(IngressListenerUnsupported::InvalidUnixSocketPath(R::TooLong))
+    );
+}
+
+#[test]
+fn ingress_carrier_revalidates_unix_socket_shape() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let base = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: String::new(),
+        endpoint_port: 0,
+        endpoint_unix_path: Some("/var/run/app.sock".to_string()),
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(base.endpoint_is_valid(), "an admitted unix carrier is valid");
+
+    // A hostile carrier that sets BOTH shapes is refused outright: accepting it
+    // would let a TCP fallback ride alongside the socket path.
+    let both = ResolvedIngressListener {
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        ..base.clone()
+    };
+    assert!(!both.endpoint_is_valid());
+    assert_eq!(both.unix_socket_path(), None);
+
+    // A traversal-like path decoded straight from wire JSON never reaches a dial.
+    let traversal = ResolvedIngressListener {
+        endpoint_unix_path: Some("/var/../etc/passwd".to_string()),
+        ..base.clone()
+    };
+    assert!(!traversal.endpoint_is_valid());
+
+    // A zero LISTENER port is invalid on the unix shape too.
+    let zero_listener = ResolvedIngressListener {
+        port: 0,
+        ..base.clone()
+    };
+    assert!(!zero_listener.endpoint_is_valid());
 }
 
 #[test]
