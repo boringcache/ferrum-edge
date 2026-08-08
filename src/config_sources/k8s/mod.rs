@@ -1246,7 +1246,8 @@ impl K8sAccumulator {
         &mut self,
         attachments: Vec<GatewayApiRouteAttachment>,
     ) {
-        self.gateway_api_refused_route_attachments.extend(attachments);
+        self.gateway_api_refused_route_attachments
+            .extend(attachments);
     }
 
     /// Project the same-slot listener-ambiguity refusals onto the status
