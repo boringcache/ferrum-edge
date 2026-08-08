@@ -4883,8 +4883,7 @@ fn http_route_resources(
                     // same-kind merge decision can compare listener identity
                     // for both the candidate and any existing sibling instead
                     // of collapsing them by numeric port.
-                    if let Some(key) =
-                        namespaced_resource_key(config_namespace, proxy_id.as_str())
+                    if let Some(key) = namespaced_resource_key(config_namespace, proxy_id.as_str())
                     {
                         acc.gateway_api_route_proxy_listeners
                             .insert(key, host_scope.listener.clone());
