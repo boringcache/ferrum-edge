@@ -36,6 +36,10 @@ pub mod mongo_store;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
 pub mod public_env_inventory;
+/// TEST-ONLY debug-build database outage control for functional fixtures.
+/// See the module docs — not a production configuration surface.
+#[allow(dead_code)] // arm_path / disarm_for_tests are exercised by external unit tests.
+pub mod test_db_fault;
 pub mod types;
 pub(crate) mod validation_pipeline;
 
