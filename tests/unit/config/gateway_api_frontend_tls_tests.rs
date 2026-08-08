@@ -677,7 +677,7 @@ fn snapshot_cap_never_retains_a_partial_listener_certificate_set() {
 }
 
 #[test]
-fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
+fn native_normalization_preserves_oversized_certificate_sets_for_rejection() {
     let mut ordered_candidates = GatewayConfig {
         frontend_tls_certificate_sources: ["declared-first", "declared-second"]
             .into_iter()
@@ -731,13 +731,15 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
 
     assert_eq!(
         config.frontend_tls_certificate_sources.len(),
-        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1
     );
-    assert!(
+    assert_eq!(
         config
             .frontend_tls_certificate_sources
             .iter()
-            .all(|source| source.listener != "zz-bundle")
+            .filter(|source| source.listener == "zz-bundle")
+            .count(),
+        2
     );
     assert_eq!(
         config
@@ -753,8 +755,12 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
             .iter()
             .any(|source| Some(source.cert_path.as_str())
                 == config.frontend_tls_cert_path.as_deref()),
-        "the legacy fallback projection must not point at the withdrawn listener"
+        "the legacy fallback projection must point at one retained source until the snapshot is rejected"
     );
+    let errors = config
+        .validate_all_fields(30)
+        .expect_err("an oversized native snapshot must be rejected");
+    assert!(errors.iter().any(|error| error.contains("admission limit")));
 
     let oversized_group: Vec<FrontendTlsCertificateSource> = (0
         ..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
@@ -775,43 +781,17 @@ fn native_normalization_truncates_certificate_sources_on_listener_boundaries() {
         ..GatewayConfig::default()
     };
     only_oversized.normalize_fields();
-    assert!(only_oversized.frontend_tls_certificate_sources.is_empty());
-    assert_eq!(only_oversized.frontend_tls_cert_path, None);
-    assert_eq!(only_oversized.frontend_tls_key_path, None);
-    assert_eq!(only_oversized.frontend_tls_source_namespace, None);
-
-    let mut oversized_with_operator_fallback = GatewayConfig {
-        frontend_tls_cert_path: Some("/operator/fallback.crt".to_string()),
-        frontend_tls_key_path: Some("/operator/fallback.key".to_string()),
-        frontend_tls_certificate_sources: (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
-            .map(|index| FrontendTlsCertificateSource {
-                namespace: "ferrum".to_string(),
-                gateway: "edge".to_string(),
-                listener: "only-listener".to_string(),
-                cert_path: format!("/certs/oversized-{index}.crt"),
-                key_path: format!("/certs/oversized-{index}.key"),
-                ..Default::default()
-            })
-            .collect(),
-        ..GatewayConfig::default()
-    };
-    oversized_with_operator_fallback.normalize_fields();
+    assert_eq!(
+        only_oversized.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1
+    );
+    let errors = only_oversized
+        .validate_all_fields(30)
+        .expect_err("one oversized listener must reject the whole snapshot");
     assert!(
-        oversized_with_operator_fallback
-            .frontend_tls_certificate_sources
-            .is_empty()
-    );
-    assert_eq!(
-        oversized_with_operator_fallback
-            .frontend_tls_cert_path
-            .as_deref(),
-        Some("/operator/fallback.crt")
-    );
-    assert_eq!(
-        oversized_with_operator_fallback
-            .frontend_tls_key_path
-            .as_deref(),
-        Some("/operator/fallback.key")
+        errors
+            .iter()
+            .any(|error| error.contains("partial listener set"))
     );
 }
 

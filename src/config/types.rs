@@ -3555,16 +3555,6 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
-        let had_gateway_certificate_sources = !self.frontend_tls_certificate_sources.is_empty();
-        let legacy_was_gateway_projection = self
-            .frontend_tls_cert_path
-            .as_deref()
-            .zip(self.frontend_tls_key_path.as_deref())
-            .is_some_and(|(cert_path, key_path)| {
-                self.frontend_tls_certificate_sources
-                    .iter()
-                    .any(|source| source.cert_path == cert_path && source.key_path == key_path)
-            });
         // Certificate sources are keyed by owning listener, NOT by namespace:
         // one listener may serve several certificateRefs and one namespace may
         // hold several independently owned Gateways (#3267 / #3268). Deduping
@@ -3596,36 +3586,20 @@ impl GatewayConfig {
                 source.key_path.clone(),
             ))
         });
-        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
-            // Never split one listener's certificateRefs at the resident-set
-            // bound. Serving a prefix of a listener's credentials would violate
-            // the same atomicity the Kubernetes translator enforces and could
-            // answer the listener with a different certificate set than the
-            // operator declared.
-            let overflow =
-                &self.frontend_tls_certificate_sources[MAX_FRONTEND_TLS_CERTIFICATE_SOURCES];
-            let overflow_listener = (
-                overflow.namespace.clone(),
-                overflow.gateway.clone(),
-                overflow.listener.clone(),
-            );
-            let truncate_at = self.frontend_tls_certificate_sources
-                [..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES]
-                .iter()
-                .position(|source| {
-                    source.namespace == overflow_listener.0
-                        && source.gateway == overflow_listener.1
-                        && source.listener == overflow_listener.2
-                })
-                .unwrap_or(MAX_FRONTEND_TLS_CERTIFICATE_SOURCES);
-            self.frontend_tls_certificate_sources.truncate(truncate_at);
-        }
 
         // Serialized/native snapshots are allowed to omit or duplicate fallback
-        // markers. Re-derive exactly one per namespace after dedup/capping, then
+        // markers. Re-derive exactly one per namespace after deduplication, then
         // project the lexicographically-first namespace's choice into the legacy
         // single-certificate fields. This keeps the one-entry path and the SNI
         // resolver on the same credential even for a hand-authored snapshot.
+        //
+        // Do NOT truncate an oversized set here. Normalization has no listener
+        // route-ownership map, so retaining only a certificate prefix could
+        // leave a dropped listener's routes reachable under an unrelated
+        // fallback certificate. Validation and the runtime resolver reject the
+        // whole oversized snapshot instead; Kubernetes translation applies the
+        // bound earlier, where it can withdraw the listener and its routes
+        // atomically.
         if !self.frontend_tls_certificate_sources.is_empty() {
             let mut default_indexes: BTreeMap<String, usize> = BTreeMap::new();
             for preference in 0..3 {
@@ -3656,17 +3630,6 @@ impl GatewayConfig {
                 self.frontend_tls_key_path = Some(default_source.key_path);
                 self.frontend_tls_source_namespace = Some(default_source.namespace);
             }
-        } else if had_gateway_certificate_sources
-            && (self.frontend_tls_source_namespace.is_some() || legacy_was_gateway_projection)
-        {
-            // The only listener group exceeded the bound and was withdrawn in
-            // full. Its legacy fallback projection must be withdrawn too, or
-            // the single-certificate path would resurrect one member of the
-            // rejected group. An unrelated operator fallback has no owning
-            // namespace and does not match a Gateway source, so it survives.
-            self.frontend_tls_cert_path = None;
-            self.frontend_tls_key_path = None;
-            self.frontend_tls_source_namespace = None;
         }
         self.normalize_hosts();
         for consumer in &mut self.consumers {
@@ -9274,6 +9237,13 @@ impl GatewayConfig {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
+            errors.push(format!(
+                "Gateway frontend TLS certificate source set exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+            ));
+        }
 
         // Shared cache: when multiple proxies reference the same TLS file path,
         // each file is opened and parsed only once during batch validation.
