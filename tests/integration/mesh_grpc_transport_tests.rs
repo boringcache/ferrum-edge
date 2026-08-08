@@ -220,6 +220,7 @@ fn mesh_mtls_target(mtls_port: u16, pinned_peer: &str) -> UpstreamTarget {
 
 /// What the destination observed on the accepted gRPC stream.
 struct ObservedRequest {
+    scheme: String,
     authority: String,
     path: String,
     te: Option<String>,
@@ -273,6 +274,7 @@ async fn serve_one_grpc_rpc<T>(
             .map(str::to_string)
     };
     let _ = observed_tx.send(ObservedRequest {
+        scheme: request.uri().scheme_str().unwrap_or_default().to_string(),
         authority: request
             .uri()
             .authority()
@@ -691,6 +693,10 @@ async fn grpc_dispatches_over_sidecar_mesh_mtls_and_relays_status_trailers() {
     );
 
     let observed = observed_rx.await.expect("server observed the request");
+    assert_eq!(
+        observed.scheme, "https",
+        "the SVID-mTLS hop must preserve HTTPS request semantics"
+    );
     assert!(
         observed.peer_presented_client_cert,
         "the mesh hop must present this gateway's client SVID, never an unauthenticated dial"
@@ -835,6 +841,10 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
     );
 
     let observed = app_observed_rx.await.expect("the app observed the request");
+    assert_eq!(
+        observed.scheme, "http",
+        "the authenticated outer HBONE hop must not mislabel the inner h2c app request as HTTPS"
+    );
     assert_eq!(
         observed.authority,
         format!("127.0.0.1:{}", app_addr.port()),
@@ -1033,6 +1043,10 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
     );
 
     let observed = app_observed_rx.await.expect("the app observed the request");
+    assert_eq!(
+        observed.scheme, "http",
+        "cross-cluster HBONE still terminates in a plaintext h2c app request"
+    );
     assert_eq!(
         observed.path, "/reviews.Reviews/Get",
         "the request path must survive a target host that is not a URI authority"

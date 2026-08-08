@@ -2978,13 +2978,14 @@ impl<'a> GrpcDispatchTransport<'a> {
         preserve_host_header: bool,
         client_host: Option<&str>,
     ) -> Result<hyper::Uri, GrpcProxyError> {
-        let (authority, what) = match self {
+        let (scheme, authority, what) = match self {
             Self::Direct(_) => {
                 return backend_url
                     .parse()
                     .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)));
             }
             Self::MeshMtls(mesh) => (
+                "https",
                 crate::proxy::mesh_mtls_dispatch_authority(
                     mesh.target,
                     preserve_host_header,
@@ -2993,6 +2994,11 @@ impl<'a> GrpcDispatchTransport<'a> {
                 "sidecar mTLS",
             ),
             Self::Hbone(hbone) => (
+                // The authenticated CONNECT is the secured OUTER hop. The
+                // nested HTTP/2 connection is h2c to the destination app, so
+                // its request semantics must remain `http` rather than
+                // claiming end-to-end TLS to the application.
+                "http",
                 hbone_dispatch_authority(hbone, preserve_host_header, client_host),
                 "Ambient HBONE",
             ),
@@ -3001,7 +3007,7 @@ impl<'a> GrpcDispatchTransport<'a> {
             .parse()
             .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL path: {}", e)))?;
         hyper::Uri::builder()
-            .scheme("https")
+            .scheme(scheme)
             .authority(authority.as_ref())
             .path_and_query(path_and_query)
             .build()

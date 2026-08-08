@@ -13557,6 +13557,7 @@ async fn h3_mesh_declared_app_port() -> u16 {
 /// What a mesh peer observed for ONE accepted gRPC stream.
 #[derive(Clone, Debug)]
 struct H3MeshObservedRpc {
+    scheme: String,
     authority: String,
     path: String,
     te: Option<String>,
@@ -13834,6 +13835,7 @@ async fn h3_mesh_serve_one_rpc(
     let uri = request.uri().clone();
     let mut recv = request.into_body();
     let record = Arc::new(Mutex::new(H3MeshObservedRpc {
+        scheme: uri.scheme_str().unwrap_or_default().to_string(),
         authority: uri
             .authority()
             .map(|authority| authority.to_string())
@@ -14516,6 +14518,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     );
 
     let observed = peer.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(observed.scheme, "https", "the Sidecar mTLS request is HTTPS");
     assert!(
         observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
         "the peer must have verified THIS gateway's client SVID (authenticated \
@@ -14685,6 +14688,10 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
     );
 
     let observed = app.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(
+        observed.scheme, "http",
+        "the inner Ambient application hop is h2c, not end-to-end HTTPS"
+    );
     assert_eq!(observed.path, H3_MESH_BACKEND_PATH);
     assert_eq!(observed.te.as_deref(), Some("trailers"));
     assert_eq!(observed.content_type.as_deref(), Some("application/grpc"));
@@ -14777,6 +14784,10 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
     );
 
     let observed = app.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(
+        observed.scheme, "http",
+        "cross-cluster Ambient still terminates in a plaintext h2c app request"
+    );
     assert_eq!(observed.body, payload);
 
     gateway.shutdown();

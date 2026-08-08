@@ -185,7 +185,10 @@ H3 client half-closes (true bidirectional streaming).
 HBONE sender acquisition, including the inner HTTP/2 handshake after CONNECT,
 is bounded by the destination policy port's effective backend connect timeout.
 A relayed app that accepts TCP but never sends HTTP/2 settings therefore cannot
-retain the RPC indefinitely when the client supplied no `grpc-timeout`.
+retain the RPC indefinitely when the client supplied no `grpc-timeout`. The
+outer HBONE hop is SVID-authenticated, while the nested application connection
+is h2c and carries `:scheme: http`; the gateway does not misrepresent the
+tunnel's outer TLS as end-to-end TLS to the application.
 
 Everything undispatchable **fails closed** with a Trailers-Only gRPC
 `UNAVAILABLE`, before any dial:
