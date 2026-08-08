@@ -770,6 +770,36 @@ pub(crate) async fn bidirectional_splice_for_test_with_timeouts(
     .await
 }
 
+/// Crate-visible entry point to `bidirectional_splice` with the client leg
+/// marked as kernel-TLS terminated.
+///
+/// Used by the live-kernel proof in `proxy::ktls_live_kernel_tests`, which is
+/// the only coverage that can show the real TLS close handshake (queued
+/// `close_notify` record → clean EOF, bare FIN → truncation, backend EOF →
+/// reciprocal alert) running against an actual kTLS socket rather than against
+/// the classifier alone.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) async fn bidirectional_splice_ktls_client_for_test(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    pipe_size: usize,
+) -> StreamCopyResult {
+    bidirectional_splice(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        None,
+        None,
+        pipe_size,
+        true,
+    )
+    .await
+}
+
 /// Crate-visible entry point to `bidirectional_splice_io_uring` for tests
 /// that need to exercise the io_uring path with backend directional timeouts.
 #[cfg(target_os = "linux")]
@@ -6862,7 +6892,10 @@ async fn sleep_for_cap(half_close_cap: Option<Duration>) {
 ///   direction reads that record back with the `SOL_TLS`/`TLS_GET_RECORD_TYPE`
 ///   `recvmsg` contract and only treats an authenticated warning-level
 ///   `close_notify` as a clean EOF; fatal alerts, other alerts, unexpected
-///   control records, and unrelated `EINVAL`s stay attributed failures.
+///   control records, and unrelated `EINVAL`s stay attributed failures. A bare
+///   TCP FIN with no alert behind it is likewise a failure — an unauthenticated
+///   end of stream is a TLS truncation, so `splice` returning `0` on a kTLS
+///   source can never end the direction cleanly.
 /// * **Transmit.** The backend→client direction emits exactly one TLS 1.2
 ///   warning `close_notify` through kTLS TX after the last application byte
 ///   and before half-closing the write side, so a graceful backend close does
@@ -8366,11 +8399,34 @@ async fn splice_one_direction_no_guard(
                 }
             }
         } else if n == 0 {
-            // EOF — source closed
+            // EOF — source closed.
+            //
+            // On a kTLS receive side a bare FIN is NOT a shutdown: the kernel
+            // record layer delivers `close_notify` as a queued alert record
+            // (which surfaces above as `EINVAL`), so reaching a plain zero-byte
+            // read means the peer stopped writing without any authenticated
+            // end-of-stream. That is a TLS truncation and must be attributed as
+            // a read failure rather than laundered into a clean relay close.
+            if src_is_ktls {
+                return Err(ktls_truncation_failure());
+            }
             half_close_relay_write_side(dst, dst_is_ktls).await;
             return Ok(());
         }
     }
+}
+
+/// The one message used for both bare-EOF truncation paths on a kTLS receive
+/// side, so the two cannot drift apart in logs or tests.
+#[cfg(target_os = "linux")]
+const KTLS_TRUNCATION_MESSAGE: &str =
+    "kTLS receive side: peer closed without an authenticated close_notify (TLS truncation)";
+
+/// Attributed read failure for an unauthenticated end of a kTLS stream.
+#[cfg(target_os = "linux")]
+fn ktls_truncation_failure() -> (StreamIoSide, anyhow::Error) {
+    let error = anyhow::anyhow!(KTLS_TRUNCATION_MESSAGE);
+    (StreamIoSide::Read, error)
 }
 
 /// How a `splice(2)` `EINVAL` on a kTLS receive side resolved once the pending
@@ -8383,8 +8439,9 @@ enum KtlsSpliceEinval {
     /// now been forwarded. Re-drive the splice.
     Resume,
     /// Attributed relay failure. Fatal alerts, other alerts, unexpected
-    /// control records, and I/O errors all land here — none of them may be
-    /// laundered into a successful-looking connection.
+    /// control records, an unauthenticated bare EOF, and I/O errors all land
+    /// here — none of them may be laundered into a successful-looking
+    /// connection.
     Failed(StreamIoSide, anyhow::Error),
 }
 
@@ -8409,40 +8466,49 @@ const KTLS_CLOSE_NOTIFY_SEND_GRACE: Duration = Duration::from_millis(250);
 async fn half_close_relay_write_side(dst: &TcpStream, dst_is_ktls: bool) {
     use std::os::unix::io::AsRawFd;
 
-    if dst_is_ktls {
-        send_ktls_close_notify_bounded(dst).await;
+    if dst_is_ktls && !send_ktls_close_notify_bounded(dst).await {
+        // The raw half-close still follows: the peer must not be left holding
+        // an open socket because a courtesy alert could not be delivered. What
+        // it must NOT be is silent — an un-emitted close_notify is exactly what
+        // a client reads as a truncated session.
+        debug!("kTLS: no complete close_notify was emitted before half-closing the write side");
     }
     shutdown_write_fd(dst.as_raw_fd());
 }
 
-/// Emit one `close_notify` through kTLS TX without blocking the runtime.
+/// Emit one complete `close_notify` through kTLS TX without blocking the
+/// runtime. Returns whether the full two-byte alert record was emitted.
 ///
-/// Best effort by design: a peer that has already reset or stopped reading
-/// must not wedge connection teardown, and failing to deliver a courtesy alert
-/// is not a relay failure. The raw half-close still follows.
+/// Bounded and best effort by design: a peer that has already reset or stopped
+/// reading must not wedge connection teardown. `send_close_notify` accepts only
+/// a full two-byte emission, so a short or zero-length `sendmsg` surfaces here
+/// as an error and is reported as "not emitted" rather than counted as a
+/// delivered shutdown.
 #[cfg(target_os = "linux")]
-async fn send_ktls_close_notify_bounded(dst: &TcpStream) {
+async fn send_ktls_close_notify_bounded(dst: &TcpStream) -> bool {
     use std::os::unix::io::AsRawFd;
 
     let fd = dst.as_raw_fd();
     let send = async {
         loop {
             if dst.writable().await.is_err() {
-                return;
+                return false;
             }
             match dst.try_io(tokio::io::Interest::WRITABLE, || {
                 crate::proxy::ktls_record::send_close_notify(fd)
             }) {
-                Ok(_) => return,
+                Ok(_) => return true,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
                     debug!("kTLS: close_notify could not be sent to the client: {e}");
-                    return;
+                    return false;
                 }
             }
         }
     };
-    let _ = tokio::time::timeout(KTLS_CLOSE_NOTIFY_SEND_GRACE, send).await;
+    tokio::time::timeout(KTLS_CLOSE_NOTIFY_SEND_GRACE, send)
+        .await
+        .unwrap_or(false)
 }
 
 /// Consume and classify the record that made `splice(2)` return `EINVAL` on a
@@ -8496,11 +8562,15 @@ async fn resolve_ktls_splice_einval(
     };
 
     match outcome {
-        // No record pending after all: the peer's write side is simply closed.
-        // End the direction here rather than resuming, both because it is the
-        // same outcome the ordinary `n == 0` path produces and because
-        // resuming into a socket that keeps answering `EINVAL` would spin.
-        KtlsRecvOutcome::Eof => KtlsSpliceEinval::CleanEof,
+        // No record pending after all: the peer closed TCP without ever
+        // sending an alert. Nothing authenticated said the stream ended, so
+        // this is a truncation — the same verdict the ordinary `n == 0` path
+        // now reaches. Returning it as a failure also ends the direction, so a
+        // socket that keeps answering `EINVAL` still cannot spin.
+        KtlsRecvOutcome::Eof => {
+            let (side, err) = ktls_truncation_failure();
+            KtlsSpliceEinval::Failed(side, err)
+        }
         KtlsRecvOutcome::ApplicationData { len } => {
             let now = coarse_now_ms();
             if let Some(la) = last_activity {

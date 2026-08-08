@@ -49,6 +49,13 @@ pub mod http2_pool;
 /// the buffered tokio-rustls accept and the userspace relay.
 #[cfg(target_os = "linux")]
 pub(crate) mod ktls_accept;
+/// Live-kernel proof that the #3619 handoff is not inert: real TLS 1.2
+/// sessions, real `setsockopt(SOL_TLS, ...)`, real `splice(2)`. Ignored by
+/// default and gated on kernel capability; the hosted kTLS live gate runs it
+/// with `FERRUM_KTLS_LIVE_REQUIRED=1` so an unavailable capability fails
+/// instead of quietly skipping.
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_live_kernel_tests;
 /// TLS control-record classification and the `SOL_TLS` `recvmsg`/`sendmsg`
 /// ancillary contract used by the kTLS splice relay (issue #3619). The
 /// classification half is platform-independent so it can be tested anywhere;

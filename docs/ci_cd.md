@@ -338,8 +338,11 @@ sequential shell script:
 
 ```bash
 # test-unit: inline lib first, then the unchanged four-test plugin-hardening
-# exact gate, then the complete external unit suite in the same job.
+# exact gate, then the kTLS live-kernel proof, then the complete external unit
+# suite in the same job.
 cargo test --lib
+FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
+  proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
 
 # test-integration-{admin-platform,mesh-protocols}
@@ -361,6 +364,20 @@ cargo nextest run --archive-file functional-tests-*.tar.zst \
   --no-fail-fast \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
+
+The kTLS step is a **live-kernel** gate, not a unit test: it drives a real
+rustls TLS 1.2 client through `try_ktls_accept`, installs kernel TLS keys on the
+runner's own kernel with `setsockopt(SOL_TLS, ...)`, relays application bytes
+through `splice(2)`, and asserts the TLS close handshake (authenticated
+`close_notify` → clean EOF, bare FIN → truncation, backend EOF → reciprocal
+alert, unauthenticated record → attributed failure). It lives in `test-unit`
+because that job is `require_success "Unit and inline lib"` in the required
+`Tests` aggregate, so the live path is blocking today without touching the
+byte-frozen aggregate wiring. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
+unavailable kernel capability into a failure rather than a skip, and the step
+additionally fails on any `SKIP:` line or on a pass count other than three, so
+a green check cannot mean "the live path did not run". See
+[tcp_udp_proxy.md](tcp_udp_proxy.md#hosted-live-kernel-coverage).
 
 The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
 PostgreSQL load-stress test run weekly and on manual dispatch in the

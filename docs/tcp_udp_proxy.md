@@ -539,13 +539,27 @@ charged to the backend circuit breaker. A fatal alert, any other alert, an
 unexpected control record, a malformed (non-two-byte) alert body, and an
 unrelated `EINVAL` all remain attributed relay errors.
 
+**A bare FIN is a truncation, not an EOF.** Because the kernel record layer
+delivers `close_notify` as a queued alert record, a kTLS receive side that
+reaches a plain zero-byte `splice(2)` — or a zero-byte `recvmsg(2)` while
+resolving an `EINVAL` — has seen the peer stop writing with *nothing
+authenticated* saying the stream ended. That is RFC 5246 §7.2.1 truncation, so
+both paths return an attributed `ClientToBackend` / read failure instead of a
+clean relay close. Only the classified warning-level `close_notify` produces
+the clean outcome.
+
 **Transmit.** A graceful backend EOF is propagated to the client as exactly one
 TLS 1.2 warning `close_notify`, emitted through kTLS TX with the matching
 `TLS_SET_RECORD_TYPE` `sendmsg(2)` ancillary message **after** the last
 application byte and **before** the raw `shutdown(SHUT_WR)`. Without it a
-conformant TLS client sees a truncated session rather than a clean close. The
-send is non-blocking and bounded (250 ms): a peer that stopped reading cannot
-wedge teardown, and the raw half-close still follows. Half-close semantics are
+conformant TLS client sees a truncated session rather than a clean close. Only
+a `sendmsg(2)` that reports **exactly** the two alert bytes counts as an
+emitted `close_notify`; a zero-length, short, or oversized result is an
+explicit error and is logged as "no complete close_notify was emitted" rather
+than being accepted as a completed shutdown. The send is non-blocking and
+bounded (250 ms): a peer that stopped reading cannot wedge teardown, and the
+raw half-close still follows even when the alert could not be delivered.
+Half-close semantics are
 preserved in both directions — receiving the client's `close_notify` half-closes
 only the client→backend direction, so the backend's remaining response bytes
 still reach the client and the reciprocal `close_notify` is sent after they
@@ -557,6 +571,53 @@ Secret material never leaves `Zeroizing` buffers, is never logged, and the
 `KernelConnection` handle rustls returns alongside the secrets is dropped
 immediately (it exists only for TLS 1.3 KeyUpdate and client-side session
 tickets, neither of which applies here).
+
+### Ancillary-message safety
+
+Every `msg_control` buffer in `src/proxy/ktls_record.rs` is an
+`AlignedCmsgBuf`, whose storage is overlaid with a real `libc::cmsghdr` so it
+carries that type's alignment. `CMSG_FIRSTHDR` / `CMSG_NXTHDR` hand back
+`*mut cmsghdr` pointers into that storage and both the writer and the reader
+dereference them, so a bare `[u8; N]` (alignment 1) would be undefined
+behaviour irrespective of how a given stack frame happens to be laid out. Each
+`CMSG_DATA` read is additionally gated on the header having declared at least
+`CMSG_LEN(1)`, the control-buffer walk is clamped to the gateway's own
+capacity, `MSG_CTRUNC` is an error rather than a guess, and a platform whose
+`CMSG_SPACE(1)` does not fit the inline capacity fails closed instead of
+truncating.
+
+### Hosted live-kernel coverage
+
+Because the whole point of issue #3619 is that the handoff had been *inert*,
+classifier unit tests are not accepted as evidence on their own. The required
+`Unit Tests` job runs `proxy::ktls_live_kernel_tests` on the GitHub-hosted
+Linux runner's real kernel with `FERRUM_KTLS_LIVE_REQUIRED=1`, which proves, on
+every pull request:
+
+1. a real rustls TLS 1.2 client reaches `KtlsAcceptOutcome::Installed` — the
+   kernel actually took the keys;
+2. application bytes relay both ways through `splice(2)`, i.e. the kernel is
+   really decrypting on read and encrypting on write;
+3. an authenticated `close_notify` is a clean EOF that half-closes the backend
+   leg;
+4. the clean backend EOF that follows produces the **reciprocal**
+   `close_notify`, so the client's own rustls session closes cleanly instead of
+   reporting a truncation;
+5. a bare TCP FIN with no alert behind it is an attributed client→backend read
+   failure; and
+6. a record the kernel cannot authenticate ends the relay with an attributed
+   failure and never with an EOF.
+
+The tests are `#[ignore]`d by default and gated on the kernel exposing the TLS
+ULP for all three AEAD families. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
+unavailable capability into a failure rather than a skip, and the CI step also
+fails on any `SKIP:` line or on a pass count other than three — so a green
+required check cannot mean "the live path did not run".
+
+Residual, covered only by the deterministic unit suite: peer-originated fatal
+alerts and non-`close_notify` warning alerts are classified by
+`classify_ktls_control_record`, because rustls exposes no API for emitting an
+arbitrary alert mid-session. The live half of that contract is case 6 above.
 
 ## UDP Session Management
 

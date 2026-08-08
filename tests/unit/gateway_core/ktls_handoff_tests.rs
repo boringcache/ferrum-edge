@@ -369,6 +369,58 @@ fn each_record_type_round_trips_through_the_control_message() {
 }
 
 // ---------------------------------------------------------------------------
+// Ancillary buffers are aligned, not assumed
+//
+// `CMSG_FIRSTHDR`/`CMSG_NXTHDR` hand back `*mut cmsghdr` pointers into the
+// control buffer and both the writer and the reader dereference them. Backing
+// that buffer with a bare `[u8; N]` (alignment 1) is undefined behaviour no
+// matter how a given stack frame happens to be laid out, so every control
+// buffer in `ktls_record` is an `AlignedCmsgBuf`. These tests pin the two
+// properties the `CMSG_*` contract actually depends on — alignment and
+// capacity — without needing a kTLS-capable kernel.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ancillary_storage_is_aligned_and_sized_for_cmsghdr() {
+    use ferrum_edge::proxy::ktls_record::AlignedCmsgBuf;
+
+    let cmsg_align = std::mem::align_of::<libc::cmsghdr>();
+    let buf_align = std::mem::align_of::<AlignedCmsgBuf>();
+    assert_eq!(buf_align, cmsg_align, "must carry cmsghdr's alignment");
+
+    // `CMSG_FIRSTHDR` returns a header pointer whenever `msg_controllen`
+    // covers one `cmsghdr`, so the buffer has to be able to hold one.
+    let header = std::mem::size_of::<libc::cmsghdr>();
+    let capacity = AlignedCmsgBuf::CAPACITY;
+    assert!(capacity >= header, "must hold one cmsghdr ({header} bytes)");
+
+    // SAFETY: `CMSG_SPACE` is pure arithmetic over its length argument.
+    let space = unsafe { libc::CMSG_SPACE(1) } as usize;
+    // SAFETY: same.
+    let len = unsafe { libc::CMSG_LEN(1) } as usize;
+    assert!(space >= len, "CMSG_SPACE(1)={space} must cover CMSG_LEN(1)={len}");
+    assert!(space <= capacity, "CMSG_SPACE(1)={space} must fit {capacity}");
+
+    let mut buf = AlignedCmsgBuf::zeroed();
+    let ptr = buf.as_mut_ptr() as usize;
+    assert_eq!(ptr % cmsg_align, 0, "msg_control must be cmsghdr-aligned");
+
+    // The byte view must clamp instead of over-reading past the storage.
+    let clamped = buf.bytes(capacity + 64).len();
+    assert_eq!(clamped, capacity, "the byte view must clamp to the buffer");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn constructed_control_message_is_cmsghdr_aligned() {
+    let control = control_for(TLS_RECORD_TYPE_ALERT);
+    let addr = control.as_bytes().as_ptr() as usize;
+    // The bytes handed to `sendmsg` must still satisfy the CMSG_* contract.
+    assert_eq!(addr % std::mem::align_of::<libc::cmsghdr>(), 0, "stays aligned");
+}
+
+// ---------------------------------------------------------------------------
 // One frontend-TLS handshake budget across every admission stage
 //
 // The kTLS attempt peeks the ClientHello and runs an unbuffered handshake
