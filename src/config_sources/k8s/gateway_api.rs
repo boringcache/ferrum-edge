@@ -5110,23 +5110,17 @@ fn route_host_scopes_for_path(
     scopes
 }
 
-/// A stable, ID-safe token for one listener, used to keep generated proxy IDs
-/// distinct across listeners that share a numeric port.
+/// A stable, ID-safe, collision-resistant token for one listener, used to keep
+/// generated proxy IDs distinct across listeners that share a numeric port.
+///
+/// A sanitized name is not sufficient: valid Gateway names `edge.a` and
+/// `edge-a` both become `edge-a` when projected into Ferrum resource IDs. Bind
+/// the token to the full namespace/Gateway/listener identity instead.
 fn listener_id_suffix(key: &GatewayApiListenerKey) -> String {
-    let mut token = String::with_capacity(key.gateway.len() + key.listener.len() + 2);
-    for part in [key.gateway.as_str(), key.listener.as_str()] {
-        if !token.is_empty() {
-            token.push('-');
-        }
-        for ch in part.chars() {
-            if ch.is_ascii_alphanumeric() {
-                token.push(ch.to_ascii_lowercase());
-            } else {
-                token.push('-');
-            }
-        }
-    }
-    token
+    let identity = format!("{}|{}|{}", key.namespace, key.gateway, key.listener);
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    const LISTENER_SUFFIX_LEN: usize = 16;
+    format!("listener-{}", &digest[..LISTENER_SUFFIX_LEN])
 }
 
 fn proxy_hosts_for_conflict_hostname(spec_hostnames: &[String], hostname: &str) -> Vec<String> {

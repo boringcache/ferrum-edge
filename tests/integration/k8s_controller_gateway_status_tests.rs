@@ -1159,6 +1159,41 @@ fn slot_claim_route(name: &str, gateways: &[&str]) -> K8sObject {
     )
 }
 
+/// Listener identity must not be derived by lossy punctuation replacement.
+/// Both Gateway names are valid, but `edge.a` and `edge-a` sanitize to the same
+/// Ferrum ID fragment. A Route attached to both must retain two distinct proxy
+/// resources and both listener ports.
+#[test]
+fn punctuation_colliding_gateway_names_keep_distinct_listener_claims() {
+    let dotted = plain_gateway("edge.a", 8080);
+    let dashed = plain_gateway("edge-a", 9090);
+    let route = slot_claim_route("route-a", &["edge.a", "edge-a"]);
+    let objects = vec![gateway_class(), dotted, dashed, route];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let mut ports: Vec<u16> = translation
+        .config
+        .proxies
+        .iter()
+        .filter_map(|proxy| proxy.listen_port)
+        .collect();
+    ports.sort_unstable();
+    assert_eq!(
+        ports,
+        vec![8080, 9090],
+        "lossy listener IDs must not overwrite one of the two claims: {:?}",
+        translation.config.proxies
+    );
+
+    let ids: std::collections::HashSet<&str> = translation
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "each listener claim needs a unique proxy ID");
+}
+
 fn route_update<'a>(
     updates: &'a [GatewayApiStatusUpdate],
     name: &str,
