@@ -1527,7 +1527,8 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
     acc: &mut K8sAccumulator,
     plan: &GatewayFrontendTlsNamespaceSlotPlan,
 ) {
-    let keys: Vec<GatewayApiListenerKey> = acc.gateway_api_listener_policies.keys().cloned().collect();
+    let keys: Vec<GatewayApiListenerKey> =
+        acc.gateway_api_listener_policies.keys().cloned().collect();
     for key in keys {
         let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
             continue;
@@ -1688,7 +1689,9 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         if policy.requires_frontend_tls {
             if listener_is_effective_tls_serving_claim(key, policy, &plan) {
                 claims.effective_tls.push(key.clone());
-                claims.effective_tls_namespaces.insert(key.namespace.clone());
+                claims
+                    .effective_tls_namespaces
+                    .insert(key.namespace.clone());
                 if let Some(source) = plan.serving_by_namespace.get(&key.namespace) {
                     claims.effective_tls_credentials.insert(source.clone());
                 }
@@ -1701,8 +1704,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (port, claims) in claims_by_port {
-        let protocol_conflict =
-            !claims.plaintext.is_empty() && !claims.effective_tls.is_empty();
+        let protocol_conflict = !claims.plaintext.is_empty() && !claims.effective_tls.is_empty();
         // Compare planned per-namespace serving credentials, not every raw
         // certificateRef that will lose namespace-slot arbitration.
         let credential_conflict = claims.effective_tls_namespaces.len() > 1
