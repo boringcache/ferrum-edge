@@ -11,8 +11,7 @@ use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
 use ferrum_edge::identity::svid_source_watch::{
     GATEWAY_SVID_FILE_POLL_INTERVAL, GatewaySvidCadence, GatewaySvidPollOutcome as Outcome,
     GatewaySvidSourceSet, GatewaySvidSourceTracker, GatewaySvidWatchConfig, gateway_svid_cadence,
-    gateway_svid_entry_rotation_equivalent, gateway_svid_rotation_equivalent,
-    run_gateway_svid_source_rotation_loop,
+    gateway_svid_rotation_equivalent, run_gateway_svid_source_rotation_loop,
 };
 use ferrum_edge::tls::events::{TlsEventFilter, global_event_log};
 use ferrum_edge::tls::source::subscription::MaterialFingerprintEntry;
@@ -248,97 +247,6 @@ fn identical_byte_rewrites_do_not_report_a_change() {
     assert_eq!(poll_at(&mut tracker, start, 2), Outcome::Unchanged);
 }
 
-/// Provider `version` is observability metadata, not a rotation signal.
-///
-/// A `k8s://` Secret rewrite that keeps the same material bytes still bumps
-/// `metadata.resourceVersion`; managed/ACME/Azure sources can likewise report a
-/// new version id for identical bytes. Derived `MaterialFingerprintEntry` Eq
-/// includes `version`, so the gateway SVID tracker must use
-/// [`gateway_svid_rotation_equivalent`] instead.
-#[test]
-fn provider_version_only_drift_is_unchanged_and_does_not_advance() {
-    let (_ca, files) = valid_svid_files();
-    let sources = files.source_set();
-    let mut tracker = tracker_for(&sources);
-    let start = Instant::now();
-    assert_eq!(poll_at(&mut tracker, start, 0), Outcome::Baseline);
-
-    let mut with_version = tracker
-        .current_fingerprints()
-        .expect("baseline fingerprints");
-    for entry in &mut with_version {
-        entry.version = Some("rv-1".to_string());
-    }
-    assert_eq!(
-        tracker.observe_complete_set(with_version.clone()),
-        Outcome::Unchanged,
-        "attaching a provider version to identical bytes must not rotate"
-    );
-
-    let mut bumped_version = with_version;
-    for entry in &mut bumped_version {
-        entry.version = Some("rv-2".to_string());
-    }
-    assert_eq!(
-        tracker.observe_complete_set(bumped_version.clone()),
-        Outcome::Unchanged,
-        "a provider version bump alone must stay Unchanged"
-    );
-
-    // Observability may refresh the stored version, but the published set must
-    // remain rotation-equivalent and must not require a commit/publish.
-    let published = tracker
-        .current_fingerprints()
-        .expect("version metadata retained on latest entries");
-    assert!(
-        gateway_svid_rotation_equivalent(&published, &bumped_version),
-        "latest entries stay rotation-equivalent after version-only drift"
-    );
-    assert_eq!(
-        published[0].version.as_deref(),
-        Some("rv-2"),
-        "provider version metadata is preserved for observability"
-    );
-
-    // A real byte change still reports Changed (and would publish).
-    let mut byte_changed = bumped_version;
-    byte_changed[0].fingerprint[0] ^= 0xff;
-    assert_eq!(
-        tracker.observe_complete_set(byte_changed),
-        Outcome::Changed,
-        "a material byte change must still report Changed"
-    );
-}
-
-/// After a version-only refresh of the published baseline, a later live poll
-/// that re-reads the same file bytes (version `None`) must stay quiet — not
-/// flip to `Changed` because the stored provider version no longer matches.
-#[test]
-fn live_poll_after_version_metadata_refresh_stays_unchanged() {
-    let (_ca, files) = valid_svid_files();
-    let sources = files.source_set();
-    let mut tracker = tracker_for(&sources);
-    let start = Instant::now();
-    assert_eq!(poll_at(&mut tracker, start, 0), Outcome::Baseline);
-
-    let mut with_version = tracker
-        .current_fingerprints()
-        .expect("baseline fingerprints");
-    for entry in &mut with_version {
-        entry.version = Some("rv-9".to_string());
-    }
-    assert_eq!(
-        tracker.observe_complete_set(with_version),
-        Outcome::Unchanged
-    );
-
-    assert_eq!(
-        poll_at(&mut tracker, start, 2),
-        Outcome::Unchanged,
-        "re-reading identical file bytes must not rotate after version metadata refresh"
-    );
-}
-
 #[test]
 fn gateway_svid_rotation_predicate_ignores_version_only() {
     let entry = |version: Option<&str>, fingerprint_byte: u8| MaterialFingerprintEntry {
@@ -354,12 +262,10 @@ fn gateway_svid_rotation_predicate_ignores_version_only() {
     let v2 = entry(Some("101"), 0x11);
     let other_bytes = entry(Some("100"), 0x22);
 
-    assert!(gateway_svid_entry_rotation_equivalent(&v1, &v2));
     assert!(gateway_svid_rotation_equivalent(
         std::slice::from_ref(&v1),
         std::slice::from_ref(&v2)
     ));
-    assert!(!gateway_svid_entry_rotation_equivalent(&v1, &other_bytes));
     assert!(!gateway_svid_rotation_equivalent(
         std::slice::from_ref(&v1),
         std::slice::from_ref(&other_bytes)

@@ -90,7 +90,7 @@ const TRUST_BUNDLE_LABEL: &str = "gateway_svid_trust_bundle";
 /// Provider-returned [`MaterialFingerprintEntry::version`] is observability
 /// metadata only — a `k8s://` `resourceVersion` bump (or ACME/Azure/managed
 /// version id) for identical bytes must not count as a rotation.
-pub fn gateway_svid_entry_rotation_equivalent(
+fn gateway_svid_entry_rotation_equivalent(
     left: &MaterialFingerprintEntry,
     right: &MaterialFingerprintEntry,
 ) -> bool {
@@ -406,31 +406,6 @@ impl GatewaySvidSourceTracker {
             refreshed,
             failures,
         }
-    }
-
-    /// Adopt `entries` as the latest complete fingerprint set and classify
-    /// them against the published baseline with
-    /// [`gateway_svid_rotation_equivalent`].
-    ///
-    /// [`Self::poll`] reads due sources then classifies through the same path.
-    /// Callers that already hold a complete set — including coverage that
-    /// injects provider-version metadata file fixtures cannot produce — can
-    /// classify without re-fetching.
-    pub fn observe_complete_set(
-        &mut self,
-        entries: Vec<MaterialFingerprintEntry>,
-    ) -> GatewaySvidPollOutcome {
-        if entries.len() != self.sources.len() {
-            return GatewaySvidPollOutcome::Idle;
-        }
-        for (source, entry) in self.sources.iter_mut().zip(entries) {
-            source.last = Some(entry);
-            source.unavailable = false;
-        }
-        let Some(current) = self.current_fingerprints() else {
-            return GatewaySvidPollOutcome::Idle;
-        };
-        self.classify_complete_set(current)
     }
 
     fn classify_complete_set(
