@@ -544,7 +544,7 @@ complete reports failure instead of success (see
 
 | Workload | Runs | Access | Bound |
 |---|---|---|---|
-| `ferrum-cni-installer` (init container) | at pod start | rw on both host dirs + socket dir | Durable artifacts: `<hostBinDir>/ferrum-cni`, the configured conflist name, `/etc/cni/net.d/.ferrum-cni-owned.marker` (ownership manifest), and `/etc/cni/net.d/.ferrum-cni-install.lock` (lifecycle lock; created/updated and left behind by design). Same-directory `O_EXCL \| O_NOFOLLOW` staging siblings are used for binary, conflist, and manifest publishes and are removed on success or failure. Under the lock, install refuses to overwrite an existing target conflist unless that file is a bounded regular single-link object whose Ferrum marker names this same owner. Reads neighbouring configs only to copy the primary's plugin list; never modifies one. |
+| `ferrum-cni-installer` (init container) | at pod start | rw on both host dirs + socket dir | Durable artifacts: `<hostBinDir>/ferrum-cni`, the configured conflist name, `/etc/cni/net.d/.ferrum-cni-owned.marker` (ownership manifest), and `/etc/cni/net.d/.ferrum-cni-install.lock` (lifecycle lock; created/updated and left behind by design). Same-directory `O_EXCL \| O_NOFOLLOW` staging siblings are used for binary, conflist, and manifest publishes and are removed on success or failure. Under the lock, install refuses to overwrite an existing target conflist unless that file is a bounded regular single-link object whose Ferrum marker names this same owner, and refuses to replace the shared plugin binary with different bytes while any other configuration still references it. Reads neighbouring configs only to copy the primary's plugin list; never modifies one. On a failure after the preflight it removes the same-owner chain it had classified — re-proved by owner, generation, and device/inode — so a failed upgrade cannot leave the node depending on a node-agent that never starts. |
 | `ferrum-cni-rollback` (native sidecar) | from this generation's publication until readiness or the deadline | rw on both host dirs, read on the socket | May remove only artifacts carrying this release's owner **and** this pod's generation. Neither its readiness budget nor its STATUS probe starts until this generation's own conflist is observed on disk — the socket is node-scoped, so an answer from an earlier node-agent generation must not be able to disarm this one's rollback — and cleanup holds the node lifecycle lock, so it cannot act against an install that is still running. |
 | `ferrum-mesh-cni-cleanup` (pre-delete hook DaemonSet) | during `helm uninstall` | rw on both host dirs | May remove only artifacts carrying this release's owner. No ServiceAccount token, no RBAC, no Kubernetes API access. Runs `hostNetwork: true`, because a pod needing its own CNI sandbox could not start on a node whose chain is broken. Its readiness marker is retracted at process start and republished only by the run that actually completed cleanup; a symlink or any other non-regular file at the marker path is refused, never followed and never deleted. |
 | `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role names one object: `get` + `delete` on `daemonsets` and `get` on `daemonsets/status`, both with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace — no list, no watch, no writes of any other kind. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup; `delete` is what lets it retire that DaemonSet itself instead of relying on a Helm deletion policy that would also fire on failure. |
@@ -563,6 +563,29 @@ Removal is gated on evidence written at install time, never on a path guess:
   manifest evidence bound to different file names, keeps the binary. Retaining
   an unreferenced executable is inert; deleting one another release still
   chains to is not.
+- A manifest's `previousBinarySha256` is an **attestation, not an
+  observation**. Hashing whatever already occupies the shared plugin path
+  proves nothing about who owns it, so the installer records that digest only
+  when the manifest already on disk carries this same owner, names these exact
+  artifact names, and had itself already recorded that digest. Every other
+  case records `null`: a pre-existing operator or third-party binary can never
+  be made removable merely because the installer read it. Because an
+  unreferenced binary is inert, retaining it never fails chain cleanup.
+- Install applies the shared-binary rule in the other direction too: while any
+  remaining `.conf`/`.conflist`/`.json` still names `ferrum-cni`, the shared
+  executable is not replaced with different bytes. Byte-identical
+  republication is not a replacement and stays allowed; an installed object
+  that cannot be classified, or a directory that cannot be fully scanned,
+  fails safe by refusing the replacement with a fixed error and leaving the
+  shared binary and manifest byte-identical.
+- A failed install does not get to strand a chain. Everything that can fail on
+  uncontrolled input — locating the primary config, building the chain,
+  serializing it, staging and gating the binary — runs before any shared
+  write, and if a later step still fails the installer removes the same-owner
+  chain its preflight had classified, re-proving owner, generation, and
+  device/inode under the same lock first. A different owner, or a generation
+  that overtook the run, is retained and logged; the original failure is
+  always surfaced.
 - The configured file name is validated as a single path component, so `..`
   or an embedded separator can never redirect a delete out of the directory.
 - Artifacts are opened with `O_NOFOLLOW` and classified against the **open

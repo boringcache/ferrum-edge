@@ -29,6 +29,24 @@
 //! rewrites a neighbouring CNI configuration, and it never removes the shared
 //! plugin binary while any CNI configuration on the node still references it.
 //!
+//! # What the manifest's `previousBinarySha256` does and does not prove
+//!
+//! Observing a digest is not owning the file it describes. `/opt/cni/bin/`
+//! is shared, so the regular file already sitting at the plugin path on a
+//! first install may belong to an operator or to another product entirely.
+//! The installer therefore records a replaced digest **only** when a prior
+//! manifest — same owner, naming these exact artifact names — already
+//! attested that same digest as one of its own. Absent that attestation the
+//! field is written `null`, and cleanup can never be talked into deleting a
+//! binary this installer merely hashed. Retaining an unreferenced binary is
+//! inert and never fails chain cleanup, so the safe direction is cheap.
+//!
+//! Install applies the same shared-binary rule cleanup does: while any other
+//! `.conf` / `.conflist` / `.json` on the node still names `ferrum-cni`, the
+//! shared executable is not replaced with different bytes. Republishing the
+//! identical bytes is a no-op and stays allowed; evidence that cannot be read
+//! fails safe by refusing the replacement.
+//!
 //! # Concurrency and swap resistance
 //!
 //! Every mutating path in this module takes an exclusive `flock` on
@@ -141,6 +159,21 @@ const REASON_TARGET_INVALID_MARKER: &str =
 /// Existing target conflist is a valid Ferrum chain for a different release.
 const REASON_TARGET_OTHER_OWNER: &str =
     "existing configuration is owned by a different Ferrum install";
+/// Another CNI configuration still chains to the shared plugin binary and the
+/// staged bytes differ from the installed ones.
+const REASON_SHARED_BINARY_REFERENCED: &str =
+    "another CNI configuration on this node still references the ferrum-cni plugin, \
+     and the staged binary differs from the installed one";
+/// The installed plugin binary could not be classified, so its bytes are
+/// unknown, while another configuration still chains to it.
+const REASON_SHARED_BINARY_UNCLASSIFIABLE: &str =
+    "the installed plugin binary could not be classified as a plain regular file, \
+     and another CNI configuration on this node still references it";
+/// The directory scan that decides whether the binary is shared could not be
+/// completed, so replacement is refused rather than guessed at.
+const REASON_SHARED_BINARY_UNPROVABLE: &str =
+    "the CNI configuration directory could not be scanned for other ferrum-cni references, \
+     so the shared plugin binary is not replaced";
 
 /// Install-time identity stamped onto every generated artifact.
 ///
@@ -399,6 +432,8 @@ pub enum CniInstallError {
     UnsafeReadyMarker { path: String },
     #[error("refusing to overwrite {path}: {reason}")]
     UnsafeInstallTarget { path: String, reason: &'static str },
+    #[error("refusing to replace the shared plugin binary {path}: {reason}")]
+    SharedBinaryInUse { path: String, reason: &'static str },
 }
 
 pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
@@ -411,6 +446,20 @@ pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
 ///
 /// Idempotent: re-running with the same source binary re-stamps ownership and
 /// rewrites the chain without touching the published binary at all.
+///
+/// # Failure is an availability question, not just a cleanliness one
+///
+/// On a same-owner upgrade the node may already be carrying this owner's
+/// PREVIOUS chain. That chain routes every pod ADD through a `ferrum-cni`
+/// socket the replacement pod is the one expected to serve, so an install
+/// that fails before publishing would leave the node pointing at a node-agent
+/// that never starts — and the replacement's rollback watcher, which is
+/// scoped to the generation that was never published, would correctly refuse
+/// to remove anything. `install` therefore lifts that pre-existing same-owner
+/// chain on its ordinary error path, still under the lock and still only
+/// after re-proving the exact owner, generation, and device/inode it observed
+/// during preflight. A chain that a different owner, or a generation that
+/// overtook this run, now occupies is left strictly alone.
 pub fn install(
     config: &CniInstallConfig,
     source_binary: &Path,
@@ -428,7 +477,9 @@ pub fn install(
 
     // Nothing shared may change until this node's lifecycle lock is held: a
     // rollback watcher that reached its deadline must not be able to delete
-    // an artifact while this run is still publishing the next one.
+    // an artifact while this run is still publishing the next one. The lock
+    // also spans the recovery below, so the chain this run may lift cannot be
+    // replaced by a peer installer between the failure and the removal.
     let _lock = InstallLock::acquire(host_conf_dir)?;
 
     // Fail closed before any staging, manifest, binary, or target-config write:
@@ -436,24 +487,79 @@ pub fn install(
     // is a bounded regular single-link file whose Ferrum marker names this
     // same owner. A foreign, malformed, or differently-owned file must never
     // be destroyed by install.
-    assert_install_target_reusable(host_conf_dir, &config.conf_file_name, &config.ownership)?;
+    let target_state =
+        assert_install_target_reusable(host_conf_dir, &config.conf_file_name, &config.ownership)?;
 
+    match install_under_lock(config, host_bin_dir, host_conf_dir, source_binary) {
+        Ok(target_conf) => Ok(target_conf),
+        Err(error) => {
+            lift_stranded_same_owner_chain(host_conf_dir, &config.conf_file_name, &target_state);
+            Err(error)
+        }
+    }
+}
+
+/// The publication sequence, run with the node lifecycle lock already held and
+/// the configured target conflist already proven reusable.
+///
+/// ORDER IS LOAD-BEARING, and every step before the first shared write is
+/// there so that a failure cannot leave shared state half-changed.
+fn install_under_lock(
+    config: &CniInstallConfig,
+    host_bin_dir: &Path,
+    host_conf_dir: &Path,
+    source_binary: &Path,
+) -> Result<PathBuf, CniInstallError> {
+    let target_conf = host_conf_dir.join(&config.conf_file_name);
     let target_binary = host_bin_dir.join(FERRUM_PLUGIN_TYPE);
 
-    // ORDER IS LOAD-BEARING, three times over.
-    //
-    // 1. The new binary is staged NEXT TO its destination and hashed as it is
+    // 1. EVERY non-publication step runs first: finding the primary config,
+    //    building the chain, and serializing it. All three can fail on input
+    //    this installer does not control (a missing primary, a primary that
+    //    is not an object, an empty plugin list), so none of them may run
+    //    after the shared manifest or the shared binary has been touched.
+    let primary = find_primary_config(host_conf_dir, &config.conf_file_name, &config.chained_with)?;
+    let chained = build_chained_conflist(
+        &primary.json,
+        &config.socket_path,
+        &config.ownership,
+        &primary.path,
+    )?;
+    let mut conflist_bytes =
+        serde_json::to_vec_pretty(&chained).map_err(|source| CniInstallError::Json {
+            path: target_conf.display().to_string(),
+            source,
+        })?;
+    conflist_bytes.push(b'\n');
+
+    // 2. The new binary is staged NEXT TO its destination and hashed as it is
     //    written, so the digest describes exactly the bytes that will be
-    //    published, from a file nothing else can reach yet.
+    //    published, from a file nothing else can reach yet. The staging file
+    //    is an unguessable `O_EXCL | O_NOFOLLOW` sibling and is removed on
+    //    every exit, so this is still not a shared mutation.
     let staged = StagedBinary::stage(source_binary, &target_binary)?;
 
-    // 2. The ownership manifest lands BEFORE the shared binary is published.
+    // 3. Decide whether the SHARED executable may be replaced at all, using
+    //    the same rule cleanup applies in the other direction. Refusal here
+    //    happens before the manifest write, so a refused install leaves the
+    //    shared binary and the shared manifest byte-identical.
+    let installed = classify_installed_binary(&target_binary)?;
+    let publication = plan_binary_publication(
+        host_conf_dir,
+        &config.conf_file_name,
+        &target_binary,
+        &installed,
+        &staged.sha256,
+    )?;
+
+    // 4. The ownership manifest lands BEFORE the shared binary is published.
     //    Nothing this install can leave behind — including after a failure at
     //    any later step — is therefore un-provable, and so nothing it leaves
-    //    behind is un-removable. The digest of the binary being replaced is
-    //    recorded alongside the new one so a crash between the manifest write
-    //    and the publish still leaves a removable binary.
-    let previous_sha256 = installed_binary_digest(&target_binary)?;
+    //    behind is un-removable. A replaced digest is carried forward only
+    //    when prior same-owner manifest evidence already attested it (see the
+    //    module docs); merely hashing whatever occupied the path proves
+    //    nothing and authorizes nothing.
+    let previous_sha256 = attested_previous_binary_digest(host_conf_dir, config, &installed)?;
     write_ownership_manifest(
         host_conf_dir,
         &config.ownership,
@@ -462,38 +568,99 @@ pub fn install(
         previous_sha256.as_deref(),
     )?;
 
-    // 3. The binary is published before anything can reference it, by an
+    // 5. The binary is published before anything can reference it, by an
     //    atomic same-directory rename — never an in-place truncate. An
     //    already-exec'd `ferrum-cni` keeps running from the old inode until
     //    it exits, and kubelet's next exec resolves the new one. When the
     //    staged bytes are identical to what is already installed (the routine
     //    `helm upgrade` case) the rename is skipped entirely, so an unchanged
     //    image performs no binary swap at all.
-    if previous_sha256.as_deref() == Some(staged.sha256.as_str()) {
-        staged.discard();
-    } else {
-        staged.publish(&target_binary)?;
+    match publication {
+        BinaryPublication::ReuseInstalled => staged.discard(),
+        BinaryPublication::Publish => staged.publish(&target_binary)?,
     }
 
-    // 4. The conflist goes down LAST: the moment it lands, every pod ADD on
-    //    this node traverses ferrum-cni, so nothing that could fail may still
-    //    be pending at that point.
-    let primary = find_primary_config(host_conf_dir, &config.conf_file_name, &config.chained_with)?;
-    let chained = build_chained_conflist(
-        &primary.json,
-        &config.socket_path,
-        &config.ownership,
-        &primary.path,
-    )?;
-    let target_conf = host_conf_dir.join(&config.conf_file_name);
-    let mut bytes =
-        serde_json::to_vec_pretty(&chained).map_err(|source| CniInstallError::Json {
-            path: target_conf.display().to_string(),
-            source,
-        })?;
-    bytes.push(b'\n');
-    atomic_write_file(&target_conf, &bytes, Some(0o644))?;
+    // 6. The conflist goes down LAST, and atomically: the moment it lands,
+    //    every pod ADD on this node traverses ferrum-cni, so nothing that
+    //    could fail may still be pending at that point. Its bytes were built
+    //    in step 1, so the only remaining failure is the publish itself.
+    atomic_write_file(&target_conf, &conflist_bytes, Some(0o644))?;
     Ok(target_conf)
+}
+
+/// Recovery for a failed install that found a pre-existing same-owner chain.
+///
+/// Removes that chain only when it is still, byte-for-byte and inode-for-inode,
+/// the object preflight classified: same device/inode/length, and a Ferrum
+/// marker naming the same owner AND the same generation. Anything else — a
+/// different owner, a generation that overtook this run, a swapped or
+/// rewritten file — is retained untouched. Diagnostics carry operator-supplied
+/// paths and fixed strings only.
+///
+/// Failures here are reported, never returned: the caller must surface the
+/// original install error, and a recovery that could not run has changed
+/// nothing.
+fn lift_stranded_same_owner_chain(
+    conf_dir: &Path,
+    conf_file_name: &str,
+    state: &InstallTargetState,
+) {
+    let InstallTargetState::SameOwnerChain {
+        ownership,
+        identity,
+    } = state
+    else {
+        return;
+    };
+    let path = conf_dir.join(conf_file_name);
+    let still_ours = match read_bounded_regular_file(&path, MAX_OWNED_JSON_BYTES) {
+        Ok(ArtifactRead::Present {
+            bytes,
+            identity: found,
+        }) => found == *identity && conflist_ownership(&bytes).as_ref() == Some(ownership),
+        // Nothing is there any more, so nothing holds the node. Not a
+        // retention worth reporting.
+        Ok(ArtifactRead::Absent) => return,
+        Ok(ArtifactRead::Rejected(_)) | Err(_) => false,
+    };
+    // Diagnostics go to stderr, not `tracing`: `install` only ever runs from
+    // the `ferrum-cni` CLI, which installs no subscriber, and an operator
+    // reading an init-container log is the whole audience for this. Every
+    // interpolated value is an operator-configured path or a fixed string.
+    if !still_ours {
+        eprintln!(
+            "ferrum-cni: install failed; {} is no longer the same-owner chained configuration \
+             this run observed, so nothing was removed",
+            path.display()
+        );
+        return;
+    }
+    match remove_verified(&path, *identity) {
+        Ok(CniArtifactOutcome::Removed | CniArtifactOutcome::AlreadyAbsent) => {
+            eprintln!(
+                "ferrum-cni: install failed during a same-owner upgrade; removed {} so pod \
+                 creation on this node no longer depends on a node-agent this install never \
+                 published",
+                path.display()
+            );
+        }
+        Ok(outcome) => {
+            eprintln!(
+                "ferrum-cni: install failed and {} could not be removed ({}: {}); pod creation \
+                 on this node still depends on the node-agent",
+                path.display(),
+                outcome.as_str(),
+                outcome.reason()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "ferrum-cni: install failed and {} could not be removed: {error}; pod creation \
+                 on this node still depends on the node-agent",
+                path.display()
+            );
+        }
+    }
 }
 
 pub fn uninstall_from_env() -> Result<CniUninstallReport, CniInstallError> {
@@ -747,6 +914,20 @@ fn conflist_ownership(bytes: &[u8]) -> Option<CniOwnership> {
     conflist_ownership_value(&value)
 }
 
+/// What the install preflight found at the configured target path.
+///
+/// The `SameOwnerChain` arm is what makes the failed-upgrade recovery
+/// provable: it carries the exact ownership marker and the exact
+/// device/inode/length the preflight classified, so the error path can
+/// re-prove both before unlinking anything.
+enum InstallTargetState {
+    Absent,
+    SameOwnerChain {
+        ownership: CniOwnership,
+        identity: FileIdentity,
+    },
+}
+
 /// Fail-closed install preflight for the configured target conflist.
 ///
 /// Held under the install lock and run before every staging / manifest /
@@ -759,15 +940,15 @@ fn assert_install_target_reusable(
     conf_dir: &Path,
     conf_file_name: &str,
     ownership: &CniOwnership,
-) -> Result<(), CniInstallError> {
+) -> Result<InstallTargetState, CniInstallError> {
     let path = conf_dir.join(conf_file_name);
     match read_bounded_regular_file(&path, MAX_OWNED_JSON_BYTES)? {
-        ArtifactRead::Absent => Ok(()),
+        ArtifactRead::Absent => Ok(InstallTargetState::Absent),
         ArtifactRead::Rejected(reason) => Err(CniInstallError::UnsafeInstallTarget {
             path: path.display().to_string(),
             reason,
         }),
-        ArtifactRead::Present { bytes, .. } => match conflist_ownership(&bytes) {
+        ArtifactRead::Present { bytes, identity } => match conflist_ownership(&bytes) {
             None => Err(CniInstallError::UnsafeInstallTarget {
                 path: path.display().to_string(),
                 reason: REASON_TARGET_UNOWNED,
@@ -776,13 +957,127 @@ fn assert_install_target_reusable(
                 path: path.display().to_string(),
                 reason: REASON_TARGET_INVALID_MARKER,
             }),
-            Some(found) if found.owner == ownership.owner => Ok(()),
+            Some(found) if found.owner == ownership.owner => {
+                Ok(InstallTargetState::SameOwnerChain {
+                    ownership: found,
+                    identity,
+                })
+            }
             Some(_) => Err(CniInstallError::UnsafeInstallTarget {
                 path: path.display().to_string(),
                 reason: REASON_TARGET_OTHER_OWNER,
             }),
         },
     }
+}
+
+/// The plugin binary currently occupying the shared install path.
+///
+/// `Unreadable` is deliberately distinct from `Absent`: a symlink, a
+/// directory, a hard-linked file, or an oversized object all leave something
+/// real at the path whose bytes this installer cannot account for, and that
+/// uncertainty must fail safe rather than read as "nothing is installed".
+enum InstalledBinary {
+    Absent,
+    Unreadable,
+    Present(String),
+}
+
+/// Classify and hash whatever occupies the shared plugin binary path, through
+/// one open handle so the digest describes the object that was classified.
+fn classify_installed_binary(path: &Path) -> Result<InstalledBinary, CniInstallError> {
+    match open_classified(path, MAX_OWNED_BINARY_BYTES)? {
+        ClassifiedArtifact::Absent => Ok(InstalledBinary::Absent),
+        ClassifiedArtifact::Rejected(_) => Ok(InstalledBinary::Unreadable),
+        ClassifiedArtifact::Present { mut file, .. } => Ok(InstalledBinary::Present(
+            hash_open_file(&mut file, path, MAX_OWNED_BINARY_BYTES)?,
+        )),
+    }
+}
+
+/// Whether this run publishes its staged binary or reuses what is installed.
+enum BinaryPublication {
+    Publish,
+    ReuseInstalled,
+}
+
+/// Apply the shared-binary rule at install time.
+///
+/// `/opt/cni/bin/ferrum-cni` is SHARED: another Ferrum release, or an
+/// operator-authored configuration, may chain to the same executable, and
+/// cleanup already refuses to delete it while such a reference exists.
+/// Install owes that reference the mirror-image guarantee — it must not swap
+/// the bytes out from under a live chain. Byte-identical republication is not
+/// a replacement and stays allowed; an unreadable installed object or an
+/// unscannable directory is ambiguous and fails safe.
+fn plan_binary_publication(
+    conf_dir: &Path,
+    generated_file_name: &str,
+    binary_path: &Path,
+    installed: &InstalledBinary,
+    staged_sha256: &str,
+) -> Result<BinaryPublication, CniInstallError> {
+    let replacement_reason = match installed {
+        // The bytes already on disk are exactly the bytes this run would
+        // publish, so nothing is replaced and no reference can be disturbed.
+        InstalledBinary::Present(digest) if digest.as_str() == staged_sha256 => {
+            return Ok(BinaryPublication::ReuseInstalled);
+        }
+        // Nothing live occupies the path, so there is no shared executable to
+        // protect. A dangling reference from another configuration can only
+        // be helped by supplying the binary it names.
+        InstalledBinary::Absent => return Ok(BinaryPublication::Publish),
+        InstalledBinary::Present(_) => REASON_SHARED_BINARY_REFERENCED,
+        InstalledBinary::Unreadable => REASON_SHARED_BINARY_UNCLASSIFIABLE,
+    };
+    match remaining_ferrum_references(conf_dir, generated_file_name) {
+        FerrumReferences::None => Ok(BinaryPublication::Publish),
+        FerrumReferences::Found => Err(CniInstallError::SharedBinaryInUse {
+            path: binary_path.display().to_string(),
+            reason: replacement_reason,
+        }),
+        FerrumReferences::Unknown => Err(CniInstallError::SharedBinaryInUse {
+            path: binary_path.display().to_string(),
+            reason: REASON_SHARED_BINARY_UNPROVABLE,
+        }),
+    }
+}
+
+/// The digest of the binary being replaced, but only when prior manifest
+/// evidence already proved that digest is this owner's.
+///
+/// Cleanup treats a recorded previous digest as authorization to delete, so
+/// this must be an ATTESTATION, not an observation. The bar is a manifest that
+/// (a) parses at the current schema, (b) names these exact artifact names, (c)
+/// carries this same owner, and (d) already recorded the digest now on disk as
+/// one of its own. That is precisely the repeat-upgrade case the field exists
+/// for — a crash between the manifest write and the binary rename still leaves
+/// whichever of the two digests is on disk provably ours — while a fresh or
+/// partial install records `null` and can never make a pre-existing operator
+/// or third-party binary removable.
+fn attested_previous_binary_digest(
+    conf_dir: &Path,
+    config: &CniInstallConfig,
+    installed: &InstalledBinary,
+) -> Result<Option<String>, CniInstallError> {
+    let InstalledBinary::Present(digest) = installed else {
+        return Ok(None);
+    };
+    let manifest_path = conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME);
+    let ManifestState::Present(prior) = read_ownership_manifest(&manifest_path)? else {
+        return Ok(None);
+    };
+    let attested = prior.speaks_for(&config.conf_file_name)
+        && prior.ownership.owner == config.ownership.owner
+        && prior.digest_matches(digest);
+    if !attested {
+        tracing::debug!(
+            path = %manifest_path.display(),
+            "No prior same-owner manifest attests the installed plugin binary; recording no \
+             previous digest, so cleanup will retain it rather than claim to own it"
+        );
+    }
+    Ok(attested.then(|| digest.clone()))
 }
 
 fn conflist_ownership_value(value: &Value) -> Option<CniOwnership> {
@@ -1140,19 +1435,6 @@ fn hash_open_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<String
         hasher.update(&buf[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-/// Digest of the plugin binary currently installed at `path`, or `None` when
-/// nothing usable is installed there.
-fn installed_binary_digest(path: &Path) -> Result<Option<String>, CniInstallError> {
-    match open_classified(path, MAX_OWNED_BINARY_BYTES)? {
-        ClassifiedArtifact::Absent | ClassifiedArtifact::Rejected(_) => Ok(None),
-        ClassifiedArtifact::Present { mut file, .. } => Ok(Some(hash_open_file(
-            &mut file,
-            path,
-            MAX_OWNED_BINARY_BYTES,
-        )?)),
-    }
 }
 
 /// Unlink a path only after re-proving it is still the object whose ownership
@@ -1959,6 +2241,12 @@ mod tests {
         // must not abort the scan — install should still find and chain the
         // valid primary. (Regression: the parse error previously propagated via
         // `?` and aborted the whole install.)
+        //
+        // Nothing is pre-installed at the plugin path on purpose: this case is
+        // about the primary-config scan, and an unscannable directory
+        // separately refuses to REPLACE a live shared binary with different
+        // bytes (`plan_binary_publication`). Supplying a binary where none
+        // exists replaces nothing, so the two rules do not interact here.
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source-ferrum-cni");
         fs::write(&source, b"new binary").unwrap();
@@ -1967,7 +2255,6 @@ mod tests {
         let socket_dir = root.path().join("run");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::create_dir_all(&conf_dir).unwrap();
-        fs::write(bin_dir.join("ferrum-cni"), b"old binary").unwrap();
         // Malformed sibling sorting before the valid primary.
         fs::write(conf_dir.join("05-broken.conf"), b"{truncated").unwrap();
         fs::write(

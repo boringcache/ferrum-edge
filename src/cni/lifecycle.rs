@@ -36,8 +36,16 @@
 //!    owner and generation. That file is written last and atomically, so its
 //!    presence is the only observable proof that the install completed and
 //!    the node now depends on the node-agent. An installer that never
-//!    publishes never created a dependency, so there is nothing to roll back
-//!    and the watcher reports [`RollbackWatchOutcome::NeverPublished`].
+//!    publishes never created a dependency of ITS OWN, so there is nothing
+//!    for this watcher to roll back and it reports
+//!    [`RollbackWatchOutcome::NeverPublished`].
+//!
+//!    That is only safe because a previous generation's chain is not this
+//!    watcher's problem either: a failed same-owner upgrade lifts the chain
+//!    it found itself, on `install`'s own error path and under the same lock
+//!    (see [`crate::cni::install::install`]). Without that, a generation-N
+//!    watcher would time out as `NeverPublished` while generation N-1's chain
+//!    still routed every pod ADD through a socket nothing would answer.
 //! 2. **Readiness.** Only now does the budget start, and only now is STATUS
 //!    probed at all. A STATUS answer observed *before* publication says
 //!    nothing about this generation — the socket path is node-scoped and a
@@ -140,7 +148,8 @@ pub enum RollbackWatchOutcome {
     Ready,
     /// This generation never published a conflist within the publish budget,
     /// so it never became a node-wide pod-creation dependency. Nothing was
-    /// removed, and nothing needed to be.
+    /// removed here; a previous same-owner chain, if one was present, was
+    /// already lifted by the failing installer itself.
     NeverPublished,
     /// The deadline passed and the generation-scoped cleanup removed the
     /// chain: pod creation on this node no longer traverses `ferrum-cni`.
