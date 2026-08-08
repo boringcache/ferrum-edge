@@ -19,8 +19,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshEgressUdpDialEndpoint, OutboundTrafficPolicy, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort,
+    AppProtocol, MeshConfig, MeshEgressUdpDialEndpoint, MeshEndpoint, OutboundTrafficPolicy,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
 };
 use ferrum_edge::modes::mesh::{
     MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MeshConfigProtocol, MeshEgressGatewayEndpoint,
@@ -1199,5 +1199,88 @@ fn se_udp_source_side_routes_are_empty_on_non_producer_topologies() {
             .expect("mesh block")
             .external_udp_egress_routes
             .is_empty()
+    );
+}
+
+/// Both halves must refuse the SAME entry shapes, or the source publishes a
+/// route whose CONNECT the gateway is guaranteed to refuse.
+///
+/// `build_egress_proxies_and_upstreams` skips a `ServiceEntry` that declares no
+/// host at all before it ever reaches the UDP branch, so such an entry admits
+/// NOTHING on the gateway — not even the endpoint-IP authorities a `STATIC`
+/// entry would otherwise contribute. The source-side materializer keys on the
+/// endpoint IP and would happily route it, so it must apply the same
+/// precondition; otherwise every captured datagram for that endpoint pays a
+/// mesh-mTLS tunnel dial and is then 404'd at the gateway.
+#[test]
+fn se_udp_hostless_service_entry_admits_nothing_on_either_half() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Host-less external UDP ServiceEntry is refused by BOTH halves (#3263)",
+        status = Status::Supported,
+        notes = "#3263: the gateway skips a ServiceEntry with no hosts[] before UDP admission, so the source must refuse it too rather than materialize a route that deterministically black-holes at the gateway.",
+    );
+    let hostless = || GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            service_entries: vec![ServiceEntry {
+                name: "syslog".to_string(),
+                namespace: "default".to_string(),
+                // No hosts: the gateway half refuses the entry outright.
+                hosts: Vec::new(),
+                endpoints: vec![MeshEndpoint {
+                    address: "203.0.113.7".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 514,
+                    protocol: AppProtocol::Udp,
+                    name: Some("udp".to_string()),
+                    target_port: None,
+                }],
+                export_to: vec!["*".to_string()],
+                workload_selector: None,
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+
+    let gateway_rt = egress_runtime();
+    let source_rt = sidecar_source_runtime_with_gateway();
+
+    // Gateway half: no admission, so no `udp` CONNECT authority resolves.
+    let gateway = prepare_gateway_config_for_mesh(hostless(), &gateway_rt).expect("gateway apply");
+    assert!(
+        gateway
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty(),
+        "a host-less ServiceEntry must admit no external UDP destination"
+    );
+
+    // Source half: must refuse the same entry instead of publishing a route
+    // that can only ever black-hole.
+    let source = prepare_gateway_config_for_mesh(hostless(), &source_rt).expect("source apply");
+    assert!(
+        source
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty(),
+        "the source must not materialize a route for an entry the gateway refuses outright"
+    );
+    assert!(
+        !source
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-")),
+        "no source-side external UDP upstream may be synthesized either"
     );
 }

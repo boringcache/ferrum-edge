@@ -5673,6 +5673,16 @@ pub(crate) fn mesh_external_udp_relay_proxy(
 /// flag the gateway allowlist uses. With the flag off the route set is cleared
 /// and nothing is published, so a flag-off gateway cannot be paired with
 /// still-materialized source routes that would black-hole captured datagrams.
+///
+/// **Shared per-entry preconditions.** For the same reason, the entry-level
+/// admission tests are kept identical to
+/// [`build_egress_proxies_and_upstreams`]'s: `location == MESH_EXTERNAL`,
+/// `exportTo` visibility for THIS workload's namespace
+/// ([`service_entry_exported_to_namespace`] — re-applied here because an xDS
+/// carrier hands `service_entries` through unfiltered), and a non-empty
+/// `hosts[]`. An entry the gateway half refuses outright can never admit the
+/// source's CONNECT, so materializing a route for it would only manufacture a
+/// guaranteed black hole.
 fn materialize_mesh_external_udp_egress_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -5706,6 +5716,44 @@ fn materialize_mesh_external_udp_egress_upstreams(
 
     'service_entries: for entry in &mesh_slice.service_entries {
         if entry.location != ServiceEntryLocation::MeshExternal {
+            continue;
+        }
+        // Re-apply `exportTo` visibility against THIS workload's namespace, for
+        // the same reason `build_egress_proxies_and_upstreams` and
+        // `apply_destination_rules` do: the slice is already narrowed by the CP
+        // (and by `MeshSlice::from_gateway_config` on the file source), but an
+        // xDS carrier hands `service_entries` straight through
+        // (`reverse_translate`), so a cross-wired or independently implemented
+        // producer must not be able to hand this workload a captured-UDP route
+        // to an external destination it may not even see. An empty `exportTo`
+        // is namespace-local by Ferrum's fail-closed-by-omission convention
+        // (`export_visibility_admits`). Silent, exactly like the gateway half —
+        // an entry this workload cannot see is not a diagnostic event.
+        if !service_entry_exported_to_namespace(entry, &runtime.namespace) {
+            continue;
+        }
+        // The gateway half refuses an entry that declares no host at all
+        // (`entry.hosts.is_empty()` in `build_egress_proxies_and_upstreams`), so
+        // it publishes NO admission for one — not even the endpoint-IP
+        // authorities. Materializing a source route here anyway would publish a
+        // route whose CONNECT the gateway is GUARANTEED to 404: exactly the
+        // half-armed shape the shared `egress_stream_enabled` gate above exists
+        // to prevent. Refuse it on the same precondition instead.
+        if entry.hosts.is_empty() {
+            let declares_udp_port = entry
+                .ports
+                .iter()
+                .any(|port_spec| matches!(port_spec.protocol, AppProtocol::Udp));
+            if declares_udp_port {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    field = "hosts[]",
+                    "Skipping source-side external UDP egress: the ServiceEntry declares no host, \
+                     which the EgressGateway refuses to admit at all, so any route materialized \
+                     for it would black-hole at the gateway"
+                );
+            }
             continue;
         }
         for port_spec in &entry.ports {
@@ -30360,6 +30408,89 @@ mod tests {
             "SPIFFE diagnostic must stay bounded, got len {}",
             err.len()
         );
+    }
+
+    /// `exportTo` visibility is re-applied source-side (issue #3263).
+    ///
+    /// A slice reaching `prepare_gateway_config_for_native_slice` — the CP-native
+    /// and xDS paths — is NOT re-narrowed by `MeshSlice::from_gateway_config`, so
+    /// the materializer is the only place that can refuse an entry this workload
+    /// may not see. Inline because the materializer and that path are both
+    /// private; the equivalent external test would run through
+    /// `from_gateway_config`, which narrows first and makes the assertion
+    /// vacuous.
+    #[test]
+    fn source_side_external_udp_egress_honors_service_entry_export_to() {
+        let entry = |export_to: Vec<String>| ServiceEntry {
+            name: "syslog".to_string(),
+            namespace: "other".to_string(),
+            hosts: vec!["syslog.external.com".to_string()],
+            endpoints: vec![config::MeshEndpoint {
+                address: "203.0.113.7".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![config::ServicePort {
+                port: 514,
+                protocol: AppProtocol::Udp,
+                name: Some("udp".to_string()),
+                target_port: None,
+            }],
+            export_to,
+            workload_selector: None,
+        };
+        let mut runtime = runtime_with_topology(MeshTopology::Sidecar);
+        runtime.namespace = "default".to_string();
+        runtime.egress_stream_enabled = true;
+        runtime.egress_gateway = Some(MeshEgressGatewayEndpoint {
+            host: "ferrum-egress.istio-system.svc.cluster.local".to_string(),
+            port: 15090,
+            spiffe_id: "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"
+                .parse()
+                .expect("gateway spiffe id"),
+        });
+
+        let materialize = |export_to: Vec<String>| {
+            let slice = MeshSlice {
+                service_entries: vec![entry(export_to)],
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig {
+                mesh: Some(Box::new(MeshConfig::default())),
+                ..GatewayConfig::default()
+            };
+            materialize_mesh_external_udp_egress_upstreams(&mut config, &runtime, &slice);
+            config
+                .mesh
+                .as_deref()
+                .expect("mesh block")
+                .external_udp_egress_routes
+                .len()
+        };
+
+        // Declared in `other`, exported nowhere (empty ⇒ namespace-local) and
+        // exported only to its own namespace: invisible to a `default` workload.
+        assert_eq!(
+            materialize(Vec::new()),
+            0,
+            "an empty exportTo is namespace-local; a foreign workload must not route it"
+        );
+        assert_eq!(
+            materialize(vec![".".to_string()]),
+            0,
+            "exportTo: ['.'] must not reach a workload outside the declaring namespace"
+        );
+        assert_eq!(
+            materialize(vec!["prod".to_string()]),
+            0,
+            "exportTo naming another namespace must not reach this workload"
+        );
+        // Explicitly exported: the route materializes as before.
+        assert_eq!(materialize(vec!["*".to_string()]), 1);
+        assert_eq!(materialize(vec!["default".to_string()]), 1);
     }
 
     #[test]
