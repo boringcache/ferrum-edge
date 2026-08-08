@@ -135,6 +135,10 @@ const REASON_SWAPPED: &str =
 /// Existing target conflist has no usable Ferrum ownership marker.
 const REASON_TARGET_UNOWNED: &str =
     "existing configuration carries no Ferrum ownership marker; it was not written by this installer";
+/// Existing target has a Ferrum-shaped marker, but its required ownership
+/// tokens are absent or outside the installer's bounded alphabet.
+const REASON_TARGET_INVALID_MARKER: &str =
+    "existing configuration carries an invalid Ferrum ownership marker";
 /// Existing target conflist is a valid Ferrum chain for a different release.
 const REASON_TARGET_OTHER_OWNER: &str =
     "existing configuration is owned by a different Ferrum install";
@@ -772,6 +776,12 @@ fn assert_install_target_reusable(
                 path: path.display().to_string(),
                 reason: REASON_TARGET_UNOWNED,
             }),
+            Some(found) if found.validate().is_err() => {
+                Err(CniInstallError::UnsafeInstallTarget {
+                    path: path.display().to_string(),
+                    reason: REASON_TARGET_INVALID_MARKER,
+                })
+            }
             Some(found) if found.owner == ownership.owner => Ok(()),
             Some(_) => Err(CniInstallError::UnsafeInstallTarget {
                 path: path.display().to_string(),

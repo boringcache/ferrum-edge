@@ -2362,6 +2362,35 @@ mod install_lifecycle {
     }
 
     #[test]
+    fn install_refuses_a_same_owner_target_with_an_invalid_marker() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+
+        let mut invalid = read_json(&node.conf_path());
+        invalid["plugins"][1]["ferrum"]
+            .as_object_mut()
+            .expect("ferrum marker object")
+            .remove("generation");
+        let invalid = serde_json::to_vec_pretty(&invalid).expect("invalid marker json");
+        fs::write(node.conf_path(), &invalid).expect("write invalid marker");
+
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("an incomplete same-owner marker must be refused");
+
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&invalid),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+    }
+
+    #[test]
     fn install_refuses_a_malformed_target_without_side_effects() {
         let node = Node::new();
         let malformed = b"{ truncated-hostile-payload";
