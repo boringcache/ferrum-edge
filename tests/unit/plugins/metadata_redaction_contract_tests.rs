@@ -11,7 +11,6 @@ use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
     is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key,
     is_sensitive_metadata_key_with_extras, parse_extras_list, strip_dedup_internal_metadata,
-    strip_internal_only_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
 use serde_json::{Map, Value, json};
@@ -277,23 +276,6 @@ fn strip_dedup_internal_metadata_retains_mesh_metrics_plans() {
             Some(format!("mesh-plan-{idx}").as_str())
         );
     }
-}
-
-#[test]
-fn strip_internal_only_metadata_removes_mesh_metrics_and_dedup_keys() {
-    let mut metadata = planted_metadata();
-    for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
-        metadata.insert((*key).to_string(), format!("mesh-plan-{idx}"));
-    }
-    strip_internal_only_metadata(&mut metadata);
-    for key in LEGACY_DEDUP_FIELDS
-        .iter()
-        .chain(MESH_METRICS_COORDINATION_KEYS.iter())
-    {
-        assert!(!metadata.contains_key(*key), "{key} must be stripped");
-    }
-    assert!(metadata.contains_key("api_key"));
-    assert!(metadata.contains_key("ai_total_tokens"));
 }
 
 #[test]

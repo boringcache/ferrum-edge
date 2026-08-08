@@ -319,14 +319,6 @@ pub fn strip_dedup_internal_metadata(metadata: &mut HashMap<String, String>) {
     metadata.retain(|key, _| !is_dedup_internal_metadata_key(key));
 }
 
-/// Strip every internal-only metadata key from a cloned observability map.
-///
-/// Prefer [`strip_dedup_internal_metadata`] for summary-construction paths that
-/// must retain `mesh.metrics.*` until in-process observers run.
-pub fn strip_internal_only_metadata(metadata: &mut HashMap<String, String>) {
-    metadata.retain(|key, _| !is_internal_only_metadata_key(key));
-}
-
 /// Returns true when the given metadata key matches any sensitive substring
 /// from `DEFAULT_SENSITIVE_METADATA_KEYS` plus the supplied operator extras
 /// (case-insensitive). The lower-level entry point used by tests; production
