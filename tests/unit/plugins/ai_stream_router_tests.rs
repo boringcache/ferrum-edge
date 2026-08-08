@@ -6419,11 +6419,13 @@ fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
             .unwrap_or_else(|| panic!("{label} remaining deferred pass must remain present"));
         let before_deferred = &ladder[..deferred];
         assert!(
-            !before_deferred.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            !before_deferred
+                .contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
             "{label} must not capture backend query before the remaining deferred pass"
         );
         assert!(
-            ladder[deferred..].contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            ladder[deferred..]
+                .contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
             "{label} must capture backend query after the remaining deferred pass"
         );
     }
