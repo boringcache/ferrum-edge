@@ -3116,16 +3116,16 @@ fn reference_resolution_reason(error: &K8sTranslateError) -> &'static str {
             "UnsupportedProtocol"
         }
         K8sTranslateError::InvalidResource { message, .. }
-            if crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message) =>
-        {
-            "BackendNotFound"
-        }
-        K8sTranslateError::InvalidResource { message, .. }
             if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_kind(
                 message,
             ) =>
         {
             "InvalidKind"
+        }
+        K8sTranslateError::InvalidResource { message, .. }
+            if crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message) =>
+        {
+            "BackendNotFound"
         }
         _ => "RefNotPermitted",
     }
