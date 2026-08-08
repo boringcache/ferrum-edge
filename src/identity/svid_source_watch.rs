@@ -21,7 +21,17 @@
 //!    or a bundle that fails validation, leaves the live SVID slot untouched
 //!    and does not advance the backend SVID generation. The warning is emitted
 //!    once and silenced until the source recovers.
-//! 3. **The generation boundary advances only after a valid replacement.** The
+//! 3. **The comparison baseline is anchored to startup, not to the first
+//!    poll.** [`GatewaySvidSourceTracker::prime`] runs synchronously before the
+//!    initial bundle load; baselining lazily inside the spawned task would
+//!    adopt whatever the sources hold once the runtime first schedules it and
+//!    silently swallow every change made during startup. A prime that could
+//!    *not* read every source establishes no baseline, so it latches a forced
+//!    first publish instead: the first later complete fingerprint set goes
+//!    through the coherent reload-and-publish path rather than being adopted as
+//!    a silent baseline, because the live slot may already hold material a
+//!    recovered source has since superseded.
+//! 4. **The generation boundary advances only after a valid replacement.** The
 //!    caller-supplied publish closure installs the bundle *then* bumps
 //!    `backend_svid_rotation_tx`, so backend pool keys (`|svidg=<n>`), pool
 //!    drains, and health-probe restarts all observe one coherent update — the
@@ -231,6 +241,13 @@ struct TrackedSource {
 pub struct GatewaySvidSourceTracker {
     sources: Vec<TrackedSource>,
     published: Option<Vec<MaterialFingerprintEntry>>,
+    /// Latched by a [`GatewaySvidSourceTracker::prime`] that established no
+    /// baseline. While set, the first complete fingerprint set is reported as
+    /// [`GatewaySvidPollOutcome::Changed`] instead of
+    /// [`GatewaySvidPollOutcome::Baseline`], so it is reloaded and published
+    /// rather than silently adopted. Cleared by [`Self::commit`], i.e. only
+    /// once a coherent bundle for those exact fingerprints is live.
+    forced_first_publish: bool,
 }
 
 impl GatewaySvidSourceTracker {
@@ -254,6 +271,7 @@ impl GatewaySvidSourceTracker {
         Self {
             sources: tracked,
             published: None,
+            forced_first_publish: false,
         }
     }
 
@@ -338,8 +356,20 @@ impl GatewaySvidSourceTracker {
         };
 
         let outcome = if self.published.is_none() {
-            self.published = Some(current);
-            GatewaySvidPollOutcome::Baseline
+            if self.forced_first_publish {
+                // The synchronous startup prime never read a complete set, so
+                // there is no anchor proving the live slot matches these bytes:
+                // a source that was unreadable at prime time may have rotated
+                // between the recovery read that produced the live bundle and
+                // now. Adopting this set as a quiet baseline would strand the
+                // live slot on the older material until something changed
+                // again. Report a change and leave `published` unset so the
+                // coherent reload path publishes and only then commits.
+                GatewaySvidPollOutcome::Changed
+            } else {
+                self.published = Some(current);
+                GatewaySvidPollOutcome::Baseline
+            }
         } else if self.published.as_deref() == Some(current.as_slice()) {
             GatewaySvidPollOutcome::Unchanged
         } else {
@@ -352,15 +382,63 @@ impl GatewaySvidSourceTracker {
         }
     }
 
+    /// Establish the comparison baseline from the sources as they are *now*.
+    ///
+    /// This must run **synchronously at startup, before the initial SVID
+    /// bundle is loaded into the live slot**, not lazily on the watcher task's
+    /// first scheduled poll. The spawned task does not run until the caller
+    /// yields to the runtime, and the gap between `ProxyState::new` and that
+    /// first yield covers the rest of gateway startup (TLS policy, listener
+    /// binds, DNS warmup). A source rewritten inside that window would be
+    /// adopted *as* the baseline, so the change is never observed and the
+    /// gateway keeps serving the pre-rotation identity until the material
+    /// happens to change again — precisely the silent-staleness this watcher
+    /// exists to prevent.
+    ///
+    /// Priming before the bundle load keeps the failure direction safe: the
+    /// baseline can only be older than or equal to what the live slot holds,
+    /// so a startup-window change costs one redundant rotation rather than a
+    /// stale identity.
+    ///
+    /// A prime that could not read every source establishes no baseline, and
+    /// the startup bundle load that follows it may still succeed — the sources
+    /// are re-read, so a transiently unavailable one can have recovered in
+    /// between. That leaves the live slot holding material this tracker never
+    /// fingerprinted, and a later rotation of the previously unreadable source
+    /// would otherwise be adopted as the baseline and never published. Such a
+    /// prime therefore latches [`Self::forced_first_publish_pending`], which
+    /// routes the first complete fingerprint set through the coherent
+    /// reload-and-publish path instead.
+    pub fn prime(&mut self, now: Instant) -> GatewaySvidPollOutcome {
+        let outcome = self.poll(now).outcome;
+        // Keyed on the baseline actually being unset rather than on the
+        // outcome variant, so any pass that fails to anchor one — an
+        // unreadable source, or a set that is still incomplete — latches the
+        // forced publish.
+        if self.published.is_none() {
+            self.forced_first_publish = true;
+        }
+        outcome
+    }
+
+    /// `true` while a failed or incomplete prime is still waiting for its
+    /// forced first reload-and-publish to succeed.
+    pub fn forced_first_publish_pending(&self) -> bool {
+        self.forced_first_publish
+    }
+
     /// Adopt the current fingerprints as the comparison baseline.
     ///
     /// Called only after the corresponding coherent bundle is already live.
     /// A failed reload deliberately leaves the prior published fingerprints in
     /// place so a recovered provider is retried even when its bytes did not
-    /// change again.
+    /// change again. For the same reason a forced first publish is released
+    /// here, and only here: a failed reload keeps the latch, so the retry
+    /// survives until a coherent bundle is genuinely live.
     pub fn commit(&mut self) {
         if let Some(current) = self.current_fingerprints() {
             self.published = Some(current);
+            self.forced_first_publish = false;
         }
     }
 
@@ -408,6 +486,13 @@ pub struct GatewaySvidWatchConfig {
     /// Cadence for provider-backed sources without an explicit `?poll=`
     /// (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`).
     pub provider_interval: Duration,
+    /// Tracker already primed by the caller via
+    /// [`GatewaySvidSourceTracker::prime`]. Production always supplies one so
+    /// the baseline is anchored to startup rather than to whenever the spawned
+    /// task is first scheduled. `None` builds the tracker here and baselines on
+    /// the first poll, which is only correct when the sources cannot have
+    /// changed since they were configured.
+    pub tracker: Option<GatewaySvidSourceTracker>,
     pub publish: GatewaySvidPublishFn,
 }
 
@@ -423,10 +508,13 @@ pub async fn run_gateway_svid_source_rotation_loop(
         sources,
         file_interval,
         provider_interval,
+        tracker,
         publish,
     } = config;
 
-    let mut tracker = GatewaySvidSourceTracker::new(&sources, file_interval, provider_interval);
+    let mut tracker = tracker.unwrap_or_else(|| {
+        GatewaySvidSourceTracker::new(&sources, file_interval, provider_interval)
+    });
     if !tracker.is_watchable() {
         info!(
             "Gateway SVID sources are all static (inline PEM); automatic refresh is disabled — \

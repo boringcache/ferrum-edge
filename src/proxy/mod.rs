@@ -110,7 +110,7 @@ use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::svid_source_watch::{
     GATEWAY_SVID_FILE_POLL_INTERVAL, GatewaySvidPublishFn, GatewaySvidSourceSet,
-    GatewaySvidWatchConfig, run_gateway_svid_source_rotation_loop,
+    GatewaySvidSourceTracker, GatewaySvidWatchConfig, run_gateway_svid_source_rotation_loop,
 };
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{
@@ -5976,6 +5976,48 @@ fn gateway_svid_source_set_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ))
 }
 
+/// Build the gateway SVID source set and prime its rotation-comparison
+/// baseline.
+///
+/// Runs in `ProxyState::new` **before** [`load_gateway_svid_bundle`], not
+/// inside the spawned watcher task. `tokio::spawn` only queues the task: it
+/// does not run until the caller yields to the runtime, which is after the
+/// remainder of gateway startup (TLS policy, listener binds, DNS warmup) and,
+/// for an embedded `ProxyState`, potentially much later. A source rewritten in
+/// that window would be adopted *as* the watcher's baseline, so the rotation
+/// would never be observed and the gateway would keep using the pre-rotation
+/// identity until the material changed again.
+///
+/// Priming ahead of the bundle load also keeps the failure direction safe: the
+/// baseline is taken from material at or before what the live slot ends up
+/// holding, so a startup-window change costs one redundant rotation instead of
+/// a silently stale identity.
+///
+/// A prime that cannot read every source is *not* necessarily fatal: the bundle
+/// load that follows re-reads the sources, so a transiently unavailable one can
+/// have recovered in between and construction succeeds with a live bundle this
+/// tracker never fingerprinted. `GatewaySvidSourceTracker::prime` latches a
+/// forced first publish for exactly that case, so the first complete
+/// fingerprint set is reloaded and published rather than adopted as a silent
+/// baseline.
+fn prime_gateway_svid_rotation_baseline(
+    env_config: &EnvConfig,
+) -> Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)> {
+    let sources = gateway_svid_source_set_from_env(env_config)?;
+    let provider_interval = Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1));
+    let mut tracker =
+        GatewaySvidSourceTracker::new(&sources, GATEWAY_SVID_FILE_POLL_INTERVAL, provider_interval);
+    if tracker.is_watchable() {
+        // An unreadable source leaves the baseline unset. If the bundle load
+        // immediately after this also fails, construction fails and nothing
+        // downstream runs; if it succeeds because the source recovered in
+        // between, the latched forced first publish makes the watcher's first
+        // complete read reload and publish instead of baselining silently.
+        tracker.prime(std::time::Instant::now());
+    }
+    Some((sources, tracker))
+}
+
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
     matches!(
         proxy.backend_scheme,
@@ -6735,11 +6777,17 @@ impl ProxyState {
     /// install the validated bundle into the SVID slot (preserving any
     /// CP-delivered trust override), then bump the backend SVID generation so
     /// pool keys, pool drains, and health probes observe one coherent update.
+    ///
+    /// `primed` carries the source set together with the baseline
+    /// [`prime_gateway_svid_rotation_baseline`] already established, so the
+    /// watcher compares against material read at startup rather than against
+    /// whatever the sources hold when the runtime first schedules this task.
     fn start_gateway_svid_rotation_task(
         &self,
+        primed: Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)>,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let sources = gateway_svid_source_set_from_env(&self.env_config)?;
+        let (sources, tracker) = primed?;
         let state = self.clone();
         let provider_interval =
             Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1));
@@ -6756,6 +6804,7 @@ impl ProxyState {
             sources,
             file_interval: GATEWAY_SVID_FILE_POLL_INTERVAL,
             provider_interval,
+            tracker: Some(tracker),
             publish,
         };
         Some(tokio::spawn(run_gateway_svid_source_rotation_loop(
@@ -6978,6 +7027,10 @@ impl ProxyState {
             ),
         );
         let env_config_arc = Arc::new(env_config.clone());
+        // Baseline the rotation watcher *before* the initial bundle load; see
+        // `prime_gateway_svid_rotation_baseline`. Doing it inside the spawned
+        // task would swallow any source change made during startup.
+        let gateway_svid_rotation = prime_gateway_svid_rotation_baseline(&env_config_arc);
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         inject_gateway_workload_metrics_if_svid(
             &mut config,
@@ -7424,8 +7477,9 @@ impl ProxyState {
                 ),
             ),
         };
+        let svid_shutdown_rx = health_check_restart_rx.clone();
         if let Some(handle) =
-            state.start_gateway_svid_rotation_task(health_check_restart_rx.clone())
+            state.start_gateway_svid_rotation_task(gateway_svid_rotation, svid_shutdown_rx)
         {
             health_check_handles.push(handle);
         }

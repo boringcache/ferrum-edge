@@ -271,6 +271,95 @@ fn uncommitted_change_remains_pending_for_a_coherent_reload_retry() {
     assert_eq!(poll_at(&mut tracker, start, 6), Outcome::Unchanged);
 }
 
+/// A prime that could not read every source must not let the first later
+/// complete read become a silent baseline.
+///
+/// The prime failure leaves no baseline, but the startup bundle load that
+/// follows it re-reads the sources, so a source that recovers in between still
+/// produces a live bundle (generation A1). If that source then rotates to A2
+/// before the watcher's first complete poll, adopting A2 as the baseline would
+/// strand the live slot on A1 until the material happened to change again —
+/// the same silent staleness the startup priming exists to prevent.
+#[test]
+fn a_failed_prime_forces_the_first_complete_read_through_a_publish() {
+    let (ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    let start = Instant::now();
+
+    let cert_pem = std::fs::read(&files.cert_path).expect("read cert");
+    std::fs::remove_file(&files.cert_path).expect("remove cert");
+    assert_eq!(tracker.prime(start), Outcome::SourceUnavailable);
+    assert!(
+        tracker.forced_first_publish_pending(),
+        "a prime that established no baseline must latch a forced first publish"
+    );
+
+    // Recovered before the startup bundle load, which therefore succeeded and
+    // put this generation (A1) in the live slot.
+    std::fs::write(&files.cert_path, cert_pem).expect("restore cert");
+
+    // A1 -> A2, still before the watcher's first complete poll.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.cert_path, rotated_cert).expect("rotate cert");
+    std::fs::write(&files.key_path, rotated_key).expect("rotate key");
+
+    assert_eq!(
+        poll_at(&mut tracker, start, 2),
+        Outcome::Changed,
+        "the first complete read after a failed prime must reload, not baseline"
+    );
+
+    // Publishing commits the observed set and releases the latch, so stable
+    // material stops churning.
+    tracker.commit();
+    assert!(!tracker.forced_first_publish_pending());
+    assert_eq!(poll_at(&mut tracker, start, 4), Outcome::Unchanged);
+}
+
+#[test]
+fn a_forced_first_publish_retries_until_a_coherent_reload_succeeds() {
+    let (_ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    let start = Instant::now();
+
+    let bundle_pem = std::fs::read(&files.trust_bundle_path).expect("read bundle");
+    std::fs::remove_file(&files.trust_bundle_path).expect("remove bundle");
+    assert_eq!(tracker.prime(start), Outcome::SourceUnavailable);
+    std::fs::write(&files.trust_bundle_path, bundle_pem).expect("restore bundle");
+
+    // The forced reload behind this pass fails (for example a provider outage
+    // between the fingerprint pass and the coherent load), so commit() is
+    // never reached and the latch must survive.
+    assert_eq!(poll_at(&mut tracker, start, 2), Outcome::Changed);
+    assert!(tracker.forced_first_publish_pending());
+
+    // Stable bytes must keep forcing a retry rather than falling quiet, so a
+    // recovered source publishes without needing another generation.
+    assert_eq!(poll_at(&mut tracker, start, 4), Outcome::Changed);
+    assert_eq!(poll_at(&mut tracker, start, 6), Outcome::Changed);
+
+    tracker.commit();
+    assert!(!tracker.forced_first_publish_pending());
+    assert_eq!(poll_at(&mut tracker, start, 8), Outcome::Unchanged);
+}
+
+#[test]
+fn a_successful_prime_keeps_ordinary_baseline_behavior() {
+    let (_ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    let start = Instant::now();
+
+    assert_eq!(tracker.prime(start), Outcome::Baseline);
+    assert!(
+        !tracker.forced_first_publish_pending(),
+        "a complete prime anchors the baseline and must not force a publish"
+    );
+    assert_eq!(poll_at(&mut tracker, start, 2), Outcome::Unchanged);
+}
+
 #[test]
 fn a_source_read_failure_keeps_the_last_good_fingerprints() {
     let (_ca, files) = valid_svid_files();
@@ -351,6 +440,7 @@ async fn watch_loop_refuses_mismatched_material_and_publishes_rotations() {
         sources: files.source_set(),
         file_interval: Duration::from_secs(1),
         provider_interval: PROVIDER_DEFAULT,
+        tracker: None,
         publish: Box::new(move |bundle| {
             assert_eq!(bundle.spiffe_id.to_string(), SPIFFE_ID);
             counter.fetch_add(1, Ordering::SeqCst) + 1
@@ -402,6 +492,131 @@ async fn watch_loop_refuses_mismatched_material_and_publishes_rotations() {
         .expect("watcher task did not panic");
 }
 
+/// A source rewritten *after* the baseline was primed but *before* the spawned
+/// watcher task first runs must still publish exactly one rotation.
+///
+/// `tokio::spawn` only queues the task; on a current-thread runtime it does not
+/// run at all until the spawner yields, and in production that gap covers the
+/// rest of gateway startup. Letting the loop baseline itself on its first poll
+/// therefore adopted post-rotation bytes as "the original" and swallowed the
+/// change permanently — the gateway kept using the pre-rotation identity
+/// (issue #3625).
+#[tokio::test]
+async fn a_change_between_priming_and_the_first_poll_still_rotates() {
+    let (ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    assert_eq!(tracker.prime(Instant::now()), Outcome::Baseline);
+    assert!(!tracker.forced_first_publish_pending());
+
+    // The rotation happens before the loop has ever been polled.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, rotated_key).expect("write key");
+    std::fs::write(&files.cert_path, rotated_cert).expect("write cert");
+
+    let published = Arc::new(AtomicU64::new(0));
+    let counter = published.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let config = GatewaySvidWatchConfig {
+        sources,
+        file_interval: Duration::from_secs(1),
+        provider_interval: PROVIDER_DEFAULT,
+        tracker: Some(tracker),
+        publish: Box::new(move |bundle| {
+            assert_eq!(bundle.spiffe_id.to_string(), SPIFFE_ID);
+            counter.fetch_add(1, Ordering::SeqCst) + 1
+        }),
+    };
+    let task = tokio::spawn(run_gateway_svid_source_rotation_loop(
+        config,
+        Some(shutdown_rx),
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while published.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        1,
+        "a change made before the watcher's first poll must still rotate exactly once"
+    );
+
+    // And it stays at one: the committed baseline suppresses further churn.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher exits on shutdown")
+        .expect("watcher task did not panic");
+}
+
+/// End-to-end counterpart of
+/// `a_failed_prime_forces_the_first_complete_read_through_a_publish`: a prime
+/// that could not read every source, a recovery that makes the startup bundle
+/// load succeed anyway, and a rotation before the spawned watcher's first
+/// complete poll must still publish exactly one rotation — and then stay quiet.
+#[tokio::test]
+async fn a_failed_prime_still_publishes_a_rotation_made_before_the_first_poll() {
+    let (ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+
+    let cert_pem = std::fs::read(&files.cert_path).expect("read cert");
+    std::fs::remove_file(&files.cert_path).expect("remove cert");
+    assert_eq!(tracker.prime(Instant::now()), Outcome::SourceUnavailable);
+    assert!(tracker.forced_first_publish_pending());
+
+    // Recovered before the startup bundle load, so construction succeeded with
+    // this generation live.
+    std::fs::write(&files.cert_path, cert_pem).expect("restore cert");
+
+    // Rotated again before the spawned task has ever polled.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, rotated_key).expect("write key");
+    std::fs::write(&files.cert_path, rotated_cert).expect("write cert");
+
+    let published = Arc::new(AtomicU64::new(0));
+    let counter = published.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let config = GatewaySvidWatchConfig {
+        sources,
+        file_interval: Duration::from_secs(1),
+        provider_interval: PROVIDER_DEFAULT,
+        tracker: Some(tracker),
+        publish: Box::new(move |bundle| {
+            assert_eq!(bundle.spiffe_id.to_string(), SPIFFE_ID);
+            counter.fetch_add(1, Ordering::SeqCst) + 1
+        }),
+    };
+    let task = tokio::spawn(run_gateway_svid_source_rotation_loop(
+        config,
+        Some(shutdown_rx),
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while published.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        1,
+        "a failed prime must force the first complete read through one publish"
+    );
+
+    // The forced publish commits, so stable material does not churn.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher exits on shutdown")
+        .expect("watcher task did not panic");
+}
+
 #[tokio::test]
 async fn watch_loop_exits_when_every_source_is_static() {
     let published = Arc::new(AtomicU64::new(0));
@@ -410,6 +625,7 @@ async fn watch_loop_exits_when_every_source_is_static() {
         sources: inline_source_set(),
         file_interval: Duration::from_secs(1),
         provider_interval: PROVIDER_DEFAULT,
+        tracker: None,
         publish: Box::new(move |_bundle| counter.fetch_add(1, Ordering::SeqCst) + 1),
     };
 
