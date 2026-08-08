@@ -151,6 +151,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback-lock recursion, raced handoff, stale state, and `ktime` wrap from
   fabricating samples. The metric has fixed microsecond buckets with saturating
   count/bucket counters, drops sum overflow, and adds no per-flow labels (#3309).
+- **SECURITY (`a2a_gateway`)**: `endpoint.grpc_services` now recognizes both the
+  canonical A2A 0.3 service `a2a.v1.A2AService` and A2A 1.0's
+  `lf.a2a.v1.A2AService` by default. Dropping the 1.0 identity from the defaults
+  meant a deployment that had relied on the former default silently stopped
+  applying method policy to 1.0 traffic after upgrading — an authorization
+  bypass. Both identities are now detected and policed; the two remain
+  distinct card layouts, so a 1.0 Agent Card is still never decoded as 0.3 and
+  card rewriting on the 1.0 service continues to fail closed with
+  `agent_card_grpc_schema_unsupported` (#3297).
 - Gateway API `BackendTLSPolicy` is watched and translated for Service-backed
   `HTTPRoute`/`GRPCRoute` backends (issue #3276). `validation.hostname` projects
   to upstream `backend_tls_sni`, optional `subjectAltNames` to
@@ -455,13 +464,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was previously ACKed and then matched nothing.
 - **BREAKING (`a2a_gateway`)**: `endpoint.grpc_services` now defaults to the
   canonical A2A 0.3 service `a2a.v1.A2AService` (package `a2a.v1`, from
-  `a2aproject/A2A` at tag `v0.3.0`) instead of A2A 1.0's
-  `lf.a2a.v1.A2AService`, and every configured entry now carries a declared
+  `a2aproject/A2A` at tag `v0.3.0`) and A2A 1.0's
+  `lf.a2a.v1.A2AService` by default, and every configured entry carries a declared
   Agent Card wire layout (issue #3297). The default is the identity whose card
   layout the default `endpoint.protocol_versions` (`0.3.0`) actually describes;
-  the previous pairing detected 1.0's service name while implementing 0.3's
-  payload, so canonical 0.3 traffic was missed by defaults and genuine 1.0
-  traffic was fed to a 0.3 decoder. Entries may still be plain service-name
+  retaining the 1.0 identity preserves method-policy enforcement for deployments
+  that relied on the former default, while its schema prevents the 0.3 decoder
+  from interpreting its renumbered card. Entries may still be plain service-name
   strings — a published A2A name resolves to the layout the specification gives
   it (`a2a.v1.A2AService` -> `a2a-0.3`, `lf.a2a.v1.A2AService` -> `a2a-1.0`) and
   any custom name resolves to `none` — or the explicit
