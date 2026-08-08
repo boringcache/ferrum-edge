@@ -3724,6 +3724,23 @@ mod tests {
 
     #[test]
     fn include_filter_excludes_gateway_api_conflict_candidates() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                    }
+                }]
+            }),
+        );
+        gateway.api_version = "gateway.networking.k8s.io/v1".to_string();
+        gateway.metadata.name = "edge".to_string();
         let mut skipped_route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -3744,9 +3761,9 @@ mod tests {
         included_route.spec["rules"][0]["backendRefs"][0]["name"] = serde_json::json!("included");
 
         let result = translate_k8s_objects_with_filter(
-            &[skipped_route, included_route],
+            &[gateway, skipped_route, included_route],
             options("default"),
-            |object| object.metadata.name == "api-b-included",
+            |object| object.kind == "Gateway" || object.metadata.name == "api-b-included",
         )
         .expect("filtered translation succeeds");
 

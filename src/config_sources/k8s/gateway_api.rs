@@ -8155,6 +8155,40 @@ mod tests {
         route
     }
 
+    /// Resolvable Gateway for conflict/dispatch fixtures that declare
+    /// `parentRefs: [{"name": "edge"}]`. Declared parents with no concrete
+    /// listener correctly emit zero routes; these tests exercise resolved
+    /// listener arbitration and need an explicit attachment target.
+    fn edge_http_gateway() -> K8sObject {
+        edge_http_gateway_ports(&[80])
+    }
+
+    fn edge_http_gateway_ports(ports: &[u16]) -> K8sObject {
+        let listeners: Vec<Value> = ports
+            .iter()
+            .map(|port| {
+                serde_json::json!({
+                    "name": format!("http-{port}"),
+                    "port": port,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                    }
+                })
+            })
+            .collect();
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": listeners
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        gateway
+    }
+
     fn assert_invalid_backend_fault_route(
         result: &crate::config_sources::k8s::K8sTranslation,
         expected_body: &str,
@@ -8351,8 +8385,8 @@ mod tests {
         let newer = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
         let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
 
-        let result =
-            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), newer, older], options())
+            .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
         assert!(
@@ -8374,8 +8408,8 @@ mod tests {
         let newer = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
         let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
 
-        let result =
-            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), newer, older], options())
+            .expect("translation succeeds");
 
         assert!(
             result
@@ -8392,8 +8426,8 @@ mod tests {
         let right = route_with_name_and_created_at("api-b", "2026-01-01T00:00:00Z");
         let left = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
 
-        let result =
-            translate_k8s_objects(&[right, left], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), right, left], options())
+            .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
         assert!(
@@ -8408,8 +8442,8 @@ mod tests {
         upper.spec["hostnames"] = serde_json::json!(["Api.Example.Com"]);
         let lower = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
 
-        let result =
-            translate_k8s_objects(&[lower, upper], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), lower, upper], options())
+            .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
         assert!(
@@ -9066,7 +9100,8 @@ mod tests {
         let mut wildcard = route_with_name_and_created_at("backend-v3", "2026-01-01T00:00:01Z");
         wildcard.spec["hostnames"] = serde_json::json!(["*.bar.com"]);
 
-        let result = translate_k8s_objects(&[exact, wildcard], options()).expect("translation");
+        let result = translate_k8s_objects(&[edge_http_gateway(), exact, wildcard], options())
+            .expect("translation");
 
         assert_eq!(result.config.proxies.len(), 2);
         assert!(
@@ -9119,7 +9154,7 @@ mod tests {
         post_route.metadata.name = "api-post".to_string();
         post_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[get_route, post_route], options())
+        let result = translate_k8s_objects(&[edge_http_gateway(), get_route, post_route], options())
             .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
@@ -9190,7 +9225,8 @@ mod tests {
         part2.metadata.name = "matching-part2".to_string();
         part2.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[part1, part2], options()).expect("translation");
+        let result = translate_k8s_objects(&[edge_http_gateway(), part1, part2], options())
+            .expect("translation");
 
         assert!(
             result.config.validate_unique_listen_paths().is_ok(),
@@ -9279,8 +9315,9 @@ mod tests {
         method_and_header.metadata.name = "api-get-header".to_string();
         method_and_header.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[header_only, method_and_header], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[edge_http_gateway(), header_only, method_and_header], options())
+                .expect("translation succeeds");
         let plugin = result
             .config
             .plugin_configs
@@ -9337,8 +9374,8 @@ mod tests {
         older.metadata.name = "api-older".to_string();
         older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
 
-        let result =
-            translate_k8s_objects(&[newer, older], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), newer, older], options())
+            .expect("translation succeeds");
         let plugin = result
             .config
             .plugin_configs
@@ -9382,8 +9419,15 @@ mod tests {
         port_8080_route.metadata.name = "api-alt".to_string();
         port_8080_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[port_80_route, port_8080_route], options())
-            .expect("translation succeeds");
+        let result = translate_k8s_objects(
+            &[
+                edge_http_gateway_ports(&[80, 8080]),
+                port_80_route,
+                port_8080_route,
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 2);
         assert!(
@@ -9416,8 +9460,8 @@ mod tests {
         mixed.metadata.name = "api-b".to_string();
         mixed.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result =
-            translate_k8s_objects(&[older, mixed], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), older, mixed], options())
+            .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 2);
         assert!(result.config.proxies.iter().any(|proxy| {
@@ -9451,8 +9495,9 @@ mod tests {
         weighted_loser.metadata.name = "api-b".to_string();
         weighted_loser.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[older, weighted_loser], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[edge_http_gateway(), older, weighted_loser], options())
+                .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
         assert!(
@@ -9550,8 +9595,8 @@ mod tests {
         goodbye.metadata.name = "goodbye".to_string();
         goodbye.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result =
-            translate_k8s_objects(&[greeter, goodbye], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), greeter, goodbye], options())
+            .expect("translation succeeds");
 
         // Two GRPCRoutes with the same path on the same host conflict — only one wins
         assert_eq!(result.config.proxies.len(), 1);
@@ -11979,10 +12024,20 @@ mod tests {
             entries
         }
 
-        let forward = translate_k8s_objects(&[http_route.clone(), grpc_route.clone()], options())
-            .expect("translation succeeds");
-        let reverse = translate_k8s_objects(&[grpc_route, http_route], options())
-            .expect("translation succeeds");
+        let forward = translate_k8s_objects(
+            &[
+                edge_http_gateway(),
+                http_route.clone(),
+                grpc_route.clone(),
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+        let reverse = translate_k8s_objects(
+            &[edge_http_gateway(), grpc_route, http_route],
+            options(),
+        )
+        .expect("translation succeeds");
         assert_eq!(
             fingerprint(&forward),
             fingerprint(&reverse),
@@ -12086,8 +12141,9 @@ mod tests {
         grpc_route.metadata.name = "grpc".to_string();
         grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[http_route, grpc_route], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[edge_http_gateway(), http_route, grpc_route], options())
+                .expect("translation succeeds");
 
         let mut ports: Vec<u16> = result
             .config
@@ -12861,8 +12917,9 @@ mod tests {
         late_web.metadata.name = "late-web".to_string();
         late_web.metadata.creation_timestamp = Some("2026-03-01T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[web, grpc_route, late_web], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[edge_http_gateway(), web, grpc_route, late_web], options())
+                .expect("translation succeeds");
 
         let mut ports: Vec<u16> = result
             .config
@@ -12908,7 +12965,8 @@ mod tests {
         goodbye.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
         let result =
-            translate_k8s_objects(&[hello, goodbye], options()).expect("translation succeeds");
+            translate_k8s_objects(&[edge_http_gateway(), hello, goodbye], options())
+                .expect("translation succeeds");
 
         let proxy = grpc_catch_all_proxy(&result);
         let plugin = grpc_dispatch_plugin(&result, proxy);
