@@ -7235,6 +7235,214 @@ async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
 }
 
 #[tokio::test]
+async fn test_anthropic_rejects_unrepresentable_message_content_at_claim() {
+    let plugin = build(openai_and_anthropic_config());
+
+    // Mixed text + image must not silently flatten to text.
+    let mixed = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "caption"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}
+            ]
+        }]
+    });
+    let mut ctx = post_ctx(&mixed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Anthropic-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo provider/client media urls: {body}"
+            );
+        }
+        other => panic!("mixed text+image must reject: {other:?}"),
+    }
+
+    // Closed text-part shape: extra/unknown fields must not silently drop.
+    let extra_fields = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "safe",
+                "image_url": {"url": "https://example.invalid/extra.png"}
+            }]
+        }]
+    });
+    let mut ctx = post_ctx(&extra_fields);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Anthropic-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo media urls from extra fields: {body}"
+            );
+        }
+        other => panic!("extra-field text part must reject: {other:?}"),
+    }
+
+    // Non-object array members fail closed.
+    let non_object = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": ["not-an-object", 7]
+        }]
+    });
+    let mut ctx = post_ctx(&non_object);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Anthropic-representable") || body.contains("content"),
+                "{body}"
+            );
+        }
+        other => panic!("non-object content part must reject: {other:?}"),
+    }
+
+    // Malformed text part (non-string text) fails closed.
+    let malformed = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": 42}]
+        }]
+    });
+    let mut ctx = post_ctx(&malformed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(
+                body.contains("malformed") || body.contains("content"),
+                "{body}"
+            );
+        }
+        other => panic!("malformed text part must reject: {other:?}"),
+    }
+
+    // System / developer non-text content must reject (not silently drop).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [
+                {
+                    "role": role,
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/sys.png"}}]
+                },
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(
+                    body.contains("Anthropic-representable") || body.contains("content"),
+                    "{role}: {body}"
+                );
+                assert!(!body.contains("example.invalid"), "{role}: {body}");
+            }
+            other => panic!("{role} non-text must reject: {other:?}"),
+        }
+    }
+
+    // System / developer null content must reject (string-or-text-parts only).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [
+                {"role": role, "content": null},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(body.contains("invalid_request_error"), "{role}: {body}");
+                assert!(
+                    body.contains("content") || body.contains("string") || body.contains("text"),
+                    "{role}: {body}"
+                );
+            }
+            other => panic!("{role} null content must reject: {other:?}"),
+        }
+    }
+
+    // Intentional assistant null content with tool_calls remains representable.
+    let with_tools = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]
+    });
+    let mut ctx = post_ctx(&with_tools);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
     let plugin = build(gemini_config());
     let body = json!({

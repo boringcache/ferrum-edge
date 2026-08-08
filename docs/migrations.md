@@ -93,6 +93,12 @@ When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **Mi
 3. Checks which migrations have been applied by reading `_ferrum_migrations`
 4. Runs any pending migrations in order
 5. Records each applied migration with its version, name, timestamp, checksum, and execution time
+6. Runs an idempotent V001 compatibility pass (folded-in tables/columns/indexes)
+7. On MySQL only, probes identity-bearing column collations against
+   `utf8mb4_0900_bin` and emits a structured startup warning with exact
+   `ALTER TABLE ... CONVERT TO` remediation when a populated upgrade still
+   carries a stale collation (warn-and-continue; never refuses startup — see
+   [configuration.md → MySQL minimum version](configuration.md#mysql-minimum-version))
 
 The applied-version read happens after the lock is acquired. When two replicas
 start together, the waiter therefore observes the winner's committed tracking
@@ -515,6 +521,18 @@ This means the migration chain has a gap. Every version must have a migration st
 ### Migration checksum mismatch warning
 
 This means a migration's source code was modified after it was already applied to the database. This is a warning only — the migration is not re-run. If the change was intentional (e.g., fixing a comment), the warning can be safely ignored.
+
+### MySQL stale identity collation warning
+
+On MySQL, after migrations, Ferrum inspects Ferrum identity-bearing columns
+for `utf8mb4_0900_bin`. A structured `warn!` listing
+affected `table.column` pairs and the exact
+`ALTER TABLE <name> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
+statements means an upgraded database still uses an older collation (for
+example `utf8mb4_general_ci` or `utf8mb4_0900_as_cs`). Until those ALTERs run,
+DB uniqueness can silently diverge from the runtime's byte-keyed indexes.
+Startup is not blocked. See
+[configuration.md → MySQL minimum version](configuration.md#mysql-minimum-version).
 
 ### "Database has duplicate listen_path values"
 

@@ -815,3 +815,78 @@ async fn test_pool_sharing_siblings_observe_per_request_connect_timeout_at_runti
         elapsed_b
     );
 }
+
+/// Issue #3622: default nonzero body-size limits must not disqualify the
+/// direct-H2 dispatch gate. Limits are enforced in-path (413 / 502) with the
+/// same ErrorClass contracts as the reqwest path.
+#[test]
+fn test_direct_h2_dispatch_allows_default_nonzero_body_limits() {
+    use ferrum_edge::_test_support::{can_dispatch_direct_http2_pool, can_use_direct_http2_pool};
+
+    const DEFAULT_LIMIT: usize = 10_485_760;
+
+    assert!(
+        can_dispatch_direct_http2_pool(true, false, false, DEFAULT_LIMIT, DEFAULT_LIMIT),
+        "default 10 MiB request/response limits must allow direct-H2 dispatch"
+    );
+    assert!(can_dispatch_direct_http2_pool(
+        true,
+        false,
+        false,
+        DEFAULT_LIMIT,
+        0
+    ));
+    assert!(can_dispatch_direct_http2_pool(
+        true,
+        false,
+        false,
+        0,
+        DEFAULT_LIMIT
+    ));
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 1));
+
+    // Body-compat still gates: retry replay / buffering force reqwest.
+    assert!(!can_dispatch_direct_http2_pool(
+        true,
+        true,
+        false,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
+    ));
+    assert!(!can_dispatch_direct_http2_pool(
+        true,
+        false,
+        true,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
+    ));
+    assert!(!can_dispatch_direct_http2_pool(
+        false,
+        false,
+        false,
+        DEFAULT_LIMIT,
+        DEFAULT_LIMIT
+    ));
+
+    // Ordinary and SNI share the same gate after in-path enforcement.
+    assert_eq!(
+        can_dispatch_direct_http2_pool(true, false, false, DEFAULT_LIMIT, DEFAULT_LIMIT),
+        can_use_direct_http2_pool(true, false, false)
+    );
+}
+
+/// Issue #3622: SizeLimitedIncoming treats max_bytes=0 as deny-all. The
+/// dispatch gate must not confuse that adapter contract with the operator
+/// spelling FERRUM_MAX_*_BODY_SIZE_BYTES=0 (unlimited): unlimited is still
+/// eligible for direct-H2, and a positive limit is also eligible because
+/// enforcement happens in-path after the gateway maps 0→unbounded.
+#[test]
+fn test_direct_h2_dispatch_unlimited_and_deny_all_semantics_are_distinct() {
+    use ferrum_edge::_test_support::can_dispatch_direct_http2_pool;
+
+    // Operator "unlimited" (both zero) — still eligible.
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
+    // Positive limits — eligible; SizeLimitedIncoming sees the positive
+    // budget (never a raw 0 from the unlimited spelling).
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 64, 64));
+}
