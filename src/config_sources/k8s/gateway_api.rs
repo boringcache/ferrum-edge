@@ -6119,7 +6119,7 @@ fn route_declares_gateway_parent_ref(object: &K8sObject) -> bool {
 /// which is the non-Kubernetes config-source shape.
 fn l4_route_declares_parent_ref(object: &K8sObject, scheme: BackendScheme) -> bool {
     if scheme.is_udp() {
-        return object.spec.contains_key("parentRefs");
+        return object.spec.get("parentRefs").is_some();
     }
     route_declares_gateway_parent_ref(object)
 }
