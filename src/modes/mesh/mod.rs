@@ -12570,6 +12570,7 @@ async fn start_spire_agent_mesh_svid_source(
     let fetch_config = crate::identity::workload_api::FetchLoopConfig {
         socket_path: env_config.mesh_spire_agent_socket.clone(),
         expected_spiffe_id: Some(expected_spiffe_id.clone()),
+        metrics_source: crate::identity::workload_api::FetchLoopMetricsSource::SpireAgent,
         ..Default::default()
     };
     let join =
