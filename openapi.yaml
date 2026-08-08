@@ -7587,6 +7587,26 @@ components:
             proxies produces a validation error (PROXY protocol is TCP-borne).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
+        backend_proxy_protocol:
+          type: [string, "null"]
+          enum: [v2, null]
+          description: |
+            Opt-in outbound PROXY protocol written on backend TCP connects for this
+            stream proxy. When set to `v2`, Ferrum prepends a PROXY protocol v2 binary
+            header carrying the trusted stream client_ip (and port) immediately after
+            the backend TCP connect — before any relayed application bytes, and before
+            the backend TLS handshake when originating TLS. Compatible with passthrough
+            (the header precedes the client's encrypted ClientHello on the wire).
+
+            Source addresses honor the inbound PROXY trust decision: when
+            stream_proxy_protocol is enabled and the peer is trusted, the forwarded
+            client identity is advertised; otherwise the accept-time socket peer is used.
+
+            Only valid for tcp / tcps stream proxies. Setting it on UDP, DTLS, or HTTP
+            proxies produces a validation error (PROXY protocol is TCP-borne). UDP
+            outbound PROXY is intentionally out of scope.
+
+            Default: null (disabled — backends see the gateway egress IP).
         stream_match:
           oneOf:
             - $ref: "#/components/schemas/StreamMatchCriteria"
