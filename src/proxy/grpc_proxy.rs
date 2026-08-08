@@ -50,6 +50,7 @@ use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
     parse_connection_listed_headers,
@@ -2694,6 +2695,297 @@ pub fn grpc_mesh_dispatch_falls_through(
     }
 }
 
+/// The concrete HTTP/2 transport a gRPC dispatch uses to reach its selected
+/// target (issue #3284).
+///
+/// Every gRPC dispatch surface classifies its target through
+/// [`classify_grpc_mesh_dispatch`] and then materializes exactly ONE of these.
+/// There is deliberately no "direct dial anyway" arm for a mesh-tagged target:
+/// [`Self::for_target`] either returns the authenticated mesh transport or an
+/// error, so a resolution failure fails closed instead of silently bypassing
+/// SVID-mTLS, identity pinning, and mesh authz identity.
+pub enum GrpcDispatchTransport<'a> {
+    /// Untagged target: the direct `GrpcConnectionPool` h2c / TLS dial.
+    Direct(&'a GrpcConnectionPool),
+    /// Sidecar `mesh.mtls` target (same-cluster pinned peer or well-formed
+    /// cross-cluster east-west): the SVID-mTLS HTTP/2 pool. Hyper h2
+    /// end-to-end, so gRPC framing, trailers, flow control, and cancellation
+    /// ride it exactly as they do the direct pool.
+    MeshMtls(MeshMtlsGrpcTransport<'a>),
+}
+
+/// A materialized Sidecar mesh-mTLS gRPC transport: the pool, the target it was
+/// resolved for, and the fail-closed dial plan (pinned peer OR trust-domain
+/// scope + destination-FQDN SNI override).
+pub struct MeshMtlsGrpcTransport<'a> {
+    pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+    target: &'a crate::config::types::UpstreamTarget,
+    plan: crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan<'a>,
+}
+
+/// Client-visible refusal when a `mesh.mtls` target's destination identity
+/// cannot be materialized (missing / corrupt `mesh.spiffe_id` pin, or a
+/// cross-cluster target whose SNI / trust-domain tags did not survive
+/// re-resolution). Deliberately names the failed contract and nothing else.
+const UNRESOLVABLE_MESH_MTLS_IDENTITY: &str =
+    "gRPC over the sidecar mesh mTLS transport requires a resolvable destination identity";
+
+/// Why a gRPC dispatch could not materialize a transport for its selected
+/// target. Every variant is FAIL CLOSED — the caller answers with a gRPC
+/// UNAVAILABLE and never falls back to an unauthenticated direct dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcTransportError {
+    /// The target's mesh transport class has no gRPC dispatch path
+    /// (Ambient HBONE same-cluster or cross-cluster: its inner protocol is
+    /// HTTP/1.1 over a byte tunnel and cannot carry HTTP/2 trailers), or the
+    /// target is malformed (cross-cluster with no transport tag, or a
+    /// cross-cluster `mesh.mtls` target missing its SNI override / trust
+    /// domain). Carries the client-visible reason.
+    Unsupported(&'static str),
+    /// The transport class IS supported but the target's identity metadata is
+    /// unmaterializable: a missing / corrupt `mesh.spiffe_id` pin, or a
+    /// cross-cluster target whose SNI / trust-domain tags did not survive
+    /// re-resolution. Field-specific detail is logged by the caller from
+    /// [`Self::message`]; nothing identity-bearing reaches the client.
+    UnmaterializableIdentity(&'static str),
+}
+
+impl GrpcTransportError {
+    /// Client-visible gRPC status message. Deliberately free of tag values,
+    /// SPIFFE IDs, SNI names, and trust domains — a refusal must not leak the
+    /// mesh identity metadata of a target the caller could not reach.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unsupported(message) | Self::UnmaterializableIdentity(message) => message,
+        }
+    }
+}
+
+impl<'a> GrpcDispatchTransport<'a> {
+    /// Resolve the transport for `target`, or a fail-closed
+    /// [`GrpcTransportError`].
+    ///
+    /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
+    /// backend host is the destination and no mesh tag exists to honor.
+    pub fn for_target(
+        grpc_pool: &'a GrpcConnectionPool,
+        mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+        target: Option<&'a crate::config::types::UpstreamTarget>,
+    ) -> Result<Self, GrpcTransportError> {
+        let Some(target) = target else {
+            return Ok(Self::Direct(grpc_pool));
+        };
+        match classify_grpc_mesh_dispatch(target) {
+            GrpcMeshDispatch::Direct => Ok(Self::Direct(grpc_pool)),
+            GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => {
+                // The classifier already proved the cross-cluster metadata is
+                // present; re-resolving here is what actually binds it, so a
+                // target that mutated between classification and dispatch still
+                // fails closed rather than dialing with a missing pin/scope.
+                let plan = match crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        return Err(GrpcTransportError::UnmaterializableIdentity(
+                            UNRESOLVABLE_MESH_MTLS_IDENTITY,
+                        ));
+                    }
+                };
+                Ok(Self::MeshMtls(MeshMtlsGrpcTransport {
+                    pool: mesh_mtls_pool,
+                    target,
+                    plan,
+                }))
+            }
+            GrpcMeshDispatch::RefuseCrossCluster => Err(GrpcTransportError::Unsupported(
+                "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
+                 (HBONE inner protocol cannot carry gRPC trailers)",
+            )),
+            GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported(
+                "gRPC over cross-cluster east-west routing requires a destination SNI override \
+                 and a remote trust domain",
+            )),
+            GrpcMeshDispatch::RefuseCrossClusterNoTransport => Err(GrpcTransportError::Unsupported(
+                "gRPC over cross-cluster east-west routing requires a mesh transport tag",
+            )),
+            GrpcMeshDispatch::RefuseHbone => Err(GrpcTransportError::Unsupported(
+                "gRPC over the Ambient HBONE mesh transport is not supported \
+                 (HBONE inner protocol cannot carry gRPC trailers)",
+            )),
+        }
+    }
+
+    /// Short transport label for structured logs. Never carries target metadata.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "direct",
+            Self::MeshMtls(_) => "mesh_mtls",
+        }
+    }
+
+    /// Acquire an HTTP/2 sender. Pool acquisition is the caller's connect
+    /// budget; deadline handling stays at the call site so both dispatch paths
+    /// keep their existing regimes.
+    async fn get_sender(&self, proxy: &Proxy) -> Result<GrpcDispatchSender, GrpcProxyError> {
+        match self {
+            Self::Direct(pool) => pool.get_sender(proxy).await.map(GrpcDispatchSender::Direct),
+            Self::MeshMtls(mesh) => {
+                let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(mesh.target);
+                mesh.pool
+                    .get_sender(
+                        proxy,
+                        &mesh.target.host,
+                        mesh.target.port,
+                        mesh.target.dispatch_policy_port(),
+                        mtls_port,
+                        mesh.plan.expected_peer.as_ref(),
+                        mesh.plan.expected_trust_domain.as_ref(),
+                        mesh.plan.sni_override,
+                    )
+                    .await
+                    .map(GrpcDispatchSender::MeshMtls)
+                    .map_err(mesh_mtls_pool_error_to_grpc)
+            }
+        }
+    }
+
+    /// Rewrite the parsed backend URI for this transport.
+    ///
+    /// The direct pool dials the URI's own authority, so it is returned
+    /// unchanged. The mesh transport instead dials the peer sidecar's inbound
+    /// mTLS listener and routes on the request `:authority`, which must name the
+    /// destination SERVICE (see `mesh_mtls_dispatch_authority`) — the same
+    /// resolver the generic HTTP-family mesh path uses, so the two cannot drift.
+    fn rewrite_backend_uri(
+        &self,
+        uri: hyper::Uri,
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Result<hyper::Uri, GrpcProxyError> {
+        let Self::MeshMtls(mesh) = self else {
+            return Ok(uri);
+        };
+        let authority = crate::proxy::mesh_mtls_dispatch_authority(
+            mesh.target,
+            preserve_host_header,
+            client_host,
+        );
+        let path_and_query = uri
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        hyper::Uri::builder()
+            .scheme("https")
+            .authority(authority.as_ref())
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(|e| {
+                GrpcProxyError::Internal(format!("Invalid sidecar mTLS request authority: {}", e))
+            })
+    }
+
+    /// Drop a stale pooled sender after a provably pre-wire `is_canceled`
+    /// dispatch failure. The mesh pool self-heals instead: its cached-sender
+    /// scans skip `is_closed()` senders, so there is nothing to invalidate.
+    fn invalidate_on_pre_wire_cancel(&self, proxy: &Proxy) {
+        if let Self::Direct(pool) = self {
+            pool.invalidate_shards_for_proxy(proxy);
+        }
+    }
+}
+
+/// An acquired HTTP/2 sender for one gRPC dispatch attempt.
+pub(crate) enum GrpcDispatchSender {
+    Direct(http2::SendRequest<GrpcBody>),
+    MeshMtls(crate::proxy::mesh_mtls_pool::MeshMtlsSender),
+}
+
+impl GrpcDispatchSender {
+    /// Send the outbound gRPC request. The mesh arm wraps the SHARED
+    /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
+    /// terminal TRAILERS frame), inline receive-limit accounting, upload
+    /// cancellation, and gRPC message counting are byte-identical across
+    /// transports.
+    async fn send_request(
+        &mut self,
+        request: Request<GrpcBody>,
+    ) -> Result<hyper::Response<Incoming>, hyper::Error> {
+        match self {
+            Self::Direct(sender) => sender.send_request(request).await,
+            Self::MeshMtls(sender) => {
+                let (parts, body) = request.into_parts();
+                let request = Request::from_parts(
+                    parts,
+                    crate::proxy::mesh_mtls_pool::MeshMtlsRequestBody::Grpc(body),
+                );
+                sender.send_request(request).await
+            }
+        }
+    }
+}
+
+/// Map a mesh-mTLS pool failure onto the gRPC transport error taxonomy so the
+/// mesh transport shares the direct pool's pre-wire / post-wire boundary, retry
+/// eligibility, and health accounting.
+fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
+    use HbonePoolError as E;
+    let message = error.to_string();
+    match error {
+        E::ConnectTimeout { timeout_ms, .. } => GrpcProxyError::BackendTimeout {
+            kind: GrpcTimeoutKind::Connect,
+            message: format!("sidecar mTLS connect timeout after {}ms", timeout_ms),
+        },
+        E::DnsLookup { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::DnsResolution,
+            message,
+            error,
+        ),
+        E::Connect { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::Connect,
+            message,
+            error,
+        ),
+        E::InvalidServerName { .. }
+        | E::InvalidDialHostTag { .. }
+        | E::InvalidAuthorityHostTag { .. }
+        | E::InvalidPeerSpiffeTag { .. }
+        | E::MissingCrossClusterSni
+        | E::MissingCrossClusterTrustDomain
+        | E::MissingCrossClusterAuthorityHost => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::InvalidServerName,
+            message,
+            error,
+        ),
+        E::NoSvid | E::NoLeafCert | E::TlsConfig(_) | E::TlsHandshake { .. } => {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                message,
+                error,
+            )
+        }
+        E::H2Handshake { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2Handshake,
+            message,
+            error,
+        ),
+        E::MaxConnectionsExceeded { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::MaxConnections,
+            message,
+            error,
+        ),
+        // CONNECT-tunnel and Extended-CONNECT shapes belong to the raw-TCP /
+        // WebSocket egress paths and are unreachable from `get_sender`; classify
+        // them pre-wire connect-class rather than inventing a post-wire kind.
+        E::InvalidConnectRequest { .. }
+        | E::ConnectStream { .. }
+        | E::ConnectRejected { .. }
+        | E::ExtendedConnectUnsupported { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::Connect,
+            message,
+            error,
+        ),
+    }
+}
+
 /// Timeout regime for a STREAMING gRPC response body:
 /// `(per_frame_read_timeout_ms, absolute_total_deadline)`.
 ///
@@ -2905,7 +3197,7 @@ pub async fn proxy_grpc_request_from_bytes(
     request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
@@ -2919,7 +3211,7 @@ pub async fn proxy_grpc_request_from_bytes(
         request_trailers,
         proxy,
         backend_url,
-        grpc_pool,
+        transport,
         dns_cache,
         proxy_headers,
         stream_response,
@@ -2985,7 +3277,10 @@ pub async fn proxy_grpc_request_streaming(
         grpc_body,
         proxy,
         backend_url,
-        grpc_pool,
+        // The H1/H2 streaming fast path is direct-dial only: a mesh-tagged
+        // target never reaches it (`grpc_mesh_dispatch_falls_through` routes it
+        // onto the generic mesh-mTLS path first).
+        &GrpcDispatchTransport::Direct(grpc_pool),
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
@@ -3015,7 +3310,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
@@ -3052,7 +3347,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         grpc_body,
         proxy,
         backend_url,
-        grpc_pool,
+        transport,
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
@@ -3078,7 +3373,7 @@ async fn proxy_grpc_streaming_dispatch(
     grpc_body: GrpcBody,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
     grpc_deadline_at: Option<tokio::time::Instant>,
@@ -3106,6 +3401,24 @@ async fn proxy_grpc_streaming_dispatch(
     // why merging FIRST is required and why `te: trailers` is
     // synthesised at the end.
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+
+    // Rebind the request line to the selected transport BEFORE the Host
+    // override, mirroring `proxy_grpc_request_core` (issue #3284). A no-op for
+    // the direct pool; a mesh dispatch presents the destination SERVICE
+    // authority the peer sidecar routes its inbound request on. A failure here
+    // is pre-dial, so retain the unread frontend upload for the caller.
+    let client_host_header = headers
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let rewritten_uri =
+        transport.rewrite_backend_uri(uri, proxy.preserve_host_header, client_host_header);
+    let uri = match rewritten_uri {
+        Ok(uri) => uri,
+        Err(e) => {
+            *held_frontend_upload = Some(grpc_body);
+            return Err(e);
+        }
+    };
 
     // Apply per-route Host override AFTER the strip, mirroring
     // `proxy_grpc_request_core` and the plain HTTP path in
@@ -3153,7 +3466,7 @@ async fn proxy_grpc_streaming_dispatch(
     // H2 retains it with the response as defense-in-depth, while H3 must defer
     // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
     let mut sender = if let Some(deadline) = grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy)).await {
+        match tokio::time::timeout_at(deadline, transport.get_sender(proxy)).await {
             Err(_) => {
                 *held_frontend_upload = Some(grpc_body);
                 return Err(GrpcProxyError::ClientDeadlineExceeded(
@@ -3167,7 +3480,7 @@ async fn proxy_grpc_streaming_dispatch(
             Ok(Ok(sender)) => sender,
         }
     } else {
-        match grpc_pool.get_sender(proxy).await {
+        match transport.get_sender(proxy).await {
             Ok(sender) => sender,
             Err(e) => {
                 *held_frontend_upload = Some(grpc_body);
@@ -3207,7 +3520,7 @@ async fn proxy_grpc_streaming_dispatch(
                 // classification even when hyper reports `is_canceled`, but still
                 // drop the stale pooled sender so the next RPC dials fresh.
                 if e.is_canceled() {
-                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -3238,7 +3551,7 @@ async fn proxy_grpc_streaming_dispatch(
                     ));
                 }
                 if e.is_canceled() {
-                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -3256,7 +3569,7 @@ async fn proxy_grpc_streaming_dispatch(
                 ));
             }
             if e.is_canceled() {
-                grpc_pool.invalidate_shards_for_proxy(proxy);
+                transport.invalidate_on_pre_wire_cancel(proxy);
             }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::backend_unavailable_with_source(
@@ -3398,7 +3711,7 @@ pub(crate) async fn proxy_grpc_request_core(
     request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
@@ -3416,6 +3729,16 @@ pub(crate) async fn proxy_grpc_request_core(
     // the two gRPC dispatch paths cannot drift on header handling. See
     // `proxy::headers` for the rationale.
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+
+    // Rebind the request line to the selected transport BEFORE the Host
+    // override below, so a mesh dispatch presents (and, without
+    // `preserve_host_header`, echoes) the destination SERVICE authority the
+    // peer sidecar's materialized inbound route matches. A no-op for the direct
+    // pool (issue #3284).
+    let client_host_header = headers
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let uri = transport.rewrite_backend_uri(uri, proxy.preserve_host_header, client_host_header)?;
 
     // Apply per-route Host override AFTER the proxy_headers merge, mirroring
     // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
@@ -3497,7 +3820,7 @@ pub(crate) async fn proxy_grpc_request_core(
     // after a sender exists; applying it here would turn a read-stall policy
     // into an unintended shorter connect timeout.
     let mut sender = if let Some(client_deadline) = client_grpc_deadline_at {
-        tokio::time::timeout_at(client_deadline, grpc_pool.get_sender(proxy))
+        tokio::time::timeout_at(client_deadline, transport.get_sender(proxy))
             .await
             .map_err(|_| {
                 GrpcProxyError::ClientDeadlineExceeded(
@@ -3505,7 +3828,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 )
             })??
     } else {
-        grpc_pool.get_sender(proxy).await?
+        transport.get_sender(proxy).await?
     };
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
@@ -3544,9 +3867,13 @@ pub(crate) async fn proxy_grpc_request_core(
         // proves the request never hit the wire, so classify pre-wire and
         // drop the stale pooled sender for the next attempt / RPC.
         if e.is_canceled() {
-            grpc_pool.invalidate_shards_for_proxy(proxy);
+            transport.invalidate_on_pre_wire_cancel(proxy);
         }
-        error!("gRPC: backend request failed: {}", e);
+        error!(
+            transport = transport.label(),
+            error = %e,
+            "gRPC: backend request failed"
+        );
         if e.is_timeout() {
             GrpcProxyError::BackendTimeout {
                 kind: GrpcTimeoutKind::Read,
@@ -4680,7 +5007,7 @@ mod tests {
             "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
         assert!(
-            body.contains("timeout_at(client_deadline, grpc_pool.get_sender(proxy))"),
+            body.contains("timeout_at(client_deadline, transport.get_sender(proxy))"),
             "pool acquisition must be bounded by only the client deadline"
         );
         let sender_acquisition = body

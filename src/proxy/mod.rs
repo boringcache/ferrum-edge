@@ -28420,7 +28420,10 @@ async fn handle_proxy_request_inner(
                     crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
-                    &state.grpc_pool,
+                    // Direct-dial only: the loop re-screens every rotated
+                    // target above and refuses a mesh-tagged one before it can
+                    // reach this call (issue #2003).
+                    &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
@@ -37777,6 +37780,56 @@ fn mesh_mtls_request_authority(preserved_host: &str, service_port: u16) -> Strin
     format!("{host}:{service_port}")
 }
 
+/// Resolve the request `:authority` a Sidecar mesh-mTLS dispatch presents to the
+/// peer sidecar's inbound listener.
+///
+/// `:authority` is the routing key on the peer: its materialized inbound route
+/// matches the SERVICE host. Precedence, highest first:
+///
+/// 1. `mesh.mtls_authority_host` — stamped only by `sidecar`-topology mesh
+///    service discovery (the gateway-to-mesh bridge). A north-south gateway's
+///    client `Host` is a public hostname the peer would 404, and the
+///    no-preserve fallback is the pod dial address (same 404).
+/// 2. A preserved, non-empty client `Host` when `preserve_host_header` is on.
+/// 3. The dial authority (peer pod + app port), matching the HBONE inner
+///    request's Host fallback.
+///
+/// For a MULTI-PORT destination the materializer stamped the owning service
+/// port (`mesh.mtls_authority_port`) on the target and the authority is
+/// rewritten to `<host>:<service_port>` — the peer's inbound `:15006` dials are
+/// direct (never NATed, no orig-dst), so the authority port is the only channel
+/// that tells its per-port inbound siblings apart. Single-port destinations
+/// carry no port tag and keep the host-only / client authority byte-for-byte.
+///
+/// Shared by the generic HTTP-family mesh-mTLS dispatch and the gRPC mesh
+/// transport (issue #3284) so the two cannot drift on peer route selection.
+pub(crate) fn mesh_mtls_dispatch_authority<'a>(
+    target: &'a UpstreamTarget,
+    preserve_host_header: bool,
+    client_host: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => {
+                std::borrow::Cow::Owned(format!("{service_host}:{service_port}"))
+            }
+            None => std::borrow::Cow::Borrowed(service_host),
+        };
+    }
+    if preserve_host_header && let Some(host) = client_host.filter(|host| !host.is_empty()) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => {
+                std::borrow::Cow::Owned(mesh_mtls_request_authority(host, service_port))
+            }
+            None => std::borrow::Cow::Borrowed(host),
+        };
+    }
+    std::borrow::Cow::Owned(hbone_pool::authority_for_host_port(
+        &target.host,
+        target.port,
+    ))
+}
+
 /// Normalize a Host/authority value for host-based routing.
 ///
 /// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
@@ -39972,46 +40025,17 @@ async fn proxy_to_backend_mesh_mtls(
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-    // `:authority` is the routing key on the peer: its materialized inbound
-    // route matches the SERVICE host. A `sidecar`-topology mesh-SD target
-    // (gateway-to-mesh bridge) carries that service host as a tag
-    // (`mesh.mtls_authority_host`) and it takes precedence over BOTH branches
-    // below — a north-south gateway's client Host is a public hostname the
-    // peer would 404, and the no-preserve fallback is the pod dial address
-    // (same 404). Otherwise a preserved client Host wins; without
-    // preservation fall back to the dial authority (peer pod + app port),
-    // matching the HBONE inner request's Host fallback. For a MULTI-PORT
-    // destination the materializer stamped the owning service port on the
-    // target, and the authority is rewritten to `<host>:<service_port>` —
-    // the peer's inbound `:15006` dials are direct (never NATed, no
-    // orig-dst), so the authority port is the only channel that tells its
-    // per-port inbound siblings apart. The original client Host still rides
-    // `x-forwarded-host` below. Single-port destinations carry no port tag
-    // and keep the host-only / client authority byte-for-byte.
-    let authority_owned;
-    let authority =
-        if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
-            match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                Some(service_port) => {
-                    authority_owned = format!("{service_host}:{service_port}");
-                    authority_owned.as_str()
-                }
-                None => service_host,
-            }
-        } else if proxy.preserve_host_header
-            && let Some(host) = headers.get("host")
-            && !host.is_empty()
-        {
-            if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                authority_owned = mesh_mtls_request_authority(host, service_port);
-                authority_owned.as_str()
-            } else {
-                host.as_str()
-            }
-        } else {
-            authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
-            authority_owned.as_str()
-        };
+    // `:authority` is the routing key on the peer. Precedence, the multi-port
+    // service-port rewrite, and the dial-authority fallback all live in the
+    // shared resolver so the gRPC mesh transport cannot drift from this path
+    // (see `mesh_mtls_dispatch_authority`). The original client Host still
+    // rides `x-forwarded-host` below.
+    let authority_resolved = mesh_mtls_dispatch_authority(
+        target,
+        proxy.preserve_host_header,
+        headers.get("host").map(String::as_str),
+    );
+    let authority = authority_resolved.as_ref();
     let tunneled_uri = match hyper::Uri::builder()
         .scheme("https")
         .authority(authority)
@@ -40075,7 +40099,7 @@ async fn proxy_to_backend_mesh_mtls(
             } else {
                 body
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body))
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -40086,7 +40110,9 @@ async fn proxy_to_backend_mesh_mtls(
             parts.headers = headers;
             (
                 parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(
+                    body::ReplayableRequestBody::new(body, trailers),
+                ),
             )
         }
     };
