@@ -5917,6 +5917,7 @@ fn l4_route_proxies(
     let mut proxies = Vec::new();
     for config_namespace in &config_namespaces {
         if !scheme.is_udp()
+            && route_declares_gateway_parent_ref(object)
             && route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace))
                 .is_empty()
         {

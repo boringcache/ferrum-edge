@@ -138,7 +138,7 @@ fn tcp_route_cross_namespace_parent_ref_materializes_in_gateway_namespace() {
 }
 
 #[test]
-fn weighted_tcp_route_cross_namespace_parent_keeps_upstream_with_proxy() {
+fn weighted_tcp_route_cross_namespace_parent_keeps_first_backend_behavior() {
     let route = object(
         "TCPRoute",
         "weighted-db",
@@ -162,13 +162,12 @@ fn weighted_tcp_route_cross_namespace_parent_keeps_upstream_with_proxy() {
         .expect("weighted cross-namespace parentRef must materialize");
 
     assert_eq!(result.config.proxies.len(), 1);
-    assert_eq!(result.config.upstreams.len(), 1);
+    assert!(result.config.upstreams.is_empty());
     let proxy = &result.config.proxies[0];
-    let upstream = &result.config.upstreams[0];
     assert_eq!(proxy.namespace, "infra");
-    assert_eq!(upstream.namespace, proxy.namespace);
-    assert_eq!(proxy.upstream_id.as_deref(), Some(upstream.id.as_str()));
-    assert_eq!(upstream.targets.len(), 2);
+    assert_eq!(proxy.backend_host, "db-primary.apps.svc.cluster.local");
+    assert_eq!(proxy.backend_port, 5432);
+    assert!(proxy.upstream_id.is_none());
 }
 
 #[test]
