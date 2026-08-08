@@ -40,6 +40,12 @@ const GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY: &str =
 /// honored so operators migrating from Istio do not have to retag.
 const WAYPOINT_GATEWAY_CLASS_NAMES: &[&str] = &["istio-waypoint", "ferrum-waypoint"];
 
+pub(crate) fn is_supported_waypoint_gateway_class(name: &str) -> bool {
+    WAYPOINT_GATEWAY_CLASS_NAMES
+        .iter()
+        .any(|expected| expected.eq_ignore_ascii_case(name))
+}
+
 /// Service label naming the GAMMA Waypoint a Service routes through.
 /// `None` (the literal string) opts the Service out of any inherited
 /// namespace-level waypoint binding. Annotations are accepted as a
@@ -2021,6 +2027,7 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
     let waypoint_for = metadata_key(object, KEY_WAYPOINT_FOR)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "service".to_string());
+    let gateway_class_name = string_field(&object.spec, "gatewayClassName").map(ToOwned::to_owned);
     if let Some(existing) = acc
         .mesh
         .waypoint_bindings
@@ -2031,11 +2038,15 @@ pub(super) fn add_waypoint_binding(acc: &mut super::K8sAccumulator, object: &K8s
         // defaults because the Gateway is the canonical owner of the
         // waypoint identity.
         existing.waypoint_for = waypoint_for;
+        if gateway_class_name.is_some() {
+            existing.gateway_class_name = gateway_class_name;
+        }
     } else {
         acc.mesh.waypoint_bindings.push(MeshWaypointBinding {
             name: object.metadata.name.clone(),
             namespace: object.metadata.namespace.clone(),
             waypoint_for,
+            gateway_class_name,
             services: Vec::new(),
         });
     }
@@ -2077,6 +2088,7 @@ pub(super) fn add_service_waypoint_binding(acc: &mut super::K8sAccumulator, obje
         name: waypoint_name,
         namespace: waypoint_namespace,
         waypoint_for: waypoint_for_override.unwrap_or_else(|| "service".to_string()),
+        gateway_class_name: None,
         services: vec![service_ref],
     });
 }
@@ -3872,12 +3884,17 @@ fn route_materialized_parent_ref_keys_for_namespace(
     refs
 }
 
-fn l4_route_listener_ports_for_namespace(
+fn l4_route_listener_bindings_for_namespace(
     object: &K8sObject,
     acc: &K8sAccumulator,
     namespace_filter: Option<&str>,
-) -> Vec<u16> {
-    let mut ports = Vec::new();
+) -> Vec<(u16, Vec<String>)> {
+    let requested_hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+        .into_iter()
+        .map(|hostname| normalize_gateway_hostname(&hostname))
+        .collect();
+    let route_hostnames = hostnames_for_listener_intersection(&requested_hostnames);
+    let mut bindings: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for parent_ref in object
         .spec
         .get("parentRefs")
@@ -3901,13 +3918,24 @@ fn l4_route_listener_ports_for_namespace(
                 && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
                 && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
             {
-                ports.push(port);
+                let hosts = bindings.entry(port).or_default();
+                if object.kind == "TLSRoute" {
+                    let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+                    hosts.extend(route_hostnames.iter().filter_map(|route_hostname| {
+                        intersect_hostnames(route_hostname, listener_hostname)
+                    }));
+                }
             }
         }
     }
-    ports.sort();
-    ports.dedup();
-    ports
+    bindings
+        .into_iter()
+        .filter_map(|(port, mut hosts)| {
+            hosts.sort();
+            hosts.dedup();
+            (object.kind != "TLSRoute" || !hosts.is_empty()).then_some((port, hosts))
+        })
+        .collect()
 }
 
 fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -5874,13 +5902,24 @@ fn l4_route_proxies(
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
     ensure_l4_parent_refs_are_same_namespace(object)?;
-    let hosts = l4_route_hosts(object, scheme)?;
+    let fallback_hosts = l4_route_hosts(object, scheme)?;
     ensure_udp_route_rule_shape(object, scheme)?;
-    let (materialized_listener_ports, materialized_parent_refs) = if scheme.is_udp() {
-        udp_route_surviving_materialization(object, acc)
+    // A `UDPRoute` never carries hostnames (`l4_route_hosts` rejects the field
+    // fail closed), so its surviving listeners bind with an empty host set.
+    // `TCPRoute`/`TLSRoute` keep the shared binding resolver, which is where
+    // TLS SNI is bounded by the listener hostname.
+    let (materialized_listener_bindings, materialized_parent_refs) = if scheme.is_udp() {
+        let (ports, parent_refs) = udp_route_surviving_materialization(object, acc);
+        (
+            ports
+                .into_iter()
+                .map(|port| (port, Vec::new()))
+                .collect::<Vec<(u16, Vec<String>)>>(),
+            parent_refs,
+        )
     } else {
         (
-            l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace)),
+            l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace)),
             route_materialized_parent_ref_keys_for_namespace(
                 object,
                 acc,
@@ -5891,22 +5930,23 @@ fn l4_route_proxies(
 
     // Fail closed on a declared-but-unmatched Gateway parent.
     //
-    // `materialized_listener_ports` is the set of concrete listener ports that
-    // survived every gate: Gateway identity, `sectionName`/`port` selection,
-    // listener protocol and `allowedRoutes` kind, `allowedRoutes` namespace,
-    // and listener materializability. A route that *declares* a Gateway parent
-    // and clears none of those gates has no listener to attach to, so it must
-    // open nothing — falling through to the backend port would bind an
-    // unintended OS listener while status correctly reports `NoMatchingParent`
-    // / `NotAllowedByListeners`. The backend-port fallback below is retained
-    // only for the parentless legacy shape (a bare TCPRoute/TLSRoute/UDPRoute
-    // supplied by a non-Kubernetes config source), which has no parent to
-    // contradict.
+    // `materialized_listener_bindings` is the set of concrete listener ports
+    // that survived every gate: Gateway identity, `sectionName`/`port`
+    // selection, listener protocol and `allowedRoutes` kind, `allowedRoutes`
+    // namespace, listener materializability, and — for `TLSRoute` — a
+    // non-empty route/listener hostname intersection. A route that *declares*
+    // a Gateway parent and clears none of those gates has no listener to
+    // attach to, so it must open nothing — falling through to the backend port
+    // would bind an unintended OS listener while status correctly reports
+    // `NoMatchingParent` / `NotAllowedByListeners`. The backend-port fallback
+    // below is retained only for the parentless legacy shape (a bare
+    // TCPRoute/TLSRoute/UDPRoute supplied by a non-Kubernetes config source),
+    // which has no parent to contradict.
     //
     // For UDPRoute this set is additionally filtered by same-listener conflict
     // losers: a route that lost ownership of every declared listener opens
     // nothing and creates no upstream, so duplicate OS binds cannot race.
-    if materialized_listener_ports.is_empty() && route_declares_gateway_parent_ref(object) {
+    if materialized_listener_bindings.is_empty() && route_declares_gateway_parent_ref(object) {
         if scheme.is_udp()
             && acc
                 .gateway_api_conflict_losers
@@ -5940,10 +5980,10 @@ fn l4_route_proxies(
             continue;
         };
 
-        let listen_ports = if materialized_listener_ports.is_empty() {
-            vec![resolved.fallback_listen_port]
+        let listen_bindings = if materialized_listener_bindings.is_empty() {
+            vec![(resolved.fallback_listen_port, fallback_hosts.clone())]
         } else {
-            materialized_listener_ports.clone()
+            materialized_listener_bindings.clone()
         };
         let rule_suffix = l4_rule_suffix(scheme, rule_index);
 
@@ -5973,8 +6013,8 @@ fn l4_route_proxies(
             (String::new(), 0, Some(upstream_id))
         };
 
-        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
-            let suffix = if listen_ports.len() == 1 {
+        for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
+            let suffix = if listen_bindings.len() == 1 {
                 rule_suffix.clone()
             } else {
                 format!("{rule_suffix}-{listen_port_index}")
@@ -5995,7 +6035,7 @@ fn l4_route_proxies(
                 backend_port,
                 upstream_id: upstream_id.clone(),
                 backend_scheme: scheme,
-                listen_port: Some(listen_port),
+                listen_port: Some(*listen_port),
                 retry: None,
                 backend_read_timeout_ms: None,
             }));
@@ -12144,6 +12184,71 @@ mod tests {
         assert!(
             !proxy.frontend_tls,
             "passthrough and frontend_tls are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tls_route_is_bounded_by_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "hostnames": ["evil.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+    }
+
+    #[test]
+    fn tls_route_without_hostnames_inherits_gateway_listener_hostname() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "hostname": "allowed.example.com",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "tls"}],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].hosts,
+            vec!["allowed.example.com".to_string()]
         );
     }
 

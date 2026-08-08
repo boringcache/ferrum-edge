@@ -690,6 +690,11 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
+    /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
+    /// key membership; the bool is ownership only — interoperable waypoint
+    /// classes (`istio-waypoint` / `ferrum-waypoint`) may be owned by another
+    /// controller and must still count as present for authz targetRefs.
     gateway_api_gateway_classes: HashMap<String, bool>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
@@ -835,6 +840,18 @@ impl K8sAccumulator {
         core::configmap_ca_bundle_pem(self, namespace, name)
     }
 
+    /// Whether a waypoint Gateway binding shell exists for `(namespace, name)`.
+    ///
+    /// Bindings are collected in a dedicated pre-pass (below) so
+    /// AuthorizationPolicy `targetRefs` → Gateway resolution does not depend on
+    /// informer/list order relative to Istio translation.
+    pub(crate) fn waypoint_gateway_exists(&self, namespace: &str, name: &str) -> bool {
+        self.mesh
+            .waypoint_bindings
+            .iter()
+            .any(|binding| binding.namespace == namespace && binding.name == name)
+    }
+
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
     }
@@ -852,6 +869,13 @@ impl K8sAccumulator {
             == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
         self.gateway_api_gateway_classes
             .insert(object.metadata.name.clone(), managed);
+    }
+
+    /// Whether a cluster-scoped GatewayClass object was observed in the
+    /// pre-pass index. Allocation-free cold-path presence check — does not
+    /// consult Ferrum-controller ownership (the stored bool).
+    pub(crate) fn gateway_class_exists(&self, name: &str) -> bool {
+        self.gateway_api_gateway_classes.contains_key(name)
     }
 
     pub(crate) fn gateway_is_managed_by_ferrum(&self, object: &K8sObject) -> bool {
@@ -1255,11 +1279,15 @@ where
     }
 
     for object in &included_objects {
-        if object.kind == "Gateway"
-            && includes_object_namespace(&acc.options, object)
-            && acc.gateway_is_managed_by_ferrum(object)
-        {
-            gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
+        if object.kind == "Gateway" && includes_object_namespace(&acc.options, object) {
+            // Collect waypoint bindings before Istio AuthorizationPolicy
+            // translation so targetRefs → Gateway resolution is order-independent.
+            if gateway_api::is_waypoint_gateway(object) {
+                gateway_api::add_waypoint_binding(&mut acc, object);
+            }
+            if acc.gateway_is_managed_by_ferrum(object) {
+                gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
+            }
         }
     }
 

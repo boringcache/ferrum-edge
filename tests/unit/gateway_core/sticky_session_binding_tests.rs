@@ -1122,6 +1122,14 @@ fn every_retry_capable_mint_site_uses_the_shared_reissue_derivation() {
     assert_eq!(mint_sites(h3_ws_src), 0);
     assert_eq!(mint_sites(h3_cross_src), 0);
 
+    assert!(
+        proxy_src.contains(
+            "sticky_dispatch_refused = matches!(\n                result.error_class,\n                Some(retry::ErrorClass::DispatchPolicyRejected)"
+        ),
+        "the generic retry helpers can refuse a target before dialing it; their \
+         DispatchPolicyRejected result must suppress sticky-cookie reissue"
+    );
+
     // Mapping the served backend onto its CONFIGURED identity is what makes a
     // wildcard-hosted upstream's cookie resolvable at all. The mint site in
     // proxy/mod.rs owns one use; retry selection lives in backend_dispatch and
