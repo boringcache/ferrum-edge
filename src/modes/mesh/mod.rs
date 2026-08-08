@@ -34,8 +34,6 @@ use anyhow::Context as _;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::identity::jwt_svid::JwtSvidSigner as _;
-
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;

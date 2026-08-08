@@ -787,7 +787,7 @@ impl JwtSvidSigner for LocalJwtAuthority {
         // happens below, under the gate.
         {
             let state = self.state.load();
-            if !self.rotation_due(&**state) {
+            if !self.rotation_due(&state) {
                 return Ok(None);
             }
         }
@@ -799,7 +799,7 @@ impl JwtSvidSigner for LocalJwtAuthority {
         // and halving the effective key lifetime for one observation.
         {
             let state = self.state.load();
-            if !self.rotation_due(&**state) {
+            if !self.rotation_due(&state) {
                 return Ok(None);
             }
         }

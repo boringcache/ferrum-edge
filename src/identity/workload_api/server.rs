@@ -73,7 +73,7 @@ use super::proto::{
 use crate::identity::attestation::{Attestor, PeerInfo, attest_chain};
 use crate::identity::ca::{CertificateAuthority, IssuanceRequest, PublishedJwtAuthority};
 use crate::identity::jwt_svid::{
-    self, DEFAULT_JWT_SVID_TTL_SECS, JwtSvidError, JwtSvidSigner, MAX_JWT_BUNDLE_TRUST_DOMAINS,
+    self, DEFAULT_JWT_SVID_TTL_SECS, JwtSvidError, MAX_JWT_BUNDLE_TRUST_DOMAINS,
 };
 use crate::identity::spiffe::TrustDomain;
 

@@ -21,7 +21,6 @@ use x509_parser::prelude::*;
 use crate::identity::{
     SvidBundle, TrustBundle, TrustBundleSet,
     ca::{IssuanceRequest, SharedCa},
-    jwt_svid::JwtSvidSigner,
     spiffe::SpiffeId,
 };
 

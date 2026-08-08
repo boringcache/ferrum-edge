@@ -619,12 +619,18 @@ mod tests {
     }
 
     fn test_ca_with_bundle(bundle: SvidBundle, stream_task_abort: AbortHandle) -> SpireAgentCa {
+        // The JWT bundle stream is inert here: these tests cover the X.509
+        // issuance boundary, and an empty set is exactly what an agent that
+        // publishes no JWT authorities produces.
+        let jwt_stream_task_abort = stream_task_abort.clone();
         SpireAgentCa {
             config: SpireAgentCaConfig::default(),
             current: Arc::new(ArcSwap::new(Arc::new(Some(AgentSnapshot { bundle })))),
             first_ready: Arc::new(Notify::new()),
             first_received: Arc::new(AtomicBool::new(true)),
             stream_task_abort,
+            jwt_bundles: Arc::new(ArcSwap::new(Arc::new(JwtBundleSet::new()))),
+            jwt_stream_task_abort,
         }
     }
 
