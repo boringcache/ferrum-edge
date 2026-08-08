@@ -26,6 +26,10 @@
 //!   **not** run attestor/entitlement checks — bundle-only callers need trust
 //!   roots to validate peers without holding an SVID. Private-key issuance
 //!   remains gated exclusively on `FetchX509SVID`.
+//! - JWT-SVID RPCs (`FetchJWTSVID`, `FetchJWTBundles`, `ValidateJWTSVID`)
+//!   return `UNIMPLEMENTED` fail-closed. An empty JWT bundle stream is not a
+//!   conformant "no authorities" signal (SPIFFE Workload API §6.2.2 requires
+//!   at least the local trust-domain bundle). Live tracker: #3617.
 //!
 //! Rotation delivery is capacity-one / latest-wins ([`super::latest_wins`]):
 //! slow consumers do not accumulate private-key-bearing responses, and
@@ -495,7 +499,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<JwtsvidRequest>,
     ) -> Result<Response<JwtsvidResponse>, Status> {
         Self::validate_workload_metadata(&request)?;
-        // Phase A: JWT-SVID minting is intentionally unimplemented; later
+        // JWT-SVID minting is intentionally unimplemented (#3617). Later
         // phases plug into the CA's `jwt_authorities()`.
         Err(Status::unimplemented(
             "JWT-SVID issuance is deferred to a later mesh phase",
@@ -510,33 +514,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<JwtBundlesRequest>,
     ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
         Self::validate_workload_metadata(&request)?;
-        let initial = JwtBundlesResponse {
-            bundles: Default::default(),
-        };
-
-        let mut rx = self.rotation_signal.subscribe();
-        let (tx, out_rx) = latest_wins::channel();
-        if !tx.publish(Ok(initial)) {
-            return Err(Status::cancelled(
-                "FetchJWTBundles stream closed before start",
-            ));
-        }
-
-        tokio::spawn(async move {
-            loop {
-                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
-                    return;
-                }
-                let resp = JwtBundlesResponse {
-                    bundles: Default::default(),
-                };
-                if !tx.publish(Ok(resp)) {
-                    return;
-                }
-            }
-        });
-
-        Ok(Response::new(Box::pin(out_rx.into_stream())))
+        // Fail closed: an empty `bundles` map is not SPIFFE-conformant
+        // (§6.2.2 requires at least the local trust-domain JWT bundle) and
+        // must not be mistaken for "zero JWT authorities configured". Mirror
+        // FetchJWTSVID / ValidateJWTSVID until #3617 delivers mint/validate.
+        Err(Status::unimplemented(
+            "JWT-SVID bundle streaming is deferred to a later mesh phase",
+        ))
     }
 
     async fn validate_jwtsvid(
