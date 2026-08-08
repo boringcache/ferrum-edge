@@ -115,8 +115,15 @@ jobs:
           # The primary config is whatever the cluster's own CNI dropped in.
           # Discover it rather than assuming a kindnet filename or plugin type,
           # so a kind image bump cannot silently turn this into a no-op.
-          primary_file="$(docker exec "$worker" ls -1 /etc/cni/net.d \
-            | grep -E '\.(conf|conflist)$' | head -n1)"
+          primary_file=""
+          while IFS= read -r candidate; do
+            case "$candidate" in
+              *.conf|*.conflist)
+                primary_file="$candidate"
+                break
+                ;;
+            esac
+          done < <(docker exec "$worker" ls -1 /etc/cni/net.d)
           if [ -z "$primary_file" ]; then
             echo "::error title=No primary CNI config on the kind worker::cannot chain behind nothing"
             exit 1
