@@ -544,10 +544,9 @@ pub fn outbound_v2_addrs(
     local_fallback: Option<SocketAddr>,
 ) -> Option<(SocketAddr, SocketAddr)> {
     let destination = match (destination_ip, destination_port) {
-        (Some(ip), Some(port)) => SocketAddr::new(
-            crate::util::client_identity::canonical_ip(ip),
-            port,
-        ),
+        (Some(ip), Some(port)) => {
+            SocketAddr::new(crate::util::client_identity::canonical_ip(ip), port)
+        }
         (None, None) => crate::util::client_identity::canonical_socket_addr(local_fallback?),
         _ => return None,
     };

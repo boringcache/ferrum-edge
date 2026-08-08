@@ -1352,11 +1352,9 @@ async fn test_tcp_outbound_proxy_protocol_v2_direct_client() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
-    let backend = start_proxy_v2_expecting_echo_server_on(
-        backend_listener,
-        Arc::clone(&observed_tuple),
-    )
-    .await;
+    let backend =
+        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_tuple))
+            .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
@@ -1392,15 +1390,17 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let (src, dst) =
-        (*observed_tuple.lock().await).expect("backend must observe PROXY header");
+    let (src, dst) = (*observed_tuple.lock().await).expect("backend must observe PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         "outbound PROXY src must be the direct client IP"
     );
     assert_ne!(src.port(), 0);
-    assert_eq!(dst.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        dst.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
     assert_eq!(dst.port(), proxy_port);
 
     shutdown_gateway(&mut gateway);
@@ -1414,11 +1414,9 @@ async fn test_tcp_outbound_proxy_protocol_v2_chained_inbound() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
-    let backend = start_proxy_v2_expecting_echo_server_on(
-        backend_listener,
-        Arc::clone(&observed_tuple),
-    )
-    .await;
+    let backend =
+        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_tuple))
+            .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
         |proxy_port| {
@@ -1447,12 +1445,7 @@ plugin_configs: []
 
     let mut stream = connect_tcp_proxy(proxy_port).await;
     // Pretend to be an LB: advertise a distinct public client identity.
-    let inbound = v2_header_tcp4_bytes(
-        [203, 0, 113, 50],
-        [192, 0, 2, 10],
-        40000,
-        15432,
-    );
+    let inbound = v2_header_tcp4_bytes([203, 0, 113, 50], [192, 0, 2, 10], 40000, 15432);
     stream
         .write_all(&inbound)
         .await
@@ -1467,8 +1460,8 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let (src, dst) = (*observed_tuple.lock().await)
-        .expect("backend must observe outbound PROXY header");
+    let (src, dst) =
+        (*observed_tuple.lock().await).expect("backend must observe outbound PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50)),

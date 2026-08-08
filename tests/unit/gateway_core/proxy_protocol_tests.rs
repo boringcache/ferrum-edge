@@ -437,8 +437,8 @@ fn outbound_v2_addrs_fall_back_to_local_listener() {
 
     let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
-    let (src, dst) = outbound_v2_addrs(client, 4321, None, None, Some(local))
-        .expect("fallback should work");
+    let (src, dst) =
+        outbound_v2_addrs(client, 4321, None, None, Some(local)).expect("fallback should work");
     assert_eq!(src.port(), 4321);
     assert_eq!(dst.ip(), local.ip());
     assert_eq!(
