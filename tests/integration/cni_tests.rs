@@ -2232,4 +2232,246 @@ mod install_lifecycle {
         ));
         assert!(node.conf_path().exists());
     }
+
+    fn assert_no_install_residue(node: &Node) {
+        for dir in [&node.bin_dir, &node.conf_dir] {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let name = entry.expect("entry").file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.ends_with(".tmp") && !name.ends_with(".install"),
+                    "refused install left staging residue: {name}"
+                );
+            }
+        }
+    }
+
+    fn assert_shared_artifacts_unchanged(
+        node: &Node,
+        conf_before: Option<&[u8]>,
+        binary_before: Option<&[u8]>,
+        manifest_before: Option<&[u8]>,
+        primary_before: &[u8],
+    ) {
+        let conf_after = fs::read(node.conf_path()).ok();
+        let binary_after = fs::read(node.binary_path()).ok();
+        let manifest_after = fs::read(node.manifest_path()).ok();
+        let primary_after = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        assert_eq!(conf_after.as_deref(), conf_before);
+        assert_eq!(binary_after.as_deref(), binary_before);
+        assert_eq!(manifest_after.as_deref(), manifest_before);
+        assert_eq!(primary_after, primary_before);
+        assert_no_install_residue(node);
+    }
+
+    fn expect_unsafe_install_target(err: CniInstallError) {
+        assert!(
+            matches!(err, CniInstallError::UnsafeInstallTarget { .. }),
+            "expected UnsafeInstallTarget, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains('{') && !message.contains("secret"),
+            "refusal must not echo hostile contents: {message}"
+        );
+    }
+
+    #[test]
+    fn install_succeeds_when_the_target_conflist_is_absent() {
+        let node = Node::new();
+        assert!(!node.conf_path().exists());
+        node.install(OWNER, "gen-1");
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+        assert!(node.manifest_path().exists());
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["owner"],
+            OWNER
+        );
+        node.assert_primary_untouched();
+        assert_no_install_residue(&node);
+    }
+
+    #[test]
+    fn install_allows_same_owner_generation_upgrade() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("new image");
+        node.install(OWNER, "gen-2");
+        let generated = read_json(&node.conf_path());
+        assert_eq!(generated["plugins"][1]["ferrum"]["owner"], OWNER);
+        assert_eq!(generated["plugins"][1]["ferrum"]["generation"], "gen-2");
+        assert_eq!(
+            fs::read(node.binary_path()).expect("binary"),
+            b"ferrum-cni v2"
+        );
+        assert_eq!(read_json(&node.manifest_path())["generation"], "gen-2");
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn install_refuses_a_different_owners_valid_chain_without_side_effects() {
+        let node = Node::new();
+        node.install("other/release", "gen-1");
+        let conf_before = fs::read(node.conf_path()).expect("conf");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("different owner must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&conf_before),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["owner"],
+            "other/release"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_unmarked_target_without_side_effects() {
+        let node = Node::new();
+        let foreign = serde_json::to_vec_pretty(&serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "operator-authored",
+            "plugins": [
+                {"type": "calico"},
+                {"type": "ferrum-cni", "ferrum": {"socketPath": "/custom.sock"}}
+            ]
+        }))
+        .expect("json");
+        fs::write(node.conf_path(), &foreign).expect("write unmarked");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("unmarked target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&foreign),
+            None,
+            None,
+            &primary_before,
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_malformed_target_without_side_effects() {
+        let node = Node::new();
+        let malformed = b"{ truncated-hostile-payload";
+        fs::write(node.conf_path(), malformed).expect("write malformed");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("malformed target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(malformed),
+            None,
+            None,
+            &primary_before,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_symlinked_target_without_side_effects() {
+        let node = Node::new();
+        let victim = node.conf_dir.join("victim.conflist");
+        fs::write(&victim, b"do-not-touch").expect("victim");
+        std::os::unix::fs::symlink(&victim, node.conf_path()).expect("symlink");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        let victim_before = fs::read(&victim).expect("victim");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("symlink target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(
+            fs::symlink_metadata(node.conf_path())
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the planted symlink must remain"
+        );
+        assert_eq!(fs::read(&victim).expect("victim"), victim_before);
+        assert!(!node.binary_path().exists());
+        assert!(!node.manifest_path().exists());
+        assert_eq!(
+            fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary"),
+            primary_before
+        );
+        assert_no_install_residue(&node);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_non_regular_target_without_side_effects() {
+        let node = Node::new();
+        fs::create_dir(node.conf_path()).expect("plant directory");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("non-regular target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(node.conf_path().is_dir());
+        assert_shared_artifacts_unchanged(&node, None, None, None, &primary_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_hard_linked_target_without_side_effects() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let alias = node.conf_dir.join("alias-ferrum.json");
+        fs::hard_link(node.conf_path(), &alias).expect("hard link");
+        let conf_before = fs::read(node.conf_path()).expect("conf");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("hard-linked target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(alias.exists());
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&conf_before),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-1"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_oversized_target_without_side_effects() {
+        let node = Node::new();
+        let mut bytes = Vec::with_capacity(2 * 1024 * 1024);
+        bytes.extend_from_slice(b"{\"plugins\":[],\"pad\":\"");
+        bytes.resize(2 * 1024 * 1024, b'a');
+        bytes.extend_from_slice(b"\"}");
+        fs::write(node.conf_path(), &bytes).expect("oversized");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("oversized target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&bytes),
+            None,
+            None,
+            &primary_before,
+        );
+    }
 }

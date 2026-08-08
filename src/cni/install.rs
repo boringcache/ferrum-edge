@@ -45,6 +45,10 @@
 //! object still carries the device/inode identity the evidence was read from.
 //! Temporary files are created `O_EXCL | O_NOFOLLOW` under an unpredictable
 //! name, so a pre-planted symlink or file cannot be followed or truncated.
+//! Install additionally fail-closes under the lock before any staging or
+//! shared write: an existing target conflist is overwritten only when it is a
+//! bounded regular single-link file whose Ferrum ownership marker names this
+//! same owner.
 //!
 //! What that does **not** claim: the final `unlink` is still by pathname, so
 //! a writer with write access to the CNI configuration directory could in
@@ -128,6 +132,12 @@ const REASON_HARD_LINKED: &str =
 const REASON_TOO_LARGE: &str = "file is larger than any artifact this installer writes";
 const REASON_SWAPPED: &str =
     "the file was replaced between the ownership check and removal; nothing was deleted";
+/// Existing target conflist has no usable Ferrum ownership marker.
+const REASON_TARGET_UNOWNED: &str =
+    "existing configuration carries no Ferrum ownership marker; it was not written by this installer";
+/// Existing target conflist is a valid Ferrum chain for a different release.
+const REASON_TARGET_OTHER_OWNER: &str =
+    "existing configuration is owned by a different Ferrum install";
 
 /// Install-time identity stamped onto every generated artifact.
 ///
@@ -384,6 +394,11 @@ pub enum CniInstallError {
          as this run's cleanup readiness marker"
     )]
     UnsafeReadyMarker { path: String },
+    #[error("refusing to overwrite {path}: {reason}")]
+    UnsafeInstallTarget {
+        path: String,
+        reason: &'static str,
+    },
 }
 
 pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
@@ -415,6 +430,13 @@ pub fn install(
     // rollback watcher that reached its deadline must not be able to delete
     // an artifact while this run is still publishing the next one.
     let _lock = InstallLock::acquire(host_conf_dir)?;
+
+    // Fail closed before any staging, manifest, binary, or target-config write:
+    // an absent target is fine; an existing one may be overwritten only when it
+    // is a bounded regular single-link file whose Ferrum marker names this
+    // same owner. A foreign, malformed, or differently-owned file must never
+    // be destroyed by install.
+    assert_install_target_reusable(host_conf_dir, &config.conf_file_name, &config.ownership)?;
 
     let target_binary = host_bin_dir.join(FERRUM_PLUGIN_TYPE);
 
@@ -723,6 +745,40 @@ fn match_ownership(config: &CniUninstallConfig, found: &CniOwnership) -> Ownersh
 fn conflist_ownership(bytes: &[u8]) -> Option<CniOwnership> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     conflist_ownership_value(&value)
+}
+
+/// Fail-closed install preflight for the configured target conflist.
+///
+/// Held under the install lock and run before every staging / manifest /
+/// binary / target write. Reuses the same bounded `O_NOFOLLOW` open-handle
+/// classification and in-file ownership marker helpers uninstall uses; it
+/// does not soften uninstall's evidence rules. Same-owner upgrades across
+/// generations are allowed; every uncertain or foreign case is refused with
+/// a fixed reason and no mutation of shared artifacts.
+fn assert_install_target_reusable(
+    conf_dir: &Path,
+    conf_file_name: &str,
+    ownership: &CniOwnership,
+) -> Result<(), CniInstallError> {
+    let path = conf_dir.join(conf_file_name);
+    match read_bounded_regular_file(&path, MAX_OWNED_JSON_BYTES)? {
+        ArtifactRead::Absent => Ok(()),
+        ArtifactRead::Rejected(reason) => Err(CniInstallError::UnsafeInstallTarget {
+            path: path.display().to_string(),
+            reason,
+        }),
+        ArtifactRead::Present { bytes, .. } => match conflist_ownership(&bytes) {
+            None => Err(CniInstallError::UnsafeInstallTarget {
+                path: path.display().to_string(),
+                reason: REASON_TARGET_UNOWNED,
+            }),
+            Some(found) if found.owner == ownership.owner => Ok(()),
+            Some(_) => Err(CniInstallError::UnsafeInstallTarget {
+                path: path.display().to_string(),
+                reason: REASON_TARGET_OTHER_OWNER,
+            }),
+        },
+    }
 }
 
 fn conflist_ownership_value(value: &Value) -> Option<CniOwnership> {
@@ -1798,7 +1854,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        fs::write(conf_dir.join("00-ferrum.conflist"), b"{truncated").unwrap();
 
         let config = CniInstallConfig {
             host_bin_dir: bin_dir.display().to_string(),
@@ -1835,6 +1890,62 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp")),
             "successful install should not leave temp config files"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_existing_malformed_target_without_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico", "ipam": {"type": "calico-ipam"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let target = conf_dir.join("00-ferrum.conflist");
+        fs::write(&target, b"{truncated").unwrap();
+        let primary_before = fs::read(conf_dir.join("10-calico.conflist")).unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+            ownership: test_ownership(),
+        };
+
+        let err = install(&config, &source).expect_err("malformed target must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnsafeInstallTarget { .. }),
+            "expected UnsafeInstallTarget, got {err:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"{truncated");
+        assert!(!bin_dir.join("ferrum-cni").exists());
+        assert!(!conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME).exists());
+        assert_eq!(
+            fs::read(conf_dir.join("10-calico.conflist")).unwrap(),
+            primary_before
+        );
+        assert!(
+            fs::read_dir(&bin_dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".install")),
+            "refused install must leave no staged binary"
         );
     }
 
