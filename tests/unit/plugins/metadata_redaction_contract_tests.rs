@@ -5,6 +5,7 @@
 //! counter controls. All projections must share one sensitivity decision.
 
 use ferrum_edge::_test_support::clone_log_metadata;
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema};
 use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
@@ -13,7 +14,6 @@ use ferrum_edge::plugins::utils::metadata_redaction::{
     strip_internal_only_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
-use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
@@ -355,7 +355,9 @@ fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projecti
 
     let projected = clone_log_metadata(&ctx);
     assert_eq!(
-        projected.get(MESH_METRICS_DISABLED_METADATA).map(String::as_str),
+        projected
+            .get(MESH_METRICS_DISABLED_METADATA)
+            .map(String::as_str),
         Some("request_count")
     );
     assert_eq!(
