@@ -1970,10 +1970,7 @@ async fn explicit_jwks_uri_is_reported_as_active() {
     );
 }
 
-async fn mount_token_and_jwks(
-    server: &MockServer,
-    id_token: &str,
-) {
+async fn mount_token_and_jwks(server: &MockServer, id_token: &str) {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     Mock::given(method("GET"))
         .and(path("/jwks"))
@@ -1994,7 +1991,9 @@ async fn mount_token_and_jwks(
         .await;
 }
 
-fn plugin_pair_for_server(server: &MockServer) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
+fn plugin_pair_for_server(
+    server: &MockServer,
+) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
     let mut config = base_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
@@ -2126,7 +2125,11 @@ async fn sealed_pending_flow_rejects_tampered_correlation_cookie() {
         "{}={};{}",
         name,
         chars.into_iter().collect::<String>(),
-        challenge.cookie.split_once(';').map(|(_, rest)| rest).unwrap_or("")
+        challenge
+            .cookie
+            .split_once(';')
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
     );
 
     match complete_callback(&plugin, &tampered, "authorization-code").await {
@@ -2168,7 +2171,8 @@ async fn sealed_pending_flow_rejects_oversized_correlation_cookie() {
     let challenge = issue_browser_challenge(&plugin).await;
     let name = cookie_name(&challenge.cookie);
     let oversized = format!("{name}={}", "A".repeat(9000));
-    let mut callback = RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+    let mut callback =
+        RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
     callback.request_is_secure = true;
     callback.headers.insert("cookie".to_string(), oversized);
     callback
@@ -2208,7 +2212,10 @@ async fn same_instance_rejects_replay_after_sealed_state_is_accepted() {
 
     assert!(matches!(
         complete_callback(&plugin, &challenge, "authorization-code").await,
-        PluginResult::Reject { status_code: 302, .. }
+        PluginResult::Reject {
+            status_code: 302,
+            ..
+        }
     ));
     match complete_callback(&plugin, &challenge, "authorization-code").await {
         PluginResult::Reject {

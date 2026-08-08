@@ -1556,9 +1556,7 @@ impl OidcRelyingParty {
             source_ip: ctx.client_ip.clone(),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
-        self.session
-            .state_cache
-            .insert(state.clone(), flow)?;
+        self.session.state_cache.insert(state.clone(), flow)?;
         Ok(CreatedFlow {
             state,
             code_verifier,
@@ -2060,9 +2058,8 @@ impl StateCache {
             if expires_at > now {
                 return Err(());
             }
-            if let Some((_, removed_expiry)) = self
-                .spent
-                .remove_if(state, |_, expires| *expires <= now)
+            if let Some((_, removed_expiry)) =
+                self.spent.remove_if(state, |_, expires| *expires <= now)
             {
                 self.remove_expiry_record(state, removed_expiry);
                 decrement_atomic(&self.active_spent);
@@ -3639,16 +3636,32 @@ mod tests {
             plugin
                 .session
                 .state_cache
-                .take_bound(&first.0, &first_hash)
-                .is_some()
+                .admit_callback(&second.0, &first_hash)
+                .is_err(),
+            "wrong sealed binding must fail closed without consuming the sibling"
         );
         assert!(
             plugin
                 .session
                 .state_cache
-                .take_bound(&second.0, &second_hash)
-                .is_some(),
+                .admit_callback(&first.0, &first_hash)
+                .is_ok()
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .admit_callback(&second.0, &second_hash)
+                .is_ok(),
             "consuming one browser-bound flow must not evict its sibling"
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .admit_callback(&first.0, &first_hash)
+                .is_err(),
+            "same-instance admission must reject replay of a spent state"
         );
     }
 
