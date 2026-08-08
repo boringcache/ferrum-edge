@@ -6278,12 +6278,10 @@ fn l4_rule_backends(
     // Field-specific diagnostics name the route's own kind: an operator
     // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
     let backend_port_field = format!("{} backendRefs[].port", object.kind);
-    let requested_port =
-        optional_port_field(object, backend_ref.get("port"), &backend_port_field)?;
+    let requested_port = optional_port_field(object, backend_ref.get("port"), &backend_port_field)?;
     let backend_port = match backend_kind {
-        super::backend_ref::BackendKind::Service => requested_port.ok_or_else(|| {
-            invalid_resource(object, format!("{backend_port_field} is required"))
-        })?,
+        super::backend_ref::BackendKind::Service => requested_port
+            .ok_or_else(|| invalid_resource(object, format!("{backend_port_field} is required")))?,
         super::backend_ref::BackendKind::ServiceImport => {
             // Stream routes keep a stable ClusterSet DNS target and never
             // expand MCS EndpointSlice addresses (that would discard all but
