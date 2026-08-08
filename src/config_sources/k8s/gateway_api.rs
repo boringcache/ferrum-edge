@@ -9154,8 +9154,9 @@ mod tests {
         post_route.metadata.name = "api-post".to_string();
         post_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[edge_http_gateway(), get_route, post_route], options())
-            .expect("translation succeeds");
+        let result =
+            translate_k8s_objects(&[edge_http_gateway(), get_route, post_route], options())
+                .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
         assert!(
@@ -9315,9 +9316,11 @@ mod tests {
         method_and_header.metadata.name = "api-get-header".to_string();
         method_and_header.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result =
-            translate_k8s_objects(&[edge_http_gateway(), header_only, method_and_header], options())
-                .expect("translation succeeds");
+        let result = translate_k8s_objects(
+            &[edge_http_gateway(), header_only, method_and_header],
+            options(),
+        )
+        .expect("translation succeeds");
         let plugin = result
             .config
             .plugin_configs
@@ -12025,19 +12028,13 @@ mod tests {
         }
 
         let forward = translate_k8s_objects(
-            &[
-                edge_http_gateway(),
-                http_route.clone(),
-                grpc_route.clone(),
-            ],
+            &[edge_http_gateway(), http_route.clone(), grpc_route.clone()],
             options(),
         )
         .expect("translation succeeds");
-        let reverse = translate_k8s_objects(
-            &[edge_http_gateway(), grpc_route, http_route],
-            options(),
-        )
-        .expect("translation succeeds");
+        let reverse =
+            translate_k8s_objects(&[edge_http_gateway(), grpc_route, http_route], options())
+                .expect("translation succeeds");
         assert_eq!(
             fingerprint(&forward),
             fingerprint(&reverse),
@@ -12964,9 +12961,8 @@ mod tests {
         goodbye.metadata.name = "goodbye".to_string();
         goodbye.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result =
-            translate_k8s_objects(&[edge_http_gateway(), hello, goodbye], options())
-                .expect("translation succeeds");
+        let result = translate_k8s_objects(&[edge_http_gateway(), hello, goodbye], options())
+            .expect("translation succeeds");
 
         let proxy = grpc_catch_all_proxy(&result);
         let plugin = grpc_dispatch_plugin(&result, proxy);
