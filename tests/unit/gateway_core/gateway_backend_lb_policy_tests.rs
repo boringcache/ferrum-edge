@@ -411,9 +411,8 @@ fn assert_full_foreign_ancestors_apply_without_ferrum_status_write(
     policy.status = json!({ "ancestors": full_foreign_ancestors() });
     let objects = vec![policy, http_route_to_service("api")];
 
-    let translated = translate_k8s_objects(&objects, options()).expect(
-        "a full foreign ancestor map must not suppress session-persistence translation",
-    );
+    let translated = translate_k8s_objects(&objects, options())
+        .expect("a full foreign ancestor map must not suppress session-persistence translation");
     assert_eq!(translated.config.upstreams.len(), 1);
     assert!(
         translated.config.upstreams[0]
@@ -474,7 +473,10 @@ fn backend_lb_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status(
 #[test]
 fn x_backend_traffic_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status() {
     assert_full_foreign_ancestors_apply_without_ferrum_status_write(
-        sticky_cookie_policy("XBackendTrafficPolicy", "gateway.networking.x-k8s.io/v1alpha1"),
+        sticky_cookie_policy(
+            "XBackendTrafficPolicy",
+            "gateway.networking.x-k8s.io/v1alpha1",
+        ),
         "XBackendTrafficPolicy",
     );
 }
