@@ -899,6 +899,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // Start the main multi-threaded runtime for the gateway
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
+    // Tokio otherwise inherits Rust's 2 MiB spawned-thread default. The proxy
+    // request future is deliberately broad (all supported protocols and plugin
+    // phases share one fail-closed dispatch boundary), and a real cross-cluster
+    // sidecar HTTP/2 request has exceeded that default on hosted Linux runners.
+    // A worker-stack overflow aborts the whole process rather than unwinding,
+    // so keep explicit headroom for the production request path. This reserves
+    // virtual address space per worker; pages are committed on demand.
+    rt_builder.thread_stack_size(8 * 1024 * 1024);
     // Key-tied for the same reason as the logging-clamp fields above: both are
     // parsed to `usize` and clamped with `.max(1)` before being re-rendered, so
     // a secret-backed `004` surfaces as `4` and a `0` as `1`. Those are derived
