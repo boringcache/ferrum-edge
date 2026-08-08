@@ -1847,7 +1847,10 @@ fn port_scoped_regex_beats_its_port_agnostic_fallback_on_the_exact_listener() {
         .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9001), false)
         .expect("the exact listener-scoped regex must match");
     assert_eq!(exact.proxy.id, "scoped");
-    assert_eq!(exact.path_params, vec![("id".to_string(), "42".to_string())]);
+    assert_eq!(
+        exact.path_params,
+        vec![("id".to_string(), "42".to_string())]
+    );
 
     let elsewhere = cache
         .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9002), false)

@@ -570,7 +570,10 @@ impl GatewayListenerManager {
                         "port {port} still has a retiring Gateway listener task; the replacement \
                          listener remains deferred until every previous accept socket closes"
                     );
-                    warn!(port = *port, "Gateway API listener rebind deferred: {error}");
+                    warn!(
+                        port = *port,
+                        "Gateway API listener rebind deferred: {error}"
+                    );
                     failures.push(GatewayListenerBindFailure { port: *port, error });
                 }
                 continue;
