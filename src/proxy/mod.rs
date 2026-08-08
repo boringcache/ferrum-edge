@@ -24392,6 +24392,8 @@ async fn handle_proxy_request_inner(
             epoch.route_generation,
             request_host.as_deref(),
             &path,
+            ctx.frontend_listen_port,
+            is_tls,
         ),
     };
 
@@ -24413,6 +24415,8 @@ async fn handle_proxy_request_inner(
                 request_host.as_deref(),
                 &path,
                 ctx.mesh_direction,
+                ctx.frontend_listen_port,
+                is_tls,
             )
         }
         other => other,
@@ -52130,6 +52134,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }

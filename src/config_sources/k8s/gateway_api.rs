@@ -86,6 +86,9 @@ struct RouteHostScope {
     proxy_hosts: Vec<String>,
     conflict_hostname: String,
     parent_refs: Vec<String>,
+    /// Gateway listener port this scope materializes on. `None` only when no
+    /// listener policy resolved the parentRef (unknown Gateway).
+    listen_port: Option<u16>,
     suffix: Option<String>,
 }
 
@@ -2122,6 +2125,7 @@ pub(crate) fn route_conflicts<'a>(
             },
             keys: key_set.keys,
             listeners: key_set.listeners,
+            listener_ports: key_set.listener_ports,
         });
     }
 
@@ -2159,6 +2163,8 @@ struct CrossKindRouteEntry {
     keys: Vec<GatewayApiRouteConflictKey>,
     /// parentRef key -> conflict hostname -> the accepted listeners behind it.
     listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>>,
+    /// Port stamped from each listener's Gateway policy (when known).
+    listener_ports: HashMap<GatewayApiListenerKey, Option<u16>>,
 }
 
 impl CrossKindRouteEntry {
@@ -2175,11 +2181,27 @@ impl CrossKindRouteEntry {
         {
             Some(listeners) if !listeners.is_empty() => listeners
                 .iter()
-                .cloned()
-                .map(CrossKindListener::Listener)
+                .map(|key| CrossKindListener::Listener {
+                    key: key.clone(),
+                    port: self.listener_ports.get(key).copied().flatten(),
+                })
                 .collect(),
             _ => BTreeSet::from([CrossKindListener::ParentRef(parent_ref.to_string())]),
         }
+    }
+
+    /// Listeners this conflict key actually attaches to (port-aligned when the
+    /// key carries a listen_port).
+    fn listeners_for_key(&self, key: &GatewayApiRouteConflictKey) -> BTreeSet<CrossKindListener> {
+        self.listeners_for(&key.parent_ref, &key.hostname)
+            .into_iter()
+            .filter(|listener| match listener {
+                CrossKindListener::Listener { port, .. } => {
+                    key.listen_port.is_none() || key.listen_port == *port
+                }
+                CrossKindListener::ParentRef(_) => key.listen_port.is_none(),
+            })
+            .collect()
     }
 }
 
@@ -2191,11 +2213,15 @@ impl CrossKindRouteEntry {
 /// reach disjoint listeners once `allowedRoutes.kinds` filters them. Arbitrating
 /// on the literal selector string would therefore both miss real overlaps and
 /// invent conflicts between routes that never share a listener, so the domain
-/// is the resolved listener wherever one is known.
+/// is the resolved listener wherever one is known. The listener's port is part
+/// of the identity so port-aware materialization can retain sibling claims.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CrossKindListener {
     /// A concrete accepted Gateway listener the parentRef resolved to.
-    Listener(GatewayApiListenerKey),
+    Listener {
+        key: GatewayApiListenerKey,
+        port: Option<u16>,
+    },
     /// No listener policy resolved the reference; fall back to its literal key.
     ParentRef(String),
 }
@@ -2204,37 +2230,32 @@ enum CrossKindListener {
 ///
 /// Gateway API v1.5.1 requires that when an HTTPRoute and a GRPCRoute attach
 /// to the same listener with intersecting hostnames, exactly one **entire**
-/// Route is accepted — resolved by the oldest `metadata.creationTimestamp`,
-/// then `{namespace}/{name}` — and that rules are never merged between the two
-/// kinds. The decision is deliberately whole-route and hostname-scoped: it does
-/// not look at rule paths or match predicates, so an HTTPRoute catch-all and a
-/// GRPCRoute on the same host can never both materialize.
+/// Route is accepted on that listener — resolved by the oldest
+/// `metadata.creationTimestamp`, then `{namespace}/{name}` — and that rules
+/// are never merged between the two kinds. The decision is deliberately
+/// whole-route and hostname-scoped on the shared listener: it does not look
+/// at rule paths or match predicates, so an HTTPRoute catch-all and a
+/// GRPCRoute on the same host can never both materialize there.
 ///
-/// The losing route is rejected by emitting a conflict for **every** one of its
-/// conflict keys, across every parentRef and hostname. That is what the rest of
-/// the pipeline already understands: `http_route_resources` drops every match
-/// whose key is a losing key (so no proxy, upstream, plugin, or
-/// materialized-parent record is produced), and the status writer reports the
-/// Route `Accepted=False` with the conflict reason on every authored parentRef.
+/// With port-aware route representation, a loss is confined to the
+/// `(parentRef, listener)` claims that actually overlapped. Surviving
+/// claims on other listeners keep their proxies, upstreams, plugins, and
+/// materialized-parent records. Conflict keys carry `listen_port` so
+/// materialization and status can retain healthy siblings.
 ///
 /// Resolution is greedy over the total `(creationTimestamp, namespace, name)`
 /// order across whole Routes, so it is independent of the order objects arrive
-/// in: a route is rejected only when it overlaps an already-accepted route of
-/// the other kind. A route that overlaps only a *rejected* opposite-kind route
-/// still wins, because a Route rejected on one listener is never admitted as a
-/// winner on another.
+/// in: a route is rejected on a listener only when it overlaps an
+/// already-accepted route of the other kind on that same listener. A route
+/// that overlaps only a *rejected* opposite-kind route still wins there,
+/// because a Route rejected on one listener is never admitted as a winner on
+/// another.
 ///
 /// Arbitration runs per resolved `CrossKindListener`, never per parentRef
 /// selector string, so a wildcard reference and a `sectionName` / `port`
 /// reference that name one listener contend with each other, while wildcard
 /// references reaching disjoint `allowedRoutes.kinds`-filtered listeners do
-/// not. A Route that loses on *any* listener is withdrawn across all of its
-/// claims: Ferrum materializes HTTP-family Gateway API routes as port-agnostic
-/// `(hosts, listen_path)` proxies, so retaining another parentRef would also
-/// retain the proxy on the listener where Gateway API forbids the merge.
-/// Keeping availability on a non-conflicting listener is not worth serving
-/// cross-kind traffic on the conflicting one, so the conservative whole-Route
-/// withdrawal is the fail-closed choice.
+/// not.
 fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApiRouteConflict> {
     // HTTPRoute and GRPCRoute cannot contend unless both kinds are present.
     // Skip claim materialization and the greedy acceptance scan when only one
@@ -2268,11 +2289,10 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
         })
         .collect::<Vec<_>>();
 
-    // Whole-Route arbitration must itself run in whole-Route order. Performing
-    // an independent greedy pass per listener and only then withdrawing a
-    // multi-parent loser would let that now-withdrawn Route displace a later
-    // Route on another listener. Process the total Gateway API order once so a
-    // loser contributes no winner state anywhere.
+    // Whole-Route order for greedy acceptance, but losses stay per-listener.
+    // Process the total Gateway API order once so a loser on listener A cannot
+    // displace a later valid Route on listener A after being withdrawn — while
+    // still allowing that Route to win (or keep) listener B.
     let mut route_order = (0..entries.len()).collect::<Vec<_>>();
     route_order.sort_by(|left, right| {
         let left = &entries[*left].candidate;
@@ -2281,49 +2301,62 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
             .then_with(|| left.resource.kind.cmp(&right.resource.kind))
     });
 
-    let mut accepted = Vec::<usize>::new();
-    let mut losses = HashMap::<usize, K8sResourceKey>::new();
+    // listener -> accepted route indices that claim it
+    let mut accepted_on_listener: HashMap<CrossKindListener, Vec<usize>> = HashMap::new();
+    // (route_index, listener) -> winner
+    let mut listener_losses: HashMap<(usize, CrossKindListener), K8sResourceKey> = HashMap::new();
     for index in route_order {
         let entry = &entries[index];
-        let winner = accepted.iter().find_map(|accepted_index| {
-            let accepted_entry = &entries[*accepted_index];
-            if accepted_entry.candidate.resource.kind == entry.candidate.resource.kind {
-                return None;
+        for (listener, hostnames) in &route_claims[index] {
+            let winner = accepted_on_listener
+                .get(listener)
+                .into_iter()
+                .flatten()
+                .find_map(|accepted_index| {
+                    let accepted_entry = &entries[*accepted_index];
+                    if accepted_entry.candidate.resource.kind == entry.candidate.resource.kind {
+                        return None;
+                    }
+                    let overlaps = route_claims[*accepted_index]
+                        .get(listener)
+                        .is_some_and(|accepted_hostnames| {
+                            cross_kind_hostnames_overlap(hostnames, accepted_hostnames)
+                        });
+                    overlaps.then(|| accepted_entry.candidate.resource.clone())
+                });
+
+            if let Some(winner) = winner {
+                listener_losses.insert((index, listener.clone()), winner);
+            } else {
+                accepted_on_listener
+                    .entry(listener.clone())
+                    .or_default()
+                    .push(index);
             }
-
-            let overlaps = route_claims[index].iter().any(|(listener, hostnames)| {
-                route_claims[*accepted_index]
-                    .get(listener)
-                    .is_some_and(|accepted_hostnames| {
-                        cross_kind_hostnames_overlap(hostnames, accepted_hostnames)
-                    })
-            });
-            overlaps.then(|| accepted_entry.candidate.resource.clone())
-        });
-
-        if let Some(winner) = winner {
-            losses.insert(index, winner);
-        } else {
-            accepted.push(index);
         }
     }
 
-    // Project a whole-Route loss back onto every one of the Route's conflict
-    // keys. A second parentRef cannot retain a port-agnostic proxy after that
-    // Route lost on any listener.
+    // Project each per-listener loss onto the conflict keys that attach to
+    // that listener only — sibling listener claims stay materializable.
     let mut conflicts = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let Some(winner) = losses.get(&index) else {
-            continue;
-        };
         for key in &entry.keys {
-            conflicts.push(GatewayApiRouteConflict {
-                key: key.clone(),
-                winner: winner.clone(),
-                loser: entry.candidate.resource.clone(),
-            });
+            for listener in entry.listeners_for_key(key) {
+                let Some(winner) = listener_losses.get(&(index, listener)) else {
+                    continue;
+                };
+                conflicts.push(GatewayApiRouteConflict {
+                    key: key.clone(),
+                    winner: winner.clone(),
+                    loser: entry.candidate.resource.clone(),
+                });
+            }
         }
     }
+    conflicts.sort_by(|left, right| {
+        (&left.loser, &left.key, &left.winner).cmp(&(&right.loser, &right.key, &right.winner))
+    });
+    conflicts.dedup_by(|left, right| left.loser == right.loser && left.key == right.key);
     conflicts
 }
 
@@ -2358,6 +2391,8 @@ struct RouteConflictKeySet {
     /// parentRef key -> conflict hostname -> the accepted listeners behind it.
     /// A pair with no entry had no listener policy resolve it.
     listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>>,
+    /// Port from each listener's Gateway policy (when known).
+    listener_ports: HashMap<GatewayApiListenerKey, Option<u16>>,
 }
 
 fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> RouteConflictKeySet {
@@ -2376,6 +2411,7 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
     let mut parent_refs_by_hostname: HashMap<&str, Vec<String>> = HashMap::new();
     let mut listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>> =
         BTreeMap::new();
+    let mut listener_ports: HashMap<GatewayApiListenerKey, Option<u16>> = HashMap::new();
     for hostname in &hostnames {
         let resolved = acc
             .map(|acc| {
@@ -2394,6 +2430,16 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
                 for (parent_ref, listener_keys) in resolved {
                     if listener_keys.is_empty() {
                         continue;
+                    }
+                    for listener_key in &listener_keys {
+                        let port = acc.and_then(|acc| {
+                            acc.gateway_api_listener_policies
+                                .get(listener_key)
+                                .and_then(|policy| {
+                                    policy.port.and_then(|port| u16::try_from(port).ok())
+                                })
+                        });
+                        listener_ports.insert(listener_key.clone(), port);
                     }
                     listeners
                         .entry(parent_ref)
@@ -2423,13 +2469,39 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
                     continue;
                 };
                 for parent_ref in parent_refs {
-                    keys.push(GatewayApiRouteConflictKey {
-                        route_family: route_family.clone(),
-                        parent_ref: parent_ref.clone(),
-                        hostname: hostname.clone(),
-                        listen_path: descriptor.listen_path.clone(),
-                        match_signature: route_conflict_match_signature(&descriptor),
-                    });
+                    let listener_ports: BTreeSet<Option<u16>> = listeners
+                        .get(parent_ref.as_str())
+                        .and_then(|by_host| by_host.get(hostname.as_str()))
+                        .map(|listener_keys| {
+                            listener_keys
+                                .iter()
+                                .map(|listener_key| {
+                                    acc.and_then(|acc| {
+                                        acc.gateway_api_listener_policies
+                                            .get(listener_key)
+                                            .and_then(|policy| {
+                                                policy.port.and_then(|port| u16::try_from(port).ok())
+                                            })
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ports = if listener_ports.is_empty() {
+                        BTreeSet::from([None])
+                    } else {
+                        listener_ports
+                    };
+                    for listen_port in ports {
+                        keys.push(GatewayApiRouteConflictKey {
+                            route_family: route_family.clone(),
+                            parent_ref: parent_ref.clone(),
+                            hostname: hostname.clone(),
+                            listen_path: descriptor.listen_path.clone(),
+                            match_signature: route_conflict_match_signature(&descriptor),
+                            listen_port,
+                        });
+                    }
                 }
             }
         }
@@ -2437,7 +2509,11 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
 
     keys.sort();
     keys.dedup();
-    RouteConflictKeySet { keys, listeners }
+    RouteConflictKeySet {
+        keys,
+        listeners,
+        listener_ports,
+    }
 }
 
 fn route_conflict_match_signature(descriptor: &RouteMatchDescriptor) -> String {
@@ -2575,10 +2651,11 @@ fn merge_http_route_proxy(
     true
 }
 
-/// Only proxies from the same Gateway API route kind may collapse. HTTP-family
-/// proxies do not retain their admitting listener, and runtime lookup uses only
-/// host and path; merging HTTPRoute and GRPCRoute state would therefore make
-/// each backend reachable through listeners that admitted only the other kind.
+/// Only proxies from the same Gateway API route kind and the same listen_port
+/// may collapse. Distinct listener ports are independent route-table slots;
+/// merging across ports would reintroduce the port-agnostic collision that
+/// port-aware representation exists to avoid. Same-kind same-port collapse
+/// still preserves rule ordering and fall-through within one listener.
 fn can_merge_http_route_proxy(
     acc: &K8sAccumulator,
     existing: &Proxy,
@@ -2588,6 +2665,7 @@ fn can_merge_http_route_proxy(
     acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && existing.namespace == proxy.namespace
         && existing.listen_path == proxy.listen_path
+        && existing.listen_port == proxy.listen_port
         && existing.hosts == proxy.hosts
         && namespaced_resource_key(&existing.namespace, &existing.id)
             .and_then(|key| acc.gateway_api_route_proxy_kinds.get(&key))
@@ -4546,10 +4624,12 @@ fn http_route_resources(
                         .collect(),
                 );
                 let host_scopes = route_host_scopes_for_path(
+                    object,
+                    acc,
                     &hostnames,
                     &conflict_hostnames,
-                    &parent_refs,
-                    &parent_refs_by_hostname,
+                    &requested_hostnames,
+                    config_namespace,
                     &route_family,
                     &descriptors_for_path,
                     &losing_conflict_keys,
@@ -4578,6 +4658,18 @@ fn http_route_resources(
                         &object.metadata.name,
                         &scoped_suffix,
                     );
+                    if let Some(port) = host_scope.listen_port {
+                        let requires_tls = acc
+                            .gateway_api_listener_policies
+                            .values()
+                            .any(|policy| {
+                                policy.port == Some(u64::from(port))
+                                    && policy.requires_frontend_tls
+                            });
+                        if requires_tls {
+                            acc.config.http_tls_listen_ports.insert(port);
+                        }
+                    }
                     let mut proxy = proxy_for_route(RouteProxySpec {
                         id: proxy_id.clone(),
                         namespace: config_namespace.clone(),
@@ -4589,7 +4681,7 @@ fn http_route_resources(
                         backend_port,
                         upstream_id: upstream_id.clone(),
                         backend_scheme,
-                        listen_port: None,
+                        listen_port: host_scope.listen_port,
                         retry: None,
                         backend_read_timeout_ms: None,
                     });
@@ -4599,6 +4691,7 @@ fn http_route_resources(
                             &host_scope.parent_refs,
                             &route_family,
                             &host_scope.conflict_hostname,
+                            host_scope.listen_port,
                             &descriptors_for_path,
                             &losing_conflict_keys,
                         );
@@ -4656,71 +4749,123 @@ fn http_route_resources(
 }
 
 fn route_host_scopes_for_path(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
     spec_hostnames: &[String],
     conflict_hostnames: &[String],
-    parent_refs: &[String],
-    parent_refs_by_hostname: &HashMap<String, Vec<String>>,
+    requested_hostnames: &[String],
+    config_namespace: &str,
     route_family: &str,
     descriptors_for_path: &[RouteMatchDescriptor],
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> Vec<RouteHostScope> {
-    if losing_conflict_keys.is_empty() {
-        if conflict_hostnames.len() > 1 {
-            return conflict_hostnames
-                .iter()
-                .enumerate()
-                .map(|(index, hostname)| RouteHostScope {
-                    proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
-                    conflict_hostname: hostname.clone(),
-                    parent_refs: parent_refs_by_hostname
-                        .get(hostname)
-                        .cloned()
-                        .unwrap_or_else(|| parent_refs.to_vec()),
-                    suffix: Some(format!("host{index}")),
-                })
-                .collect();
-        }
-        return vec![RouteHostScope {
-            proxy_hosts: spec_hostnames.to_vec(),
-            conflict_hostname: conflict_hostnames
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "*".to_string()),
-            parent_refs: parent_refs.to_vec(),
-            suffix: None,
-        }];
-    }
-
-    conflict_hostnames
-        .iter()
-        .enumerate()
-        .filter_map(|(index, hostname)| {
-            let scoped_parent_refs = parent_refs_by_hostname
-                .get(hostname)
-                .filter(|refs| !refs.is_empty())
-                .cloned()
-                .unwrap_or_else(|| parent_refs.to_vec());
+    let mut scopes = Vec::new();
+    for (host_index, hostname) in conflict_hostnames.iter().enumerate() {
+        let resolved = route_allowed_parent_listeners_for_hostname(
+            object,
+            acc,
+            requested_hostnames,
+            Some(config_namespace),
+            hostname,
+        );
+        if resolved.is_empty() {
+            // Unknown Gateway: keep a port-agnostic claim so status still
+            // reports the authored parentRef, matching pre-port-aware behavior.
+            let parent_refs = route_allowed_parent_ref_keys_for_hostname(
+                object,
+                acc,
+                requested_hostnames,
+                Some(config_namespace),
+                hostname,
+            );
+            if parent_refs.is_empty() {
+                continue;
+            }
             let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
                 !descriptor_conflicts_for_host(
-                    &scoped_parent_refs,
+                    &parent_refs,
                     route_family,
                     hostname,
                     descriptor,
+                    None,
                     losing_conflict_keys,
                 )
             });
             if !has_surviving_match {
-                return None;
+                continue;
             }
-
-            Some(RouteHostScope {
+            scopes.push(RouteHostScope {
                 proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
                 conflict_hostname: hostname.clone(),
-                parent_refs: scoped_parent_refs,
-                suffix: Some(format!("host{index}")),
-            })
-        })
-        .collect()
+                parent_refs,
+                listen_port: None,
+                suffix: Some(format!("host{host_index}")),
+            });
+            continue;
+        }
+
+        for (parent_ref, listener_keys) in resolved {
+            for listener_key in listener_keys {
+                let listen_port = acc
+                    .gateway_api_listener_policies
+                    .get(&listener_key)
+                    .and_then(|policy| policy.port.and_then(|port| u16::try_from(port).ok()));
+                let parent_refs = vec![parent_ref.clone()];
+                let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
+                    !descriptor_conflicts_for_host(
+                        &parent_refs,
+                        route_family,
+                        hostname,
+                        descriptor,
+                        listen_port,
+                        losing_conflict_keys,
+                    )
+                });
+                if !has_surviving_match {
+                    continue;
+                }
+                let port_suffix = listen_port
+                    .map(|port| format!("p{port}"))
+                    .unwrap_or_else(|| "punknown".to_string());
+                scopes.push(RouteHostScope {
+                    proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
+                    conflict_hostname: hostname.clone(),
+                    parent_refs,
+                    listen_port,
+                    suffix: Some(format!("host{host_index}-{port_suffix}")),
+                });
+            }
+        }
+    }
+
+    // Collapse identical (hosts, listen_port, parent_refs) scopes that multiple
+    // hostnames somehow produced; keep stable order.
+    scopes.sort_by(|left, right| {
+        (
+            &left.conflict_hostname,
+            left.listen_port,
+            &left.parent_refs,
+            &left.suffix,
+        )
+            .cmp(&(
+                &right.conflict_hostname,
+                right.listen_port,
+                &right.parent_refs,
+                &right.suffix,
+            ))
+    });
+    scopes.dedup_by(|left, right| {
+        left.proxy_hosts == right.proxy_hosts
+            && left.listen_port == right.listen_port
+            && left.parent_refs == right.parent_refs
+            && left.conflict_hostname == right.conflict_hostname
+    });
+
+    // Single-scope routes omit the host/port suffix for stable proxy IDs.
+    if scopes.len() == 1 {
+        scopes[0].suffix = None;
+    }
+    scopes
 }
 
 fn proxy_hosts_for_conflict_hostname(spec_hostnames: &[String], hostname: &str) -> Vec<String> {
@@ -4735,6 +4880,7 @@ fn skipped_descriptors_for_host(
     parent_refs: &[String],
     route_family: &str,
     hostname: &str,
+    listen_port: Option<u16>,
     descriptors_for_path: &[RouteMatchDescriptor],
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> HashSet<RouteMatchDescriptor> {
@@ -4746,6 +4892,7 @@ fn skipped_descriptors_for_host(
                 route_family,
                 hostname,
                 descriptor,
+                listen_port,
                 losing_conflict_keys,
             )
         })
@@ -4758,6 +4905,7 @@ fn descriptor_conflicts_for_host(
     route_family: &str,
     hostname: &str,
     descriptor: &RouteMatchDescriptor,
+    listen_port: Option<u16>,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
     !parent_refs.is_empty()
@@ -4768,6 +4916,7 @@ fn descriptor_conflicts_for_host(
                 hostname: hostname.to_string(),
                 listen_path: descriptor.listen_path.clone(),
                 match_signature: route_conflict_match_signature(descriptor),
+                listen_port,
             })
         })
 }
@@ -7047,6 +7196,119 @@ mod tests {
                 && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
                 && warning.contains("winner is default/api-old")
         }));
+    }
+
+    /// Same hostname+path on distinct HTTP and HTTPS listeners must validate
+    /// and stamp each admitting listener port onto the materialized proxies.
+    #[test]
+    fn http_and_https_listeners_share_host_path_without_collision() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "http",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "app.example.com",
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    },
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "hostname": "app.example.com",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        let secret = tls_secret("app-cert", "default", true);
+        let http_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge", "sectionName": "http"}],
+                "hostnames": ["app.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-plain", "port": 8080}]
+                }]
+            }),
+        );
+        let mut https_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge", "sectionName": "https"}],
+                "hostnames": ["app.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "web-tls", "port": 8443}]
+                }]
+            }),
+        );
+        https_route.metadata.name = "https-api".to_string();
+
+        let result =
+            translate_k8s_objects(&[gateway, secret, http_route, https_route], options())
+                .expect("translation succeeds");
+
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "distinct listeners must not collide: {:?}",
+            result.config.validate_unique_listen_paths()
+        );
+        let mut listen_ports: Vec<Option<u16>> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+            .map(|proxy| proxy.listen_port)
+            .collect();
+        listen_ports.sort();
+        assert_eq!(listen_ports, vec![Some(80), Some(443)]);
+        assert!(
+            result.config.http_tls_listen_ports.contains(&443),
+            "HTTPS listener ports must be recorded for TLS frontend matching: {:?}",
+            result.config.http_tls_listen_ports
+        );
+    }
+
+    /// An unknown sectionName fails closed with no materialization for that claim.
+    #[test]
+    fn missing_section_name_listener_does_not_materialize() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "app.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }]
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge", "sectionName": "does-not-exist"}],
+                "hostnames": ["app.example.com"],
+                "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+        assert!(
+            result.config.proxies.is_empty(),
+            "unknown sectionName must not program traffic: {:?}",
+            result.config.proxies
+        );
     }
 
     #[test]
@@ -10425,10 +10687,9 @@ mod tests {
                 }
             }
         ]));
-        // Distinct listen paths: Ferrum materializes Gateway API HTTP-family
-        // routes as port-agnostic `(hosts, listen_path)` proxies, so two Routes
-        // that survive on different listeners still have to occupy different
-        // route-table slots.
+        // Distinct listen paths keep the same-kind dispatch lists separate; with
+        // port-aware representation the kind-disjoint listeners also stamp
+        // distinct `listen_port` values.
         let http_route = cross_kind_http_route(
             serde_json::json!({"name": "edge"}),
             Some(serde_json::json!([{"path": {"type": "PathPrefix", "value": "/admin"}}])),
@@ -10472,12 +10733,8 @@ mod tests {
     /// listen path they most commonly occupy: a pathless GRPCRoute predicate
     /// *always* materializes on `/`, and an HTTPRoute with no `matches` (or a
     /// `PathPrefix: /` rule) does too. Gateway API requires both Routes to be
-    /// accepted here — they never share a listener — while Ferrum has exactly
-    /// one port-agnostic `(hosts, listen path)` slot for them.
-    ///
-    /// Because Ferrum cannot represent the listener dimension in its HTTP route
-    /// table, preserving isolation must take precedence over merging these
-    /// routes: the resulting duplicate slot is rejected at config validation.
+    /// accepted here — they never share a listener — and port-aware
+    /// representation gives each a distinct `listen_port` so they validate.
     #[test]
     fn cross_kind_routes_on_kind_disjoint_listeners_do_not_merge() {
         let gateway = cross_kind_gateway(serde_json::json!([
@@ -10525,23 +10782,32 @@ mod tests {
                 2,
                 "cross-kind routes must remain separate to preserve listener isolation"
             );
+            let mut listen_ports: Vec<Option<u16>> = result
+                .config
+                .proxies
+                .iter()
+                .map(|proxy| proxy.listen_port)
+                .collect();
+            listen_ports.sort();
+            assert_eq!(
+                listen_ports,
+                vec![Some(80), Some(8080)],
+                "each kind-disjoint listener must stamp its port onto the proxy"
+            );
             assert!(
-                result.config.validate_unique_listen_paths().is_err(),
-                "an unrepresentable cross-listener overlap must fail closed"
+                result.config.validate_unique_listen_paths().is_ok(),
+                "port-scoped siblings must not collide: {:?}",
+                result.config.validate_unique_listen_paths()
             );
         }
     }
 
     /// A wildcard parentRef can reach several listeners while emitting one
-    /// shared conflict key, and Ferrum materializes HTTP-family Gateway API
-    /// routes as port-agnostic `(hosts, listen_path)` proxies. A claim kept
-    /// because it won on the GRPCRoute-only listener would therefore still
-    /// route on the shared listener, where Gateway API v1.5.1 forbids the
-    /// HTTPRoute/GRPCRoute merge — the representation cannot express "accepted
-    /// on the other listener only". So the claim is withdrawn whole and the
-    /// GRPCRoute contributes no traffic state anywhere.
+    /// parentRef selector. With port-aware representation, a loss on the shared
+    /// listener withdraws only that listener's claim — the GRPCRoute keeps the
+    /// grpc-only listener and continues to program traffic there.
     #[test]
-    fn a_wildcard_parent_ref_losing_on_one_listener_is_withdrawn_whole() {
+    fn a_wildcard_parent_ref_losing_on_one_listener_retains_sibling_claims() {
         let gateway = cross_kind_gateway(serde_json::json!([
             {
                 "name": "shared",
@@ -10563,9 +10829,7 @@ mod tests {
             }
         ]));
         // The HTTPRoute pins the shared listener and is older, so it wins
-        // there. Its distinct listen path means the GRPCRoute would have had a
-        // route-table slot of its own had the claim been kept — the withdrawal
-        // is the conflict decision, not a route-table collision.
+        // there. The GRPCRoute must keep the grpc-only listener.
         let http_route = cross_kind_http_route(
             serde_json::json!({"name": "edge", "sectionName": "shared"}),
             Some(serde_json::json!([{"path": {"type": "PathPrefix", "value": "/admin"}}])),
@@ -10581,58 +10845,49 @@ mod tests {
         ] {
             let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
-            let ports: Vec<u16> = result
+            let mut ports: Vec<u16> = result
                 .config
                 .proxies
                 .iter()
                 .map(|proxy| proxy.backend_port)
                 .collect();
+            ports.sort_unstable();
             assert_eq!(
                 ports,
-                vec![8080],
-                "the GRPCRoute loses on the shared listener, so its port-agnostic claim is \
-                 withdrawn from the grpc-only listener too"
+                vec![8080, 50051],
+                "the GRPCRoute loses on the shared listener but retains the grpc-only claim"
             );
             assert!(
-                !result
+                result
                     .config
-                    .upstreams
+                    .proxies
                     .iter()
-                    .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
-                "the withdrawn GRPCRoute must not leave an upstream: {:?}",
-                result.config.upstreams
+                    .any(|proxy| proxy.backend_port == 50051 && proxy.listen_port == Some(8080)),
+                "retained GRPCRoute claim must be scoped to the grpc-only listener port"
             );
             assert!(
-                !result
-                    .config
-                    .plugin_configs
-                    .iter()
-                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
-                "the withdrawn GRPCRoute must contribute no dispatch rules"
-            );
-            assert!(
-                !result
+                result
                     .materialized_route_parents
                     .iter()
                     .any(|entry| entry.route.kind == "GRPCRoute"),
-                "the withdrawn GRPCRoute must claim no materialized parent"
+                "the retained GRPCRoute must claim a materialized parent"
             );
             assert!(
                 result.warnings.iter().any(|warning| {
                     warning.contains("GRPCRoute default/grpc")
                         && warning.contains("Gateway API forbids merging")
                 }),
-                "the withdrawal must be reported: {:?}",
+                "the shared-listener loss must still be reported: {:?}",
                 result.warnings
             );
             assert!(result.config.validate_unique_listen_paths().is_ok());
         }
     }
 
-    /// A separate allowed parentRef must not let a route retain its
-    /// port-agnostic proxy after it loses cross-kind arbitration elsewhere.
+    /// A multi-parent GRPCRoute that loses on the shared listener keeps the
+    /// grpc-only parentRef claim once port-aware representation applies.
     #[test]
-    fn a_multi_parent_route_losing_on_one_listener_is_withdrawn_whole() {
+    fn a_multi_parent_route_losing_on_one_listener_retains_sibling_claims() {
         let gateway = cross_kind_gateway(serde_json::json!([
             {
                 "name": "shared",
@@ -10670,28 +10925,33 @@ mod tests {
             .expect("translation succeeds");
 
         assert!(
-            !result
-                .config
-                .proxies
-                .iter()
-                .any(|proxy| proxy.backend_port == 50051),
-            "the losing multi-parent GRPCRoute must contribute no proxy"
+            result.config.proxies.iter().any(|proxy| {
+                proxy.backend_port == 50051 && proxy.listen_port == Some(8080)
+            }),
+            "the GRPCRoute must retain the grpc-only claim: {:?}",
+            result.config.proxies
         );
         assert!(
-            !result
+            !result.config.proxies.iter().any(|proxy| {
+                proxy.backend_port == 50051 && proxy.listen_port == Some(80)
+            }),
+            "the shared-listener GRPCRoute claim must still be withdrawn"
+        );
+        assert!(
+            result
                 .config
                 .upstreams
                 .iter()
                 .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
-            "the losing multi-parent GRPCRoute must contribute no upstream"
+            "the retained GRPCRoute claim must keep its upstream"
         );
     }
 
-    /// A Route withdrawn whole after a loss on one listener must not remain an
-    /// arbitration winner on another listener and suppress a later valid Route
-    /// there.
+    /// A Route that loses on one listener retains sibling claims, but those
+    /// retained claims must not suppress a later Route that does not share the
+    /// same listen path / conflict key on another listener.
     #[test]
-    fn a_withdrawn_route_cannot_displace_a_later_route_elsewhere() {
+    fn a_partial_loss_does_not_displace_a_later_route_elsewhere() {
         let gateway = cross_kind_gateway(serde_json::json!([
             {
                 "name": "first",
@@ -10741,25 +11001,26 @@ mod tests {
                 .expect("translation succeeds");
 
         assert!(
-            !result
-                .materialized_route_parents
+            result
+                .config
+                .proxies
                 .iter()
-                .any(|entry| entry.route.kind == "GRPCRoute"),
-            "the middle GRPCRoute loses on the first listener and must be withdrawn whole"
+                .any(|proxy| proxy.backend_port == 50051 && proxy.listen_port == Some(8080)),
+            "the middle GRPCRoute retains the second-listener claim after losing on the first"
         );
         assert!(
             result
                 .materialized_route_parents
                 .iter()
                 .any(|entry| { entry.route.kind == "HTTPRoute" && entry.route.name == "survivor" }),
-            "a withdrawn GRPCRoute must not displace the later HTTPRoute on the second listener"
+            "the later HTTPRoute on the second listener must still materialize"
         );
         assert!(
             !result.warnings.iter().any(|warning| {
                 warning.contains("HTTPRoute default/survivor")
                     && warning.contains("Gateway API forbids merging")
             }),
-            "the later Route must not be reported as losing to a Route withdrawn elsewhere: {:?}",
+            "the later Route must not be reported as losing to a Route that only lost elsewhere: {:?}",
             result.warnings
         );
     }

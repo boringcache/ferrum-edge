@@ -41,7 +41,7 @@ paths:
 - Never replace prefix matching with O(n) scans or regex matching with sequential per-pattern checks.
 - Router cache is a `DashMap`, sized by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` defaulting to `max(10000, proxies * 3)`. Negative lookups are cached.
 - Exact listen paths match after query stripping. Regex listen paths use `~` and are auto-anchored full-path. Prefix-style regexes must end with `.*`.
-- HTTP-family proxies (`http`, `https`, `ws`, `wss`, `grpc`, `grpcs`, `h3`) route by hosts and listen path. At least one is required; `listen_port` must be `None`.
+- HTTP-family proxies (`http`, `https`, `ws`, `wss`, `grpc`, `grpcs`, `h3`) route by hosts and listen path. At least one is required. Optional `listen_port` scopes matching to that frontend port (Gateway API listener identity); omit it for port-agnostic matching.
 - Stream-family proxies (`tcp`, `tcp_tls`, `udp`, `dtls`) route by `listen_port`; `listen_path` must be `None`.
 - Host-only HTTP proxies match all paths for their hosts; `strip_listen_path` is a no-op there.
 - HTTP-family `backend_scheme` accepts `http` or `https` and defaults to `https`. Stream-family requires an explicit scheme.

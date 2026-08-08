@@ -557,6 +557,10 @@ pub struct GatewayApiRouteConflictKey {
     pub hostname: String,
     pub listen_path: String,
     pub match_signature: String,
+    /// Gateway listener port this claim attaches to. `None` when no listener
+    /// policy resolved the parentRef (unknown Gateway) — arbitration then
+    /// falls back to the literal parentRef identity alone.
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,10 +676,9 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
-    /// Source route kind for every materialized Gateway API HTTP-family proxy.
-    /// The route table is port-agnostic, so cross-kind proxies must not collapse:
-    /// doing so would expose each route through listeners that admitted only the
-    /// other kind.
+    /// The route table is port-aware: cross-kind proxies on distinct listeners
+    /// keep separate `listen_port` identities and must not collapse across
+    /// kinds even when they share hosts+path.
     pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
@@ -1289,15 +1292,14 @@ where
         // same parent, hostname, and listen path — exactly like HTTPRoute.
         //
         // A cross-kind (HTTPRoute vs GRPCRoute) collision is different in
-        // kind, not degree: Gateway API v1.5.1 requires the whole losing Route
-        // to be rejected on the shared listener, so every one of its matches is
-        // suppressed rather than just the colliding one. Because the
-        // materialized route is port-agnostic, the rejection covers the whole
-        // parentRef claim — including any other listener that claim reaches.
+        // kind, not degree: Gateway API v1.5.1 requires the losing claim to be
+        // rejected on the shared listener. Port-aware representation confines
+        // that loss to the overlapping `(parentRef, listener)` claim so sibling
+        // listeners retain their healthy materialization.
         let skipped_reason = if conflict.loser.kind == conflict.winner.kind {
             "the conflicting match was skipped"
         } else {
-            "the whole route was withdrawn from that parentRef claim because Gateway API forbids \
+            "the conflicting listener claim was withdrawn because Gateway API forbids \
              merging HTTPRoute and GRPCRoute rules on a shared listener"
         };
         acc.warnings.push(format!(

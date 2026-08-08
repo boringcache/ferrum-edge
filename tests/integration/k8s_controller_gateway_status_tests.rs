@@ -576,9 +576,8 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
             "allowedRoutes": {"kinds": [{"kind": "GRPCRoute"}]}
         }
     ]));
-    // Distinct listen paths: Ferrum materializes Gateway API HTTP-family routes
-    // as port-agnostic `(hosts, listen_path)` proxies, so two Routes surviving
-    // on different listeners still occupy different route-table slots.
+    // Distinct listen paths keep dispatch lists separate; port-aware
+    // representation also stamps distinct listener ports onto each proxy.
     let mut http_route = object(
         "gateway.networking.k8s.io/v1",
         "HTTPRoute",
@@ -644,19 +643,12 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
 }
 
 /// The fail-closed edge between the two cases above: one wildcard parentRef
-/// reaches a shared listener *and* a GRPCRoute-only listener, emitting a single
-/// `(parentRef, hostname)` claim. It loses the cross-kind arbitration on the
-/// shared listener and would otherwise be accepted on the GRPCRoute-only one.
-///
-/// Ferrum materializes HTTP-family Gateway API routes as port-agnostic
-/// `(hosts, listen_path)` proxies, so a claim kept for the listener it won
-/// cannot be restricted to that listener — it would still route on the shared
-/// listener, exactly where Gateway API forbids HTTPRoute/GRPCRoute merging.
-/// The claim is therefore withdrawn whole: the GRPCRoute contributes no proxy,
-/// no upstream, no plugin, and no materialized parent anywhere, and is reported
-/// `Accepted=False`/`Conflicted` — independent of object observation order.
+/// reaches a shared listener *and* a GRPCRoute-only listener. It loses the
+/// cross-kind arbitration on the shared listener. With port-aware
+/// representation it retains the grpc-only claim, keeps Accepted=True for the
+/// surviving parent, and continues to program traffic on that listener.
 #[test]
-fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners() {
+fn cross_kind_wildcard_claim_losing_one_listener_retains_sibling_claims() {
     let gateway = cross_kind_gateway(json!([
         {
             "name": "shared",
@@ -672,9 +664,6 @@ fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners
         }
     ]));
     // The HTTPRoute pins the shared listener and is older, so it wins there.
-    // Its distinct listen path means the GRPCRoute would have had a route-table
-    // slot of its own had the claim been kept — the withdrawal is the conflict
-    // decision, not a `(hosts, listen_path)` collision.
     let mut http_route = object(
         "gateway.networking.k8s.io/v1",
         "HTTPRoute",
@@ -722,62 +711,53 @@ fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners
     ] {
         let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
-        // The losing GRPCRoute materializes no traffic state on *either*
-        // listener, including the one it would otherwise have won.
-        let ports: Vec<u16> = translation
+        let mut ports: Vec<u16> = translation
             .config
             .proxies
             .iter()
             .map(|proxy| proxy.backend_port)
             .collect();
+        ports.sort_unstable();
         assert_eq!(
             ports,
-            vec![8080],
-            "the withdrawn GRPCRoute must not keep the grpc-only listener"
+            vec![8080, 50051],
+            "the GRPCRoute loses on the shared listener but retains the grpc-only claim"
         );
         assert!(
-            !translation
-                .config
-                .upstreams
-                .iter()
-                .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
-            "the withdrawn GRPCRoute must not leave an upstream: {:?}",
-            translation.config.upstreams
+            translation.config.proxies.iter().any(|proxy| {
+                proxy.backend_port == 50051 && proxy.listen_port == Some(8080)
+            }),
+            "retained GRPCRoute claim must be scoped to the grpc-only listener"
         );
         assert!(
-            !translation
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
-            "the withdrawn GRPCRoute must contribute no dispatch rules"
-        );
-        assert!(
-            !translation
+            translation
                 .materialized_route_parents
                 .iter()
                 .any(|entry| entry.route.kind == "GRPCRoute"),
-            "the withdrawn GRPCRoute must claim no materialized parent"
+            "the retained GRPCRoute must claim a materialized parent"
         );
 
-        // ...and the withdrawal is reported, naming a real applicable winner.
         let conflict = translation
             .route_conflicts
             .iter()
             .find(|conflict| conflict.loser.kind == "GRPCRoute")
-            .expect("the withdrawal must be reported as a conflict");
+            .expect("the shared-listener loss must still be reported as a conflict");
         assert_eq!(conflict.winner.kind, "HTTPRoute");
         assert_eq!(conflict.winner.name, "web");
+        assert_eq!(conflict.key.listen_port, Some(80));
 
         let updates =
             plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
         let grpc_update = updates
             .iter()
             .find(|update| update.kind == "GRPCRoute" && update.name == "grpc")
-            .expect("the withdrawn GRPCRoute gets a status update");
+            .expect("the GRPCRoute gets a status update");
         let accepted = accepted_condition(grpc_update);
-        assert_eq!(accepted["status"].as_str(), Some("False"));
-        assert_eq!(accepted["reason"].as_str(), Some("Conflicted"));
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "partial listener loss must keep Accepted=True: {accepted:?}"
+        );
 
         let http_update = updates
             .iter()

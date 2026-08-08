@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Port-aware Gateway API HTTP-family route representation (issue #3612):
+  materialized proxies carry the admitting listener's `listen_port`, the router
+  selects by frontend port / TLS class (with HTTP/HTTPS protocol remap for the
+  common Service projection of :80/:443 onto the process binds), and cross-kind
+  arbitration retains healthy sibling `(parentRef, listener)` claims instead of
+  withdrawing the whole Route. Same-listener overlaps still fail closed.
+
 - `ai_federation` incremental provider response streaming behind a new root
   `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat
   Completions request carrying `"stream": true` is claimed in `before_proxy`,

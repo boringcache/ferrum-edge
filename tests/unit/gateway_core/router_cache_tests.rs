@@ -1700,3 +1700,74 @@ fn encoded_slash_case_insensitive_hex() {
     let upper = cache.find_proxy(None, "/api%2Fadmin").unwrap();
     assert_eq!(upper.proxy.id, "protected");
 }
+
+#[test]
+fn port_scoped_siblings_select_by_frontend_port() {
+    let mut plain = test_proxy("plain", "/api");
+    plain.hosts = vec!["app.example.com".into()];
+    plain.listen_port = Some(80);
+    plain.backend_port = 8080;
+
+    let mut tls = test_proxy("tls", "/api");
+    tls.hosts = vec!["app.example.com".into()];
+    tls.listen_port = Some(443);
+    tls.backend_port = 8443;
+
+    let mut config = test_config(vec![plain, tls]);
+    config.http_tls_listen_ports.insert(443);
+    let cache = RouterCache::new(&config, 100);
+
+    let on_http = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+        .expect("plaintext remap to the single nontls listen_port");
+    assert_eq!(on_http.proxy.id, "plain");
+
+    let on_https = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8443), true)
+        .expect("TLS remap to the single tls listen_port");
+    assert_eq!(on_https.proxy.id, "tls");
+
+    let exact_plain = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(80), false)
+        .expect("exact nontls port");
+    assert_eq!(exact_plain.proxy.id, "plain");
+}
+
+#[test]
+fn same_protocol_distinct_ports_require_exact_frontend_match() {
+    let mut a = test_proxy("a", "/api");
+    a.hosts = vec!["app.example.com".into()];
+    a.listen_port = Some(9001);
+    a.backend_port = 7001;
+
+    let mut b = test_proxy("b", "/api");
+    b.hosts = vec!["app.example.com".into()];
+    b.listen_port = Some(9002);
+    b.backend_port = 7002;
+
+    let config = test_config(vec![a, b]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(9001), false)
+            .unwrap()
+            .proxy
+            .id,
+        "a"
+    );
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(9002), false)
+            .unwrap()
+            .proxy
+            .id,
+        "b"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(8000), false)
+            .is_none(),
+        "multiple nontls listen_ports disable protocol remap"
+    );
+}

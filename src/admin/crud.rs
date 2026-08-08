@@ -3295,11 +3295,12 @@ impl AdminResource for Proxy {
                 }
                 Some(_) => {}
             }
-        } else if self.listen_port.is_some() {
-            return Err(ValidationError::Message(format!(
-                "HTTP proxy (scheme {}) must not set listen_port",
-                self.scheme_display()
-            )));
+        } else if let Some(port) = self.listen_port
+            && port < 1
+        {
+            return Err(ValidationError::Message(
+                "listen_port 0 must be >= 1".to_string(),
+            ));
         }
 
         Ok(())

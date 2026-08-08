@@ -182,19 +182,19 @@ materializes anything:
   and a GRPCRoute method predicate on the same host are a conflict even though
   their predicates are disjoint.
 - The losing Route produces no proxy, no upstream, no plugin, and no
-  materialized-parent record for **any** of its `(parentRef, hostname)` claims,
-  so it cannot route traffic through a different parent after losing elsewhere.
-  It is reported `Accepted=False` with `reason: Conflicted` and a message naming
-  the winner, and the translator emits a matching warning.
-- Overlap is detected per listener and per hostname intersection, but the
-  resulting acceptance decision is whole-Route: a loss on any listener
-  withdraws every parentRef and hostname claim authored by that Route. Splitting
-  independently admissible claims into separate Route objects is the only way
-  to retain one after another loses.
+  materialized-parent record for the overlapping `(parentRef, listener)`
+  claims. Sibling claims on other listeners are retained once port-aware
+  representation applies. The overlapping claim is reported `Accepted=False`
+  with `reason: Conflicted` (when every claim under that parentRef lost) or the
+  parent stays `Accepted=True` when at least one listener claim survives, with
+  a message naming the winner on the conflicting listener.
+- Overlap is detected per listener and per hostname intersection. The resulting
+  acceptance decision is per-`(parentRef, listener)`: a loss on one listener
+  does not withdraw healthy sibling claims.
 - Rejection does not cascade: Routes are considered once in the total Gateway
-  API order, and a Route withdrawn after a loss is never admitted as a winner
-  on another listener. A later Route is therefore unaffected when it overlaps
-  only that already-rejected Route.
+  API order, and a Route withdrawn after a loss on one listener is never
+  admitted as a winner on that same listener. A later Route is therefore
+  unaffected when it overlaps only that already-rejected claim.
 
 "The same listener" means the **resolved** listener, not the literal
 `parentRefs[]` entry. A parentRef is a selector, so the two are not
@@ -205,37 +205,36 @@ interchangeable:
   contend, even though their selector shapes differ.
 - Two wildcard references on one Gateway that `allowedRoutes.kinds` sends to
   *different* listeners never share one, so neither is rejected.
-- ParentRefs are not independent acceptance compartments inside one Route.
-  Ferrum's route representation is port-agnostic (see the known limitation
-  below), so retaining a second parentRef after a loss would retain that Route's
-  proxy on the listener where it lost. The Route is therefore
-  **conservatively withdrawn across every parentRef and hostname after a loss
-  on any listener**. Availability on a non-conflicting listener does not take
-  priority over not serving cross-kind traffic on the conflicting one.
-
-Route status is still reported against the parentRef the operator wrote —
-listener resolution is an internal arbitration detail and never rewrites the
-`parentRef` echoed in `status.parents[]`.
+- ParentRefs are not independent acceptance compartments inside one Route for
+  *unresolved* selectors, but once Ferrum can stamp a listener port onto the
+  materialized proxy, a cross-kind loss is confined to the overlapping
+  `(parentRef, listener)` claim. Surviving claims on other listeners keep their
+  proxies and remain `Accepted` when at least one claim is programmed. Route
+  status still echoes each parentRef the operator wrote — listener resolution
+  is an internal arbitration detail.
 
 Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
-`(hostname, listen path)` still collapse into one ordered dispatch-rule list,
-and only claim-for-claim collisions are resolved as conflicts.
+`(hostname, listen path, listen_port)` still collapse into one ordered
+dispatch-rule list, and only claim-for-claim collisions are resolved as
+conflicts.
 
-**Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
-port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
-not distinguishable in the route table. Two consequences follow:
+**Port-aware route representation.** Ferrum materializes Gateway API HTTP-family
+routes with the admitting listener's port on `Proxy.listen_port`, so listeners
+of one Gateway are distinguishable in the route table:
 
-- Two routes that legitimately survive on different listeners but claim the same
-  `(hostname, listen path)` collide at config validation
-  (`Overlapping host+listen_path`) rather than being served per listener port.
-  This fail-closed behavior prevents either route from becoming reachable on a
-  listener that admitted only the other kind. Give such routes distinct listen
-  paths, distinct hostnames, or distinct Gateways.
-- One Route cannot retain a second `(parentRef, hostname)` claim after a
-  cross-kind loss elsewhere; the entire Route is withdrawn (above). Claims that
-  need independent acceptance must be expressed as separate Route objects,
-  each scoped to its own listener (`sectionName` or `port`) and non-intersecting
-  hostname as appropriate.
+- Two routes that share `(hostname, listen path)` on **different** listeners
+  validate and serve independently — traffic on each frontend reaches only the
+  route attached to that listener (exact port match, or the HTTP/HTTPS protocol
+  remap when a single listener port of that class is projected onto
+  `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`).
+- Overlapping host+path on the **same** effective listener still fails closed
+  at config validation (`Overlapping host+listen_path`) with field-specific
+  Gateway API status diagnostics.
+- A Route that loses cross-kind arbitration on one listener retains healthy
+  sibling claims on other listeners. Claims that need independent acceptance
+  no longer require splitting into separate Route objects solely to survive a
+  loss elsewhere; `sectionName` / `port` scoping remains the way to attach to a
+  specific listener.
 
 ### Fail-closed match shapes
 
