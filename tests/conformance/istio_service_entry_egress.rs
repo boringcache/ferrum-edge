@@ -888,7 +888,7 @@ fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
         "the CONNECT authority names the EXTERNAL endpoint the gateway admits"
     );
     assert!(
-        target.tags.get("mesh.hbone").is_none(),
+        !target.tags.contains_key("mesh.hbone"),
         "the EgressGateway exposes no :15008 HBONE listener"
     );
 }
