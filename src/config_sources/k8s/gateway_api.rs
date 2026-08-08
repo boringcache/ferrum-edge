@@ -5874,8 +5874,49 @@ fn l4_route_proxies(
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+    // Cross-namespace TCPRoute/TLSRoute parentRefs use the same listener
+    // AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant authorizes
+    // backendRefs only, not parentRefs. UDPRoute keeps its stricter
+    // same-namespace parent contract.
     ensure_route_parent_refs_allowed(object, acc)?;
-    ensure_l4_parent_refs_are_same_namespace(object)?;
+    if scheme.is_udp() {
+        ensure_l4_parent_refs_are_same_namespace(object)?;
+    }
+
+    let config_namespaces = if scheme.is_udp() {
+        vec![object.metadata.namespace.clone()]
+    } else {
+        route_materialization_namespaces(object, acc)
+    };
+    let mut proxies = Vec::new();
+    for config_namespace in &config_namespaces {
+        if !scheme.is_udp()
+            && route_declares_gateway_parent_ref(object)
+            && route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace))
+                .is_empty()
+        {
+            continue;
+        }
+        let namespace_suffix = (config_namespaces.len() > 1)
+            .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
+        proxies.extend(l4_route_proxies_for_namespace(
+            object,
+            acc,
+            scheme,
+            config_namespace,
+            namespace_suffix.as_deref(),
+        )?);
+    }
+    Ok(proxies)
+}
+
+fn l4_route_proxies_for_namespace(
+    object: &K8sObject,
+    acc: &mut K8sAccumulator,
+    scheme: BackendScheme,
+    config_namespace: &str,
+    route_namespace_suffix: Option<&str>,
+) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let fallback_hosts = l4_route_hosts(object, scheme)?;
     ensure_udp_route_rule_shape(object, scheme)?;
     // A `UDPRoute` never carries hostnames (`l4_route_hosts` rejects the field
@@ -5893,12 +5934,8 @@ fn l4_route_proxies(
         )
     } else {
         (
-            l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace)),
-            route_materialized_parent_ref_keys_for_namespace(
-                object,
-                acc,
-                Some(&object.metadata.namespace),
-            ),
+            l4_route_listener_bindings_for_namespace(object, acc, Some(config_namespace)),
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace)),
         )
     };
 
@@ -5995,11 +6032,15 @@ fn l4_route_proxies(
         };
 
         for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
-            let suffix = if listen_bindings.len() == 1 {
+            let base_suffix = if listen_bindings.len() == 1 {
                 rule_suffix.clone()
             } else {
                 format!("{rule_suffix}-{listen_port_index}")
             };
+            let suffix = route_namespace_suffix.map_or_else(
+                || base_suffix.clone(),
+                |namespace_suffix| format!("{base_suffix}-{namespace_suffix}"),
+            );
             proxies.push(proxy_for_route(RouteProxySpec {
                 id: resource_id(
                     "gwapi-l4",
@@ -6007,7 +6048,8 @@ fn l4_route_proxies(
                     &object.metadata.name,
                     &suffix,
                 ),
-                namespace: object.metadata.namespace.clone(),
+                // The parent Gateway namespace owns the stream listener.
+                namespace: config_namespace.to_string(),
                 hosts: hosts.clone(),
                 listen_path: None,
                 strip_listen_path: false,
@@ -12046,7 +12088,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_route_rejects_cross_namespace_parent_ref_until_l4_parent_materialization_exists() {
+    fn tcp_route_materializes_cross_namespace_parent_ref_when_listener_allows_it() {
         let mut gateway = object(
             "Gateway",
             serde_json::json!({
@@ -12076,16 +12118,18 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(
+        let result = translate_k8s_objects(
             &[gateway, route],
             options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
         )
-        .expect_err("cross-namespace L4 parentRefs should fail closed");
+        .expect("an allowed cross-namespace L4 parentRef should materialize");
 
-        assert!(
-            err.to_string()
-                .contains("cross-namespace parentRefs are not supported")
-        );
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.namespace, "infra");
+        assert_eq!(proxy.listen_port, Some(5432));
+        assert_eq!(proxy.backend_host, "db.default.svc.cluster.local");
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
     }
 
     #[test]

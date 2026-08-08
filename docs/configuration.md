@@ -522,7 +522,7 @@ Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action
 
 Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding, so upgrades from older mesh previews should expect backends to receive the original Kubernetes request path.
 
-Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
+Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes. Cross-namespace `parentRefs` for `HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `TLSRoute` are authorized by the target Gateway listener's `allowedRoutes` (namespace/kind/sectionName resolution), not by ReferenceGrant; missing or unauthorized parents fail closed with `Accepted=False` / `NotAllowedByListeners`, and authorized L4 routes materialize stream proxies in the parent Gateway namespace.
 
 Gateway listener `allowedRoutes.namespaces.selector` is parsed atomically.
 `matchLabels` values must be strings, label keys and values must satisfy
