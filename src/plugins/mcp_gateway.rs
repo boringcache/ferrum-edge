@@ -23,6 +23,9 @@ use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 
+use super::mcp_aggregate_sse::{
+    AggregateSseBounds, AggregateSseBroker, AggregateSseError, StreamIdentity,
+};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -64,6 +67,11 @@ const MCP_BATCH_NOTIFICATION_FAILED: i64 = -32011;
 /// JSON-RPC application error: a `tools/call` result failed declared
 /// `outputSchema` validation (or could not be decoded for validation).
 const MCP_INVALID_TOOL_RESULT: i64 = -32012;
+/// JSON-RPC application error: `initialize` could not admit the paired
+/// aggregate SSE broker session, so the minted MCP session would have been
+/// usable for POST JSON but never able to attach its event stream. Admission
+/// fails closed instead of returning a half-working session.
+const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
 /// Maximum nesting depth admitted for a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
@@ -223,6 +231,12 @@ struct McpSessionConfig {
     initialize_upstreams: InitializeStrategy,
     session_ttl: Duration,
     max_sessions: usize,
+    /// When true (default), aggregate-router GET with `Accept: text/event-stream`
+    /// attaches a multiplexed SSE listener. When false, GET keeps the legacy
+    /// 405 rejection so operators can disable multiplexing without changing
+    /// mode. Transparent mode never uses this flag.
+    sse_multiplexing: bool,
+    sse_bounds: AggregateSseBounds,
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +636,11 @@ pub struct McpGateway {
     // O(1) access to the same per-session catalog used for request routing
     // without retaining or logging the raw downstream session id.
     session_catalogs_by_hash: Arc<DashMap<String, Arc<RwLock<McpCatalog>>>>,
+    /// Multiplexed aggregate SSE broker. Generation-scoped with the plugin
+    /// instance: reload / update / delete drops this `Arc`, and the broker's
+    /// `Drop` retires the generation — closing every session and ending every
+    /// attached body — so no event can cross generations.
+    sse_broker: Arc<AggregateSseBroker>,
     policy: McpPolicy,
     validation: McpValidationConfig,
     observability: McpObservabilityConfig,
@@ -756,6 +775,15 @@ impl McpGateway {
         // (honors FERRUM_POOL_SHARD_AMOUNT via the shared http client).
         let session_shard_amount = http_client.pool_shard_amount();
 
+        // Build the broker before the struct literal moves `sessions`: it is
+        // sized from the same session cap so broker cardinality can never
+        // exceed the MCP session store it mirrors.
+        let sse_broker = Arc::new(AggregateSseBroker::new(
+            sessions.sse_bounds.clone(),
+            sessions.max_sessions,
+            session_shard_amount,
+        ));
+
         // No static replay-provenance digest is computed here on purpose. The
         // public-URI mapping this plugin writes into response bodies comes from
         // the live per-session `McpCatalog`, not from `config`; see
@@ -773,6 +801,7 @@ impl McpGateway {
             session_admission_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
             session_catalogs_by_hash: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
+            sse_broker,
             policy,
             validation,
             observability,
@@ -1159,7 +1188,7 @@ impl McpGateway {
         protocol_version: String,
         client_info: Option<Value>,
         client_capabilities: Option<Value>,
-    ) -> String {
+    ) -> Result<String, AggregateSseError> {
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
 
         // Enforce the cap and reclaim sessions atomically, but keep upstream
@@ -1170,6 +1199,7 @@ impl McpGateway {
         // exceed `max_sessions` yet don't serialize behind each other's network
         // cleanup. The evicted sessions' upstream DELETEs are issued concurrently
         // after the lock is released.
+        let mut sse_admission_error: Option<AggregateSseError> = None;
         let evicted = {
             let _admission_guard = self.session_admission_lock.lock().await;
 
@@ -1236,11 +1266,25 @@ impl McpGateway {
             );
             self.session_catalogs_by_hash
                 .insert(hash_str(&downstream_session_id), catalog);
+            // Pair the MCP session with its broker slot inside the SAME
+            // admission critical section that just made room, so the two
+            // cardinalities cannot diverge and a later GET cannot race
+            // initialize. Failure is fail-closed rather than ignored: a session
+            // the client can initialize but never attach an event stream to is
+            // exactly the silently half-working state to avoid.
+            if self.sessions.sse_multiplexing
+                && let Err(error) = self.sse_broker.ensure_session(&downstream_session_id)
+            {
+                self.take_downstream_session(&downstream_session_id);
+                sse_admission_error = Some(error);
+            }
             evicted
         };
 
         // Tear down evicted sessions' upstreams concurrently, outside the lock, so
         // eviction never serializes new sessions behind upstream DELETE round trips.
+        // This still runs when broker admission refused the new session: those
+        // sessions are already out of the store either way.
         if !evicted.is_empty() {
             futures_util::future::join_all(
                 evicted
@@ -1250,7 +1294,10 @@ impl McpGateway {
             .await;
         }
 
-        downstream_session_id
+        match sse_admission_error {
+            Some(error) => Err(error),
+            None => Ok(downstream_session_id),
+        }
     }
 
     async fn ensure_upstream_initialized(
@@ -1516,6 +1563,11 @@ impl McpGateway {
         if session.is_some() {
             self.session_catalogs_by_hash
                 .remove(&hash_str(downstream_session_id));
+            // Single funnel for DELETE, TTL expiry and cap eviction, so broker
+            // session cardinality always mirrors the MCP session store. The
+            // removal blocks on a plain bookkeeping lock rather than a
+            // best-effort `try_lock`, so an attached listener always ends.
+            self.sse_broker.remove_session(downstream_session_id);
         }
         session
     }
@@ -1583,6 +1635,390 @@ impl McpGateway {
         };
         self.delete_upstream_sessions(session, ctx).await;
         true
+    }
+
+    /// Write one fixed-key `mcp.*` metadata entry.
+    fn note_metadata(ctx: &mut RequestContext, key: &str, value: &str) {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+
+    /// Record a fixed SSE reason token.
+    ///
+    /// The token comes from the error VARIANT, so no session id, JSON-RPC id,
+    /// header value, or event payload can reach transaction metadata or a log.
+    fn note_sse_error(ctx: &mut RequestContext, error: AggregateSseError) {
+        Self::note_metadata(ctx, "mcp.sse.error", error.reason_token());
+    }
+
+    fn note_sse_cancel(ctx: &mut RequestContext, reason: &str) {
+        Self::note_metadata(ctx, "mcp.sse.cancel", reason);
+    }
+
+    fn note_route_decision(ctx: &mut RequestContext, decision: &str) {
+        Self::note_metadata(ctx, "mcp.route_decision", decision);
+    }
+
+    /// Fail-closed SSE rejection: fixed status, fixed reason, fixed metadata
+    /// token. No client-controlled value reaches any of the three.
+    fn sse_error_response(ctx: &mut RequestContext, error: AggregateSseError) -> PluginResult {
+        Self::note_route_decision(ctx, "deny");
+        Self::note_sse_error(ctx, error);
+        let body = json!({"error": error.as_static_reason()});
+        json_response(error.http_status(), body, None)
+    }
+
+    /// Aggregate-router GET: attach the one multiplexed SSE listener for a live
+    /// downstream session. Transparent mode never reaches this path.
+    async fn handle_aggregate_sse_get(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.sessions.sse_multiplexing {
+            Self::note_route_decision(ctx, "deny");
+            let body = json!({"error": "aggregate MCP SSE multiplexing is disabled"});
+            return json_response(405, body, None);
+        }
+        if !super::mcp_aggregate_sse::headers_request_aggregate_sse(headers) {
+            return Self::sse_error_response(ctx, AggregateSseError::InvalidAccept);
+        }
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            return Self::sse_error_response(ctx, AggregateSseError::MissingSession);
+        };
+        if !self.touch_downstream_session(&session_id, ctx).await {
+            Self::note_route_decision(ctx, "deny");
+            Self::note_sse_error(ctx, AggregateSseError::UnknownSession);
+            return session_not_found_response();
+        }
+        // Record only THAT a resume cursor was present. The value is
+        // client-controlled, so neither it nor its length reaches metadata.
+        let last_event_id = header_value(headers, "last-event-id");
+        if last_event_id.is_some() {
+            Self::note_metadata(ctx, "mcp.sse.resume_requested", "true");
+        }
+        match self.sse_broker.attach_listener(&session_id, last_event_id) {
+            Ok(listener) => {
+                // Single-consumer handoff: exactly one transport claims the
+                // body. A context clone shares this lease and can never
+                // duplicate delivery, and if no transport claims it, dropping
+                // the lease frees the session's single-listener slot.
+                ctx.mcp_aggregate_sse = Some(listener);
+                Self::note_route_decision(ctx, "sse_listener");
+                let session_hash = hash_str(&session_id);
+                Self::note_metadata(ctx, "mcp.session.downstream", &session_hash);
+                PluginResult::Reject {
+                    status_code: 200,
+                    body: String::new(),
+                    headers: sse_listener_headers(),
+                }
+            }
+            Err(error) => {
+                let session_gone = matches!(
+                    error,
+                    AggregateSseError::UnknownSession
+                        | AggregateSseError::StaleSession
+                        | AggregateSseError::BrokerRetired
+                );
+                if session_gone {
+                    // Same shape the rest of the gateway uses to tell a client
+                    // to re-initialize rather than retry on this session.
+                    Self::note_route_decision(ctx, "deny");
+                    Self::note_sse_error(ctx, error);
+                    return session_not_found_response();
+                }
+                Self::sse_error_response(ctx, error)
+            }
+        }
+    }
+
+    /// Record how this request's JSON-RPC response was finally delivered:
+    /// `multiplexed` on the event stream, `inline` on the POST, or `suppressed`
+    /// because the client cancelled it. Fixed tokens only.
+    fn note_sse_delivery(ctx: &mut RequestContext, outcome: &str) {
+        Self::note_metadata(ctx, "mcp.sse.delivery", outcome);
+    }
+
+    /// Whether this dispatch may multiplex its terminal JSON-RPC response.
+    ///
+    /// Notification-form messages produce no JSON-RPC response at all, batch
+    /// members are assembled into one HTTP response array by the batch
+    /// restriction, and `initialize` answers with the session header an event
+    /// stream cannot carry (and has no session to attach to yet). None of those
+    /// may open a stream identity.
+    fn sse_multiplex_eligible(
+        &self,
+        ctx: &RequestContext,
+        envelope: &McpEnvelope,
+        method: &str,
+    ) -> bool {
+        self.sessions.sse_multiplexing
+            && self.mode == McpGatewayMode::AggregateRouter
+            && envelope.message_kind == McpMessageKind::Request
+            && envelope.id.is_some()
+            && !self.batch_forbids_upstream(ctx)
+            && method != "initialize"
+    }
+
+    /// Open the multiplexed request stream for this dispatch, BEFORE the method
+    /// handler runs any catalog refresh, upstream initialize, or backend
+    /// dispatch.
+    ///
+    /// Opening here is what makes cancellation meaningful: a concurrent
+    /// `notifications/cancelled` on another connection finds a genuinely open
+    /// stream while this one is still doing its slow work, and the eventual
+    /// response is then suppressed instead of being published late.
+    ///
+    /// Every refusal falls back to the ordinary inline JSON response. An id
+    /// that is not a representable identity is never coerced into one, so a
+    /// fallback can neither collide with a live stream nor retain state.
+    fn open_sse_stream_for_request(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        envelope: &McpEnvelope,
+        method: &str,
+    ) {
+        if !self.sse_multiplex_eligible(ctx, envelope, method) {
+            return;
+        }
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            return;
+        };
+        if !self.sse_broker.has_listener(&session_id) {
+            return;
+        }
+        let Some(id) = envelope.id.as_ref() else {
+            return;
+        };
+        let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
+        let identity = match StreamIdentity::from_json_rpc_id(id, max_id_bytes) {
+            Ok(identity) => identity,
+            Err(error) => {
+                Self::note_sse_error(ctx, error);
+                return;
+            }
+        };
+        match self.sse_broker.open_stream(&session_id, &identity) {
+            Ok(stream) => {
+                ctx.mcp_sse_stream = Some(stream);
+                Self::note_metadata(ctx, "mcp.sse.stream", "open");
+            }
+            Err(error) => Self::note_sse_error(ctx, error),
+        }
+    }
+
+    /// Whether a gateway-authored dispatch result is the terminal JSON-RPC
+    /// response for the identity this request opened.
+    ///
+    /// Bare status responses (the `404` that asks a client to re-initialize,
+    /// the `202` notification acknowledgement) and any response carrying a
+    /// downstream session header are NOT multiplexable: an event stream cannot
+    /// convey either, so they stay on the POST.
+    fn is_multiplexable_dispatch_response(
+        &self,
+        status_code: u16,
+        body: &str,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        if status_code != 200 || body.is_empty() {
+            return false;
+        }
+        if header_value(headers, &self.sessions.downstream_session_header).is_some() {
+            return false;
+        }
+        header_value(headers, "content-type").is_some_and(mcp_content_type_is_json)
+    }
+
+    /// Decide how a gateway-authored terminal response will be delivered, and
+    /// STAGE the multiplexable ones for the response lifecycle. Nothing is ever
+    /// published from here.
+    ///
+    /// `before_proxy` runs long before any response phase has seen these bytes.
+    /// Publishing an event here — and replacing the POST with an empty `202` —
+    /// would put a gateway-authored JSON-RPC payload on the wire that a
+    /// configured response-body WAF rule, `body_validator` response schema,
+    /// `ai_response_guard` redaction, response transform, or the authoritative
+    /// final client-visible body/header policy never inspected, while those
+    /// policies ran over the empty `202` instead. Upstream-routed responses have
+    /// always published from the final phase; this keeps both producers on the
+    /// same governed representation.
+    ///
+    /// So a multiplexable response is returned UNCHANGED with its stream lease
+    /// still on the context. Ferrum's synthetic-response lifecycle carries those
+    /// exact bytes through every response phase, and
+    /// [`Self::multiplex_final_response`] — reached from
+    /// `on_final_response_body` on that same lifecycle — reserves whatever
+    /// representation the client is actually allowed to receive. Publication
+    /// waits for `on_response_committed`, after the POST-side acknowledgement
+    /// has survived final header policy; otherwise the governed response stays
+    /// inline.
+    ///
+    /// Keeping the lease open until then also keeps cancellation meaningful for
+    /// the whole of the response lifecycle, not just up to dispatch.
+    ///
+    /// `PluginResult::Continue` means the request is being routed upstream and
+    /// its response does not exist yet, so the lease likewise stays on the
+    /// context and the same final-phase decision owns it.
+    fn deliver_dispatch_result_via_sse(
+        &self,
+        ctx: &mut RequestContext,
+        result: PluginResult,
+    ) -> PluginResult {
+        let Some(stream) = ctx.mcp_sse_stream.take() else {
+            return result;
+        };
+        let (status_code, body, headers) = match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            // `Continue` routes this request upstream, so its response does not
+            // exist yet: keep the lease and let the response-side hook own the
+            // terminal decision. Any other shape is likewise returned untouched
+            // with the lease reinstalled, so the context drop still releases the
+            // identity exactly once.
+            other => {
+                ctx.mcp_sse_stream = Some(stream);
+                return other;
+            }
+        };
+        if !self.is_multiplexable_dispatch_response(status_code, &body, &headers) {
+            // A bare status response or a session-header-bearing reply can
+            // never become an event, and no later response phase can turn it
+            // into one. Release the identity now rather than carrying a lease
+            // the final phase would only settle.
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+            return PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            };
+        }
+        // Staged, not published. `mcp.route_decision` records the DISPATCH
+        // decision; `mcp.sse.delivery`, written at reservation refusal or the
+        // committed boundary, is the authoritative delivery outcome.
+        ctx.mcp_sse_stream = Some(stream);
+        Self::note_route_decision(ctx, "sse_multiplex");
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        }
+    }
+
+    /// Reserve the FINAL governed JSON-RPC response for the session's SSE
+    /// listener and select the POST-side empty `202`.
+    ///
+    /// One decision point for both producers: an upstream-routed response and a
+    /// gateway-authored one staged by [`Self::deliver_dispatch_result_via_sse`]
+    /// arrive here identically, after normalization, response-body
+    /// inspection/guardrails, semantic response transforms, and the
+    /// authoritative final client-visible body policy have produced the exact
+    /// representation the client is allowed to receive.
+    ///
+    /// Nothing becomes listener-visible here. A successful admission stores a
+    /// private RAII publication on the request context; the observe-only
+    /// committed hook publishes it only if the empty `202` survives the final
+    /// response-header lifecycle. This keeps a gateway-authored synthetic
+    /// response from escaping a policy that replaces that acknowledgement after
+    /// the body hook, while shared broker reservation accounting makes the
+    /// eventual commit capacity-infallible.
+    fn multiplex_final_response(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<PluginResult> {
+        let stream = ctx.mcp_sse_stream.take()?;
+        // An MCP JSON-RPC response is multiplexable only when the FINAL response
+        // is the protocol's ordinary 200 representation. Converting a 4xx/5xx
+        // (or any other status) into the POST-side 202 would erase the failure
+        // semantics of a policy replacement or an upstream error and move that
+        // body onto a stream as though it were a successful JSON-RPC response.
+        // The session-header exclusion is re-checked here, not only at dispatch:
+        // an event stream cannot convey it whichever phase added it.
+        let inspectable = response_status == 200
+            && !body.is_empty()
+            && header_value(response_headers, "content-type").is_none_or(mcp_content_type_is_json)
+            && header_value(response_headers, &self.sessions.downstream_session_header).is_none()
+            && Self::response_encoding_allows_rewrite(response_headers)
+            && !super::utils::sse::original_response_is_event_stream(ctx, response_headers);
+        if !inspectable {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+            return None;
+        }
+        match stream.reserve_encoded(body) {
+            Ok(publication) => {
+                ctx.mcp_sse_publication = Some(publication);
+                Some(empty_response(202))
+            }
+            Err(AggregateSseError::StreamCancelled) => {
+                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+                Some(empty_response(202))
+            }
+            Err(error) => {
+                Self::note_sse_error(ctx, error);
+                Self::note_sse_delivery(ctx, "inline");
+                None
+            }
+        }
+    }
+
+    /// Release the request's stream identity because this POST is answering
+    /// inline. Idempotent, and a no-op when no stream was opened.
+    fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+        if let Some(publication) = ctx.mcp_sse_publication.take() {
+            publication.abort();
+        }
+        if let Some(stream) = ctx.mcp_sse_stream.take() {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+        }
+    }
+
+    /// Cancel the multiplexed stream a `notifications/cancelled` names.
+    ///
+    /// This is a SIDE EFFECT only: the notification keeps its ordinary routing
+    /// (including passthrough to the primary upstream when configured), and a
+    /// JSON-RPC notification never receives an error response, so an unknown or
+    /// unrepresentable request id records a fixed metadata token rather than
+    /// changing the HTTP outcome.
+    fn cancel_sse_stream_for_notification(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        envelope: &McpEnvelope,
+    ) {
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            return;
+        };
+        let request_id = envelope
+            .params
+            .as_ref()
+            .and_then(|params| params.get("requestId"));
+        let Some(request_id) = request_id else {
+            let missing = AggregateSseError::StreamIdMissing;
+            Self::note_sse_cancel(ctx, missing.reason_token());
+            return;
+        };
+        let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
+        let identity = match StreamIdentity::from_json_rpc_id(request_id, max_id_bytes) {
+            Ok(identity) => identity,
+            Err(error) => {
+                Self::note_sse_cancel(ctx, error.reason_token());
+                return;
+            }
+        };
+        match self.sse_broker.cancel_stream(&session_id, &identity) {
+            Ok(()) => Self::note_sse_cancel(ctx, "cancelled"),
+            Err(error) => Self::note_sse_cancel(ctx, error.reason_token()),
+        }
     }
 
     async fn request_upstream_json(
@@ -4129,6 +4565,38 @@ impl McpGateway {
             return self.handle_transparent_post(ctx, headers, envelope);
         }
 
+        // `notifications/cancelled` additionally cancels the multiplexed stream
+        // it names, as a side effect that does not intercept dispatch: the
+        // notification keeps its ordinary routing (including passthrough to the
+        // primary upstream when `passthrough_unknown_methods` is configured).
+        if self.sessions.sse_multiplexing && method == "notifications/cancelled" {
+            self.cancel_sse_stream_for_notification(ctx, headers, envelope);
+        }
+
+        // Open the multiplexed stream identity BEFORE the handler runs, so the
+        // whole slow part of the request — catalog refresh, upstream
+        // initialize, backend dispatch — is cancellable, and so every terminal
+        // aggregate response below funnels through one delivery decision
+        // instead of each arm inventing its own.
+        self.open_sse_stream_for_request(ctx, headers, envelope, method);
+        let result = self
+            .dispatch_aggregate_method(ctx, headers, envelope, method, protocol_version)
+            .await;
+        self.deliver_dispatch_result_via_sse(ctx, result)
+    }
+
+    /// Aggregate-router method dispatch. Every arm returns the response as it
+    /// would be answered inline; whether that response is written to the POST or
+    /// multiplexed onto the session's event stream is decided once, by
+    /// [`Self::deliver_dispatch_result_via_sse`].
+    async fn dispatch_aggregate_method(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        method: &str,
+        protocol_version: Option<String>,
+    ) -> PluginResult {
         match method {
             "initialize" => {
                 // MCP initialize is a negotiation, not a gate: echo a supported
@@ -4165,7 +4633,7 @@ impl McpGateway {
                     .as_ref()
                     .and_then(|params| params.get("capabilities"))
                     .cloned();
-                let downstream_session_id = self
+                let created = self
                     .create_downstream_session(
                         ctx,
                         version.clone(),
@@ -4173,6 +4641,22 @@ impl McpGateway {
                         client_capabilities,
                     )
                     .await;
+                let downstream_session_id = match created {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        // The MCP session and its SSE broker slot are admitted
+                        // together. Refusing here keeps the two cardinalities
+                        // consistent instead of handing back a session that can
+                        // never attach its event stream.
+                        Self::note_sse_error(ctx, error);
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            MCP_SSE_SESSION_UNAVAILABLE,
+                            "MCP session capacity unavailable",
+                            None,
+                        );
+                    }
+                };
                 ctx.metadata.insert(
                     "mcp.session.downstream".to_string(),
                     hash_str(&downstream_session_id),
@@ -4448,6 +4932,12 @@ impl Plugin for McpGateway {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
             && (ctx.mcp_validate_tool_result.is_some()
+                // A routed request that opened a multiplexed stream needs its
+                // complete client-visible representation to publish one SSE
+                // event. If the refinement below declines to buffer it, the
+                // response is streamed inline instead and the lease releases
+                // the identity — the response is never lost either way.
+                || ctx.mcp_sse_stream.is_some()
                 || ctx
                     .metadata
                     .get(METADATA_RESPONSE_REWRITE_KEY)
@@ -4520,17 +5010,7 @@ impl Plugin for McpGateway {
                 }
                 return PluginResult::Continue;
             }
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
-            return PluginResult::Reject {
-                status_code: 405,
-                body: json!({"error": "aggregate MCP SSE multiplexing is not supported in V1"})
-                    .to_string(),
-                headers: HashMap::from([(
-                    "content-type".to_string(),
-                    "application/json".to_string(),
-                )]),
-            };
+            return self.handle_aggregate_sse_get(ctx, headers).await;
         }
 
         if ctx.method.eq_ignore_ascii_case("DELETE") {
@@ -4948,7 +5428,98 @@ impl Plugin for McpGateway {
         PluginResult::Continue
     }
 
+    /// Final client-visible buffered response.
+    ///
+    /// Two things happen here, in this order. First the plugin's own fail-closed
+    /// enforcement decides the response; a replacement it authors is answered
+    /// inline on the POST, and the request's stream identity is released rather
+    /// than publishing a gateway error under it. Only a response that survived
+    /// enforcement unchanged is eligible to be multiplexed onto the session's
+    /// event stream.
+    ///
+    /// This is the SINGLE reservation point for aggregate SSE. It owns the
+    /// terminal admission decision for `tools/call`, `prompts/get`,
+    /// `resources/read`, and
+    /// every passthrough method routed to the primary upstream, and equally for
+    /// the gateway-authored responses (`tools/list`, `prompts/list`,
+    /// `resources/list`, `ping`, gateway JSON-RPC errors) that
+    /// [`Self::deliver_dispatch_result_via_sse`] staged in `before_proxy` and
+    /// that reach this hook on Ferrum's synthetic-response lifecycle. Both
+    /// therefore reserve only bytes that the configured response-body policies
+    /// have already accepted. The committed hook is the sole visibility point.
     async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let enforced =
+            self.enforce_final_response_body(ctx, response_status, response_headers, body);
+        if !matches!(enforced, PluginResult::Continue) {
+            Self::settle_sse_stream_inline(ctx);
+            return enforced;
+        }
+        match self.multiplex_final_response(ctx, response_status, response_headers, body) {
+            Some(replacement) => replacement,
+            None => PluginResult::Continue,
+        }
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        let Some(publication) = ctx.mcp_sse_publication.take() else {
+            return;
+        };
+        // The reservation was made for one fixed empty acknowledgement. If a
+        // later reject/header phase selected anything else, keep that response
+        // inline and make the event permanently invisible.
+        if response_status != 202 || !body.is_empty() {
+            publication.abort();
+            Self::note_sse_delivery(ctx, "inline");
+            return;
+        }
+        match publication.commit() {
+            Ok(_) => Self::note_sse_delivery(ctx, "multiplexed"),
+            Err(AggregateSseError::StreamCancelled) => {
+                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+            }
+            Err(error) => {
+                // Session deletion/retirement can race this boundary. The POST
+                // acknowledgement is already final, so record a fixed token and
+                // suppress rather than panic or expose a stale payload.
+                Self::note_sse_error(ctx, error);
+                Self::note_sse_delivery(ctx, "suppressed");
+            }
+        }
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .filter(|server| server.enabled)
+            .map(|server| server.target.host.clone())
+            .collect()
+    }
+}
+
+/// Fail-closed response-body enforcement, split out of the trait hook so the
+/// multiplexed SSE delivery decision has exactly one place to read its verdict:
+/// a gateway-authored replacement is answered inline, never published as an
+/// event under the caller's stream identity.
+impl McpGateway {
+    fn enforce_final_response_body(
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,
@@ -5077,14 +5648,6 @@ impl Plugin for McpGateway {
                 )
             }
         }
-    }
-
-    fn warmup_hostnames(&self) -> Vec<String> {
-        self.servers
-            .values()
-            .filter(|server| server.enabled)
-            .map(|server| server.target.host.clone())
-            .collect()
     }
 }
 
@@ -6128,6 +6691,22 @@ fn empty_response(status_code: u16) -> PluginResult {
     }
 }
 
+/// Response headers for an attached aggregate SSE listener. `no-cache` plus the
+/// nginx-style `x-accel-buffering: no` keep intermediaries from buffering an
+/// event stream; `Content-Length` is never authored here — the reject builder
+/// selects streaming framing instead.
+fn sse_listener_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    insert_header(&mut headers, "content-type", "text/event-stream");
+    insert_header(&mut headers, "cache-control", "no-cache");
+    insert_header(&mut headers, "x-accel-buffering", "no");
+    headers
+}
+
+fn insert_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    headers.insert(name.to_string(), value.to_string());
+}
+
 fn session_not_found_response() -> PluginResult {
     empty_response(404)
 }
@@ -6669,7 +7248,62 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
+        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(true),
+        sse_bounds: parse_sse_bounds(sessions)?,
     })
+}
+
+/// Parse the `sessions.sse_*` bounds for the aggregate SSE multiplexer.
+///
+/// Range enforcement lives in [`AggregateSseBounds::validate`], which produces
+/// field-specific diagnostics that never echo the configured value; this only
+/// reads the raw values and refuses ones a `usize` cannot represent.
+fn parse_sse_bounds(sessions: Option<&Map<String, Value>>) -> Result<AggregateSseBounds, String> {
+    let mut bounds = AggregateSseBounds::default();
+    let key = "sse_max_streams_per_session";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_streams_per_session = sse_usize(value, key)?;
+    }
+    let key = "sse_max_retained_events";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_retained_events = sse_usize(value, key)?;
+    }
+    let key = "sse_max_retained_bytes";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_retained_bytes = sse_usize(value, key)?;
+    }
+    let key = "sse_max_event_bytes";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_event_bytes = sse_usize(value, key)?;
+    }
+    let key = "sse_max_replay_events";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_replay_events = sse_usize(value, key)?;
+    }
+    let key = "sse_max_stream_id_bytes";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_stream_id_bytes = sse_usize(value, key)?;
+    }
+    let key = "sse_max_last_event_id_bytes";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.max_last_event_id_bytes = sse_usize(value, key)?;
+    }
+    let key = "sse_listener_max_lifetime_seconds";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.listener_max_lifetime = Duration::from_secs(value);
+    }
+    let key = "sse_keepalive_seconds";
+    if let Some(value) = optional_u64_from_object(sessions, key)? {
+        bounds.keepalive_interval = Duration::from_secs(value);
+    }
+    bounds.validate()
+}
+
+fn sse_usize(value: u64, key: &str) -> Result<usize, String> {
+    match usize::try_from(value) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(format!("mcp_gateway: 'sessions.{key}' is too large")),
+    }
 }
 
 fn parse_capabilities(object: &Map<String, Value>) -> Result<McpCapabilitiesConfig, String> {

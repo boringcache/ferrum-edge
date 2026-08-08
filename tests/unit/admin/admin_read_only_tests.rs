@@ -1007,7 +1007,8 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
         .and_then(|tail| tail.split("async fn prepare_audit_intent").next())
         .expect("config-database admission method remains inspectable");
     assert!(
-        config_admission.contains("evaluate_independent_store_write_gate")
+        config_admission.contains("admit_read_only_gate")
+            && config_admission.contains("evaluate_db_unavailable_gate")
             && config_admission.contains("prepare_audit_intent().await")
             && !config_admission.contains("evaluate_non_topology_write_gate"),
         "mutation admission must re-attempt durable prepare so fail-closed recovers after transient spool errors"
@@ -1021,13 +1022,24 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
         })
         .expect("independent-store admission method remains inspectable");
     assert!(
-        independent_admission.contains("evaluate_independent_store_write_gate"),
+        independent_admission.contains("admit_read_only_gate")
+            && independent_admission.contains("evaluate_db_unavailable_gate"),
         "managed TLS/ACME admission must retain read-only and database-availability gates"
     );
     assert!(
         independent_admission.contains("prepare_audit_intent().await")
             && !independent_admission.contains("evaluate_non_topology_write_gate"),
         "managed TLS/ACME audit events must be durably prepared before their independent-store mutation"
+    );
+
+    assert!(
+        admin_source.contains("fn note_read_only_rejection")
+            && admin_source.contains("audit::read_only_rejection_log_context"),
+        "read-only admission must emit bounded structured logs from sanitized request context"
+    );
+    assert!(
+        admin_source.contains("record_admin_read_only_rejection"),
+        "read-only admission must increment the Prometheus counter"
     );
 
     // Config-DB handler call sites must not use the sync gate alone.
@@ -1062,4 +1074,80 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
             idx + 1
         );
     }
+}
+
+#[tokio::test]
+async fn test_admit_write_increments_read_only_rejection_counter() {
+    ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
+    let config = TestConfig::default();
+    let state = create_test_admin_state(&config, true);
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+
+    let Err(err) = state.admit_write().await else {
+        panic!("admit_write must fail closed in read-only mode");
+    };
+    assert_eq!(err.status(), hyper::StatusCode::FORBIDDEN);
+    assert_eq!(registry.admin_read_only_rejected_mutations_total(), 1);
+}
+
+#[tokio::test]
+async fn test_check_write_allowed_does_not_increment_read_only_rejection_counter() {
+    ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
+    let config = TestConfig::default();
+    let state = create_test_admin_state(&config, true);
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+
+    assert!(state.check_write_allowed().is_some());
+    assert_eq!(registry.admin_read_only_rejected_mutations_total(), 0);
+}
+
+#[tokio::test]
+async fn test_admit_non_config_db_write_increments_read_only_rejection_counter() {
+    ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
+    let config = TestConfig::default();
+    let state = create_test_admin_state(&config, true);
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+
+    let Err(err) = state.admit_non_config_db_write().await else {
+        panic!("admit_non_config_db_write must fail closed in read-only mode");
+    };
+    assert_eq!(err.status(), hyper::StatusCode::FORBIDDEN);
+    assert_eq!(registry.admin_read_only_rejected_mutations_total(), 1);
+}
+
+#[tokio::test]
+async fn test_read_only_rejection_log_context_uses_request_slot() {
+    use ferrum_edge::admin::audit;
+    use std::sync::Arc;
+
+    let slot = audit::new_request_slot("POST", "/proxies", "staging");
+    let observed = audit::scope_request(Arc::clone(&slot), async {
+        audit::read_only_rejection_log_context()
+    })
+    .await;
+    assert_eq!(
+        observed,
+        Some((
+            "POST".to_string(),
+            "/proxies".to_string(),
+            "staging".to_string()
+        ))
+    );
+}
+
+#[test]
+fn test_read_only_rejection_metric_renders_on_prometheus_scrape() {
+    ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
+    let registry = ferrum_edge::plugins::prometheus_metrics::MetricsRegistry::new();
+    registry.configure(60, 3600, 0, "test-ns");
+    registry.record_admin_read_only_rejection();
+    let output = registry.render_uncached();
+    assert!(
+        output.contains("ferrum_admin_read_only_rejected_mutations_total"),
+        "read-only rejection counter must be in /metrics exposition"
+    );
+    assert!(
+        output.contains("ferrum_admin_read_only_rejected_mutations_total{namespace=\"test-ns\"} 1"),
+        "counter must include namespace label and incremented value"
+    );
 }

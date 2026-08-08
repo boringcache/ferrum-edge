@@ -1776,15 +1776,19 @@ where
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
-    let retry_config = if crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method) {
-        proxy.retry.as_ref()
-    } else {
-        None
-    };
     // Absolute route ceiling retained on Proxy.retry (never permanently lowered
     // to the initial target's DestinationRule cap). Retry authorization uses
     // min(route_retry_ceiling, current_or_candidate_cap).
     let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
+    let selected_target_allows_retry =
+        crate::proxy::current_retry_attempt_allowed(route_retry_ceiling, proxy, upstream_target, 0);
+    let retry_config = if selected_target_allows_retry
+        && crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
+    {
+        proxy.retry.as_ref()
+    } else {
+        None
+    };
     let should_buffer_response = retry_config.is_some()
         || !crate::proxy::should_stream_response_body(
             proxy,
@@ -2983,7 +2987,13 @@ where
     // windowed streaming path. Retry-enabled requests use the same marked
     // decision context as H1/H2, allowing inherently streaming responses such
     // as MCP SSE to opt out conservatively after headers arrive.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method);
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
+        && crate::proxy::current_retry_attempt_allowed(
+            route_retry_ceiling,
+            proxy,
+            current_target.as_deref(),
+            0,
+        );
     let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
     let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
     let should_buffer_response = !crate::proxy::refine_stream_response_for_content_type(

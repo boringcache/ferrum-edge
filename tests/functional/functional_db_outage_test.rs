@@ -7,52 +7,66 @@
 //! 4. Health endpoint reports degraded status with admin_writes_enabled=false
 //! 5. After DB recovery, writes resume and polling picks up changes
 //!
-//! Uses SQLite in database mode — outage is simulated by renaming the DB file.
+//! Uses SQLite in database mode. Outage is simulated through the debug-only
+//! `FERRUM_TEST_DB_FAULT_CONTROL` seam ([`ferrum_edge::config::test_db_fault`]):
+//! the harness creates/removes a control file so config-DB acquires fail with
+//! ordinary `PoolClosed` errors. Live SQLite/WAL/SHM files are never overwritten
+//! while the gateway holds mapped descriptors (that race historically caused
+//! SIGBUS / incomplete HTTP responses).
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_outage
 
 use crate::common::TestGateway;
 use serde_json::json;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
+use tempfile::TempDir;
 
 // ============================================================================
-// Test Harness — thin wrapper around TestGateway. DB-file corruption methods
-// are specific to this test; the subprocess + JWT + retry live in TestGateway.
+// Test Harness — thin wrapper around TestGateway. DB outage control is a
+// debug-only file seam; the subprocess + JWT + retry live in TestGateway.
 // ============================================================================
 
 struct DbOutageTestHarness {
     gw: TestGateway,
-    db_path: PathBuf,
+    /// Parent of the fault-control file; kept alive for the harness lifetime.
+    _fault_dir: TempDir,
+    fault_control_path: PathBuf,
     proxy_base_url: String,
     admin_base_url: String,
 }
 
 impl DbOutageTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let fault_dir = TempDir::new()?;
+        let fault_control_path = fault_dir.path().join("db_fault_control");
+        // Control file must be absent at startup so the gateway loads healthy
+        // config before the harness trips the outage.
         let gw = TestGateway::builder()
             .log_level("info")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
             // Short pool acquire timeout so the polling loop's full-reload
-            // fallback fails quickly when the DB is corrupted, rather than
+            // fallback fails quickly when the DB is unavailable, rather than
             // waiting 30s for sqlx's after_connect retry backoff to exhaust.
             .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            // Debug-only outage control path (ignored in release builds).
+            .env(
+                ferrum_edge::config::test_db_fault::CONTROL_ENV,
+                fault_control_path.to_string_lossy().as_ref(),
+            )
             // Tight poll interval so the test budget for "wait for poll to
             // observe DB state" stays small. With 1s polls, every
             // wait_for_poll() can be ~5s instead of ~8s.
             .db_poll_interval_seconds(1)
             .spawn()
             .await?;
-        // TestGateway's SQLite DbType creates `test.db` in the harness temp
-        // dir. We need the path on disk so we can corrupt/restore it.
-        let db_path = gw.temp_dir.path().join("test.db");
 
         Ok(Self {
             proxy_base_url: gw.proxy_base_url.clone(),
             admin_base_url: gw.admin_base_url.clone(),
             gw,
-            db_path,
+            _fault_dir: fault_dir,
+            fault_control_path,
         })
     }
 
@@ -60,98 +74,33 @@ impl DbOutageTestHarness {
         self.gw.auth_header()
     }
 
-    /// Simulate database outage by corrupting the SQLite files.
-    /// SQLite keeps file descriptors open, so renaming or chmod won't break
-    /// existing pooled connections. Overwriting file contents modifies the
-    /// inode data visible through all FDs, causing errors on the next query.
+    /// Simulate database outage by creating the debug-only fault control file.
     ///
-    /// WAL mode complications:
-    /// - The SHM file is memory-mapped. Truncating it (changing file size)
-    ///   triggers SIGBUS. Instead, we overwrite it with zeros (same size) to
-    ///   invalidate the WAL index without causing a signal.
-    /// - The main DB is overwritten with garbage (not truncated to 0 bytes)
-    ///   to prevent `?mode=rwc` from treating it as a fresh empty database
-    ///   when the pool creates new connections.
-    /// - Existing connections may have pages in SQLite's page cache. Zeroing
-    ///   the SHM invalidates the WAL index, forcing SQLite to re-read and
-    ///   detect the corruption on the next transaction.
+    /// The gateway's config-DB pool accessor then returns a pre-closed pool so
+    /// acquires fail with recoverable connectivity errors. This does **not**
+    /// mutate live SQLite/WAL/SHM bytes under an active mapping.
     fn simulate_db_outage(&self) {
-        // Back up the DB (and WAL/SHM) before corrupting
-        let backup_path = self.db_path.with_extension("db.backup");
-        std::fs::copy(&self.db_path, &backup_path).expect("Failed to backup DB");
-        let wal_path = self.db_path.with_extension("db-wal");
-        let shm_path = self.db_path.with_extension("db-shm");
-        if wal_path.exists() {
-            let _ = std::fs::copy(&wal_path, wal_path.with_extension("wal.backup"));
-        }
-        if shm_path.exists() {
-            let _ = std::fs::copy(&shm_path, shm_path.with_extension("shm.backup"));
-        }
-
-        // Overwrite DB with garbage bytes — not empty (prevents ?mode=rwc
-        // from auto-creating a fresh valid database on new connections).
-        let garbage = vec![0xFFu8; 4096];
-        std::fs::write(&self.db_path, &garbage).expect("Failed to corrupt DB file");
-        // Overwrite WAL with garbage
-        if wal_path.exists() {
-            let _ = std::fs::write(&wal_path, &garbage);
-        }
-        // Overwrite SHM with zeros (same size) to invalidate the WAL index.
-        // MUST NOT truncate/resize — the file is memory-mapped and changing
-        // its size triggers SIGBUS. Use OpenOptions without truncate to write
-        // zeros in-place (std::fs::write uses O_TRUNC internally, which
-        // briefly sets the file to 0 bytes before writing).
-        if let Ok(meta) = std::fs::metadata(&shm_path) {
-            let zeros = vec![0u8; meta.len() as usize];
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&shm_path) {
-                let _ = f.write_all(&zeros);
-            }
-        }
-        println!("  DB file corrupted to simulate outage");
+        std::fs::write(&self.fault_control_path, b"1").expect("Failed to create DB fault control");
+        println!("  DB fault control armed to simulate outage");
     }
 
-    /// Restore database by copying the backup back
+    /// Restore database connectivity by removing the fault control file.
     fn restore_db(&self) {
-        let backup_path = self.db_path.with_extension("db.backup");
-        std::fs::copy(&backup_path, &self.db_path).expect("Failed to restore DB from backup");
-        // Restore WAL and SHM from backups
-        let wal_backup = self
-            .db_path
-            .with_extension("db-wal")
-            .with_extension("wal.backup");
-        let shm_backup = self
-            .db_path
-            .with_extension("db-shm")
-            .with_extension("shm.backup");
-        if wal_backup.exists() {
-            let _ = std::fs::copy(&wal_backup, self.db_path.with_extension("db-wal"));
+        match std::fs::remove_file(&self.fault_control_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("Failed to clear DB fault control: {err}"),
         }
-        if shm_backup.exists() {
-            // The SHM file remains memory-mapped by the gateway process.
-            // `std::fs::copy` opens the destination with truncation, briefly
-            // shrinking the live mapping to zero and making a concurrent
-            // SQLite access vulnerable to SIGBUS. Restore only when the
-            // original extent is still intact, and write the backup bytes in
-            // place without truncating or resizing the mapped file.
-            let shm_path = self.db_path.with_extension("db-shm");
-            let backup = std::fs::read(&shm_backup).expect("Failed to read SHM backup");
-            let live_len = std::fs::metadata(&shm_path)
-                .expect("Failed to stat live SHM file")
-                .len();
-            assert_eq!(
-                live_len,
-                backup.len() as u64,
-                "Refusing to resize the live SQLite SHM mapping during restore"
-            );
-            let mut shm = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&shm_path)
-                .expect("Failed to open live SHM file for in-place restore");
-            shm.write_all(&backup)
-                .expect("Failed to restore SHM bytes in place");
-            shm.sync_all().expect("Failed to sync restored SHM bytes");
-        }
-        println!("  DB file restored from backup");
+        println!("  DB fault control cleared (connectivity restored)");
+    }
+
+    /// Assert the gateway child is still running. Induced outages must not
+    /// terminate the process (the historical SQLite SHM corruption race did).
+    fn assert_gateway_alive(&mut self) {
+        assert!(
+            self.gw.is_running(),
+            "gateway must remain alive and serving through the induced DB outage"
+        );
     }
 
     /// Wait for DB poll to pick up changes.
@@ -249,7 +198,7 @@ async fn start_header_echo_backend() -> Result<HeaderEchoBackend, Box<dyn std::e
 async fn test_db_outage_proxy_continues_with_plugins() {
     println!("\n=== DB Outage: Proxy + Plugins Continue Working ===\n");
 
-    let harness = DbOutageTestHarness::new()
+    let mut harness = DbOutageTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -416,6 +365,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
 
     // Wait for at least one poll cycle to detect the outage
     harness.wait_for_poll().await;
+    harness.assert_gateway_alive();
 
     // Verify proxy STILL works during outage (cached config)
     println!("  Verifying proxy still works during outage...");
@@ -514,7 +464,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
 async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("\n=== DB Outage: Admin API Read vs Write Behavior ===\n");
 
-    let harness = DbOutageTestHarness::new()
+    let mut harness = DbOutageTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -614,6 +564,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
 
     // Wait for poll cycle to detect outage
     harness.wait_for_poll().await;
+    harness.assert_gateway_alive();
 
     // --- Phase 2a: Verify reads fall back to cached config ---
     println!("  Testing read operations (should use cached config)...");
@@ -1055,7 +1006,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
 async fn test_db_outage_key_auth_continues() {
     println!("\n=== DB Outage: Key Auth Plugin Continues Working ===\n");
 
-    let harness = DbOutageTestHarness::new()
+    let mut harness = DbOutageTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -1197,6 +1148,7 @@ async fn test_db_outage_key_auth_continues() {
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
     harness.wait_for_poll().await;
+    harness.assert_gateway_alive();
 
     // Verify auth STILL works during outage: valid key succeeds
     let resp = client
@@ -1266,7 +1218,7 @@ async fn test_db_outage_key_auth_continues() {
 async fn test_db_outage_rate_limiting_continues() {
     println!("\n=== DB Outage: Rate Limiting Plugin Continues Working ===\n");
 
-    let harness = DbOutageTestHarness::new()
+    let mut harness = DbOutageTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -1368,6 +1320,7 @@ async fn test_db_outage_rate_limiting_continues() {
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
     harness.wait_for_poll().await;
+    harness.assert_gateway_alive();
 
     // Rate limiting state should still be enforced during outage.
     // Wait a minute for the rate limit window to reset, or just verify

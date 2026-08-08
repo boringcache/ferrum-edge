@@ -897,13 +897,22 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
         "native H3 must delegate both initial header paths and each deferred pass"
     );
 
-    let writer = server
-        .split("async fn send_h3_plugin_reject_flavor_aware(")
-        .nth(1)
-        .expect("native H3 plugin rejection writer must remain present")
-        .split("/// Send a trailers-only gRPC error response over H3.")
-        .next()
+    // Bound the region at the CLOSING BRACE of the recv-halt wrapper rather than
+    // at whatever item happens to follow it. The counted grace-expiry arms below
+    // are a property of these two functions alone, so an unrelated writer added
+    // after them (the aggregate MCP SSE pump, for one) must not be swept in.
+    let writer_start = server
+        .find("async fn send_h3_plugin_reject_flavor_aware(")
+        .expect("native H3 plugin rejection writer must remain present");
+    let recv_halt_start = server[writer_start..]
+        .find("async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(")
+        .map(|offset| writer_start + offset)
+        .expect("native H3 recv-halt rejection writer must remain present");
+    let writer_end = server[recv_halt_start..]
+        .find("\n}\n")
+        .map(|offset| recv_halt_start + offset)
         .expect("native H3 plugin rejection deadline wrapper must remain bounded");
+    let writer = &server[writer_start..writer_end];
     assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
     assert!(writer.contains("replace_buffered_h3_response_with_grpc_deadline("));
     // Already-selected gateway deadline rejections use the shared post-deadline
@@ -928,6 +937,102 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
         2,
         "each bounded full-stream branch must halt the request direction after the write settles"
     );
+
+    // The aggregate MCP SSE lease is adopted from the SAME rejection funnel, so
+    // it must be taken (and therefore released) exactly once, and adopted only
+    // while the gateway-authored event stream is still the final representation.
+    assert_eq!(
+        writer.matches("ctx.mcp_aggregate_sse.take()").count(),
+        1,
+        "the SSE listener lease must be taken exactly once on the H3 reject funnel"
+    );
+    for conjunct in [
+        "matches!(flavor, HttpFlavor::Plain)",
+        "grpc_web_response_content_type.is_none()",
+        "!terminal_gateway_deadline",
+        "http_status == StatusCode::OK",
+        "body.is_empty()",
+        "crate::proxy::response_headers_select_event_stream(headers)",
+    ] {
+        assert!(
+            writer.contains(conjunct),
+            "H3 SSE adoption must keep the `{conjunct}` representation guard"
+        );
+    }
+}
+
+/// The native H3 aggregate MCP SSE writer is a long-lived pump rather than a
+/// buffered representation, so its framing decision, its hard listener bound,
+/// and its listener-slot release order are the properties worth freezing.
+#[test]
+fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("async fn send_h3_aggregate_sse_response(")
+        .expect("native H3 aggregate SSE writer must remain present");
+    let end = server[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .expect("native H3 aggregate SSE writer must remain bounded");
+    let sse_writer = &server[start..end];
+
+    // Streaming framing: no `Content-Length` may be published for bytes that
+    // have not been written yet.
+    assert!(
+        sse_writer.contains("sanitize_client_response_headers_for_wire("),
+        "the H3 SSE response must pass the final wire header boundary"
+    );
+    assert!(
+        sse_writer.contains("ClientResponseFraming::Streaming"),
+        "the H3 SSE response must be framed as a streaming body"
+    );
+    assert!(
+        !sse_writer.contains("ClientResponseFraming::ExactBody"),
+        "an SSE stream has no exact body length to publish"
+    );
+
+    // Both the header write and the DATA pump sit inside the same hard listener
+    // lifetime: `send_response`/`send_data` await QUIC flow control, and a
+    // parked task never polls the body's own timer.
+    assert_eq!(
+        sse_writer
+            .matches("tokio::time::timeout_at(deadline,")
+            .count(),
+        2,
+        "the header write and the DATA pump must share one hard listener bound"
+    );
+    assert!(
+        sse_writer.contains("let deadline = body.deadline();"),
+        "the hard bound must come from the broker-owned listener lifetime"
+    );
+
+    // Dropping the body is what returns the session's single-listener slot, so
+    // every exit — the header-write timeout and the ordinary end of the pump —
+    // must release it, and the ordinary path must release it BEFORE the QUIC
+    // stream teardown a reconnecting client races.
+    assert_eq!(
+        sse_writer.matches("drop(body);").count(),
+        2,
+        "every H3 SSE exit must release the listener slot"
+    );
+    let release = sse_writer
+        .rfind("drop(body);")
+        .expect("the pump exit must release the listener slot");
+    let finish = sse_writer
+        .find("stream.finish()")
+        .expect("the H3 SSE writer must finish the response stream");
+    assert!(
+        release < finish,
+        "the listener slot must be released before the QUIC stream teardown"
+    );
+
+    // Nothing here may collect the stream: a buffered SSE body is unbounded.
+    for buffering in ["collect()", "to_bytes(", "Vec::from", "BytesMut"] {
+        assert!(
+            !sse_writer.contains(buffering),
+            "the H3 SSE pump must never buffer the stream (`{buffering}`)"
+        );
+    }
 }
 
 #[test]
