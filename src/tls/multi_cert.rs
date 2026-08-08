@@ -15,6 +15,7 @@
 //! owning `namespace/gateway/listener`, which is public Kubernetes metadata.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
@@ -177,6 +178,7 @@ pub fn load_gateway_multi_cert_tls_config(
             crate::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
         );
     }
+    validate_explicit_listener_claims(certificates)?;
 
     // A single stapled OCSP response is bound to ONE certificate, so it is
     // only correct to attach while there is exactly one. With several, it is
@@ -351,6 +353,68 @@ pub fn load_gateway_multi_cert_tls_config(
         &cert_display,
         &key_display,
     )
+}
+
+/// Revalidate listener ownership on the data plane before loading key material.
+///
+/// Kubernetes translation already withdraws an explicit-hostname collision,
+/// but ConfigSync is still a hostile serialization boundary. A buggy or
+/// compromised control plane must not be able to bypass that decision and make
+/// the resolver combine two listeners' different certificate sets as signing
+/// candidates for one claimed name. One listener identity must also carry one
+/// consistent hostname across all of its certificateRefs.
+fn validate_explicit_listener_claims(
+    certificates: &[GatewayCertificateInput],
+) -> Result<(), anyhow::Error> {
+    let mut listener_hostnames: HashMap<&str, Option<String>> = HashMap::new();
+    let mut listener_certificates: HashMap<(String, &str), Vec<(String, String)>> = HashMap::new();
+
+    for input in certificates {
+        let hostname = input
+            .hostname
+            .as_deref()
+            .map(|hostname| {
+                normalize_indexable_sni_name(hostname).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Gateway certificate entry has an invalid explicit listener hostname"
+                    )
+                })
+            })
+            .transpose()?;
+        match listener_hostnames.entry(input.identity.as_str()) {
+            Entry::Occupied(entry) if entry.get() != &hostname => {
+                anyhow::bail!(
+                    "Gateway frontend TLS listener identity carries inconsistent hostname claims"
+                );
+            }
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(hostname.clone());
+            }
+        }
+        if let Some(hostname) = hostname {
+            listener_certificates
+                .entry((hostname, input.identity.as_str()))
+                .or_default()
+                .push((input.cert_source.clone(), input.key_source.clone()));
+        }
+    }
+
+    let mut hostname_certificates: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for ((hostname, _identity), certificate_set) in listener_certificates {
+        match hostname_certificates.entry(hostname) {
+            Entry::Occupied(entry) if entry.get() != &certificate_set => {
+                anyhow::bail!(
+                    "Gateway frontend TLS snapshot contains conflicting certificate sets for one explicit listener hostname"
+                );
+            }
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(certificate_set);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load and pair one certificate, returning it plus its parsed leaf DER.

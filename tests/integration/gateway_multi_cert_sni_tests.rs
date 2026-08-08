@@ -430,6 +430,72 @@ fn an_invalid_explicit_listener_hostname_fails_the_whole_set_closed() {
 }
 
 #[test]
+fn conflicting_explicit_listener_claims_fail_the_runtime_snapshot_closed() {
+    ensure_crypto_provider();
+    let Fixture {
+        _dir, alpha, beta, ..
+    } = fixture();
+
+    let error = load_gateway_multi_cert_tls_config(
+        &[
+            input(
+                &alpha,
+                "ferrum/edge-a/https",
+                Some("shop.example.com"),
+                true,
+            ),
+            input(
+                &beta,
+                "ferrum/edge-b/https",
+                Some("shop.example.com"),
+                false,
+            ),
+        ],
+        None,
+        None,
+        &tls_policy(),
+        30,
+        &[],
+    )
+    .expect_err("a ConfigSync collision must not bypass translator withdrawal");
+
+    assert!(error.to_string().contains("conflicting certificate sets"));
+}
+
+#[test]
+fn one_listener_identity_cannot_carry_inconsistent_hostnames() {
+    ensure_crypto_provider();
+    let Fixture {
+        _dir, alpha, beta, ..
+    } = fixture();
+
+    let error = load_gateway_multi_cert_tls_config(
+        &[
+            input(
+                &alpha,
+                "ferrum/edge/https",
+                Some("a.example.com"),
+                true,
+            ),
+            input(
+                &beta,
+                "ferrum/edge/https",
+                Some("b.example.com"),
+                false,
+            ),
+        ],
+        None,
+        None,
+        &tls_policy(),
+        30,
+        &[],
+    )
+    .expect_err("one listener must have one consistent hostname claim");
+
+    assert!(error.to_string().contains("inconsistent hostname claims"));
+}
+
+#[test]
 fn a_mismatched_certificate_and_key_pair_is_refused() {
     ensure_crypto_provider();
     let Fixture {
