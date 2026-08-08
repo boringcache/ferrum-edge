@@ -35328,13 +35328,24 @@ async fn proxy_to_backend(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // A Unix backend's `host:port` is only a schema-compatible carrier. It is
+    // never resolved or dialed: the reserved target tag below is re-admitted
+    // against the data plane's socket-root policy and the resulting path is
+    // connected with `UnixStream`. Keep the synthetic loopback authority out
+    // of IP-egress policy too. Otherwise `FERRUM_BACKEND_ALLOW_IPS=public`
+    // rejects an entirely local Unix socket before its real containment and
+    // inode/peer-credential gates can run.
+    let unix_target = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t));
+
     // Enforce the backend egress policy for a literal-IP backend before dialing
     // (reqwest/pools skip the DnsCacheResolver for IP literals).
-    if let Some(reason) = denied_literal_backend_or_dns_override(
-        effective_host,
-        proxy,
-        &state.env_config.backend_allow_ips,
-    ) {
+    if unix_target.is_none()
+        && let Some(reason) = denied_literal_backend_or_dns_override(
+            effective_host,
+            proxy,
+            &state.env_config.backend_allow_ips,
+        )
+    {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,
@@ -35353,7 +35364,9 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let resolved_ip = if dispatch_hbone
+    let resolved_ip = if unix_target.is_some() {
+        None
+    } else if dispatch_hbone
         && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
     {
         None
@@ -35413,7 +35426,7 @@ async fn proxy_to_backend(
     //     request/response streaming, the receipt-anchored gRPC deadline,
     //     cancellation, `te: trailers` regeneration, and terminal-trailer
     //     forwarding are the identical code path on both transports.
-    if let Some(unix_target) = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t)) {
+    if let Some(unix_target) = unix_target {
         let unix_h2c = unix_backend::target_unix_backend_is_h2c(unix_target);
         let socket_path = match unix_backend::resolve_unix_socket_target(
             unix_target,

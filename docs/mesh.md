@@ -1713,7 +1713,7 @@ The status writer reports the count of modeled listeners as `status.ferrum.trans
 
 ### Unix-socket backends
 
-A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a fresh `tokio::net::UnixStream` instead of a TCP connection.
+A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a fresh `tokio::net::UnixStream` instead of a TCP connection. Its schema-compatible loopback `host:port` carrier is never resolved or dialed and is not evaluated by `FERRUM_BACKEND_ALLOW_IPS`; the socket-specific containment, ownership, inode, and peer-credential gates below are the authoritative egress policy for this local transport.
 
 #### Containment is mandatory and off by default
 

@@ -13981,6 +13981,12 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
                         .expect("socket root is UTF-8")
                         .to_string(),
                 ),
+                // A Unix target's synthetic loopback `host:port` is never a
+                // network dial target. Public-only IP egress must therefore
+                // leave this socket path to its own containment, inode, and
+                // peer-credential admission gates instead of rejecting the
+                // carrier address before Unix dispatch.
+                ("FERRUM_BACKEND_ALLOW_IPS", "public".to_string()),
                 ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
             ],
         },
