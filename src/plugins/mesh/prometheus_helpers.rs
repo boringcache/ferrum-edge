@@ -1320,6 +1320,17 @@ fn intern_label(value: &str) -> Arc<str> {
     }
 }
 
+/// True when metadata carries mesh identity/routing keys rather than only the
+/// reserved internal `mesh.metrics.*` coordination namespace.
+fn metadata_has_mesh_identity_keys(metadata: &HashMap<String, String>) -> bool {
+    metadata.keys().any(|key| {
+        key.starts_with("mesh.")
+            && !crate::plugins::utils::metadata_redaction::is_mesh_metrics_internal_metadata_key(
+                key,
+            )
+    })
+}
+
 /// Build the RED/service-graph metric key for a mesh request.
 ///
 /// Per-field label values are interned via [`intern_label`] so repeated label
@@ -1329,7 +1340,7 @@ fn intern_label(value: &str) -> Arc<str> {
 /// service-graph aggregation, log shaping) and is gated off unless mesh
 /// metrics / the service graph are enabled.
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
-    if !summary.metadata.keys().any(|key| key.starts_with("mesh.")) {
+    if !metadata_has_mesh_identity_keys(&summary.metadata) {
         return None;
     }
 
@@ -1679,7 +1690,7 @@ pub fn mesh_stream_key_from_metadata(
     proxy_id: &str,
     proxy_name: Option<&str>,
 ) -> Option<MeshRequestKey> {
-    if !metadata.keys().any(|key| key.starts_with("mesh.")) {
+    if !metadata_has_mesh_identity_keys(metadata) {
         return None;
     }
     let destination_default = proxy_name.unwrap_or(proxy_id);

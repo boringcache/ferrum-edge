@@ -369,6 +369,54 @@ async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
 }
 
 #[tokio::test]
+async fn test_registry_distinguishes_mesh_identity_from_prometheus_observation_marker() {
+    let registry = MetricsRegistry::new();
+
+    let mut observation_only = make_summary("plain-proxy", "GET", 200, 12.0, 10.0);
+    observation_only.metadata.insert(
+        prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+        "1".to_string(),
+    );
+    registry.record(&observation_only);
+    let observation_output = registry.render_uncached();
+
+    assert!(
+        observation_output.contains("ferrum_requests_total{"),
+        "ordinary exporter metrics should still record"
+    );
+    assert!(
+        !observation_output.contains("ferrum_mesh_requests_total"),
+        "internal observation marker alone must not synthesize mesh RED families"
+    );
+    assert!(
+        !observation_output.contains("ferrum_mesh_request_duration_ms"),
+        "internal observation marker alone must not synthesize mesh RED families"
+    );
+
+    let mut mesh_summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
+    mesh_summary.metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        ),
+    ]);
+    registry.record(&mesh_summary);
+    let mesh_output = registry.render_uncached();
+
+    assert!(mesh_output.contains("ferrum_mesh_requests_total{"));
+    assert!(mesh_output.contains("source_workload=\"frontend\""));
+    assert!(mesh_output.contains("destination_workload=\"payments\""));
+    assert!(mesh_output.contains("ferrum_mesh_request_duration_ms_bucket{"));
+}
+
+#[tokio::test]
 async fn test_registry_renders_mesh_cert_telemetry_metrics() {
     let registry = MetricsRegistry::new();
 
