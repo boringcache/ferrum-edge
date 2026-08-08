@@ -133,7 +133,8 @@ fn h3_deferred_destination_override_is_rebound_before_dispatch() {
         .expect("rebound destinations must re-resolve the effective proxy");
     assert!(recap < reresolve);
     assert!(
-        after_deferred[reselect..].contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
+        after_deferred[reselect..]
+            .contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
         "matched_proxy must describe the rebound selected base"
     );
 }

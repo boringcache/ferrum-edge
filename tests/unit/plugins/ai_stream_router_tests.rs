@@ -6526,7 +6526,9 @@ fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
         "native HTTP/3 must rebind the destination before capturing the canonical query"
     );
     assert!(
-        h3_after.contains("let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);"),
+        h3_after.contains(
+            "let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);"
+        ),
         "native HTTP/3 must gate reselection on routing-proxy identity movement"
     );
 }
