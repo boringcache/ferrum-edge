@@ -356,12 +356,10 @@ distinguishable both in the route table and on the wire:
   determining if a listener is distinct", so sibling HTTPS listeners on one port
   with disjoint hostnames and different `certificateRefs` stay `Accepted`.
   Within a namespace the listener whose `certificateRef` does not win that
-  namespace's single serving slot keeps its listener status but materializes no
-  routes, so it never serves traffic under another listener's certificate. Until
-  Ferrum can select a certificate per SNI hostname, that listener's `Programmed`
-  condition therefore reports a socket that is bound and serving a *different*
-  Gateway's credential; the guarantee it does make is that no route is
-  advertised on it.
+  namespace's single serving slot stays `Accepted`, but materializes no routes
+  and reports `Programmed=False` with `reason: NoListeners`. Until Ferrum can
+  select a certificate per SNI hostname, this prevents the listener from
+  advertising or serving traffic under another listener's certificate.
 
 **Listener lifecycle and its bounds.** The listener set is reconciled on every
 config publication, so reload / update / delete / withdrawal reach the sockets
