@@ -341,7 +341,8 @@ async fn workload_api_streams_federated_x509_bundles() {
     let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
     let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
     let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain.clone(), 600)
-        .with_federated_trust_domains(vec![partner_domain.clone()]);
+        .with_federated_trust_domains(vec![partner_domain.clone()])
+        .expect("one federated trust domain is within the configured cap");
 
     let svid_resp = svc
         .fetch_x509svid(workload_request(X509svidRequest {}))
@@ -1899,6 +1900,180 @@ mod socket_boundary {
             std::fs::read(&file).expect("the file survives"),
             b"operator data",
             "validation must never mutate the artifact it refuses"
+        );
+    }
+}
+
+// ── Socket mode, lexical path, liveness, and cleanup identity ─────────────
+//
+// The pure halves of the socket contract, exercised over shapes a test process
+// cannot always force onto a real filesystem.
+
+#[cfg(unix)]
+mod socket_policy {
+    use ferrum_edge::identity::workload_api::{
+        MAX_STAGING_SUFFIX_BYTES, SocketLiveness, WorkloadApiSocketConfig, classify_connect_result,
+        matches_bound_socket_identity,
+    };
+    use std::io;
+
+    const EUID: u32 = 1000;
+    const OTHER_UID: u32 = 4242;
+
+    #[test]
+    fn a_mode_that_permits_no_connection_is_refused_at_parse() {
+        // `connect(2)` on a Unix socket requires WRITE permission on the socket
+        // file. A mode with neither an owner nor a group write bit therefore
+        // binds happily and then rejects every workload with EACCES, which
+        // contradicts the startup contract: a successful start must mean
+        // workloads can actually connect.
+        for mode in ["0000", "0400", "0440", "0444", "0500", "0550", "0555"] {
+            let error = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .expect_err("a mode with no owner/group write bit must be refused");
+            assert!(
+                error.to_string().contains("write"),
+                "mode {mode} should be refused for lacking a write bit, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn world_writable_modes_stay_refused() {
+        for mode in ["0666", "0662", "0602", "0002", "0777"] {
+            let error = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .expect_err("a world-writable mode must be refused");
+            assert!(
+                error.to_string().contains("world-writable"),
+                "mode {mode} should be refused as world-writable, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_that_grant_owner_or_group_write_are_accepted() {
+        // Owner-write alone, group-write alone, and the default all satisfy the
+        // "a workload can reach it" rule; the group case is the documented
+        // production shape.
+        for mode in ["0600", "0660", "0060", "0760", "0700"] {
+            let config = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .unwrap_or_else(|error| panic!("mode {mode} should parse, got: {error}"));
+            assert_ne!(
+                config.socket_mode & 0o220,
+                0,
+                "mode {mode} must retain a write bit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_dot_segment_is_refused_rather_than_normalized_away() {
+        // `Path::components()` drops an embedded `.` on Unix, so a lexical
+        // rejection written over it would have accepted this path while the
+        // documentation promised otherwise. The check reads raw segments.
+        for path in [
+            "/run/ferrum/./api.sock",
+            "/run/./ferrum/api.sock",
+            "/run/ferrum/../ferrum/api.sock",
+            "/run/ferrum/..",
+            "/./api.sock",
+        ] {
+            let error = WorkloadApiSocketConfig::from_parts(path, "0660")
+                .expect("mode parses")
+                .validate()
+                .expect_err("a '.' or '..' segment must be refused");
+            assert!(
+                error.to_string().contains("'.' or '..'"),
+                "path {path} should be refused for its dot segment, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_with_no_room_for_the_staging_directory_is_refused() {
+        // The socket is bound inside a private staging directory beneath the
+        // parent and only then renamed into place, so it is the STAGING path
+        // that has to fit `sockaddr_un.sun_path`. A parent that leaves no
+        // headroom is a configuration error, not a bare EINVAL from `bind`.
+        let parent = format!("/{}", "d".repeat(90));
+        let error = WorkloadApiSocketConfig::from_parts(format!("{parent}/s"), "0660")
+            .expect("mode parses")
+            .validate()
+            .expect_err("an over-long parent must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("staging") || text.contains("Unix-socket limit"),
+            "unexpected reason: {error}"
+        );
+
+        // The default deployment path is comfortably inside the budget, so the
+        // reserved headroom costs a real operator nothing.
+        let default_parent = "/run/ferrum/workload-api";
+        assert!(
+            default_parent.len() + MAX_STAGING_SUFFIX_BYTES <= 100,
+            "the documented default parent must still fit with staging headroom"
+        );
+        WorkloadApiSocketConfig::from_parts(format!("{default_parent}/socket"), "0660")
+            .expect("the default path and mode parse");
+    }
+
+    #[test]
+    fn only_a_definitive_not_listening_result_admits_an_unlink() {
+        // A successful connection means a LIVE endpoint: refusing to unlink it
+        // is what stops a second same-uid process taking over the path
+        // workloads dial for their identity. Everything the kernel could not
+        // answer definitively is undetermined, and undetermined fails closed.
+        assert_eq!(classify_connect_result(&Ok(())), SocketLiveness::Live);
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::ConnectionRefused))),
+            SocketLiveness::NotListening
+        );
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::NotFound))),
+            SocketLiveness::NotListening
+        );
+        for ambiguous in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_connect_result(&Err(io::Error::from(ambiguous))),
+                SocketLiveness::Undetermined,
+                "{ambiguous:?} must not be read as 'nobody is listening'"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_identity_is_type_and_owner_as_well_as_device_and_inode() {
+        let bound = (7u64, 42u64);
+
+        assert!(
+            matches_bound_socket_identity(true, EUID, bound, EUID, bound),
+            "our own socket at the recorded inode is the thing we may unlink"
+        );
+        // Inode reuse: the number is recycled and a REGULAR FILE lands on it.
+        // A device+inode-only predicate would have deleted somebody's data.
+        assert!(
+            !matches_bound_socket_identity(false, EUID, bound, EUID, bound),
+            "a non-socket on the recycled inode must not satisfy the identity"
+        );
+        // Type replacement by another user, same inode.
+        assert!(
+            !matches_bound_socket_identity(true, OTHER_UID, bound, EUID, bound),
+            "another user's socket must not satisfy the identity"
+        );
+        // A different inode is a different object even when it is our socket.
+        assert!(
+            !matches_bound_socket_identity(true, EUID, (7, 43), EUID, bound),
+            "a successor socket at the same path must be left alone"
+        );
+        assert!(
+            !matches_bound_socket_identity(true, EUID, (8, 42), EUID, bound),
+            "the device is part of the identity too"
         );
     }
 }

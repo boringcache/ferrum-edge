@@ -11295,6 +11295,11 @@ async fn arm_mesh_runtime_startup(
         })?;
         let listener = start_mesh_workload_api_server(env_config, source).await?;
         owner.set_workload_api_listener(listener);
+        // The serve task is spawned, so without this the mesh runtime would keep
+        // serving traffic after the Workload API had silently disappeared —
+        // exactly the "looks healthy, issues nothing" posture the fatal bind
+        // failure above refuses at startup.
+        owner.watch_workload_api_termination();
     }
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
@@ -15482,6 +15487,68 @@ impl MeshStartupOwner {
         listener: crate::identity::workload_api::WorkloadApiListener,
     ) {
         self.workload_api_listener = Some(listener);
+    }
+
+    /// Propagate an **unexpected** Workload API server termination into the
+    /// shared mesh shutdown path.
+    ///
+    /// The listener's serve future runs on a spawned task, so a tonic transport
+    /// error — or a panic — would otherwise remove the identity endpoint while
+    /// the data plane kept serving traffic. Workloads would then be unable to
+    /// obtain or renew an SVID against a gateway that still reports itself
+    /// healthy, which is the same silent-downgrade the fatal startup bind
+    /// refuses.
+    ///
+    /// A **requested** shutdown is quiet and deterministic: the shared flag is
+    /// always set before `WorkloadApiListener::shutdown` is called, and this task
+    /// selects on that flag, so the termination it then observes is never
+    /// reported as a fault.
+    fn watch_workload_api_termination(&mut self) {
+        let Some(listener) = self.workload_api_listener.as_ref() else {
+            return;
+        };
+        let mut terminated_rx = listener.termination_signal();
+        let socket = listener.socket_path().to_path_buf();
+        let shutdown_tx = self.shutdown_tx.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let handle = tokio::spawn(async move {
+            loop {
+                // Bound to locals rather than read inline: a `watch::Ref` is a
+                // read guard, and one held across the `select!` below would make
+                // this future non-`Send`.
+                let shutdown_requested = *shutdown_rx.borrow();
+                if shutdown_requested {
+                    // Requested shutdown won the race: nothing to report.
+                    return;
+                }
+                let terminated = *terminated_rx.borrow();
+                if terminated {
+                    break;
+                }
+                tokio::select! {
+                    changed = terminated_rx.changed() => {
+                        if changed.is_err() {
+                            // Sender dropped without a value: the listener is
+                            // gone either way, so fall through to the
+                            // shutdown-state check below.
+                            break;
+                        }
+                    }
+                    _ = wait_for_mesh_shutdown(&mut shutdown_rx) => return,
+                }
+            }
+            let shutdown_requested = *shutdown_rx.borrow();
+            if shutdown_requested {
+                return;
+            }
+            error!(
+                socket = %socket.display(),
+                "SPIFFE Workload API server terminated unexpectedly; initiating mesh shutdown \
+                 rather than serving traffic with no identity endpoint"
+            );
+            let _ = shutdown_tx.send(true);
+        });
+        self.tasks.mesh_background_handles.push(handle);
     }
 
     /// Signal shutdown, drain listeners/tasks with a bound, preserve `err`.

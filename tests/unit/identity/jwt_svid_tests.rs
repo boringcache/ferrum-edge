@@ -2224,3 +2224,416 @@ fn workload_api_socket_config_rejects_unsafe_paths_and_modes() {
         "a well-formed path and mode must be accepted"
     );
 }
+
+// ── cryptographic admission of authority public keys ─────────────────────
+//
+// Shape is neither strength nor curve membership. These pin that a malformed or
+// weak authority is refused BEFORE it can be republished in `FetchJWTBundles`
+// or turned into a verification key.
+
+/// A valid 2048-bit RSA key's JWK members, recovered through the library's own
+/// publisher so the fixture cannot drift from the encoding under test.
+fn rsa_jwk_members() -> (Vec<u8>, Vec<u8>) {
+    let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("RSA key generated")
+        .public_key_pem();
+    let published = jwks_document(&[PublishedJwtAuthority::new(td(), "rsa-1", pem.as_str())])
+        .expect("a 2048-bit RSA authority publishes");
+    let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
+    let decode = |member: &str| {
+        URL_SAFE_NO_PAD
+            .decode(parsed["keys"][0][member].as_str().expect("member is a string"))
+            .expect("member is base64url")
+    };
+    (decode("n"), decode("e"))
+}
+
+fn rsa_jwks(modulus: &[u8], exponent: &[u8]) -> String {
+    format!(
+        "{{\"keys\":[{{\"kty\":\"RSA\",\"kid\":\"rsa-1\",\"n\":\"{}\",\"e\":\"{}\"}}]}}",
+        URL_SAFE_NO_PAD.encode(modulus),
+        URL_SAFE_NO_PAD.encode(exponent)
+    )
+}
+
+fn spki_pem_from_der(der: &[u8]) -> String {
+    let mut out = String::from("-----BEGIN PUBLIC KEY-----\n");
+    let encoded = STANDARD.encode(der);
+    for chunk in encoded.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END PUBLIC KEY-----\n");
+    out
+}
+
+fn spki_der_from_pem(pem: &str) -> Vec<u8> {
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    STANDARD.decode(body.as_bytes()).expect("PEM body is base64")
+}
+
+#[test]
+fn rsa_admission_is_by_significant_bit_length_not_byte_count() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    let (modulus, exponent) = rsa_jwk_members();
+    assert_eq!(modulus.len(), 256, "the baseline is a 2048-bit modulus");
+    authorities_from_jwks(&td(), rsa_jwks(&modulus, &exponent).as_bytes())
+        .expect("a 2048-bit RSA key with exponent 65537 is admitted");
+
+    // 256 BYTES but only 2041 significant BITS. A byte-count floor waves this
+    // through; a bit-length floor does not.
+    let mut weak = vec![0x01u8];
+    weak.extend(std::iter::repeat_n(0xffu8, 255));
+    assert_eq!(weak.len(), 256);
+    authorities_from_jwks(&td(), rsa_jwks(&weak, &exponent).as_bytes())
+        .expect_err("a 2041-bit modulus padded into 256 bytes must be refused");
+
+    // Leading zero octets are not canonical (RFC 7518 §6.3.1) and never count
+    // toward strength; DER re-encoding would have silently normalized them.
+    let mut padded = vec![0x00u8];
+    padded.extend_from_slice(&modulus);
+    authorities_from_jwks(&td(), rsa_jwks(&padded, &exponent).as_bytes())
+        .expect_err("a leading zero octet in 'n' must be refused, not normalized away");
+    let mut padded_exponent = vec![0x00u8];
+    padded_exponent.extend_from_slice(&exponent);
+    authorities_from_jwks(&td(), rsa_jwks(&modulus, &padded_exponent).as_bytes())
+        .expect_err("a leading zero octet in 'e' must be refused");
+
+    // Above the documented RSA-8192 ceiling.
+    let oversized = vec![0xffu8; 1025];
+    authorities_from_jwks(&td(), rsa_jwks(&oversized, &exponent).as_bytes())
+        .expect_err("a modulus beyond the 8192-bit ceiling must be refused");
+}
+
+#[test]
+fn rsa_public_exponents_must_be_odd_and_at_least_three() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    let (modulus, _) = rsa_jwk_members();
+    for (label, exponent) in [
+        ("zero", vec![0x00u8]),
+        ("one", vec![0x01u8]),
+        ("two", vec![0x02u8]),
+        ("even", vec![0x01, 0x00, 0x02]),
+        (
+            "large even",
+            vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ),
+    ] {
+        authorities_from_jwks(&td(), rsa_jwks(&modulus, &exponent).as_bytes())
+            .err()
+            .unwrap_or_else(|| panic!("{label}: an unusable RSA exponent must be refused"));
+    }
+    // 65537, the one real-world value.
+    authorities_from_jwks(&td(), rsa_jwks(&modulus, &[0x01, 0x00, 0x01]).as_bytes())
+        .expect("exponent 65537 is admitted");
+    // 3 is the RFC 8017 floor and is admitted rather than special-cased away.
+    authorities_from_jwks(&td(), rsa_jwks(&modulus, &[0x03]).as_bytes())
+        .expect("exponent 3 is admitted");
+}
+
+#[test]
+fn an_off_curve_ec_point_is_refused_on_both_the_jwk_and_the_spki_path() {
+    use ferrum_edge::identity::jwt_svid::{authorities_from_jwks, decoding_key_for_authority};
+
+    let key = forge_key();
+    // Baseline: the untampered key is admitted, so the negative cases below
+    // prove something about the point rather than about the fixture.
+    decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "k1", key.public_key_pem.as_str()))
+        .expect("a genuine P-256 authority is usable");
+
+    // SPKI path: flip the last byte of the uncompressed point. The OID, the
+    // 0x04 marker, and both coordinate lengths are all still correct — only
+    // curve membership is not.
+    let mut der = spki_der_from_pem(&key.public_key_pem);
+    let last = der.len() - 1;
+    der[last] ^= 0x01;
+    let tampered_pem = spki_pem_from_der(&der);
+    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "k1", tampered_pem.as_str()))
+        .expect_err("an off-curve point must not become a verification key");
+    let message = error.to_string();
+    assert!(
+        !message.contains(&STANDARD.encode(&der)[..16]),
+        "an authority rejection must never echo key bytes: {message}"
+    );
+
+    // JWK path: the same tampering expressed as a `y` coordinate, so a hostile
+    // federated bundle cannot republish an off-curve authority either.
+    let published = jwks_document(&[PublishedJwtAuthority::new(td(), "k1", key.public_key_pem.as_str())])
+        .expect("baseline JWKS builds");
+    let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
+    let mut y = URL_SAFE_NO_PAD
+        .decode(parsed["keys"][0]["y"].as_str().expect("y is a string"))
+        .expect("y is base64url");
+    let last = y.len() - 1;
+    y[last] ^= 0x01;
+    let document = format!(
+        "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k1\",\"x\":{},\"y\":\"{}\"}}]}}",
+        parsed["keys"][0]["x"],
+        URL_SAFE_NO_PAD.encode(&y)
+    );
+    authorities_from_jwks(&td(), document.as_bytes())
+        .expect_err("an off-curve JWK point must be refused before publication");
+}
+
+#[test]
+fn p256_and_p384_authorities_round_trip_through_publication_and_validation() {
+    use ferrum_edge::identity::jwt_svid::{authorities_from_jwks, decoding_key_for_authority};
+    use jsonwebtoken::Algorithm;
+
+    for (label, params, expected_alg, expected_curve) in [
+        (
+            "P-256",
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            Algorithm::ES256,
+            "P-256",
+        ),
+        (
+            "P-384",
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+            Algorithm::ES384,
+            "P-384",
+        ),
+    ] {
+        let pem = rcgen::KeyPair::generate_for(params)
+            .unwrap_or_else(|e| panic!("{label} key generated: {e}"))
+            .public_key_pem();
+        let authority = PublishedJwtAuthority::new(td(), "ec-1", pem.as_str());
+        let (_, algs) = decoding_key_for_authority(&authority)
+            .unwrap_or_else(|e| panic!("{label}: a genuine authority must be usable: {e}"));
+        assert_eq!(
+            algs,
+            vec![expected_alg],
+            "{label}: the curve pins exactly one algorithm"
+        );
+
+        let published = jwks_document(&[authority]).expect("JWKS builds");
+        let parsed: serde_json::Value = serde_json::from_slice(&published).expect("JWKS is JSON");
+        assert_eq!(parsed["keys"][0]["crv"], expected_curve, "{label}");
+        let recovered = authorities_from_jwks(&td(), &published)
+            .unwrap_or_else(|e| panic!("{label}: the published JWKS parses back: {e}"));
+        assert_eq!(recovered.len(), 1, "{label}");
+    }
+}
+
+// ── retired keys are verification-only, structurally ─────────────────────
+
+#[test]
+fn a_configured_retired_key_retains_no_signing_capability() {
+    // The docs promise "published for verification only". That has to be true of
+    // the retained representation itself, not merely of how it is currently
+    // used: a retired entry holding an `EncodingKey` would leave every rotated-
+    // off private key loaded and usable for the process's whole lifetime.
+    let primary = signing_key_pem();
+    let previous = signing_key_pem();
+    let authority = LocalJwtAuthority::new(
+        LocalJwtAuthorityConfig::new(td())
+            .with_signing_key_pem(&primary)
+            .with_retired_key_pems([previous.clone()]),
+    )
+    .expect("an authority with configured retired material builds");
+
+    let retained = authority.retained_public_material();
+    assert_eq!(retained.len(), 1, "the configured previous key is retained");
+    let (retained_kid, retained_pem) = &retained[0];
+    assert!(!retained_kid.is_empty(), "a retained key keeps its kid");
+    assert!(
+        retained_pem.starts_with("-----BEGIN PUBLIC KEY-----"),
+        "retained material must be an SPKI PUBLIC KEY document, got: {retained_pem}"
+    );
+    assert!(
+        !retained_pem.contains("PRIVATE"),
+        "retained material must carry no private envelope"
+    );
+    assert!(
+        jsonwebtoken::EncodingKey::from_ec_pem(retained_pem.as_bytes()).is_err(),
+        "retained material must not be constructible into a signing key"
+    );
+
+    // It is still PUBLISHED, so the rotation overlap the docs promise is intact.
+    let published = authority.authorities();
+    assert!(
+        published.iter().any(|a| &a.key_id == retained_kid),
+        "a retired key must still be published for verification"
+    );
+    // ...and it never signs: every minted token carries the ACTIVE kid.
+    let minted = authority
+        .mint(&workload_id(), &["spiffe://aud.test/x".to_string()], 0)
+        .expect("the active key mints");
+    assert_eq!(minted.key_id, authority.active_key_id());
+    assert_ne!(&minted.key_id, retained_kid);
+}
+
+#[tokio::test]
+async fn an_ephemeral_rotation_retires_only_public_material() {
+    let authority = authority();
+    let retired_kid = authority.active_key_id();
+    authority.rotate().await.expect("an ephemeral key rotates");
+
+    let retained = authority.retained_public_material();
+    assert_eq!(retained.len(), 1, "the outgoing key is retained");
+    assert_eq!(retained[0].0, retired_kid, "the outgoing key id is retained");
+    assert!(
+        retained[0].1.starts_with("-----BEGIN PUBLIC KEY-----")
+            && !retained[0].1.contains("PRIVATE"),
+        "an in-process rotation must copy only public metadata"
+    );
+    assert!(
+        jsonwebtoken::EncodingKey::from_ec_pem(retained[0].1.as_bytes()).is_err(),
+        "the rotated-off key must not remain constructible into a signer"
+    );
+    assert_ne!(
+        authority.active_key_id(),
+        retired_kid,
+        "rotation installed a new active key"
+    );
+}
+
+// ── federated trust domains are bounded at configuration ─────────────────
+
+mod federated_bounds {
+    use super::*;
+    use ferrum_edge::identity::jwt_svid::MAX_JWT_BUNDLE_TRUST_DOMAINS;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::proto::{JwtBundlesRequest, X509BundlesRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts every per-trust-domain CA call so a test can assert the fan-out
+    /// one RPC produces, which is the actual resource the cap protects.
+    struct CountingCa {
+        trust_domain: TrustDomain,
+        jwt: Arc<LocalJwtAuthority>,
+        jwt_calls: AtomicUsize,
+        bundle_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CertificateAuthority for CountingCa {
+        async fn issue_svid(&self, _req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+            Err(CaError::UnknownTrustDomain("not used".to_string()))
+        }
+
+        async fn trust_bundle(&self, domain: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+            self.bundle_calls.fetch_add(1, Ordering::SeqCst);
+            if domain != &self.trust_domain {
+                // Every federated alias is an "absent peer", which is precisely
+                // the shape that never advanced an output-counted cap.
+                return Err(CaError::UnknownTrustDomain(domain.to_string()));
+            }
+            Ok(PublishedTrustBundle {
+                trust_domain: self.trust_domain.clone(),
+                roots_der: vec![b"stub-root".to_vec()],
+                refresh_hint_secs: None,
+            })
+        }
+
+        async fn jwt_authorities(
+            &self,
+            domain: &TrustDomain,
+        ) -> Result<Vec<PublishedJwtAuthority>, CaError> {
+            self.jwt_calls.fetch_add(1, Ordering::SeqCst);
+            if domain != &self.trust_domain {
+                // Published-but-empty: the exact case an insertion-counted cap
+                // never noticed.
+                return Ok(Vec::new());
+            }
+            Ok(self.jwt.authorities())
+        }
+    }
+
+    fn counting_ca() -> Arc<CountingCa> {
+        Arc::new(CountingCa {
+            trust_domain: td(),
+            jwt: authority(),
+            jwt_calls: AtomicUsize::new(0),
+            bundle_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn service_with(
+        ca: Arc<CountingCa>,
+        federated: Vec<TrustDomain>,
+    ) -> Result<WorkloadApiService, ferrum_edge::identity::jwt_svid::JwtSvidError> {
+        let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id: workload_id() });
+        WorkloadApiService::new(
+            vec![attestor],
+            ca as Arc<dyn CertificateAuthority>,
+            td(),
+            600,
+        )
+        .with_federated_trust_domains(federated)
+    }
+
+    fn partner(index: usize) -> TrustDomain {
+        TrustDomain::new(format!("partner{index}.test")).expect("trust domain is valid")
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_local_aliases_collapse_to_one_ca_call_each() {
+        let ca = counting_ca();
+        // Twenty entries, one distinct partner, plus the local domain repeated.
+        let mut configured = vec![td(); 5];
+        configured.extend(std::iter::repeat_n(partner(0), 15));
+        let svc = service_with(Arc::clone(&ca), configured).expect("within the cap");
+
+        svc.fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+            .await
+            .expect("the local bundle is published");
+        assert_eq!(
+            ca.jwt_calls.load(Ordering::SeqCst),
+            2,
+            "one local call plus exactly one federated call, not one per alias"
+        );
+
+        svc.fetch_x509_bundles(workload_request(X509BundlesRequest {}))
+            .await
+            .expect_err("the absent federated peer fails the X.509 bundle call");
+        assert_eq!(
+            ca.bundle_calls.load(Ordering::SeqCst),
+            2,
+            "the X.509 surface is deduplicated too"
+        );
+    }
+
+    #[test]
+    fn an_over_cap_federated_list_is_refused_rather_than_silently_truncated() {
+        // Reporting a trust posture the operator did not configure is worse than
+        // refusing one they did: an over-cap list is a constructor error.
+        let over_cap: Vec<TrustDomain> = (0..MAX_JWT_BUNDLE_TRUST_DOMAINS).map(partner).collect();
+        assert!(
+            service_with(counting_ca(), over_cap).is_err(),
+            "more federated domains than one bundle response may carry must be refused"
+        );
+
+        // One below the cap (the local domain always occupies a slot) is fine.
+        let at_cap: Vec<TrustDomain> = (0..MAX_JWT_BUNDLE_TRUST_DOMAINS - 1).map(partner).collect();
+        assert!(
+            service_with(counting_ca(), at_cap).is_ok(),
+            "the documented maximum must remain configurable"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_federated_bundles_cannot_drive_unbounded_ca_calls() {
+        // Every federated alias publishes NOTHING, so an insertion-counted cap
+        // never advanced and every configured alias reached the CA. The bound is
+        // now on the inputs, so the fan-out is fixed before any call is issued.
+        let ca = counting_ca();
+        let federated: Vec<TrustDomain> =
+            (0..MAX_JWT_BUNDLE_TRUST_DOMAINS - 1).map(partner).collect();
+        let svc = service_with(Arc::clone(&ca), federated).expect("at the cap");
+
+        svc.fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+            .await
+            .expect("the local bundle is still published");
+        assert_eq!(
+            ca.jwt_calls.load(Ordering::SeqCst),
+            MAX_JWT_BUNDLE_TRUST_DOMAINS,
+            "at most the local domain plus the capped federated set is queried"
+        );
+    }
+}

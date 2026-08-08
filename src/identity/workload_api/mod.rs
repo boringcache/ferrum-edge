@@ -29,8 +29,9 @@ pub use fetch_loop::{
 #[allow(unused_imports)]
 pub use listener::{
     DEFAULT_FERRUM_WORKLOAD_API_SOCKET, DEFAULT_WORKLOAD_API_SOCKET_MODE, DirectoryTrustVerdict,
-    WorkloadApiListener, WorkloadApiListenerError, WorkloadApiSocketConfig,
-    classify_directory_component, serve_workload_api,
+    MAX_STAGING_SUFFIX_BYTES, SocketLiveness, WorkloadApiListener, WorkloadApiListenerError,
+    WorkloadApiSocketConfig, classify_connect_result, classify_directory_component,
+    matches_bound_socket_identity, serve_workload_api,
 };
 #[allow(unused_imports)]
 pub use server::WorkloadApiService;

@@ -81,6 +81,16 @@
 //! a private key, nor its source, nor a minted token appears in `Debug`,
 //! `Display`, logs, or errors — only the public `kid`, which is by construction
 //! published in the JWT bundle.
+//!
+//! **A retired key is not a key.** "Verification-only retention" is enforced by
+//! the type system, not by convention: the retired set holds `RetainedPublicKey`
+//! (`kid` + algorithm + SPKI public PEM) and there is no `EncodingKey` anywhere
+//! in it. A configured previous private PEM is parsed only long enough to
+//! validate it and derive that public metadata, and the private half is dropped
+//! before construction returns; an ephemeral rotation likewise copies only the
+//! outgoing key's public metadata, leaving its signing object with the
+//! superseded state to be released. So a key the trust domain has rotated off
+//! cannot sign in this process even by mistake.
 
 use std::fmt;
 use std::sync::Arc;
@@ -313,9 +323,41 @@ struct JwtSigningKey {
     public_key_pem: String,
 }
 
+/// The **public-only** representation of a key retained for verification.
+///
+/// Deliberately a distinct type from [`JwtSigningKey`] rather than a reuse of
+/// it. "Verification-only retention" is a claim the documentation makes to
+/// operators, and holding an `Arc<JwtSigningKey>` in the retired set would have
+/// made it false: every configured previous private PEM would stay loaded as a
+/// usable [`EncodingKey`] for the whole process lifetime, one `authorities()`
+/// refactor away from signing with a key the trust domain has already rotated
+/// off. There is no private material here to misuse — the private half of a
+/// configured retired PEM is parsed only long enough to validate it and derive
+/// this public metadata, then dropped.
+struct RetainedPublicKey {
+    key_id: String,
+    algorithm: Algorithm,
+    /// SPKI PEM of the public half — this is what goes into JWT bundles.
+    public_key_pem: String,
+}
+
+impl RetainedPublicKey {
+    /// Copy the public metadata of a key this process is retiring. Used on the
+    /// ephemeral rotation path, which is the only place a former *active* key
+    /// becomes a retired one in process; the [`EncodingKey`] is left behind with
+    /// the old [`AuthorityState`] and released with it.
+    fn from_signing_key(key: &JwtSigningKey) -> Self {
+        Self {
+            key_id: key.key_id.clone(),
+            algorithm: key.algorithm,
+            public_key_pem: key.public_key_pem.clone(),
+        }
+    }
+}
+
 /// A key kept for verification only.
 struct RetiredJwtKey {
-    key: Arc<JwtSigningKey>,
+    key: Arc<RetainedPublicKey>,
     /// Instant after which the key is dropped from published authorities.
     ///
     /// `None` for **operator-configured** retired material: its publication
@@ -455,7 +497,11 @@ impl LocalJwtAuthority {
         }
         let mut retired: Vec<RetiredJwtKey> = Vec::with_capacity(config.retired_key_pems.len());
         for pem in &config.retired_key_pems {
-            let key = Arc::new(signing_key_from_pem(pem)?);
+            // Validated exactly as a primary key is — same PEM bounds, same
+            // P-256 requirement, same `kid` derivation — but only the *public*
+            // half survives the call. A configured previous key must not remain
+            // usable for signing anywhere in this process.
+            let key = Arc::new(retained_public_key_from_pem(pem)?);
             if retired.iter().any(|entry| entry.key.key_id == key.key_id) {
                 return Err(JwtSvidError::InvalidSigningMaterial(
                     "two configured retired JWT signing keys are the same key",
@@ -605,7 +651,10 @@ impl LocalJwtAuthority {
         // nothing and leaves no orphaned material.
         let mut retained: Vec<RetiredJwtKey> = Vec::with_capacity(self.max_retained_keys);
         retained.push(RetiredJwtKey {
-            key: Arc::clone(&previous.active),
+            // Public metadata only: the outgoing key's `EncodingKey` stays with
+            // the superseded `AuthorityState` and is released with it, so a
+            // retired key is never a signing capability.
+            key: Arc::new(RetainedPublicKey::from_signing_key(&previous.active)),
             verifiable_until: Some(now + overlap),
         });
         for entry in &previous.retired {
@@ -665,6 +714,24 @@ impl LocalJwtAuthority {
     /// of every token this authority currently mints).
     pub fn active_key_id(&self) -> String {
         self.state.load().active.key_id.clone()
+    }
+
+    /// Everything this authority retains for a retired key: its `kid` and its
+    /// SPKI public PEM, newest first.
+    ///
+    /// This is the whole of the retained representation — `RetainedPublicKey`
+    /// has no other field, and in particular no `EncodingKey` — so the accessor
+    /// is both the diagnostic surface and the introspection seam tests use to
+    /// pin "verification-only" as a structural property rather than a promise.
+    /// Both values are public by construction: they are exactly what the JWT
+    /// bundle publishes.
+    pub fn retained_public_material(&self) -> Vec<(String, String)> {
+        let state = self.state.load();
+        state
+            .retired
+            .iter()
+            .map(|entry| (entry.key.key_id.clone(), entry.key.public_key_pem.clone()))
+            .collect()
     }
 
     fn clamp_ttl(&self, requested: u64) -> u64 {
@@ -869,6 +936,46 @@ fn signing_key_from_pem(pem: &Zeroizing<String>) -> Result<JwtSigningKey, JwtSvi
     }
     signing_key_from_key_pair(&key_pair)
         .map_err(|_| JwtSvidError::InvalidSigningMaterial("configured JWT signing key is unusable"))
+}
+
+/// Load an operator-configured **retired** key for verification only.
+///
+/// Held to exactly the same admission rules as an active key
+/// ([`signing_key_from_pem`]) — a retired entry is published in the JWT bundle,
+/// so material Ferrum would refuse to sign with must not be republished as
+/// trusted either — but it produces no [`EncodingKey`]. The `rcgen::KeyPair` is
+/// the only thing that ever holds the private half, and it is dropped when this
+/// function returns.
+fn retained_public_key_from_pem(
+    pem: &Zeroizing<String>,
+) -> Result<RetainedPublicKey, JwtSvidError> {
+    if pem.trim().is_empty() {
+        return Err(JwtSvidError::InvalidSigningMaterial(
+            "configured JWT signing key PEM is empty",
+        ));
+    }
+    if pem.len() > MAX_JWT_SIGNING_KEY_PEM_BYTES {
+        return Err(JwtSvidError::InvalidSigningMaterial(
+            "configured JWT signing key PEM is too large",
+        ));
+    }
+    let key_pair = rcgen::KeyPair::from_pem(pem).map_err(|_| {
+        JwtSvidError::InvalidSigningMaterial(
+            "configured JWT signing key is not a usable private key PEM",
+        )
+    })?;
+    if !key_pair.is_compatible(&rcgen::PKCS_ECDSA_P256_SHA256) {
+        return Err(JwtSvidError::InvalidSigningMaterial(
+            "configured JWT signing key is not an ECDSA P-256 key; JWT-SVIDs are minted ES256",
+        ));
+    }
+    let public_key_pem = key_pair.public_key_pem();
+    let key_id = jwks::published_authority_key_id(&public_key_pem)?;
+    Ok(RetainedPublicKey {
+        key_id,
+        algorithm: JWT_SVID_SIGNING_ALG,
+        public_key_pem,
+    })
 }
 
 /// Generate an ephemeral ES256 signing key. Dev/test only — see

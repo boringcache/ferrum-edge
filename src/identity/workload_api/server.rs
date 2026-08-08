@@ -80,6 +80,17 @@ use crate::identity::spiffe::TrustDomain;
 const WORKLOAD_METADATA_KEY: &str = "workload.spiffe.io";
 const WORKLOAD_METADATA_VAL: &str = "true";
 
+/// Maximum number of **federated** trust domains one service may be configured
+/// with.
+///
+/// The local trust domain always occupies one slot of
+/// [`MAX_JWT_BUNDLE_TRUST_DOMAINS`], so the federated set gets the rest. The
+/// bound is enforced once, in
+/// [`WorkloadApiService::with_federated_trust_domains`], and every per-RPC loop
+/// additionally iterates at most this many entries — a belt on the constructor's
+/// braces, so no future field mutation can reopen an unbounded CA fan-out.
+const MAX_FEDERATED_TRUST_DOMAINS: usize = MAX_JWT_BUNDLE_TRUST_DOMAINS - 1;
+
 /// Workload API service implementation. Held as an `Arc` and cloned per RPC.
 pub struct WorkloadApiService {
     pub attestors: Vec<Arc<dyn Attestor>>,
@@ -136,9 +147,45 @@ impl WorkloadApiService {
         }
     }
 
-    pub fn with_federated_trust_domains(mut self, trust_domains: Vec<TrustDomain>) -> Self {
-        self.federated_trust_domains = trust_domains;
-        self
+    /// Attach the federated trust domains this service publishes bundles for.
+    ///
+    /// The input is **normalized once, here**, and every later RPC iterates the
+    /// result rather than the operator's raw list:
+    ///
+    /// - exact duplicates are collapsed (the map keys they produce are
+    ///   identical, so a repeated alias is pure extra CA work);
+    /// - the local trust domain is dropped — it is always published from its own
+    ///   dedicated path, and a federated entry for it would be a second fetch of
+    ///   the same bundle;
+    /// - the remaining count is bounded by
+    ///   [`MAX_JWT_BUNDLE_TRUST_DOMAINS`] minus the local domain's slot.
+    ///
+    /// Over-cap input is an **error**, not a truncation. Bounding inside the
+    /// per-RPC loops instead let arbitrarily many empty or failing aliases drive
+    /// unbounded CA calls (the JWT loop counted only *successfully inserted*
+    /// bundles, so a domain that published nothing never advanced it), and
+    /// silently dropping the tail would have reported a trust posture the
+    /// operator did not configure. Refusing at construction is the only answer
+    /// that is both bounded and honest.
+    pub fn with_federated_trust_domains(
+        mut self,
+        trust_domains: Vec<TrustDomain>,
+    ) -> Result<Self, JwtSvidError> {
+        let mut normalized: Vec<TrustDomain> = Vec::with_capacity(trust_domains.len());
+        for domain in trust_domains {
+            if domain == self.trust_domain || normalized.contains(&domain) {
+                continue;
+            }
+            normalized.push(domain);
+        }
+        if normalized.len() > MAX_FEDERATED_TRUST_DOMAINS {
+            return Err(JwtSvidError::InvalidRequest(
+                "more federated trust domains are configured than one Workload API bundle response \
+                 may carry",
+            ));
+        }
+        self.federated_trust_domains = normalized;
+        Ok(self)
     }
 
     /// Requested lifetime for minted JWT-SVIDs.
@@ -358,7 +405,13 @@ impl WorkloadApiService {
         let mut bundles = HashMap::new();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
         bundles.insert(trust_domain.to_string(), bundle_concat);
-        for td in federated_trust_domains {
+        // Same bounded-iteration contract as the JWT path: the configured vector
+        // is normalized and capped at construction, and `take` keeps the CA
+        // fan-out bounded regardless.
+        for td in federated_trust_domains
+            .iter()
+            .take(MAX_FEDERATED_TRUST_DOMAINS)
+        {
             if td == trust_domain {
                 continue;
             }
@@ -385,6 +438,12 @@ impl WorkloadApiService {
     /// acceptable material and a hostile externally supplied bundle can never
     /// reach a scan.
     ///
+    /// The federated iteration is bounded by [`MAX_FEDERATED_TRUST_DOMAINS`]
+    /// *inputs*, not by outputs. Configuration is already deduplicated,
+    /// local-domain-free, and capped by
+    /// [`WorkloadApiService::with_federated_trust_domains`], so the number of CA
+    /// calls one RPC can make is fixed before any of them is issued.
+    ///
     /// A federated domain the CA does not serve is skipped rather than failing
     /// the whole call — federation is best-effort and the local bundle is the
     /// load-bearing one. A local-domain failure is not skipped, and neither is
@@ -410,16 +469,17 @@ impl WorkloadApiService {
         jwt_svid::validate_published_authorities(trust_domain, &local)?;
         bundles.insert(trust_domain.clone(), local);
 
-        for federated in federated_trust_domains {
+        // Bounded by the ITERATION, not by how many bundles came back: counting
+        // successful insertions let arbitrarily many empty or failing aliases
+        // drive unbounded CA calls, because neither outcome advanced the count.
+        // The configured vector is already deduplicated, local-domain-free, and
+        // capped; `take` keeps that true independently of how it was populated.
+        for federated in federated_trust_domains
+            .iter()
+            .take(MAX_FEDERATED_TRUST_DOMAINS)
+        {
             if federated == trust_domain {
                 continue;
-            }
-            if bundles.len() >= MAX_JWT_BUNDLE_TRUST_DOMAINS {
-                warn!(
-                    max = MAX_JWT_BUNDLE_TRUST_DOMAINS,
-                    "JWT bundle trust-domain cap reached; remaining federated domains omitted"
-                );
-                break;
             }
             match ca.jwt_authorities(federated).await {
                 Ok(authorities) if !authorities.is_empty() => {
@@ -484,7 +544,10 @@ impl WorkloadApiService {
         federated_trust_domains: &[TrustDomain],
     ) -> Result<HashMap<String, Vec<u8>>, crate::identity::ca::CaError> {
         let mut bundles = HashMap::new();
-        for td in federated_trust_domains {
+        for td in federated_trust_domains
+            .iter()
+            .take(MAX_FEDERATED_TRUST_DOMAINS)
+        {
             let bundle = ca.trust_bundle(td).await?;
             let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
             bundles.insert(td.to_string(), bundle_concat);

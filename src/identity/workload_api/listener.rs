@@ -16,7 +16,10 @@
 //!
 //! **Path shape.** The path must be **absolute** and contain no `.` / `..`
 //! component, so a relative or traversing path can never resolve somewhere the
-//! operator did not name.
+//! operator did not name. The check inspects the **raw Unix path segments**
+//! rather than [`Path::components`]: that iterator normalizes an embedded `.`
+//! away on Unix, so a lexical rejection written in terms of it would silently
+//! accept `/trusted/./api.sock` — a path that is not the one the operator wrote.
 //!
 //! **Every directory component, not just the parent.** Trust in the socket's
 //! location is only as strong as the weakest directory on the way to it: a
@@ -45,28 +48,65 @@
 //! and a directory Ferrum creates under a symlink an attacker planted is exactly
 //! the escape this refuses.
 //!
-//! **Existing artifacts are never clobbered.** An artifact at the socket path is
-//! removed **only** when it is a socket *and* owned by this process's effective
-//! uid. A regular file, a directory, a symlink, or another user's socket is
-//! refused — that is somebody else's data, and deleting it is both destructive
-//! and a way to be tricked into unlinking an arbitrary path.
+//! **A live endpoint is never taken over, and a stale one is proven stale.**
+//! An artifact at the socket path is only ever removed when it is a socket owned
+//! by this process's effective uid — a regular file, a directory, a symlink, or
+//! another user's socket is refused outright. Ownership alone is *not* enough,
+//! though: a second Ferrum process running as the same uid would otherwise
+//! unlink the first one's **live** Workload API socket and take over the path
+//! workloads dial for their identity. So before any unlink, the existing socket
+//! is probed with a real Unix-domain `connect(2)`
+//! ([`probe_existing_socket`]) and
 //!
-//! **Permissions are established at creation, then proven.** The socket is bound
-//! under a temporarily narrowed `umask`, so the kernel applies the configured
-//! mode *as part of* `bind(2)` and there is no window at the process umask at
-//! all. Immediately afterwards the bound path is re-stat'ed and must be a socket
-//! owned by this process with exactly the configured mode; that `(dev, ino)` is
-//! recorded as the **bound identity**. If a platform ignores the umask, a
-//! path-based `chmod` is attempted only while the path still resolves to that
-//! same identity, and the result is re-verified. If the bound identity cannot be
-//! established at all, startup **fails** and the artifact is cleaned up
-//! identity-checked — Ferrum does not serve a credential endpoint whose on-disk
-//! identity it could not confirm.
+//! - a **successful connection means live**: startup is refused and nothing is
+//!   unlinked;
+//! - only a **connection-refused / not-listening** result admits the socket as
+//!   stale leftover from a crashed run;
+//! - **anything ambiguous fails closed** — `EACCES`, `EAGAIN` (a listener whose
+//!   backlog is full), a timeout, or any other error. "We could not tell" is
+//!   never treated as "nobody is there".
 //!
-//! On shutdown the socket file is unlinked **only if Ferrum created it and it is
-//! still the same socket** (same device + inode as the one bound), so a
-//! restarted peer's socket at the same path is never removed by a late shutdown
-//! of the previous process.
+//! Immediately before the unlink the artifact's `(device, inode, type, owner)`
+//! is re-checked against what was probed, so a replacement that raced in
+//! between is never the thing deleted.
+//!
+//! **Permissions are established before publication, never through the process
+//! umask.** The umask is process-global state; mesh mode has already started
+//! admin and background tasks by the time this runs, so narrowing it here would
+//! silently change the permissions of unrelated files those tasks create. The
+//! socket is instead published in three steps:
+//!
+//! 1. a **private staging directory** is created under the already-validated
+//!    parent with `mkdir(2)` mode `0700`. A requested `0700` can only be
+//!    narrowed by a umask, never widened, so the directory is inaccessible to
+//!    every other user regardless of ambient state (and its mode is verified
+//!    anyway, because a pathological umask could have narrowed it to something
+//!    this process cannot itself traverse);
+//! 2. the socket is bound **inside** that directory and its mode is set and
+//!    verified there. Whatever mode `bind(2)` happened to create it with is
+//!    unreachable to anyone else for the whole of that window, so there is never
+//!    a permissive temporary endpoint;
+//! 3. the socket inode is **renamed** onto the final path — same parent, so the
+//!    same filesystem, so the publication is atomic — and re-verified
+//!    afterwards: still a socket, still owned by this process, still exactly the
+//!    configured mode, and still the same `(device, inode)`. That pair is
+//!    recorded as the **bound identity**.
+//!
+//! If the bound identity cannot be established at any point, startup **fails**
+//! and every artifact (staged socket, staging directory, and a published socket
+//! that failed its post-rename check) is cleaned up identity-checked. Ferrum
+//! does not serve a credential endpoint whose on-disk identity it could not
+//! confirm.
+//!
+//! The staging directory needs room inside `sockaddr_un.sun_path`, so
+//! [`WorkloadApiSocketConfig::validate`] additionally requires the socket's
+//! parent directory to leave [`MAX_STAGING_SUFFIX_BYTES`] of headroom.
+//!
+//! On shutdown the socket file is unlinked **only if Ferrum created it and the
+//! object is still that same socket** — same device and inode, still of socket
+//! type, and still owned by this effective uid. Device+inode alone is an
+//! incomplete identity: inode numbers are reused, so a regular file that
+//! happened to land on the freed inode would otherwise satisfy the predicate.
 //!
 //! **What is *not* claimed.** A POSIX Unix socket has no `fbind`/`fchmod` path
 //! that reaches the bound filesystem inode (on Linux `fchmod(2)` on a socket fd
@@ -82,10 +122,21 @@
 //! Bind, validation, and permission failures are all returned to the caller;
 //! mesh startup treats them as fatal when the surface is enabled, so a
 //! misconfigured Workload API never degrades silently into "not listening".
+//!
+//! ## Termination
+//!
+//! The serve task is spawned, so an unexpected exit — a tonic transport error,
+//! or a panic — would otherwise leave the mesh runtime happily serving traffic
+//! with no Workload API at all. [`WorkloadApiListener::termination_signal`]
+//! publishes that event: the guard that fires it lives *inside* the spawned
+//! task, so it is delivered on a panic unwind exactly as on a clean return, and
+//! it carries the socket cleanup with it. Mesh mode observes the signal and
+//! initiates the shared shutdown path; a requested shutdown races nothing,
+//! because the observer checks the shared shutdown flag first and stays quiet.
 
 use std::fmt;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -109,6 +160,25 @@ pub const DEFAULT_WORKLOAD_API_SOCKET_MODE: u32 = 0o660;
 /// with a diagnostic instead.
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 
+/// Headroom the private staging directory needs inside `sun_path`, beyond the
+/// socket's parent directory: `/` + `.fw-<pid>-<seq>` + `/s`.
+///
+/// The socket is bound at `<parent>/.fw-<pid>-<seq>/s` before it is renamed onto
+/// its configured path, and *that* path is what `bind(2)` has to fit into
+/// `sockaddr_un`. `pid` is at most 10 decimal digits and `seq` at most 8 hex
+/// digits, so the worst case is `1 + 4 + 10 + 1 + 8 + 2`.
+pub const MAX_STAGING_SUFFIX_BYTES: usize = 26;
+
+/// Attempts to find an unused staging-directory name before giving up. A
+/// collision needs another process with our pid, so one retry would do; a small
+/// bound keeps it deterministic without ever looping.
+#[cfg(unix)]
+const MAX_STAGING_DIR_ATTEMPTS: u32 = 8;
+
+/// Serial number distinguishing concurrent staging directories in one process.
+#[cfg(unix)]
+static STAGING_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Errors raised while establishing or tearing down the Workload API listener.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkloadApiListenerError {
@@ -130,8 +200,8 @@ pub enum WorkloadApiListenerError {
 pub struct WorkloadApiSocketConfig {
     /// Absolute filesystem path to bind.
     pub socket_path: PathBuf,
-    /// Permission bits the bound socket is created with (applied through the
-    /// umask at `bind`, then verified).
+    /// Permission bits the published socket carries. Set and verified inside a
+    /// private staging directory, then published by rename.
     pub socket_mode: u32,
 }
 
@@ -150,6 +220,17 @@ impl WorkloadApiSocketConfig {
     /// An unparseable or over-wide mode is an error, not a fallback: silently
     /// substituting a default here would hand the operator a socket with
     /// permissions they did not ask for.
+    ///
+    /// Two value ranges are refused outright:
+    ///
+    /// - **world-writable** (`0o002`), because any local process could then
+    ///   impersonate the endpoint;
+    /// - **no owner or group write bit** (`0o220`), because `connect(2)` to a
+    ///   Unix socket requires *write* permission on the socket file. A mode such
+    ///   as `0000` or `0440` parses and binds happily and then rejects every
+    ///   workload with `EACCES`, which contradicts the whole point of the
+    ///   fail-closed startup contract: a successful start must mean workloads
+    ///   can actually connect.
     pub fn from_parts(
         socket_path: impl Into<PathBuf>,
         socket_mode: &str,
@@ -176,6 +257,13 @@ impl WorkloadApiSocketConfig {
                  impersonate the Workload API endpoint"
             )));
         }
+        if mode & 0o220 == 0 {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "socket mode '{socket_mode}' grants no owner or group write bit, and connecting to \
+                 a Unix socket requires write permission; no workload could reach the endpoint. \
+                 Use a mode such as 0660 that grants the workload's group"
+            )));
+        }
         Ok(Self {
             socket_path: socket_path.into(),
             socket_mode: mode,
@@ -198,11 +286,10 @@ impl WorkloadApiSocketConfig {
         // Traversal is refused on the *lexical* path rather than resolved away:
         // an operator-facing setting should mean exactly what it says, and a
         // `..` component is either a mistake or an attempt to escape the
-        // directory the deployment mounted.
-        if path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-        {
+        // directory the deployment mounted. Inspected on raw segments, because
+        // `Path::components()` drops an embedded `.` on Unix and a check written
+        // over it would not actually enforce what this message promises.
+        if has_dot_segment(path) {
             return Err(WorkloadApiListenerError::Socket(format!(
                 "path '{}' must not contain '.' or '..' components",
                 path.display()
@@ -226,9 +313,41 @@ impl WorkloadApiSocketConfig {
                 path.display()
             ))
         })?;
+        // The socket is bound inside a private staging directory under this
+        // parent and only then renamed into place, so it is the *staging* path
+        // that has to fit `sockaddr_un.sun_path`.
+        let max_parent = MAX_SOCKET_PATH_BYTES.saturating_sub(MAX_STAGING_SUFFIX_BYTES);
+        if parent.as_os_str().len() > max_parent {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "the socket's parent directory '{}' leaves no room for the private staging \
+                 directory the socket is published from; keep the parent within {max_parent} bytes",
+                parent.display()
+            )));
+        }
         validate_parent_directory(parent)?;
         Ok(())
     }
+}
+
+/// Whether any raw path segment is exactly `.` or `..`.
+///
+/// Deliberately not written over [`Path::components`]: that iterator normalizes
+/// `CurDir` away for anything but a leading `.`, so `/trusted/./api.sock` would
+/// pass a check built on it while still not being the path the operator wrote.
+#[cfg(unix)]
+fn has_dot_segment(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
+}
+
+#[cfg(not(unix))]
+fn has_dot_segment(path: &Path) -> bool {
+    use std::path::Component;
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
 }
 
 /// A running Workload API listener.
@@ -239,6 +358,7 @@ impl WorkloadApiSocketConfig {
 pub struct WorkloadApiListener {
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
+    terminated_rx: watch::Receiver<bool>,
     join: JoinHandle<()>,
 }
 
@@ -256,6 +376,19 @@ impl WorkloadApiListener {
     /// The bound socket path, for diagnostics and for tests that dial it.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// A receiver that flips to `true` when the serve task has ended, **for any
+    /// reason at all** — requested shutdown, transport error, or panic.
+    ///
+    /// The sender lives in a drop guard inside the spawned task, so a panic
+    /// unwind publishes it exactly as a clean return does. The signal on its own
+    /// says nothing about *why* the task ended; a caller that cares (mesh mode
+    /// does) distinguishes a requested stop by checking its own shutdown state
+    /// first, which is deterministic because that flag is always set before
+    /// [`Self::shutdown`] is called.
+    pub fn termination_signal(&self) -> watch::Receiver<bool> {
+        self.terminated_rx.clone()
     }
 
     /// Signal the serve future to stop, wait for it, and unlink the socket we
@@ -279,6 +412,27 @@ impl WorkloadApiListener {
     }
 }
 
+/// Runs the identity-checked socket cleanup and publishes the termination
+/// signal when the serve task ends.
+///
+/// A drop guard rather than trailing statements: the task is spawned, so a panic
+/// inside tonic would otherwise skip both, leaving a stale socket on disk *and*
+/// a mesh runtime that never learns its Workload API is gone.
+#[cfg(unix)]
+struct ServeExitGuard {
+    socket_path: PathBuf,
+    bound_identity: Option<(u64, u64)>,
+    terminated_tx: watch::Sender<bool>,
+}
+
+#[cfg(unix)]
+impl Drop for ServeExitGuard {
+    fn drop(&mut self) {
+        cleanup_owned_socket(&self.socket_path, self.bound_identity);
+        let _ = self.terminated_tx.send(true);
+    }
+}
+
 /// Bind the socket, serve [`WorkloadApiService`] on it, and return a handle.
 ///
 /// The socket exists and is correctly permissioned by the time this returns, so
@@ -289,38 +443,16 @@ pub async fn serve_workload_api(
     service: WorkloadApiService,
     config: WorkloadApiSocketConfig,
 ) -> Result<WorkloadApiListener, WorkloadApiListenerError> {
-    use tokio::net::UnixListener;
     use tokio_stream::wrappers::UnixListenerStream;
 
     config.validate()?;
     let path = config.socket_path.clone();
-    remove_owned_stale_socket(&path)?;
+    refuse_live_or_clear_stale_socket(&path)?;
 
-    // Bind under a narrowed umask so the kernel applies the configured mode as
-    // part of creating the socket inode. There is then no interval in which the
-    // endpoint exists at whatever the process umask happened to be — a
-    // post-bind `chmod` can only ever shrink that window, never remove it.
-    let listener = {
-        let _umask = ScopedUmask::narrowing_to(config.socket_mode);
-        UnixListener::bind(&path).map_err(|e| {
-            WorkloadApiListenerError::Io(format!("bind '{}' failed: {e}", path.display()))
-        })?
-    };
-
-    // Establish the bound identity and prove the mode. A failure here is fatal
-    // and the artifact is removed identity-checked: serving a credential
-    // endpoint whose on-disk identity or permissions we could not confirm is
-    // exactly the silent-downgrade this refuses.
-    let bound_identity = match confirm_bound_socket(&path, config.socket_mode) {
-        Ok(identity) => Some(identity),
-        Err(error) => {
-            drop(listener);
-            remove_self_owned_socket_best_effort(&path);
-            return Err(error);
-        }
-    };
+    let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (terminated_tx, terminated_rx) = watch::channel(false);
     // Built here rather than inside the spawned task so the receiver is moved
     // into exactly one future and its mutability is unambiguous.
     let shutdown_signal = async move {
@@ -331,9 +463,16 @@ pub async fn serve_workload_api(
         }
     };
     let incoming = UnixListenerStream::new(listener);
-    let cleanup_path = path.clone();
     let server = service.into_server();
+    let guard = ServeExitGuard {
+        socket_path: path.clone(),
+        bound_identity: Some(bound_identity),
+        terminated_tx,
+    };
     let join = tokio::spawn(async move {
+        // Bound first so it drops LAST — after the serve future, and on a panic
+        // unwind as well as on a clean return.
+        let exit_guard = guard;
         let result = tonic::transport::Server::builder()
             .add_service(server)
             .serve_with_incoming_shutdown(incoming, shutdown_signal)
@@ -341,13 +480,10 @@ pub async fn serve_workload_api(
         if let Err(error) = result {
             warn!(
                 error = %error,
-                socket = %cleanup_path.display(),
+                socket = %exit_guard.socket_path.display(),
                 "SPIFFE Workload API server exited with an error"
             );
         }
-        // Clean up ONLY our own artifact: if the inode at this path is no
-        // longer the socket we bound, another process owns it now.
-        cleanup_owned_socket(&cleanup_path, bound_identity);
     });
 
     info!(
@@ -358,6 +494,7 @@ pub async fn serve_workload_api(
     Ok(WorkloadApiListener {
         socket_path: path,
         shutdown_tx,
+        terminated_rx,
         join,
     })
 }
@@ -370,131 +507,244 @@ pub async fn serve_workload_api(
     Err(WorkloadApiListenerError::Unsupported)
 }
 
-/// Narrow the process umask for the duration of a bind, then restore it.
+/// A private, `0700`, per-attempt directory the socket is bound inside before it
+/// is published.
 ///
-/// The umask is process-global, which is why the guard exists at all: it is held
-/// across exactly one `bind(2)` and restored on drop, including on the error
-/// path. Startup is the only place this runs — the Workload API listener is
-/// bound once, before the serving runtime is doing anything else that creates
-/// files — so the global window is a single syscall pair rather than a mode a
-/// later file creation could inherit.
-///
-/// This is the only mechanism that gives a Unix socket its permissions
-/// atomically. `fchmod(2)` is not an alternative: on Linux a socket file
-/// descriptor's `f_path` is the anonymous `sockfs` inode, not the bound name, so
-/// `fchmod` on it would "succeed" while leaving the bound path untouched.
+/// This is what replaces the process-global umask narrowing the listener used to
+/// perform. `mkdir(2)`'s mode argument is masked by the umask, so a requested
+/// `0700` can only ever come out *narrower* — never wider — which is exactly the
+/// property that makes it safe without touching process-global state. Nothing
+/// but this process (and root) can traverse it, so the interval between `bind`
+/// and the mode being set is not observable to any other user.
 #[cfg(unix)]
-struct ScopedUmask {
-    previous: libc::mode_t,
+struct StagingDir {
+    path: PathBuf,
 }
 
 #[cfg(unix)]
-impl ScopedUmask {
-    /// Set the umask to the complement of `mode`, so a file created with
-    /// permission bits `0o777` lands at exactly `mode`.
-    // `mode_t` is `u32` on Linux but `u16` on the BSDs/macOS, so the cast is
-    // load-bearing on some targets even where it is an identity on others.
-    #[allow(clippy::unnecessary_cast)]
-    fn narrowing_to(mode: u32) -> Self {
-        // SAFETY: `umask` is an infallible process-credential call that returns
-        // the previous mask; it has no failure mode and no memory effects.
-        let previous = unsafe { libc::umask((!mode & 0o777) as libc::mode_t) };
-        Self { previous }
+impl StagingDir {
+    /// Create the staging directory under `parent`, verifying that what landed
+    /// on disk really is our own private `0700` directory.
+    fn create(parent: &Path) -> Result<Self, WorkloadApiListenerError> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        use std::sync::atomic::Ordering;
+
+        let pid = std::process::id();
+        for _ in 0..MAX_STAGING_DIR_ATTEMPTS {
+            let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".fw-{pid}-{sequence:x}"));
+            // Re-checked here as well as in `validate`: the bound is what keeps
+            // the staged bind inside `sockaddr_un.sun_path`, and a bare `EINVAL`
+            // from `bind` would be an unreadable failure.
+            if path.as_os_str().len() + 2 > MAX_SOCKET_PATH_BYTES {
+                return Err(WorkloadApiListenerError::Socket(format!(
+                    "the socket's parent directory '{}' leaves no room for the private staging \
+                     directory the socket is published from",
+                    parent.display()
+                )));
+            }
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(WorkloadApiListenerError::Io(format!(
+                        "cannot create the private staging directory '{}': {error}",
+                        path.display()
+                    )));
+                }
+            }
+            let staging = Self { path };
+
+            // Prove what we just created. A pathological umask can narrow `0700`
+            // to something this process cannot itself traverse, and a broken
+            // filesystem could ignore the mode entirely; neither may be served
+            // through.
+            let metadata = std::fs::symlink_metadata(&staging.path).map_err(|error| {
+                WorkloadApiListenerError::Io(format!(
+                    "cannot inspect the private staging directory '{}': {error}",
+                    staging.path.display()
+                ))
+            })?;
+            let effective_uid = unsafe { libc::geteuid() };
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != effective_uid
+            {
+                return Err(WorkloadApiListenerError::Io(format!(
+                    "the private staging directory '{}' is not the directory this process just \
+                     created",
+                    staging.path.display()
+                )));
+            }
+            if metadata.mode() & 0o777 != 0o700 {
+                std::fs::set_permissions(&staging.path, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        WorkloadApiListenerError::Io(format!(
+                            "cannot set mode 0700 on the private staging directory '{}': {error}",
+                            staging.path.display()
+                        ))
+                    })?;
+                let after = std::fs::symlink_metadata(&staging.path).map_err(|error| {
+                    WorkloadApiListenerError::Io(format!(
+                        "cannot re-inspect the private staging directory '{}': {error}",
+                        staging.path.display()
+                    ))
+                })?;
+                if after.mode() & 0o777 != 0o700
+                    || (after.dev(), after.ino()) != (metadata.dev(), metadata.ino())
+                {
+                    return Err(WorkloadApiListenerError::Io(format!(
+                        "the private staging directory '{}' could not be confirmed private",
+                        staging.path.display()
+                    )));
+                }
+            }
+            return Ok(staging);
+        }
+        Err(WorkloadApiListenerError::Io(format!(
+            "could not create a private staging directory under '{}' after \
+             {MAX_STAGING_DIR_ATTEMPTS} attempts",
+            parent.display()
+        )))
+    }
+
+    /// The path the socket is bound at while it is being permissioned. One
+    /// character, because the whole staging path has to fit `sun_path`.
+    fn socket_path(&self) -> PathBuf {
+        self.path.join("s")
     }
 }
 
 #[cfg(unix)]
-impl Drop for ScopedUmask {
+impl Drop for StagingDir {
+    /// Best-effort teardown on every path, success or failure. After a
+    /// successful publication the staged socket has already been renamed away,
+    /// so only the empty directory remains.
     fn drop(&mut self) {
-        // SAFETY: as above.
-        unsafe {
-            libc::umask(self.previous);
-        }
+        remove_self_owned_socket_best_effort(&self.socket_path());
+        let _ = std::fs::remove_dir(&self.path);
     }
 }
 
-/// Confirm the artifact at `path` is the socket this process just bound, with
-/// exactly `expected_mode`, and return its `(device, inode)` identity.
+/// Bind the socket inside a private staging directory, permission it there, and
+/// publish it onto `path` by rename.
 ///
-/// This is the "fail startup if the bound identity cannot be established" step.
-/// A Unix socket gives no descriptor-based route to its bound filesystem inode,
-/// so identity is established by stat'ing the name and requiring it to be a
-/// socket owned by this process's effective uid; anything else means the name we
-/// bound is no longer the object at that name.
-///
-/// The chmod fallback exists only for a platform that ignored the umask. It is
-/// performed *between two identity checks* so Ferrum can never chmod an artifact
-/// it has not just confirmed is its own — the failure mode the pathname-based
-/// approach otherwise has.
+/// Returns the listener together with the published `(device, inode)` identity.
+/// Every failure leaves no artifact behind: the staging directory's `Drop`
+/// removes the staged socket, and a post-publication verification failure
+/// removes the published one identity-checked.
 #[cfg(unix)]
-fn confirm_bound_socket(
+fn bind_and_publish_socket(
     path: &Path,
-    expected_mode: u32,
-) -> Result<(u64, u64), WorkloadApiListenerError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    socket_mode: u32,
+) -> Result<(tokio::net::UnixListener, (u64, u64)), WorkloadApiListenerError> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let effective_uid = unsafe { libc::geteuid() };
-    let inspect = |stage: &str| -> Result<(u64, u64, u32), WorkloadApiListenerError> {
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            WorkloadApiListenerError::Io(format!(
-                "cannot confirm the bound Workload API socket at '{}' ({stage}): {error}",
-                path.display()
-            ))
-        })?;
-        if !metadata.file_type().is_socket() {
-            return Err(WorkloadApiListenerError::Io(format!(
-                "'{}' is not a socket after bind ({stage}); refusing to serve an endpoint whose \
-                 on-disk identity cannot be established",
-                path.display()
-            )));
-        }
-        if metadata.uid() != effective_uid {
-            return Err(WorkloadApiListenerError::Io(format!(
-                "the artifact at '{}' is owned by another user after bind ({stage}); it is not \
-                 the socket this process created",
-                path.display()
-            )));
-        }
-        Ok((metadata.dev(), metadata.ino(), metadata.mode() & 0o777))
-    };
-
-    let (dev, ino, mode) = inspect("after bind")?;
-    if mode == expected_mode {
-        return Ok((dev, ino));
-    }
-
-    // Fallback for a platform that did not honour the umask. Only reachable
-    // while the path still resolves to the inode confirmed above.
-    let permissions = std::fs::Permissions::from_mode(expected_mode);
-    std::fs::set_permissions(path, permissions).map_err(|error| {
-        WorkloadApiListenerError::Io(format!(
-            "setting mode {expected_mode:#o} on '{}' failed: {error}",
+    let parent = path.parent().ok_or_else(|| {
+        WorkloadApiListenerError::Socket(format!(
+            "path '{}' has no parent directory",
             path.display()
         ))
     })?;
-    let (dev_after, ino_after, mode_after) = inspect("after chmod")?;
-    if (dev_after, ino_after) != (dev, ino) {
+    let staging = StagingDir::create(parent)?;
+    let staged_path = staging.socket_path();
+
+    let listener = tokio::net::UnixListener::bind(&staged_path).map_err(|error| {
+        WorkloadApiListenerError::Io(format!("bind '{}' failed: {error}", path.display()))
+    })?;
+
+    // Permission it while it is still unreachable to every other user. The mode
+    // `bind(2)` happened to apply is never exposed.
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(socket_mode)).map_err(
+        |error| {
+            WorkloadApiListenerError::Io(format!(
+                "setting mode {socket_mode:#o} on the staged Workload API socket failed: {error}"
+            ))
+        },
+    )?;
+    let staged_identity = confirm_socket_identity(&staged_path, socket_mode, "in staging")?;
+
+    // Publication. Same parent directory, therefore the same filesystem, so the
+    // rename is atomic: a workload either sees no socket or sees the finished,
+    // correctly permissioned one.
+    std::fs::rename(&staged_path, path).map_err(|error| {
+        WorkloadApiListenerError::Io(format!(
+            "publishing the Workload API socket at '{}' failed: {error}",
+            path.display()
+        ))
+    })?;
+
+    match confirm_socket_identity(path, socket_mode, "after publication") {
+        Ok(published_identity) if published_identity == staged_identity => {
+            Ok((listener, published_identity))
+        }
+        Ok(_) => {
+            drop(listener);
+            cleanup_owned_socket(path, Some(staged_identity));
+            Err(WorkloadApiListenerError::Io(format!(
+                "the socket published at '{}' is not the inode this process bound; refusing to \
+                 serve it",
+                path.display()
+            )))
+        }
+        Err(error) => {
+            drop(listener);
+            cleanup_owned_socket(path, Some(staged_identity));
+            Err(error)
+        }
+    }
+}
+
+/// Confirm the artifact at `path` is a socket owned by this process carrying
+/// exactly `expected_mode`, and return its `(device, inode)` identity.
+///
+/// A Unix socket gives no descriptor-based route to its bound filesystem inode,
+/// so identity is established by stat'ing the name; `stage` names which of the
+/// two checks (in staging, after publication) is reporting.
+#[cfg(unix)]
+fn confirm_socket_identity(
+    path: &Path,
+    expected_mode: u32,
+    stage: &str,
+) -> Result<(u64, u64), WorkloadApiListenerError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let effective_uid = unsafe { libc::geteuid() };
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        WorkloadApiListenerError::Io(format!(
+            "cannot confirm the Workload API socket at '{}' ({stage}): {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_socket() {
         return Err(WorkloadApiListenerError::Io(format!(
-            "the socket at '{}' was replaced while its permissions were being set; refusing to \
-             serve it",
+            "'{}' is not a socket ({stage}); refusing to serve an endpoint whose on-disk identity \
+             cannot be established",
             path.display()
         )));
     }
-    if mode_after != expected_mode {
+    if metadata.uid() != effective_uid {
         return Err(WorkloadApiListenerError::Io(format!(
-            "the socket at '{}' does not carry the configured mode {expected_mode:#o}; refusing \
-             to serve an endpoint whose permissions cannot be confirmed",
+            "the artifact at '{}' is owned by another user ({stage}); it is not the socket this \
+             process created",
             path.display()
         )));
     }
-    Ok((dev, ino))
+    if metadata.mode() & 0o777 != expected_mode {
+        return Err(WorkloadApiListenerError::Io(format!(
+            "the socket at '{}' does not carry the configured mode {expected_mode:#o} ({stage}); \
+             refusing to serve an endpoint whose permissions cannot be confirmed",
+            path.display()
+        )));
+    }
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 /// Remove the artifact at `path` only if it is a socket owned by this process.
 ///
-/// Used on the bind-failure rollback, where there is no confirmed identity to
-/// compare against. Ownership plus file-type is the strongest check available
-/// there, and it still refuses to delete another user's data or a non-socket.
+/// Used for staging teardown, where there is no confirmed identity to compare
+/// against. Ownership plus file-type is the strongest check available there, and
+/// it still refuses to delete another user's data or a non-socket.
 #[cfg(unix)]
 fn remove_self_owned_socket_best_effort(path: &Path) {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -509,28 +759,63 @@ fn remove_self_owned_socket_best_effort(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// `(device, inode)` of the socket at `path`, when it exists.
+/// `(device, inode)` of the object at `path`, but **only** when it is still a
+/// socket owned by this process's effective uid.
+///
+/// Type and ownership are part of the identity rather than a separate check:
+/// inode numbers are reused, so a regular file that happens to land on the
+/// freed inode would otherwise satisfy a device+inode-only predicate and be
+/// unlinked as if it were our socket.
 #[cfg(unix)]
-fn socket_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
+fn owned_socket_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = std::fs::symlink_metadata(path).ok()?;
-    Some((metadata.dev(), metadata.ino()))
+    let identity = (metadata.dev(), metadata.ino());
+    let effective_uid = unsafe { libc::geteuid() };
+    // `identity` as its own "recorded" value reduces the predicate to exactly
+    // the type + ownership half here; the caller compares the pair.
+    matches_bound_socket_identity(
+        metadata.file_type().is_socket(),
+        metadata.uid(),
+        identity,
+        effective_uid,
+        identity,
+    )
+    .then_some(identity)
 }
 
 #[cfg(not(unix))]
-fn socket_identity(_path: &Path) -> Option<(u64, u64)> {
+fn owned_socket_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Unlink the socket at `path` only when it is still the exact inode we bound.
+/// Whether an observed on-disk object is the **exact socket** recorded as bound.
+///
+/// Separated from the filesystem so the policy can be exercised over shapes a
+/// test cannot force on disk — notably inode reuse, where a regular file lands
+/// on the number a deleted socket freed. `(device, inode)` alone is an
+/// incomplete identity precisely because inode numbers are recycled; type and
+/// ownership are part of what "our socket" means, not extra checks alongside it.
+pub fn matches_bound_socket_identity(
+    is_socket: bool,
+    uid: u32,
+    identity: (u64, u64),
+    effective_uid: u32,
+    bound_identity: (u64, u64),
+) -> bool {
+    is_socket && uid == effective_uid && identity == bound_identity
+}
+
+/// Unlink the socket at `path` only when it is still the exact socket we bound.
 #[cfg(unix)]
 fn cleanup_owned_socket(path: &Path, bound_identity: Option<(u64, u64)>) {
     let Some(bound_identity) = bound_identity else {
         return;
     };
-    if socket_identity(path) != Some(bound_identity) {
-        // Somebody else's socket (or nothing) is here now. Removing it would be
-        // destructive to a process that legitimately took over the path.
+    if owned_socket_identity(path) != Some(bound_identity) {
+        // Somebody else's socket (or nothing, or an object of another type) is
+        // here now. Removing it would be destructive to a process that
+        // legitimately took over the path.
         return;
     }
     if let Err(error) = std::fs::remove_file(path)
@@ -547,15 +832,61 @@ fn cleanup_owned_socket(path: &Path, bound_identity: Option<(u64, u64)>) {
 #[cfg(not(unix))]
 fn cleanup_owned_socket(_path: &Path, _bound_identity: Option<(u64, u64)>) {}
 
-/// Remove a leftover socket from a previous run, and only that.
+/// What a `connect(2)` probe learned about an existing socket at the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketLiveness {
+    /// A connection succeeded: something is listening right now.
+    Live,
+    /// The kernel reported that nobody is listening (`ECONNREFUSED`) or that the
+    /// name has since vanished. Only this verdict admits an unlink.
+    NotListening,
+    /// The probe could not decide — `EACCES`, a full backlog, a timeout, any
+    /// other error. Fail closed.
+    Undetermined,
+}
+
+/// Probe whether an existing socket path has a live listener behind it.
+///
+/// Exposed so the *policy* can be tested directly. The kernel error kind is the
+/// only evidence available: `ECONNREFUSED` is the definitive "the inode exists
+/// but no process has it bound and listening" signal a crashed predecessor
+/// leaves behind, and everything else is either a live listener or an answer we
+/// did not get.
+pub fn classify_connect_result(result: &io::Result<()>) -> SocketLiveness {
+    match result {
+        Ok(()) => SocketLiveness::Live,
+        Err(error) => match error.kind() {
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => {
+                SocketLiveness::NotListening
+            }
+            _ => SocketLiveness::Undetermined,
+        },
+    }
+}
+
+/// Attempt a Unix-domain connection to `path` and classify the outcome.
+#[cfg(unix)]
+fn probe_existing_socket(path: &Path) -> SocketLiveness {
+    let result = std::os::unix::net::UnixStream::connect(path).map(|stream| {
+        // Close immediately: the probe is the connection, not anything on it.
+        drop(stream);
+    });
+    classify_connect_result(&result)
+}
+
+/// Refuse a live endpoint, and remove a leftover socket from a previous run.
 ///
 /// A crashed process leaves its socket behind and `bind` would fail with
-/// `EADDRINUSE`, so a stale artifact has to be cleared. It is cleared only when
-/// it is a socket owned by this process's effective uid: a regular file, a
-/// directory, a symlink, or another user's socket is refused outright rather
-/// than deleted.
+/// `EADDRINUSE`, so a stale artifact has to be cleared. Ownership alone is not
+/// evidence of staleness — a second Ferrum process running as the same uid would
+/// otherwise unlink a *live* peer's socket and take over the path workloads dial
+/// for their identity — so liveness is established positively with a real
+/// `connect(2)`, and anything the probe cannot decide fails closed.
+///
+/// A regular file, a directory, a symlink, or another user's socket is refused
+/// outright rather than deleted.
 #[cfg(unix)]
-fn remove_owned_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError> {
+fn refuse_live_or_clear_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let metadata = match std::fs::symlink_metadata(path) {
@@ -590,12 +921,57 @@ fn remove_owned_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError
             path.display()
         )));
     }
-    std::fs::remove_file(path).map_err(|error| {
-        WorkloadApiListenerError::Socket(format!(
-            "cannot remove the stale socket at '{}': {error}",
-            path.display()
-        ))
-    })?;
+
+    match probe_existing_socket(path) {
+        SocketLiveness::Live => {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "'{}' is a SPIFFE Workload API socket that is currently LIVE — another process is \
+                 listening on it. Refusing to unlink it and take over the endpoint workloads dial \
+                 for their identity; stop that process or configure a different \
+                 FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                path.display()
+            )));
+        }
+        SocketLiveness::Undetermined => {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "'{}' is an existing socket whose liveness could not be determined; refusing to \
+                 unlink a socket that may still be serving workloads",
+                path.display()
+            )));
+        }
+        SocketLiveness::NotListening => {}
+    }
+
+    // Re-check the exact identity immediately before the unlink: between the
+    // stat above and here a successor may have replaced the path, and deleting
+    // *that* is the destructive act the probe exists to prevent.
+    let probed_identity = (metadata.dev(), metadata.ino());
+    match owned_socket_identity(path) {
+        None => {
+            // Gone (or no longer ours) — nothing of ours to remove, and nothing
+            // we are entitled to remove either.
+            return Ok(());
+        }
+        Some(identity) if identity != probed_identity => {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "the socket at '{}' was replaced while it was being checked; refusing to unlink \
+                 the replacement",
+                path.display()
+            )));
+        }
+        Some(_) => {}
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "cannot remove the stale socket at '{}': {error}",
+                path.display()
+            )));
+        }
+    }
     warn!(
         socket = %path.display(),
         "removed a stale SPIFFE Workload API socket left by a previous run"
@@ -604,7 +980,7 @@ fn remove_owned_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError
 }
 
 #[cfg(not(unix))]
-fn remove_owned_stale_socket(_path: &Path) -> Result<(), WorkloadApiListenerError> {
+fn refuse_live_or_clear_stale_socket(_path: &Path) -> Result<(), WorkloadApiListenerError> {
     Err(WorkloadApiListenerError::Unsupported)
 }
 

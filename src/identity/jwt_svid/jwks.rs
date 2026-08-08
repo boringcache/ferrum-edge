@@ -16,7 +16,7 @@
 //! |---|---|
 //! | EC P-256 (`prime256v1`) | `ES256` |
 //! | EC P-384 (`secp384r1`) | `ES384` |
-//! | RSA ≥ 2048 bit | `RS256` `RS384` `RS512` `PS256` `PS384` `PS512` |
+//! | RSA 2048–8192 bit | `RS256` `RS384` `RS512` `PS256` `PS384` `PS512` |
 //!
 //! Everything else — EC P-521 (no `jsonwebtoken` verifier), other curves,
 //! Ed25519, DSA, GOST, unknown SPKI — is refused rather than guessed at, and
@@ -43,6 +43,34 @@
 //! produce. A **malformed** policy member is a rejection, never a fall-through
 //! to "unspecified" — a bundle that says something Ferrum cannot parse must not
 //! be trusted as if it had said nothing.
+//!
+//! ## Cryptographic admission
+//!
+//! Shape is not strength, and shape is not membership. Both are checked on
+//! *every* path — externally supplied JWK, PEM/SPKI, and verification-key
+//! construction — before an authority is published in `FetchJWTBundles` or used
+//! to build a `DecodingKey`:
+//!
+//! - an **RSA modulus** is bounded by its *significant* bit length,
+//!   `2048..=8192`. A byte-count floor is not the same test: 256 bytes with a
+//!   small top byte is a 2041-bit key, and leading zero octets add nothing.
+//! - an **RSA public exponent** must be odd and at least 3, within a bounded
+//!   encoding. `0` and `1` are not exponents and an even value cannot be coprime
+//!   with φ(n); real keys are 65537.
+//! - externally supplied RSA `n` / `e` must additionally be **canonical**
+//!   unsigned big-endian (RFC 7518 §6.3.1) — no leading zero octet. DER
+//!   re-encoding would otherwise normalize a non-canonical member silently and
+//!   let one key be published under two thumbprints.
+//! - an **EC point** must actually lie on its named curve and not be the
+//!   identity. An OID, an uncompressed marker, and correctly sized coordinates
+//!   describe an off-curve point just as happily, and republishing one in
+//!   `FetchJWTBundles` would hand every workload a bogus authority. Membership is
+//!   proven with a bounded ephemeral ECDH agreement at the provider seam
+//!   ([`crate::fips::ec_point_on_named_curve`]), so the arithmetic stays on the
+//!   *selected* provider — `ring` on an ordinary build, the AWS-LC FIPS module on
+//!   a `fips` build — rather than on a second, unrouted implementation.
+//!
+//! Every rejection is a fixed string; no key bytes ever reach an error.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -64,11 +92,24 @@ const PEM_PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
 /// Maximum accepted SPKI DER size. An SPKI for the key types we support is a
 /// few hundred bytes; RSA-8192 is the practical ceiling.
 const MAX_SPKI_DER_BYTES: usize = 4 * 1024;
-/// Minimum accepted RSA modulus size in bytes (2048 bit).
-const MIN_RSA_MODULUS_BYTES: usize = 256;
+/// Minimum accepted RSA modulus size, in **significant** bits.
+///
+/// Measured in bits rather than bytes on purpose. A byte-length floor of 256
+/// admits a 2041-bit modulus whose top byte happens to be small, and leading
+/// zero bytes never contribute strength at all — so the check is performed on
+/// the significant bit length after stripping them.
+const MIN_RSA_MODULUS_BITS: u32 = 2048;
+/// Maximum accepted RSA modulus size, in significant bits. The module documents
+/// RSA-8192 as its ceiling; without an explicit bound a bundle could publish an
+/// arbitrarily large modulus and make every verification attempt expensive.
+const MAX_RSA_MODULUS_BITS: u32 = 8192;
 /// Maximum accepted RSA public exponent size. Real exponents are 3 bytes
 /// (`65537`); a large one is a malformed or hostile JWK.
 const MAX_RSA_EXPONENT_BYTES: usize = 8;
+/// Smallest RSA public exponent that is not trivially broken. `0`/`1` are not
+/// exponents at all and `2` is even (so not coprime with φ(n)); RFC 8017 and
+/// SP 800-56B put the floor at 3, and every real key uses 65537.
+const MIN_RSA_PUBLIC_EXPONENT: u64 = 3;
 
 /// DER content bytes of the named-curve OIDs we accept.
 /// `1.2.840.10045.3.1.7` — NIST P-256 / prime256v1.
@@ -493,22 +534,24 @@ fn spki_pem_from_jwk(jwk: &Map<String, Value>) -> Result<String, JwtSvidError> {
                 der_sequence(&[algorithm, der_bit_string(&point)])
             }
             "RSA" => {
-                // `n` / `e` are unsigned big-endian with no leading zeros
-                // (RFC 7518 §6.3.1). The modulus bound is re-checked by
-                // `jwk_public_key` after the round trip; checking the raw length
-                // here keeps an oversized member from being DER-encoded at all.
-                let modulus = jwk_base64url_bounded(jwk, "n", MAX_SPKI_DER_BYTES)?;
+                // `n` / `e` are unsigned big-endian **with no leading zero
+                // octet** (RFC 7518 §6.3.1). Enforced rather than tolerated: DER
+                // re-encoding strips leading zeros, so a non-canonical member
+                // would be silently normalized and the same key could then be
+                // published under two different thumbprints. Bounding the raw
+                // members here also keeps an oversized one from being
+                // DER-encoded at all; `jwk_public_key` re-checks the resulting
+                // key after the round trip.
+                let modulus =
+                    jwk_base64url_bounded(jwk, "n", (MAX_RSA_MODULUS_BITS / 8) as usize)?;
                 let exponent = jwk_base64url_bounded(jwk, "e", MAX_RSA_EXPONENT_BYTES)?;
-                if modulus.len() < MIN_RSA_MODULUS_BYTES {
+                if modulus.first() == Some(&0) || exponent.first() == Some(&0) {
                     return Err(JwtSvidError::InvalidAuthority(
-                        "JWT authority RSA public key is smaller than 2048 bits",
+                        "JWT bundle JWKS RSA member is not a canonical unsigned big-endian value",
                     ));
                 }
-                if exponent.is_empty() {
-                    return Err(JwtSvidError::InvalidAuthority(
-                        "JWT authority RSA public key has an empty exponent",
-                    ));
-                }
+                check_rsa_modulus(&modulus)?;
+                check_rsa_exponent(&exponent)?;
                 let rsa_public_key = der_sequence(&[
                     der_positive_integer(&modulus),
                     der_positive_integer(&exponent),
@@ -826,6 +869,11 @@ fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
                     "JWT authority EC public key is not an uncompressed point of the named curve",
                 ));
             }
+            // Shape is not membership: an OID, an uncompressed marker, and two
+            // correctly sized coordinates describe a point that need not lie on
+            // the curve at all. Prove it does before the key is published or
+            // used to build a verifier.
+            check_ec_point_on_curve(&curve, data)?;
             let (x, y) = data[1..].split_at(curve.coordinate_bytes);
             Ok(JwkPublicKey {
                 kty: "EC",
@@ -841,16 +889,8 @@ fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
         PublicKey::RSA(rsa) => {
             let modulus = strip_leading_zeros(rsa.modulus);
             let exponent = strip_leading_zeros(rsa.exponent);
-            if modulus.len() < MIN_RSA_MODULUS_BYTES {
-                return Err(JwtSvidError::InvalidAuthority(
-                    "JWT authority RSA public key is smaller than 2048 bits",
-                ));
-            }
-            if exponent.is_empty() {
-                return Err(JwtSvidError::InvalidAuthority(
-                    "JWT authority RSA public key has an empty exponent",
-                ));
-            }
+            check_rsa_modulus(modulus)?;
+            check_rsa_exponent(exponent)?;
             Ok(JwkPublicKey {
                 kty: "RSA",
                 members: vec![
@@ -870,6 +910,103 @@ fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
         }
         _ => Err(JwtSvidError::InvalidAuthority(
             "unsupported JWT authority key type",
+        )),
+    }
+}
+
+/// Significant bit length of an unsigned big-endian integer, ignoring leading
+/// zero bytes. `0` for a zero (or empty) value.
+fn significant_bit_length(unsigned_be: &[u8]) -> u32 {
+    let significant = strip_leading_zeros(unsigned_be);
+    match significant.first() {
+        None => 0,
+        // `strip_leading_zeros` guarantees a nonzero first byte, so
+        // `leading_zeros()` is at most 7 and the subtraction cannot underflow.
+        Some(first) => (significant.len() as u32 - 1) * 8 + (8 - first.leading_zeros()),
+    }
+}
+
+/// Admit an RSA modulus only inside the documented `2048..=8192` significant-bit
+/// range.
+///
+/// A byte-length floor is not equivalent: 256 bytes whose top byte is `0x01`
+/// carries 2041 significant bits, which is weaker than the module claims to
+/// accept, and leading zero bytes contribute nothing at all. The upper bound is
+/// enforced for the same reason it is documented — an unbounded modulus makes
+/// every verification against that authority arbitrarily expensive.
+fn check_rsa_modulus(modulus: &[u8]) -> Result<(), JwtSvidError> {
+    let bits = significant_bit_length(modulus);
+    if bits < MIN_RSA_MODULUS_BITS {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority RSA public key is smaller than 2048 significant bits",
+        ));
+    }
+    if bits > MAX_RSA_MODULUS_BITS {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority RSA public key is larger than the 8192-bit ceiling",
+        ));
+    }
+    Ok(())
+}
+
+/// Admit an RSA public exponent only when it is odd and at least 3.
+///
+/// `0`, `1`, and `2` are not usable RSA exponents (`1` is the identity and an
+/// even exponent cannot be coprime with φ(n)), and an even exponent generally is
+/// a malformed or hostile JWK rather than an unusual key. The size bound is
+/// applied by the caller before this runs, which is what makes the `u64`
+/// conversion below total.
+fn check_rsa_exponent(exponent: &[u8]) -> Result<(), JwtSvidError> {
+    let significant = strip_leading_zeros(exponent);
+    if significant.is_empty() || significant.len() > MAX_RSA_EXPONENT_BYTES {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority RSA public exponent is empty or oversized",
+        ));
+    }
+    let mut value: u64 = 0;
+    for byte in significant {
+        value = (value << 8) | u64::from(*byte);
+    }
+    if value < MIN_RSA_PUBLIC_EXPONENT || value % 2 == 0 {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority RSA public exponent must be an odd value of at least 3",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove an uncompressed SEC1 point really lies on its named curve, and is not
+/// the identity.
+///
+/// Delegated to [`crate::fips::ec_point_on_named_curve`], the provider seam: a
+/// bounded ephemeral ECDH agreement whose shared secret is discarded, because
+/// both backends validate the peer public key (SEC1 §3.2.2) as part of accepting
+/// it and neither exposes that validation on its own. Routing it through the
+/// seam keeps the arithmetic on the *selected* provider — `ring` on an ordinary
+/// build, the AWS-LC FIPS module on a `fips` build — instead of adding a second,
+/// unrouted elliptic implementation on a trust-admission path.
+///
+/// An **unavailable** check is a failure, never an acceptance, and no error
+/// carries any key bytes.
+fn check_ec_point_on_curve(curve: &EcCurve, point: &[u8]) -> Result<(), JwtSvidError> {
+    use crate::fips::{EcPointCheck, backend::agreement, ec_point_on_named_curve};
+
+    let algorithm = match curve.jwk_name {
+        "P-256" => &agreement::ECDH_P256,
+        "P-384" => &agreement::ECDH_P384,
+        _ => {
+            return Err(JwtSvidError::InvalidAuthority(
+                "unsupported JWT authority EC curve",
+            ));
+        }
+    };
+    match ec_point_on_named_curve(algorithm, point) {
+        EcPointCheck::OnCurve => Ok(()),
+        EcPointCheck::Invalid => Err(JwtSvidError::InvalidAuthority(
+            "JWT authority EC public key is not a valid point on its named curve",
+        )),
+        EcPointCheck::Unavailable => Err(JwtSvidError::Internal(
+            "EC public-key validation could not be performed".to_string(),
         )),
     }
 }

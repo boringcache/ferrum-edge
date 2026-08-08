@@ -17,7 +17,14 @@
 //!   validates against a *new* instance built from the same configured signing
 //!   material;
 //! - **shutdown cleanup** — the socket artifact Ferrum created is unlinked, and
-//!   a foreign artifact at the same path is refused rather than clobbered.
+//!   a foreign artifact at the same path is refused rather than clobbered;
+//! - **no take-over of a live endpoint** — a second start against a socket that
+//!   is still serving is refused (ownership was never evidence of staleness),
+//!   while a genuinely stale socket with no listener is still cleared;
+//! - **publication without global state** — the process umask is untouched and
+//!   no staging artifact survives;
+//! - **termination signalling** — the seam mesh mode uses to notice that its
+//!   identity endpoint has gone away.
 //!
 //! Everything runs on the ordinary hosted CI runner: a Unix socket in a
 //! per-test temp directory, no root, no network.
@@ -630,17 +637,22 @@ async fn two_replicas_on_one_configuration_validate_each_others_tokens() {
 #[tokio::test]
 async fn the_bound_socket_carries_the_configured_mode_and_is_owned_by_this_process() {
     // The bound identity Ferrum verifies before serving: a socket, owned by this
-    // process, at exactly the configured mode. The mode is applied through the
-    // umask at `bind` and then VERIFIED, so a permissive ambient umask can
-    // neither widen the endpoint nor be served un-narrowed. (This asserts the
-    // end state; the umask here is process-global and other tests in this
-    // binary bind concurrently, so it is not a proof about the intermediate
-    // window — the module contract covers that.)
+    // process, at exactly the configured mode.
+    //
+    // Ferrum never touches the process umask — it binds inside a private 0700
+    // staging directory, sets and verifies the mode there, and renames the inode
+    // into place — so a permissive ambient umask must neither widen the endpoint
+    // nor be observable in the published artifact. The umask is set to 0o000
+    // here to prove exactly that: it is the state that WOULD have leaked through
+    // if publication depended on it.
     let previous = unsafe { libc::umask(0o000) };
     let harness = Harness::start("mode", &signing_key_pem()).await;
-    unsafe {
-        libc::umask(previous);
-    }
+    let umask_after_bind = unsafe { libc::umask(previous) };
+    assert_eq!(
+        umask_after_bind, 0o000,
+        "publishing the socket must not mutate the process umask; it is global state that other \
+         already-running runtime tasks create files under"
+    );
 
     let metadata = std::fs::symlink_metadata(&harness.path).expect("socket exists after bind");
     {
@@ -726,4 +738,172 @@ async fn a_socket_path_under_an_untrusted_ancestor_is_refused_before_bind() {
     );
 
     let _ = std::fs::remove_dir_all(&ancestor);
+}
+
+#[tokio::test]
+async fn a_second_start_refuses_a_live_same_uid_socket_and_leaves_it_serving() {
+    // The take-over race. Ownership was never evidence of staleness: two Ferrum
+    // processes run as the same uid, so an owner-only check let the second one
+    // unlink the first one's LIVE Workload API socket and become the endpoint
+    // workloads dial for their identity. Liveness is now proven with a real
+    // connect(2), and a live socket fails startup.
+    use std::os::unix::fs::MetadataExt;
+
+    let first = Harness::start("live", &signing_key_pem()).await;
+    let path = first.path.clone();
+    let inode_before = std::fs::symlink_metadata(&path)
+        .expect("the first server's socket exists")
+        .ino();
+
+    let ca = internal_ca_with_jwt_key(&signing_key_pem());
+    let service = WorkloadApiService::new(
+        vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
+        ca as Arc<dyn CertificateAuthority>,
+        trust_domain(),
+        600,
+    );
+    let socket = WorkloadApiSocketConfig::from_parts(path.clone(), "0660").expect("mode parses");
+    let refused = serve_workload_api(service, socket)
+        .await
+        .expect_err("a LIVE same-uid socket must not be taken over");
+    assert!(
+        refused.to_string().contains("LIVE"),
+        "unexpected refusal reason: {refused}"
+    );
+
+    // The first server owns the same inode at the same path and still answers.
+    assert_eq!(
+        std::fs::symlink_metadata(&path)
+            .expect("the live socket survives the refused start")
+            .ino(),
+        inode_before,
+        "the refused start must not have unlinked or replaced the live socket"
+    );
+    let mut client = connect(&path).await;
+    let minted = client
+        .fetch_jwtsvid(workload_request(JwtsvidRequest {
+            audience: vec!["spiffe://audience.test/api".to_string()],
+            spiffe_id: String::new(),
+        }))
+        .await
+        .expect("the original server is still serving on its socket")
+        .into_inner();
+    assert_eq!(minted.svids[0].spiffe_id, workload_id().as_str());
+
+    drop(client);
+    first.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_socket_with_no_listener_is_still_cleared() {
+    // The other half of the same contract: a crashed predecessor leaves a socket
+    // inode behind with nothing bound to it, `bind` would fail EADDRINUSE, and
+    // that case must still start. Dropping a std listener leaves the file on
+    // disk without a listener, which is exactly the crashed-run shape.
+    let path = socket_path("stale");
+    let leftover =
+        std::os::unix::net::UnixListener::bind(&path).expect("test can bind a leftover socket");
+    drop(leftover);
+    assert!(path.exists(), "the leftover socket file remains on disk");
+
+    let ca = internal_ca_with_jwt_key(&signing_key_pem());
+    let service = WorkloadApiService::new(
+        vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
+        ca as Arc<dyn CertificateAuthority>,
+        trust_domain(),
+        600,
+    );
+    let socket = WorkloadApiSocketConfig::from_parts(path.clone(), "0660").expect("mode parses");
+    let listener = serve_workload_api(service, socket)
+        .await
+        .expect("a genuinely stale socket is cleared and rebound");
+
+    let mut client = connect(&path).await;
+    client
+        .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+        .await
+        .expect("the newly bound server serves");
+    drop(client);
+    listener.shutdown().await;
+    assert!(!path.exists(), "shutdown unlinks the socket it created");
+}
+
+#[tokio::test]
+async fn publication_leaves_no_staging_artifact_behind() {
+    // The socket is bound inside a private 0700 staging directory and renamed
+    // into place, so the parent directory must hold exactly the published socket
+    // afterwards — no `.fw-*` directory, no half-published inode.
+    let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_nanos();
+    let parent = base.join(format!("fe-wl-stg-{}", unique % 1_000_000_000));
+    std::fs::create_dir(&parent).expect("create the socket's parent directory");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod parent");
+    }
+    let path = parent.join("api.sock");
+
+    let ca = internal_ca_with_jwt_key(&signing_key_pem());
+    let service = WorkloadApiService::new(
+        vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
+        ca as Arc<dyn CertificateAuthority>,
+        trust_domain(),
+        600,
+    );
+    let socket = WorkloadApiSocketConfig::from_parts(path.clone(), "0660").expect("mode parses");
+    let listener = serve_workload_api(service, socket)
+        .await
+        .expect("the listener binds and publishes");
+
+    let entries: Vec<String> = std::fs::read_dir(&parent)
+        .expect("the parent directory is readable")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec!["api.sock".to_string()],
+        "publication must leave only the socket behind, no staging directory"
+    );
+
+    listener.shutdown().await;
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[tokio::test]
+async fn the_termination_signal_fires_when_the_serve_task_ends() {
+    // The seam mesh mode observes: the serve task is spawned, so without a
+    // published termination the runtime would keep serving traffic after the
+    // identity endpoint had silently disappeared. The signal is set by a drop
+    // guard inside the task, which is what makes it survive a panic unwind as
+    // well as a clean return.
+    let harness = Harness::start("term", &signing_key_pem()).await;
+    let mut terminated = harness.listener.termination_signal();
+    assert!(
+        !*terminated.borrow(),
+        "a serving listener must not report termination"
+    );
+
+    harness.listener.shutdown().await;
+
+    // A requested shutdown publishes the same signal; distinguishing it from a
+    // fault is the observer's job (mesh checks its shared shutdown flag first).
+    tokio::time::timeout(std::time::Duration::from_secs(5), terminated.changed())
+        .await
+        .expect("the termination signal is published promptly")
+        .expect("the sender outlives the serve task until it fires");
+    assert!(*terminated.borrow(), "the serve task reported termination");
+    assert!(
+        !harness.path.exists(),
+        "the socket artifact is cleaned up by the same guard"
+    );
 }
