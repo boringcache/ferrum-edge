@@ -545,27 +545,51 @@ complete reports failure instead of success (see
 | Workload | Runs | Access | Bound |
 |---|---|---|---|
 | `ferrum-cni-installer` (init container) | at pod start | rw on both host dirs + socket dir | Writes exactly two paths: `<hostBinDir>/ferrum-cni` and the configured conflist name. Reads neighbouring configs only to copy the primary's plugin list; never modifies one. |
-| `ferrum-cni-rollback` (native sidecar) | until readiness or the deadline | rw on both host dirs, read on the socket | May remove only artifacts carrying this release's owner **and** this pod's generation. |
-| `ferrum-mesh-cni-cleanup` (pre-delete hook DaemonSet) | during `helm uninstall` | rw on both host dirs | May remove only artifacts carrying this release's owner. No ServiceAccount token, no RBAC, no Kubernetes API access. |
+| `ferrum-cni-rollback` (native sidecar) | from this generation's publication until readiness or the deadline | rw on both host dirs, read on the socket | May remove only artifacts carrying this release's owner **and** this pod's generation. Its readiness budget does not start until this generation's own conflist is observed on disk, and cleanup holds the node lifecycle lock, so it cannot act against an install that is still running. |
+| `ferrum-mesh-cni-cleanup` (pre-delete hook DaemonSet) | during `helm uninstall` | rw on both host dirs | May remove only artifacts carrying this release's owner. No ServiceAccount token, no RBAC, no Kubernetes API access. Runs `hostNetwork: true`, because a pod needing its own CNI sandbox could not start on a node whose chain is broken. |
 | `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role is a single rule: `get` on `daemonsets`/`daemonsets/status` with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup. |
 
 Removal is gated on evidence written at install time, never on a path guess:
 
 - The conflist must carry `managedBy: ferrum-edge` inside its own `ferrum-cni`
   plugin entry, and its `owner`/`generation` must match the run's scope.
-- The binary is removed only when the sibling ownership manifest's recorded
-  SHA-256 matches the bytes on disk, and never while any configuration still
-  chains to it.
+- `<hostBinDir>/ferrum-cni` is a **shared** executable, so it is removed only
+  when all of the following hold: this run's chain is gone, no remaining
+  `.conf`/`.conflist`/`.json` in the directory still names the `ferrum-cni`
+  plugin type, the sibling ownership manifest names *these exact* artifacts
+  (`confFileName` / `binaryFileName`), and the manifest's recorded SHA-256
+  matches the bytes on disk. A directory that could not be fully scanned, or
+  manifest evidence bound to different file names, keeps the binary. Retaining
+  an unreferenced executable is inert; deleting one another release still
+  chains to is not.
 - The configured file name is validated as a single path component, so `..`
   or an embedded separator can never redirect a delete out of the directory.
-- Artifacts are opened with `O_NOFOLLOW`, and symlinks, hard-linked files,
-  non-regular files, and oversized files are refused rather than removed —
-  closing the "swap a symlink into the configured name and let root delete an
-  arbitrary path" class.
+- Artifacts are opened with `O_NOFOLLOW` and classified against the **open
+  handle** (regular file, single link, plausible size). Reads are capped in
+  bytes independently of the pre-read length, and the binary is hashed through
+  the same handle it was classified on, so the digest that authorizes a
+  removal is the digest of the object being removed. Removal re-opens the path
+  `O_NOFOLLOW` and refuses unless the device/inode still matches. Symlinks,
+  hard-linked files, non-regular files, and oversized files are refused rather
+  than removed.
+- Temporary files are created `O_EXCL | O_NOFOLLOW` at mode `0600` under an
+  unpredictable name in the destination directory, so a pre-planted symlink or
+  file at a guessable path cannot be followed or truncated by a root process.
+- Every mutating run — install and cleanup alike — holds an exclusive `flock`
+  on `/etc/cni/net.d/.ferrum-cni-install.lock` for its whole duration, so two
+  Ferrum lifecycle steps on one node can never interleave.
 - Ownership tokens are bounded to 128 bytes of `[A-Za-z0-9._:/@#-]`, so
   nothing operator-supplied reaches the filesystem or a log line unchecked.
   Cleanup diagnostics report fixed reason strings and operator-configured
   paths only; file contents are never echoed.
+
+**What this does not claim.** The final `unlink` is still by pathname. The
+lock removes that race between Ferrum's own processes, and the identity
+re-check refuses every swap that lands before it, but against a third party
+with write access to a root-owned host CNI directory the window is narrowed,
+not closed — and such a party can already replace the primary CNI
+configuration outright. The bound that matters is the evidence gate above:
+anything Ferrum cannot prove it owns is retained and reported, never removed.
 
 Everything else in the directory — the primary CNI's config, another
 meta-plugin's config, another Ferrum release's chain — is retained and

@@ -524,6 +524,13 @@ nodeAgent:
       # above worst-case node-agent start (image pull, bpffs mount, initial
       # pod relist) so a healthy slow start is never rolled back.
       readyTimeoutSeconds: 300
+      # Budget for this pod's own installer to publish its chained conflist.
+      # The readiness budget above starts only once that file is observed on
+      # disk carrying this generation's ownership marker, so the watcher can
+      # never delete state an installer is still publishing. Exceeding this
+      # budget means no chain was ever installed by this pod — nothing to roll
+      # back — and the watcher exits non-zero saying exactly that.
+      publishTimeoutSeconds: 300
       pollIntervalSeconds: 5
     # Cleanup on `helm uninstall`.
     #

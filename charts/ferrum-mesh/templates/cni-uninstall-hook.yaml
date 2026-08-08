@@ -145,6 +145,18 @@ spec:
         app.kubernetes.io/name: ferrum-mesh-cni-cleanup
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      {{- /*
+        hostNetwork is LOAD-BEARING, not a convenience. Cleanup runs exactly
+        when a chained ferrum-cni is on the node and its socket is about to
+        disappear (or already has), and a chained ADD fails closed. A pod that
+        needed its own CNI sandbox would therefore be stuck in
+        ContainerCreating behind the very chain it exists to remove — the hook
+        would deadlock on every node it is most needed. Pods with
+        hostNetwork: true skip CNI ADD entirely, exactly like the node-agent
+        DaemonSet this hook cleans up after.
+      */}}
+      hostNetwork: true
+      dnsPolicy: Default
       serviceAccountName: ferrum-mesh-cni-cleanup
       automountServiceAccountToken: false
       {{- with $uninstall.tolerations }}
@@ -237,6 +249,14 @@ spec:
         app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      {{- /*
+        Same reason as the cleanup DaemonSet: the wait Job has to be
+        schedulable on a node whose CNI chain is broken. It reaches the API
+        server through KUBERNETES_SERVICE_HOST (an IP), so it needs no cluster
+        DNS and keeps dnsPolicy: Default.
+      */}}
+      hostNetwork: true
+      dnsPolicy: Default
       serviceAccountName: ferrum-mesh-cni-cleanup-wait
       restartPolicy: Never
       securityContext:

@@ -1,0 +1,438 @@
+name: CNI Install Lifecycle Live
+
+# Live, hosted proof for issue #3609.
+#
+# The unit and integration suites drive `install` / `uninstall` /
+# `rollback-watch` against temporary directories. That proves the ownership
+# and filesystem logic but NOT the thing the issue is actually about: that a
+# chained `ferrum-cni` really does gate pod creation on a live node, and that
+# the rollback and uninstall paths really do give that node back.
+#
+# So this job creates a disposable two-node kind cluster and, on the WORKER
+# node only (the control plane is deliberately left clean so kubectl keeps
+# working throughout):
+#
+#   1. installs the chain with the real binary, in a real pod, against the
+#      cluster's real primary CNI configuration;
+#   2. injects the failure the issue describes — no node-agent, so no socket —
+#      and proves a new pod on that node is stuck in ContainerCreating;
+#   3. runs the real `rollback-watch` and proves the SAME pod recovers to
+#      Running once the chain is removed;
+#   4. reinstalls, runs the real `uninstall`, proves it is idempotent, proves
+#      the primary CNI configuration is byte-identical to what it was before
+#      any of this ran, and proves pod creation still works afterwards.
+#
+# Every lifecycle pod uses hostNetwork, because a pod that needed its own CNI
+# sandbox could not start on a node whose chain is broken — the same reason
+# the chart's cleanup hook is hostNetwork.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/cni-lifecycle-live.yml"
+      - ".github/actions/package-ferrum-runtime-image/**"
+      - ".github/actions/setup-kubernetes-tools/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "proto/**"
+      - "src/bin/ferrum-cni.rs"
+      - "src/cni/**"
+      - "charts/ferrum-mesh/templates/cni-uninstall-hook.yaml"
+      - "charts/ferrum-mesh/templates/node-agent-daemonset.yaml"
+      - "docs/node_agent.md"
+      - "docs/node_agent_security.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cni-lifecycle-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: cni-lifecycle-live
+  KIND_CLUSTER: ferrum-cni-lifecycle
+  OWNER_ID: ferrum/cni-lifecycle-live
+  INSTALL_GENERATION: live-generation-1
+  CONF_FILE_NAME: 00-ferrum.conflist
+
+jobs:
+  cni-lifecycle-live:
+    name: CNI install lifecycle live recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-cni-lifecycle-live"
+
+      - name: Build the ferrum-cni plugin binary
+        run: cargo build --profile pr-build --bin ferrum-cni
+
+      # The packaging action always lands the supplied binary at
+      # /app/ferrum-edge; every manifest below therefore invokes the CNI
+      # lifecycle CLI by that path. Reusing the shared action keeps the
+      # runtime base image pinned in exactly one place.
+      - name: Package the plugin binary into a runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-cni
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Create a disposable two-node kind cluster
+        run: |
+          set -euo pipefail
+          cat > kind-cni-lifecycle.yaml <<'YAML'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+          YAML
+          kind create cluster --name "$KIND_CLUSTER" --config kind-cni-lifecycle.yaml --wait 180s
+          kubectl get nodes -o wide
+
+      - name: Load the runtime image into the cluster
+        run: |
+          set -euo pipefail
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$KIND_CLUSTER"
+
+      - name: Capture the worker's untouched primary CNI configuration
+        id: primary
+        run: |
+          set -euo pipefail
+          worker="${KIND_CLUSTER}-worker"
+          # The primary config is whatever the cluster's own CNI dropped in.
+          # Discover it rather than assuming a kindnet filename or plugin type,
+          # so a kind image bump cannot silently turn this into a no-op.
+          primary_file="$(docker exec "$worker" sh -c \
+            'ls -1 /etc/cni/net.d | grep -E "\.conf(list)?$" | head -n1')"
+          if [ -z "$primary_file" ]; then
+            echo "::error title=No primary CNI config on the kind worker::cannot chain behind nothing"
+            exit 1
+          fi
+          docker exec "$worker" cat "/etc/cni/net.d/${primary_file}" > primary-before.json
+          chained_with="$(python3 -c 'import json; d = json.load(open("primary-before.json")); p = d.get("plugins"); print(p[0]["type"] if p else d["type"])')"
+          primary_sha="$(sha256sum primary-before.json | cut -d" " -f1)"
+          echo "file=$primary_file" >> "$GITHUB_OUTPUT"
+          echo "chained_with=$chained_with" >> "$GITHUB_OUTPUT"
+          echo "sha=$primary_sha" >> "$GITHUB_OUTPUT"
+          echo "Primary CNI config $primary_file (first plugin: $chained_with, sha256 $primary_sha)"
+
+      - name: Run the live install / fail-closed / rollback / uninstall lifecycle
+        env:
+          PRIMARY_FILE: ${{ steps.primary.outputs.file }}
+          CHAINED_WITH: ${{ steps.primary.outputs.chained_with }}
+          PRIMARY_SHA: ${{ steps.primary.outputs.sha }}
+        run: |
+          set -euo pipefail
+          worker="${KIND_CLUSTER}-worker"
+          image="${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}"
+
+          # Render one lifecycle Job. $1 = job name, $2 = ferrum-cni verb,
+          # $3.. = extra `name=value` env entries.
+          render_job() {
+            local name="$1" verb="$2"
+            shift 2
+            {
+              cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${name}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                # See the chart's cleanup hook: a pod that needed its own CNI
+                # sandbox could never start on a node whose chain is broken.
+                hostNetwork: true
+                dnsPolicy: Default
+                restartPolicy: Never
+                nodeSelector:
+                  kubernetes.io/hostname: ${worker}
+                containers:
+                  - name: ferrum-cni
+                    image: ${image}
+                    imagePullPolicy: Never
+                    command: ["/app/ferrum-edge", "${verb}"]
+                    securityContext:
+                      runAsUser: 0
+                      runAsGroup: 0
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: ["ALL"]
+                    env:
+                      - name: HOST_BIN_DIR
+                        value: /opt/cni/bin
+                      - name: HOST_CONF_DIR
+                        value: /etc/cni/net.d
+                      - name: HOST_SOCKET_DIR
+                        value: /var/run/ferrum
+                      - name: CONF_FILE_NAME
+                        value: ${CONF_FILE_NAME}
+          YAML
+              local pair
+              for pair in "$@"; do
+                printf '            - name: %s\n              value: "%s"\n' \
+                  "${pair%%=*}" "${pair#*=}"
+              done
+              cat <<'YAML'
+                    volumeMounts:
+                      - name: host-cni-bin
+                        mountPath: /opt/cni/bin
+                      - name: host-cni-conf
+                        mountPath: /etc/cni/net.d
+                      - name: host-socket
+                        mountPath: /var/run/ferrum
+                volumes:
+                  - name: host-cni-bin
+                    hostPath:
+                      path: /opt/cni/bin
+                      type: DirectoryOrCreate
+                  - name: host-cni-conf
+                    hostPath:
+                      path: /etc/cni/net.d
+                      type: DirectoryOrCreate
+                  - name: host-socket
+                    hostPath:
+                      path: /var/run/ferrum
+                      type: DirectoryOrCreate
+          YAML
+            }
+          }
+
+          # Run a lifecycle Job and return its container exit status. The
+          # rollback verb exits non-zero BY DESIGN, so the caller decides what
+          # a given exit code means rather than `set -e` deciding for it.
+          run_job() {
+            local name="$1"
+            shift
+            kubectl delete job "$name" --ignore-not-found --wait=true >/dev/null
+            render_job "$name" "$@" | kubectl apply -f -
+            local deadline=$((SECONDS + 300)) phase=""
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              phase="$(kubectl get pods -l "job-name=$name" \
+                -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+              case "$phase" in
+                Succeeded|Failed) break ;;
+              esac
+              sleep 3
+            done
+            echo "--- $name logs (phase=$phase) ---"
+            kubectl logs "job/$name" --all-containers --tail=200 || true
+            if [ "$phase" != "Succeeded" ] && [ "$phase" != "Failed" ]; then
+              kubectl describe "job/$name" || true
+              echo "::error title=Lifecycle job never terminated::$name stayed in phase '$phase'"
+              return 99
+            fi
+            [ "$phase" = "Succeeded" ]
+          }
+
+          on_worker() { docker exec "$worker" sh -c "$1"; }
+
+          assert_primary_untouched() {
+            docker exec "$worker" cat "/etc/cni/net.d/${PRIMARY_FILE}" > primary-now.json
+            local now
+            now="$(sha256sum primary-now.json | cut -d' ' -f1)"
+            if [ "$now" != "$PRIMARY_SHA" ]; then
+              echo "::error title=Primary CNI config was modified::$PRIMARY_FILE changed ($PRIMARY_SHA -> $now)"
+              diff -u primary-before.json primary-now.json || true
+              exit 1
+            fi
+          }
+
+          # ---------------------------------------------------------------
+          # 1. Install the chain with the real binary on a real node.
+          # ---------------------------------------------------------------
+          run_job cni-install install \
+            "CHAINED_WITH=${CHAINED_WITH}" \
+            "SOCKET_PATH=/var/run/ferrum/node-agent-cni.sock" \
+            "OWNER_ID=${OWNER_ID}" \
+            "INSTALL_GENERATION=${INSTALL_GENERATION}"
+          on_worker "cat /etc/cni/net.d/${CONF_FILE_NAME}"
+          on_worker "test -x /opt/cni/bin/ferrum-cni"
+          on_worker "grep -q 'ferrum-edge' /etc/cni/net.d/.ferrum-cni-owned.marker"
+          assert_primary_untouched
+
+          # ---------------------------------------------------------------
+          # 2. Failure injection: no node-agent, so no socket. A NEW pod on
+          #    this node must fail closed rather than start unenrolled.
+          # ---------------------------------------------------------------
+          on_worker "rm -f /var/run/ferrum/node-agent-cni.sock"
+          kubectl delete pod stuck-pod --ignore-not-found --wait=true >/dev/null
+          kubectl apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: stuck-pod
+            namespace: default
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: ${worker}
+            restartPolicy: Never
+            containers:
+              - name: pause
+                image: ${image}
+                imagePullPolicy: Never
+                command: ["/app/ferrum-edge", "uninstall-status"]
+          YAML
+          deadline=$((SECONDS + 90))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            phase="$(kubectl get pod stuck-pod -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            if [ "$phase" != "Pending" ]; then
+              break
+            fi
+            sleep 5
+          done
+          phase="$(kubectl get pod stuck-pod -o jsonpath='{.status.phase}')"
+          kubectl describe pod stuck-pod | tail -n 30
+          if [ "$phase" != "Pending" ]; then
+            echo "::error title=Chained ferrum-cni did not fail closed::a new pod reached phase '$phase' with no node-agent socket"
+            exit 1
+          fi
+          if ! kubectl describe pod stuck-pod | grep -qiE 'ferrum-cni|FailedCreatePodSandBox'; then
+            echo "::error title=Pod is Pending for the wrong reason::no ferrum-cni CNI error in the pod events"
+            exit 1
+          fi
+          echo "Confirmed live: with the chain installed and no node-agent, pod creation fails closed."
+
+          # ---------------------------------------------------------------
+          # 3. Recovery: the real rollback watcher removes THIS generation's
+          #    artifacts, and the stuck pod recovers on its own.
+          # ---------------------------------------------------------------
+          set +e
+          run_job cni-rollback rollback-watch \
+            "EXPECTED_OWNER=${OWNER_ID}" \
+            "EXPECTED_GENERATION=${INSTALL_GENERATION}" \
+            "SOCKET_PATH=/var/run/ferrum/node-agent-cni.sock" \
+            "PUBLISH_TIMEOUT_SECS=30" \
+            "READY_TIMEOUT_SECS=30" \
+            "POLL_INTERVAL_SECS=5"
+          rollback_status=$?
+          set -e
+          if [ "$rollback_status" -eq 99 ]; then
+            exit 1
+          fi
+          if [ "$rollback_status" -eq 0 ]; then
+            echo "::error title=Rollback reported success::a rollback that had to remove the chain must exit non-zero"
+            exit 1
+          fi
+          if on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"; then
+            echo "::error title=Rollback left the chained conflist behind::the node still depends on the node-agent"
+            exit 1
+          fi
+          assert_primary_untouched
+
+          deadline=$((SECONDS + 300))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            phase="$(kubectl get pod stuck-pod -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+              break
+            fi
+            sleep 5
+          done
+          phase="$(kubectl get pod stuck-pod -o jsonpath='{.status.phase}')"
+          if [ "$phase" = "Pending" ]; then
+            kubectl describe pod stuck-pod | tail -n 30
+            echo "::error title=Pod creation did not recover after rollback::stuck-pod is still Pending"
+            exit 1
+          fi
+          echo "Confirmed live: rollback restored pod creation on the node (stuck-pod reached '$phase')."
+
+          # ---------------------------------------------------------------
+          # 4. Reinstall, then the real uninstall path — twice, for
+          #    idempotency — and confirm the node is usable afterwards.
+          # ---------------------------------------------------------------
+          run_job cni-reinstall install \
+            "CHAINED_WITH=${CHAINED_WITH}" \
+            "SOCKET_PATH=/var/run/ferrum/node-agent-cni.sock" \
+            "OWNER_ID=${OWNER_ID}" \
+            "INSTALL_GENERATION=live-generation-2"
+          on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"
+
+          run_job cni-uninstall uninstall "EXPECTED_OWNER=${OWNER_ID}"
+          if on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"; then
+            echo "::error title=Uninstall left the chained conflist behind::helm uninstall would strand this node"
+            exit 1
+          fi
+          if on_worker "test -e /opt/cni/bin/ferrum-cni"; then
+            echo "::error title=Uninstall left the plugin binary behind::nothing references it, so it should have gone"
+            exit 1
+          fi
+          run_job cni-uninstall-repeat uninstall "EXPECTED_OWNER=${OWNER_ID}"
+          assert_primary_untouched
+
+          kubectl delete pod stuck-pod --ignore-not-found --wait=true >/dev/null
+          kubectl delete pod recovered-pod --ignore-not-found --wait=true >/dev/null
+          kubectl apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: recovered-pod
+            namespace: default
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: ${worker}
+            restartPolicy: Never
+            containers:
+              - name: pause
+                image: ${image}
+                imagePullPolicy: Never
+                command: ["/app/ferrum-edge", "uninstall-status"]
+          YAML
+          deadline=$((SECONDS + 180))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            phase="$(kubectl get pod recovered-pod -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            if [ "$phase" != "Pending" ] && [ -n "$phase" ]; then
+              break
+            fi
+            sleep 5
+          done
+          phase="$(kubectl get pod recovered-pod -o jsonpath='{.status.phase}')"
+          if [ "$phase" = "Pending" ]; then
+            kubectl describe pod recovered-pod | tail -n 30
+            echo "::error title=Pod creation still broken after uninstall::recovered-pod is Pending"
+            exit 1
+          fi
+          echo "Confirmed live: after uninstall the node creates pods normally (recovered-pod reached '$phase')."
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/cni-lifecycle-results"
+          mkdir -p "$results"
+          kubectl get nodes -o wide > "$results/nodes.txt" 2>&1
+          kubectl get pods -A -o wide > "$results/pods.txt" 2>&1
+          kubectl get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
+          kubectl describe pods > "$results/pods-describe.txt" 2>&1
+          for job in cni-install cni-rollback cni-reinstall cni-uninstall cni-uninstall-repeat; do
+            kubectl logs "job/$job" --all-containers --tail=500 > "$results/$job.log" 2>&1
+          done
+          docker exec "${KIND_CLUSTER}-worker" sh -c 'ls -la /etc/cni/net.d; ls -la /opt/cni/bin' \
+            > "$results/worker-cni-dirs.txt" 2>&1
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cni-lifecycle-live-diagnostics
+          path: cni-lifecycle-results
+          if-no-files-found: ignore
+
+      - name: Destroy the disposable cluster
+        if: always()
+        run: kind delete cluster --name "$KIND_CLUSTER" || true

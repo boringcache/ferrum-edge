@@ -21,16 +21,43 @@
 //!   marker inside its own `ferrum-cni` plugin entry (a place the CNI spec
 //!   reserves for the plugin, so no neighbour can be confused by it), and
 //! - a sibling [`OWNERSHIP_MANIFEST_FILE_NAME`] manifest records the same
-//!   ownership plus the SHA-256 of the binary that was installed.
+//!   ownership, the names of the artifacts it speaks for, and the SHA-256 of
+//!   the binary that was installed.
 //!
 //! Uninstall removes an artifact only when that evidence is present and
 //! matches; anything else is retained and reported. It never reads or
-//! rewrites a neighbouring CNI configuration, never follows a symlink, and
-//! never removes a binary while a conflist still references it.
+//! rewrites a neighbouring CNI configuration, and it never removes the shared
+//! plugin binary while any CNI configuration on the node still references it.
+//!
+//! # Concurrency and swap resistance
+//!
+//! Every mutating path in this module takes an exclusive `flock` on
+//! [`INSTALL_LOCK_FILE_NAME`] in the CNI configuration directory first, so an
+//! installer publishing a chain and a cleanup run removing one can never
+//! interleave on a node. That lock is the ownership boundary the rollback
+//! watcher relies on: it cannot delete state while an installer still holds
+//! the lock, and an installer cannot publish a conflist while a cleanup run
+//! holds it.
+//!
+//! Within a run, artifacts are opened `O_NOFOLLOW`, classified against the
+//! open handle, read with a hard byte cap, and hashed through that same
+//! handle. Removal re-opens the path `O_NOFOLLOW` and refuses unless the
+//! object still carries the device/inode identity the evidence was read from.
+//! Temporary files are created `O_EXCL | O_NOFOLLOW` under an unpredictable
+//! name, so a pre-planted symlink or file cannot be followed or truncated.
+//!
+//! What that does **not** claim: the final `unlink` is still by pathname, so
+//! a writer with write access to the CNI configuration directory could in
+//! principle swap the entry between the identity re-check and the unlink.
+//! The `flock` removes that race between Ferrum's own processes; against a
+//! hostile third party with write access to a root-owned host CNI directory
+//! it narrows the window rather than closing it.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -51,6 +78,14 @@ pub const FERRUM_MANAGED_BY: &str = "ferrum-edge";
 /// [`find_primary_config`]'s scan skips it outright.
 pub const OWNERSHIP_MANIFEST_FILE_NAME: &str = ".ferrum-cni-owned.marker";
 
+/// Cross-process mutual-exclusion file for every mutating lifecycle step.
+///
+/// Like the manifest, the name carries no CNI configuration extension, so the
+/// container runtime and the primary-config scan both ignore it. It is
+/// deliberately left behind by cleanup: it holds no state, and removing it
+/// would drop the lock a concurrent run may be waiting on.
+pub const INSTALL_LOCK_FILE_NAME: &str = ".ferrum-cni-install.lock";
+
 /// Schema version of the ownership manifest. A manifest with any other
 /// version is treated as unreadable (ownership unproven) rather than
 /// guessed at.
@@ -66,6 +101,33 @@ const MAX_OWNED_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Bound on the opaque operator-supplied owner / generation tokens.
 const MAX_OWNERSHIP_TOKEN_BYTES: usize = 128;
+
+/// How long a lifecycle step waits for the node's install lock before giving
+/// up. Long enough to sit through a peer's whole publish, short enough that a
+/// wedged holder surfaces as a visible failure rather than a hang.
+#[cfg(unix)]
+const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// Gap between install-lock acquisition attempts.
+#[cfg(unix)]
+const INSTALL_LOCK_RETRY: Duration = Duration::from_millis(100);
+
+/// Attempts at finding an unused temporary name before giving up.
+const TEMP_NAME_ATTEMPTS: usize = 8;
+
+/// Copy/hash chunk size.
+const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Fixed reason strings. They are `&'static str` on purpose: cleanup
+/// diagnostics print operator-configured paths and these constants, never
+/// file contents or any other untrusted input.
+const REASON_SYMLINK: &str = "path is a symlink; Ferrum only installs and removes regular files";
+const REASON_NOT_REGULAR: &str = "path is not a regular file";
+const REASON_HARD_LINKED: &str =
+    "path is hard-linked; removing it could affect another name for the same file";
+const REASON_TOO_LARGE: &str = "file is larger than any artifact this installer writes";
+const REASON_SWAPPED: &str =
+    "the file was replaced between the ownership check and removal; nothing was deleted";
 
 /// Install-time identity stamped onto every generated artifact.
 ///
@@ -140,6 +202,11 @@ impl CniUninstallConfig {
             expected_owner: optional_env("EXPECTED_OWNER"),
             expected_generation: optional_env("EXPECTED_GENERATION"),
         })
+    }
+
+    /// True when `found` is exactly the scope this cleanup may remove.
+    pub fn owns(&self, found: &CniOwnership) -> bool {
+        matches!(match_ownership(self, found), OwnershipMatch::Match)
     }
 
     fn validate(&self) -> Result<(), CniInstallError> {
@@ -229,6 +296,17 @@ impl CniUninstallReport {
         !matches!(self.conflist, CniArtifactOutcome::RetainedForeign(_))
     }
 
+    /// True when this run actually removed the node-wide dependency: the
+    /// generated conflist is gone from the node.
+    ///
+    /// Distinct from [`Self::is_success`], which also accepts "another
+    /// install owns this chain, so it is not mine to lift". A caller that
+    /// wants to tell an operator "pod creation no longer depends on the
+    /// node-agent" must use this, not success.
+    pub fn chain_lifted(&self) -> bool {
+        self.conflist.is_cleared()
+    }
+
     /// One line per artifact, safe to print to stderr: every field is either
     /// an operator-supplied path or a fixed reason string.
     pub fn summary_lines(&self) -> Vec<String> {
@@ -283,6 +361,13 @@ pub enum CniInstallError {
     #[error("could not resolve current executable: {0}")]
     CurrentExe(std::io::Error),
     #[error(
+        "another ferrum-cni install or cleanup still holds {path}; \
+         refusing to run concurrently with it"
+    )]
+    LockBusy { path: String },
+    #[error("{path} is not a readable regular plugin binary")]
+    UnusableSourceBinary { path: String },
+    #[error(
         "{name} must be 1..={max} bytes of [A-Za-z0-9._:/@#-]; \
          set it from a stable deployment identity"
     )]
@@ -302,6 +387,10 @@ pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
     install(&config, &source_binary)
 }
 
+/// Install (or upgrade in place) the Ferrum CNI artifacts on this node.
+///
+/// Idempotent: re-running with the same source binary re-stamps ownership and
+/// rewrites the chain without touching the published binary at all.
 pub fn install(
     config: &CniInstallConfig,
     source_binary: &Path,
@@ -317,25 +406,51 @@ pub fn install(
     create_dir_all(host_conf_dir)?;
     create_dir_all(host_socket_dir)?;
 
-    let target_binary = host_bin_dir.join(FERRUM_PLUGIN_TYPE);
-    atomic_copy_executable(source_binary, &target_binary)?;
-    let binary_sha256 = hash_file(&target_binary)?;
+    // Nothing shared may change until this node's lifecycle lock is held: a
+    // rollback watcher that reached its deadline must not be able to delete
+    // an artifact while this run is still publishing the next one.
+    let _lock = InstallLock::acquire(host_conf_dir)?;
 
-    // ORDER IS LOAD-BEARING, twice over.
+    let target_binary = host_bin_dir.join(FERRUM_PLUGIN_TYPE);
+
+    // ORDER IS LOAD-BEARING, three times over.
     //
-    // The ownership manifest goes down before anything that can fail later,
-    // so every artifact this install can leave behind — including after a
-    // mid-install error — is already provably ours and therefore removable.
-    // And the conflist goes down LAST: the moment it lands, every pod ADD on
-    // this node traverses ferrum-cni, so nothing that could fail may still be
-    // pending at that point.
+    // 1. The new binary is staged NEXT TO its destination and hashed as it is
+    //    written, so the digest describes exactly the bytes that will be
+    //    published, from a file nothing else can reach yet.
+    let staged = StagedBinary::stage(source_binary, &target_binary)?;
+
+    // 2. The ownership manifest lands BEFORE the shared binary is published.
+    //    Nothing this install can leave behind — including after a failure at
+    //    any later step — is therefore un-provable, and so nothing it leaves
+    //    behind is un-removable. The digest of the binary being replaced is
+    //    recorded alongside the new one so a crash between the manifest write
+    //    and the publish still leaves a removable binary.
+    let previous_sha256 = installed_binary_digest(&target_binary)?;
     write_ownership_manifest(
         host_conf_dir,
         &config.ownership,
         &config.conf_file_name,
-        &binary_sha256,
+        &staged.sha256,
+        previous_sha256.as_deref(),
     )?;
 
+    // 3. The binary is published before anything can reference it, by an
+    //    atomic same-directory rename — never an in-place truncate. An
+    //    already-exec'd `ferrum-cni` keeps running from the old inode until
+    //    it exits, and kubelet's next exec resolves the new one. When the
+    //    staged bytes are identical to what is already installed (the routine
+    //    `helm upgrade` case) the rename is skipped entirely, so an unchanged
+    //    image performs no binary swap at all.
+    if previous_sha256.as_deref() == Some(staged.sha256.as_str()) {
+        staged.discard();
+    } else {
+        staged.publish(&target_binary)?;
+    }
+
+    // 4. The conflist goes down LAST: the moment it lands, every pod ADD on
+    //    this node traverses ferrum-cni, so nothing that could fail may still
+    //    be pending at that point.
     let primary = find_primary_config(host_conf_dir, &config.conf_file_name, &config.chained_with)?;
     let chained = build_chained_conflist(
         &primary.json,
@@ -373,6 +488,11 @@ pub fn uninstall(config: &CniUninstallConfig) -> Result<CniUninstallReport, CniI
     let manifest_path = conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME);
     let binary_path = bin_dir.join(FERRUM_PLUGIN_TYPE);
 
+    // Serialize against a concurrent installer for the whole run. A missing
+    // configuration directory means nothing was ever installed, so there is
+    // nothing to serialize against and nothing to remove.
+    let _lock = InstallLock::acquire_if_dir_exists(conf_dir)?;
+
     let manifest_state = read_ownership_manifest(&manifest_path)?;
     let manifest = match &manifest_state {
         ManifestState::Present(manifest) => Some(manifest),
@@ -387,55 +507,40 @@ pub fn uninstall(config: &CniUninstallConfig) -> Result<CniUninstallReport, CniI
     let conflist = match read_bounded_regular_file(&conf_path, MAX_OWNED_JSON_BYTES)? {
         ArtifactRead::Absent => CniArtifactOutcome::AlreadyAbsent,
         ArtifactRead::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
-        ArtifactRead::Present(bytes) => match conflist_ownership(&bytes) {
+        ArtifactRead::Present { bytes, identity } => match conflist_ownership(&bytes) {
             None => CniArtifactOutcome::RetainedForeign(
                 "file carries no Ferrum ownership marker; it was not written by this installer",
             ),
             Some(found) => match match_ownership(config, &found) {
-                OwnershipMatch::Match => {
-                    remove_file(&conf_path)?;
-                    CniArtifactOutcome::Removed
-                }
+                OwnershipMatch::Match => remove_verified(&conf_path, identity)?,
                 OwnershipMatch::OtherOwner => CniArtifactOutcome::RetainedOtherOwner,
                 OwnershipMatch::OtherGeneration => CniArtifactOutcome::RetainedOtherGeneration,
             },
         },
     };
 
-    // 2. The plugin binary. Never while a conflist still references it, and
-    //    only when the manifest's recorded digest matches the bytes on disk —
-    //    an operator or another product that replaced the file keeps it.
+    // 2. The plugin binary. `/opt/cni/bin/ferrum-cni` is SHARED: another
+    //    Ferrum release, or an operator-authored configuration, may chain to
+    //    the same executable. It therefore goes only when this run's chain is
+    //    gone, NO remaining CNI configuration on the node still names
+    //    `ferrum-cni`, and the manifest's recorded digest matches the bytes
+    //    on disk. Anything that cannot be proven keeps the binary: it is
+    //    inert once nothing references it, so retention costs a stale file
+    //    while deletion could break a live release.
     let binary = if !conflist.is_cleared() {
         CniArtifactOutcome::RetainedDeliberate(
             "a chained CNI configuration still references the plugin binary",
         )
     } else {
-        match manifest {
-            None => match read_file_metadata(&binary_path)? {
-                ArtifactMeta::Absent => CniArtifactOutcome::AlreadyAbsent,
-                ArtifactMeta::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
-                ArtifactMeta::Present => CniArtifactOutcome::RetainedForeign(
-                    "no ownership manifest records this binary as Ferrum-installed",
-                ),
-            },
-            Some(manifest) => match match_ownership(config, &manifest.ownership) {
-                OwnershipMatch::OtherOwner => CniArtifactOutcome::RetainedOtherOwner,
-                OwnershipMatch::OtherGeneration => CniArtifactOutcome::RetainedOtherGeneration,
-                OwnershipMatch::Match => match read_file_metadata(&binary_path)? {
-                    ArtifactMeta::Absent => CniArtifactOutcome::AlreadyAbsent,
-                    ArtifactMeta::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
-                    ArtifactMeta::Present => {
-                        if hash_file(&binary_path)? == manifest.binary_sha256 {
-                            remove_file(&binary_path)?;
-                            CniArtifactOutcome::Removed
-                        } else {
-                            CniArtifactOutcome::RetainedForeign(
-                                "binary content does not match the digest recorded at install",
-                            )
-                        }
-                    }
-                },
-            },
+        match remaining_ferrum_references(conf_dir, &config.conf_file_name) {
+            FerrumReferences::Found => CniArtifactOutcome::RetainedDeliberate(
+                "another CNI configuration on this node still references the ferrum-cni plugin",
+            ),
+            FerrumReferences::Unknown => CniArtifactOutcome::RetainedForeign(
+                "the CNI configuration directory could not be scanned for remaining \
+                 ferrum-cni references, so the shared binary is kept",
+            ),
+            FerrumReferences::None => remove_owned_binary(config, manifest, &binary_path)?,
         }
     };
 
@@ -452,10 +557,7 @@ pub fn uninstall(config: &CniUninstallConfig) -> Result<CniUninstallReport, CniI
                 )
             } else {
                 match match_ownership(config, &manifest.ownership) {
-                    OwnershipMatch::Match => {
-                        remove_file(&manifest_path)?;
-                        CniArtifactOutcome::Removed
-                    }
+                    OwnershipMatch::Match => remove_verified(&manifest_path, manifest.identity)?,
                     OwnershipMatch::OtherOwner => CniArtifactOutcome::RetainedOtherOwner,
                     OwnershipMatch::OtherGeneration => CniArtifactOutcome::RetainedOtherGeneration,
                 }
@@ -473,26 +575,109 @@ pub fn uninstall(config: &CniUninstallConfig) -> Result<CniUninstallReport, CniI
     })
 }
 
+/// Decide the shared plugin binary's fate once the chain is provably gone and
+/// nothing else on the node references `ferrum-cni`.
+fn remove_owned_binary(
+    config: &CniUninstallConfig,
+    manifest: Option<&OwnershipManifest>,
+    binary_path: &Path,
+) -> Result<CniArtifactOutcome, CniInstallError> {
+    let Some(manifest) = manifest else {
+        return Ok(match open_classified(binary_path, MAX_OWNED_BINARY_BYTES)? {
+            ClassifiedArtifact::Absent => CniArtifactOutcome::AlreadyAbsent,
+            ClassifiedArtifact::Rejected(reason) => CniArtifactOutcome::RetainedForeign(reason),
+            ClassifiedArtifact::Present { .. } => CniArtifactOutcome::RetainedForeign(
+                "no ownership manifest records this binary as Ferrum-installed",
+            ),
+        });
+    };
+    if !manifest.speaks_for(&config.conf_file_name) {
+        return Ok(CniArtifactOutcome::RetainedForeign(
+            "the ownership manifest does not name this configuration and plugin binary",
+        ));
+    }
+    match match_ownership(config, &manifest.ownership) {
+        OwnershipMatch::OtherOwner => return Ok(CniArtifactOutcome::RetainedOtherOwner),
+        OwnershipMatch::OtherGeneration => {
+            return Ok(CniArtifactOutcome::RetainedOtherGeneration);
+        }
+        OwnershipMatch::Match => {}
+    }
+    // Classify, hash, and remove through ONE open, so the digest that
+    // authorizes removal is the digest of the object being removed.
+    let (mut file, identity) = match open_classified(binary_path, MAX_OWNED_BINARY_BYTES)? {
+        ClassifiedArtifact::Absent => return Ok(CniArtifactOutcome::AlreadyAbsent),
+        ClassifiedArtifact::Rejected(reason) => {
+            return Ok(CniArtifactOutcome::RetainedForeign(reason));
+        }
+        ClassifiedArtifact::Present { file, identity } => (file, identity),
+    };
+    let digest = hash_open_file(&mut file, binary_path, MAX_OWNED_BINARY_BYTES)?;
+    drop(file);
+    if !manifest.digest_matches(&digest) {
+        return Ok(CniArtifactOutcome::RetainedForeign(
+            "binary content does not match the digest recorded at install",
+        ));
+    }
+    remove_verified(binary_path, identity)
+}
+
 /// Network name of the generated conflist, used by the readiness watcher's
 /// STATUS probe. Returns `None` when the file is absent or unreadable — the
 /// caller falls back to a constant rather than failing the probe.
 pub fn generated_network_name(conf_dir: &str, conf_file_name: &str) -> Option<String> {
+    let value = read_generated_conflist(conf_dir, conf_file_name)?;
+    let name = value.get("name")?.as_str()?;
+    Some(name.to_string())
+}
+
+/// Ownership currently published in the generated conflist, or `None` when no
+/// Ferrum-generated chain is present at that path.
+///
+/// The rollback watcher uses this to prove that the install it is watching
+/// actually completed: the conflist is written last, so its presence under
+/// this generation's marker is the only observable "the install finished and
+/// this node now depends on the node-agent" signal.
+pub fn published_conflist_ownership(conf_dir: &str, conf_file_name: &str) -> Option<CniOwnership> {
+    let value = read_generated_conflist(conf_dir, conf_file_name)?;
+    conflist_ownership_value(&value)
+}
+
+fn read_generated_conflist(conf_dir: &str, conf_file_name: &str) -> Option<Value> {
     if validate_single_component("CONF_FILE_NAME", conf_file_name).is_err() {
         return None;
     }
     let path = Path::new(conf_dir).join(conf_file_name);
     let bytes = match read_bounded_regular_file(&path, MAX_OWNED_JSON_BYTES) {
-        Ok(ArtifactRead::Present(bytes)) => bytes,
+        Ok(ArtifactRead::Present { bytes, .. }) => bytes,
         _ => return None,
     };
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    let name = value.get("name")?.as_str()?;
-    Some(name.to_string())
+    serde_json::from_slice(&bytes).ok()
 }
 
 struct OwnershipManifest {
     ownership: CniOwnership,
+    conf_file_name: String,
+    binary_file_name: String,
     binary_sha256: String,
+    previous_binary_sha256: Option<String>,
+    identity: FileIdentity,
+}
+
+impl OwnershipManifest {
+    /// The manifest is evidence for exactly the artifact names it recorded.
+    /// A manifest naming a different conflist or a different binary proves
+    /// nothing about the files this run is about to touch.
+    fn speaks_for(&self, conf_file_name: &str) -> bool {
+        self.conf_file_name == conf_file_name && self.binary_file_name == FERRUM_PLUGIN_TYPE
+    }
+
+    /// An upgrade records both the digest it published and the one it
+    /// replaced, so a crash between the manifest write and the binary swap
+    /// still leaves whichever of the two is on disk provably ours.
+    fn digest_matches(&self, digest: &str) -> bool {
+        self.binary_sha256 == digest || self.previous_binary_sha256.as_deref() == Some(digest)
+    }
 }
 
 /// What the sibling ownership manifest could be made to say.
@@ -513,10 +698,14 @@ enum OwnershipMatch {
 }
 
 fn match_ownership(config: &CniUninstallConfig, found: &CniOwnership) -> OwnershipMatch {
-    if let Some(expected) = config.expected_owner.as_deref() && expected != found.owner {
+    if let Some(expected) = config.expected_owner.as_deref()
+        && expected != found.owner
+    {
         return OwnershipMatch::OtherOwner;
     }
-    if let Some(expected) = config.expected_generation.as_deref() && expected != found.generation {
+    if let Some(expected) = config.expected_generation.as_deref()
+        && expected != found.generation
+    {
         return OwnershipMatch::OtherGeneration;
     }
     OwnershipMatch::Match
@@ -526,6 +715,10 @@ fn match_ownership(config: &CniUninstallConfig, found: &CniOwnership) -> Ownersh
 /// Returns `None` for anything that is not a Ferrum-generated chain.
 fn conflist_ownership(bytes: &[u8]) -> Option<CniOwnership> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
+    conflist_ownership_value(&value)
+}
+
+fn conflist_ownership_value(value: &Value) -> Option<CniOwnership> {
     let ferrum = value
         .get("plugins")?
         .as_array()?
@@ -550,11 +743,65 @@ fn conflist_ownership(bytes: &[u8]) -> Option<CniOwnership> {
     })
 }
 
+/// Whether any CNI configuration still in the directory (other than the
+/// generated one this run owns) chains to the `ferrum-cni` plugin.
+enum FerrumReferences {
+    None,
+    Found,
+    /// The directory or one of its configuration files could not be read, so
+    /// the answer is unknown. Callers fail safe and retain the binary.
+    Unknown,
+}
+
+fn remaining_ferrum_references(conf_dir: &Path, generated_file_name: &str) -> FerrumReferences {
+    let Ok(entries) = fs::read_dir(conf_dir) else {
+        return FerrumReferences::Unknown;
+    };
+    let generated = std::ffi::OsStr::new(generated_file_name);
+    let mut unknown = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unknown = true;
+            continue;
+        };
+        let path = entry.path();
+        if !is_cni_config_file(&path) {
+            continue;
+        }
+        if path.file_name() == Some(generated) {
+            continue;
+        }
+        match read_bounded_regular_file(&path, MAX_OWNED_JSON_BYTES) {
+            Ok(ArtifactRead::Absent) => {}
+            // A neighbour that cannot be classified or parsed could be
+            // anything, including a configuration that chains to the shared
+            // binary. Unknown, not absent.
+            Ok(ArtifactRead::Rejected(_)) | Err(_) => unknown = true,
+            Ok(ArtifactRead::Present { bytes, .. }) => {
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Err(_) => unknown = true,
+                    Ok(json) => {
+                        if contains_plugin_type(&json, FERRUM_PLUGIN_TYPE) {
+                            return FerrumReferences::Found;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if unknown {
+        FerrumReferences::Unknown
+    } else {
+        FerrumReferences::None
+    }
+}
+
 fn write_ownership_manifest(
     conf_dir: &Path,
     ownership: &CniOwnership,
     conf_file_name: &str,
     binary_sha256: &str,
+    previous_binary_sha256: Option<&str>,
 ) -> Result<(), CniInstallError> {
     let path = conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME);
     let manifest = serde_json::json!({
@@ -565,11 +812,13 @@ fn write_ownership_manifest(
         "confFileName": conf_file_name,
         "binaryFileName": FERRUM_PLUGIN_TYPE,
         "binarySha256": binary_sha256,
+        "previousBinarySha256": previous_binary_sha256,
     });
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(|source| CniInstallError::Json {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|source| CniInstallError::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
     bytes.push(b'\n');
     atomic_write_file(&path, &bytes, Some(0o600))
 }
@@ -581,7 +830,7 @@ fn write_ownership_manifest(
 /// conflist carries its own marker, so cleanup must still be able to lift the
 /// node-wide dependency when the manifest is lost or corrupt.
 fn read_ownership_manifest(path: &Path) -> Result<ManifestState, CniInstallError> {
-    let bytes = match read_bounded_regular_file(path, MAX_OWNED_JSON_BYTES)? {
+    let (bytes, identity) = match read_bounded_regular_file(path, MAX_OWNED_JSON_BYTES)? {
         ArtifactRead::Absent => return Ok(ManifestState::Absent),
         ArtifactRead::Rejected(reason) => {
             tracing::warn!(
@@ -591,7 +840,7 @@ fn read_ownership_manifest(path: &Path) -> Result<ManifestState, CniInstallError
             );
             return Ok(ManifestState::Unusable(reason));
         }
-        ArtifactRead::Present(bytes) => bytes,
+        ArtifactRead::Present { bytes, identity } => (bytes, identity),
     };
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         tracing::warn!(
@@ -626,25 +875,83 @@ fn read_ownership_manifest(path: &Path) -> Result<ManifestState, CniInstallError
             "ownership manifest is missing owner/generation/binarySha256",
         ));
     };
+    let (Some(conf_file_name), Some(binary_file_name)) = (
+        value.get("confFileName").and_then(Value::as_str),
+        value.get("binaryFileName").and_then(Value::as_str),
+    ) else {
+        tracing::warn!(
+            path = %path.display(),
+            "Ignoring CNI ownership manifest that does not name the artifacts it owns"
+        );
+        return Ok(ManifestState::Unusable(
+            "ownership manifest does not name the artifacts it owns",
+        ));
+    };
     Ok(ManifestState::Present(OwnershipManifest {
         ownership: CniOwnership {
             owner: owner.to_string(),
             generation: generation.to_string(),
         },
+        conf_file_name: conf_file_name.to_string(),
+        binary_file_name: binary_file_name.to_string(),
         binary_sha256: binary_sha256.to_string(),
+        previous_binary_sha256: value
+            .get("previousBinarySha256")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        identity,
     }))
+}
+
+/// Device / inode / length identity of an artifact, captured from the very
+/// handle its ownership evidence was read through.
+///
+/// Removal re-opens the path `O_NOFOLLOW` and refuses unless the object still
+/// has this identity, so a path swapped after the evidence was read is
+/// retained rather than deleted. Non-Unix builds exist only for matrix
+/// parity (CNI is a Linux concept) and can compare length alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    len: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+        len: meta.len(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(meta: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+        len: meta.len(),
+    }
 }
 
 enum ArtifactRead {
     Absent,
     Rejected(&'static str),
-    Present(Vec<u8>),
+    Present {
+        bytes: Vec<u8>,
+        identity: FileIdentity,
+    },
 }
 
-enum ArtifactMeta {
+enum ClassifiedArtifact {
     Absent,
     Rejected(&'static str),
-    Present,
+    Present {
+        file: File,
+        identity: FileIdentity,
+    },
 }
 
 enum OpenedArtifact {
@@ -659,19 +966,17 @@ enum OpenedArtifact {
 /// `open` pair would leave open: the kernel refuses the open outright, so
 /// there is no window in which a traversal target can be substituted.
 fn open_no_follow(path: &Path) -> Result<OpenedArtifact, CniInstallError> {
-    let mut options = fs::OpenOptions::new();
+    let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     match options.open(path) {
         Ok(file) => Ok(OpenedArtifact::Opened(file)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(OpenedArtifact::Absent),
-        Err(err) if is_symlink_open_refusal(&err) => Ok(OpenedArtifact::Rejected(
-            "path is a symlink; Ferrum only installs and removes regular files",
-        )),
+        Err(err) if is_symlink_open_refusal(&err) => Ok(OpenedArtifact::Rejected(REASON_SYMLINK)),
         Err(source) => Err(CniInstallError::Io {
             path: path.display().to_string(),
             source,
@@ -690,81 +995,69 @@ fn is_symlink_open_refusal(_err: &std::io::Error) -> bool {
     false
 }
 
-/// Classify a path as a removable Ferrum artifact candidate without reading
-/// it. Used for the plugin binary, which is too large to buffer.
-fn read_file_metadata(path: &Path) -> Result<ArtifactMeta, CniInstallError> {
+/// Open a path `O_NOFOLLOW` and reject anything that is not a plain,
+/// single-linked, plausibly-sized file. Every later decision — read, hash,
+/// remove — is made against the returned handle and identity, so they all
+/// describe one object rather than one path.
+fn open_classified(path: &Path, max_bytes: u64) -> Result<ClassifiedArtifact, CniInstallError> {
     let file = match open_no_follow(path)? {
-        OpenedArtifact::Absent => return Ok(ArtifactMeta::Absent),
-        OpenedArtifact::Rejected(reason) => return Ok(ArtifactMeta::Rejected(reason)),
+        OpenedArtifact::Absent => return Ok(ClassifiedArtifact::Absent),
+        OpenedArtifact::Rejected(reason) => return Ok(ClassifiedArtifact::Rejected(reason)),
         OpenedArtifact::Opened(file) => file,
     };
-    classify_open_file(&file, path, MAX_OWNED_BINARY_BYTES)
-}
-
-/// Reject anything that is not a plain, single-linked, plausibly-sized file.
-/// The checks run against the already-open handle, so they describe the
-/// object that will actually be read or removed.
-fn classify_open_file(
-    file: &File,
-    path: &Path,
-    max_bytes: u64,
-) -> Result<ArtifactMeta, CniInstallError> {
     let meta = file.metadata().map_err(|source| CniInstallError::Io {
         path: path.display().to_string(),
         source,
     })?;
     if !meta.is_file() {
-        return Ok(ArtifactMeta::Rejected("path is not a regular file"));
+        return Ok(ClassifiedArtifact::Rejected(REASON_NOT_REGULAR));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() != 1 {
-            return Ok(ArtifactMeta::Rejected(
-                "path is hard-linked; removing it could affect another name for the same file",
-            ));
+            return Ok(ClassifiedArtifact::Rejected(REASON_HARD_LINKED));
         }
     }
     if meta.len() > max_bytes {
-        return Ok(ArtifactMeta::Rejected(
-            "file is larger than any artifact this installer writes",
-        ));
+        return Ok(ClassifiedArtifact::Rejected(REASON_TOO_LARGE));
     }
-    Ok(ArtifactMeta::Present)
+    Ok(ClassifiedArtifact::Present {
+        identity: file_identity(&meta),
+        file,
+    })
 }
 
+/// Read a classified artifact with a HARD cap.
+///
+/// The pre-read length check is advisory only — the file can grow between the
+/// `fstat` and the read — so the read itself is bounded by `max_bytes + 1` and
+/// anything that reaches the cap is rejected rather than buffered.
 fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<ArtifactRead, CniInstallError> {
-    let mut file = match open_no_follow(path)? {
-        OpenedArtifact::Absent => return Ok(ArtifactRead::Absent),
-        OpenedArtifact::Rejected(reason) => return Ok(ArtifactRead::Rejected(reason)),
-        OpenedArtifact::Opened(file) => file,
+    let (file, identity) = match open_classified(path, max_bytes)? {
+        ClassifiedArtifact::Absent => return Ok(ArtifactRead::Absent),
+        ClassifiedArtifact::Rejected(reason) => return Ok(ArtifactRead::Rejected(reason)),
+        ClassifiedArtifact::Present { file, identity } => (file, identity),
     };
-    match classify_open_file(&file, path, max_bytes)? {
-        ArtifactMeta::Present => {}
-        ArtifactMeta::Rejected(reason) => return Ok(ArtifactRead::Rejected(reason)),
-        ArtifactMeta::Absent => return Ok(ArtifactRead::Absent),
-    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let mut capped = file.take(max_bytes.saturating_add(1));
+    capped
+        .read_to_end(&mut bytes)
         .map_err(|source| CniInstallError::Io {
             path: path.display().to_string(),
             source,
         })?;
-    Ok(ArtifactRead::Present(bytes))
+    if bytes.len() as u64 > max_bytes {
+        return Ok(ArtifactRead::Rejected(REASON_TOO_LARGE));
+    }
+    Ok(ArtifactRead::Present { bytes, identity })
 }
 
-fn hash_file(path: &Path) -> Result<String, CniInstallError> {
-    let mut file = match open_no_follow(path)? {
-        OpenedArtifact::Opened(file) => file,
-        OpenedArtifact::Absent | OpenedArtifact::Rejected(_) => {
-            return Err(CniInstallError::Io {
-                path: path.display().to_string(),
-                source: std::io::Error::other("path is not a readable regular file"),
-            });
-        }
-    };
+/// Hash an already-classified open handle, refusing to read past `max_bytes`.
+fn hash_open_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<String, CniInstallError> {
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    let mut total: u64 = 0;
     loop {
         let read = file.read(&mut buf).map_err(|source| CniInstallError::Io {
             path: path.display().to_string(),
@@ -773,9 +1066,49 @@ fn hash_file(path: &Path) -> Result<String, CniInstallError> {
         if read == 0 {
             break;
         }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(CniInstallError::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::other("file grew past the supported size while hashing"),
+            });
+        }
         hasher.update(&buf[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Digest of the plugin binary currently installed at `path`, or `None` when
+/// nothing usable is installed there.
+fn installed_binary_digest(path: &Path) -> Result<Option<String>, CniInstallError> {
+    match open_classified(path, MAX_OWNED_BINARY_BYTES)? {
+        ClassifiedArtifact::Absent | ClassifiedArtifact::Rejected(_) => Ok(None),
+        ClassifiedArtifact::Present { mut file, .. } => {
+            Ok(Some(hash_open_file(&mut file, path, MAX_OWNED_BINARY_BYTES)?))
+        }
+    }
+}
+
+/// Unlink a path only after re-proving it is still the object whose ownership
+/// evidence was checked.
+fn remove_verified(
+    path: &Path,
+    expected: FileIdentity,
+) -> Result<CniArtifactOutcome, CniInstallError> {
+    match open_classified(path, u64::MAX)? {
+        ClassifiedArtifact::Absent => return Ok(CniArtifactOutcome::AlreadyAbsent),
+        ClassifiedArtifact::Rejected(reason) => {
+            return Ok(CniArtifactOutcome::RetainedForeign(reason));
+        }
+        ClassifiedArtifact::Present { file, identity } => {
+            drop(file);
+            if identity != expected {
+                return Ok(CniArtifactOutcome::RetainedForeign(REASON_SWAPPED));
+            }
+        }
+    }
+    remove_file(path)?;
+    Ok(CniArtifactOutcome::Removed)
 }
 
 fn remove_file(path: &Path) -> Result<(), CniInstallError> {
@@ -787,6 +1120,84 @@ fn remove_file(path: &Path) -> Result<(), CniInstallError> {
             source,
         }),
     }
+}
+
+/// Exclusive whole-node lock over the CNI install lifecycle.
+///
+/// Held for the entire duration of `install` and `uninstall`. This is what
+/// makes rollback ownership provable: a watcher that reached its deadline
+/// blocks here until a still-running installer has finished publishing, and
+/// then re-reads the ownership markers before deciding anything.
+struct InstallLock {
+    /// Held so the advisory lock lives as long as this guard. Released by the
+    /// kernel when the descriptor closes, including on abnormal exit.
+    _file: File,
+}
+
+impl InstallLock {
+    fn acquire(conf_dir: &Path) -> Result<Self, CniInstallError> {
+        let path = conf_dir.join(INSTALL_LOCK_FILE_NAME);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|source| CniInstallError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        lock_exclusive(&file, &path)?;
+        Ok(Self { _file: file })
+    }
+
+    /// Same, but a missing configuration directory simply means nothing was
+    /// ever installed — there is no peer to exclude and nothing to remove.
+    fn acquire_if_dir_exists(conf_dir: &Path) -> Result<Option<Self>, CniInstallError> {
+        if !conf_dir.is_dir() {
+            return Ok(None);
+        }
+        Self::acquire(conf_dir).map(Some)
+    }
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &File, path: &Path) -> Result<(), CniInstallError> {
+    use std::os::unix::io::AsRawFd;
+
+    let deadline = Instant::now() + INSTALL_LOCK_WAIT;
+    loop {
+        // SAFETY: `file` owns a live descriptor for the whole call, and
+        // `flock` only affects that descriptor's advisory lock state.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => {}
+            Some(libc::EINTR) => continue,
+            _ => {
+                return Err(CniInstallError::Io {
+                    path: path.display().to_string(),
+                    source: err,
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CniInstallError::LockBusy {
+                path: path.display().to_string(),
+            });
+        }
+        std::thread::sleep(INSTALL_LOCK_RETRY);
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &File, _path: &Path) -> Result<(), CniInstallError> {
+    Ok(())
 }
 
 fn validate_ownership_token(name: &'static str, value: &str) -> Result<(), CniInstallError> {
@@ -1029,20 +1440,119 @@ fn create_dir_all(path: &Path) -> Result<(), CniInstallError> {
     })
 }
 
-fn atomic_copy_executable(source: &Path, target: &Path) -> Result<(), CniInstallError> {
-    let tmp_path = temp_sibling_path(target, "tmp");
-    let result = (|| {
-        fs::copy(source, &tmp_path).map_err(|source| CniInstallError::Io {
-            path: tmp_path.display().to_string(),
+/// The next plugin binary, written to an exclusive temporary file beside its
+/// destination and hashed as it was written.
+///
+/// Staging in the destination directory keeps the publish a same-filesystem
+/// `rename`, which is atomic and never truncates the file a concurrently
+/// exec'd `ferrum-cni` is running from.
+struct StagedBinary {
+    path: PathBuf,
+    sha256: String,
+    consumed: bool,
+}
+
+impl StagedBinary {
+    fn stage(source: &Path, target: &Path) -> Result<Self, CniInstallError> {
+        let (path, mut file) = create_exclusive_temp(target, "install")?;
+        let staged = copy_and_hash(source, &mut file, &path);
+        drop(file);
+        let sha256 = match staged.and_then(|sha256| set_executable(&path).map(|()| sha256)) {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            path,
+            sha256,
+            consumed: false,
+        })
+    }
+
+    fn publish(mut self, target: &Path) -> Result<(), CniInstallError> {
+        atomic_rename(&self.path, target)?;
+        self.consumed = true;
+        Ok(())
+    }
+
+    /// An upgrade whose bytes are already installed publishes nothing.
+    fn discard(mut self) {
+        self.consumed = true;
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for StagedBinary {
+    fn drop(&mut self) {
+        if !self.consumed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Stream `source` into `dest`, hashing the same bytes in one pass so the
+/// digest cannot describe a different revision than the one written.
+fn copy_and_hash(
+    source: &Path,
+    dest: &mut File,
+    dest_path: &Path,
+) -> Result<String, CniInstallError> {
+    // The source is only ever READ, so it is checked for the properties that
+    // matter to a read — no symlink traversal, a regular file, and the
+    // streaming cap below. Deliberately NOT the link-count check `uninstall`
+    // applies: nothing here is removed, and a container image layer is free
+    // to hard-link the binaries it ships.
+    let mut input = match open_no_follow(source)? {
+        OpenedArtifact::Opened(file) => file,
+        OpenedArtifact::Absent | OpenedArtifact::Rejected(_) => {
+            return Err(CniInstallError::UnusableSourceBinary {
+                path: source.display().to_string(),
+            });
+        }
+    };
+    let source_is_regular = input
+        .metadata()
+        .map(|meta| meta.is_file())
+        .map_err(|err| CniInstallError::Io {
+            path: source.display().to_string(),
+            source: err,
+        })?;
+    if !source_is_regular {
+        return Err(CniInstallError::UnusableSourceBinary {
+            path: source.display().to_string(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    let mut total: u64 = 0;
+    loop {
+        let read = input.read(&mut buf).map_err(|source| CniInstallError::Io {
+            path: dest_path.display().to_string(),
             source,
         })?;
-        set_executable(&tmp_path)?;
-        atomic_rename(&tmp_path, target)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_OWNED_BINARY_BYTES {
+            return Err(CniInstallError::UnusableSourceBinary {
+                path: source.display().to_string(),
+            });
+        }
+        hasher.update(&buf[..read]);
+        dest.write_all(&buf[..read])
+            .map_err(|source| CniInstallError::Io {
+                path: dest_path.display().to_string(),
+                source,
+            })?;
     }
-    result
+    dest.sync_all().map_err(|source| CniInstallError::Io {
+        path: dest_path.display().to_string(),
+        source,
+    })?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn atomic_write_file(
@@ -1050,37 +1560,86 @@ fn atomic_write_file(
     contents: &[u8],
     mode: Option<u32>,
 ) -> Result<(), CniInstallError> {
-    let tmp_path = temp_sibling_path(target, "tmp");
-    let result = (|| {
-        let mut file = File::create(&tmp_path).map_err(|source| CniInstallError::Io {
+    let (tmp_path, mut file) = create_exclusive_temp(target, "tmp")?;
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| CniInstallError::Io {
             path: tmp_path.display().to_string(),
             source,
-        })?;
-        file.write_all(contents)
-            .and_then(|()| file.sync_all())
-            .map_err(|source| CniInstallError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            })?;
-        drop(file);
+        });
+    drop(file);
+    let result = written.and_then(|()| {
         if let Some(mode) = mode {
             set_mode(&tmp_path, mode)?;
         }
         atomic_rename(&tmp_path, target)
-    })();
+    });
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
     result
 }
 
-fn temp_sibling_path(target: &Path, suffix: &str) -> PathBuf {
-    let pid = std::process::id();
-    let name = target
+/// Create a temporary sibling of `target` that cannot be pre-planted.
+///
+/// `O_EXCL | O_CREAT` refuses any existing entry — including a symlink, which
+/// a predictable PID-derived name would otherwise let an attacker point at an
+/// arbitrary file and have the installer truncate. `O_NOFOLLOW` refuses one
+/// even in the impossible case, the name carries unguessable randomness, and
+/// the mode is `0600` from creation rather than after the fact.
+fn create_exclusive_temp(target: &Path, suffix: &str) -> Result<(PathBuf, File), CniInstallError> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let base = target
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("ferrum-cni");
-    target.with_file_name(format!(".{name}.{pid}.{suffix}"))
+        .unwrap_or(FERRUM_PLUGIN_TYPE);
+    let mut last_error = None;
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let token = random_temp_token();
+        let path = dir.join(format!(".{base}.{token:016x}.{suffix}"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last_error = Some(err),
+            Err(source) => {
+                return Err(CniInstallError::Io {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(CniInstallError::Io {
+        path: dir.display().to_string(),
+        source: last_error
+            .unwrap_or_else(|| std::io::Error::other("no unused temporary name was available")),
+    })
+}
+
+fn random_temp_token() -> u64 {
+    use crate::fips::backend::rand::SecureRandom;
+
+    let rng = crate::fips::backend::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    if rng.fill(&mut bytes).is_ok() {
+        return u64::from_ne_bytes(bytes);
+    }
+    // Only reachable if the platform RNG fails outright. Falls back to a
+    // value that is still unique per process and instant, and the `O_EXCL`
+    // creation stays the actual safety property either way.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ u64::from(std::process::id())
 }
 
 fn atomic_rename(source: &Path, target: &Path) -> Result<(), CniInstallError> {
@@ -1252,8 +1811,8 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".tmp")),
-            "successful install should not leave temp binary files"
+                .contains(".install")),
+            "successful install should not leave staged binary files"
         );
         assert!(
             fs::read_dir(conf_dir).unwrap().all(|entry| !entry

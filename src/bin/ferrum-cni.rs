@@ -184,6 +184,16 @@ mod cni_main {
             );
             return ExitCode::from(1);
         }
+        if !report.chain_lifted() {
+            // Success, but not because this node stopped depending on the
+            // node-agent: another Ferrum install owns the chain and this run
+            // must not touch it. Say so rather than implying a clean node.
+            eprintln!(
+                "ferrum-cni: the chained CNI configuration is owned by a different Ferrum \
+                 install and was deliberately left in place. This node still traverses \
+                 ferrum-cni for that other release."
+            );
+        }
 
         // Holding is opt-in. Absent `READY_MARKER_PATH` this is a plain
         // one-shot cleanup (manual runs, Jobs); with it set the process stays
@@ -248,6 +258,14 @@ mod cni_main {
             }
         };
         match runtime.block_on(lifecycle::await_cleanup_daemonset(&config)) {
+            Ok(report) if report.scheduled_nowhere() => {
+                eprintln!(
+                    "ferrum-cni: the cleanup DaemonSet scheduled onto no node, so no node was \
+                     cleaned. If nodes exist but are cordoned or tainted, clean them with the \
+                     manual steps in docs/node_agent.md before deleting the release."
+                );
+                ExitCode::SUCCESS
+            }
             Ok(report) => {
                 eprintln!(
                     "ferrum-cni: CNI cleanup completed on {} of {} scheduled nodes",
@@ -273,7 +291,9 @@ mod cni_main {
             }
         };
         eprintln!(
-            "ferrum-cni: watching for node-agent CNI readiness (budget {}s, poll {}s)",
+            "ferrum-cni: waiting for this generation's chained configuration to be published \
+             (budget {}s), then for node-agent CNI readiness (budget {}s, poll {}s)",
+            config.publish_timeout.as_secs(),
             config.ready_timeout.as_secs(),
             config.poll_interval.as_secs()
         );
@@ -288,6 +308,19 @@ mod cni_main {
                     std::thread::sleep(Duration::from_secs(3600));
                 }
             }
+            Ok(RollbackWatchOutcome::NeverPublished) => {
+                // Nothing was removed because nothing was ever chained: an
+                // installer that never published a conflist never made this
+                // node depend on the node-agent. Still a failed pod, so this
+                // stays visibly non-zero.
+                eprintln!(
+                    "ferrum-cni: this generation never published a chained CNI configuration \
+                     within {}s, so pod creation on this node never depended on the node-agent \
+                     and nothing was removed. Inspect the installer init container.",
+                    config.publish_timeout.as_secs()
+                );
+                ExitCode::from(1)
+            }
             Ok(RollbackWatchOutcome::RolledBack(report)) => {
                 eprintln!(
                     "ferrum-cni: node-agent did not reach CNI readiness within {}s; rolling \
@@ -298,11 +331,39 @@ mod cni_main {
                     eprintln!("ferrum-cni: {line}");
                 }
                 eprintln!(
-                    "ferrum-cni: rollback finished. Pod creation on this node no longer \
-                     depends on the node-agent; enrollment falls back to the kube-rs \
-                     watcher. Recreate the node-agent pod to reinstall the chain once the \
-                     underlying failure is fixed."
+                    "ferrum-cni: the chained configuration is gone, so pod creation on this \
+                     node no longer depends on the node-agent; enrollment falls back to the \
+                     kube-rs watcher. Any artifact reported above as retained was left in \
+                     place on purpose. Recreate the node-agent pod to reinstall the chain \
+                     once the underlying failure is fixed."
                 );
+                ExitCode::from(1)
+            }
+            Ok(RollbackWatchOutcome::Superseded(report)) => {
+                // A newer install owns the artifacts now. Deleting nothing is
+                // the correct outcome, and claiming a rollback happened would
+                // be a lie about the node's state.
+                eprintln!(
+                    "ferrum-cni: a newer install generation owns the CNI artifacts on this \
+                     node; this watcher removed nothing and the chained configuration is \
+                     still in place under the newer generation's ownership."
+                );
+                for line in report.summary_lines() {
+                    eprintln!("ferrum-cni: {line}");
+                }
+                ExitCode::from(1)
+            }
+            Ok(RollbackWatchOutcome::RollbackIncomplete(report)) => {
+                eprintln!(
+                    "ferrum-cni: rollback did NOT clear the chained CNI configuration. Pod \
+                     creation on this node still traverses ferrum-cni. Inspect the file \
+                     reported below and remove it manually once you have confirmed it is the \
+                     Ferrum-generated chain; the primary CNI configuration it chains behind \
+                     was never modified and needs no repair."
+                );
+                for line in report.summary_lines() {
+                    eprintln!("ferrum-cni: {line}");
+                }
                 ExitCode::from(1)
             }
             Err(err) => {

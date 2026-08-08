@@ -183,6 +183,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            {{- /* The readiness budget starts only once THIS generation's
+                   conflist is observed on disk, so the watcher can never
+                   delete state an installer is still publishing. This is the
+                   separate budget for that publication to happen at all. */}}
+            - name: PUBLISH_TIMEOUT_SECS
+              value: {{ default 300 $cniRollback.publishTimeoutSeconds | quote }}
             - name: READY_TIMEOUT_SECS
               value: {{ default 300 $cniRollback.readyTimeoutSeconds | quote }}
             - name: POLL_INTERVAL_SECS

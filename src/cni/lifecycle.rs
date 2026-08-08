@@ -21,6 +21,31 @@
 //!   artifacts **this pod's own installer wrote** and exits non-zero, so the
 //!   node keeps creating pods and the failure stays visible.
 //!
+//! # Why the readiness budget does not start at container start
+//!
+//! The watcher is a native sidecar and therefore starts *before* the
+//! installer init container. If its budget started immediately it could
+//! expire while the installer was still working, delete this generation's
+//! staged state, and then watch the installer publish a conflist nothing was
+//! left to remove — manufacturing exactly the stranded chain the watcher
+//! exists to prevent.
+//!
+//! So the run has two phases with distinct ownership:
+//!
+//! 1. **Publication.** Poll until the generated conflist carries *this*
+//!    owner and generation. That file is written last and atomically, so its
+//!    presence is the only observable proof that the install completed and
+//!    the node now depends on the node-agent. An installer that never
+//!    publishes never created a dependency, so there is nothing to roll back
+//!    and the watcher reports [`RollbackWatchOutcome::NeverPublished`].
+//! 2. **Readiness.** Only now does the budget start.
+//!
+//! Cleanup additionally takes the node's install lock
+//! ([`crate::cni::install::INSTALL_LOCK_FILE_NAME`]) for its whole run, and
+//! re-reads the ownership markers under that lock, so it cannot interleave
+//! with a still-running installer at all — and re-verifies the exact
+//! device/inode it is about to unlink.
+//!
 //! Time only decides *when* to act. What may be removed is decided by the
 //! ownership evidence written at install: the watcher pins both the owner and
 //! the install generation, so a slow start that is overtaken by a newer
@@ -31,12 +56,20 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::cni::install::{self, CniInstallError, CniUninstallConfig, CniUninstallReport};
+use crate::cni::install::{
+    self, CniArtifactOutcome, CniInstallError, CniUninstallConfig, CniUninstallReport,
+};
 
-/// Default budget for the node-agent to reach CNI readiness. Deliberately
+/// Default budget for the node-agent to reach CNI readiness, measured from
+/// the moment this generation's conflist is observed on disk. Deliberately
 /// generous: a healthy but slow start (image pull, BPF fs mount, initial pod
 /// relist on a large node) must not be mistaken for a broken install.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default budget for this generation's installer to publish its conflist.
+/// Exceeding it means no chain was ever installed by this pod, which is not a
+/// node-wide dependency and therefore not something to roll back.
+pub const DEFAULT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default gap between STATUS probes.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -53,6 +86,9 @@ pub const FALLBACK_STATUS_NETWORK_NAME: &str = "ferrum-mesh";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackWatchConfig {
     pub socket_path: String,
+    /// How long this generation's installer gets to publish its conflist
+    /// before the watcher concludes no chain was ever installed.
+    pub publish_timeout: Duration,
     pub ready_timeout: Duration,
     pub poll_interval: Duration,
     /// Scope of what a rollback may remove. The Helm chart pins both
@@ -67,6 +103,11 @@ impl RollbackWatchConfig {
             DEFAULT_READY_TIMEOUT,
             MAX_READY_TIMEOUT_SECS,
         )?;
+        let publish_timeout = duration_from_env(
+            "PUBLISH_TIMEOUT_SECS",
+            DEFAULT_PUBLISH_TIMEOUT,
+            MAX_READY_TIMEOUT_SECS,
+        )?;
         let poll_interval = duration_from_env(
             "POLL_INTERVAL_SECS",
             DEFAULT_POLL_INTERVAL,
@@ -74,21 +115,51 @@ impl RollbackWatchConfig {
         )?;
         Ok(Self {
             socket_path: required_env("SOCKET_PATH")?,
+            publish_timeout,
             ready_timeout,
-            poll_interval: poll_interval.min(ready_timeout),
+            poll_interval: poll_interval.min(ready_timeout).min(publish_timeout),
             uninstall: CniUninstallConfig::from_env()?,
         })
     }
 }
 
+/// How a rollback watch ended.
+///
+/// The variants are deliberately not collapsed into "rolled back": a run that
+/// deleted nothing, and a run that tried and failed, must not be reported to
+/// an operator as if the node-wide dependency had been lifted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RollbackWatchOutcome {
-    /// The node-agent answered STATUS before the deadline; artifacts are
-    /// retained for the lifetime of this pod.
+    /// The node-agent answered STATUS; artifacts are retained for the
+    /// lifetime of this pod.
     Ready,
-    /// The deadline passed with no successful STATUS; the generation-scoped
-    /// cleanup ran and produced this report.
+    /// This generation never published a conflist within the publish budget,
+    /// so it never became a node-wide pod-creation dependency. Nothing was
+    /// removed, and nothing needed to be.
+    NeverPublished,
+    /// The deadline passed and the generation-scoped cleanup removed the
+    /// chain: pod creation on this node no longer traverses `ferrum-cni`.
     RolledBack(CniUninstallReport),
+    /// The deadline passed, cleanup ran, and the chained conflist is STILL
+    /// present — a foreign or unremovable file occupies the configured path.
+    /// The node-wide dependency was not lifted.
+    RollbackIncomplete(CniUninstallReport),
+    /// The deadline passed but a newer install now owns the artifacts. This
+    /// run deliberately deleted nothing; the newer generation's own watcher
+    /// is responsible for it.
+    Superseded(CniUninstallReport),
+}
+
+impl RollbackWatchOutcome {
+    /// True only when this node no longer depends on the node-agent because
+    /// of *this* generation.
+    pub fn dependency_cleared(&self) -> bool {
+        match self {
+            Self::Ready | Self::Superseded(_) => false,
+            Self::NeverPublished => true,
+            Self::RolledBack(report) | Self::RollbackIncomplete(report) => report.chain_lifted(),
+        }
+    }
 }
 
 /// Poll `probe` until it returns true or the readiness budget is exhausted,
@@ -100,6 +171,25 @@ pub fn run_rollback_watch(
     config: &RollbackWatchConfig,
     probe: &mut dyn FnMut() -> bool,
 ) -> Result<RollbackWatchOutcome, CniInstallError> {
+    // Phase 1 — publication. The budget below must not start while the
+    // installer may still be working, and cleanup must never run against an
+    // install that has not completed.
+    let publish_deadline = Instant::now() + config.publish_timeout;
+    loop {
+        if probe() {
+            return Ok(RollbackWatchOutcome::Ready);
+        }
+        if this_generation_is_published(config) {
+            break;
+        }
+        let now = Instant::now();
+        if now >= publish_deadline {
+            return Ok(RollbackWatchOutcome::NeverPublished);
+        }
+        std::thread::sleep(config.poll_interval.min(publish_deadline - now));
+    }
+
+    // Phase 2 — readiness, measured from the completed install.
     let deadline = Instant::now() + config.ready_timeout;
     loop {
         if probe() {
@@ -113,8 +203,36 @@ pub fn run_rollback_watch(
         // the window in which the node cannot create pods.
         std::thread::sleep(config.poll_interval.min(deadline - now));
     }
+
+    // `uninstall` takes the node install lock for its whole run and re-reads
+    // every ownership marker under it, so a newer installer that started
+    // while this budget was expiring is either excluded or observed — never
+    // half-observed.
     let report = install::uninstall(&config.uninstall)?;
-    Ok(RollbackWatchOutcome::RolledBack(report))
+    Ok(classify_rollback(report))
+}
+
+/// True when the generated conflist on disk carries exactly the owner and
+/// generation this watcher is scoped to.
+fn this_generation_is_published(config: &RollbackWatchConfig) -> bool {
+    let conf_dir = &config.uninstall.host_conf_dir;
+    let conf_file = &config.uninstall.conf_file_name;
+    install::published_conflist_ownership(conf_dir, conf_file)
+        .is_some_and(|found| config.uninstall.owns(&found))
+}
+
+fn classify_rollback(report: CniUninstallReport) -> RollbackWatchOutcome {
+    match report.conflist {
+        CniArtifactOutcome::Removed | CniArtifactOutcome::AlreadyAbsent => {
+            RollbackWatchOutcome::RolledBack(report)
+        }
+        CniArtifactOutcome::RetainedOtherOwner | CniArtifactOutcome::RetainedOtherGeneration => {
+            RollbackWatchOutcome::Superseded(report)
+        }
+        CniArtifactOutcome::RetainedForeign(_) | CniArtifactOutcome::RetainedDeliberate(_) => {
+            RollbackWatchOutcome::RollbackIncomplete(report)
+        }
+    }
 }
 
 /// One CNI STATUS round-trip against the node-agent socket.
@@ -194,11 +312,28 @@ impl CleanupWaitConfig {
 /// Default budget for every node's cleanup pod to finish.
 pub const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a controller-observed "no node matches this DaemonSet" status has
+/// to hold before it counts as "there was nothing to clean".
+///
+/// A DaemonSet that was created moments ago also reports `0/0`, so a single
+/// snapshot of it proves nothing. Requiring the controller's own observed
+/// generation *and* a settle window separates "the controller has looked and
+/// there are genuinely no nodes" from "the controller has not looked yet".
+const ZERO_DESIRED_SETTLE: Duration = Duration::from_secs(15);
+
 /// What the cleanup DaemonSet's status said when the wait ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupWaitReport {
     pub desired: i32,
     pub ready: i32,
+}
+
+impl CleanupWaitReport {
+    /// True when the DaemonSet scheduled onto no node at all, so no node was
+    /// cleaned — reported explicitly rather than as "0 of 0 succeeded".
+    pub fn scheduled_nowhere(&self) -> bool {
+        self.desired == 0
+    }
 }
 
 /// Block until every node's cleanup pod is Ready — that is, until
@@ -212,9 +347,12 @@ pub struct CleanupWaitReport {
 /// phase a completion boundary Helm does understand, and makes a node that
 /// cannot be cleaned fail the uninstall instead of passing silently.
 ///
-/// `desired == 0` (no node currently matches the DaemonSet) is a success only
-/// once the DaemonSet controller has observed the object, so an unobserved
-/// all-zero status is never mistaken for "nothing to do".
+/// Completion requires the DaemonSet controller to have observed the object
+/// (`status.observedGeneration >= metadata.generation`; a status that carries
+/// no observed generation at all is treated as unobserved, never as
+/// observed-and-idle). An all-zero status additionally has to persist for
+/// [`ZERO_DESIRED_SETTLE`], so a freshly created DaemonSet's initial `0/0`
+/// snapshot can never be mistaken for "nothing to do".
 pub async fn await_cleanup_daemonset(
     config: &CleanupWaitConfig,
 ) -> Result<CleanupWaitReport, String> {
@@ -231,6 +369,7 @@ pub async fn await_cleanup_daemonset(
         desired: 0,
         ready: 0,
     };
+    let mut zero_since: Option<Instant> = None;
     loop {
         match api.get_status(&config.daemonset_name).await {
             Ok(daemonset) => {
@@ -242,10 +381,24 @@ pub async fn await_cleanup_daemonset(
                     };
                     let observed = match (generation, status.observed_generation) {
                         (Some(generation), Some(observed)) => observed >= generation,
-                        _ => true,
+                        // A generation the controller has not reported on is
+                        // unobserved. Treating a missing observed generation
+                        // as "observed" is what let an all-zero initial status
+                        // pass as a completed cleanup.
+                        (Some(_), None) => false,
+                        (None, _) => true,
                     };
-                    if observed && last.ready >= last.desired {
+                    if !observed || last.desired > 0 {
+                        zero_since = None;
+                    }
+                    if observed && last.desired > 0 && last.ready >= last.desired {
                         return Ok(last);
+                    }
+                    if observed && last.desired == 0 {
+                        let settled = *zero_since.get_or_insert_with(Instant::now);
+                        if settled.elapsed() >= ZERO_DESIRED_SETTLE {
+                            return Ok(last);
+                        }
                     }
                 }
             }
@@ -253,6 +406,7 @@ pub async fn await_cleanup_daemonset(
                 // A transient API error must not be read as "cleanup done".
                 // This runs from the CLI, which installs no tracing
                 // subscriber, so the operator only sees stderr.
+                zero_since = None;
                 eprintln!(
                     "ferrum-cni: could not read the status of DaemonSet {}; retrying: {err}",
                     config.daemonset_name
@@ -286,7 +440,9 @@ pub async fn await_cleanup_daemonset(
 /// cleanup never publishes it.
 pub fn write_ready_marker(path: &str) -> io::Result<()> {
     let path = Path::new(path);
-    if let Some(parent) = path.parent() && !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, b"ferrum-cni cleanup complete\n")

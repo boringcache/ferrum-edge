@@ -2083,6 +2083,7 @@ jobs:
             'name: ferrum-mesh-cni-cleanup-wait' 'name: OWNER_ID' \
             'name: INSTALL_GENERATION' 'name: EXPECTED_OWNER' \
             'name: READY_MARKER_PATH' 'restartPolicy: Always' \
+            'name: PUBLISH_TIMEOUT_SECS' \
             'automountServiceAccountToken: false' \
             'resourceNames: ["ferrum-mesh-cni-cleanup"]' \
             '- await-cleanup'; do
@@ -2109,6 +2110,17 @@ jobs:
           # completion boundary.
           if ! grep -A3 '^kind: Job' "$cni_out" | grep -Fq 'name: ferrum-mesh-cni-cleanup-wait'; then
             echo "::error title=CNI cleanup has no wait Job::a hook DaemonSet alone is fire-and-forget; the release could be deleted mid-cleanup"
+            exit 1
+          fi
+          # Both cleanup pods must be hostNetwork: a pod that needed its own
+          # CNI sandbox could never start on a node whose chain is broken, so
+          # the hook would deadlock exactly where it is needed most.
+          cni_hook_out="$RUNNER_TEMP/ferrum-helm-results/cni-uninstall-hook.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --show-only templates/cni-uninstall-hook.yaml > "$cni_hook_out"
+          if [ "$(grep -c 'hostNetwork: true' "$cni_hook_out")" -lt 2 ]; then
+            echo "::error title=CNI cleanup pods are not hostNetwork::cleanup would deadlock behind the chain it removes"
             exit 1
           fi
           # The wait Job's RBAC must stay a single read verb on one named object.
