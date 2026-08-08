@@ -392,13 +392,24 @@ impl Drop for MeshEgressUdpSessionSlot {
 /// when the cap is already reached. The optimistic `fetch_add` + rollback keeps
 /// the admission a single atomic RMW on the accept path (no lock, no scan).
 fn reserve_mesh_egress_udp_session(max_sessions: usize) -> Option<MeshEgressUdpSessionSlot> {
-    let previous =
-        MESH_EGRESS_UDP_ACTIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if previous >= max_sessions as u64 {
-        MESH_EGRESS_UDP_ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if !try_reserve_mesh_egress_udp_session(&MESH_EGRESS_UDP_ACTIVE_SESSIONS, max_sessions) {
         return None;
     }
     Some(MeshEgressUdpSessionSlot)
+}
+
+/// Atomic admission core kept separate so the cap and rollback behavior can be
+/// tested without mutating the process-wide live-session counter.
+fn try_reserve_mesh_egress_udp_session(
+    active_sessions: &std::sync::atomic::AtomicU64,
+    max_sessions: usize,
+) -> bool {
+    let previous = active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if previous >= max_sessions as u64 {
+        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 
 fn inbound_hbone_relay_effective_destination_allowed(
@@ -1751,7 +1762,7 @@ mod tests {
     use super::{
         build_hbone_relay_summary, hbone_relay_body_outcome,
         inbound_hbone_relay_effective_destination_allowed,
-        registered_pod_target_for_udp_destination,
+        registered_pod_target_for_udp_destination, try_reserve_mesh_egress_udp_session,
     };
     use crate::config::types::{Proxy, UpstreamTarget};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -1785,6 +1796,23 @@ mod tests {
             locality: None,
             path: None,
         }
+    }
+
+    #[test]
+    fn external_udp_session_admission_enforces_cap_and_rolls_back_refusal() {
+        let active = std::sync::atomic::AtomicU64::new(0);
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert!(!try_reserve_mesh_egress_udp_session(&active, 2));
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a refused reservation must roll its optimistic increment back"
+        );
+
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     fn mesh_with_workload_port(port: u16) -> MeshConfig {
