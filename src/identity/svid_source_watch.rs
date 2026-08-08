@@ -21,7 +21,12 @@
 //!    or a bundle that fails validation, leaves the live SVID slot untouched
 //!    and does not advance the backend SVID generation. The warning is emitted
 //!    once and silenced until the source recovers.
-//! 3. **The generation boundary advances only after a valid replacement.** The
+//! 3. **The comparison baseline is anchored to startup, not to the first
+//!    poll.** [`GatewaySvidSourceTracker::prime`] runs synchronously before the
+//!    initial bundle load; baselining lazily inside the spawned task would
+//!    adopt whatever the sources hold once the runtime first schedules it and
+//!    silently swallow every change made during startup.
+//! 4. **The generation boundary advances only after a valid replacement.** The
 //!    caller-supplied publish closure installs the bundle *then* bumps
 //!    `backend_svid_rotation_tx`, so backend pool keys (`|svidg=<n>`), pool
 //!    drains, and health-probe restarts all observe one coherent update — the
@@ -352,6 +357,27 @@ impl GatewaySvidSourceTracker {
         }
     }
 
+    /// Establish the comparison baseline from the sources as they are *now*.
+    ///
+    /// This must run **synchronously at startup, before the initial SVID
+    /// bundle is loaded into the live slot**, not lazily on the watcher task's
+    /// first scheduled poll. The spawned task does not run until the caller
+    /// yields to the runtime, and the gap between `ProxyState::new` and that
+    /// first yield covers the rest of gateway startup (TLS policy, listener
+    /// binds, DNS warmup). A source rewritten inside that window would be
+    /// adopted *as* the baseline, so the change is never observed and the
+    /// gateway keeps serving the pre-rotation identity until the material
+    /// happens to change again — precisely the silent-staleness this watcher
+    /// exists to prevent.
+    ///
+    /// Priming before the bundle load keeps the failure direction safe: the
+    /// baseline can only be older than or equal to what the live slot holds,
+    /// so a startup-window change costs one redundant rotation rather than a
+    /// stale identity.
+    pub fn prime(&mut self, now: Instant) -> GatewaySvidPollOutcome {
+        self.poll(now).outcome
+    }
+
     /// Adopt the current fingerprints as the comparison baseline.
     ///
     /// Called only after the corresponding coherent bundle is already live.
@@ -408,6 +434,13 @@ pub struct GatewaySvidWatchConfig {
     /// Cadence for provider-backed sources without an explicit `?poll=`
     /// (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`).
     pub provider_interval: Duration,
+    /// Tracker already primed by the caller via
+    /// [`GatewaySvidSourceTracker::prime`]. Production always supplies one so
+    /// the baseline is anchored to startup rather than to whenever the spawned
+    /// task is first scheduled. `None` builds the tracker here and baselines on
+    /// the first poll, which is only correct when the sources cannot have
+    /// changed since they were configured.
+    pub tracker: Option<GatewaySvidSourceTracker>,
     pub publish: GatewaySvidPublishFn,
 }
 
@@ -423,10 +456,13 @@ pub async fn run_gateway_svid_source_rotation_loop(
         sources,
         file_interval,
         provider_interval,
+        tracker,
         publish,
     } = config;
 
-    let mut tracker = GatewaySvidSourceTracker::new(&sources, file_interval, provider_interval);
+    let mut tracker = tracker.unwrap_or_else(|| {
+        GatewaySvidSourceTracker::new(&sources, file_interval, provider_interval)
+    });
     if !tracker.is_watchable() {
         info!(
             "Gateway SVID sources are all static (inline PEM); automatic refresh is disabled — \

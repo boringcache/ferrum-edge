@@ -351,6 +351,7 @@ async fn watch_loop_refuses_mismatched_material_and_publishes_rotations() {
         sources: files.source_set(),
         file_interval: Duration::from_secs(1),
         provider_interval: PROVIDER_DEFAULT,
+        tracker: None,
         publish: Box::new(move |bundle| {
             assert_eq!(bundle.spiffe_id.to_string(), SPIFFE_ID);
             counter.fetch_add(1, Ordering::SeqCst) + 1
@@ -402,6 +403,66 @@ async fn watch_loop_refuses_mismatched_material_and_publishes_rotations() {
         .expect("watcher task did not panic");
 }
 
+/// A source rewritten *after* the baseline was primed but *before* the spawned
+/// watcher task first runs must still publish exactly one rotation.
+///
+/// `tokio::spawn` only queues the task; on a current-thread runtime it does not
+/// run at all until the spawner yields, and in production that gap covers the
+/// rest of gateway startup. Letting the loop baseline itself on its first poll
+/// therefore adopted post-rotation bytes as "the original" and swallowed the
+/// change permanently — the gateway kept using the pre-rotation identity
+/// (issue #3625).
+#[tokio::test]
+async fn a_change_between_priming_and_the_first_poll_still_rotates() {
+    let (ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    assert_eq!(tracker.prime(Instant::now()), Outcome::Baseline);
+
+    // The rotation happens before the loop has ever been polled.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, rotated_key).expect("write key");
+    std::fs::write(&files.cert_path, rotated_cert).expect("write cert");
+
+    let published = Arc::new(AtomicU64::new(0));
+    let counter = published.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let config = GatewaySvidWatchConfig {
+        sources,
+        file_interval: Duration::from_secs(1),
+        provider_interval: PROVIDER_DEFAULT,
+        tracker: Some(tracker),
+        publish: Box::new(move |bundle| {
+            assert_eq!(bundle.spiffe_id.to_string(), SPIFFE_ID);
+            counter.fetch_add(1, Ordering::SeqCst) + 1
+        }),
+    };
+    let task = tokio::spawn(run_gateway_svid_source_rotation_loop(
+        config,
+        Some(shutdown_rx),
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while published.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        1,
+        "a change made before the watcher's first poll must still rotate exactly once"
+    );
+
+    // And it stays at one: the committed baseline suppresses further churn.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher exits on shutdown")
+        .expect("watcher task did not panic");
+}
+
 #[tokio::test]
 async fn watch_loop_exits_when_every_source_is_static() {
     let published = Arc::new(AtomicU64::new(0));
@@ -410,6 +471,7 @@ async fn watch_loop_exits_when_every_source_is_static() {
         sources: inline_source_set(),
         file_interval: Duration::from_secs(1),
         provider_interval: PROVIDER_DEFAULT,
+        tracker: None,
         publish: Box::new(move |_bundle| counter.fetch_add(1, Ordering::SeqCst) + 1),
     };
 
