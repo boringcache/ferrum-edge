@@ -87,6 +87,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
+pub mod mcp_aggregate_sse;
 pub mod mcp_gateway;
 pub mod mesh;
 pub mod mesh_route_dispatch;
@@ -2721,6 +2722,34 @@ pub struct RequestContext {
     /// forged `mcp.*` key can either force or clear the guard, and it never
     /// reaches transaction metadata.
     pub(crate) mcp_batch_forbids_upstream: bool,
+    /// Aggregate-router multiplexed SSE listener staged by `mcp_gateway` for a
+    /// GET attach. Kept out of public `metadata` so a forgeable key cannot
+    /// attach to, or steal, a session's event stream.
+    ///
+    /// This is a Clone-able HANDLE, not the stream itself: the body behind it
+    /// is claimed by a one-shot compare-and-swap
+    /// (`AggregateSseListener::take_body`), so a `RequestContext` clone shares
+    /// the same lease and can never duplicate or divert delivery. If no
+    /// transport ever claims it — because a later plugin replaced the
+    /// rejection — dropping the last handle releases the session's
+    /// single-listener slot instead of stranding it.
+    pub(crate) mcp_aggregate_sse: Option<mcp_aggregate_sse::AggregateSseListener>,
+    /// Lease for the multiplexed request stream this request opened, before any
+    /// catalog refresh or upstream dispatch began. Private for the same reason
+    /// as the listener lease: a forgeable metadata key must not be able to open,
+    /// steal, or terminate another request's stream identity.
+    ///
+    /// Dropping the context is the exact-once release path for every ending a
+    /// request can have — inline answer, backend or body error, policy
+    /// replacement, cancellation, transport disconnect — so no cleanup task is
+    /// ever spawned and no identity can leak its per-session capacity.
+    pub(crate) mcp_sse_stream: Option<mcp_aggregate_sse::AggregateSseStream>,
+    /// Aggregate-SSE event reserved after final body policy selected an empty
+    /// POST-side `202`, but not yet visible to the listener. The committed hook
+    /// publishes it only if that exact acknowledgement survives the remaining
+    /// response-header lifecycle; drop/abort returns the reservation and stream
+    /// capacity exactly once. Private so metadata cannot forge publication.
+    pub(crate) mcp_sse_publication: Option<mcp_aggregate_sse::AggregateSsePublication>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -3228,6 +3257,9 @@ impl RequestContext {
             mcp_trusted_tool_name_rewrite: None,
             mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
+            mcp_aggregate_sse: None,
+            mcp_sse_stream: None,
+            mcp_sse_publication: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -4342,6 +4374,18 @@ impl RequestContext {
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
+            // A hook-context copy is never a transport, so it has no business
+            // holding the listener lease at all. The real request context keeps
+            // it and is the only place the response builders read it from.
+            mcp_aggregate_sse: None,
+            // Likewise for the request-stream lease: this short-lived copy is
+            // discarded after the request-body hooks, and only `metadata`/WAF/AI
+            // state is copied back. Holding a lease here would terminalize the
+            // live request's identity when the copy dropped.
+            mcp_sse_stream: None,
+            // A pending response publication is likewise owned only by the live
+            // response lifecycle, never by a request-body compatibility clone.
+            mcp_sse_publication: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

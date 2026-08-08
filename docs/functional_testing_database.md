@@ -38,7 +38,7 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | Namespace + runtime isolation | `namespace_suite_sqlite`, `runtime_isolation_sqlite` | `namespace_suite_postgres`, `runtime_isolation_postgres` | `namespace_suite_mysql`, `runtime_isolation_mysql` | `namespace_suite_mongodb`, `runtime_isolation_mongodb` |
 | Concurrent mutations | included in SQLite CRUD matrix | included in PostgreSQL CRUD matrix | included in MySQL CRUD matrix | included in MongoDB CRUD matrix |
 | Migrate up + idempotency | `functional_migrate_*` (application shard) | `test_postgres_migrate_up_is_idempotent` | `test_mysql_migrate_up_is_idempotent` | N/A (index ensure path in Mongo lifecycle) |
-| Connectivity recovery | `functional_db_outage_test` / `functional_db_failover_test` | `test_postgres_connectivity_recovery_after_container_pause` | `test_mysql_connectivity_recovery_after_container_pause` | proxy continues on cached config in Mongo lifecycle |
+| Connectivity recovery | `functional_db_outage_test` (debug-only `FERRUM_TEST_DB_FAULT_CONTROL` file seam; never corrupts live SQLite/WAL/SHM) / `functional_db_failover_test` | `test_postgres_connectivity_recovery_after_container_pause` | `test_mysql_connectivity_recovery_after_container_pause` | proxy continues on cached config in Mongo lifecycle |
 | Supported TLS modes | `test_sqlite_without_tls_settings` (N/A network TLS) | `test_postgresql_tls_verify_full`, `test_postgresql_tls_require` | `test_mysql_tls_verify_identity`, `test_mysql_tls_required` | `test_mongodb_tls_connection` (verify-full), `test_mongodb_tls_require_connection` (require), `test_mongodb_mtls_connection` (mTLS); hosted inline in data-plane CI |
 
 ### CI job mapping
@@ -65,6 +65,7 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | SQL TLS certs provisioned inline by data-plane CI (local: `tests/scripts/setup_db_tls.sh`) |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL/MongoDB TLS fixtures are missing |
+| `FERRUM_TEST_DB_FAULT_CONTROL` | path set by `functional_db_outage_test` harness | **Debug builds only.** Test-only file seam that forces config-DB acquires to fail with `PoolClosed` while the control file exists. Not a product setting; omitted from `ferrum.conf` / operator configuration docs. Release binaries ignore it. |
 
 ## Overview
 
