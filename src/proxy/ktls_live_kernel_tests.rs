@@ -45,13 +45,16 @@
 //!
 //! # Capability gate
 //!
-//! Every test needs a kernel with the TLS ULP and all three AEAD families the
-//! rustls TLS 1.2 client offers (the admission gate refuses unless *every*
-//! offered suite is installable). Without them the tests print `SKIP:` and
-//! pass — unless `FERRUM_KTLS_LIVE_REQUIRED=1`, which turns an unavailable
-//! capability into a failure. The hosted gate sets that variable, so the
-//! required CI signal is "the live path ran", never "the live path was
-//! quietly unavailable".
+//! Every test needs a kernel with the TLS ULP and AES-128-GCM kTLS support.
+//! The throwaway client and server providers are deliberately restricted to
+//! the single TLS 1.2 AES-128-GCM suite, so the production admission gate can
+//! prove every offered suite is installable even on hosted kernels that do not
+//! implement ChaCha20-Poly1305 kTLS. This narrows only the test offer set; it
+//! does not weaken production eligibility. Without AES-128 support the tests
+//! print `SKIP:` and pass — unless `FERRUM_KTLS_LIVE_REQUIRED=1`, which turns
+//! an unavailable capability into a failure. The hosted gate sets that
+//! variable, so the required CI signal is "the live path ran", never "the live
+//! path was quietly unavailable".
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -101,10 +104,10 @@ fn kernel_supports_live_ktls() -> bool {
     let aes128 = ktls::is_ktls_aes128gcm_available();
     let aes256 = ktls::is_ktls_aes256gcm_available();
     let chacha = ktls::is_ktls_chacha20_poly1305_available();
-    // The admission gate requires that *every* suite the client offered is
-    // installable, and a rustls TLS 1.2 client offers all three families, so a
-    // partial kernel declines the handoff instead of performing it.
-    if aes128 && aes256 && chacha {
+    // The live provider below offers only AES-128-GCM, so that is the only
+    // capability this proof needs. Keep the other probes in the diagnostic so
+    // a red hosted gate still explains the runner's full kTLS posture.
+    if aes128 {
         return true;
     }
     let probes = format!("aes128={aes128} aes256={aes256} chacha20={chacha}");
@@ -113,6 +116,27 @@ fn kernel_supports_live_ktls() -> bool {
     }
     println!("SKIP: kernel TLS ULP is unusable ({probes}); needs Linux 5.11+ with `tls` loaded");
     false
+}
+
+/// Provider for the live proof, restricted to one TLS 1.2 cipher that the
+/// hosted Linux kTLS gate supports.
+///
+/// Production remains conservative and declines a ClientHello unless every
+/// selectable TLS 1.2 suite it offered has kernel support. Restricting this
+/// throwaway test provider is how the live proof supplies such an offer set on
+/// kernels that support AES-GCM but not ChaCha20-Poly1305 kTLS.
+fn live_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = crate::fips::base_crypto_provider();
+    provider.cipher_suites.retain(|suite| {
+        suite.suite()
+            == rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    });
+    assert_eq!(
+        provider.cipher_suites.len(),
+        1,
+        "the base provider must expose the TLS 1.2 AES-128-GCM live-test suite"
+    );
+    Arc::new(provider)
 }
 
 /// Frontend `ServerConfig`: TLS 1.2 only, self-signed ECDSA leaf, kTLS secret
@@ -128,7 +152,7 @@ fn live_server_config() -> Arc<ServerConfig> {
         .expect("self-sign the live test certificate");
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-    let provider = Arc::new(crate::fips::base_crypto_provider());
+    let provider = live_crypto_provider();
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
         .expect("TLS 1.2 is a supported protocol version")
@@ -143,7 +167,7 @@ fn live_server_config() -> Arc<ServerConfig> {
 
 /// TLS 1.2-only client that trusts the throwaway self-signed leaf.
 fn live_connector() -> TlsConnector {
-    let provider = Arc::new(crate::fips::base_crypto_provider());
+    let provider = live_crypto_provider();
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
         .expect("TLS 1.2 is a supported protocol version")

@@ -413,9 +413,7 @@ async fn peek_client_hello(stream: &TcpStream, deadline: Option<Instant>) -> Opt
             buf.truncate(peeked);
             return Some(buf);
         }
-        if deadline.is_none() {
-            return None;
-        }
+        let d = deadline?;
         if peeked >= buf.len() {
             let want = crate::proxy::sni::next_peek_capacity(peeked);
             if want > buf.len() {
@@ -428,7 +426,6 @@ async fn peek_client_hello(stream: &TcpStream, deadline: Option<Instant>) -> Opt
             return None;
         }
         let now = Instant::now();
-        let d = deadline?;
         if now >= d {
             return None;
         }

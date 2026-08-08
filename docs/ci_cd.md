@@ -366,7 +366,7 @@ cargo nextest run --archive-file functional-tests-*.tar.zst \
 ```
 
 The kTLS step is a **live-kernel** gate, not a unit test: it drives a real
-rustls TLS 1.2 client through `try_ktls_accept`, installs kernel TLS keys on the
+rustls TLS 1.2 AES-128-GCM client through `try_ktls_accept`, installs kernel TLS keys on the
 runner's own kernel with `setsockopt(SOL_TLS, ...)`, relays application bytes
 through `splice(2)`, and asserts the TLS close handshake (authenticated
 `close_notify` → clean EOF, bare FIN → truncation, backend EOF → reciprocal

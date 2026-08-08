@@ -609,11 +609,14 @@ every pull request:
 6. a record the kernel cannot authenticate ends the relay with an attributed
    failure and never with an EOF.
 
-The tests are `#[ignore]`d by default and gated on the kernel exposing the TLS
-ULP for all three AEAD families. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
-unavailable capability into a failure rather than a skip, and the CI step also
-fails on any `SKIP:` line or on a pass count other than three — so a green
-required check cannot mean "the live path did not run".
+The tests are `#[ignore]`d by default and pin their throwaway TLS 1.2 client
+and server to AES-128-GCM, so the kernel gate needs that kTLS family without
+requiring hosted kernels to implement ChaCha20-Poly1305 too. Production
+eligibility is unchanged: it still requires every selectable suite in the
+actual ClientHello to be installable. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
+unavailable AES-128 capability into a failure rather than a skip, and the CI
+step also fails on any `SKIP:` line or on a pass count other than three — so a
+green required check cannot mean "the live path did not run".
 
 Residual, covered only by the deterministic unit suite: peer-originated fatal
 alerts and non-`close_notify` warning alerts are classified by
