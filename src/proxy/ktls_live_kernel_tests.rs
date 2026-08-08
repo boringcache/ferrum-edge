@@ -36,9 +36,11 @@
 //! 6. A record the kernel cannot authenticate ends the relay with an
 //!    attributed failure and never with EOF.
 //! 7. The handed-off session carries a real per-direction confidentiality
-//!    budget: the negotiated suite's rustls `confidentiality_limit`, and
+//!    budget: the negotiated suite's rustls `confidentiality_limit`,
 //!    kernel-reported record sequence numbers that already account for the
-//!    records the handshake itself spent.
+//!    records the handshake itself spent, and a receive window the real kernel
+//!    has actually pinned — `SO_RCVBUF` reads back unchanged after the handoff,
+//!    which is the property the receive record bound is built on.
 //!
 //! Peer-originated fatal and non-`close_notify` warning alerts are classified
 //! by [`classify_ktls_control_record`](crate::proxy::ktls_record::classify_ktls_control_record),
@@ -260,6 +262,7 @@ fn assert_live_confidentiality_policy(accepted: &KtlsAccepted) {
         policy.initial_transmit_seq < threshold && policy.initial_receive_seq < threshold,
         "a fresh session must start well inside its budget"
     );
+    assert_live_receive_window_is_pinned(accepted, &policy);
     // Both guards must build; an already-exhausted direction would refuse the
     // relay outright.
     for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
@@ -270,6 +273,38 @@ fn assert_live_confidentiality_policy(accepted: &KtlsAccepted) {
         assert_eq!(guard.threshold(), threshold);
         assert!(guard.allowance() > 0, "a fresh window must be open");
     }
+}
+
+/// Prove on a real kernel that the receive window the budget was sized against
+/// is the socket's own, and that the kernel is holding it still.
+///
+/// The receive record bound is only sound if `sk_rcvbuf` cannot grow after the
+/// handoff. `setsockopt(SO_RCVBUF)` sets `SOCK_RCVBUF_LOCK`, which is what makes
+/// that true, but only a live kernel can show that the value the policy carries
+/// really came from this socket and really survives the key install: the pinned
+/// size is read back here, after `enable_ktls` ran, and must still account for
+/// the whole ceiling.
+fn assert_live_receive_window_is_pinned(
+    accepted: &KtlsAccepted,
+    policy: &crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy,
+) {
+    use crate::proxy::ktls_confidentiality::KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = accepted.stream.as_raw_fd();
+    let live = ktls::socket_receive_buffer_bytes(fd)
+        .expect("a kTLS socket must still report SO_RCVBUF after the key install");
+    assert!(
+        live > 0,
+        "a pinned receive buffer must read back as a positive size"
+    );
+    assert!(
+        policy.stable_receive_ceiling >= live + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
+        "the ceiling ({}) must cover the pinned buffer ({live}) plus its overshoot headroom",
+        policy.stable_receive_ceiling
+    );
+    let again = ktls::socket_receive_buffer_bytes(fd).expect("SO_RCVBUF stays readable");
+    assert_eq!(live, again, "a pinned receive buffer must not move");
 }
 
 /// Bind a loopback listener and report its address.

@@ -8622,9 +8622,12 @@ async fn splice_one_direction_no_guard(
 /// budget, observing the kernel's `TLS_RX` sequence number only when the
 /// current window cannot cover it.
 ///
-/// The charge is the guard's cached bound — derived from the socket receive
-/// buffer ceiling, which is what caps how many records a single non-blocking
-/// receive can consume — so the common case is one subtraction and no syscall.
+/// The charge is the guard's fixed bound — derived once at handoff from the
+/// socket's *pinned* receive ceiling, which is what caps how many records a
+/// single non-blocking receive can consume — so the common case is one
+/// subtraction and no syscall. The observation refreshes the sequence number
+/// only; it never re-measures the window, because the ceiling it was sized
+/// against is kernel-locked for the life of the connection.
 #[cfg(target_os = "linux")]
 fn charge_ktls_receive(
     guard: &mut crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard,

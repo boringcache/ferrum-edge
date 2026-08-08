@@ -1557,8 +1557,11 @@ pub mod ktls {
 
     /// Current `SO_RCVBUF` for a socket, in bytes.
     ///
-    /// Used to bound how many TLS records one non-blocking receive can consume
-    /// (`proxy::ktls_confidentiality::receive_record_bound`).
+    /// This is the kernel's `sk_rcvbuf`, already doubled for skb overhead, and
+    /// it is what caps how much unread wire data the socket may hold. On its
+    /// own it is **not** a stable bound: TCP receive autotuning rewrites it as
+    /// the connection runs. [`pin_socket_receive_buffer`] is what makes a
+    /// readback of this value hold still.
     pub fn socket_receive_buffer_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1583,28 +1586,94 @@ pub mod ktls {
         Ok(value as u64)
     }
 
-    /// Kernel ceiling on TCP receive-buffer autotuning (`tcp_rmem[2]`), in the
-    /// same units `SO_RCVBUF` reports.
+    /// Bytes currently queued on `fd` for reading, from the kernel's own
+    /// `FIONREAD` accounting.
     ///
-    /// The kernel doubles the configured value to cover skb overhead when it
-    /// reports `SO_RCVBUF`, so the `/proc` figure is doubled here to keep the
-    /// two comparable. Read once and cached: this is a boot-time sysctl, and
-    /// an operator raising it mid-run only makes the cached value smaller than
-    /// reality — which is why callers also take the max with the socket's live
-    /// `SO_RCVBUF`.
+    /// Called on a socket that carries the TLS ULP but no keys yet, so this is
+    /// still plain `tcp_ioctl` accounting: exactly the unread wire bytes
+    /// `rcv_nxt - copied_seq`. It is the *only* sound way to bound data that
+    /// was already queued before [`pin_socket_receive_buffer`] took effect —
+    /// that data was admitted under whatever `sk_rcvbuf` autotuning had reached
+    /// at the time, which no later observation can reconstruct.
+    pub fn socket_receive_queue_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: `fd` is borrowed from a live socket by the caller and
+        // `FIONREAD` writes exactly one `c_int` through the pointer.
+        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, std::ptr::addr_of_mut!(queued)) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if queued < 0 {
+            return Err(std::io::Error::other(
+                "kTLS: FIONREAD reported a negative receive queue",
+            ));
+        }
+        Ok(queued as u64)
+    }
+
+    /// Pin this socket's receive buffer so the kernel can never grow it again,
+    /// and return the kernel's own readback of the pinned size.
     ///
-    /// `None` when `/proc` is unreadable or unparseable; callers then fall back
-    /// to a conservative constant ceiling.
-    pub fn kernel_max_receive_buffer_bytes() -> Option<u64> {
-        static TCP_RMEM_MAX: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        *TCP_RMEM_MAX.get_or_init(|| {
-            let text = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_rmem").ok()?;
-            let mut fields = text.split_whitespace();
-            let _min = fields.next()?;
-            let _default = fields.next()?;
-            let max = fields.next()?.parse::<u64>().ok()?;
-            Some(max.saturating_mul(2))
-        })
+    /// # The invariant this establishes
+    ///
+    /// A successful `setsockopt(SOL_SOCKET, SO_RCVBUF)` sets `SOCK_RCVBUF_LOCK`
+    /// in `sk->sk_userlocks`, and every kernel path that would otherwise raise
+    /// `sk_rcvbuf` — `tcp_rcv_space_adjust`, `tcp_clamp_window` — is gated on
+    /// that flag being clear. From the moment this returns, `sk_rcvbuf` for this
+    /// socket can only change through another `setsockopt` on this same fd,
+    /// which the gateway never issues. Raising `net.ipv4.tcp_rmem[2]` or
+    /// `net.core.rmem_max` afterwards therefore cannot move it: those sysctls
+    /// feed autotuning and future `setsockopt` clamping, not a locked socket.
+    ///
+    /// That is what a confidentiality bound needs and what a `/proc` snapshot
+    /// can never give: a *per-socket* ceiling the kernel itself enforces for the
+    /// remaining life of the connection.
+    ///
+    /// # Linux doubling and clamping, handled by readback
+    ///
+    /// The kernel clamps the requested value to `net.core.rmem_max`, then stores
+    /// `max(2 * value, SOCK_MIN_RCVBUF)`. Neither adjustment is predicted here —
+    /// the `getsockopt` readback afterwards *is* the answer, and it is the value
+    /// the caller must bound with. `request_bytes` is only a request.
+    ///
+    /// The request is floored at the socket's live `SO_RCVBUF` so pinning never
+    /// shrinks a buffer the connection has already earned. Even if the kernel
+    /// still lands below that (a small `rmem_max` against an already-autotuned
+    /// socket), no queued byte is lost: Linux keeps skbs that are already on the
+    /// receive queue and merely stops admitting more, and the caller bounds the
+    /// pre-existing queue separately with [`socket_receive_queue_bytes`].
+    pub fn pin_socket_receive_buffer(
+        fd: std::os::unix::io::RawFd,
+        request_bytes: u64,
+    ) -> std::io::Result<u64> {
+        let current = socket_receive_buffer_bytes(fd).unwrap_or(0);
+        // `sk_setsockopt` rejects a negative value and internally clamps to
+        // `INT_MAX / 2` before doubling, so saturate here rather than wrap.
+        let want = request_bytes.max(current).min(libc::c_int::MAX as u64 / 2) as libc::c_int;
+        // SAFETY: `want` is a live `c_int` and `len` describes it exactly; `fd`
+        // is borrowed from a live socket by the caller.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(want).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The readback, not the request, is the bound. A kernel that answered
+        // the set but cannot report the result leaves nothing to bound with, so
+        // the error propagates and the caller refuses the handoff.
+        let pinned = socket_receive_buffer_bytes(fd)?;
+        if pinned == 0 {
+            return Err(std::io::Error::other(
+                "kTLS: pinned SO_RCVBUF read back as zero",
+            ));
+        }
+        Ok(pinned)
     }
 
     /// Attempt to enable kTLS on a connected TCP socket.
@@ -2334,8 +2403,15 @@ pub mod ktls {
     }
 
     #[allow(dead_code)]
-    pub fn kernel_max_receive_buffer_bytes() -> Option<u64> {
-        None
+    pub fn socket_receive_queue_bytes(_fd: i32) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
+    }
+
+    /// No socket can be pinned off Linux because no socket can carry kTLS
+    /// there. Failing keeps the receive-window bound fail-closed.
+    #[allow(dead_code)]
+    pub fn pin_socket_receive_buffer(_fd: i32, _request_bytes: u64) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
     }
 }
 

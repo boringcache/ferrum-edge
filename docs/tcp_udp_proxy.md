@@ -606,12 +606,58 @@ Ferrum therefore enforces the limit itself, per direction, in
   used up. Because the reservation precedes the syscall, the true sequence number
   can never pass the threshold between two observations. Transmit is bounded by
   `ceil(bytes / 2^14) + 1` records per write; receive is bounded by
-  `receive-buffer-ceiling / 29` (the smallest possible TLS 1.2 AEAD record on the
-  wire: 5-byte header + 8-byte explicit nonce + 16-byte tag), with the ceiling
-  taken as the largest of the live `SO_RCVBUF`, the kernel's `tcp_rmem` maximum,
-  and a 16 MiB floor so receive-buffer autotuning during a window cannot
-  invalidate the bound. In practice that is roughly one `getsockopt` per 70
-  splice calls, and none at all on a quiet socket.
+  `receive-ceiling / 29` (the smallest possible TLS 1.2 AEAD record on the
+  wire: 5-byte header + 8-byte explicit nonce + 16-byte tag). In practice that is
+  roughly one `getsockopt` per few dozen splice calls, and none at all on a
+  quiet socket.
+* **The receive ceiling is pinned in the kernel, not sampled in userspace.** The
+  receive bound is only a bound if the socket cannot come to hold more wire data
+  than it was charged for, and a live `SO_RCVBUF` reading does not establish
+  that: TCP receive autotuning rewrites `sk_rcvbuf` as the connection runs,
+  limited by `net.ipv4.tcp_rmem[2]`, which an operator can raise at any time.
+  Taking the maximum of a live reading, a cached `/proc` snapshot, and a constant
+  would not fix it — each of those is stale or arbitrary, so the socket could
+  autotune past the charged bound and one nonblocking `splice(2)` full of
+  minimum-size records could cross the AES-GCM threshold before the next
+  observation.
+
+  So before the rustls session is consumed, a session with a finite limit issues
+  `setsockopt(SOL_SOCKET, SO_RCVBUF)` on its own socket. That sets
+  `SOCK_RCVBUF_LOCK` in `sk->sk_userlocks`, and every kernel path that raises
+  `sk_rcvbuf` (`tcp_rcv_space_adjust`, `tcp_clamp_window`) is gated on that flag
+  being clear, so from that instant the size is frozen for the life of the
+  connection regardless of any later sysctl change. Linux's clamp to
+  `net.core.rmem_max` and its doubling for skb overhead are not predicted: the
+  `getsockopt` readback afterwards *is* the pinned size, and it is what the bound
+  uses. Data that was already queued when the pin took effect was admitted under
+  the old, unknowable size, so it is measured directly with `FIONREAD` **after**
+  the pin and added on top, along with 1 MiB of headroom for the one super-frame
+  Linux may admit past the limit and for the kTLS strparser's partial-record
+  anchor. Afterwards the kernel admits data only while the queue is below the
+  pinned size, so `queued <= max(queued_at_pin, pinned)` holds at every later
+  instant and the ceiling covers both terms. The request is floored at the
+  socket's live `SO_RCVBUF` so pinning never shrinks a buffer the connection
+  already earned, and a smaller readback still loses no data — Linux keeps the
+  skbs already queued and merely stops admitting more.
+
+  That ceiling is computed exactly once, at handoff, and every later observation
+  window uses it. An observation refreshes the record sequence number and
+  nothing else; `KtlsObservation` deliberately carries no size field, so there is
+  no seam through which a mutable global could reopen the window wider.
+
+  Two consequences are worth stating plainly. Pinning ends receive autotuning for
+  that socket, so a kTLS-accelerated AES-GCM frontend on a high bandwidth-delay
+  path is limited by `net.core.rmem_max` (the request is 4 MiB, and Linux clamps
+  it) rather than by `net.ipv4.tcp_rmem[2]`; operators who need more should raise
+  `net.core.rmem_max`. And ChaCha20-Poly1305, whose limit is `u64::MAX`, builds
+  no guard, pins nothing, and keeps ordinary autotuning.
+* **A receive window that cannot be pinned refuses the handoff.** The pin and its
+  readback happen after the handshake but *before*
+  `dangerous_into_kernel_connection`, so a kernel that will not pin the buffer or
+  will not report the pinned size fails the connection while the rustls session
+  is still whole, rather than starting a relay whose receive side no budget
+  covers. Every recoverable refusal still happens earlier, on a pristine socket,
+  with the buffered userspace fallback intact.
 * **A 2^16-record reserve** is held back below the cipher limit, so teardown
   records (the `close_notify` alert) and any kernel accounting subtlety stay
   inside the safe bound.

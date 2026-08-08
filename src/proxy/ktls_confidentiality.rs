@@ -50,13 +50,46 @@
 //! * **Receive** — [`receive_record_bound`]. One non-blocking receive can only
 //!   consume records the kernel has already queued, and queued data is capped
 //!   by the socket receive buffer, so the record count is capped by
-//!   `receive-buffer-ceiling / minimum-record-wire-size`. The ceiling is taken
-//!   from the live `SO_RCVBUF` **and** the kernel's `tcp_rmem` maximum, so
-//!   receive-buffer autotuning during an observation window cannot invalidate
-//!   the bound (see [`receive_buffer_ceiling`]).
+//!   `receive-ceiling / minimum-record-wire-size`.
 //!
-//! With a 6 MiB ceiling that is roughly one `getsockopt` per 70 splice calls,
-//! and with a quiet socket it is one per several hundred megabytes.
+//! With a multi-megabyte ceiling that is roughly one `getsockopt` per few dozen
+//! splice calls, and with a quiet socket it is one per several hundred
+//! megabytes.
+//!
+//! # Why the receive ceiling has to be *pinned*, not merely measured
+//!
+//! The receive bound is only as good as the claim "the kernel cannot hold more
+//! than this". A live `SO_RCVBUF` reading does not support that claim: TCP
+//! receive autotuning rewrites `sk_rcvbuf` while the connection runs, bounded by
+//! `net.ipv4.tcp_rmem[2]` — a sysctl an operator can raise at any moment. Taking
+//! the maximum of a live reading, a cached `/proc` snapshot, and a constant does
+//! not fix that: every one of those three is either stale or arbitrary, so a
+//! socket could autotune above the charged bound and a single nonblocking
+//! `splice(2)` could then consume more minimum-size records than were reserved,
+//! crossing the AES-GCM confidentiality threshold before the next observation.
+//!
+//! So the ceiling is made immutable in the kernel instead of estimated in
+//! userspace. Before the rustls session is consumed,
+//! [`crate::socket_opts::ktls::pin_socket_receive_buffer`] issues
+//! `setsockopt(SO_RCVBUF)`, which sets `SOCK_RCVBUF_LOCK` on the socket; every
+//! kernel path that raises `sk_rcvbuf` is gated on that flag being clear, so
+//! from that instant `sk_rcvbuf` is frozen for the life of this connection no
+//! matter what the sysctls do afterwards. The `getsockopt` readback — not the
+//! request — is the pinned value, which is how Linux's clamp-to-`rmem_max` and
+//! doubling-for-overhead semantics are accounted for without predicting them.
+//!
+//! Data that was *already* queued when the pin took effect was admitted under
+//! the old, unknown `sk_rcvbuf`, so it is measured directly with `FIONREAD`
+//! after the pin and added in ([`stable_receive_ceiling`]). Afterwards the
+//! kernel only admits data while the queue is below the pinned size, so for
+//! every later instant `queued ≤ max(queued_at_pin, pinned)`, and the ceiling
+//! bounds both terms plus [`KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES`] of headroom
+//! for the one super-frame Linux may admit past the limit and for the TLS
+//! strparser's partial-record anchor.
+//!
+//! That single value is computed once at handoff and never revised: an
+//! observation refreshes the *sequence number*, never the window's size, so
+//! there is no seam through which a mutable process-global could widen it.
 //!
 //! # Fail closed
 //!
@@ -67,8 +100,9 @@
 //! budget ([`KtlsConfidentialityError::WindowExceedsBudget`]), and of course
 //! reaching the threshold itself ([`KtlsConfidentialityError::LimitReached`]).
 //! Ciphers whose limit is enforceable are additionally refused *before the
-//! handshake is consumed* when the kernel cannot expose the counter at all —
-//! see `proxy::ktls_accept`.
+//! handshake is consumed* when the kernel cannot expose the counter at all, and
+//! a receive window that cannot be pinned and read back refuses the handoff
+//! while the rustls session is still intact — see `proxy::ktls_accept`.
 
 use crate::socket_opts::ktls::KtlsCipher;
 
@@ -93,11 +127,24 @@ pub const MAX_TLS_PLAINTEXT_BYTES: u64 = 16_384;
 /// receive buffer allows.
 pub const MIN_TLS12_AEAD_RECORD_WIRE_BYTES: u64 = 29;
 
-/// Floor for the receive-buffer ceiling when the kernel maximum is unknown or
-/// smaller than this. Deliberately generous: overstating the ceiling only
-/// costs extra `getsockopt` calls, whereas understating it would break the
-/// bound.
-pub const DEFAULT_RECEIVE_BUFFER_CEILING_BYTES: u64 = 16 * 1024 * 1024;
+/// Receive-buffer size requested when pinning a kTLS socket.
+///
+/// Pinning necessarily disables receive autotuning, so the request is chosen to
+/// be comfortably above the default autotuned working set rather than minimal.
+/// The kernel clamps it to `net.core.rmem_max` and then doubles it, and the
+/// readback is what the bound actually uses, so this value is a preference for
+/// throughput and never part of the safety argument.
+pub const KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Headroom added on top of the pinned buffer and the measured queue.
+///
+/// Linux admits an incoming segment when the receive queue is *below*
+/// `sk_rcvbuf`, so the queue may end up one super-frame past it (GRO, and larger
+/// still with BIG TCP), and the kTLS strparser may hold one partial record in
+/// its anchor outside that accounting. One mebibyte covers both with room to
+/// spare. Overstating the ceiling only buys extra `getsockopt` calls;
+/// understating it would break the bound.
+pub const KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES: u64 = 1024 * 1024;
 
 /// Which traffic key a budget belongs to.
 ///
@@ -237,39 +284,46 @@ pub fn transmit_record_bound(bytes: u64) -> u64 {
 /// Upper bound on the records one non-blocking receive can consume.
 ///
 /// A receive only sees records the kernel already holds, and what it holds is
-/// capped by the socket receive buffer. Every record costs at least
+/// capped by [`stable_receive_ceiling`]. Every record costs at least
 /// [`MIN_TLS12_AEAD_RECORD_WIRE_BYTES`] there, so the count cannot exceed
 /// `ceiling / 29`. The `+ 1` covers a record straddling the accounting edge.
 #[inline]
-pub fn receive_record_bound(receive_buffer_ceiling_bytes: u64) -> u64 {
-    receive_buffer_ceiling_bytes
+pub fn receive_record_bound(receive_ceiling_bytes: u64) -> u64 {
+    receive_ceiling_bytes
         .div_ceil(MIN_TLS12_AEAD_RECORD_WIRE_BYTES)
         .saturating_add(1)
 }
 
-/// Receive-buffer ceiling to bound a whole observation window with.
+/// The immutable receive ceiling a whole kTLS session is bounded with.
 ///
-/// `current` is this socket's live `SO_RCVBUF`; `kernel_max` is the kernel's
-/// autotuning maximum (`tcp_rmem[2]`, already doubled for kernel overhead) or
-/// `None` when it could not be read. The result is the largest of the three
-/// candidates, so buffer growth *after* an observation still cannot exceed the
-/// value the window was sized with.
+/// `pinned_receive_buffer_bytes` is the `getsockopt(SO_RCVBUF)` readback taken
+/// *after* `SOCK_RCVBUF_LOCK` was set, so the kernel cannot raise it again for
+/// this socket. `queued_bytes` is the `FIONREAD` measurement taken *after* the
+/// same pin, which is what bounds data admitted under the old, unknown buffer
+/// size — a quantity no post-hoc observation could otherwise reconstruct.
+///
+/// Because the kernel only admits more data while the queue is below the pinned
+/// size, at every later instant `queued ≤ max(queued_at_pin, pinned)`; summing
+/// the two terms and adding [`KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES`] is therefore
+/// a strict over-approximation that holds for the life of the connection.
 #[inline]
-pub fn receive_buffer_ceiling(current: u64, kernel_max: Option<u64>) -> u64 {
-    current
-        .max(kernel_max.unwrap_or(0))
-        .max(DEFAULT_RECEIVE_BUFFER_CEILING_BYTES)
+pub fn stable_receive_ceiling(pinned_receive_buffer_bytes: u64, queued_bytes: u64) -> u64 {
+    pinned_receive_buffer_bytes
+        .saturating_add(queued_bytes)
+        .saturating_add(KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES)
 }
 
 /// One reading of a direction's kernel record sequence number.
+///
+/// An observation carries the sequence number and nothing else, deliberately.
+/// The per-syscall record bound is fixed at handoff from the pinned receive
+/// ceiling, so there is no field here through which a later reading could
+/// widen the window — which is exactly the hazard a re-measured, autotuning-
+/// or sysctl-derived bound reintroduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KtlsObservation {
     /// Live `rec_seq` for the direction.
     pub record_seq: u64,
-    /// Refreshed pessimistic per-syscall record bound, when the observation
-    /// also re-measured it (the receive side re-reads `SO_RCVBUF`). `None`
-    /// leaves the caller's bound in place.
-    pub step_records: Option<u64>,
 }
 
 /// Everything about a handed-off session that decides whether — and how — the
@@ -319,13 +373,20 @@ pub struct KtlsConfidentialityPolicy {
     pub initial_transmit_seq: u64,
     /// Kernel `TLS_RX` `rec_seq` observed immediately after key install.
     pub initial_receive_seq: u64,
-    /// Receive-buffer ceiling measured at handoff, used to size the first
-    /// receive observation window.
-    pub initial_receive_buffer_ceiling: u64,
+    /// The pinned, kernel-enforced receive ceiling this session is bounded
+    /// with. Established once at handoff from a locked `SO_RCVBUF` plus the
+    /// queue measured behind it, and never revised — every receive observation
+    /// window for the life of the connection is sized from this one value.
+    pub stable_receive_ceiling: u64,
 }
 
 impl KtlsConfidentialityPolicy {
     /// A policy for a suite rustls reports as unlimited.
+    ///
+    /// No guard is ever built from it, so no receive window is ever sized: the
+    /// ceiling is zero because such a session never pins its receive buffer at
+    /// all, which is also why an unlimited suite keeps ordinary TCP receive
+    /// autotuning.
     pub fn unlimited(cipher: KtlsCipher, tls_version: u16) -> Self {
         Self {
             limits: KtlsSessionLimits {
@@ -335,7 +396,7 @@ impl KtlsConfidentialityPolicy {
             },
             initial_transmit_seq: 0,
             initial_receive_seq: 0,
-            initial_receive_buffer_ceiling: DEFAULT_RECEIVE_BUFFER_CEILING_BYTES,
+            stable_receive_ceiling: 0,
         }
     }
 
@@ -351,7 +412,7 @@ impl KtlsConfidentialityPolicy {
         if !self.limits.requires_enforcement() {
             return Ok(None);
         }
-        let ceiling = self.initial_receive_buffer_ceiling;
+        let ceiling = self.stable_receive_ceiling;
         let seq = match direction {
             KtlsDirection::Transmit => self.initial_transmit_seq,
             KtlsDirection::Receive => self.initial_receive_seq,
@@ -428,6 +489,10 @@ impl KtlsConfidentialityGuard {
     }
 
     /// Pessimistic record bound charged for the next relay syscall.
+    ///
+    /// Fixed for the life of the guard. On the receive side it is derived from
+    /// the pinned receive ceiling at handoff; there is intentionally no setter,
+    /// so no later observation can enlarge it.
     #[inline]
     pub fn step_records(&self) -> u64 {
         self.step_records
@@ -469,12 +534,6 @@ impl KtlsConfidentialityGuard {
         self.allowance = self.threshold - record_seq;
         Ok(())
     }
-
-    /// Replace the pessimistic per-syscall record bound.
-    #[inline]
-    pub fn set_step_records(&mut self, records: u64) {
-        self.step_records = records.max(1);
-    }
 }
 
 /// Reserve `records`, paying for one kernel observation if the current window
@@ -484,6 +543,10 @@ impl KtlsConfidentialityGuard {
 /// driven deterministically from tests: `observe` is only invoked when the
 /// pre-charge fails, and a reservation that still does not fit afterwards is a
 /// terminal refusal rather than a retry.
+///
+/// An observation reopens the window at `threshold - record_seq` and nothing
+/// more. It cannot change what a step costs, because the receive step was fixed
+/// against a kernel-pinned ceiling before the first relayed byte.
 pub fn charge_or_observe<F>(
     guard: &mut KtlsConfidentialityGuard,
     records: u64,
@@ -497,22 +560,12 @@ where
     }
     let observation = observe()?;
     guard.refresh(observation.record_seq)?;
-    // A refreshed bound only ever raises the retry charge: the receive window
-    // may have grown since it was last measured, and charging the smaller of
-    // the two would leave that growth unaccounted for.
-    let retry = match observation.step_records {
-        Some(step) => {
-            guard.set_step_records(step);
-            step.max(records)
-        }
-        None => records,
-    };
-    if guard.charge(retry) {
+    if guard.charge(records) {
         return Ok(());
     }
     Err(KtlsConfidentialityError::WindowExceedsBudget {
         direction: guard.direction(),
-        step_records: retry,
+        step_records: records,
         remaining: guard.allowance(),
     })
 }
@@ -522,8 +575,8 @@ mod linux {
     use std::os::unix::io::RawFd;
 
     use super::{
-        KtlsConfidentialityError, KtlsDirection, KtlsObservation, KtlsSessionLimits,
-        receive_buffer_ceiling, receive_record_bound,
+        KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES, KtlsConfidentialityError, KtlsDirection,
+        KtlsObservation, KtlsSessionLimits, stable_receive_ceiling,
     };
     use crate::socket_opts::ktls;
 
@@ -547,29 +600,31 @@ mod linux {
             direction,
             detail: e.to_string(),
         })?;
-        let step_records = match direction {
-            KtlsDirection::Transmit => None,
-            // Re-measure the receive buffer with the counter: autotuning may
-            // have grown it since the last window was sized.
-            KtlsDirection::Receive => Some(receive_record_bound(current_receive_ceiling(fd))),
-        };
-        Ok(KtlsObservation {
-            record_seq,
-            step_records,
-        })
+        // Deliberately nothing else: the receive window's size was fixed
+        // against a kernel-pinned ceiling at handoff, so re-measuring a
+        // mutable buffer size here is precisely what must not happen.
+        Ok(KtlsObservation { record_seq })
     }
 
-    /// Receive-buffer ceiling for this socket right now.
+    /// Freeze this socket's receive window and return the immutable ceiling the
+    /// whole session's receive bound is built on.
     ///
-    /// An unreadable `SO_RCVBUF` is not fatal: [`receive_buffer_ceiling`]
-    /// floors the answer at the kernel autotuning maximum and at
-    /// [`super::DEFAULT_RECEIVE_BUFFER_CEILING_BYTES`], and a larger ceiling
-    /// only makes the bound more conservative.
-    pub fn current_receive_ceiling(fd: RawFd) -> u64 {
-        let current = ktls::socket_receive_buffer_bytes(fd).unwrap_or(0);
-        receive_buffer_ceiling(current, ktls::kernel_max_receive_buffer_bytes())
+    /// Must be called while the rustls session is still intact, because failure
+    /// has to be a refusal rather than a relay that cannot be bounded. Both
+    /// steps are setup-time syscalls on a cold path; the relay itself pays
+    /// nothing for them.
+    ///
+    /// The `FIONREAD` measurement is taken *after* the pin on purpose. Anything
+    /// queued before the pin was admitted under a buffer size that is no longer
+    /// knowable, and reading the queue afterwards captures all of it; reading it
+    /// first would leave the bytes that arrived in between unaccounted for.
+    pub fn pin_receive_window(fd: RawFd) -> std::io::Result<u64> {
+        let request = KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES;
+        let pinned = ktls::pin_socket_receive_buffer(fd, request)?;
+        let queued = ktls::socket_receive_queue_bytes(fd)?;
+        Ok(stable_receive_ceiling(pinned, queued))
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{current_receive_ceiling, observe_record_seq};
+pub use linux::{observe_record_seq, pin_receive_window};

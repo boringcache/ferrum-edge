@@ -58,6 +58,17 @@
 //! handshake already spent are counted — to the relay, which enforces it per
 //! direction.
 //!
+//! The receive half of that budget rests on a bound for how many records one
+//! nonblocking `splice(2)` can consume, which in turn rests on how much wire
+//! data the socket may hold. That is only a bound if the kernel cannot enlarge
+//! it, so for a suite with a finite limit this module pins the socket receive
+//! buffer (`SO_RCVBUF`, which sets `SOCK_RCVBUF_LOCK` and ends autotuning for
+//! this socket) and reads the pinned size back **before**
+//! `dangerous_into_kernel_connection` runs. If that cannot be done, the handoff
+//! is refused while the rustls session is still whole rather than relaying
+//! records no budget covers. An unlimited suite pins nothing and keeps ordinary
+//! receive autotuning.
+//!
 //! # TLS 1.3 is refused, not silently mishandled
 //!
 //! The kernel holds a static copy of the application traffic secret and this
@@ -85,8 +96,8 @@ use crate::modes::mesh::node_waypoint_observability::{
     NodeWaypointHboneHandshakePhase, record_hbone_handshake,
 };
 use crate::proxy::ktls_confidentiality::{
-    KtlsConfidentialityPolicy, KtlsDirection, KtlsSessionLimits, current_receive_ceiling,
-    observe_record_seq,
+    KtlsConfidentialityPolicy, KtlsDirection, KtlsSessionLimits, observe_record_seq,
+    pin_receive_window,
 };
 use crate::socket_opts::ktls;
 
@@ -312,6 +323,28 @@ pub(crate) async fn try_ktls_accept(
              report record sequence numbers",
         ));
     }
+    // The receive side of the budget is only enforceable against a receive
+    // window the kernel will not silently enlarge, so that window is pinned —
+    // and its size read back — while the rustls session is still whole. A
+    // kernel that will not pin or will not report the pinned size leaves the
+    // receive bound unprovable, which refuses the handoff here rather than
+    // relaying records no budget covers. An unlimited suite needs no bound and
+    // keeps ordinary receive autotuning.
+    let stable_receive_ceiling = if limits.requires_enforcement() {
+        match pin_receive_window(stream.as_raw_fd()) {
+            Ok(ceiling) => ceiling,
+            Err(e) => {
+                record_frontend_tls_failure(record_mesh_mtls_metric, "error");
+                warn!("kTLS: receive window could not be pinned: {e}");
+                return KtlsAcceptOutcome::Failed(io::Error::other(format!(
+                    "kTLS: the receive window could not be pinned, so the confidentiality \
+                     bound cannot be enforced: {e}"
+                )));
+            }
+        }
+    } else {
+        0
+    };
     if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2) {
         // Unreachable: rustls cannot negotiate TLS 1.3 without the
         // `supported_versions` extension the eligibility gate rejected.
@@ -362,7 +395,8 @@ pub(crate) async fn try_ktls_accept(
     match ktls::enable_ktls(fd, &params) {
         Ok(true) => {
             drop(params);
-            let seeded = seed_confidentiality_policy(fd, &limits, tx_seq, rx_seq);
+            let seeded =
+                seed_confidentiality_policy(fd, &limits, tx_seq, rx_seq, stable_receive_ceiling);
             let confidentiality = match seeded {
                 Ok(policy) => policy,
                 Err(e) => {
@@ -718,11 +752,18 @@ fn suite_confidentiality_limit(suite: rustls::SupportedCipherSuite) -> u64 {
 /// budget can be built on, so it fails closed. The observed values (not the
 /// requested ones) seed the policy, so the budget starts from what the kernel
 /// will actually count from.
+///
+/// `stable_receive_ceiling` is the already-pinned receive bound from
+/// [`pin_receive_window`], established before the rustls session was consumed.
+/// It is carried through unchanged: this function must not re-derive a ceiling,
+/// because a value read here would be a fresh observation of a quantity the
+/// budget needs to be immutable.
 fn seed_confidentiality_policy(
     fd: std::os::unix::io::RawFd,
     limits: &KtlsSessionLimits,
     handshake_tx_seq: u64,
     handshake_rx_seq: u64,
+    stable_receive_ceiling: u64,
 ) -> io::Result<KtlsConfidentialityPolicy> {
     if !limits.requires_enforcement() {
         let cipher = limits.cipher;
@@ -744,7 +785,7 @@ fn seed_confidentiality_policy(
         limits: *limits,
         initial_transmit_seq: tx.record_seq,
         initial_receive_seq: rx.record_seq,
-        initial_receive_buffer_ceiling: current_receive_ceiling(fd),
+        stable_receive_ceiling,
     };
     // Reject a session that is already out of budget rather than starting a
     // relay that would refuse on its first syscall.

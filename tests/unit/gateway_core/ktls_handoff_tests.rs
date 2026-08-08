@@ -554,10 +554,11 @@ async fn an_untouched_budget_still_grants_the_whole_configured_timeout() {
 
 mod confidentiality {
     use ferrum_edge::proxy::ktls_confidentiality::{
-        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KtlsConfidentialityError, KtlsConfidentialityGuard,
+        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES,
+        KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES, KtlsConfidentialityError, KtlsConfidentialityGuard,
         KtlsConfidentialityPolicy, KtlsDirection, KtlsObservation, KtlsSessionLimits,
         MAX_TLS_PLAINTEXT_BYTES, MIN_TLS12_AEAD_RECORD_WIRE_BYTES, charge_or_observe,
-        receive_buffer_ceiling, receive_record_bound, transmit_record_bound,
+        receive_record_bound, stable_receive_ceiling, transmit_record_bound,
     };
     use ferrum_edge::socket_opts::ktls::KtlsCipher;
 
@@ -577,7 +578,7 @@ mod confidentiality {
             limits: aes_limits(),
             initial_transmit_seq: tx_seq,
             initial_receive_seq: rx_seq,
-            initial_receive_buffer_ceiling: 128 * 1024,
+            stable_receive_ceiling: 128 * 1024,
         }
     }
 
@@ -620,15 +621,44 @@ mod confidentiality {
     }
 
     #[test]
-    fn the_receive_ceiling_takes_the_largest_candidate() {
-        // Autotuning may grow the buffer after a window is sized, so the
-        // window must be sized against the kernel maximum, never the live
-        // value alone.
-        let big = 64 * 1024 * 1024u64;
-        assert_eq!(receive_buffer_ceiling(1024, Some(big)), big);
-        assert_eq!(receive_buffer_ceiling(big, Some(1024)), big);
-        // With no kernel maximum readable, the conservative floor applies.
-        assert!(receive_buffer_ceiling(1024, None) >= 16 * 1024 * 1024);
+    fn the_stable_ceiling_covers_the_pinned_buffer_and_the_queue_behind_it() {
+        // Once `SO_RCVBUF` is pinned the kernel only admits more data while the
+        // queue sits below the pinned size, so every later instant satisfies
+        // `queued <= max(queued_at_pin, pinned)`. Summing the two terms is a
+        // strict over-approximation of that maximum, and the overshoot headroom
+        // covers the one super-frame Linux may admit past the limit.
+        let pinned = 425_984u64;
+        let queued = 12_000u64;
+        assert_eq!(
+            stable_receive_ceiling(pinned, queued),
+            pinned + queued + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES
+        );
+        // Data queued under the old, unknowable buffer size is what the
+        // `FIONREAD` term exists for: a large pre-pin queue must raise the
+        // ceiling even when the pin came out small.
+        let shrunk = stable_receive_ceiling(64 * 1024, 8 * 1024 * 1024);
+        assert!(
+            shrunk >= 8 * 1024 * 1024,
+            "a queue larger than the pinned buffer must still be covered, got {shrunk}"
+        );
+        // Both terms are attacker-influenced only upwards, so the arithmetic
+        // must saturate rather than wrap into a tiny ceiling.
+        assert_eq!(stable_receive_ceiling(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_pinned_request_is_a_preference_and_never_the_bound() {
+        // The request is only what `setsockopt` is asked for; Linux clamps it to
+        // `net.core.rmem_max` and then doubles it, so the readback — modelled
+        // here as an arbitrary pinned value unrelated to the request — is what
+        // the ceiling is built from.
+        assert!(KTLS_PINNED_RECEIVE_BUFFER_REQUEST_BYTES > 0);
+        let clamped_far_below_the_request = 64 * 1024u64;
+        assert_eq!(
+            stable_receive_ceiling(clamped_far_below_the_request, 0),
+            clamped_far_below_the_request + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
+            "the ceiling must follow the kernel readback, not the requested size"
+        );
     }
 
     #[test]
@@ -697,7 +727,7 @@ mod confidentiality {
         // window is charged per write.
         assert_eq!(
             rx.step_records(),
-            receive_record_bound(policy.initial_receive_buffer_ceiling)
+            receive_record_bound(policy.stable_receive_ceiling)
         );
     }
 
@@ -723,10 +753,7 @@ mod confidentiality {
         for _ in 0..10_000 {
             charge_or_observe(&mut guard, transmit_record_bound(128 * 1024), || {
                 observations += 1;
-                Ok(KtlsObservation {
-                    record_seq: 0,
-                    step_records: None,
-                })
+                Ok(KtlsObservation { record_seq: 0 })
             })
             .expect("well inside the budget");
         }
@@ -743,10 +770,7 @@ mod confidentiality {
         let mut observations = 0usize;
         charge_or_observe(&mut guard, 4, || {
             observations += 1;
-            Ok(KtlsObservation {
-                record_seq: 1_000,
-                step_records: Some(4),
-            })
+            Ok(KtlsObservation { record_seq: 1_000 })
         })
         .expect("the kernel counter proves headroom remains");
         assert_eq!(observations, 1);
@@ -801,7 +825,6 @@ mod confidentiality {
         let err = charge_or_observe(&mut guard, 1, || {
             Ok(KtlsObservation {
                 record_seq: threshold,
-                step_records: None,
             })
         })
         .expect_err("the traffic key must not be used past its bound");
@@ -832,13 +855,8 @@ mod confidentiality {
         let threshold = 1_000u64;
         let mut guard = guard_with(threshold, 0, 10);
         assert!(guard.charge(threshold));
-        let err = charge_or_observe(&mut guard, 10, || {
-            Ok(KtlsObservation {
-                record_seq: 995,
-                step_records: Some(10),
-            })
-        })
-        .expect_err("a step that could cross the threshold must be refused");
+        let err = charge_or_observe(&mut guard, 10, || Ok(KtlsObservation { record_seq: 995 }))
+            .expect_err("a step that could cross the threshold must be refused");
         assert!(matches!(
             err,
             KtlsConfidentialityError::WindowExceedsBudget {
@@ -850,20 +868,64 @@ mod confidentiality {
     }
 
     #[test]
-    fn a_refreshed_window_never_lowers_the_charge() {
-        // If the receive buffer grew, the retry must be charged at the new,
-        // larger bound — not the stale one the caller computed.
-        let mut guard = guard_for(KtlsDirection::Receive, 0);
+    fn an_observation_reopens_the_window_but_never_resizes_the_step() {
+        // The receive step is fixed at handoff against a kernel-pinned ceiling.
+        // An observation may only move the sequence number; if it could also
+        // widen the per-syscall bound, the mutable-ceiling hazard this design
+        // removes would be back — a socket could be charged against one size and
+        // then splice against a larger one.
+        let policy = aes_policy(0, 0);
+        let mut guard = policy
+            .guard(KtlsDirection::Receive)
+            .expect("receive guard builds")
+            .expect("AES-GCM is enforced");
+        let step = guard.step_records();
+        assert_eq!(step, receive_record_bound(policy.stable_receive_ceiling));
         assert!(guard.charge(guard.allowance()));
-        charge_or_observe(&mut guard, 4, || {
-            Ok(KtlsObservation {
-                record_seq: 10,
-                step_records: Some(4_096),
+        charge_or_observe(&mut guard, step, || Ok(KtlsObservation { record_seq: 10 }))
+            .expect("headroom remains");
+        assert_eq!(
+            guard.step_records(),
+            step,
+            "no observation may resize the pinned receive window"
+        );
+        assert_eq!(guard.allowance(), guard.threshold() - 10 - step);
+    }
+
+    #[test]
+    fn a_receive_step_is_charged_before_every_syscall_at_the_pinned_size() {
+        // The pre-charge is what keeps `true_seq <= observed_seq + charges`, so
+        // the number of splices a single observation window covers must follow
+        // the pinned ceiling exactly — not a value re-measured later.
+        let policy = KtlsConfidentialityPolicy {
+            limits: aes_limits(),
+            initial_transmit_seq: 0,
+            initial_receive_seq: 0,
+            stable_receive_ceiling: stable_receive_ceiling(425_984, 0),
+        };
+        let mut guard = policy
+            .guard(KtlsDirection::Receive)
+            .expect("receive guard builds")
+            .expect("AES-GCM is enforced");
+        let step = guard.step_records();
+        let expected_charges = guard.allowance() / step;
+        let mut observations = 0usize;
+        for _ in 0..expected_charges {
+            charge_or_observe(&mut guard, step, || {
+                observations += 1;
+                Ok(KtlsObservation { record_seq: 0 })
             })
+            .expect("inside the first window");
+        }
+        assert_eq!(observations, 0, "the pinned window covers every splice");
+        // The next charge no longer fits, so exactly one observation is paid
+        // for — and a counter that has not moved reopens the full window.
+        charge_or_observe(&mut guard, step, || {
+            observations += 1;
+            Ok(KtlsObservation { record_seq: 0 })
         })
-        .expect("headroom remains");
-        assert_eq!(guard.step_records(), 4_096);
-        assert_eq!(guard.allowance(), guard.threshold() - 10 - 4_096);
+        .expect("a static counter proves the budget is untouched");
+        assert_eq!(observations, 1);
     }
 
     #[test]
