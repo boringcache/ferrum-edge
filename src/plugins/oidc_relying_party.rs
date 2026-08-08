@@ -2116,20 +2116,6 @@ impl StateCache {
         }
     }
 
-    fn take_bound(&self, state: &str, sealed_binding_hash: &[u8]) -> Option<FlowState> {
-        let now = Instant::now();
-        let (_, flow) = self.entries.remove_if(state, |_, flow| {
-            flow.expires_at <= now
-                || constant_time_eq(&flow.sealed_binding_hash, sealed_binding_hash)
-        })?;
-        self.remove_expiry_record(state, flow.expires_at);
-        decrement_atomic(&self.active_entries);
-        self.release_source(&flow.source_ip);
-        (flow.expires_at > now
-            && constant_time_eq(&flow.sealed_binding_hash, sealed_binding_hash))
-        .then_some(flow)
-    }
-
     fn evict_expired(&self) {
         let now = Instant::now();
         let current_bucket = self.bucket_for(now);
