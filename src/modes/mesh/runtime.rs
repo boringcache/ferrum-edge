@@ -15,7 +15,10 @@ use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
 use crate::identity::SpiffeId;
-use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
+use crate::modes::mesh::config::{
+    MeshPolicy, PolicyScope, PolicyTargetAttachment, WaypointAttachment, Workload,
+    policy_scope_applies_to_workload,
+};
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
 use crate::modes::mesh::revision::{
@@ -141,6 +144,23 @@ pub struct PolicyScopeCache {
     pub spiffe_id: SpiffeId,
     pub namespace: String,
     pub labels: HashMap<String, String>,
+    /// The MeshService this cache was indexed UNDER, when it was built as a
+    /// DESTINATION scope. Empty on every source/attestation scope.
+    ///
+    /// Set only by [`Self::for_destination_service`], from the Service the
+    /// destination-scope index is keyed by — never from `Workload.service_name`,
+    /// which names a single projection and cannot disambiguate a pod that
+    /// several Services select.
+    ///
+    /// Leaving it empty on source scopes is load-bearing: `PartialEq` on this
+    /// struct is the source-attestation collapse used by ambient UDP source
+    /// indexing and NodeWaypoint capture-destination resolution, where duplicate
+    /// records for one pod must compare EQUAL. Stamping a per-projection service
+    /// name into the shared constructors would make those records diverge and
+    /// silently fail closed.
+    pub service_name: String,
+    /// Namespace of [`Self::service_name`]; empty whenever that is empty.
+    pub service_namespace: String,
 }
 
 impl PolicyScopeCache {
@@ -153,6 +173,8 @@ impl PolicyScopeCache {
             spiffe_id,
             namespace: namespace.into(),
             labels,
+            service_name: String::new(),
+            service_namespace: String::new(),
         }
     }
 
@@ -161,11 +183,72 @@ impl PolicyScopeCache {
             spiffe_id: workload.spiffe_id.clone(),
             namespace: workload.namespace.clone(),
             labels: workload.selector.labels.clone(),
+            service_name: String::new(),
+            service_namespace: String::new(),
+        }
+    }
+
+    /// Build a DESTINATION scope for `workload` reached through the
+    /// `(service_namespace, service_name)` MeshService.
+    ///
+    /// The service identity is the index key, not a workload field, so a pod
+    /// projected through several Services yields one destination scope per
+    /// Service and each matches only its own `targetRefs`.
+    pub fn for_destination_service(
+        workload: &Workload,
+        service_namespace: &str,
+        service_name: &str,
+    ) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+            service_namespace: service_namespace.to_string(),
+            ..Self::from_workload(workload)
         }
     }
 
     pub fn policy_applies(&self, policy: &MeshPolicy) -> bool {
         policy_scope_applies_to_workload(policy, &self.namespace, &self.labels)
+    }
+
+    /// Destination-scope applicability inside a waypoint path.
+    ///
+    /// `waypoint` is the authoritative identity of the proxy evaluating this
+    /// request. It is REQUIRED, not optional context: slice retention keeps a
+    /// `targetRefs` policy when ANY attachment matches and never prunes the
+    /// others, so checking only "is this a Gateway attachment?" would let a
+    /// policy targeting `{Service reviews, Gateway waypoint-b}` apply to every
+    /// destination at waypoint-a. Both halves re-check exactly:
+    ///
+    /// * `Service` — exact destination `(namespace, name)` membership; absent
+    ///   membership fails closed. Shared pod-selector labels never attach a
+    ///   Service A policy to Service B traffic.
+    /// * `Gateway` / `GatewayClass` — this exact waypoint / this exact
+    ///   `spec.gatewayClassName` ([`WaypointAttachment::matches`]).
+    ///
+    /// A non-waypoint proxy (`waypoint.name == None`) matches no attachment at
+    /// all: Istio applies `targetRefs` policies at waypoint proxies only, so a
+    /// targeted policy must not become mesh-wide on a NodeWaypoint or Sidecar
+    /// destination path.
+    pub fn policy_applies_for_destination(
+        &self,
+        policy: &MeshPolicy,
+        waypoint: WaypointAttachment<'_>,
+    ) -> bool {
+        match &policy.scope {
+            PolicyScope::TargetRefs { attachments } => {
+                attachments.iter().any(|attachment| match attachment {
+                    PolicyTargetAttachment::Service { namespace, name } => {
+                        waypoint.name.is_some()
+                            && !self.service_name.is_empty()
+                            && namespace == &self.service_namespace
+                            && name == &self.service_name
+                    }
+                    PolicyTargetAttachment::Gateway { .. }
+                    | PolicyTargetAttachment::GatewayClass { .. } => waypoint.matches(attachment),
+                })
+            }
+            _ => self.policy_applies(policy),
+        }
     }
 }
 

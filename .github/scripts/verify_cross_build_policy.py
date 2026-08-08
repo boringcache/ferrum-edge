@@ -13310,6 +13310,69 @@ def validate_automation_collection(
     return errors
 
 
+PROTECTED_BUILD_JOB_NAMES = tuple(job for _, job, *_ in WORKFLOW_CONTRACTS)
+
+
+def protected_build_reachable_automation(
+    workflows: dict[str, str],
+    actions: dict[str, str],
+    automation: dict[str, str],
+    label: str,
+) -> tuple[set[str], bool]:
+    """Automation reachable from the trusted ARM64 cross-build jobs.
+
+    The freeze exists to stop a pull request altering anything that EXECUTES
+    inside the trusted ARM64 cross-build. Seeding reachability from every
+    workflow made that far broader than the property: a lab harness invoked
+    only by its own conformance workflow was frozen too, and because
+    `generic_action_cross_surfaces` collapses a sensitive file to one
+    `file:<sha256>` surface, "frozen" means no pull request may change a single
+    byte of it — not a comment, not a retry loop. A Gateway API harness earned
+    that purely by containing fixture text (`/cross`, `blackbox-cross`).
+
+    Seeds are therefore the protected job blocks themselves, plus every local
+    action. Actions are included wholesale on purpose: a protected job may
+    `uses:` any of them, and seeding a partial set would UNDER-approximate and
+    silently release a file that really does run in the trusted build. Over-
+    approximating only keeps more files frozen, which is the safe direction.
+
+    Returns `(reachable, scoped)`. `scoped=False` means the scope could not be
+    established, and the caller must fall back to comparing every file.
+    """
+
+    seeds: dict[str, str] = {}
+    located: set[str] = set()
+    for name, contents in sorted(workflows.items()):
+        for job_name in PROTECTED_BUILD_JOB_NAMES:
+            block, failures = extract_job_block(
+                contents,
+                f"{label} {name}",
+                job_name,
+                required=False,
+            )
+            if failures:
+                # A protected workflow that will not parse must not be allowed
+                # to narrow the freeze.
+                return set(), False
+            if block is not None:
+                seeds[f"workflows/{name}#{job_name}"] = block
+                located.add(job_name)
+    if located != set(PROTECTED_BUILD_JOB_NAMES):
+        # Every contract's job must be found on this revision, or the scope is
+        # unknown and the freeze stays global.
+        return set(), False
+    for name, contents in actions.items():
+        seeds[f"actions/{name}"] = contents
+    reachable, _interpreters, errors = reachable_automation_references(
+        seeds,
+        automation,
+        label,
+    )
+    if errors:
+        return set(), False
+    return reachable, True
+
+
 def compare_pr_automation_collection(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
@@ -13348,6 +13411,26 @@ def compare_pr_automation_collection(
     )
     errors = [*baseline_errors, *proposed_errors]
 
+    # Narrow the FREEZE to automation that can execute in the trusted ARM64
+    # cross-build. `scoped` is false whenever either revision's scope could not
+    # be established, in which case every file is compared exactly as before.
+    baseline_build_scope, baseline_scoped = protected_build_reachable_automation(
+        merge_base_workflows,
+        merge_base_actions,
+        merge_base_automation,
+        f"merge-base {source}",
+    )
+    proposed_build_scope, proposed_scoped = protected_build_reachable_automation(
+        proposed_workflows,
+        proposed_actions,
+        proposed_automation,
+        f"proposed {source}",
+    )
+    build_scoped = baseline_scoped and proposed_scoped
+    # Union across revisions: a pull request must not be able to drop the
+    # reachability edge and edit the file in the same commit.
+    build_reachable = baseline_build_scope | proposed_build_scope
+
     def named_interpreters(
         recorded: dict[str, set[str | None]],
         name: str,
@@ -13380,17 +13463,28 @@ def compare_pr_automation_collection(
             proposed_automation.get(name, ""),
             named_interpreters(proposed_interpreters, name),
         )
-        newly_reached_cross_surface = (
-            name not in baseline_reachable
-            and name in proposed_reachable
-            and bool(proposed_surfaces)
-        )
+        # Outside the trusted build's reach, a Cross surface cannot execute
+        # with elevated trust, so the file is not frozen. When the scope is
+        # unknown every file stays in scope, preserving the old behaviour.
+        in_build_scope = not build_scoped or name in build_reachable
+        if build_scoped:
+            newly_reached_cross_surface = (
+                name not in baseline_build_scope
+                and name in proposed_build_scope
+                and bool(proposed_surfaces)
+            )
+        else:
+            newly_reached_cross_surface = (
+                name not in baseline_reachable
+                and name in proposed_reachable
+                and bool(proposed_surfaces)
+            )
         if newly_reached_cross_surface and baseline_surfaces == proposed_surfaces:
             errors.append(
                 f"{source}/{name} cannot newly reach an existing Cross "
                 "executable/configuration surface"
             )
-        elif baseline_surfaces != proposed_surfaces:
+        elif baseline_surfaces != proposed_surfaces and in_build_scope:
             errors.append(
                 f"{source}/{name} cannot add or change Cross executable/"
                 "configuration surfaces"
@@ -15964,6 +16058,140 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("benign referenced-script edit was rejected")
+
+    # Build-scoped automation freeze. The freeze protects what executes inside
+    # the trusted ARM64 cross-build; a lab harness reached only by its own
+    # conformance workflow is not that, and freezing it means (because a
+    # sensitive file collapses to one `file:<sha256>` surface) that no pull
+    # request may change a single byte of it.
+    protected_build_workflow = (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  build-arm64-cross:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: sh scripts/build_arm64.sh\n"
+        "  build-release-arm64-cross:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo release\n"
+    )
+    protected_build_workflow_without_script = protected_build_workflow.replace(
+        "      - run: sh scripts/build_arm64.sh\n",
+        "      - run: echo build\n",
+    )
+    lab_only_workflow = (
+        "name: Lab\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  lab:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: bash scripts/lab.sh\n"
+    )
+    benign_build_script = "#!/bin/sh\necho building\n"
+    benign_lab_script = "#!/bin/sh\necho lab\n"
+    cross_sensitive_script = "#!/bin/sh\ncross build --target aarch64-unknown-linux-gnu\n"
+    cross_sensitive_script_edit = (
+        "#!/bin/sh\n# a comment the freeze used to forbid\n"
+        "cross build --target aarch64-unknown-linux-gnu\n"
+    )
+    scoped_workflows = {
+        "ci.yml": protected_build_workflow,
+        "lab.yml": lab_only_workflow,
+    }
+    if compare_pr_automation_collection(
+        scoped_workflows,
+        scoped_workflows,
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/build_arm64.sh": benign_build_script,
+            "scripts/lab.sh": cross_sensitive_script,
+        },
+        {
+            "scripts/build_arm64.sh": benign_build_script,
+            "scripts/lab.sh": cross_sensitive_script_edit,
+        },
+        "self-test build-scoped automation",
+    ):
+        failures.append(
+            "automation reached only by a non-build workflow was still frozen"
+        )
+    if not compare_pr_automation_collection(
+        scoped_workflows,
+        scoped_workflows,
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script_edit,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        "self-test build-scoped automation",
+    ):
+        failures.append("automation inside the trusted ARM64 build was not frozen")
+    if not compare_pr_automation_collection(
+        {"ci.yml": protected_build_workflow_without_script, "lab.yml": lab_only_workflow},
+        scoped_workflows,
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        "self-test build-scoped automation",
+    ):
+        failures.append(
+            "newly reaching an existing trusted-build Cross surface was allowed"
+        )
+    # The attack this narrowing could otherwise enable: drop the reachability
+    # edge and edit the file in the SAME commit, so the proposed revision alone
+    # says the file is out of scope. `build_reachable` unions both revisions
+    # precisely so the merge base still vouches for it.
+    if not compare_pr_automation_collection(
+        scoped_workflows,
+        {"ci.yml": protected_build_workflow_without_script, "lab.yml": lab_only_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        {
+            "scripts/build_arm64.sh": cross_sensitive_script_edit,
+            "scripts/lab.sh": benign_lab_script,
+        },
+        "self-test build-scoped automation",
+    ):
+        failures.append(
+            "dropping the trusted-build reachability edge released the file "
+            "for editing in the same commit"
+        )
+    # Scope unknown (no protected job on either revision) must freeze everything,
+    # exactly as before this narrowing existed.
+    if not compare_pr_automation_collection(
+        {"lab.yml": lab_only_workflow},
+        {"lab.yml": lab_only_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {"scripts/lab.sh": cross_sensitive_script},
+        {"scripts/lab.sh": cross_sensitive_script_edit},
+        "self-test build-scoped automation",
+    ):
+        failures.append(
+            "an unknown trusted-build scope did not fall back to freezing"
+        )
 
     cross_automation = {
         "scripts/safe.sh": (

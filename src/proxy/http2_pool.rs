@@ -50,10 +50,11 @@ thread_local! {
 
 /// Multiplexed hyper H2 sender for the plain-HTTPS direct pool.
 ///
-/// Body type is [`SizeLimitedIncoming`] so SNI-required (and any other)
-/// direct-H2 dispatches can enforce `max_request_body_size_bytes` while
-/// streaming the client upload — mirroring the mesh-mTLS / HBONE pools.
-/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`).
+/// Body type is [`SizeLimitedIncoming`] so ordinary and SNI direct-H2
+/// dispatches can enforce `max_request_body_size_bytes` while streaming
+/// the client upload — mirroring the mesh-mTLS / HBONE pools.
+/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`);
+/// note the adapter itself treats `max_bytes = 0` as deny-all.
 pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
 
 /// Terminal protocol outcome for one DNS candidate.

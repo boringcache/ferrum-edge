@@ -951,6 +951,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
             name: "api-waypoint".to_string(),
             namespace: "ferrum".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: vec![MeshWaypointServiceRef {
                 namespace: "ferrum".to_string(),
                 name: "api".to_string(),
