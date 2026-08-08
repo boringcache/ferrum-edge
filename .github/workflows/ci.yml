@@ -2087,7 +2087,7 @@ jobs:
             'automountServiceAccountToken: false' \
             'resourceNames: ["ferrum-mesh-cni-cleanup"]' \
             '- await-cleanup'; do
-            if ! grep -Fq "$needle" "$cni_out"; then
+            if ! grep -Fq -- "$needle" "$cni_out"; then
               echo "::error title=CNI lifecycle wiring missing::expected ${needle} in the rendered CNI install lifecycle (#3609)"
               exit 1
             fi
