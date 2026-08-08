@@ -100,7 +100,7 @@ async fn proxy_state_loads_gateway_svid_bundle_from_env_config() {
         ..Default::default()
     };
 
-    let (state, _handles) = ProxyState::new(
+    let (state, handles) = ProxyState::new(
         GatewayConfig::default(),
         test_dns_cache(),
         env_config,
@@ -116,6 +116,9 @@ async fn proxy_state_loads_gateway_svid_bundle_from_env_config() {
         "spiffe://corp.example/ns/gateway/sa/edge"
     );
     assert_eq!(bundle.trust_bundles.local.x509_authorities.len(), 1);
+    for handle in handles {
+        handle.abort();
+    }
 }
 
 /// A validated source change must reach the live SVID slot **and** advance the
@@ -131,7 +134,7 @@ async fn gateway_svid_source_change_publishes_a_backend_rotation_generation() {
         ..Default::default()
     };
 
-    let (state, _handles) = ProxyState::new(
+    let (state, handles) = ProxyState::new(
         GatewayConfig::default(),
         test_dns_cache(),
         env_config,
@@ -183,6 +186,9 @@ async fn gateway_svid_source_change_publishes_a_backend_rotation_generation() {
         rotated_leaf, original_leaf,
         "the live SVID slot must hold the rotated material once the generation advanced"
     );
+    for handle in handles {
+        handle.abort();
+    }
 }
 
 #[tokio::test]
@@ -207,7 +213,7 @@ async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
         ..GatewayConfig::default()
     };
 
-    let (state, _handles) =
+    let (state, handles) =
         ProxyState::new(config, test_dns_cache(), env_config, None, None).expect("proxy state");
 
     let loaded_config = state.config.load_full();
@@ -236,4 +242,7 @@ async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
             .any(|plugin| plugin.name() == "workload_metrics"),
         "auto-injected workload_metrics should be active for HTTP proxies"
     );
+    for handle in handles {
+        handle.abort();
+    }
 }

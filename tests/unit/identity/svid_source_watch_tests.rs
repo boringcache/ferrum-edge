@@ -250,6 +250,28 @@ fn changed_bytes_on_any_single_source_report_a_change() {
 }
 
 #[test]
+fn uncommitted_change_remains_pending_for_a_coherent_reload_retry() {
+    let (ca, files) = valid_svid_files();
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    let start = Instant::now();
+    assert_eq!(poll_at(&mut tracker, start, 0), Outcome::Baseline);
+
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.cert_path, rotated_cert).expect("rotate cert");
+    std::fs::write(&files.key_path, rotated_key).expect("rotate key");
+    assert_eq!(poll_at(&mut tracker, start, 2), Outcome::Changed);
+
+    // A coherent second read can fail after fingerprinting (for example, a
+    // provider outage). Until a validated bundle is actually published and
+    // commit() is called, stable candidate bytes must stay pending so recovery
+    // is retried without requiring another source generation.
+    assert_eq!(poll_at(&mut tracker, start, 4), Outcome::Changed);
+    tracker.commit();
+    assert_eq!(poll_at(&mut tracker, start, 6), Outcome::Unchanged);
+}
+
+#[test]
 fn a_source_read_failure_keeps_the_last_good_fingerprints() {
     let (_ca, files) = valid_svid_files();
     let sources = files.source_set();
@@ -275,6 +297,32 @@ fn a_source_read_failure_keeps_the_last_good_fingerprints() {
     // Recovery with the same bytes is not a rotation.
     std::fs::write(&files.cert_path, cert_pem).expect("restore cert");
     assert_eq!(poll_at(&mut tracker, start, 4), Outcome::Unchanged);
+}
+
+#[test]
+fn faster_source_success_does_not_mask_a_slower_source_outage() {
+    let (_ca, files) = valid_svid_files();
+    let key_source = format!("file://{}?poll=10s", files.key_path.display());
+    let sources = GatewaySvidSourceSet::new(
+        files.cert_path.to_string_lossy().into_owned(),
+        key_source,
+        files.trust_bundle_path.to_string_lossy().into_owned(),
+        None,
+    );
+    let mut tracker = tracker_for(&sources);
+    let start = Instant::now();
+    assert_eq!(poll_at(&mut tracker, start, 0), Outcome::Baseline);
+
+    let key_pem = std::fs::read(&files.key_path).expect("read key");
+    std::fs::remove_file(&files.key_path).expect("remove key");
+    assert_eq!(poll_at(&mut tracker, start, 10), Outcome::SourceUnavailable);
+
+    // The key is healthy again, but its 10s cadence has not elapsed. Faster
+    // cert/trust reads must not report recovery while the failed source still
+    // carries only its stale last-good fingerprint.
+    std::fs::write(&files.key_path, key_pem).expect("restore key");
+    assert_eq!(poll_at(&mut tracker, start, 11), Outcome::Idle);
+    assert_eq!(poll_at(&mut tracker, start, 20), Outcome::Unchanged);
 }
 
 #[test]

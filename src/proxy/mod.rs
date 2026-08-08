@@ -5687,14 +5687,15 @@ pub struct ProxyState {
     /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
     /// readers.
     pub gateway_svid_bundle: SharedSvidBundle,
-    /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
-    /// override; when a CP snapshot removes them, this restores file trust.
+    /// Latest SVID bundle loaded from configured or runtime sources.
+    /// CP-delivered trust bundles are an override; when a CP snapshot removes
+    /// them, this restores the source-provided trust.
     pub gateway_file_svid_bundle: SharedSvidBundle,
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
     /// Serializes the cold-path gateway SVID writers:
-    /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
+    /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
@@ -5730,9 +5731,9 @@ pub struct ProxyState {
     /// The internal consumer side ([`spawn_backend_svid_rotation_task`]) holds
     /// a `Receiver` and drives `backend_svid_generation` plus pool drains.
     ///
-    /// The gateway SVID file watcher publishes to this sender when
-    /// `FERRUM_GATEWAY_SVID_*` files are configured and a validated reload
-    /// succeeds. Future in-memory producers can also wire in by cloning the
+    /// The gateway SVID source watcher publishes to this sender when
+    /// `FERRUM_GATEWAY_SVID_*` sources are configured and a validated reload
+    /// succeeds. In-memory producers can also wire in by cloning the
     /// sender and handing the clone to `RotationConfig.revision_tx`
     /// ([`crate::identity::rotation::RotationConfig::new`]) or
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
@@ -6328,13 +6329,13 @@ impl ProxyState {
 
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
-    /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
+    /// If the gateway already has a source-loaded SVID, rebuild the SVID bundle
     /// with the new trust material so TLS builders see the update through the
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
     ///
     /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. The gateway SVID file watcher can also swap
+    /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
     /// the SVID bundle, so all gateway SVID slot writes are serialized by
     /// `gateway_svid_update_lock`.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
@@ -6352,7 +6353,7 @@ impl ProxyState {
         }
     }
 
-    /// Clear CP-delivered trust bundles and restore the latest file-loaded SVID.
+    /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
     pub fn clear_gateway_trust_bundles(&self) {
         let _guard = self
             .gateway_svid_update_lock
@@ -6387,7 +6388,7 @@ impl ProxyState {
 
     /// Force a gateway SVID reload from the currently configured sources.
     ///
-    /// This is the admin-triggered equivalent of the file watcher path. It
+    /// This is the admin-triggered equivalent of the source watcher path. It
     /// accepts any source form supported by `load_svid_bundle_from_sources`
     /// (file path, inline PEM, typed URI), preserves any CP-delivered trust
     /// override, and publishes a backend SVID generation bump so backend pools

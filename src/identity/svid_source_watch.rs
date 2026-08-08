@@ -219,6 +219,7 @@ struct TrackedSource {
     watched: WatchedMaterialSource,
     cadence: GatewaySvidCadence,
     last: Option<MaterialFingerprintEntry>,
+    unavailable: bool,
     due_at: Option<Instant>,
 }
 
@@ -246,6 +247,7 @@ impl GatewaySvidSourceTracker {
                 watched: watched.clone(),
                 cadence,
                 last: None,
+                unavailable: false,
                 due_at: None,
             });
         }
@@ -292,8 +294,10 @@ impl GatewaySvidSourceTracker {
                 Ok(entry) => {
                     refreshed.push(entry.clone());
                     source.last = Some(entry);
+                    source.unavailable = false;
                 }
                 Err(error) => {
+                    source.unavailable = true;
                     failures.push(GatewaySvidSourceFailure {
                         label: source.watched.label,
                         kind: source.watched.kind,
@@ -307,6 +311,18 @@ impl GatewaySvidSourceTracker {
         if !failures.is_empty() {
             return GatewaySvidPollReport {
                 outcome: GatewaySvidPollOutcome::SourceUnavailable,
+                refreshed,
+                failures,
+            };
+        }
+
+        if self.sources.iter().any(|source| source.unavailable) {
+            // Another source with a slower cadence is still unavailable from
+            // an earlier pass. A successful read of a faster source is not
+            // recovery and must not re-enable its warning or compare a set
+            // containing the unavailable source's stale fingerprint.
+            return GatewaySvidPollReport {
+                outcome: GatewaySvidPollOutcome::Idle,
                 refreshed,
                 failures,
             };
@@ -338,9 +354,10 @@ impl GatewaySvidSourceTracker {
 
     /// Adopt the current fingerprints as the comparison baseline.
     ///
-    /// Called after a reload attempt whether or not it succeeded: recording a
-    /// failing set stops the watcher from re-warning on every tick while a bad
-    /// state is stable, and the next genuine change still compares unequal.
+    /// Called only after the corresponding coherent bundle is already live.
+    /// A failed reload deliberately leaves the prior published fingerprints in
+    /// place so a recovered provider is retried even when its bytes did not
+    /// change again.
     pub fn commit(&mut self) {
         if let Some(current) = self.current_fingerprints() {
             self.published = Some(current);
@@ -413,7 +430,7 @@ pub async fn run_gateway_svid_source_rotation_loop(
     if !tracker.is_watchable() {
         info!(
             "Gateway SVID sources are all static (inline PEM); automatic refresh is disabled — \
-             rotate with POST /admin/tls/rotate/svid or a configuration reload"
+             update the configured literal and reload configuration or restart to rotate"
         );
         return;
     }
@@ -446,8 +463,12 @@ pub async fn run_gateway_svid_source_rotation_loop(
                 record_refresh_for_entries(GATEWAY_SVID_SURFACE, &report.refreshed, "unchanged");
             }
             GatewaySvidPollOutcome::Changed => {
-                note_recovery(&mut failure_logged);
-                reload_and_publish(&sources, &mut tracker, publish.as_ref());
+                reload_and_publish(
+                    &sources,
+                    &mut tracker,
+                    publish.as_ref(),
+                    &mut failure_logged,
+                );
             }
         }
 
@@ -514,6 +535,7 @@ fn reload_and_publish(
     sources: &GatewaySvidSourceSet,
     tracker: &mut GatewaySvidSourceTracker,
     publish: &dyn Fn(SvidBundle) -> u64,
+    failure_logged: &mut bool,
 ) {
     let entries = tracker.current_fingerprints().unwrap_or_default();
     // One coherent re-read of all three sources. If a source changes again
@@ -522,6 +544,7 @@ fn reload_and_publish(
     // and reloads again — a redundant rotation, never a stale identity.
     match sources.load_bundle() {
         Ok(bundle) => {
+            note_recovery(failure_logged);
             let spiffe_id = bundle.spiffe_id.to_string();
             let revision = publish(bundle);
             tracker.commit();
@@ -534,17 +557,24 @@ fn reload_and_publish(
             );
         }
         Err(error) => {
-            // Record the failing set so a stable bad state does not re-warn on
-            // every tick. The live SVID slot and the backend SVID generation
-            // are both left untouched.
-            tracker.commit();
+            // Keep the last *published* fingerprint. The coherent bundle load
+            // re-fetches all three sources after the fingerprint pass, so it
+            // can fail transiently even when the observed bytes are stable.
+            // Committing a failed candidate would suppress every future retry
+            // until a source changed again, leaving a recovered provider stuck
+            // on the old SVID. Retaining the published fingerprint retries on
+            // the next source cadence while the warning remains warn-once.
             record_refresh_for_entries(GATEWAY_SVID_SURFACE, &entries, "rebuild_error");
             let error = anyhow::anyhow!("{error}");
             record_rebuild_error(GATEWAY_SVID_SURFACE, &entries, &error);
-            warn!(
-                error = %error,
-                "Gateway SVID sources changed but the reload failed; keeping the current material"
-            );
+            if !*failure_logged {
+                warn!(
+                    error = %error,
+                    "Gateway SVID sources changed but the reload failed; keeping the current \
+                     material (silenced until a coherent reload succeeds)"
+                );
+                *failure_logged = true;
+            }
         }
     }
 }
