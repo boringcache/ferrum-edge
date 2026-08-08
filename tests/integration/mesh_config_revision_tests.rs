@@ -1974,8 +1974,8 @@ fn kubernetes_minimum_scope_watermark_cannot_displace_accepted_content() {
     state.record_applied_slice(&from_a);
 
     let from_b = slice_with_content("cp-b", Some(publish(&replica_b)), "authz-still-live");
-    let rejection = state
-        .install_slice(from_b)
+    let install = state.install_slice(from_b);
+    let rejection = install
         .rejection()
         .expect("a lagging replica must not displace accepted content at an equal sequence");
     assert_eq!(
@@ -2374,8 +2374,8 @@ fn two_kubernetes_replicas_order_by_the_shared_resource_version() {
             .install_slice(slice_at("cp-a", Some(fresh.clone())))
             .installed()
     );
-    let rejection = state
-        .install_slice(slice_at("cp-b", Some(lagging)))
+    let install = state.install_slice(slice_at("cp-b", Some(lagging)));
+    let rejection = install
         .rejection()
         .expect("a lagging Kubernetes replica must be quarantined");
     assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
