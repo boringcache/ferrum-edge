@@ -115,8 +115,8 @@ jobs:
           # The primary config is whatever the cluster's own CNI dropped in.
           # Discover it rather than assuming a kindnet filename or plugin type,
           # so a kind image bump cannot silently turn this into a no-op.
-          primary_file="$(docker exec "$worker" sh -c \
-            'ls -1 /etc/cni/net.d | grep -E "\.conf(list)?$" | head -n1')"
+          primary_file="$(docker exec "$worker" ls -1 /etc/cni/net.d \
+            | grep -E '\.(conf|conflist)$' | head -n1)"
           if [ -z "$primary_file" ]; then
             echo "::error title=No primary CNI config on the kind worker::cannot chain behind nothing"
             exit 1
@@ -241,8 +241,6 @@ jobs:
             [ "$phase" = "Succeeded" ]
           }
 
-          on_worker() { docker exec "$worker" sh -c "$1"; }
-
           assert_primary_untouched() {
             docker exec "$worker" cat "/etc/cni/net.d/${PRIMARY_FILE}" > primary-now.json
             local now
@@ -262,16 +260,16 @@ jobs:
             "SOCKET_PATH=/var/run/ferrum/node-agent-cni.sock" \
             "OWNER_ID=${OWNER_ID}" \
             "INSTALL_GENERATION=${INSTALL_GENERATION}"
-          on_worker "cat /etc/cni/net.d/${CONF_FILE_NAME}"
-          on_worker "test -x /opt/cni/bin/ferrum-cni"
-          on_worker "grep -q 'ferrum-edge' /etc/cni/net.d/.ferrum-cni-owned.marker"
+          docker exec "$worker" cat "/etc/cni/net.d/${CONF_FILE_NAME}"
+          docker exec "$worker" test -x /opt/cni/bin/ferrum-cni
+          docker exec "$worker" grep -q ferrum-edge /etc/cni/net.d/.ferrum-cni-owned.marker
           assert_primary_untouched
 
           # ---------------------------------------------------------------
           # 2. Failure injection: no node-agent, so no socket. A NEW pod on
           #    this node must fail closed rather than start unenrolled.
           # ---------------------------------------------------------------
-          on_worker "rm -f /var/run/ferrum/node-agent-cni.sock"
+          docker exec "$worker" rm -f /var/run/ferrum/node-agent-cni.sock
           kubectl delete pod stuck-pod --ignore-not-found --wait=true >/dev/null
           kubectl apply -f - <<YAML
           apiVersion: v1
@@ -330,7 +328,7 @@ jobs:
             echo "::error title=Rollback reported success::a rollback that had to remove the chain must exit non-zero"
             exit 1
           fi
-          if on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"; then
+          if docker exec "$worker" test -e "/etc/cni/net.d/${CONF_FILE_NAME}"; then
             echo "::error title=Rollback left the chained conflist behind::the node still depends on the node-agent"
             exit 1
           fi
@@ -361,14 +359,14 @@ jobs:
             "SOCKET_PATH=/var/run/ferrum/node-agent-cni.sock" \
             "OWNER_ID=${OWNER_ID}" \
             "INSTALL_GENERATION=live-generation-2"
-          on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"
+          docker exec "$worker" test -e "/etc/cni/net.d/${CONF_FILE_NAME}"
 
           run_job cni-uninstall uninstall "EXPECTED_OWNER=${OWNER_ID}"
-          if on_worker "test -e /etc/cni/net.d/${CONF_FILE_NAME}"; then
+          if docker exec "$worker" test -e "/etc/cni/net.d/${CONF_FILE_NAME}"; then
             echo "::error title=Uninstall left the chained conflist behind::helm uninstall would strand this node"
             exit 1
           fi
-          if on_worker "test -e /opt/cni/bin/ferrum-cni"; then
+          if docker exec "$worker" test -e /opt/cni/bin/ferrum-cni; then
             echo "::error title=Uninstall left the plugin binary behind::nothing references it, so it should have gone"
             exit 1
           fi
@@ -422,8 +420,13 @@ jobs:
           for job in cni-install cni-rollback cni-reinstall cni-uninstall cni-uninstall-repeat; do
             kubectl logs "job/$job" --all-containers --tail=500 > "$results/$job.log" 2>&1
           done
-          docker exec "${KIND_CLUSTER}-worker" sh -c 'ls -la /etc/cni/net.d; ls -la /opt/cni/bin' \
-            > "$results/worker-cni-dirs.txt" 2>&1
+          {
+            echo "=== /etc/cni/net.d ==="
+            docker exec "${KIND_CLUSTER}-worker" ls -la /etc/cni/net.d
+            echo
+            echo "=== /opt/cni/bin ==="
+            docker exec "${KIND_CLUSTER}-worker" ls -la /opt/cni/bin
+          } > "$results/worker-cni-dirs.txt" 2>&1
 
       - name: Upload diagnostics
         if: always()
