@@ -38,13 +38,13 @@
 //!    over, and native/xDS parity — including a run of the production watcher
 //!    task over scripted reflector generations.
 //! 8. The equal-revision CONTENT BINDING (issue #3611): a `Same` revision
-//!    installs only for identical semantic content, so a producer whose scalar
-//!    revision is not content-unique — a Kubernetes CP publishing the MINIMUM
-//!    per-scope watermark while serving a latest-only snapshot — cannot roll a
-//!    data plane back through a lagging replica at an equal sequence. Covers
-//!    the local runtime and xDS paths, the exact-content replay that must keep
-//!    installing, revision/identity pairing across rollback and reset, and the
-//!    multi-scope Kubernetes counterexample itself.
+//!    installs only for identical semantic content. The Kubernetes producer
+//!    binds mesh to the scalar at `publish_k8s_reconcile` (retaining the last
+//!    accepted mesh under an equal sequence); the data-plane gate remains the
+//!    cross-replica defense so a lagging peer at an equal sequence cannot roll
+//!    a data plane back. Covers the local runtime and xDS paths, the
+//!    exact-content replay that must keep installing, revision/identity pairing
+//!    across rollback and reset, and the multi-scope Kubernetes counterexample.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
@@ -2406,7 +2406,8 @@ fn two_kubernetes_replicas_order_by_the_shared_resource_version() {
 /// publishing an unsequenced (which a data plane would quarantine as
 /// `missing_revision`) or an optimistic frame. Publication is also monotonic
 /// against a scope set that GROWS, which is the one way the aggregate minimum
-/// can dip.
+/// can dip. Divergent mesh under that retained scalar is withheld at the
+/// reconciler publication boundary (see `k8s_mesh_revision_binding_tests`).
 #[test]
 fn incomplete_convergence_retains_the_last_kubernetes_revision() {
     let tracker = K8sConfigRevisionTracker::new(Some("k8s".to_string()));
@@ -2427,7 +2428,8 @@ fn incomplete_convergence_retains_the_last_kubernetes_revision() {
 
     // A CRD installed later registers a new scope whose evidence is younger, so
     // the aggregate minimum dips. The in-process floor keeps publication
-    // monotonic; the data plane sees a replay, never a rewind.
+    // monotonic; the scalar never rewinds. Divergent mesh under that retained
+    // scalar is withheld at the reconciler publication boundary.
     let backend_tls = watch_scope_key("gateway.networking.k8s.io/v1", "BackendTLSPolicy", "all");
     tracker.begin_generation(&backend_tls, Some(6_000));
     tracker.commit_list(&backend_tls);

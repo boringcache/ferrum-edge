@@ -80,9 +80,11 @@
 //!   it were complete;
 //! * an unavailable watermark does not publish an unsequenced or optimistic
 //!   frame. [`K8sConfigRevisionTracker::publish`] retains the last published
-//!   sequence and refuses to advance, so content still reaches data planes (an
-//!   equal revision installs, by the gate's reconnect-replay rule) while
-//!   ordering never overstates.
+//!   sequence and refuses to advance. Divergent mesh evolved under that equal
+//!   scalar is **not** broadcast: the reconciler publication boundary retains
+//!   the last accepted mesh until the sequence can advance, so data planes see
+//!   either an identical equal-revision replay or no mesh change at all — never
+//!   a new snapshot stamped with the old scalar.
 //!
 //! # Monotonicity
 //!
@@ -341,9 +343,12 @@ impl K8sConfigRevisionTracker {
     /// * `Some(watermark)` — publish `max(watermark, floor)`, which keeps the
     ///   sequence monotonic when the aggregate minimum dips because the scope
     ///   set grew.
-    /// * `None` with a sequence already established — republish the floor. The
-    ///   content still reaches data planes (an equal revision installs, by the
-    ///   gate's reconnect-replay rule) while the ordering claim does not move.
+    /// * `None` with a sequence already established — republish the floor.
+    ///   Ordering does not move. The reconciler publication boundary additionally
+    ///   retains the last accepted mesh when the candidate mesh differs under
+    ///   that equal scalar, so a withheld advance cannot authorize divergent
+    ///   content. Identical mesh at the retained sequence remains an ordinary
+    ///   idempotent republish.
     /// * `None` with nothing established — publish no revision. Data planes
     ///   bootstrap unversioned, exactly as they did before this feature; the
     ///   first established sequence then bootstraps the gate.

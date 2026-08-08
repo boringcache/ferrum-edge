@@ -29,7 +29,7 @@ use crate::k8s_controller::status::{
 use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 use crate::modes::mesh::config::MeshConfig;
-use crate::modes::mesh::revision::MeshConfigRevision;
+use crate::modes::mesh::revision::{MeshConfigRevision, MeshRevisionOrder};
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = DEFAULT_STATUS_PLAN_WORK_BUDGET;
@@ -54,6 +54,10 @@ pub struct AcceptedK8sOverlay {
     /// it from here (#2982). Anything else would let a DB reload publish a mesh
     /// snapshot stamped with a revision that did not describe it, or (as before
     /// this change) wipe the revision entirely on the next poll.
+    ///
+    /// Bound atomically to `translation.mesh` at publication: an equal scalar
+    /// with divergent mesh retains the previously accepted pair rather than
+    /// storing the divergent candidate under the old sequence.
     ///
     /// `None` when revision publication is disabled or no convergence evidence
     /// has ever been established.
@@ -691,6 +695,16 @@ fn namespaces_for_broadcast(
 /// Returns the published snapshot, or `None` when the merge produced no
 /// content change (nothing committed, nothing broadcast).
 ///
+/// Inside the gate this also **binds mesh content to the authoritative
+/// revision** (issue #3611): a candidate whose sequence equals the last
+/// accepted overlay's sequence but whose mesh differs retains the previously
+/// accepted mesh (and that same sequence). The effective translation stored in
+/// [`K8sOverlaySlot`], merged into `config_arc`, and broadcast is therefore one
+/// value — a store-then-merge mismatch cannot resurrect a withheld divergent
+/// mesh on a later DB reload. Non-mesh Gateway/API fields from the candidate
+/// still publish. Unversioned publication (no sequence established yet) is
+/// unchanged bootstrap behavior.
+///
 /// The overlay slot is still written BEFORE the CAS. Holding the gate means
 /// there is no losing CAS writer in practice, but the ordering is preserved so
 /// the CAS retry loops stay correct on their own terms: a writer that did lose
@@ -711,6 +725,13 @@ pub fn publish_k8s_reconcile(
     mesh_revision: Option<&MeshConfigRevision>,
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
+        let previous = overlay_slot.load_full();
+        let (effective_translation, effective_revision) = bind_k8s_mesh_revision_publication(
+            previous.as_ref().as_ref(),
+            translation,
+            mesh_revision,
+        );
+
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin
         // configurations, so without this gate it could bypass the CP full and
@@ -722,9 +743,16 @@ pub fn publish_k8s_reconcile(
         // Every other admission point calls a policy function that returns
         // immediately when FIPS mode is off; doing the merge unconditionally
         // here would charge every ordinary reconcile for a second full clone.
+        //
+        // FIPS runs on the EFFECTIVE translation (after equal-revision mesh
+        // retention), so a withheld divergent mesh cannot be admitted by
+        // validating a candidate that will not be stored.
         if crate::fips::is_enforcing() {
-            let candidate =
-                merge_k8s_translation(config_arc.load().as_ref(), translation, managed_namespaces);
+            let candidate = merge_k8s_translation(
+                config_arc.load().as_ref(),
+                &effective_translation,
+                managed_namespaces,
+            );
             if let Err(error) = crate::fips::policy::check_gateway_config(&candidate) {
                 error!("Kubernetes configuration rejected — FIPS policy: {}", error);
                 return None;
@@ -734,15 +762,15 @@ pub fn publish_k8s_reconcile(
         // reloads can re-merge it instead of broadcasting a wipe (#2982).
         store_accepted_k8s_overlay(
             overlay_slot,
-            translation.clone(),
+            effective_translation.clone(),
             managed_namespaces.clone(),
-            mesh_revision.cloned(),
+            effective_revision.clone(),
         );
         let new_config = swap_merged_k8s_translation(
             config_arc,
-            translation,
+            &effective_translation,
             managed_namespaces,
-            mesh_revision,
+            effective_revision.as_ref(),
         )?;
 
         // Notify DPs and mesh subscribers of the config change.
@@ -764,6 +792,102 @@ pub fn publish_k8s_reconcile(
         );
         Some(new_config)
     })
+}
+
+/// Bind the mesh snapshot that may leave this CP to the authoritative
+/// Kubernetes config revision (issue #3611).
+///
+/// `K8sConfigRevisionTracker::publish` may retain/republish an equal scalar
+/// while `do_reconcile` has already evolved the reflector snapshot (incomplete
+/// evidence, or a complete aggregate MIN pinned by a quiet scope). Broadcasting
+/// that divergent mesh under the old scalar is exactly what
+/// `MeshRevisionGate` must reject as `divergent_content`. The producer therefore
+/// keeps the last accepted mesh until the sequence advances.
+///
+/// Returns the effective translation (candidate non-mesh fields, possibly
+/// retained mesh) and the revision that must stamp it. Decision happens only at
+/// the publication boundary; callers must invoke this inside
+/// [`CpPublicationGate`].
+fn bind_k8s_mesh_revision_publication(
+    previous: Option<&AcceptedK8sOverlay>,
+    translation: &GatewayConfig,
+    mesh_revision: Option<&MeshConfigRevision>,
+) -> (GatewayConfig, Option<MeshConfigRevision>) {
+    let mut effective = translation.clone();
+    let Some(candidate_revision) = mesh_revision.filter(|revision| revision.is_well_formed())
+    else {
+        // Unversioned bootstrap / disabled authority: no scalar to bind.
+        return (effective, mesh_revision.cloned());
+    };
+    let Some(previous) = previous else {
+        return (effective, Some(candidate_revision.clone()));
+    };
+    let Some(previous_revision) = previous
+        .mesh_revision
+        .as_ref()
+        .filter(|revision| revision.is_well_formed())
+    else {
+        // First established sequence after unversioned publication.
+        return (effective, Some(candidate_revision.clone()));
+    };
+
+    match MeshConfigRevision::compare(Some(previous_revision), Some(candidate_revision)) {
+        MeshRevisionOrder::Newer | MeshRevisionOrder::Incomparable => {
+            // Sequence advanced (or a new ordering domain): release the newest
+            // mesh, including authoritative withdrawals.
+            (effective, Some(candidate_revision.clone()))
+        }
+        MeshRevisionOrder::Same => {
+            if k8s_published_mesh_content_matches(&previous.translation, &effective) {
+                // Idempotent equal-revision republish.
+                (effective, Some(candidate_revision.clone()))
+            } else {
+                warn!(
+                    retained_sequence = previous_revision.sequence,
+                    "Kubernetes mesh content changed under an unchanged authoritative revision; \
+                     retaining the last accepted mesh snapshot until the sequence advances"
+                );
+                retain_previously_accepted_k8s_mesh(&mut effective, previous);
+                (effective, Some(previous_revision.clone()))
+            }
+        }
+        MeshRevisionOrder::Older
+        | MeshRevisionOrder::Unversioned
+        | MeshRevisionOrder::Bootstrap => {
+            // A non-advancing claim cannot authorize different mesh content.
+            // The tracker floor normally prevents Older; fail closed anyway.
+            retain_previously_accepted_k8s_mesh(&mut effective, previous);
+            (effective, Some(previous_revision.clone()))
+        }
+    }
+}
+
+fn retain_previously_accepted_k8s_mesh(
+    effective: &mut GatewayConfig,
+    previous: &AcceptedK8sOverlay,
+) {
+    effective.mesh = previous.translation.mesh.clone();
+    effective.k8s_mesh_overlay = previous.translation.k8s_mesh_overlay.clone();
+}
+
+/// Whether two translations carry the same mesh content protected by
+/// [`MeshConfigRevision`].
+///
+/// Uses the shared canonical digest so producer retention and the data-plane
+/// equal-revision identity agree on semantic equality. Digests are compared,
+/// never logged. An uncomputable identity fails closed (not a match).
+fn k8s_published_mesh_content_matches(left: &GatewayConfig, right: &GatewayConfig) -> bool {
+    match (
+        k8s_published_mesh_content_identity(left.mesh.as_deref()),
+        k8s_published_mesh_content_identity(right.mesh.as_deref()),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => false,
+    }
+}
+
+fn k8s_published_mesh_content_identity(mesh: Option<&MeshConfig>) -> Option<[u8; 32]> {
+    crate::grpc::mesh_slice_drift::canonical_content_digest(&mesh).ok()
 }
 
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
@@ -788,7 +912,9 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         (watermark, set.snapshot_all())
     };
     // Publication applies the in-process monotonic floor and the
-    // retain-last-good rule for incomplete evidence.
+    // retain-last-good sequence rule for incomplete evidence. Equal-sequence
+    // mesh retention (when the candidate mesh diverges under that scalar) is
+    // applied later inside `publish_k8s_reconcile`.
     let mesh_revision = ctx.revision.publish(revision_watermark);
 
     let resource_count = objects.len();

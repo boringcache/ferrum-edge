@@ -75,14 +75,19 @@
 //!
 //! A scalar revision only orders snapshots if the producer guarantees that one
 //! `(authority, sequence)` names exactly one config content. A Kubernetes
-//! controller CP cannot: its published sequence is the MINIMUM per-scope
-//! convergence watermark, while the latest-only reflector snapshot it serves may
-//! already contain later changes from another scope. Replica A at scope
-//! watermarks `[110, 100]` and replica B at `[100, 100]` therefore both publish
-//! sequence `100`, and A's snapshot carries the change made at `110` while B's
-//! does not. Installing every `Same` would let a data plane that accepted A fail
-//! over to B and silently install the OLDER content at the SAME sequence — the
-//! exact rollback this module exists to prevent.
+//! controller CP's published sequence is the MINIMUM per-scope convergence
+//! watermark, while the latest-only reflector snapshot it materializes may
+//! already contain later changes from another scope (or may keep evolving while
+//! incomplete evidence pins the floor). Replica A at scope watermarks
+//! `[110, 100]` and replica B at `[100, 100]` therefore both compute sequence
+//! `100`, and A's snapshot carries the change made at `110` while B's does not.
+//! The Kubernetes publication boundary therefore binds mesh content to the
+//! accepted scalar before broadcast: equal revision + divergent mesh retains the
+//! previously accepted mesh. Installing every `Same` at the data plane without
+//! that producer bind (or across replicas that accepted different content at the
+//! same minimum) would let a data plane that accepted A fail over to B and
+//! silently install the OLDER content at the SAME sequence — the exact rollback
+//! this module exists to prevent.
 //!
 //! So the gate binds a stable, deterministic semantic CONTENT IDENTITY
 //! ([`MeshRevisionContentIdentity`]) to every accepted and applied revision, and
