@@ -681,10 +681,7 @@ fn udp_route_with_only_non_gateway_parents_opens_no_listener() {
             "parentRefs": parent_refs,
             "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
         });
-        let invalid_objects = [
-            gateway_class(),
-            udp_route("invalid-parent-refs", invalid),
-        ];
+        let invalid_objects = [gateway_class(), udp_route("invalid-parent-refs", invalid)];
         assert_no_listener_for_declared_parent(&invalid_objects, 5353);
     }
 }
