@@ -5941,12 +5941,13 @@ fn l4_route_proxies(
     // `NoMatchingParent` / `NotAllowedByListeners`. The backend-port fallback
     // below is retained only for the parentless legacy shape (a bare
     // TCPRoute/TLSRoute/UDPRoute supplied by a non-Kubernetes config source),
-    // which has no parent to contradict.
+    // which has no parent to contradict — see [`l4_route_declares_parent_ref`]
+    // for why a `UDPRoute` counts a *non-Gateway* parent as a declaration too.
     //
     // For UDPRoute this set is additionally filtered by same-listener conflict
     // losers: a route that lost ownership of every declared listener opens
     // nothing and creates no upstream, so duplicate OS binds cannot race.
-    if materialized_listener_bindings.is_empty() && route_declares_gateway_parent_ref(object) {
+    if materialized_listener_bindings.is_empty() && l4_route_declares_parent_ref(object, scheme) {
         if scheme.is_udp()
             && acc
                 .gateway_api_conflict_losers
@@ -5955,6 +5956,12 @@ fn l4_route_proxies(
             acc.warnings.push(format!(
                 "{} {}/{} lost every claimed UDP listener to an older competing UDPRoute; \
                  no listener was opened",
+                object.kind, object.metadata.namespace, object.metadata.name
+            ));
+        } else if scheme.is_udp() && !route_declares_gateway_parent_ref(object) {
+            acc.warnings.push(format!(
+                "{} {}/{} declares only non-Gateway parentRefs, which Ferrum does not implement \
+                 for UDPRoute; no listener was opened",
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
         } else {
@@ -6092,6 +6099,32 @@ fn route_declares_gateway_parent_ref(object: &K8sObject) -> bool {
         .get("parentRefs")
         .and_then(Value::as_array)
         .is_some_and(|parent_refs| parent_refs.iter().any(parent_ref_is_gateway))
+}
+
+/// True when the route declares a `parentRefs[]` entry that arms the
+/// fail-closed listener gate.
+///
+/// `TCPRoute`/`TLSRoute` keep their historical rule: only a **Gateway** parent
+/// counts as a listener declaration, so a route carrying just a GAMMA `Service`
+/// parent still reaches the backend-port fallback exactly as before.
+///
+/// A `UDPRoute` is stricter, because Ferrum implements **no** non-Gateway parent
+/// for it: any declared parent that resolves to no materializable listener — a
+/// `Service` parent, a mistyped `kind`, an unrecognized `group` — must open
+/// nothing rather than quietly bind a north-south UDP relay on the backend port.
+/// Such a route also names no managed Gateway, so it is not a status candidate
+/// and the fallback listener would be completely unannounced. The fallback
+/// survives only for a genuinely parentless route (no `parentRefs` at all),
+/// which is the non-Kubernetes config-source shape.
+fn l4_route_declares_parent_ref(object: &K8sObject, scheme: BackendScheme) -> bool {
+    if scheme.is_udp() {
+        return object
+            .spec
+            .get("parentRefs")
+            .and_then(Value::as_array)
+            .is_some_and(|parent_refs| !parent_refs.is_empty());
+    }
+    route_declares_gateway_parent_ref(object)
 }
 
 /// Proxy/upstream id suffix for one L4 rule.

@@ -37,7 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names the upstream bound, and — because the object is upstream-valid — status
   reports `Accepted=False` with the upstream `UnsupportedValue` reason instead
   of the generic `Invalid`, while `ResolvedRefs` is still evaluated on its own
-  terms. Update and delete regenerate live stream listeners and upstreams.
+  terms. A `UDPRoute` whose `parentRefs` name only non-Gateway parents (a GAMMA
+  `Service` parent, a mistyped `kind`, an unrecognized `group`) opens nothing
+  either: Ferrum implements no non-Gateway `UDPRoute` parent and such a route is
+  not a status candidate, so the backend-port fallback would be an unannounced
+  north-south UDP listener. Only a `UDPRoute` with no `parentRefs` at all keeps
+  that fallback; `TCPRoute`/`TLSRoute` keep their historical Gateway-parent-only
+  gate. Update and delete regenerate live stream listeners and upstreams.
   Attachment, weighted backend sets, ReferenceGrant fail-closed behavior,
   status, update, and deletion are gated by CI Unit Tests
   (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the **live

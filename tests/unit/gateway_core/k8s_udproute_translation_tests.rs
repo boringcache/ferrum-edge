@@ -648,6 +648,48 @@ fn parentless_l4_routes_keep_the_backend_port_fallback() {
 }
 
 #[test]
+fn udp_route_with_only_non_gateway_parents_opens_no_listener() {
+    // Ferrum implements no non-Gateway parent for UDPRoute, and such a route is
+    // not a status candidate either (it names no managed Gateway). Falling back
+    // to the backend port would bind an unannounced north-south UDP relay, so a
+    // declared parent Ferrum cannot resolve must open nothing.
+    let gamma = json!({
+        "parentRefs": [{"group": "", "kind": "Service", "name": "coredns"}],
+        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+    });
+    let gamma_objects = [gateway_class(), udp_route("gamma", gamma)];
+    assert_no_listener_for_declared_parent(&gamma_objects, 5353);
+
+    // A mistyped parent kind must fail the same way rather than silently
+    // downgrading to the parentless fallback.
+    let mistyped = json!({
+        "parentRefs": [{"kind": "gateway", "name": "edge"}],
+        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+    });
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("typo", mistyped),
+    ];
+    assert_no_listener_for_declared_parent(&objects, 5353);
+}
+
+#[test]
+fn non_gateway_parents_keep_the_tcp_route_fallback() {
+    // The stricter UDP rule above must not change shared TCPRoute/TLSRoute
+    // behavior: only a Gateway parent arms their fail-closed listener gate.
+    let spec = json!({
+        "parentRefs": [{"group": "", "kind": "Service", "name": "db"}],
+        "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+    });
+    let objects = [gateway_class(), l4_route("TCPRoute", "db", spec)];
+    let tcp = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(tcp.config.proxies.len(), 1);
+    assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
+}
+
+#[test]
 fn udp_route_with_unmatched_section_name_opens_no_listener() {
     let route = udp_route(
         "dns",
