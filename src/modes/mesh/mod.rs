@@ -53,12 +53,12 @@ use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_c
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
     AppProtocol, DestinationRuleLookupTier, EastWestGateway, MeshConfig, MeshDestinationRule,
-    MeshEgressUdpDestination, MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer,
-    MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication,
-    MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode,
-    PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
-    destination_rule_exported_to_namespace, destination_rule_lookup_tier, resolve_target_port,
-    service_entry_exported_to_namespace,
+    MeshEgressUdpDestination, MeshEgressUdpDialEndpoint, MeshExternalUdpEgressRoute,
+    MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
+    MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
+    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -346,6 +346,24 @@ impl MeshConfigProtocol {
     }
 }
 
+/// The EgressGateway a SOURCE workload steers captured external UDP to
+/// (issue #3263).
+///
+/// Both halves are mandatory together and neither is inferred: the address names
+/// the gateway's mesh mTLS terminator (its `FERRUM_MESH_EGRESS_LISTEN_ADDR`,
+/// conventionally `:15090`), and the SPIFFE id is PINNED as the expected peer of
+/// the outbound SVID-mTLS handshake, so a captured datagram can only ever leave
+/// through a gateway whose SVID matches the identity the operator declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshEgressGatewayEndpoint {
+    /// Dial host of the gateway's mesh mTLS listener.
+    pub host: String,
+    /// Dial port of the gateway's mesh mTLS listener.
+    pub port: u16,
+    /// Expected peer SVID identity, verified during the outbound handshake.
+    pub spiffe_id: crate::identity::SpiffeId,
+}
+
 /// Parsed mesh runtime settings kept separate from `EnvConfig` so mesh mode
 /// stays strictly additive and non-mesh deployments do not carry new fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +395,14 @@ pub struct MeshRuntimeConfig {
     /// from sidecars. Only used when `topology == EgressGateway`. Parsed from
     /// `FERRUM_MESH_EGRESS_LISTEN_ADDR`, default `0.0.0.0:15090`.
     pub egress_listen_addr: SocketAddr,
+    /// SOURCE-side EgressGateway endpoint this workload steers captured external
+    /// UDP to (issue #3263), from `FERRUM_MESH_EGRESS_GATEWAY_ADDR` +
+    /// `FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID`.
+    ///
+    /// `None` disables source-side external UDP egress entirely (the default):
+    /// there is no guessing of a gateway address and never a direct
+    /// unauthenticated dial of the external destination.
+    pub egress_gateway: Option<MeshEgressGatewayEndpoint>,
     pub workload_spiffe_id: Option<String>,
     /// Name of the GAMMA Waypoint this process serves. Required when
     /// `topology == ServiceWaypoint`; ignored for every other topology.
@@ -589,6 +615,10 @@ impl MeshRuntimeConfig {
                 .as_deref()
                 .unwrap_or(DEFAULT_EGRESS_LISTEN_ADDR),
         )?;
+        let egress_gateway = parse_egress_gateway_endpoint(
+            resolve_ferrum_var("FERRUM_MESH_EGRESS_GATEWAY_ADDR").as_deref(),
+            resolve_ferrum_var("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID").as_deref(),
+        )?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
         let waypoint_name = resolve_ferrum_var("FERRUM_MESH_WAYPOINT_NAME")
@@ -735,6 +765,7 @@ impl MeshRuntimeConfig {
             egress_hbone_port,
             egress_mtls_port,
             egress_listen_addr,
+            egress_gateway,
             workload_spiffe_id,
             waypoint_name,
             xds_node_cluster,
@@ -1183,6 +1214,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     synthesize_mesh_outbound_cors_plugins(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
+    // Source-side external UDP egress to the configured EgressGateway (#3263).
+    // Runs beside the in-mesh UDP materializer and shares its route index, so a
+    // captured datagram resolves through one table regardless of destination.
+    materialize_mesh_external_udp_egress_upstreams(&mut config, runtime, mesh_slice);
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
@@ -5558,6 +5593,300 @@ fn materialize_mesh_outbound_udp_upstreams(
     }
 }
 
+/// Reserved id prefix for SOURCE-side external UDP egress upstreams
+/// (issue #3263). A DISTINCT id space from the in-mesh `__mesh-out-udp-upstream-`
+/// upstreams so an external ServiceEntry and an in-mesh service can never share
+/// or clobber an upstream identity.
+pub(crate) const MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX: &str = "__mesh-out-udp-ext-upstream-";
+
+/// Reserved id prefix for the synthesized SOURCE-side external UDP egress relay
+/// proxies (issue #3263), the external counterpart of
+/// [`MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX`]. Same non-route-prefix rationale.
+pub(crate) const MESH_EXTERNAL_UDP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-udp-ext-relay-";
+
+/// Upstream id for one SOURCE-side external UDP egress endpoint. Forward-derived
+/// from the ServiceEntry identity plus the exact endpoint address the captured
+/// datagram was sent to, never parsed back.
+pub(crate) fn mesh_external_udp_upstream_id(
+    namespace: &str,
+    service_entry: &str,
+    port: u16,
+    dest_ip: &str,
+) -> String {
+    format!("{MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX}{namespace}-{service_entry}-{port}-{dest_ip}")
+        .replace(['/', '.', ':'], "-")
+}
+
+/// Build the synthesized relay proxy backing one SOURCE-side external UDP egress
+/// route (issue #3263). Same deterministic shape and pool-config contract as the
+/// in-mesh UDP relay proxy — `BackendScheme::Udp`, shared builder — so the dial
+/// budgets stay identical; only the id space and the upstream differ.
+pub(crate) fn mesh_external_udp_relay_proxy(
+    namespace: &str,
+    service_entry: &str,
+    port: u16,
+    dest_ip: &str,
+    upstream_id: &str,
+) -> Proxy {
+    let id = format!(
+        "{MESH_EXTERNAL_UDP_RELAY_PROXY_ID_PREFIX}{namespace}-{service_entry}-{port}-{dest_ip}"
+    )
+    .replace(['/', '.', ':'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Udp)
+}
+
+/// Materialize SOURCE-side captured-UDP egress to the configured EgressGateway
+/// for external `ServiceEntry` UDP ports (issue #3263).
+///
+/// This is the producer half of external UDP egress: without it the gateway's
+/// `udp` CONNECT terminator has no originator and the ServiceEntry stays inert.
+/// It runs on the topologies that HAVE a UDP source-capture producer — `Sidecar`
+/// (pod-netns TPROXY → current-netns listener) and `Ambient` (per-pod-netns
+/// producer) — and materializes nothing anywhere else.
+///
+/// **Transport.** The EgressGateway exposes ONE mesh listener: SVID-mTLS
+/// termination on `egress_listen_addr` (conventionally `:15090`). It has no
+/// `:15008` HBONE listener, so BOTH source topologies reach it over the
+/// mesh-mTLS datagram tunnel (`mesh.mtls` + `mesh.mtls_port`), exactly as a
+/// Sidecar reaches a peer sidecar's `:15006`. That branch requires no capability
+/// probe (an operator-declared gateway speaks mesh-mTLS by construction) and
+/// REQUIRES the pinned `mesh.spiffe_id`, so an unverifiable gateway identity
+/// refuses the dial instead of falling back.
+///
+/// **Keying.** A datagram carries no Host, so the only thing the source can key
+/// on is the original destination the workload dialed — for an external
+/// ServiceEntry that is the endpoint IP the mesh DNS proxy answered with. Only
+/// `STATIC` entries declare those IPs, so only `STATIC` entries can be
+/// source-routed; a `DNS`/`NONE` entry is refused with a field-specific warning
+/// rather than guessed at. The CONNECT `:authority` names that same endpoint
+/// `IP:service port`, which is precisely the endpoint-derived admission the
+/// gateway allowlist grants — so the gateway dials that one endpoint and never
+/// resolves a name.
+fn materialize_mesh_external_udp_egress_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // Rebuilt from scratch on EVERY apply and assigned unconditionally, so an
+    // update/delete/topology-flip that withdraws a ServiceEntry withdraws the
+    // captured-datagram route with it (mirrors `egress_udp_destinations`).
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.external_udp_egress_routes.clear();
+    }
+    if !matches!(
+        runtime.topology,
+        MeshTopology::Sidecar | MeshTopology::Ambient
+    ) {
+        return;
+    }
+
+    let mut routes: Vec<MeshExternalUdpEgressRoute> = Vec::new();
+    let mut claimed: std::collections::HashSet<(String, u16)> = std::collections::HashSet::new();
+    let now = chrono::Utc::now();
+    let mut upstreams: Vec<Upstream> = Vec::new();
+
+    for entry in &mesh_slice.service_entries {
+        if entry.location != ServiceEntryLocation::MeshExternal {
+            continue;
+        }
+        for port_spec in &entry.ports {
+            if !matches!(port_spec.protocol, AppProtocol::Udp) {
+                continue;
+            }
+            if port_spec.port == 0 {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    field = "ports[].number",
+                    "Skipping source-side external UDP egress for ServiceEntry port 0"
+                );
+                continue;
+            }
+            let Some(gateway) = runtime.egress_gateway.as_ref() else {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    port = port_spec.port,
+                    field = "FERRUM_MESH_EGRESS_GATEWAY_ADDR",
+                    "Skipping source-side external UDP egress: no EgressGateway endpoint is \
+                     configured. Set FERRUM_MESH_EGRESS_GATEWAY_ADDR and \
+                     FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID to steer captured external UDP through \
+                     an identity-pinned gateway; captured datagrams are dropped until then and \
+                     are never direct-dialed."
+                );
+                continue;
+            };
+            if entry.resolution != Resolution::Static {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    port = port_spec.port,
+                    field = "resolution",
+                    resolution = ?entry.resolution,
+                    "Skipping source-side external UDP egress: only STATIC resolution declares \
+                     the endpoint addresses a captured datagram can be matched against (a UDP \
+                     datagram carries no Host), so a DNS/NONE entry cannot be source-routed"
+                );
+                continue;
+            }
+            // No numeric `targetPort` is applied here: the source keys and names
+            // the SERVICE port (the captured original destination and the CONNECT
+            // authority both carry it); resolving the dial port is the gateway's job.
+            let endpoints = resolve_static_udp_dial_endpoints(entry, port_spec, None);
+            if endpoints.is_empty() {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    port = port_spec.port,
+                    field = "endpoints[]",
+                    "Skipping source-side external UDP egress: the STATIC entry declares no \
+                     usable IP-literal endpoint to match captured datagrams against"
+                );
+                continue;
+            }
+            for endpoint in &endpoints {
+                // `resolve_static_udp_dial_endpoints` resolves the DIAL port; the
+                // captured original destination and the CONNECT authority both
+                // carry the SERVICE port, which is what the gateway admits.
+                let dest_ip = endpoint.host.clone();
+                if !claimed.insert((dest_ip.clone(), port_spec.port)) {
+                    warn!(
+                        service_entry = %entry.name,
+                        namespace = %entry.namespace,
+                        address = %dest_ip,
+                        port = port_spec.port,
+                        "Skipping source-side external UDP egress endpoint: another ServiceEntry \
+                         already claimed this address and port"
+                    );
+                    continue;
+                }
+                let upstream_id = mesh_external_udp_upstream_id(
+                    &entry.namespace,
+                    &entry.name,
+                    port_spec.port,
+                    &dest_ip,
+                );
+                let service_fqdn = entry
+                    .hosts
+                    .iter()
+                    .map(|host| host.trim())
+                    .find(|host| !host.is_empty() && !host.contains('*'))
+                    .unwrap_or(dest_ip.as_str())
+                    .to_string();
+                let target = build_external_udp_egress_gateway_target(
+                    gateway,
+                    &dest_ip,
+                    port_spec.port,
+                    entry,
+                );
+                upstreams.push(mesh_outbound_route_upstream(
+                    &upstream_id,
+                    &entry.namespace,
+                    &service_fqdn,
+                    vec![target],
+                    now,
+                ));
+                routes.push(MeshExternalUdpEgressRoute {
+                    namespace: entry.namespace.clone(),
+                    service_entry: entry.name.clone(),
+                    port: port_spec.port,
+                    dest_ip,
+                    upstream_id,
+                    service_fqdn,
+                });
+            }
+        }
+    }
+
+    if routes.is_empty() {
+        return;
+    }
+    let materialized = routes.len();
+    for upstream in upstreams {
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+        {
+            *existing = upstream;
+        } else {
+            config.upstreams.push(upstream);
+        }
+    }
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.external_udp_egress_routes = routes;
+        info!(
+            external_udp_routes = materialized,
+            topology = ?runtime.topology,
+            "Materialized source-side external UDP egress routes to the configured EgressGateway \
+             (captured datagrams are framed over a udp-marked mesh-mTLS CONNECT, identity-pinned \
+             to the gateway SVID)"
+        );
+    } else {
+        // Without a mesh block nothing on the request path can consult the
+        // routes, so captured datagrams stay dropped. Say so rather than
+        // leaving a half-materialized upstream set silently unreachable.
+        warn!(
+            external_udp_routes = materialized,
+            "Source-side external UDP egress routes were materialized but the prepared config \
+             carries no mesh block; captured external UDP stays dropped"
+        );
+    }
+}
+
+/// Build the single identity-pinned upstream target of a source-side external
+/// UDP egress route: dial the EgressGateway's mesh mTLS listener, but name the
+/// EXTERNAL endpoint in the CONNECT `:authority`.
+fn build_external_udp_egress_gateway_target(
+    gateway: &MeshEgressGatewayEndpoint,
+    dest_ip: &str,
+    service_port: u16,
+    entry: &ServiceEntry,
+) -> UpstreamTarget {
+    let mut tags: HashMap<String, String> = HashMap::new();
+    // Sidecar-style mesh-mTLS transport: the gateway terminates SVID-mTLS on its
+    // egress listener and speaks the same H2 CONNECT the peer-sidecar relay does.
+    tags.insert(
+        crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG.to_string(),
+        "true".to_string(),
+    );
+    if gateway.port != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT {
+        tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+            gateway.port.to_string(),
+        );
+    }
+    // REQUIRED pinned peer: `target_mesh_mtls_expected_peer` refuses an unpinned
+    // mesh.mtls dial, so this is what keeps an unverified gateway from
+    // terminating external egress.
+    tags.insert(
+        crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG.to_string(),
+        gateway.spiffe_id.as_str().to_string(),
+    );
+    // The CONNECT `:authority` host is the EXTERNAL endpoint; the authority port
+    // is `target.port` below. Together they are exactly the endpoint-derived
+    // admission the gateway's allowlist grants.
+    tags.insert(
+        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+        dest_ip.to_string(),
+    );
+    tags.insert("mesh.namespace".to_string(), entry.namespace.clone());
+    tags.insert("mesh.service".to_string(), entry.name.clone());
+    tags.insert("mesh.protocol".to_string(), "udp".to_string());
+    UpstreamTarget {
+        // Dial host: the gateway. `target_mesh_mtls_dial_host` falls back to
+        // `target.host` when no dial-host tag is present.
+        host: gateway.host.clone(),
+        // CONNECT authority port (NOT the dial port — that is `mesh.mtls_port`).
+        port: service_port,
+        service_port_policy_key: Some(service_port),
+        weight: 1,
+        tags,
+        locality: None,
+        path: None,
+    }
+}
+
 /// Reserved id prefix for the synthesized raw-TCP egress relay proxies. Like
 /// the upstream id, deliberately NOT under `__mesh-outbound-` so it can never
 /// be misclassified as a direction-scoped route id — these proxies never
@@ -9070,6 +9399,17 @@ fn build_egress_proxies_and_upstreams(
 /// nothing is ever guessed, widened, or fallen back to a direct unauthenticated
 /// UDP path.
 ///
+/// **Authority is not the dial destination.** Under `STATIC` resolution the
+/// operator declared the concrete endpoint set, so the ServiceEntry host is
+/// admitted as an AUTHORITY whose dial endpoints are exactly those declared
+/// `endpoints[]` — the gateway never DNS-resolves the host in that mode. An
+/// endpoint IP is additionally admitted as an authority in its own right, but
+/// then its dial set is that ONE endpoint (never the whole set), so a CONNECT
+/// naming an endpoint reaches only the endpoint it named. Under `DNS`/`NONE`
+/// resolution the entry declares no dialable endpoint set, so the host's single
+/// dial endpoint is the host itself (resolved at dial time — the meaning of
+/// those modes) and endpoints admit nothing.
+///
 /// Refusals, all warned with the offending field:
 /// - stream-family egress not enabled (`FERRUM_MESH_EGRESS_STREAM_ENABLED`);
 /// - `port: 0` (a CONNECT authority can never name it);
@@ -9077,6 +9417,8 @@ fn build_egress_proxies_and_upstreams(
 ///   prefix pattern would have to be resolved by guessing;
 /// - an empty/whitespace host;
 /// - a `STATIC` endpoint address that is not a bare IP literal;
+/// - a `STATIC` entry that resolved NO usable endpoint — the host is refused
+///   outright rather than falling back to DNS-resolving the authority;
 /// - a `(host, port)` pair another ServiceEntry already admitted.
 fn build_udp_egress_destinations_for_entry(
     entry: &ServiceEntry,
@@ -9112,8 +9454,36 @@ fn build_udp_egress_destinations_for_entry(
     // without moving the port the CONNECT authority names. A named targetPort
     // has no workload port table to resolve against on an external entry, so it
     // resolves to `None` and the service port is dialed.
-    let dial_port =
-        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
+    let numeric_target_port = resolve_target_port(port_spec.target_port.as_ref(), &[]);
+    let dial_port = numeric_target_port.unwrap_or(port_spec.port);
+
+    // Resolve the operator-declared STATIC endpoint set ONCE for this port. It
+    // is both the host authority's dial set and the source of the endpoint-IP
+    // authorities below, so the two can never disagree about what is dialable.
+    let static_endpoints = if entry.resolution == Resolution::Static {
+        Some(resolve_static_udp_dial_endpoints(
+            entry,
+            port_spec,
+            numeric_target_port,
+        ))
+    } else {
+        None
+    };
+    // Fail closed rather than silently falling back to DNS: a STATIC entry whose
+    // endpoints are all unusable (non-IP addresses, or none declared) has no
+    // dialable destination, and admitting its host anyway would make the gateway
+    // resolve the authority — exactly the STATIC-endpoint bypass this must not do.
+    if static_endpoints.as_ref().is_some_and(|eps| eps.is_empty()) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            field = "endpoints[]",
+            port = port_spec.port,
+            "Skipping STATIC UDP egress ServiceEntry port: it declares no usable IP-literal \
+             endpoint, and a STATIC destination must never be reached by DNS-resolving its host"
+        );
+        return;
+    }
 
     let mut admitted_for_port = 0usize;
     for host in &entry.hosts {
@@ -9141,11 +9511,19 @@ fn build_udp_egress_destinations_for_entry(
             );
             continue;
         }
+        // STATIC ⇒ dial the declared endpoint set; DNS/NONE ⇒ the host itself.
+        let dial_endpoints = match &static_endpoints {
+            Some(endpoints) => endpoints.clone(),
+            None => vec![MeshEgressUdpDialEndpoint {
+                host: host.to_ascii_lowercase(),
+                port: dial_port,
+            }],
+        };
         if push_udp_egress_destination(
             entry,
             host,
             port_spec.port,
-            dial_port,
+            dial_endpoints,
             materialized_udp_destinations,
             destinations,
         ) {
@@ -9153,38 +9531,18 @@ fn build_udp_egress_destinations_for_entry(
         }
     }
 
-    // STATIC resolution names concrete endpoint addresses; a workload may dial
-    // one of those directly instead of the ServiceEntry host, so admit them too
-    // — but only when they are bare IP literals. A named endpoint port (when the
-    // service port carries a name and no numeric targetPort) moves that
-    // endpoint's dial port the same way a numeric targetPort does.
-    if entry.resolution == Resolution::Static {
-        for endpoint in &entry.endpoints {
-            let address = endpoint.address.trim();
-            if address.parse::<std::net::IpAddr>().is_err() {
-                warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    field = "endpoints[].address",
-                    address = %address,
-                    port = port_spec.port,
-                    "Skipping UDP egress ServiceEntry endpoint whose address is not an IP literal"
-                );
-                continue;
-            }
-            let endpoint_dial_port = match (
-                resolve_target_port(port_spec.target_port.as_ref(), &[]),
-                port_spec.name.as_deref(),
-            ) {
-                (Some(numeric), _) => numeric,
-                (None, Some(name)) => endpoint.ports.get(name).copied().unwrap_or(port_spec.port),
-                (None, None) => port_spec.port,
-            };
+    // A workload may dial a STATIC endpoint address directly instead of the
+    // ServiceEntry host, so each endpoint IP is admitted as an authority too —
+    // with a dial set of exactly THAT endpoint, never the whole set. Direct
+    // endpoint-IP admission is therefore always explicitly derived from the
+    // endpoint it names.
+    if let Some(endpoints) = &static_endpoints {
+        for endpoint in endpoints {
             if push_udp_egress_destination(
                 entry,
-                address,
+                &endpoint.host,
                 port_spec.port,
-                endpoint_dial_port,
+                vec![endpoint.clone()],
                 materialized_udp_destinations,
                 destinations,
             ) {
@@ -9204,16 +9562,99 @@ fn build_udp_egress_destinations_for_entry(
     }
 }
 
-/// Insert one `(host, port)` admission, refusing a duplicate another
-/// ServiceEntry already claimed. Returns `true` when the admission was added.
+/// Upper bound on the dial endpoints one admitted external UDP destination may
+/// carry (issue #3263).
+///
+/// The set is precomputed at materialization and walked with a modulo index at
+/// dial time, so it must stay small and fixed: a slice may not grow the
+/// request-path work per CONNECT without bound. Endpoints beyond the cap are
+/// dropped with a warning (a SUBSET is always safe — it can only narrow what the
+/// gateway may dial, never widen it).
+pub const MAX_EGRESS_UDP_DIAL_ENDPOINTS: usize = 64;
+
+/// Resolve the `STATIC` dial endpoint set of one external `ServiceEntry` UDP
+/// port: every `endpoints[].address` that is a bare IP literal, paired with the
+/// port that endpoint is reached on.
+///
+/// Port precedence mirrors the rest of the egress materializer: a numeric
+/// `targetPort` wins; otherwise a NAMED service port resolves against this
+/// endpoint's own `ports` map; otherwise the service port is dialed. Non-IP
+/// addresses are dropped with a field-specific warning — the gateway must not
+/// DNS-resolve anything in `STATIC` mode.
+fn resolve_static_udp_dial_endpoints(
+    entry: &ServiceEntry,
+    port_spec: &crate::modes::mesh::config::ServicePort,
+    numeric_target_port: Option<u16>,
+) -> Vec<MeshEgressUdpDialEndpoint> {
+    let mut endpoints: Vec<MeshEgressUdpDialEndpoint> = Vec::new();
+    for endpoint in &entry.endpoints {
+        let address = endpoint.address.trim();
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "endpoints[].address",
+                address = %address,
+                port = port_spec.port,
+                "Skipping UDP egress ServiceEntry endpoint whose address is not an IP literal"
+            );
+            continue;
+        };
+        let port = match (numeric_target_port, port_spec.name.as_deref()) {
+            (Some(numeric), _) => numeric,
+            (None, Some(name)) => endpoint.ports.get(name).copied().unwrap_or(port_spec.port),
+            (None, None) => port_spec.port,
+        };
+        if port == 0 {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "endpoints[].ports",
+                address = %address,
+                port = port_spec.port,
+                "Skipping UDP egress ServiceEntry endpoint that resolves to dial port 0"
+            );
+            continue;
+        }
+        let host = ip.to_string();
+        if endpoints
+            .iter()
+            .any(|existing| existing.host == host && existing.port == port)
+        {
+            continue;
+        }
+        if endpoints.len() >= MAX_EGRESS_UDP_DIAL_ENDPOINTS {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "endpoints[]",
+                port = port_spec.port,
+                max_endpoints = MAX_EGRESS_UDP_DIAL_ENDPOINTS,
+                "Dropping UDP egress ServiceEntry endpoints beyond the per-destination cap"
+            );
+            break;
+        }
+        endpoints.push(MeshEgressUdpDialEndpoint { host, port });
+    }
+    endpoints
+}
+
+/// Insert one `(host, port)` admission with its precomputed dial endpoints,
+/// refusing a duplicate another ServiceEntry already claimed. Returns `true`
+/// when the admission was added.
 fn push_udp_egress_destination(
     entry: &ServiceEntry,
     host: &str,
     port: u16,
-    dial_port: u16,
+    dial_endpoints: Vec<MeshEgressUdpDialEndpoint>,
     materialized_udp_destinations: &mut std::collections::HashSet<(String, u16)>,
     destinations: &mut Vec<MeshEgressUdpDestination>,
 ) -> bool {
+    // An admission with nothing to dial would be an authority the relay accepts
+    // and then cannot serve; refuse it instead.
+    if dial_endpoints.is_empty() {
+        return false;
+    }
     // Authority hosts are compared ASCII-case-insensitively on the request path,
     // so normalize once here instead of per CONNECT.
     let host = host.to_ascii_lowercase();
@@ -9231,7 +9672,7 @@ fn push_udp_egress_destination(
     destinations.push(MeshEgressUdpDestination {
         host,
         port,
-        dial_port,
+        dial_endpoints,
         service_entry: entry.name.clone(),
         namespace: entry.namespace.clone(),
     });
@@ -15591,6 +16032,7 @@ pub mod startup_rollback_test_seams {
             egress_hbone_port: hbone::ISTIO_HBONE_PORT,
             egress_mtls_port: crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT,
             egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
+            egress_gateway: None,
             workload_spiffe_id: None,
             waypoint_name: None,
             xds_node_cluster: "ferrum".to_string(),
@@ -15754,6 +16196,91 @@ pub mod startup_rollback_test_seams {
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
+}
+
+/// Parse the SOURCE-side EgressGateway endpoint (issue #3263) from its two
+/// operator variables.
+///
+/// Fail-closed and field-specific:
+/// - both unset ⇒ `None` (source-side external UDP egress is simply off);
+/// - one set without the other ⇒ hard startup error naming the missing variable
+///   — an address without a pinned identity would dial an unverified peer, and
+///   an identity without an address has nothing to dial;
+/// - a malformed `host:port`, port `0`, empty host, or invalid SPIFFE id ⇒ hard
+///   startup error naming the offending variable.
+///
+/// The host is NOT required to be an IP literal: an EgressGateway is normally
+/// reached by its in-cluster Service FQDN. It is resolved at dial time by the
+/// mesh-mTLS pool, and the handshake still pins [`SpiffeId`] as the expected
+/// peer, so name resolution cannot substitute a different gateway identity.
+fn parse_egress_gateway_endpoint(
+    addr_raw: Option<&str>,
+    spiffe_raw: Option<&str>,
+) -> Result<Option<MeshEgressGatewayEndpoint>, String> {
+    let addr_raw = addr_raw.map(str::trim).filter(|value| !value.is_empty());
+    let spiffe_raw = spiffe_raw.map(str::trim).filter(|value| !value.is_empty());
+    let (addr_raw, spiffe_raw) = match (addr_raw, spiffe_raw) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID is required when \
+                 FERRUM_MESH_EGRESS_GATEWAY_ADDR is set: the egress gateway's SVID identity is \
+                 pinned as the expected mTLS peer, and dialing it unpinned would let any \
+                 reachable peer terminate external UDP egress"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR is required when \
+                 FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID is set: there is no default egress gateway \
+                 address and Ferrum never guesses one"
+                    .to_string(),
+            );
+        }
+        (Some(addr), Some(spiffe)) => (addr, spiffe),
+    };
+
+    // `host:port` where the host may be a name, an IPv4 literal, or a bracketed
+    // IPv6 literal. `rsplit_once(':')` is correct for the first two; the
+    // bracketed form is split on the closing bracket first.
+    let (host, port_raw) = if let Some(rest) = addr_raw.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return Err(format!(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR has an unterminated IPv6 literal (got \
+                 '{addr_raw}'); expected '[<ipv6>]:<port>'"
+            ));
+        };
+        let Some(port_raw) = tail.strip_prefix(':') else {
+            return Err(format!(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '[<ipv6>]:<port>' (got '{addr_raw}')"
+            ));
+        };
+        (host, port_raw)
+    } else {
+        let Some((host, port_raw)) = addr_raw.rsplit_once(':') else {
+            return Err(format!(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '<host>:<port>' (got '{addr_raw}'); the \
+                 port names the gateway's mesh mTLS listener (conventionally 15090)"
+            ));
+        };
+        (host, port_raw)
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(format!(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty host (got '{addr_raw}')"
+        ));
+    }
+    let port = parse_port("FERRUM_MESH_EGRESS_GATEWAY_ADDR", port_raw.trim())?;
+    let spiffe_id = spiffe_raw.parse::<crate::identity::SpiffeId>().map_err(|e| {
+        format!("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID must be a valid SPIFFE id: {e}")
+    })?;
+    Ok(Some(MeshEgressGatewayEndpoint {
+        host: host.to_ascii_lowercase(),
+        port,
+        spiffe_id,
+    }))
 }
 
 /// The NodeWaypoint **transparent inbound capture** listener address, resolved
@@ -16639,6 +17166,7 @@ mod tests {
             egress_hbone_port: hbone::ISTIO_HBONE_PORT,
             egress_mtls_port: crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT,
             egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
+            egress_gateway: None,
             workload_spiffe_id: None,
             waypoint_name: None,
             xds_node_cluster: "ferrum".to_string(),
@@ -16753,6 +17281,7 @@ mod tests {
             egress_hbone_port: hbone::ISTIO_HBONE_PORT,
             egress_mtls_port: crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT,
             egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
+            egress_gateway: None,
             workload_spiffe_id: None,
             waypoint_name: None,
             xds_node_cluster: "default".to_string(),
@@ -31142,7 +31671,12 @@ mod tests {
             vec![MeshEgressUdpDestination {
                 host: "dns.external.com".to_string(),
                 port: 53,
-                dial_port: 53,
+                // DNS resolution declares no dialable endpoint set, so the
+                // authority host itself is the single dial endpoint.
+                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                }],
                 service_entry: "dns".to_string(),
                 namespace: "default".to_string(),
             }]
@@ -31231,12 +31765,20 @@ mod tests {
                 name: "static-hostname-endpoint".to_string(),
                 namespace: "default".to_string(),
                 hosts: vec!["static.external.com".to_string()],
-                endpoints: vec![MeshEndpoint {
-                    address: "not-an-ip.example".to_string(),
-                    ports: HashMap::new(),
-                    labels: HashMap::new(),
-                    network: None,
-                }],
+                endpoints: vec![
+                    MeshEndpoint {
+                        address: "not-an-ip.example".to_string(),
+                        ports: HashMap::new(),
+                        labels: HashMap::new(),
+                        network: None,
+                    },
+                    MeshEndpoint {
+                        address: "198.51.100.9".to_string(),
+                        ports: HashMap::new(),
+                        labels: HashMap::new(),
+                        network: None,
+                    },
+                ],
                 resolution: Resolution::Static,
                 location: ServiceEntryLocation::MeshExternal,
                 ports: vec![ServicePort {
@@ -31274,19 +31816,160 @@ mod tests {
             false,
         );
 
-        // Only `static.external.com:161` survives: the port-0 entry, the
-        // wildcard/empty hosts, and the non-IP endpoint are all refused, and the
-        // duplicate `(static.external.com, 161)` claim cannot overwrite the
-        // first entry's dial port with 9999.
+        // Only `static.external.com:161` (plus its own endpoint IP) survives:
+        // the port-0 entry, the wildcard/empty hosts, and the non-IP endpoint
+        // are all refused, and the duplicate `(static.external.com, 161)` claim
+        // cannot overwrite the first entry's dial endpoint with `:9999`.
         assert_eq!(
             udp_destinations,
-            vec![MeshEgressUdpDestination {
-                host: "static.external.com".to_string(),
+            vec![
+                MeshEgressUdpDestination {
+                    host: "static.external.com".to_string(),
+                    port: 161,
+                    // The declared STATIC endpoint — never the authority host.
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 161,
+                    }],
+                    service_entry: "static-hostname-endpoint".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "198.51.100.9".to_string(),
+                    port: 161,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 161,
+                    }],
+                    service_entry: "static-hostname-endpoint".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_udp_static_service_entry_without_usable_endpoints_admits_nothing() {
+        // Issue #3263 gap: a STATIC ServiceEntry names its dial destinations
+        // explicitly. If none of them is usable there is nothing to relay to,
+        // and admitting the host anyway would make the gateway DNS-RESOLVE the
+        // authority — silently bypassing STATIC endpoint semantics. Fail closed.
+        let service_entries = vec![ServiceEntry {
+            name: "static-broken".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["broken.external.com".to_string()],
+            endpoints: vec![MeshEndpoint {
+                address: "not-an-ip.example".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
                 port: 161,
-                dial_port: 161,
-                service_entry: "static-hostname-endpoint".to_string(),
-                namespace: "default".to_string(),
-            }]
+                protocol: AppProtocol::Udp,
+                name: None,
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_, _, udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        assert!(
+            udp_destinations.is_empty(),
+            "a STATIC entry with no usable endpoint must admit nothing, got {udp_destinations:?}"
+        );
+    }
+
+    #[test]
+    fn egress_udp_static_service_entry_admits_every_declared_endpoint() {
+        // Multiple STATIC endpoints are precomputed as the host authority's dial
+        // set (bounded, selected by a modulo cursor at CONNECT time), while each
+        // endpoint IP is admitted as an authority whose dial set is EXACTLY that
+        // one endpoint — direct endpoint-IP admission is always derived from the
+        // endpoint it names, never from its siblings.
+        let service_entries = vec![ServiceEntry {
+            name: "ntp".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["ntp.external.com".to_string()],
+            endpoints: vec![
+                MeshEndpoint {
+                    address: "203.0.113.10".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+                MeshEndpoint {
+                    address: "203.0.113.11".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+            ],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 123,
+                protocol: AppProtocol::Udp,
+                name: None,
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_, _, udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        let both = vec![
+            MeshEgressUdpDialEndpoint {
+                host: "203.0.113.10".to_string(),
+                port: 123,
+            },
+            MeshEgressUdpDialEndpoint {
+                host: "203.0.113.11".to_string(),
+                port: 123,
+            },
+        ];
+        assert_eq!(
+            udp_destinations,
+            vec![
+                MeshEgressUdpDestination {
+                    host: "ntp.external.com".to_string(),
+                    port: 123,
+                    dial_endpoints: both.clone(),
+                    service_entry: "ntp".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "203.0.113.10".to_string(),
+                    port: 123,
+                    dial_endpoints: vec![both[0].clone()],
+                    service_entry: "ntp".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "203.0.113.11".to_string(),
+                    port: 123,
+                    dial_endpoints: vec![both[1].clone()],
+                    service_entry: "ntp".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ]
         );
     }
 
@@ -31331,14 +32014,20 @@ mod tests {
                 MeshEgressUdpDestination {
                     host: "syslog.external.com".to_string(),
                     port: 514,
-                    dial_port: 1514,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "203.0.113.7".to_string(),
+                        port: 1514,
+                    }],
                     service_entry: "syslog".to_string(),
                     namespace: "default".to_string(),
                 },
                 MeshEgressUdpDestination {
                     host: "203.0.113.7".to_string(),
                     port: 514,
-                    dial_port: 1514,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "203.0.113.7".to_string(),
+                        port: 1514,
+                    }],
                     service_entry: "syslog".to_string(),
                     namespace: "default".to_string(),
                 },
@@ -31402,7 +32091,10 @@ mod tests {
             vec![MeshEgressUdpDestination {
                 host: "dns.external.com".to_string(),
                 port: 53,
-                dial_port: 53,
+                dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                }],
                 service_entry: "dns".to_string(),
                 namespace: "default".to_string(),
             }]

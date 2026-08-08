@@ -40,7 +40,7 @@ Current mesh HBONE/DNS perf status lives in
 | Native SMTP/email notification channel | Implemented — [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) (`src/notifications/channels/email.rs`) |
 | MongoDB replica-set change-stream wakeups | Implemented — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs` + `mongo_store.rs`) |
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
-| EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator; no UDP/DTLS listener, by design) |
+| EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
 
 ## Live dedicated trackers (current backlog)
 

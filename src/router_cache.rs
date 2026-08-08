@@ -2367,6 +2367,50 @@ impl RouterCache {
                     }
                 }
             }
+
+            // ── SOURCE-side EXTERNAL UDP egress (issue #3263) ───────────────
+            // Forward-derived from `external_udp_egress_routes`, which the mesh
+            // materializer builds only for `MESH_EXTERNAL` `ServiceEntry` UDP
+            // ports with STATIC endpoints AND a configured, identity-pinned
+            // EgressGateway. Folded into the SAME `(dest ip, port)` index the
+            // in-mesh datapath uses, so `mesh_udp_capture` needs no external
+            // special case; in-mesh VIP pairs are inserted FIRST and win, so an
+            // external entry can never shadow an in-mesh service VIP. A route
+            // whose upstream did not materialize resolves `CloseNotRoutable`
+            // (drop), never a guess.
+            for route in &mesh.external_udp_egress_routes {
+                let Ok(ip) = route.dest_ip.parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                if route.port == 0 {
+                    continue;
+                }
+                let upstream = mesh_upstreams
+                    .get(route.namespace.as_str())
+                    .and_then(|by_id| by_id.get(route.upstream_id.as_str()))
+                    .copied();
+                let decision = if let Some(upstream) = upstream {
+                    let mut relay_proxy = crate::modes::mesh::mesh_external_udp_relay_proxy(
+                        &route.namespace,
+                        &route.service_entry,
+                        route.port,
+                        &route.dest_ip,
+                        &route.upstream_id,
+                    );
+                    relay_proxy.dispatch_port_overrides =
+                        dispatch_port_overrides_for_upstream(upstream);
+                    MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                        upstream_id: route.upstream_id.clone(),
+                        relay_proxy: Arc::new(relay_proxy),
+                        service_fqdn: route.service_fqdn.clone(),
+                    }))
+                } else {
+                    MeshTcpEgressDecision::CloseNotRoutable
+                };
+                mesh_udp_egress
+                    .entry((ip.to_canonical(), route.port))
+                    .or_insert(decision);
+            }
         }
 
         for proxy in &config.proxies {
@@ -5846,6 +5890,79 @@ mod tests {
         let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_udp_egress_table_routes_external_service_entry_endpoints() {
+        // Issue #3263 source side: an external ServiceEntry endpoint route folds
+        // into the SAME (dest ip, port) index the in-mesh datapath uses, so a
+        // captured datagram to the endpoint the DNS proxy answered with relays
+        // through the EgressGateway upstream. A route whose upstream did not
+        // materialize is CloseNotRoutable (drop), never a guess, and an in-mesh
+        // VIP claim on the same pair always wins.
+        use crate::modes::mesh::config::{MeshConfig, MeshExternalUdpEgressRoute};
+        let route = MeshExternalUdpEgressRoute {
+            namespace: "default".to_string(),
+            service_entry: "syslog".to_string(),
+            port: 514,
+            dest_ip: "203.0.113.7".to_string(),
+            upstream_id: "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7".to_string(),
+            service_fqdn: "syslog.external.com".to_string(),
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7",
+            "namespace": "default",
+            "name": "syslog.external.com",
+            "targets": [{"host": "egress.istio-system.svc.cluster.local", "port": 514}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                external_udp_egress_routes: vec![route.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        match table.mesh_udp_egress_decision("203.0.113.7:514".parse().expect("addr")) {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(
+                    entry.upstream_id,
+                    "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7"
+                );
+                assert_eq!(entry.service_fqdn, "syslog.external.com");
+                assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Udp));
+            }
+            _ => panic!("expected Relay for an admitted external endpoint"),
+        }
+        // Neighbouring port / address are not external destinations.
+        assert!(
+            table
+                .mesh_udp_egress_decision("203.0.113.7:515".parse().expect("addr"))
+                .is_none()
+        );
+        assert!(
+            table
+                .mesh_udp_egress_decision("203.0.113.8:514".parse().expect("addr"))
+                .is_none()
+        );
+
+        // Route present, upstream withdrawn ⇒ fail closed (drop), never dial.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                external_udp_egress_routes: vec![route],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        assert!(matches!(
+            table.mesh_udp_egress_decision("203.0.113.7:514".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
     }
