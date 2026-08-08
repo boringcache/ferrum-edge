@@ -399,8 +399,14 @@ fn ancillary_storage_is_aligned_and_sized_for_cmsghdr() {
     let space = unsafe { libc::CMSG_SPACE(1) } as usize;
     // SAFETY: same.
     let len = unsafe { libc::CMSG_LEN(1) } as usize;
-    assert!(space >= len, "CMSG_SPACE(1)={space} must cover CMSG_LEN(1)={len}");
-    assert!(space <= capacity, "CMSG_SPACE(1)={space} must fit {capacity}");
+    assert!(
+        space >= len,
+        "CMSG_SPACE(1)={space} must cover CMSG_LEN(1)={len}"
+    );
+    assert!(
+        space <= capacity,
+        "CMSG_SPACE(1)={space} must fit {capacity}"
+    );
 
     let mut buf = AlignedCmsgBuf::zeroed();
     let ptr = buf.as_mut_ptr() as usize;
@@ -417,7 +423,11 @@ fn constructed_control_message_is_cmsghdr_aligned() {
     let control = control_for(TLS_RECORD_TYPE_ALERT);
     let addr = control.as_bytes().as_ptr() as usize;
     // The bytes handed to `sendmsg` must still satisfy the CMSG_* contract.
-    assert_eq!(addr % std::mem::align_of::<libc::cmsghdr>(), 0, "stays aligned");
+    assert_eq!(
+        addr % std::mem::align_of::<libc::cmsghdr>(),
+        0,
+        "stays aligned"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -555,10 +555,11 @@ application byte and **before** the raw `shutdown(SHUT_WR)`. Without it a
 conformant TLS client sees a truncated session rather than a clean close. Only
 a `sendmsg(2)` that reports **exactly** the two alert bytes counts as an
 emitted `close_notify`; a zero-length, short, or oversized result is an
-explicit error and is logged as "no complete close_notify was emitted" rather
+explicit error and becomes an attributed backend-to-client write failure rather
 than being accepted as a completed shutdown. The send is non-blocking and
-bounded (250 ms): a peer that stopped reading cannot wedge teardown, and the
-raw half-close still follows even when the alert could not be delivered.
+bounded (250 ms): a peer that stopped reading cannot wedge teardown. The raw
+half-close still follows even when the alert could not be delivered, while the
+transaction remains observably failed instead of reporting a clean TLS close.
 Half-close semantics are
 preserved in both directions — receiving the client's `close_notify` half-closes
 only the client→backend direction, so the backend's remaining response bytes

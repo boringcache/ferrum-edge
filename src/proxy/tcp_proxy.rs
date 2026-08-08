@@ -8339,7 +8339,7 @@ async fn splice_one_direction_no_guard(
                     .await
                     {
                         KtlsSpliceEinval::CleanEof => {
-                            half_close_relay_write_side(dst, dst_is_ktls).await;
+                            half_close_relay_write_side(dst, dst_is_ktls).await?;
                             return Ok(());
                         }
                         KtlsSpliceEinval::Resume => continue,
@@ -8394,7 +8394,7 @@ async fn splice_one_direction_no_guard(
                     // See the synchronous libc fallback above: a clean
                     // terminal write-side condition should still propagate
                     // the relay half-close before this direction exits Ok.
-                    half_close_relay_write_side(dst, dst_is_ktls).await;
+                    half_close_relay_write_side(dst, dst_is_ktls).await?;
                     return Ok(());
                 }
             }
@@ -8410,7 +8410,7 @@ async fn splice_one_direction_no_guard(
             if src_is_ktls {
                 return Err(ktls_truncation_failure());
             }
-            half_close_relay_write_side(dst, dst_is_ktls).await;
+            half_close_relay_write_side(dst, dst_is_ktls).await?;
             return Ok(());
         }
     }
@@ -8463,27 +8463,34 @@ const KTLS_CLOSE_NOTIFY_SEND_GRACE: Duration = Duration::from_millis(250);
 /// close_notify owed after the client's own close_notify, which is emitted
 /// only once the remaining backend→client response bytes have drained.
 #[cfg(target_os = "linux")]
-async fn half_close_relay_write_side(dst: &TcpStream, dst_is_ktls: bool) {
+async fn half_close_relay_write_side(
+    dst: &TcpStream,
+    dst_is_ktls: bool,
+) -> Result<(), (StreamIoSide, anyhow::Error)> {
     use std::os::unix::io::AsRawFd;
 
-    if dst_is_ktls && !send_ktls_close_notify_bounded(dst).await {
-        // The raw half-close still follows: the peer must not be left holding
-        // an open socket because a courtesy alert could not be delivered. What
-        // it must NOT be is silent — an un-emitted close_notify is exactly what
-        // a client reads as a truncated session.
-        debug!("kTLS: no complete close_notify was emitted before half-closing the write side");
-    }
+    let close_notify_failed = dst_is_ktls && !send_ktls_close_notify_bounded(dst).await;
+    // Always release the raw write side even when the bounded TLS alert could
+    // not be emitted; the peer must not be left holding an open connection.
     shutdown_write_fd(dst.as_raw_fd());
+    if close_notify_failed {
+        return Err((
+            StreamIoSide::Write,
+            anyhow::anyhow!(
+                "kTLS transmit side: no complete close_notify was emitted before half-close"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Emit one complete `close_notify` through kTLS TX without blocking the
 /// runtime. Returns whether the full two-byte alert record was emitted.
 ///
-/// Bounded and best effort by design: a peer that has already reset or stopped
-/// reading must not wedge connection teardown. `send_close_notify` accepts only
-/// a full two-byte emission, so a short or zero-length `sendmsg` surfaces here
-/// as an error and is reported as "not emitted" rather than counted as a
-/// delivered shutdown.
+/// Bounded by design: a peer that has already reset or stopped reading must not
+/// wedge connection teardown. `send_close_notify` accepts only a full two-byte
+/// emission, so a short or zero-length `sendmsg` surfaces to the caller as an
+/// attributed write failure rather than a successful-looking relay shutdown.
 #[cfg(target_os = "linux")]
 async fn send_ktls_close_notify_bounded(dst: &TcpStream) -> bool {
     use std::os::unix::io::AsRawFd;

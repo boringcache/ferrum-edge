@@ -510,9 +510,10 @@ mod linux {
     /// more than the two bytes offered, so an oversized result means the
     /// ancillary contract was not honoured as understood.
     pub fn send_close_notify(fd: RawFd) -> io::Result<usize> {
-        let mut control = TlsRecordTypeControl::new(super::TLS_RECORD_TYPE_ALERT).ok_or_else(|| {
-            io::Error::other("kTLS: cannot build the close_notify record-type control message")
-        })?;
+        let mut control =
+            TlsRecordTypeControl::new(super::TLS_RECORD_TYPE_ALERT).ok_or_else(|| {
+                io::Error::other("kTLS: cannot build the close_notify record-type control message")
+            })?;
         let mut body = super::CLOSE_NOTIFY_ALERT_BODY;
         let mut iov = libc::iovec {
             iov_base: body.as_mut_ptr().cast::<libc::c_void>(),

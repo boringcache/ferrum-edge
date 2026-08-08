@@ -257,7 +257,11 @@ async fn ktls_live_relays_plaintext_and_completes_the_tls_close_handshake() {
         let accepted = accept_ktls(&frontend, &server_config).await;
         // SNI comes from the same peeked ClientHello that proved eligibility.
         let sni = accepted.sni_hostname.as_deref();
-        assert_eq!(sni, Some(LIVE_SNI), "the accept must surface the peeked SNI");
+        assert_eq!(
+            sni,
+            Some(LIVE_SNI),
+            "the accept must surface the peeked SNI"
+        );
         let backend = TcpStream::connect(backend_addr)
             .await
             .expect("relay dials the backend");
@@ -328,7 +332,10 @@ async fn ktls_live_bare_fin_is_attributed_as_a_tls_truncation() {
         assert_eq!(direction, Direction::ClientToBackend);
         assert_eq!(side, Some(StreamIoSide::Read));
         let named = message.contains("close_notify") && message.contains("truncation");
-        assert!(named, "the failure must name the missing close_notify: {message}");
+        assert!(
+            named,
+            "the failure must name the missing close_notify: {message}"
+        );
         assert_eq!(result.bytes_client_to_backend, 0, "no bytes were ever sent");
 
         client.await.expect("client task");
@@ -391,7 +398,10 @@ async fn ktls_live_unauthenticated_record_never_becomes_a_clean_eof() {
         assert_eq!(direction, Direction::ClientToBackend);
         assert_eq!(side, Some(StreamIoSide::Read));
         assert!(!message.is_empty(), "the failure must carry its cause");
-        assert_eq!(result.bytes_client_to_backend, 0, "no forged byte reaches it");
+        assert_eq!(
+            result.bytes_client_to_backend, 0,
+            "no forged byte reaches it"
+        );
 
         client.await.expect("client task");
         backend_app.await.expect("backend task");
