@@ -9271,7 +9271,8 @@ fn materialize_egress_gateway_proxies(
 ///
 /// UDP ServiceEntry ports (`AppProtocol::Udp`) materialize NO listener and no
 /// upstream: datagram-over-mesh egress rides the gateway's existing
-/// authenticated mesh CONNECT terminator (SVID-mTLS `:15006` / HBONE `:15008`)
+/// authenticated mesh CONNECT terminator (`:15090` by default for both source
+/// topologies)
 /// and the shared datagram codec, so there is no plaintext UDP listener to bind,
 /// no port-only TCP/UDP dedup collision with a sibling TCP port on the same
 /// number (DNS `53/TCP` + `53/UDP` coexist), and no DTLS material to seed. What
