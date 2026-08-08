@@ -712,8 +712,7 @@ async fn a_socket_path_under_an_untrusted_ancestor_is_refused_before_bind() {
         trust_domain(),
         600,
     );
-    let config =
-        WorkloadApiSocketConfig::from_parts(socket.clone(), "0660").expect("mode parses");
+    let config = WorkloadApiSocketConfig::from_parts(socket.clone(), "0660").expect("mode parses");
     let refused = serve_workload_api(service, config)
         .await
         .expect_err("a world-writable ancestor must be refused before bind");

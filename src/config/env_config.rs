@@ -6120,14 +6120,12 @@ impl EnvConfig {
     }
 
     /// Enabling the Workload API surface with no CA backend at all.
-    const WORKLOAD_API_REQUIRES_CA_BACKEND: &str =
-        "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
+    const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
          API has an authority to mint SVIDs from";
 
     /// Enabling the Workload API surface on the SPIRE backend, which can only
     /// ever issue Ferrum's own identity (issue #3617).
-    const WORKLOAD_API_SPIRE_UNSUPPORTED: &str =
-        "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
+    const WORKLOAD_API_SPIRE_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
          FERRUM_MESH_CA_BACKEND=spire. A SPIRE agent issues only the calling process's own \
          identity, so Ferrum cannot mint an X.509-SVID or a JWT-SVID for an attested downstream \
          workload through it — serving the surface would either fail every request or substitute \
@@ -6139,8 +6137,7 @@ impl EnvConfig {
 
     /// Configured JWT signing material rotates externally, so an in-process
     /// cadence alongside it is refused rather than silently normalized away.
-    const JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED: &str =
-        "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 when FERRUM_MESH_JWT_SIGNING_KEY_PEM is \
+    const JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED: &str = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 when FERRUM_MESH_JWT_SIGNING_KEY_PEM is \
          configured. Configured JWT signing material is rotated EXTERNALLY: set the new key in \
          FERRUM_MESH_JWT_SIGNING_KEY_PEM and the outgoing one in \
          FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM, roll the fleet, then drop the previous key \

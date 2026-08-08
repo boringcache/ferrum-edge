@@ -1663,14 +1663,63 @@ mod socket_boundary {
             // A directory's OWNER may modify its entries whatever the mode says,
             // so ownership is checked independently of permissions. This is the
             // directory-owner exception the sticky bit does not constrain.
-            ("other-owned 0755", false, true, OTHER_UID, 0o755, UntrustedOwner),
-            ("other-owned 0700", false, true, OTHER_UID, 0o700, UntrustedOwner),
-            ("other-owned sticky", false, true, OTHER_UID, 0o1777, UntrustedOwner),
+            (
+                "other-owned 0755",
+                false,
+                true,
+                OTHER_UID,
+                0o755,
+                UntrustedOwner,
+            ),
+            (
+                "other-owned 0700",
+                false,
+                true,
+                OTHER_UID,
+                0o700,
+                UntrustedOwner,
+            ),
+            (
+                "other-owned sticky",
+                false,
+                true,
+                OTHER_UID,
+                0o1777,
+                UntrustedOwner,
+            ),
             // Group-writable is an untrusted actor exactly as world-writable is.
-            ("group-writable 0775", false, true, EUID, 0o775, UntrustedlyWritable),
-            ("group-writable 0770", false, true, ROOT, 0o770, UntrustedlyWritable),
-            ("world-writable 0777", false, true, ROOT, 0o777, UntrustedlyWritable),
-            ("world-writable 0707", false, true, EUID, 0o707, UntrustedlyWritable),
+            (
+                "group-writable 0775",
+                false,
+                true,
+                EUID,
+                0o775,
+                UntrustedlyWritable,
+            ),
+            (
+                "group-writable 0770",
+                false,
+                true,
+                ROOT,
+                0o770,
+                UntrustedlyWritable,
+            ),
+            (
+                "world-writable 0777",
+                false,
+                true,
+                ROOT,
+                0o777,
+                UntrustedlyWritable,
+            ),
+            (
+                "world-writable 0707",
+                false,
+                true,
+                EUID,
+                0o707,
+                UntrustedlyWritable,
+            ),
         ];
 
         for (label, is_symlink, is_dir, uid, mode, expected) in cases {

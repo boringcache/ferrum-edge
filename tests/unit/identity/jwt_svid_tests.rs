@@ -1629,7 +1629,11 @@ async fn a_token_at_the_maximum_lifetime_survives_a_restart() {
     let pem = signing_key_pem();
     let before_restart = authority_with_key(&pem);
     let minted = before_restart
-        .mint(&workload_id(), &["aud-a".to_string()], MAX_JWT_SVID_TTL_SECS)
+        .mint(
+            &workload_id(),
+            &["aud-a".to_string()],
+            MAX_JWT_SVID_TTL_SECS,
+        )
         .expect("mint succeeds");
     let lifetime = (minted.expires_at - minted.issued_at).num_seconds();
     assert_eq!(lifetime, MAX_JWT_SVID_TTL_SECS as i64);
@@ -1987,11 +1991,7 @@ fn ec_jwks_with(extra_members: &str) -> String {
     let key = forge_key();
     let recovered = ferrum_edge::identity::jwt_svid::authorities_from_jwks(
         &td(),
-        format!(
-            "{{\"keys\":[{}]}}",
-            jwk_of(&key.public_key_pem, "k1", "")
-        )
-        .as_bytes(),
+        format!("{{\"keys\":[{}]}}", jwk_of(&key.public_key_pem, "k1", "")).as_bytes(),
     );
     assert!(
         recovered.is_ok(),
