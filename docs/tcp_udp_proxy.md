@@ -482,8 +482,11 @@ of the following decline with the socket byte-for-byte intact and the ordinary
 buffered tokio-rustls accept takes over: secret extraction not enabled on the
 listener, no kernel cipher probe passed, no complete ClientHello observable
 before `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, a TLS 1.3 offer, an
-offer set containing any suite this kernel cannot install, or a `TCP_ULP`
-install failure. `TCP_ULP` is installed *before* the handshake precisely so its
+offer set containing any suite this kernel cannot install, a `server_name`
+extension whose hostname this path cannot reproduce as faithfully as
+`ServerConnection::server_name()` would (see "Observability and semantics"),
+or a `TCP_ULP` install failure.
+`TCP_ULP` is installed *before* the handshake precisely so its
 failure is still recoverable; with no keys installed the ULP is the kernel's
 transparent `TLS_BASE` variant, so the userspace relay on the decline path is
 unaffected.
@@ -515,9 +518,19 @@ SNI, `on_stream_connect` plugin ordering, `tcp_idle_timeout_seconds`,
 `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`,
 `backend_write_timeout_ms`, byte accounting, and first-failure direction
 attribution are identical on both paths — the kTLS socket carries plaintext to
-userspace, so it feeds the same splice loops as a plain-to-plain relay. SNI on
-the kTLS path is parsed from the peeked ClientHello rather than read back from
-a `ServerConnection`.
+userspace, so it feeds the same splice loops as a plain-to-plain relay.
+
+SNI is the one value with no shared source: the buffered path reads
+`ServerConnection::server_name()`, while `UnbufferedServerConnection` exposes no
+equivalent accessor, so the kTLS path re-parses the peeked ClientHello. Ferrum's
+SNI validator is deliberately stricter than the `DnsName` rules rustls applies
+to a received SNI — it refuses underscore labels and a trailing root dot, both
+of which rustls accepts — so a ClientHello whose `server_name` extension is
+present but not representable here would report no SNI where the buffered path
+reports a hostname. Rather than let the two paths disagree, those connections
+**decline the handoff** (before the socket is touched) and take the buffered
+accept, which reports rustls's own value. Every handed-off connection therefore
+observes the same SNI the userspace relay would have.
 
 ### TLS close handshake on a spliced connection
 

@@ -329,9 +329,32 @@ pub struct ClientHelloKtlsFacts {
     pub offers_aes256_gcm: bool,
     /// At least one TLS 1.2 ChaCha20-Poly1305 suite rustls can select was offered.
     pub offers_chacha20_poly1305: bool,
+    /// A `server_name` extension (RFC 6066, type 0x0000) was present, so the
+    /// buffered accept would have had a hostname to report.
+    pub offers_server_name: bool,
 }
 
 impl ClientHelloKtlsFacts {
+    /// Whether the SNI derived from this peeked ClientHello can stand in for
+    /// the value the buffered accept would have reported.
+    ///
+    /// The kTLS branch has no `ServerConnection::server_name()` to read back —
+    /// `UnbufferedServerConnection` exposes no equivalent accessor — so it
+    /// re-parses the hello with [`extract_sni_from_client_hello`]. That
+    /// validator is deliberately stricter than the `DnsName` rules rustls
+    /// applies to a received SNI: it refuses underscore labels and a trailing
+    /// root dot, both of which rustls accepts and would surface from
+    /// `server_name()`. A present `server_name` extension that yields no
+    /// hostname here would therefore make a handed-off connection report `None`
+    /// where the buffered path reports a name, silently changing what stream
+    /// lifecycle plugins and transaction summaries observe. Declining the
+    /// handoff for those hellos keeps the two paths observationally identical;
+    /// the socket is still pristine, so the buffered accept surfaces rustls's
+    /// own value.
+    pub fn sni_is_representable(&self, parsed_sni: Option<&str>) -> bool {
+        !self.offers_server_name || parsed_sni.is_some()
+    }
+
     /// Whether rustls could select a suite whose finite confidentiality limit
     /// requires a kernel-pinned receive window before the handshake begins.
     ///
@@ -507,17 +530,29 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
         return None;
     }
 
-    facts.offers_tls13 = extensions_offer_tls13(&body[pos..extensions_end])?;
+    let scanned = scan_client_hello_extensions(&body[pos..extensions_end])?;
+    facts.offers_tls13 = scanned.offers_tls13;
+    facts.offers_server_name = scanned.offers_server_name;
     Some(facts)
 }
 
-/// Walk the extension list for `supported_versions` (0x002b) and report
-/// whether TLS 1.3 (0x0304) is among the offered versions.
+/// What the ClientHello extension block tells the pre-handshake kTLS gate.
+#[derive(Debug, Clone, Copy, Default)]
+struct ScannedExtensions {
+    /// TLS 1.3 (0x0304) appeared in `supported_versions` (0x002b).
+    offers_tls13: bool,
+    /// A `server_name` extension (0x0000) was present.
+    offers_server_name: bool,
+}
+
+/// Walk the extension list for `supported_versions` (0x002b) and `server_name`
+/// (0x0000), reporting whether TLS 1.3 was offered and whether the hello
+/// carried an SNI extension at all.
 ///
 /// Returns `None` on a malformed extension list: callers must treat that as
 /// "cannot prove this is TLS 1.2", never as "this is TLS 1.2".
-fn extensions_offer_tls13(mut ext: &[u8]) -> Option<bool> {
-    let mut offered_tls13 = false;
+fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
+    let mut scanned = ScannedExtensions::default();
     let mut saw_supported_versions = false;
 
     while !ext.is_empty() {
@@ -529,6 +564,11 @@ fn extensions_offer_tls13(mut ext: &[u8]) -> Option<bool> {
         let extension_end = 4usize.checked_add(ext_len)?;
         if ext.len() < extension_end {
             return None;
+        }
+        if ext_type == 0x0000 {
+            // Presence only. Whether the name is representable is decided by
+            // `extract_sni_from_client_hello` over the same bytes.
+            scanned.offers_server_name = true;
         }
         if ext_type == 0x002b {
             if saw_supported_versions {
@@ -548,14 +588,14 @@ fn extensions_offer_tls13(mut ext: &[u8]) -> Option<bool> {
             let mut i = 1usize;
             while i < data.len() {
                 if u16::from_be_bytes([data[i], data[i + 1]]) == 0x0304 {
-                    offered_tls13 = true;
+                    scanned.offers_tls13 = true;
                 }
                 i += 2;
             }
         }
         ext = &ext[extension_end..];
     }
-    Some(offered_tls13)
+    Some(scanned)
 }
 
 /// Concatenate the handshake-layer payloads of consecutive TLS handshake records

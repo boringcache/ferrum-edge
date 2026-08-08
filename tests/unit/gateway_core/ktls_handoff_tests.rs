@@ -281,6 +281,77 @@ fn malformed_client_hello_vector_boundaries_are_refused() {
     assert!(client_hello_ktls_facts(&duplicate_supported_versions).is_none());
 }
 
+/// Build a `server_name` extension (RFC 6066) carrying one `host_name` entry.
+///
+/// Hand-built rather than taken from a rustls client because rustls trims a
+/// trailing root dot before it encodes SNI, so its client can never produce one
+/// of the two hostname shapes this gate exists for.
+fn server_name_extension(hostname: &str) -> Vec<u8> {
+    let name = hostname.as_bytes();
+    let mut entry = vec![0x00]; // host_name
+    entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    entry.extend_from_slice(name);
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+    data.extend_from_slice(&entry);
+
+    let mut ext = vec![0x00, 0x00];
+    ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&data);
+    ext
+}
+
+fn hello_with_sni(hostname: &str) -> Vec<u8> {
+    let ext = server_name_extension(hostname);
+    minimal_client_hello(&[0xC0, 0x2F], &ext, ext.len(), &[])
+}
+
+#[test]
+fn an_sni_the_peeked_parse_cannot_represent_declines_the_handoff() {
+    // rustls validates a received SNI with `DnsName`, which accepts underscore
+    // labels and a trailing root dot; Ferrum's SNI validator deliberately
+    // refuses both. The buffered accept would report those hostnames from
+    // `ServerConnection::server_name()`, so a handoff that quietly reported no
+    // SNI would change what stream lifecycle plugins and transaction summaries
+    // observe. Such hellos must decline instead of being handed off.
+    for hostname in ["ktls_underscore.example.com", "ktls.example.com."] {
+        let hello = hello_with_sni(hostname);
+        let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
+        let parsed = ferrum_edge::proxy::sni::extract_sni_from_client_hello(&hello);
+
+        assert!(
+            facts.offers_server_name,
+            "{hostname:?} must be seen as a present server_name extension"
+        );
+        assert!(
+            parsed.is_none(),
+            "sanity: Ferrum's SNI validator refuses {hostname:?}"
+        );
+        assert!(
+            !facts.sni_is_representable(parsed.as_deref()),
+            "{hostname:?} must decline the kTLS handoff rather than relay with no SNI"
+        );
+    }
+}
+
+#[test]
+fn a_representable_or_absent_sni_keeps_the_handoff_eligible() {
+    let hello = hello_with_sni("ktls.example.com");
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
+    let parsed = ferrum_edge::proxy::sni::extract_sni_from_client_hello(&hello);
+    assert!(facts.offers_server_name);
+    assert_eq!(parsed.as_deref(), Some("ktls.example.com"));
+    assert!(facts.sni_is_representable(parsed.as_deref()));
+
+    // No extensions at all means no server_name, so the buffered path would
+    // have reported `None` too and there is nothing to diverge on.
+    let bare = minimal_client_hello(&[0xC0, 0x2F], &[], 0, &[]);
+    let facts = client_hello_ktls_facts(&bare).expect("compact ClientHello parses");
+    assert!(!facts.offers_server_name);
+    assert!(facts.sni_is_representable(None));
+}
+
 #[test]
 fn sni_used_for_the_ktls_relay_identity_comes_from_the_same_hello() {
     // The kTLS branch has no `ServerConnection::server_name()` to read, so it

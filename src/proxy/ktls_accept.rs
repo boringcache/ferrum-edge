@@ -40,7 +40,9 @@
 //! [`try_ktls_accept`] is allowed to touch the socket destructively only after
 //! every recoverable refusal has been made. Everything that can decline —
 //! kernel/cipher probes, secret-extraction opt-in, ClientHello facts (TLS 1.3
-//! offered, no kernel-supported AEAD suite), receive-window pin/readback, and
+//! offered, no kernel-supported AEAD suite), an SNI this path cannot reproduce
+//! as faithfully as `ServerConnection::server_name()` would,
+//! receive-window pin/readback, and
 //! `TCP_ULP` install — happens before any TLS byte is consumed (the ClientHello
 //! is only `MSG_PEEK`ed) and returns [`KtlsAcceptOutcome::Declined`] with a
 //! stream the ordinary buffered tokio-rustls accept can continue using.
@@ -234,6 +236,26 @@ pub(crate) async fn try_ktls_accept(
         return KtlsAcceptOutcome::Declined(stream);
     }
 
+    // Peer identity parity with the buffered accept. That path reports
+    // `ServerConnection::server_name()`, the hostname rustls itself validated;
+    // `UnbufferedServerConnection` exposes no equivalent accessor, so this path
+    // re-parses the peeked hello. Ferrum's SNI validator is deliberately
+    // stricter than rustls's `DnsName` rules (underscore labels and a trailing
+    // root dot are refused here and accepted there), so a hello whose
+    // `server_name` extension is present but unrepresentable would hand the
+    // relay a `None` where the buffered accept reports a hostname — silently
+    // changing what stream lifecycle plugins and transaction summaries see.
+    // Decline while the socket is still pristine instead.
+    let sni_hostname = crate::proxy::sni::extract_sni_from_client_hello(&hello);
+    if !facts.sni_is_representable(sni_hostname.as_deref()) {
+        debug!(
+            peer = %peer.ip(),
+            "kTLS: ClientHello SNI is not representable from the peeked hello, retaining the \
+             userspace rustls relay so the connection reports rustls's own server name"
+        );
+        return KtlsAcceptOutcome::Declined(stream);
+    }
+
     // AES-GCM's finite confidentiality limit is only enforceable against a
     // receive window the kernel will not silently enlarge. Pin and read that
     // window while the peeked ClientHello is still the only TLS input we have
@@ -255,8 +277,6 @@ pub(crate) async fn try_ktls_accept(
     } else {
         0
     };
-
-    let sni_hostname = crate::proxy::sni::extract_sni_from_client_hello(&hello);
 
     let mut conn = match UnbufferedServerConnection::new(config.clone()) {
         Ok(conn) => conn,
