@@ -14518,7 +14518,10 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     );
 
     let observed = peer.wait_for_rpc(Duration::from_secs(10)).await;
-    assert_eq!(observed.scheme, "https", "the Sidecar mTLS request is HTTPS");
+    assert_eq!(
+        observed.scheme, "https",
+        "the Sidecar mTLS request is HTTPS"
+    );
     assert!(
         observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
         "the peer must have verified THIS gateway's client SVID (authenticated \
