@@ -24,13 +24,46 @@ CA_HEALTH_RE = re.compile(
 TRUST_BUNDLE_RE = re.compile(
     r'^ferrum_mesh_trust_bundle_version\{(?P<labels>[^}]*)\}\s+(?P<value>-?\d+(?:\.\d+)?)\s*$'
 )
-LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+LABEL_RE = re.compile(
+    r'\s*([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\[\\"n]|[^"\\])*)"\s*'
+)
 
 
-def parse_labels(raw: str) -> dict[str, str]:
+def _unescape_label_value(raw: str) -> str:
+    value: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\":
+            value.append(char)
+            index += 1
+            continue
+
+        escaped = raw[index + 1]
+        value.append({"\\": "\\", '"': '"', "n": "\n"}[escaped])
+        index += 2
+    return "".join(value)
+
+
+def parse_labels(raw: str) -> dict[str, str] | None:
     labels: dict[str, str] = {}
-    for match in LABEL_RE.finditer(raw):
-        labels[match.group(1)] = match.group(2).encode("utf-8").decode("unicode_escape")
+    position = 0
+    while position < len(raw):
+        match = LABEL_RE.match(raw, position)
+        if match is None:
+            return None
+        name = match.group(1)
+        if name in labels:
+            return None
+        labels[name] = _unescape_label_value(match.group(2))
+        position = match.end()
+        if position == len(raw):
+            break
+        if raw[position] != ",":
+            return None
+        position += 1
+        if position == len(raw):
+            return None
     return labels
 
 
@@ -50,6 +83,8 @@ def prove_spire_agent_identity(
         if match is None:
             continue
         labels = parse_labels(match.group("labels"))
+        if labels is None:
+            continue
         if labels.get("spiffe_id") != expected_spiffe:
             continue
         if labels.get("source") != "spire_agent":
@@ -73,6 +108,8 @@ def prove_spire_agent_identity(
             if match is None:
                 continue
             labels = parse_labels(match.group("labels"))
+            if labels is None:
+                continue
             if (
                 labels.get("spiffe_id") == expected_spiffe
                 and labels.get("source") == "workload_api"
@@ -96,6 +133,8 @@ def prove_spire_agent_identity(
         if match is None:
             continue
         labels = parse_labels(match.group("labels"))
+        if labels is None:
+            continue
         if labels.get("ca_type") != "spire_agent":
             continue
         value = float(match.group("value"))
@@ -115,6 +154,8 @@ def prove_spire_agent_identity(
         if match is None:
             continue
         labels = parse_labels(match.group("labels"))
+        if labels is None:
+            continue
         if labels.get("trust_domain") != trust_domain:
             continue
         if labels.get("source") != "spire_agent":
@@ -257,6 +298,25 @@ ferrum_mesh_ca_health{ca_type="spire_agent"} 1
         ),
         ["trust_bundle_version"],
         "reject-missing-trust-bundle",
+    )
+
+    malformed_labels = """
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent",broken} 3569
+ferrum_mesh_ca_health{ca_type="spire_agent",ca_type="other"} 1
+ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agent",bad="\\t"} 1
+"""
+    _assert_errors(
+        prove_spire_agent_identity(
+            malformed_labels,
+            expected_spiffe=expected_spiffe,
+            trust_domain=trust_domain,
+        ),
+        [
+            "ferrum_mesh_cert_expiry_seconds",
+            'ca_type="spire_agent"',
+            "ferrum_mesh_trust_bundle_version",
+        ],
+        "reject-malformed-or-duplicate-labels",
     )
 
     print("spire_ambient_metrics.py --self-test: ok")
