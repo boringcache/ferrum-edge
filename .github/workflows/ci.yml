@@ -1068,6 +1068,7 @@ jobs:
               functional_file_mode_test
               functional_gateway_backend_tls_policy_test
               functional_host_only_routing_test
+              functional_port_aware_routes_test
               functional_migrate_mode_test
               functional_protocol_validation_test
               functional_regex_routing_test
