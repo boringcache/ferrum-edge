@@ -904,7 +904,7 @@ fn tls_secret_object_in(name: &str, namespace: &str) -> K8sObject {
     use base64::Engine as _;
     let cert = include_str!("../certs/server.crt");
     let key = include_str!("../certs/server.key");
-    let secret = object(
+    object(
         "v1",
         "Secret",
         name,
@@ -916,8 +916,7 @@ fn tls_secret_object_in(name: &str, namespace: &str) -> K8sObject {
                 "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
             }
         }),
-    );
-    secret
+    )
 }
 
 fn listener_status<'a>(update: &'a GatewayApiStatusUpdate, name: &str) -> &'a Value {
@@ -1101,7 +1100,7 @@ fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
         "refused same-port listeners must not become MeshServices: {names:?}"
     );
     assert!(
-        names.iter().any(|name| *name == "edge-healthy"),
+        names.contains(&"edge-healthy"),
         "healthy plaintext sibling on another port must remain exposed: {names:?}"
     );
     assert!(
@@ -1317,13 +1316,11 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         .map(|service| service.name.as_str())
         .collect();
     assert!(
-        names.iter().any(|name| *name == "edge-https"),
+        names.contains(&"edge-https"),
         "planned namespace TLS winner must remain exposed: {names:?}"
     );
     assert!(
-        !names
-            .iter()
-            .any(|name| *name == "reference-grant-edge-https"),
+        !names.contains(&"reference-grant-edge-https"),
         "non-winning same-namespace Gateway must not advertise a MeshService under the wrong serving slot: {names:?}"
     );
     assert_eq!(
@@ -1358,13 +1355,11 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         })
         .unwrap_or_default();
     assert!(
-        reversed_names.iter().any(|name| *name == "edge-https"),
+        reversed_names.contains(&"edge-https"),
         "order-independent winner exposure: {reversed_names:?}"
     );
     assert!(
-        !reversed_names
-            .iter()
-            .any(|name| *name == "reference-grant-edge-https"),
+        !reversed_names.contains(&"reference-grant-edge-https"),
         "order-independent non-winner refusal: {reversed_names:?}"
     );
 }
