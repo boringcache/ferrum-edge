@@ -30168,8 +30168,8 @@ mod tests {
             (overlong_host.as_str(), "overlong host"),
         ];
         for (addr, label) in cases {
-            let err = parse_egress_gateway_endpoint(Some(addr), Some(spiffe))
-                .expect_err(label);
+            let err =
+                parse_egress_gateway_endpoint(Some(addr), Some(spiffe)).expect_err(label);
             assert!(
                 err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"),
                 "{label}: diagnostic must name the field, got {err}"
@@ -30185,11 +30185,8 @@ mod tests {
             );
         }
 
-        let err = parse_egress_gateway_endpoint(
-            Some("egress.example.com:15090"),
-            None,
-        )
-        .expect_err("spiffe required");
+        let err = parse_egress_gateway_endpoint(Some("egress.example.com:15090"), None)
+            .expect_err("spiffe required");
         assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"));
         assert!(!err.contains("egress.example.com"));
 
