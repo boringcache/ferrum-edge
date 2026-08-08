@@ -332,6 +332,17 @@ pub struct ClientHelloKtlsFacts {
 }
 
 impl ClientHelloKtlsFacts {
+    /// Whether rustls could select a suite whose finite confidentiality limit
+    /// requires a kernel-pinned receive window before the handshake begins.
+    ///
+    /// ChaCha20-Poly1305 is unlimited in both pinned providers, while both
+    /// AES-GCM suites have a finite limit. This predicate is deliberately
+    /// conservative: if the ClientHello offers AES alongside ChaCha20, rustls
+    /// may still select AES, so the receive window must already be pinned.
+    pub fn requires_receive_window_pin(&self) -> bool {
+        self.offers_aes128_gcm || self.offers_aes256_gcm
+    }
+
     /// Whether a kTLS handoff may be attempted for this ClientHello, given the
     /// per-cipher kernel probe results.
     ///

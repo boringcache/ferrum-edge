@@ -121,6 +121,30 @@ fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
 }
 
 #[test]
+fn every_aes_offer_requires_the_receive_window_to_be_pinned_before_handshake() {
+    let aes128 = ClientHelloKtlsFacts {
+        offers_aes128_gcm: true,
+        ..ClientHelloKtlsFacts::default()
+    };
+    let aes256_and_chacha = ClientHelloKtlsFacts {
+        offers_aes256_gcm: true,
+        offers_chacha20_poly1305: true,
+        ..ClientHelloKtlsFacts::default()
+    };
+    let chacha_only = ClientHelloKtlsFacts {
+        offers_chacha20_poly1305: true,
+        ..ClientHelloKtlsFacts::default()
+    };
+
+    assert!(aes128.requires_receive_window_pin());
+    assert!(aes256_and_chacha.requires_receive_window_pin());
+    assert!(
+        !chacha_only.requires_receive_window_pin(),
+        "the unlimited suite must retain receive autotuning"
+    );
+}
+
+#[test]
 fn a_single_uninstallable_offered_suite_declines_the_whole_connection() {
     let hello = client_hello_for(&[&rustls::version::TLS12]);
     let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");

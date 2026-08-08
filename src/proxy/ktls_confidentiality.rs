@@ -102,7 +102,8 @@
 //! Ciphers whose limit is enforceable are additionally refused *before the
 //! handshake is consumed* when the kernel cannot expose the counter at all, and
 //! a receive window that cannot be pinned and read back refuses the handoff
-//! while the rustls session is still intact — see `proxy::ktls_accept`.
+//! before the handshake consumes any bytes, preserving the userspace rustls
+//! fallback — see `proxy::ktls_accept`.
 
 use crate::socket_opts::ktls::KtlsCipher;
 
@@ -611,9 +612,10 @@ mod linux {
     /// Freeze this socket's receive window and return the immutable ceiling the
     /// whole session's receive bound is built on.
     ///
-    /// Must be called while the rustls session is still intact, because failure
-    /// has to be a refusal rather than a relay that cannot be bounded. Both
-    /// steps are setup-time syscalls on a cold path; the relay itself pays
+    /// Must be called before the handshake consumes socket bytes, because
+    /// failure has to preserve the ordinary userspace rustls fallback rather
+    /// than drop a valid connection or start a relay that cannot be bounded.
+    /// Both steps are setup-time syscalls on a cold path; the relay itself pays
     /// nothing for them.
     ///
     /// The `FIONREAD` measurement is taken *after* the pin on purpose. Anything

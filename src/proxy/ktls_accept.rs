@@ -40,10 +40,10 @@
 //! [`try_ktls_accept`] is allowed to touch the socket destructively only after
 //! every recoverable refusal has been made. Everything that can decline —
 //! kernel/cipher probes, secret-extraction opt-in, ClientHello facts (TLS 1.3
-//! offered, no kernel-supported AEAD suite), `TCP_ULP` install — happens while
-//! the socket is still pristine (the ClientHello is only `MSG_PEEK`ed, never
-//! consumed) and returns [`KtlsAcceptOutcome::Declined`] with the untouched
-//! stream so the caller runs the ordinary buffered tokio-rustls accept.
+//! offered, no kernel-supported AEAD suite), receive-window pin/readback, and
+//! `TCP_ULP` install — happens before any TLS byte is consumed (the ClientHello
+//! is only `MSG_PEEK`ed) and returns [`KtlsAcceptOutcome::Declined`] with a
+//! stream the ordinary buffered tokio-rustls accept can continue using.
 //!
 //! # The traffic keys carry a confidentiality budget across the handoff
 //!
@@ -63,11 +63,11 @@
 //! data the socket may hold. That is only a bound if the kernel cannot enlarge
 //! it, so for a suite with a finite limit this module pins the socket receive
 //! buffer (`SO_RCVBUF`, which sets `SOCK_RCVBUF_LOCK` and ends autotuning for
-//! this socket) and reads the pinned size back **before**
-//! `dangerous_into_kernel_connection` runs. If that cannot be done, the handoff
-//! is refused while the rustls session is still whole rather than relaying
-//! records no budget covers. An unlimited suite pins nothing and keeps ordinary
-//! receive autotuning.
+//! this socket) and reads the pinned size back **before the handshake consumes
+//! any bytes**. If that cannot be done, the handoff cleanly falls back to the
+//! ordinary userspace rustls accept rather than dropping a valid connection or
+//! relaying records no budget covers. An unlimited suite pins nothing and keeps
+//! ordinary receive autotuning.
 //!
 //! # TLS 1.3 is refused, not silently mishandled
 //!
@@ -234,6 +234,28 @@ pub(crate) async fn try_ktls_accept(
         return KtlsAcceptOutcome::Declined(stream);
     }
 
+    // AES-GCM's finite confidentiality limit is only enforceable against a
+    // receive window the kernel will not silently enlarge. Pin and read that
+    // window while the peeked ClientHello is still the only TLS input we have
+    // observed. If either syscall fails, the ordinary buffered rustls accept
+    // can continue on the unconsumed stream. Pin whenever AES is one of the
+    // selectable offers, even if ChaCha20 is also present, because rustls may
+    // choose either suite.
+    let stable_receive_ceiling = if facts.requires_receive_window_pin() {
+        match pin_receive_window(stream.as_raw_fd()) {
+            Ok(ceiling) => ceiling,
+            Err(e) => {
+                debug!(
+                    peer = %peer.ip(),
+                    "kTLS: receive window could not be pinned ({e}), retaining the userspace rustls relay"
+                );
+                return KtlsAcceptOutcome::Declined(stream);
+            }
+        }
+    } else {
+        0
+    };
+
     let sni_hostname = crate::proxy::sni::extract_sni_from_client_hello(&hello);
 
     let mut conn = match UnbufferedServerConnection::new(config.clone()) {
@@ -323,28 +345,16 @@ pub(crate) async fn try_ktls_accept(
              report record sequence numbers",
         ));
     }
-    // The receive side of the budget is only enforceable against a receive
-    // window the kernel will not silently enlarge, so that window is pinned —
-    // and its size read back — while the rustls session is still whole. A
-    // kernel that will not pin or will not report the pinned size leaves the
-    // receive bound unprovable, which refuses the handoff here rather than
-    // relaying records no budget covers. An unlimited suite needs no bound and
-    // keeps ordinary receive autotuning.
-    let stable_receive_ceiling = if limits.requires_enforcement() {
-        match pin_receive_window(stream.as_raw_fd()) {
-            Ok(ceiling) => ceiling,
-            Err(e) => {
-                record_frontend_tls_failure(record_mesh_mtls_metric, "error");
-                warn!("kTLS: receive window could not be pinned: {e}");
-                return KtlsAcceptOutcome::Failed(io::Error::other(format!(
-                    "kTLS: the receive window could not be pinned, so the confidentiality \
-                     bound cannot be enforced: {e}"
-                )));
-            }
-        }
-    } else {
-        0
-    };
+    // The pre-handshake ClientHello gate pins the receive window whenever an
+    // AES-GCM suite is selectable. Restate that invariant against the suite
+    // rustls actually chose before consuming the session.
+    if limits.requires_enforcement() && stable_receive_ceiling == 0 {
+        record_frontend_tls_failure(record_mesh_mtls_metric, "error");
+        return KtlsAcceptOutcome::Failed(io::Error::other(
+            "kTLS: negotiated suite requires a receive bound that was not established before \
+             the handshake",
+        ));
+    }
     if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2) {
         // Unreachable: rustls cannot negotiate TLS 1.3 without the
         // `supported_versions` extension the eligibility gate rejected.

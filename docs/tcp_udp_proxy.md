@@ -656,12 +656,11 @@ Ferrum therefore enforces the limit itself, per direction, in
   `net.core.rmem_max`. And ChaCha20-Poly1305, whose limit is `u64::MAX`, builds
   no guard, pins nothing, and keeps ordinary autotuning.
 * **A receive window that cannot be pinned refuses the handoff.** The pin and its
-  readback happen after the handshake but *before*
-  `dangerous_into_kernel_connection`, so a kernel that will not pin the buffer or
-  will not report the pinned size fails the connection while the rustls session
-  is still whole, rather than starting a relay whose receive side no budget
-  covers. Every recoverable refusal still happens earlier, on a pristine socket,
-  with the buffered userspace fallback intact.
+  readback happen from the peeked ClientHello *before the handshake consumes any
+  bytes*. A kernel that will not pin the buffer or report the pinned size
+  therefore declines the kTLS optimization and continues with the buffered
+  userspace rustls accept instead of dropping a valid connection or starting a
+  relay whose receive side no budget covers.
 * **A 2^16-record reserve** is held back below the cipher limit, so teardown
   records (the `close_notify` alert) and any kernel accounting subtlety stay
   inside the safe bound.
