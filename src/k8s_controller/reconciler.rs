@@ -814,13 +814,11 @@ fn bind_k8s_mesh_revision_publication(
     mesh_revision: Option<&MeshConfigRevision>,
 ) -> (GatewayConfig, Option<MeshConfigRevision>) {
     let mut effective = translation.clone();
-    let Some(candidate_revision) = mesh_revision.filter(|revision| revision.is_well_formed())
-    else {
-        // Unversioned bootstrap / disabled authority: no scalar to bind.
-        return (effective, mesh_revision.cloned());
-    };
     let Some(previous) = previous else {
-        return (effective, Some(candidate_revision.clone()));
+        // Unversioned bootstrap / disabled authority: no prior scalar exists
+        // to bind. A present malformed value is retained for the existing
+        // downstream validation boundary to reject rather than normalized.
+        return (effective, mesh_revision.cloned());
     };
     let Some(previous_revision) = previous
         .mesh_revision
@@ -828,7 +826,16 @@ fn bind_k8s_mesh_revision_publication(
         .filter(|revision| revision.is_well_formed())
     else {
         // First established sequence after unversioned publication.
-        return (effective, Some(candidate_revision.clone()));
+        return (effective, mesh_revision.cloned());
+    };
+    let Some(candidate_revision) = mesh_revision.filter(|revision| revision.is_well_formed())
+    else {
+        // Once a usable sequence is established, an absent or malformed claim
+        // cannot authorize different mesh content. The tracker is expected to
+        // retain its floor, but this publication boundary must fail closed if
+        // that invariant is ever violated.
+        retain_previously_accepted_k8s_mesh(&mut effective, previous);
+        return (effective, Some(previous_revision.clone()));
     };
 
     match MeshConfigRevision::compare(Some(previous_revision), Some(candidate_revision)) {
@@ -851,11 +858,16 @@ fn bind_k8s_mesh_revision_publication(
                 (effective, Some(previous_revision.clone()))
             }
         }
-        MeshRevisionOrder::Older
-        | MeshRevisionOrder::Unversioned
-        | MeshRevisionOrder::Bootstrap => {
+        MeshRevisionOrder::Older => {
             // A non-advancing claim cannot authorize different mesh content.
             // The tracker floor normally prevents Older; fail closed anyway.
+            retain_previously_accepted_k8s_mesh(&mut effective, previous);
+            (effective, Some(previous_revision.clone()))
+        }
+        MeshRevisionOrder::Unversioned | MeshRevisionOrder::Bootstrap => {
+            // Both inputs above are known well formed, so these outcomes would
+            // violate `MeshConfigRevision::compare`'s contract. Fail closed if
+            // that contract changes instead of treating this as bootstrap.
             retain_previously_accepted_k8s_mesh(&mut effective, previous);
             (effective, Some(previous_revision.clone()))
         }

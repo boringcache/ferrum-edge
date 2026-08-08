@@ -341,3 +341,20 @@ fn unversioned_bootstrap_still_publishes_evolving_mesh() {
     );
     assert!(harness.overlay_revision().is_none());
 }
+
+#[test]
+fn missing_revision_after_versioned_publication_retains_prior_mesh() {
+    let harness = Harness::new();
+    let first = authoritative_translation("gwapi-route-a", "svc-a");
+    assert!(harness.publish(&first, Some(&revision(100))).is_some());
+
+    let divergent = authoritative_translation("gwapi-route-a", "svc-withheld");
+    assert!(harness.publish(&divergent, None).is_none());
+    assert_eq!(harness.overlay_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(harness.live_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(harness.overlay_revision(), Some(revision(100)));
+    assert_eq!(
+        harness.config_arc.load().mesh_revision,
+        Some(revision(100))
+    );
+}
