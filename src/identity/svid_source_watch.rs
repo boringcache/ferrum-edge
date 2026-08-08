@@ -19,8 +19,11 @@
 //!    refusal, not a published half-generation.
 //! 2. **Last-good survives transient failure.** A source that cannot be read,
 //!    or a bundle that fails validation, leaves the live SVID slot untouched
-//!    and does not advance the backend SVID generation. The warning is emitted
-//!    once and silenced until the source recovers.
+//!    and does not advance the backend SVID generation. The *retry* runs on
+//!    every source cadence, but the warning and the [`crate::tls::events`]
+//!    record are armed once per distinct failing state — see
+//!    [`FailureReporter`], which exists because that event log rewrites its
+//!    whole bounded on-disk ring on every record.
 //! 3. **The comparison baseline is anchored to startup, not to the first
 //!    poll.** [`GatewaySvidSourceTracker::prime`] runs synchronously before the
 //!    initial bundle load; baselining lazily inside the spawned task would
@@ -533,7 +536,7 @@ pub async fn run_gateway_svid_source_rotation_loop(
         );
     }
 
-    let mut failure_logged = false;
+    let mut reporter = FailureReporter::default();
 
     loop {
         if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
@@ -544,19 +547,14 @@ pub async fn run_gateway_svid_source_rotation_loop(
         match report.outcome {
             GatewaySvidPollOutcome::Idle | GatewaySvidPollOutcome::Baseline => {}
             GatewaySvidPollOutcome::SourceUnavailable => {
-                record_source_failures(&sources, &report.failures, &mut failure_logged);
+                record_source_failures(&sources, &report.failures, &mut reporter);
             }
             GatewaySvidPollOutcome::Unchanged => {
-                note_recovery(&mut failure_logged);
+                note_recovery(&mut reporter);
                 record_refresh_for_entries(GATEWAY_SVID_SURFACE, &report.refreshed, "unchanged");
             }
             GatewaySvidPollOutcome::Changed => {
-                reload_and_publish(
-                    &sources,
-                    &mut tracker,
-                    publish.as_ref(),
-                    &mut failure_logged,
-                );
+                reload_and_publish(&sources, &mut tracker, publish.as_ref(), &mut reporter);
             }
         }
 
@@ -576,17 +574,74 @@ pub async fn run_gateway_svid_source_rotation_loop(
     }
 }
 
-fn note_recovery(failure_logged: &mut bool) {
-    if *failure_logged {
+/// Warn-once **and record-once** state for a failing pass.
+///
+/// Retrying is deliberate: a source that stays unreadable, and a candidate
+/// whose coherent reload keeps failing, are both re-attempted on every source
+/// cadence so a recovered provider publishes without needing another material
+/// change. The *reporting* must not follow that cadence. [`crate::tls::events`]
+/// is a bounded ring that re-serializes its full contents and atomically
+/// rewrites its on-disk store on every record, and marks the TLS inventory
+/// cache stale; a file-backed source failing on the 1s cadence would therefore
+/// rewrite that store once per second indefinitely and, within the ring's
+/// capacity, evict every other TLS surface's rotation history from both the
+/// in-memory log and the persisted file.
+///
+/// Each distinct failing state is therefore recorded and warned exactly once,
+/// and re-armed when that state changes or the source recovers. The two failure
+/// classes latch independently rather than superseding each other, so a source
+/// that flaps between unreadable and readable-but-refused still records one
+/// event per distinct state instead of one per poll. The
+/// `ferrum_tls_source_refresh_total` counters stay per attempt, so `rate()`
+/// still shows the retry loop running.
+#[derive(Default)]
+struct FailureReporter {
+    /// Labels of the sources that could not be read on the last reported pass.
+    unavailable: Option<Vec<&'static str>>,
+    /// Candidate fingerprints of the last reported unpublishable reload.
+    rebuild: Option<Vec<MaterialFingerprintEntry>>,
+}
+
+impl FailureReporter {
+    /// `true` when this exact set of unreadable sources is not already
+    /// reported.
+    fn arm_unavailable(&mut self, failures: &[GatewaySvidSourceFailure]) -> bool {
+        let labels = failures.iter().map(|f| f.label).collect::<Vec<_>>();
+        if self.unavailable.as_deref() == Some(labels.as_slice()) {
+            return false;
+        }
+        self.unavailable = Some(labels);
+        true
+    }
+
+    /// `true` when this exact candidate is not already reported as an
+    /// unpublishable reload.
+    fn arm_rebuild(&mut self, entries: &[MaterialFingerprintEntry]) -> bool {
+        if self.rebuild.as_deref() == Some(entries) {
+            return false;
+        }
+        self.rebuild = Some(entries.to_vec());
+        true
+    }
+
+    /// Disarm on recovery. `true` when a failure was actually pending.
+    fn clear(&mut self) -> bool {
+        let had_unavailable = self.unavailable.take().is_some();
+        let had_rebuild = self.rebuild.take().is_some();
+        had_unavailable || had_rebuild
+    }
+}
+
+fn note_recovery(reporter: &mut FailureReporter) {
+    if reporter.clear() {
         info!("Gateway SVID source watcher recovered source access");
-        *failure_logged = false;
     }
 }
 
 fn record_source_failures(
     sources: &GatewaySvidSourceSet,
     failures: &[GatewaySvidSourceFailure],
-    failure_logged: &mut bool,
+    reporter: &mut FailureReporter,
 ) {
     let registry = crate::plugins::prometheus_metrics::global_registry();
     for failure in failures {
@@ -596,6 +651,12 @@ fn record_source_failures(
             GATEWAY_SVID_SURFACE,
             "load_error",
         );
+    }
+
+    // The read itself is retried on every cadence; the event record and the
+    // warning are armed once per distinct outage. See `FailureReporter`.
+    if !reporter.arm_unavailable(failures) {
+        return;
     }
 
     // Only the sources that actually failed are attributed; a trust-bundle
@@ -608,22 +669,18 @@ fn record_source_failures(
     }
     let detail = describe_failures(failures);
     record_load_error(GATEWAY_SVID_SURFACE, &failed, &detail);
-
-    if !*failure_logged {
-        warn!(
-            error = %detail,
-            "Gateway SVID source could not be read; keeping the current SVID material \
-             (silenced until the source recovers)"
-        );
-        *failure_logged = true;
-    }
+    warn!(
+        error = %detail,
+        "Gateway SVID source could not be read; keeping the current SVID material \
+         (silenced until the source recovers or the failing set changes)"
+    );
 }
 
 fn reload_and_publish(
     sources: &GatewaySvidSourceSet,
     tracker: &mut GatewaySvidSourceTracker,
     publish: &dyn Fn(SvidBundle) -> u64,
-    failure_logged: &mut bool,
+    reporter: &mut FailureReporter,
 ) {
     let entries = tracker.current_fingerprints().unwrap_or_default();
     // One coherent re-read of all three sources. If a source changes again
@@ -632,7 +689,7 @@ fn reload_and_publish(
     // and reloads again — a redundant rotation, never a stale identity.
     match sources.load_bundle() {
         Ok(bundle) => {
-            note_recovery(failure_logged);
+            note_recovery(reporter);
             let spiffe_id = bundle.spiffe_id.to_string();
             let revision = publish(bundle);
             tracker.commit();
@@ -651,18 +708,20 @@ fn reload_and_publish(
             // Committing a failed candidate would suppress every future retry
             // until a source changed again, leaving a recovered provider stuck
             // on the old SVID. Retaining the published fingerprint retries on
-            // the next source cadence while the warning remains warn-once.
+            // the next source cadence; the event record and the warning are
+            // armed once per distinct candidate so that retry does not rewrite
+            // the bounded TLS event store on every poll. See `FailureReporter`.
             record_refresh_for_entries(GATEWAY_SVID_SURFACE, &entries, "rebuild_error");
+            if !reporter.arm_rebuild(&entries) {
+                return;
+            }
             let error = anyhow::anyhow!("{error}");
             record_rebuild_error(GATEWAY_SVID_SURFACE, &entries, &error);
-            if !*failure_logged {
-                warn!(
-                    error = %error,
-                    "Gateway SVID sources changed but the reload failed; keeping the current \
-                     material (silenced until a coherent reload succeeds)"
-                );
-                *failure_logged = true;
-            }
+            warn!(
+                error = %error,
+                "Gateway SVID sources changed but the reload failed; keeping the current \
+                 material (silenced until a coherent reload succeeds or the candidate changes)"
+            );
         }
     }
 }

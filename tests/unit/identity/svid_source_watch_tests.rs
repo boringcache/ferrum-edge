@@ -12,6 +12,7 @@ use ferrum_edge::identity::svid_source_watch::{
     GatewaySvidSourceSet, GatewaySvidSourceTracker, GatewaySvidWatchConfig, gateway_svid_cadence,
     run_gateway_svid_source_rotation_loop,
 };
+use ferrum_edge::tls::events::{TlsEventFilter, global_event_log};
 use ferrum_edge::tls::source::{CertSource, MaterialKind};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -123,6 +124,19 @@ fn tracker_for(sources: &GatewaySvidSourceSet) -> GatewaySvidSourceTracker {
 
 fn poll_at(tracker: &mut GatewaySvidSourceTracker, start: Instant, secs: u64) -> Outcome {
     tracker.poll(start + Duration::from_secs(secs)).outcome
+}
+
+/// Recorded `tls::events` entries naming `source_id` with `outcome`.
+///
+/// The process-wide event log is shared by every test in this binary, so the
+/// count is scoped to one temp-directory source identity and one outcome.
+fn event_count(source_id: &str, outcome: &str) -> usize {
+    let filter = TlsEventFilter {
+        source_id: Some(source_id.to_string()),
+        outcome: Some(outcome.to_string()),
+        ..Default::default()
+    };
+    global_event_log().list(&filter).len()
 }
 
 fn inline_source_set() -> GatewaySvidSourceSet {
@@ -609,6 +623,136 @@ async fn a_failed_prime_still_publishes_a_rotation_made_before_the_first_poll() 
     // The forced publish commits, so stable material does not churn.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     assert_eq!(published.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher exits on shutdown")
+        .expect("watcher task did not panic");
+}
+
+/// A candidate that keeps failing its coherent reload must keep being retried
+/// but must reach the bounded TLS event log only once.
+///
+/// `tls::events` re-serializes its entire ring and atomically rewrites its
+/// on-disk store on every record, and marks the TLS inventory cache stale.
+/// Recording each retry would rewrite that store once per second for as long as
+/// an operator's SVID stays broken and, within the ring's capacity, evict every
+/// other TLS surface's rotation history from both the log and the persisted
+/// file.
+#[tokio::test]
+async fn a_refused_candidate_is_recorded_once_and_still_retried() {
+    let (ca, files) = valid_svid_files();
+    let cert_source_id = files.cert_path.display().to_string();
+    let before = event_count(&cert_source_id, "rebuild_error");
+
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    assert_eq!(tracker.prime(Instant::now()), Outcome::Baseline);
+
+    // A key that does not pair with the published cert: stable bytes, and a
+    // refusal that repeats on every poll until the operator fixes it.
+    let (_orphan_cert, orphan_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, orphan_key).expect("write mismatched key");
+
+    let published = Arc::new(AtomicU64::new(0));
+    let counter = published.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let config = GatewaySvidWatchConfig {
+        sources,
+        file_interval: Duration::from_secs(1),
+        provider_interval: PROVIDER_DEFAULT,
+        tracker: Some(tracker),
+        publish: Box::new(move |_bundle| counter.fetch_add(1, Ordering::SeqCst) + 1),
+    };
+    let task = tokio::spawn(run_gateway_svid_source_rotation_loop(
+        config,
+        Some(shutdown_rx),
+    ));
+
+    // Several poll cycles of the same refused candidate.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        event_count(&cert_source_id, "rebuild_error") - before,
+        1,
+        "a stable refused candidate must be recorded once, not once per poll"
+    );
+
+    // Recording once must not quiet the retry itself: a valid complete
+    // generation still publishes without another intervening change.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, rotated_key).expect("write key");
+    std::fs::write(&files.cert_path, rotated_cert).expect("write cert");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while published.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        1,
+        "record-once must not suppress the coherent reload retry"
+    );
+
+    shutdown_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("watcher exits on shutdown")
+        .expect("watcher task did not panic");
+}
+
+/// The same record-once rule covers an unreadable source: a missing SVID file
+/// is re-read on every 1s poll, but only the first pass writes a `load_error`
+/// event.
+#[tokio::test]
+async fn an_unreadable_source_is_recorded_once_and_still_retried() {
+    let (ca, files) = valid_svid_files();
+    let cert_source_id = files.cert_path.display().to_string();
+    let before = event_count(&cert_source_id, "load_error");
+
+    let sources = files.source_set();
+    let mut tracker = tracker_for(&sources);
+    assert_eq!(tracker.prime(Instant::now()), Outcome::Baseline);
+    std::fs::remove_file(&files.cert_path).expect("remove cert");
+
+    let published = Arc::new(AtomicU64::new(0));
+    let counter = published.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let config = GatewaySvidWatchConfig {
+        sources,
+        file_interval: Duration::from_secs(1),
+        provider_interval: PROVIDER_DEFAULT,
+        tracker: Some(tracker),
+        publish: Box::new(move |_bundle| counter.fetch_add(1, Ordering::SeqCst) + 1),
+    };
+    let task = tokio::spawn(run_gateway_svid_source_rotation_loop(
+        config,
+        Some(shutdown_rx),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        event_count(&cert_source_id, "load_error") - before,
+        1,
+        "a stable source outage must be recorded once, not once per poll"
+    );
+
+    // The source is still being re-read, so a recovered generation publishes.
+    let (rotated_cert, rotated_key) = issue_svid(&ca);
+    std::fs::write(&files.key_path, rotated_key).expect("write key");
+    std::fs::write(&files.cert_path, rotated_cert).expect("write cert");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while published.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        1,
+        "record-once must not suppress the source re-read"
+    );
 
     shutdown_tx.send_replace(true);
     tokio::time::timeout(Duration::from_secs(5), task)
