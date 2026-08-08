@@ -857,7 +857,13 @@ impl K8sAccumulator {
         service_port: u16,
         weight: u32,
     ) -> Vec<RouteBackend> {
-        core::endpoint_route_backends_for_service_import(self, namespace, name, service_port, weight)
+        core::endpoint_route_backends_for_service_import(
+            self,
+            namespace,
+            name,
+            service_port,
+            weight,
+        )
     }
 
     pub(crate) fn secret_is_valid_tls_certificate(&self, namespace: &str, name: &str) -> bool {

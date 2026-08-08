@@ -3055,7 +3055,9 @@ fn reference_resolution_reason(error: &K8sTranslateError) -> &'static str {
             "BackendNotFound"
         }
         K8sTranslateError::InvalidResource { message, .. }
-            if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_kind(message) =>
+            if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_kind(
+                message,
+            ) =>
         {
             "InvalidKind"
         }

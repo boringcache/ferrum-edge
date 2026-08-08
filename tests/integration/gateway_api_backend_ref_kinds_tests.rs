@@ -156,7 +156,10 @@ fn service_import_live_materialization_tracks_create_update_delete() {
         .iter()
         .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
         .expect("fail-closed dispatch");
-    assert_eq!(plugin.config["rules"][0]["fault"]["abort"]["status_code"], 500);
+    assert_eq!(
+        plugin.config["rules"][0]["fault"]["abort"]["status_code"],
+        500
+    );
     let (status, reason) = resolved_refs_status(&objects);
     assert_eq!(status, "False");
     assert_eq!(reason.as_deref(), Some("BackendNotFound"));

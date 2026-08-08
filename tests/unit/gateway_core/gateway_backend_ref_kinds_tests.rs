@@ -323,7 +323,10 @@ fn service_import_update_changes_port_materialization() {
         }),
     );
     let second = translate_k8s_objects(&[route_v2, import_updated], options()).unwrap();
-    assert_eq!(second.config.proxies[0].backend_host, first.config.proxies[0].backend_host);
+    assert_eq!(
+        second.config.proxies[0].backend_host,
+        first.config.proxies[0].backend_host
+    );
     assert_eq!(second.config.proxies[0].backend_port, 8080);
 }
 
@@ -372,7 +375,10 @@ fn status_and_translation_agree_on_service_import_resolved_refs() {
     let conditions = route_update.status["parents"][0]["conditions"]
         .as_array()
         .unwrap();
-    assert_eq!(find_condition(conditions, "ResolvedRefs")["status"], "False");
+    assert_eq!(
+        find_condition(conditions, "ResolvedRefs")["status"],
+        "False"
+    );
     assert_eq!(
         find_condition(conditions, "ResolvedRefs")["reason"],
         "BackendNotFound"
@@ -405,13 +411,10 @@ fn service_import_endpoint_slice_expansion_when_pod_discovery_enabled() {
             }]
         }),
     );
-    slice
-        .metadata
-        .labels
-        .insert(
-            "multicluster.kubernetes.io/service-name".to_string(),
-            "store".to_string(),
-        );
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
 
     let opts = options().with_pod_discovery_enabled(true);
 

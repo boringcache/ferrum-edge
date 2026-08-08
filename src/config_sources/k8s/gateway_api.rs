@@ -5703,16 +5703,15 @@ fn l4_route_proxies(
             raw_backend_port,
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
-        if matches!(
-            backend_kind,
-            super::backend_ref::BackendKind::ServiceImport
-        ) && super::backend_ref::backend_target_missing(
-            acc,
-            backend_kind,
-            &backend_namespace,
-            backend_name,
-            backend_port,
-        ) {
+        if matches!(backend_kind, super::backend_ref::BackendKind::ServiceImport)
+            && super::backend_ref::backend_target_missing(
+                acc,
+                backend_kind,
+                &backend_namespace,
+                backend_name,
+                backend_port,
+            )
+        {
             return Err(invalid_resource(
                 object,
                 format!(
