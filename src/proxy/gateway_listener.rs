@@ -58,10 +58,13 @@
 //! # Ports this manager refuses
 //!
 //! A Gateway listener port that collides with a socket Ferrum already owns is
-//! skipped fail-closed, never stolen:
+//! never stolen. A process-global proxy frontend of the same class already
+//! satisfies the listener — the router keys the request by the real accepted
+//! port — so the manager records it as already served and binds no duplicate
+//! socket. Every other collision is skipped fail-closed:
 //!
-//! - anything in [`ProxyState::reserved_gateway_ports`] (the global proxy and
-//!   admin HTTP/HTTPS ports and the CP gRPC port),
+//! - an HTTP listener on the global HTTPS port (or the reverse),
+//! - admin HTTP/HTTPS ports and the CP gRPC port,
 //! - any port claimed by a TCP/UDP stream proxy in the same config, and
 //! - any port two HTTP-family proxies claim with different TLS classes.
 //!
@@ -104,6 +107,9 @@ impl GatewayListenerClass {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayListenerPlan {
     pub ports: BTreeMap<u16, GatewayListenerClass>,
+    /// Desired ports already served by a process-global proxy frontend of the
+    /// same class. No dynamic bind and no failure are needed for these.
+    pub already_served: BTreeMap<u16, GatewayListenerClass>,
     /// Ports the config asked for that this process refuses to bind, with the
     /// reason. Surfaced rather than silently dropped.
     pub refused: BTreeMap<u16, String>,
@@ -115,7 +121,11 @@ impl GatewayListenerPlan {
     /// `reserved` is [`ProxyState::reserved_gateway_ports`] — the effective
     /// reservation for *this* process, not `EnvConfig` alone, so a pre-bound
     /// in-process harness socket is honored too.
-    pub fn from_config(config: &GatewayConfig, reserved: &std::collections::HashSet<u16>) -> Self {
+    pub fn from_config(
+        config: &GatewayConfig,
+        reserved: &std::collections::HashSet<u16>,
+        existing_frontends: &BTreeMap<u16, GatewayListenerClass>,
+    ) -> Self {
         let mut stream_ports: BTreeSet<u16> = BTreeSet::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream()
@@ -126,6 +136,7 @@ impl GatewayListenerPlan {
         }
 
         let mut ports: BTreeMap<u16, GatewayListenerClass> = BTreeMap::new();
+        let mut already_served: BTreeMap<u16, GatewayListenerClass> = BTreeMap::new();
         let mut refused: BTreeMap<u16, String> = BTreeMap::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream() {
@@ -137,11 +148,36 @@ impl GatewayListenerPlan {
             if port == 0 {
                 continue;
             }
+            // TLS class comes from this proxy's own namespace-qualified entry.
+            let class = if config
+                .http_tls_listen_ports
+                .contains(&(proxy.namespace.clone(), port))
+            {
+                GatewayListenerClass::Tls
+            } else {
+                GatewayListenerClass::Plaintext
+            };
+            if let Some(existing) = existing_frontends.get(&port) {
+                if *existing == class {
+                    already_served.insert(port, class);
+                } else {
+                    refused.entry(port).or_insert_with(|| {
+                        format!(
+                            "port {port} is already owned by a process-global {} proxy \
+                             listener, but this Gateway listener requires {}; the Gateway \
+                             listener is not served",
+                            existing.label(),
+                            class.label()
+                        )
+                    });
+                }
+                continue;
+            }
             if reserved.contains(&port) {
                 refused.entry(port).or_insert_with(|| {
                     format!(
-                        "port {port} is already owned by a global proxy/admin/control-plane \
-                         listener; the Gateway listener is not bound"
+                        "port {port} is already owned by an admin/control-plane listener; the \
+                         Gateway listener is not bound"
                     )
                 });
                 continue;
@@ -155,15 +191,6 @@ impl GatewayListenerPlan {
                 });
                 continue;
             }
-            // TLS class comes from this proxy's own namespace-qualified entry.
-            let class = if config
-                .http_tls_listen_ports
-                .contains(&(proxy.namespace.clone(), port))
-            {
-                GatewayListenerClass::Tls
-            } else {
-                GatewayListenerClass::Plaintext
-            };
             if let Some(existing) = ports.insert(port, class)
                 && existing != class
             {
@@ -182,7 +209,12 @@ impl GatewayListenerPlan {
         }
         // Every refusal reason wins over any class this port also resolved to.
         ports.retain(|port, _| !refused.contains_key(port));
-        Self { ports, refused }
+        already_served.retain(|port, _| !refused.contains_key(port));
+        Self {
+            ports,
+            already_served,
+            refused,
+        }
     }
 }
 
@@ -295,12 +327,28 @@ pub struct GatewayListenerManager {
     /// seen, and the slow retry tick only reconciles when a bind failure is
     /// outstanding, so a missed publication could stay missed indefinitely.
     revisions: Mutex<Option<watch::Receiver<u64>>>,
+    /// Process-global HTTP/HTTPS proxy sockets that can directly serve a
+    /// same-port Gateway route without a second bind.
+    existing_frontends: BTreeMap<u16, GatewayListenerClass>,
     bind_failures: arc_swap::ArcSwap<Vec<GatewayListenerBindFailure>>,
 }
 
 impl GatewayListenerManager {
     pub fn new(state: ProxyState, bind_addr: std::net::IpAddr, tls: GatewayListenerTls) -> Self {
         let revisions = state.subscribe_config_revision();
+        let mut existing_frontends = BTreeMap::new();
+        if state.env_config.proxy_http_port != 0 {
+            existing_frontends.insert(
+                state.env_config.proxy_http_port,
+                GatewayListenerClass::Plaintext,
+            );
+        }
+        if tls.is_configured() && state.env_config.proxy_https_port != 0 {
+            existing_frontends.insert(
+                state.env_config.proxy_https_port,
+                GatewayListenerClass::Tls,
+            );
+        }
         Self {
             state,
             bind_addr,
@@ -309,8 +357,30 @@ impl GatewayListenerManager {
             listeners: Mutex::new(BTreeMap::new()),
             draining: Mutex::new(Vec::new()),
             revisions: Mutex::new(Some(revisions)),
+            existing_frontends,
             bind_failures: arc_swap::ArcSwap::from_pointee(Vec::new()),
         }
+    }
+
+    /// Override the process-global frontend ports with the sockets actually
+    /// adopted by the mode. File-mode harnesses may pass pre-bound listeners
+    /// whose live ports differ from `EnvConfig`.
+    #[must_use]
+    pub fn with_existing_frontends(
+        mut self,
+        plaintext_port: Option<u16>,
+        tls_port: Option<u16>,
+    ) -> Self {
+        self.existing_frontends.clear();
+        if let Some(port) = plaintext_port.filter(|port| *port != 0) {
+            self.existing_frontends
+                .insert(port, GatewayListenerClass::Plaintext);
+        }
+        if let Some(port) = tls_port.filter(|port| *port != 0) {
+            self.existing_frontends
+                .insert(port, GatewayListenerClass::Tls);
+        }
+        self
     }
 
     /// Bind a QUIC listener beside every TLS-class Gateway listener port.
@@ -352,8 +422,11 @@ impl GatewayListenerManager {
     /// docs for why an unbindable listener port is never fatal.
     pub async fn reconcile(&self) -> Vec<GatewayListenerBindFailure> {
         let config = self.state.config.load_full();
-        let plan =
-            GatewayListenerPlan::from_config(&config, self.state.reserved_gateway_ports.as_ref());
+        let plan = GatewayListenerPlan::from_config(
+            &config,
+            self.state.reserved_gateway_ports.as_ref(),
+            &self.existing_frontends,
+        );
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
             .iter()

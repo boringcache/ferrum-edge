@@ -1417,6 +1417,10 @@ pub async fn serve(
                 .as_ref()
                 .and_then(|h| h.slot.clone()),
         },
+    )
+    .with_existing_frontends(
+        bound.proxy_http.map(|addr| addr.port()),
+        bound.proxy_https.map(|addr| addr.port()),
     );
     // Every TLS-class Gateway listener port also gets its own QUIC socket, so
     // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over

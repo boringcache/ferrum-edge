@@ -12,8 +12,8 @@
 //! - reload that **adds** a listener port,
 //! - reload that **withdraws** a listener port — routing must fail closed
 //!   immediately, before the socket finishes draining,
-//! - refusal of a Gateway listener port that collides with a socket the
-//!   gateway already owns.
+//! - reuse of a matching process-global proxy frontend without a duplicate
+//!   bind, and refusal of a Gateway listener that collides with admin.
 
 use std::time::Duration;
 
@@ -358,10 +358,11 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
 }
 
-/// A Gateway listener port that collides with a socket the gateway already
-/// owns is refused with a diagnostic, not silently stolen or silently dropped.
+/// A Gateway listener whose port and frontend class match the process-global
+/// proxy socket is already served by that socket. The manager must neither
+/// attempt a duplicate bind nor report a false failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_listener_port_colliding_with_a_reserved_port_is_refused() {
+async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
     let (backend, _b) = start_body_backend(b"listener-a").await;
 
     let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,14 +385,48 @@ async fn gateway_listener_port_colliding_with_a_reserved_port_is_refused() {
 
     assert!(
         handles.gateway_listeners.active_ports().await.is_empty(),
-        "a Gateway listener must not take over the global proxy socket"
+        "the manager must not duplicate the global proxy socket"
     );
     let failures = handles.gateway_listeners.bind_failures();
     assert!(
-        failures
-            .iter()
-            .any(|failure| failure.port == global_proxy_port),
-        "the refusal must be surfaced, not silent: {failures:?}"
+        failures.iter().all(|failure| failure.port != global_proxy_port),
+        "a same-class global frontend satisfies the listener, not a failure: {failures:?}"
+    );
+    assert_eq!(
+        http_get(global_proxy_port, "/api/x").await,
+        (200, "listener-a".to_string()),
+        "the exact accepted port must route on the existing global frontend"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+}
+
+/// A Gateway listener that collides with a non-proxy reserved socket is still
+/// refused and surfaced; the manager must never take over the admin frontend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_listener_port_colliding_with_admin_is_refused() {
+    let (backend, _b) = start_body_backend(b"listener-a").await;
+
+    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = admin_http.local_addr().unwrap().port();
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let handles = serve(
+        test_env_config(0, 0),
+        config_with(vec![port_scoped_proxy("gw-a", backend, Some(admin_port))]),
+        serve_options(proxy_http, admin_http),
+        shutdown_tx.clone(),
+    )
+    .await
+    .expect("file::serve starts");
+
+    assert!(handles.gateway_listeners.active_ports().await.is_empty());
+    let failures = handles.gateway_listeners.bind_failures();
+    assert!(
+        failures.iter().any(|failure| failure.port == admin_port),
+        "the admin collision must be surfaced: {failures:?}"
     );
 
     let _ = shutdown_tx.send(true);

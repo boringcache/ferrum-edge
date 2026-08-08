@@ -277,13 +277,16 @@ without a restart. Two bounds are deliberate and tested:
   stale-route. The socket itself stops accepting as soon as the accept loop
   observes its per-listener shutdown signal and then drains in-flight requests
   under the normal graceful-shutdown budget.
-- **A listener port that cannot be bound is reported, not fatal.** A port
-  already owned by a global proxy / admin / control-plane listener, or by a
-  TCP/UDP stream proxy, is refused; a port the process lacks permission to bind
+- **A listener port that cannot be bound is reported, not fatal.** A same-class
+  process-global proxy frontend on the exact requested port already satisfies
+  the Gateway listener: the router sees that accepted port, so the dynamic
+  manager binds no duplicate socket and reports no failure. A wrong-class
+  global proxy frontend, an admin / control-plane listener, or a TCP/UDP stream
+  proxy on the port is refused; a port the process lacks permission to bind
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
-  `GatewayListenerManager::bind_failures`, and routes scoped to that listener
-  stay unreachable rather than being served somewhere else.
+  `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
+  refused listener stay unreachable rather than being served somewhere else.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so with
   `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
