@@ -26,10 +26,15 @@
 //!
 //! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
 //! and camelCase spellings under a leading `_` + first segment `dedup`) are
-//! never emitted into transaction-log projections at all (omitted, not
-//! redacted). Typed request state is the primary home for that material; this
-//! filter is the shared fail-closed contract if any producer still writes the
-//! legacy keys.
+//! removed before an in-process transaction summary is built and are also
+//! omitted from every external transaction-log projection (omitted, not
+//! redacted). Typed request state is the primary home for that material.
+//!
+//! Internal mesh-metrics plans/markers under `mesh.metrics.*` follow a
+//! two-stage lifetime: they stay on the in-process summary long enough for
+//! built-in observers such as Prometheus to consume disable and tag-override
+//! plans, then are omitted from external serialization/schema output. The mesh
+//! metrics namespace coordinates metric production and is not user metadata.
 
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -71,6 +76,9 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
 /// in transaction-log or audit projections. Prefer typed non-serializable
 /// request state; this prefix is the fail-closed observability contract.
 pub const INTERNAL_ONLY_METADATA_KEY_PREFIX: &str = "_dedup_";
+
+/// Prefix reserved for internal mesh metric plans and lifecycle markers.
+pub const INTERNAL_ONLY_MESH_METRICS_PREFIX: &str = "mesh.metrics.";
 
 /// Placeholder string written in place of sensitive metadata values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
@@ -242,8 +250,8 @@ fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
     has_apikey || (has_api && has_key)
 }
 
-/// Returns true when the key is request-private lifecycle state that must be
-/// omitted from every transaction-log / audit projection.
+/// Returns true when the key is request-private deduplication lifecycle state
+/// that must be removed before an in-process transaction summary is built.
 ///
 /// Fail-closed across case, delimiter, and camelCase spellings of the reserved
 /// `_dedup_*` namespace: a leading `_` whose first alphanumeric segment is
@@ -252,7 +260,7 @@ fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
 /// observability contract if residual lifecycle keys appear under any of those
 /// spellings. Non-prefixed names (`dedup_key`, `request_dedup_*`) and longer
 /// first segments (`_deduplication`) stay observable.
-pub fn is_internal_only_metadata_key(key: &str) -> bool {
+pub fn is_dedup_internal_metadata_key(key: &str) -> bool {
     if !key.as_bytes().first().is_some_and(|byte| *byte == b'_') {
         return false;
     }
@@ -279,13 +287,36 @@ pub fn is_internal_only_metadata_key(key: &str) -> bool {
     first_segment_is_dedup == Some(true)
 }
 
-/// Strip every internal-only metadata key from a cloned observability map.
+/// Returns true when the key is an internal mesh-metrics plan or lifecycle
+/// marker under the reserved `mesh.metrics.*` namespace (ASCII case-insensitive).
+pub fn is_mesh_metrics_internal_metadata_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..INTERNAL_ONLY_MESH_METRICS_PREFIX.len())
+        .is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(INTERNAL_ONLY_MESH_METRICS_PREFIX.as_bytes())
+        })
+}
+
+/// Returns true when the key must never appear in external transaction-log /
+/// audit projections.
+///
+/// This is the serialization/schema contract. Summary construction uses
+/// [`is_dedup_internal_metadata_key`] for the earlier in-process strip and
+/// retains `mesh.metrics.*` until built-in observers consume it.
+pub fn is_internal_only_metadata_key(key: &str) -> bool {
+    is_mesh_metrics_internal_metadata_key(key) || is_dedup_internal_metadata_key(key)
+}
+
+/// Strip request-deduplication lifecycle keys before building an in-process
+/// transaction summary.
 ///
 /// Shared by `clone_log_metadata` and any other summary construction path so
-/// lifecycle coordination state cannot reach a logger even if a producer wrote
-/// the legacy `_dedup_*` names into the public metadata map.
-pub fn strip_internal_only_metadata(metadata: &mut HashMap<String, String>) {
-    metadata.retain(|key, _| !is_internal_only_metadata_key(key));
+/// `_dedup_*` coordination state cannot reach a logger even if a producer wrote
+/// the legacy names into the public metadata map. Mesh metrics coordination keys
+/// are intentionally retained here so built-in observers can consume disable and
+/// tag-override plans before external serialization omits them.
+pub fn strip_dedup_internal_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.retain(|key, _| !is_dedup_internal_metadata_key(key));
 }
 
 /// Returns true when the given metadata key matches any sensitive substring
