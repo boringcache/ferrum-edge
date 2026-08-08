@@ -1478,10 +1478,16 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     let mut shapes_by_port: BTreeMap<u16, Vec<(GatewayApiListenerKey, PortShape)>> =
         BTreeMap::new();
     for (key, policy) in &acc.gateway_api_listener_policies {
-        // Only the HTTP family shares the HTTP-route socket set. A TLS
-        // passthrough or L4 listener on the same number is a different
-        // datapath entirely and must not be dragged into this decision.
-        if !policy.materializable || !matches!(policy.protocol.as_str(), "HTTP" | "HTTPS") {
+        // Only the HTTP family shares the HTTP-route socket set — the same
+        // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
+        // GRPCRoute on. A TLS-passthrough or L4 listener on the same number is
+        // a different datapath entirely and must not be dragged in here.
+        if !policy.materializable
+            || !matches!(
+                policy.protocol.as_str(),
+                "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
+            )
+        {
             continue;
         }
         let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) else {
