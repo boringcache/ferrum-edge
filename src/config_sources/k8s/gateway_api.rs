@@ -21,7 +21,7 @@ use super::{
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
     optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
     resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    route_request_transformer_plugin_for_proxy, string_array, string_field,
     upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
@@ -5718,8 +5718,11 @@ fn l4_route_proxies(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let (backend_kind, backend_namespace) =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let requested_port =
-            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?;
+        let requested_port = optional_port_field(
+            object,
+            backend_ref.get("port"),
+            "TCPRoute/TLSRoute backendRefs[].port",
+        )?;
         let backend_port = match backend_kind {
             super::backend_ref::BackendKind::Service => requested_port.ok_or_else(|| {
                 invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
