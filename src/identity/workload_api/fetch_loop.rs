@@ -125,8 +125,8 @@ impl SvidFetchHandle {
         notified.await;
     }
 
-    fn install(&self, bundle: SvidBundle) {
-        record_fetch_bundle_metrics(&bundle);
+    fn install(&self, bundle: SvidBundle, metrics_source: FetchLoopMetricsSource) {
+        record_fetch_bundle_metrics(&bundle, metrics_source);
         if let Some(installer) = self.installer.get() {
             installer(bundle);
         } else {
@@ -152,6 +152,37 @@ impl Default for SvidFetchHandle {
     }
 }
 
+/// Bounded telemetry identity for a Workload API fetch loop.
+///
+/// Keeping this as an enum prevents a caller-controlled metric label from
+/// creating unbounded Prometheus cardinality. The mesh SPIRE producer uses
+/// [`Self::SpireAgent`]; generic Workload API consumers retain the historical
+/// `workload_api` label.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FetchLoopMetricsSource {
+    #[default]
+    WorkloadApi,
+    SpireAgent,
+}
+
+impl FetchLoopMetricsSource {
+    fn source_label(self) -> &'static str {
+        match self {
+            Self::WorkloadApi => "workload_api",
+            Self::SpireAgent => "spire_agent",
+        }
+    }
+
+    fn set_ca_health(self, healthy: bool) {
+        if matches!(self, Self::SpireAgent) {
+            crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
+                "spire_agent",
+                healthy,
+            );
+        }
+    }
+}
+
 /// Configuration for the fetch loop.
 #[derive(Debug, Clone)]
 pub struct FetchLoopConfig {
@@ -163,6 +194,8 @@ pub struct FetchLoopConfig {
     pub reconnect_backoff: Duration,
     /// Maximum backoff cap. Backoff doubles up to this value.
     pub max_reconnect_backoff: Duration,
+    /// Bounded source label and optional CA-health identity for telemetry.
+    pub metrics_source: FetchLoopMetricsSource,
 }
 
 impl Default for FetchLoopConfig {
@@ -172,6 +205,7 @@ impl Default for FetchLoopConfig {
             expected_spiffe_id: None,
             reconnect_backoff: Duration::from_secs(1),
             max_reconnect_backoff: Duration::from_secs(30),
+            metrics_source: FetchLoopMetricsSource::default(),
         }
     }
 }
@@ -195,6 +229,10 @@ pub fn spawn_fetch_loop_with_handle(
 
 async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
     let mut backoff = config.reconnect_backoff;
+    // Materialize the SPIRE health series before the first connection
+    // attempt, so an initial outage is visible while mesh startup waits for
+    // its first SVID and before any successful sample has existed.
+    config.metrics_source.set_ca_health(false);
     loop {
         match WorkloadApiClient::connect(&config.socket_path).await {
             Ok(mut client) => match client
@@ -204,6 +242,7 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                 Ok((mut stream, _first_signal)) => {
                     info!(socket = %config.socket_path, "SVID fetch stream established");
                     backoff = config.reconnect_backoff;
+                    let mut failure_recorded = false;
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(bundle) => {
@@ -211,23 +250,32 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
                                     spiffe_id = %bundle.spiffe_id,
                                     "received fresh SVID from Workload API"
                                 );
-                                handle.install(bundle);
+                                handle.install(bundle, config.metrics_source);
+                                config.metrics_source.set_ca_health(true);
                             }
                             Err(e) => {
-                                record_workload_api_rotation_failure(&handle);
+                                record_workload_api_rotation_failure(
+                                    &handle,
+                                    config.metrics_source,
+                                );
+                                failure_recorded = true;
                                 warn!(error = %e, "SVID fetch stream error — reconnecting");
                                 break;
                             }
                         }
                     }
+                    if !failure_recorded {
+                        record_workload_api_rotation_failure(&handle, config.metrics_source);
+                        warn!("SVID fetch stream ended — reconnecting");
+                    }
                 }
                 Err(e) => {
-                    record_workload_api_rotation_failure(&handle);
+                    record_workload_api_rotation_failure(&handle, config.metrics_source);
                     error!(error = %e, "Workload API stream RPC failed");
                 }
             },
             Err(e) => {
-                record_workload_api_rotation_failure(&handle);
+                record_workload_api_rotation_failure(&handle, config.metrics_source);
                 error!(error = %e, "failed to connect to Workload API agent");
             }
         }
@@ -237,7 +285,11 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
     }
 }
 
-fn record_workload_api_rotation_failure(handle: &SvidFetchHandle) {
+fn record_workload_api_rotation_failure(
+    handle: &SvidFetchHandle,
+    metrics_source: FetchLoopMetricsSource,
+) {
+    metrics_source.set_ca_health(false);
     let spiffe_id = handle
         .snapshot()
         .as_ref()
@@ -246,25 +298,26 @@ fn record_workload_api_rotation_failure(handle: &SvidFetchHandle) {
         .unwrap_or_else(|| "unknown".to_string());
     crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
         &spiffe_id,
-        "workload_api",
+        metrics_source.source_label(),
     );
 }
 
-fn record_fetch_bundle_metrics(bundle: &SvidBundle) {
+fn record_fetch_bundle_metrics(bundle: &SvidBundle, metrics_source: FetchLoopMetricsSource) {
+    let source = metrics_source.source_label();
     crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_seconds(
         &bundle.spiffe_id,
-        "workload_api",
+        source,
         time_until_expiry(bundle).as_secs(),
     );
     crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
         bundle.trust_bundles.local.trust_domain.as_str(),
-        "workload_api",
+        source,
         bundle.trust_bundles.local.x509_authorities.as_slice(),
     );
     for federated in bundle.trust_bundles.federated.values() {
         crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
             federated.trust_domain.as_str(),
-            "workload_api",
+            source,
             federated.x509_authorities.as_slice(),
         );
     }
@@ -274,7 +327,7 @@ fn record_fetch_bundle_metrics(bundle: &SvidBundle) {
 /// without round-tripping through the agent. Not intended for production
 /// flows.
 pub fn install_test_bundle(handle: &SvidFetchHandle, bundle: SvidBundle) {
-    handle.install(bundle);
+    handle.install(bundle, FetchLoopMetricsSource::WorkloadApi);
 }
 
 /// Required by the rotation module: convert a bundle's notAfter into a
