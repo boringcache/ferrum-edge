@@ -106,7 +106,7 @@ What it drives against live Hydra:
    fan out; reserved `Authorization` mapping is rejected at config time;
    client-supplied claim destinations are overwritten only with verified values.
 5. Negatives: wrong state, missing correlation cookie, nonce mismatch (Hydra
-   signs a different nonce than Ferrum stored), wrong issuer via explicit live
+   signs a different nonce than Ferrum sealed into the pending-flow cookie), wrong issuer via explicit live
    endpoints (signed-token `iss` rejection), wrong audience, and live token
    endpoint + unrelated JWKS (signature failure). Subject is proven positively
    via successful login; multi-audience `azp` enforcement remains unit-covered.
