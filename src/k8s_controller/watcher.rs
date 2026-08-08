@@ -829,13 +829,12 @@ pub(crate) async fn run_watcher_generations<S, F>(
             // that wake-up from `refresh_requested` alone would both mislabel
             // the log and inflate the long-standing `watch_idle_relists`
             // metric with demand-driven refreshes.
-            let (deadline, relist_for_evidence_refresh) =
-                match (idle_deadline, refresh_deadline) {
-                    (Some(idle), Some(refresh)) if refresh <= idle => (Some(refresh), true),
-                    (Some(idle), Some(_)) | (Some(idle), None) => (Some(idle), false),
-                    (None, Some(refresh)) => (Some(refresh), true),
-                    (None, None) => (None, false),
-                };
+            let (deadline, relist_for_evidence_refresh) = match (idle_deadline, refresh_deadline) {
+                (Some(idle), Some(refresh)) if refresh <= idle => (Some(refresh), true),
+                (Some(idle), Some(_)) | (Some(idle), None) => (Some(idle), false),
+                (None, Some(refresh)) => (Some(refresh), true),
+                (None, None) => (None, false),
+            };
 
             tokio::select! {
                 biased;

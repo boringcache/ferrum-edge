@@ -298,7 +298,8 @@ impl K8sConfigRevisionTracker {
     /// Non-blocking and safe to call from inside the publication gate: `watch`
     /// stores one value and wakes subscribers without allocating or awaiting.
     pub fn request_evidence_refresh(&self) {
-        self.evidence_refresh_requests.fetch_add(1, Ordering::Relaxed);
+        self.evidence_refresh_requests
+            .fetch_add(1, Ordering::Relaxed);
         self.refresh_requests.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });

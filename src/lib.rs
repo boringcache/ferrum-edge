@@ -7870,8 +7870,7 @@ pub mod _test_support {
             Box::pin(std::future::ready(next))
         });
 
-        let metrics =
-            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
+        let metrics = std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
         let task = run_watcher_generations(
             target,
             initial_writer,
