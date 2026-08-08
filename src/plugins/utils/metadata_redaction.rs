@@ -25,11 +25,11 @@
 //! `ai_total_tokens` stay visible.
 //!
 //! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
-//! and camelCase spellings under a leading `_` + first segment `dedup`) are
-//! never emitted into transaction-log projections at all (omitted, not
-//! redacted). Typed request state is the primary home for that material; this
-//! filter is the shared fail-closed contract if any producer still writes the
-//! legacy keys.
+//! and camelCase spellings under a leading `_` + first segment `dedup`) and
+//! internal mesh-metrics plans/markers under `mesh.metrics.*` are never emitted
+//! into transaction-log projections at all (omitted, not redacted). Typed
+//! request state is the primary home for deduplication material; the mesh
+//! metrics namespace coordinates metric production and is not user metadata.
 
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -71,6 +71,9 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
 /// in transaction-log or audit projections. Prefer typed non-serializable
 /// request state; this prefix is the fail-closed observability contract.
 pub const INTERNAL_ONLY_METADATA_KEY_PREFIX: &str = "_dedup_";
+
+/// Prefix reserved for internal mesh metric plans and lifecycle markers.
+pub const INTERNAL_ONLY_MESH_METRICS_PREFIX: &str = "mesh.metrics.";
 
 /// Placeholder string written in place of sensitive metadata values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
@@ -245,14 +248,25 @@ fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
 /// Returns true when the key is request-private lifecycle state that must be
 /// omitted from every transaction-log / audit projection.
 ///
-/// Fail-closed across case, delimiter, and camelCase spellings of the reserved
+/// Fail-closed across ASCII case for the reserved `mesh.metrics.*` namespace,
+/// and across case, delimiter, and camelCase spellings of the reserved
 /// `_dedup_*` namespace: a leading `_` whose first alphanumeric segment is
-/// `dedup` (ASCII case-insensitive). Canonical producer names still use
+/// `dedup`. Canonical dedup producers still use
 /// [`INTERNAL_ONLY_METADATA_KEY_PREFIX`]; this matcher is the shared
 /// observability contract if residual lifecycle keys appear under any of those
 /// spellings. Non-prefixed names (`dedup_key`, `request_dedup_*`) and longer
 /// first segments (`_deduplication`) stay observable.
 pub fn is_internal_only_metadata_key(key: &str) -> bool {
+    if key
+        .as_bytes()
+        .get(..INTERNAL_ONLY_MESH_METRICS_PREFIX.len())
+        .is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(INTERNAL_ONLY_MESH_METRICS_PREFIX.as_bytes())
+        })
+    {
+        return true;
+    }
+
     if !key.as_bytes().first().is_some_and(|byte| *byte == b'_') {
         return false;
     }

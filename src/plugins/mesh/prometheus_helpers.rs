@@ -85,6 +85,16 @@ pub struct MeshRequestKey {
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+/// Stamped by the single enabled process-global `prometheus_metrics` plugin
+/// when its request/stream hook actually observed this transaction.
+///
+/// Workload-metrics producers and body scanners require this marker before
+/// updating the global registry. Mesh mode auto-injects `workload_metrics`, but
+/// it deliberately does not auto-inject a Prometheus exporter; without this
+/// gate, the opened half of a TCP lifecycle and gRPC body scanners would still
+/// run in deployments where `/metrics` was otherwise plugin-gated silent.
+pub const MESH_PROMETHEUS_METRICS_OBSERVED_METADATA: &str =
+    "mesh.metrics.prometheus_metrics_observed";
 /// Stamped by `workload_metrics::on_stream_connect` when that plugin actually
 /// observed the stream. Stream-path lifecycle finalizers require this marker:
 /// mesh routing/security setup may pre-populate other `mesh.*` metadata before
@@ -1749,15 +1759,17 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
     key
 }
 
-/// True when `workload_metrics` actually observed a mesh TCP connection.
+/// True when both metric plugins actually observed a mesh TCP connection.
 ///
 /// Other mesh paths stamp routing/security `mesh.*` metadata before the plugin
-/// chain. Requiring the observation marker prevents an earlier plugin rejection
-/// from synthesizing workload-metric lifecycle series under incomplete/default
-/// labels. The request protocol still defaults to `tcp` exactly as the key
-/// builder does.
+/// chain. Requiring both observation markers prevents an earlier plugin
+/// rejection from synthesizing workload-metric lifecycle series under
+/// incomplete/default labels and keeps mesh mode silent when its auto-injected
+/// `workload_metrics` plugin has no configured Prometheus exporter. The request
+/// protocol still defaults to `tcp` exactly as the key builder does.
 pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
+    metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
+        && metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
         && metadata
             .get("mesh.request_protocol")
             .or_else(|| metadata.get("request_protocol"))
@@ -1770,7 +1782,8 @@ pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
 }
 
 /// Finalize mesh `TCP_OPENED_CONNECTIONS` once for a stream that reached
-/// workload-metrics observation (proved by
+/// Prometheus and workload-metrics observation (proved by
+/// [`MESH_PROMETHEUS_METRICS_OBSERVED_METADATA`] and
 /// [`MESH_WORKLOAD_METRICS_OBSERVED_METADATA`]).
 ///
 /// Call from the stream path after the last `on_stream_connect` hook that
@@ -1799,13 +1812,14 @@ pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
     normalized == "grpc" || normalized.starts_with("grpc-")
 }
 
-/// True when request metadata identifies a gRPC (or gRPC-Web) transaction that
+/// True when the Prometheus hook observed a gRPC (or gRPC-Web) transaction that
 /// should populate authoritative length-prefixed message counters.
 pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bool {
-    metadata
-        .get("request_protocol")
-        .or_else(|| metadata.get("mesh.request_protocol"))
-        .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
+    metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
+        && metadata
+            .get("request_protocol")
+            .or_else(|| metadata.get("mesh.request_protocol"))
+            .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
 }
 
 /// Record a complete buffered gRPC body with store/fetch_max semantics so
