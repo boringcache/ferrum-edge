@@ -150,6 +150,8 @@ fn every_rejection_reason_is_specific_and_leaks_no_path() {
         UnixSocketPathRejection::InteriorNul,
         UnixSocketPathRejection::ControlCharacter,
         UnixSocketPathRejection::TooLong,
+        UnixSocketPathRejection::MissingSocketPathTag,
+        UnixSocketPathRejection::ConflictingTransportTags,
         UnixSocketPathRejection::ContainmentNotConfigured,
         UnixSocketPathRejection::InvalidContainmentRoot,
         UnixSocketPathRejection::OutsideAllowedRoots,
@@ -252,6 +254,13 @@ fn containment_roots_are_normalized_conservatively() {
     assert!(
         err.contains("FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS"),
         "the startup error must name the offending setting: {err}"
+    );
+    let hostile = "/run/ferrum\nforged-log-record";
+    let err = validate_allowed_roots(&roots(&[hostile]))
+        .expect_err("a control character in a root must fail startup");
+    assert!(
+        !err.contains(hostile) && err.contains("entry 1"),
+        "the diagnostic must identify the entry without interpolating a hostile path: {err:?}"
     );
 }
 

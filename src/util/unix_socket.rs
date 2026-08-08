@@ -111,6 +111,15 @@ pub enum UnixSocketPathRejection {
     /// The path does not fit `sockaddr_un.sun_path` on every supported
     /// platform (see [`MAX_UNIX_SOCKET_PATH_BYTES`]).
     TooLong,
+    /// The secondary h2c marker was present without the primary socket-path
+    /// marker. A partially stripped transport identity must fail closed rather
+    /// than falling through to the target's placeholder TCP address.
+    MissingSocketPathTag,
+    /// A Unix transport marker was combined with another reserved `mesh.*`
+    /// tag. Mesh transport identities are mutually exclusive; accepting a
+    /// mixed carrier would let tag ordering choose a different security
+    /// boundary than the materializer declared.
+    ConflictingTransportTags,
     /// No containment roots are configured
     /// (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` is unset or empty), so no Unix
     /// socket path is admissible. This is the DEFAULT: the feature is opt-in
@@ -182,6 +191,12 @@ impl UnixSocketPathRejection {
             Self::InteriorNul => "unix socket path contains a NUL byte",
             Self::ControlCharacter => "unix socket path contains a control character",
             Self::TooLong => "unix socket path exceeds the portable sockaddr_un limit",
+            Self::MissingSocketPathTag => {
+                "unix socket h2c marker is missing its socket path marker"
+            }
+            Self::ConflictingTransportTags => {
+                "unix socket target carries conflicting reserved mesh transport tags"
+            }
             Self::ContainmentNotConfigured => {
                 "unix socket backends are disabled: FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS is unset"
             }
@@ -284,11 +299,13 @@ pub fn normalize_allowed_root(root: &str) -> Result<&str, UnixSocketPathRejectio
 /// the offending entry so the process can refuse to start rather than silently
 /// running with a narrower (or wider) allowlist than was written.
 pub fn validate_allowed_roots(roots: &[String]) -> Result<(), String> {
-    for root in roots {
+    for (index, root) in roots.iter().enumerate() {
         if normalize_allowed_root(root).is_err() {
             return Err(format!(
-                "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS: '{root}' is not a usable containment root \
-                 (must be an absolute, normalized directory path other than '/')"
+                "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS entry {} is not a usable containment root \
+                 (must be an absolute, normalized directory path other than '/'); the value is \
+                 withheld because filesystem paths are not log-safe",
+                index + 1
             ));
         }
     }

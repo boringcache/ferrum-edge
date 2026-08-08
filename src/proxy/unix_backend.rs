@@ -192,7 +192,19 @@ pub fn resolve_unix_socket_target<'a>(
     target: &'a UpstreamTarget,
     allowed_roots: &[String],
 ) -> Option<Result<&'a str, UnixSocketPathRejection>> {
-    let path = target.tags.get(MESH_UNIX_SOCKET_TAG)?.as_str();
+    if !target_is_unix_backend(target) {
+        return None;
+    }
+    if target.tags.keys().any(|key| {
+        key.starts_with("mesh.")
+            && key != MESH_UNIX_SOCKET_TAG
+            && key != MESH_UNIX_SOCKET_H2C_TAG
+    }) {
+        return Some(Err(UnixSocketPathRejection::ConflictingTransportTags));
+    }
+    let Some(path) = target.tags.get(MESH_UNIX_SOCKET_TAG).map(String::as_str) else {
+        return Some(Err(UnixSocketPathRejection::MissingSocketPathTag));
+    };
     Some(admit_configured_path(path, allowed_roots).map(|()| path))
 }
 
@@ -201,6 +213,7 @@ pub fn resolve_unix_socket_target<'a>(
 #[inline]
 pub fn target_is_unix_backend(target: &UpstreamTarget) -> bool {
     target.tags.contains_key(MESH_UNIX_SOCKET_TAG)
+        || target.tags.contains_key(MESH_UNIX_SOCKET_H2C_TAG)
 }
 
 /// Whether this Unix target speaks h2c prior-knowledge HTTP/2 (and therefore

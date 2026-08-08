@@ -11,13 +11,18 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferrum_edge::proxy::unix_backend::{UnixBackendError, connect_admitted};
-use ferrum_edge::util::unix_socket::admit_socket_for_connect;
+use ferrum_edge::config::types::UpstreamTarget;
+use ferrum_edge::proxy::unix_backend::{
+    MESH_UNIX_SOCKET_H2C_TAG, MESH_UNIX_SOCKET_TAG, UnixBackendError, connect_admitted,
+    resolve_unix_socket_target, target_is_unix_backend,
+};
+use ferrum_edge::util::unix_socket::{UnixSocketPathRejection, admit_socket_for_connect};
 
 /// A listener that accepts and then counts every byte it is ever sent.
 ///
@@ -81,6 +86,49 @@ fn roots(root: &Path) -> Vec<String> {
 /// bytes, so "zero bytes" is evidence rather than a race the test won.
 async fn settle() {
     tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+fn tagged_target(tags: &[(&str, &str)]) -> UpstreamTarget {
+    UpstreamTarget {
+        host: "127.0.0.1".to_string(),
+        port: 8443,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>(),
+        locality: None,
+        path: None,
+    }
+}
+
+/// Either half of the Unix transport identity reserves the target. A carrier
+/// that loses only the primary path tag must be refused, never downgraded to
+/// the placeholder TCP address.
+#[test]
+fn a_lone_h2c_marker_fails_closed_as_a_malformed_unix_target() {
+    let target = tagged_target(&[(MESH_UNIX_SOCKET_H2C_TAG, "true")]);
+    assert!(target_is_unix_backend(&target));
+    assert_eq!(
+        resolve_unix_socket_target(&target, &["/run/ferrum".to_string()]),
+        Some(Err(UnixSocketPathRejection::MissingSocketPathTag))
+    );
+}
+
+/// Reserved mesh transport identities are mutually exclusive. In particular,
+/// a carrier must not be able to make call-site ordering choose Unix instead
+/// of an mTLS/HBONE boundary (or vice versa).
+#[test]
+fn mixed_reserved_mesh_transport_tags_are_rejected() {
+    let target = tagged_target(&[
+        (MESH_UNIX_SOCKET_TAG, "/run/ferrum/app.sock"),
+        ("mesh.mtls", "true"),
+    ]);
+    assert_eq!(
+        resolve_unix_socket_target(&target, &["/run/ferrum".to_string()]),
+        Some(Err(UnixSocketPathRejection::ConflictingTransportTags))
+    );
 }
 
 /// THE CHECK-TO-CONNECT SWAP, deterministically: admit socket A, replace the
