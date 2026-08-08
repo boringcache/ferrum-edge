@@ -3823,12 +3823,10 @@ impl Plugin for PrometheusMetrics {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
-        ctx.metadata
-            .get_or_insert_with(Default::default)
-            .insert(
-                prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-                "1".to_string(),
-            );
+        ctx.metadata.get_or_insert_with(Default::default).insert(
+            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        );
         PluginResult::Continue
     }
 

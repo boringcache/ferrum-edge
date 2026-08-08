@@ -705,8 +705,16 @@ fn test_summary_omits_internal_mesh_metrics_metadata() {
     let json = serde_json::to_string(&summary).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert!(parsed["metadata"].get("mesh.metrics.prometheus_metrics_observed").is_none());
-    assert!(parsed["metadata"].get("Mesh.Metrics.Request_Count.Tag_Overrides").is_none());
+    assert!(
+        parsed["metadata"]
+            .get("mesh.metrics.prometheus_metrics_observed")
+            .is_none()
+    );
+    assert!(
+        parsed["metadata"]
+            .get("Mesh.Metrics.Request_Count.Tag_Overrides")
+            .is_none()
+    );
     assert_eq!(parsed["metadata"]["mesh.source.workload"], "frontend");
     assert!(!json.contains("internal-plan"));
 }
@@ -947,7 +955,11 @@ fn test_stream_summary_omits_internal_mesh_metrics_metadata() {
     let json = serde_json::to_string(&summary).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert!(parsed["metadata"].get("mesh.metrics.tcp_opened_finalized").is_none());
+    assert!(
+        parsed["metadata"]
+            .get("mesh.metrics.tcp_opened_finalized")
+            .is_none()
+    );
     assert_eq!(parsed["metadata"]["mesh.destination.service"], "db");
 }
 
