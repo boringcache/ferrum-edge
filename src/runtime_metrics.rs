@@ -103,7 +103,7 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 17] = [
+const ERROR_CLASSES: [&str; 18] = [
     "connection_timeout",
     "connection_refused",
     "connection_reset",
@@ -120,6 +120,7 @@ const ERROR_CLASSES: [&str; 17] = [
     "port_exhaustion",
     "graceful_remote_close",
     "dispatch_policy_rejected",
+    "backend_connection_limit",
     "request_error",
 ];
 
@@ -1463,6 +1464,7 @@ mod tests {
             ErrorClass::PortExhaustion,
             ErrorClass::GracefulRemoteClose,
             ErrorClass::DispatchPolicyRejected,
+            ErrorClass::BackendConnectionLimit,
             ErrorClass::RequestError,
         ];
 

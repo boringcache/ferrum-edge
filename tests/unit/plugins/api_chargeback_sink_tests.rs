@@ -2473,6 +2473,8 @@ async fn connect_method_is_not_classified_as_websocket() {
             response_status_code: 200,
             bytes_sent: 10,
             bytes_received: 20,
+            grpc_request_messages: 0,
+            grpc_response_messages: 0,
             ..TransactionSummary::default()
         })
         .await;
@@ -4891,6 +4893,8 @@ fn billable_summary(request_id: &str) -> TransactionSummary {
         response_status_code: 200,
         bytes_sent: 100,
         bytes_received: 200,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         ..TransactionSummary::default()
     };
     summary

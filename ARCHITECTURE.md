@@ -20,6 +20,8 @@ Ferrum Edge is a high-performance edge proxy built in Rust that follows a modula
 
 ## Project Structure
 
+The directory trees below are representative excerpts; see the cited paths for the complete layout.
+
 ### **Core Application (`src/`)**
 
 ```
@@ -31,7 +33,7 @@ src/
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS support
 ├── consumer_index.rs          # Consumer lookup index for auth plugins
 ├── health_check.rs            # Active and passive backend health checking
-├── load_balancer.rs           # Load balancing (RoundRobin, Weighted, LeastConn, ConsistentHash, Random)
+├── load_balancer.rs           # Load balancing (six algorithms; see docs/load_balancing.md)
 ├── plugin_cache.rs            # Plugin configuration cache with atomic updates
 ├── retry.rs                   # Retry logic with backoff strategies
 ├── router_cache.rs            # Pre-sorted route table with bounded path cache
@@ -266,8 +268,8 @@ TLS configuration for client connections with optional mutual authentication:
 
 **Listener Architecture**:
 - **Separate HTTP and HTTPS listeners** for clear protocol separation
-- **HTTP listener**: Always enabled, handles plain text traffic
-- **HTTPS listener**: Enabled only when TLS certificates are configured
+- **HTTP listener**: Enabled by default; `FERRUM_PROXY_HTTP_PORT=0` disables plaintext proxy traffic
+- **HTTPS listener**: Enabled only when TLS certificates are configured and `FERRUM_PROXY_HTTPS_PORT` is non-zero
 - **No protocol conflicts**: Each listener handles its protocol exclusively
 - **Standard port conventions**: HTTP (8000), HTTPS (8443), both configurable
 
@@ -277,14 +279,16 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 
 **Key Features**:
 - **Separate Admin Listeners**: Independent from proxy listeners
-- **Admin HTTP**: Always enabled on port 9000 (configurable)
+- **Admin HTTP**: Enabled by default on loopback (`FERRUM_ADMIN_BIND_ADDRESS`, default `127.0.0.1`) port 9000 (`FERRUM_ADMIN_HTTP_PORT`); set port `0` to disable plaintext admin
 - **Admin HTTPS**: Enabled when admin TLS certificates are configured on port 9443 (configurable)
+- **Safe-by-default bind**: In writable `database`/`cp` modes, a non-loopback plaintext admin bind without `FERRUM_ADMIN_ALLOWED_CIDRS` is a hard startup error unless `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` (dev only)
 - **Admin mTLS**: Client certificate verification for admin access
-- **JWT Authentication**: Required on both HTTP and HTTPS endpoints
+- **JWT Authentication**: Required for management routes on both HTTP and HTTPS. `/live` is minimal and unauthenticated; `/health`, `/status`, and `/overload` expose only coarse unauthenticated state, while `/metrics` and detailed diagnostics require observability authorization
 - **No-Verify Mode**: Testing mode for admin API TLS
 
 **Admin Listener Architecture**:
-- **Admin HTTP Listener**: `FERRUM_ADMIN_HTTP_PORT` (default 9000)
+- **Admin bind address**: `FERRUM_ADMIN_BIND_ADDRESS` (default `127.0.0.1`)
+- **Admin HTTP Listener**: `FERRUM_ADMIN_HTTP_PORT` (default 9000; `0` disables plaintext)
 - **Admin HTTPS Listener**: `FERRUM_ADMIN_HTTPS_PORT` (default 9443)
 - **Admin TLS Certificates**: `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`
 - **Admin Client CA Bundle**: `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` for mTLS
@@ -304,14 +308,14 @@ Optional HTTP/3 listener using QUIC transport, enabled via `FERRUM_ENABLE_HTTP3=
 - QUIC-based transport with TLS 1.3 (mandatory per spec)
 - Shares the HTTPS port with HTTP/1.1 and HTTP/2 listeners
 - Configurable idle timeout and max concurrent streams
-- **0-RTT early data is disabled** for security — 0-RTT is vulnerable to replay attacks on non-idempotent operations proxied through the gateway
+- **0-RTT early data** — disabled by default. HTTP/3 can opt in via `FERRUM_TLS_EARLY_DATA_METHODS` (method allowlist; non-GET methods log replay-risk warnings). The allowlist is enforced when each request is admitted: disallowed early requests receive `425 Too Early`, while allowed 0-RTT requests forward `Early-Data: 1` to backends. HTTPS/HTTP/1.1 and HTTP/2 frontends keep 0-RTT disabled even when the env var is set (tokio-rustls cannot expose per-request early-data state)
 
 ### **4. Load Balancer & Health Checks (`src/load_balancer.rs`, `src/health_check.rs`)**
 
 Distributes traffic across multiple backend targets within an upstream group:
 
 **Key Features**:
-- Five algorithms: round robin, weighted round robin (smooth WRR), least connections, consistent hashing (150 vnodes), random
+- Six algorithms: round robin, weighted round robin (smooth WRR), least connections, least latency, consistent hashing (150 vnodes), random
 - Atomic rebuild on config changes — no requests dropped during reconfiguration
 - Active health checks (periodic HTTP probes) and passive health checks (response monitoring)
 - Passive recovery timer (`healthy_after_seconds`) for automatic target restoration
@@ -416,7 +420,7 @@ All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lo
 | **File** | YAML/JSON file | Config loaded once at startup. File can be deleted/corrupted afterward with zero impact. SIGHUP reload gracefully falls back to previous config on parse errors. |
 | **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. If `FERRUM_DB_FAILOVER_URLS` is configured, failover URLs are tried in order before marking the DB as unavailable. If `FERRUM_DB_READ_REPLICA_URL` is configured, polling reads are offloaded to the replica (falls back to primary if replica is unreachable). |
 | **Control Plane** | SQL database | Polling loop logs a warning. Does not broadcast stale updates to Data Planes. DPs retain their last known config. Admin API reads fall back to the in-memory cached config. |
-| **Data Plane** | Control Plane (gRPC) | Auto-reconnects to CP every 5 seconds. Continues serving traffic with cached config. Admin API reads served from cached config with `X-Data-Source: cached` header. |
+| **Data Plane** | Control Plane (gRPC) | Priority-ordered multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) with jittered exponential backoff (1s → 30s cap, ±25% jitter) between reconnect attempts. Continues serving traffic with cached config. Admin API reads served from cached config with `X-Data-Source: cached` header. |
 
 #### **Admin API Resilience**
 
@@ -426,7 +430,7 @@ Admin API read endpoints (GET proxies, consumers, plugin configs) use a two-tier
 
 Fallback responses include an `X-Data-Source: cached` header so callers can detect stale data. Write operations (POST/PUT/DELETE) require a live database and will return `503 Service Unavailable` if the database is offline — there is no way to safely write without a data store.
 
-The `/health` endpoint reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages.
+Authenticated `/health` detail reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages. Unauthenticated probes receive only `status` and `ready`.
 
 ### **8. DNS System (`src/dns/`)**
 
@@ -435,7 +439,7 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 **Key Features**:
 - In-memory `DashMap` caching with configurable TTL
 - **Startup warmup** — resolves all proxy backend, upstream target, and plugin endpoint hostnames (deduplicated) before accepting requests
-- **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
+- **Background refresh** — proactively re-resolves entries at a configurable TTL threshold (default 90%, `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`) before expiration
 - **`DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementation that routes all HTTP client DNS lookups (proxy backends, health checks, and plugin outbound calls) through the cache, keeping DNS off the hot request path
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
@@ -587,7 +591,8 @@ export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/global-key.pem"
 The project uses comprehensive testing at multiple levels:
 
 ### **Unit Tests**
-- All tests located in `tests/` directory (no inline tests in `src/`)
+- Primary test suites live under `tests/` (unit, integration, functional, conformance, performance)
+- Some `src/` modules also include inline `#[cfg(test)]` modules (e.g. `overload.rs`, `load_balancer.rs`, `cli.rs`); new coverage should prefer external tests under `tests/` per project policy
 - Test individual functions and modules
 - Fast execution with minimal dependencies
 

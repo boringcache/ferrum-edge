@@ -75,6 +75,8 @@ fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSu
         body_completed: true,
         bytes_sent: 32,
         bytes_received: 64,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
