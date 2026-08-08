@@ -13,13 +13,19 @@
 //!    dispatch path never falls back to the target's placeholder `host:port`
 //!    (which nothing listens on). This mirrors the `mesh.hbone` / `mesh.mtls`
 //!    contract.
-//! 2. **The path is re-admitted at dial time, against the CONTAINMENT
-//!    allowlist.** The tag rides `UpstreamTarget.tags`, decoded from config that
-//!    may have crossed the CP/DP, file, or xDS boundary, so the dial re-runs the
-//!    full [`crate::util::unix_socket::admit_socket_for_connect`] gate —
-//!    containment, symlink-resolved containment, socket file type, owner uid,
-//!    and mode — rather than trusting the value that reached it. With no
-//!    configured roots (the default) every tagged target is refused.
+//! 2. **The path is re-admitted at dial time, and the CONNECTION is bound to the
+//!    admitted identity.** The tag rides `UpstreamTarget.tags`, decoded from
+//!    config that may have crossed the CP/DP, file, or xDS boundary, so the dial
+//!    re-runs the full [`crate::util::unix_socket::admit_socket_for_connect`]
+//!    gate — containment, symlink-resolved containment, the whole
+//!    parent-to-root directory chain, socket file type, owner uid, and mode —
+//!    rather than trusting the value that reached it. With no configured roots
+//!    (the default) every tagged target is refused. Admission yields an
+//!    [`crate::util::unix_socket::AdmittedUnixSocket`], and
+//!    [`connect_admitted`] dials THAT canonical path and then proves, before
+//!    writing a single request byte, that the connected peer's uid equals the
+//!    checked socket owner's uid and that the path still names the checked
+//!    inode. A socket swapped between check and connect is closed unused.
 //! 3. **The wire protocol is carried, never inferred.**
 //!    [`MESH_UNIX_SOCKET_H2C_TAG`] is resolved at translation from the
 //!    listener's declared `port.protocol`; an absent tag is HTTP/1.1. h2c
@@ -32,6 +38,8 @@
 //! so a hand-authored pod label can never forge them.
 
 use crate::config::types::UpstreamTarget;
+#[cfg(unix)]
+use crate::util::unix_socket::AdmittedUnixSocket;
 use crate::util::unix_socket::{UnixSocketPathRejection, admit_configured_path};
 
 /// Reserved `UpstreamTarget.tags` key carrying the absolute path of the
@@ -68,6 +76,25 @@ pub enum UnixBackendError {
     Connect(std::io::Error),
     /// The connect did not complete within the effective timeout.
     ConnectTimeout { timeout_ms: u64 },
+    /// The kernel would not report the connected peer's credentials, so the
+    /// peer's identity is unknowable. Fail closed: an unverifiable peer is
+    /// treated exactly like a mismatched one.
+    PeerCredentialsUnavailable(std::io::Error),
+    /// The connected peer's uid is not the uid that owned the socket admission
+    /// checked. Either the socket was replaced between check and connect, or
+    /// the object at that path was never the application's. Refused before any
+    /// request byte is written.
+    ///
+    /// Note this is an EXACT-uid comparison against the checked owner, not
+    /// membership in the configured `allowed_uids` allowlist: the allowlist
+    /// decides which sockets may be admitted at all, while this decides that
+    /// the connection reached the very socket that was admitted.
+    PeerUidMismatch { expected: u32, actual: u32 },
+    /// The admitted path no longer names the filesystem object admission
+    /// checked (`(dev, ino)`, type, or owner changed), or that object could no
+    /// longer be inspected. This is the check-to-connect swap, caught after the
+    /// connect and before any request byte.
+    SocketIdentityChanged,
     /// The h2c prior-knowledge HTTP/2 client handshake failed on an
     /// `http2`/`grpc`-declared listener. The socket accepted the connection but
     /// the application does not speak h2c on it — a configuration mismatch, not
@@ -91,6 +118,18 @@ impl std::fmt::Display for UnixBackendError {
             Self::ConnectTimeout { timeout_ms } => {
                 write!(f, "unix backend connect timed out after {timeout_ms}ms")
             }
+            Self::PeerCredentialsUnavailable(err) => {
+                write!(f, "unix backend peer credentials unavailable: {err}")
+            }
+            Self::PeerUidMismatch { expected, actual } => write!(
+                f,
+                "unix backend peer uid {actual} does not match the admitted socket owner uid \
+                 {expected}"
+            ),
+            Self::SocketIdentityChanged => write!(
+                f,
+                "unix backend socket was replaced between admission and connect"
+            ),
             Self::H2Handshake(err) => {
                 write!(f, "unix backend h2c handshake failed: {err}")
             }
@@ -112,14 +151,22 @@ impl UnixBackendError {
     ///   terminal gateway-side policy decision — replaying it anywhere would
     ///   produce the same refusal, and the app is not implicated, so it is
     ///   `DispatchPolicyRejected` (health-neutral, not retried);
+    /// * the three connected-peer refusals are also gateway-side policy: the
+    ///   peer is not the admitted socket's owner, or its identity could not be
+    ///   established. They are health-neutral on purpose — the legitimate
+    ///   application must not be ejected because an attacker raced its socket —
+    ///   and they are not retried, because a retry would repeat the dial into
+    ///   the same substituted object;
     /// * a failed or timed-out connect — or a refused h2c handshake — IS
     ///   evidence the local app is down, wedged, or not speaking its declared
     ///   protocol, so those keep the ordinary connect-phase classes.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
-            Self::InadmissiblePath(_) | Self::PlatformUnsupported => {
-                crate::retry::ErrorClass::DispatchPolicyRejected
-            }
+            Self::InadmissiblePath(_)
+            | Self::PlatformUnsupported
+            | Self::PeerCredentialsUnavailable(_)
+            | Self::PeerUidMismatch { .. }
+            | Self::SocketIdentityChanged => crate::retry::ErrorClass::DispatchPolicyRejected,
             Self::Connect(_) => crate::retry::ErrorClass::ConnectionRefused,
             Self::ConnectTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
             // The handshake completes before any request frame is written, so
@@ -200,14 +247,137 @@ const UNIX_H2C_MAX_FRAME_SIZE: u32 = 16 * 1024;
 #[cfg(unix)]
 const UNIX_H2C_MAX_CONCURRENT_RESET_STREAMS: usize = 1024;
 
-/// Admit `path` at the TOCTOU boundary and dial it, bounded by
-/// `connect_timeout_ms`.
+/// The uid of the process on the other end of a CONNECTED Unix stream.
+///
+/// This is the strong half of the TOCTOU contract: it describes the peer the
+/// bytes would actually reach, not a pathname that may since have been
+/// re-pointed.
+///
+/// Platform contract — the `cfg` list below is exactly the set of Unix targets
+/// on which the kernel reports connected-peer credentials and tokio exposes
+/// them through `UnixStream::peer_cred`:
+///
+/// * **Linux / Android** — `getsockopt(SOL_SOCKET, SO_PEERCRED)` yields a
+///   `struct ucred` captured when the connection was established and never
+///   updated afterwards. On the CONNECTING side that is the credential set of
+///   the process that called `listen(2)`, which is exactly the fact needed
+///   here: it names the peer that will read the request, and the peer cannot
+///   change it after the fact by setuid-ing.
+/// * **Apple / FreeBSD / DragonFly** — `getpeereid(3)`; **NetBSD** —
+///   `LOCAL_PEERCRED`; **illumos / Solaris** — `getpeerucred(3)`. All report the
+///   same connect-time effective uid of the listening peer.
+///
+/// Any other Unix target has no equivalently strong guarantee, so it refuses
+/// Unix backends outright (`PlatformUnsupported`) rather than weakening the
+/// check Linux can actually enforce.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    )
+))]
+fn connected_peer_uid(stream: &tokio::net::UnixStream) -> Result<u32, UnixBackendError> {
+    stream
+        .peer_cred()
+        .map(|cred| cred.uid())
+        .map_err(UnixBackendError::PeerCredentialsUnavailable)
+}
+
+/// Unix target without a connected-peer-credential mechanism: refuse rather
+/// than dial with a weaker guarantee than Linux enforces. See the documented
+/// platform contract on the supported variant of this function.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))
+))]
+fn connected_peer_uid(stream: &tokio::net::UnixStream) -> Result<u32, UnixBackendError> {
+    let _ = stream;
+    Err(UnixBackendError::PlatformUnsupported)
+}
+
+/// Dial an already-admitted socket identity and prove the connection reached
+/// THAT identity before any request byte is written.
+///
+/// The dial targets [`AdmittedUnixSocket::resolved_path`] — the canonical,
+/// symlink-free path admission inspected — so the configured pathname is never
+/// re-resolved and a symlink flipped after admission has nothing to redirect.
+///
+/// After `connect(2)` returns and before the caller may write anything:
+///
+/// 1. the connected peer's uid must equal the checked socket owner's uid
+///    EXACTLY. Not "some uid in `allowed_uids`": the allowlist decides which
+///    sockets may be admitted, this decides that the transport reached the one
+///    that was;
+/// 2. the checked path must still name the same `(dev, ino)`, file type, and
+///    owner. Unlinking and re-binding a socket always yields a new inode, so a
+///    swap performed inside the check-to-connect window is visible here even
+///    when the replacement is owned by the same uid.
+///
+/// Either failure — and an unavailable credential, which is identity ambiguity
+/// and therefore also a failure — drops the stream unused. There is no fallback
+/// to TCP, to the placeholder `host:port`, or to a weaker check.
+#[cfg(unix)]
+pub async fn connect_admitted(
+    admitted: &AdmittedUnixSocket,
+    connect_timeout_ms: u64,
+) -> Result<tokio::net::UnixStream, UnixBackendError> {
+    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
+    let stream = match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        tokio::net::UnixStream::connect(admitted.resolved_path()),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(UnixBackendError::Connect(err)),
+        Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
+    };
+
+    let peer_uid = connected_peer_uid(&stream)?;
+    if peer_uid != admitted.owner_uid() {
+        return Err(UnixBackendError::PeerUidMismatch {
+            expected: admitted.owner_uid(),
+            actual: peer_uid,
+        });
+    }
+    // Fail closed on identity ambiguity: an unreadable path is treated the same
+    // as a changed one.
+    if !admitted.still_names_checked_object().unwrap_or(false) {
+        return Err(UnixBackendError::SocketIdentityChanged);
+    }
+    Ok(stream)
+}
+
+/// Admit `path` at the TOCTOU boundary and dial the resulting checked identity,
+/// bounded by `connect_timeout_ms`.
 ///
 /// The admission re-run here is the SECOND half of the containment contract:
 /// the value reached this process over a CP/DP, file, or xDS boundary, and the
 /// filesystem may have changed since translation admitted it. It checks
-/// containment, symlink-resolved containment, socket file type, owner uid, and
-/// mode — see [`crate::util::unix_socket::admit_socket_for_connect`].
+/// containment, symlink-resolved containment, the full parent-to-root directory
+/// chain, socket file type, owner uid, and mode — see
+/// [`crate::util::unix_socket::admit_socket_for_connect`] — and hands
+/// [`connect_admitted`] the identity to bind the connection to.
 #[cfg(unix)]
 async fn admit_and_connect(
     path: &str,
@@ -215,22 +385,10 @@ async fn admit_and_connect(
     allowed_roots: &[String],
     allowed_uids: &[u32],
 ) -> Result<tokio::net::UnixStream, UnixBackendError> {
-    if let Err(rejection) =
+    let admitted =
         crate::util::unix_socket::admit_socket_for_connect(path, allowed_roots, allowed_uids)
-    {
-        return Err(UnixBackendError::InadmissiblePath(rejection));
-    }
-    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        tokio::net::UnixStream::connect(path),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(err)) => Err(UnixBackendError::Connect(err)),
-        Err(_) => Err(UnixBackendError::ConnectTimeout { timeout_ms }),
-    }
+            .map_err(UnixBackendError::InadmissiblePath)?;
+    connect_admitted(&admitted, connect_timeout_ms).await
 }
 
 /// Dial a co-located Unix-domain STREAM socket for an HTTP/1.1 backend,
@@ -265,8 +423,7 @@ pub async fn dial_unix_h2c_sender(
 ) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
-    let stream =
-        admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
+    let stream = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
 
     let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
     builder

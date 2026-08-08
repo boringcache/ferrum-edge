@@ -1,0 +1,188 @@
+//! The check-to-connect boundary of the Sidecar ingress Unix transport
+//! (issue #3261).
+//!
+//! Path admission alone cannot be atomic with `connect(2)`, so the transport
+//! binds the CONNECTION to the identity admission checked: the connected peer's
+//! uid must equal the checked socket owner's uid, and the checked path must
+//! still name the checked inode. Both assertions run after `connect(2)` and
+//! BEFORE any request byte is written, which is the property these tests prove —
+//! each substituted peer accepts the connection and then observes that zero
+//! bytes ever arrive.
+
+#![cfg(unix)]
+
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use ferrum_edge::proxy::unix_backend::{UnixBackendError, connect_admitted};
+use ferrum_edge::util::unix_socket::{AdmittedUnixSocket, admit_socket_for_connect};
+
+/// A listener that accepts and then counts every byte it is ever sent.
+///
+/// The refusal contract is an ORDERING claim, so the substituted peer has to be
+/// able to observe request bytes if any were written. Accepting (rather than
+/// leaving the backlog untouched) is deliberate: the connect must succeed so
+/// that the *post-connect* identity checks are what refuses.
+struct CountingPeer {
+    bytes: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CountingPeer {
+    fn bind(path: &Path) -> Self {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind substituted peer");
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&bytes);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                counter.fetch_add(n, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self { bytes, task }
+    }
+
+    fn bytes_received(&self) -> usize {
+        self.bytes.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CountingPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn canonical_root(temp: &tempfile::TempDir) -> PathBuf {
+    temp.path().canonicalize().expect("canonicalize temp dir")
+}
+
+fn roots(root: &Path) -> Vec<String> {
+    vec![root.to_str().expect("utf-8 root").to_string()]
+}
+
+/// Give the substituted peer a moment in which it *could* have observed request
+/// bytes, so "zero bytes" is evidence rather than a race the test won.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+/// THE CHECK-TO-CONNECT SWAP, deterministically: admit socket A, replace the
+/// path with a different socket B, then dial the admitted identity. The connect
+/// succeeds — B really is listening — but the inode no longer matches what was
+/// checked, so the stream is dropped unused and B never sees a request byte.
+///
+/// B is bound by this same process, so its owner and peer uid are identical to
+/// A's: the refusal here is the INODE identity check specifically, which is the
+/// only thing that can catch a same-uid substitution.
+#[tokio::test]
+async fn a_socket_swapped_after_admission_is_refused_before_any_request_byte() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = canonical_root(&temp);
+    let path = root.join("app.sock");
+
+    let original = std::os::unix::net::UnixListener::bind(&path).expect("bind original socket");
+    let admitted = admit_socket_for_connect(path.to_str().expect("utf-8"), &roots(&root), &[])
+        .expect("the original socket is admitted");
+
+    // The swap: unlink the admitted socket and bind a different object at the
+    // same path. Exactly what an attacker with write access to the directory
+    // would do inside the check-to-connect window.
+    drop(original);
+    std::fs::remove_file(&path).expect("unlink the admitted socket");
+    let substituted = CountingPeer::bind(&path);
+
+    let outcome = connect_admitted(&admitted, 2_000).await;
+    assert!(
+        matches!(outcome, Err(UnixBackendError::SocketIdentityChanged)),
+        "a swapped socket must be refused as an identity change, got {outcome:?}"
+    );
+
+    settle().await;
+    assert_eq!(
+        substituted.bytes_received(),
+        0,
+        "the substituted peer must never receive a request byte"
+    );
+}
+
+/// The connected-peer credential gate: the peer's uid must equal the CHECKED
+/// socket owner's uid exactly. Asserted by handing `connect_admitted` an
+/// identity that claims a different owner for a socket this process really
+/// owns — the mismatch is refused after `connect(2)` and before any byte.
+#[tokio::test]
+async fn a_peer_uid_that_differs_from_the_checked_owner_is_refused_before_any_request_byte() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = canonical_root(&temp);
+    let path = root.join("app.sock");
+    let peer = CountingPeer::bind(&path);
+
+    let metadata = std::fs::symlink_metadata(&path).expect("stat socket");
+    // SAFETY: `geteuid` takes no arguments, reads process state, never fails.
+    let euid = unsafe { libc::geteuid() };
+    let foreign_uid = euid.wrapping_add(1);
+    let claimed =
+        AdmittedUnixSocket::new(path.clone(), foreign_uid, metadata.dev(), metadata.ino());
+
+    let outcome = connect_admitted(&claimed, 2_000).await;
+    match outcome {
+        Err(UnixBackendError::PeerUidMismatch { expected, actual }) => {
+            assert_eq!(expected, foreign_uid);
+            assert_eq!(actual, euid);
+        }
+        other => panic!("a peer uid mismatch must be refused, got {other:?}"),
+    }
+
+    settle().await;
+    assert_eq!(
+        peer.bytes_received(),
+        0,
+        "a peer whose uid does not match the checked owner must never receive a request byte"
+    );
+
+    // The SAME peer is accepted once the identity names its real owner, proving
+    // the refusal above was the uid comparison and nothing else.
+    let honest = AdmittedUnixSocket::new(path, euid, metadata.dev(), metadata.ino());
+    assert!(
+        connect_admitted(&honest, 2_000).await.is_ok(),
+        "the real owner's identity must still connect"
+    );
+}
+
+/// A socket that vanishes inside the window is identity ambiguity, and ambiguity
+/// fails closed rather than dialing whatever appears next.
+#[tokio::test]
+async fn an_unlinked_socket_is_refused_rather_than_dialed_blind() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = canonical_root(&temp);
+    let path = root.join("app.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+    let admitted = admit_socket_for_connect(path.to_str().expect("utf-8"), &roots(&root), &[])
+        .expect("the socket is admitted");
+
+    drop(listener);
+    std::fs::remove_file(&path).expect("unlink socket");
+
+    let outcome = connect_admitted(&admitted, 2_000).await;
+    assert!(
+        matches!(outcome, Err(UnixBackendError::Connect(_))),
+        "an absent socket must fail closed at connect, got {outcome:?}"
+    );
+}

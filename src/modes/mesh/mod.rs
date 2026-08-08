@@ -33005,10 +33005,7 @@ mod tests {
         let runtime = unix_ingress_runtime(spiffe);
         let slice = unix_ingress_slice(
             spiffe,
-            vec![unix_ingress_listener(
-                8443,
-                "/var/run/ferrum-test/app.sock",
-            )],
+            vec![unix_ingress_listener(8443, "/var/run/ferrum-test/app.sock")],
         );
 
         let config =

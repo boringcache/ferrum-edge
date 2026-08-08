@@ -4509,9 +4509,9 @@ fn grpc_mesh_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'stat
         // the H1/H2 frontend (issue #3261). Mesh capture is TCP-only, so an H3
         // frontend cannot reach a Sidecar ingress listener in practice.
         grpc_proxy::GrpcMeshDispatch::UnixSocketH2c
-        | grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => Some(
-            "gRPC over a unix-socket backend is not supported on the HTTP/3 frontend",
-        ),
+        | grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
+            Some("gRPC over a unix-socket backend is not supported on the HTTP/3 frontend")
+        }
     }
 }
 

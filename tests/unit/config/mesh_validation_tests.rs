@@ -2066,12 +2066,10 @@ fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
     );
     assert_eq!(
         resolved.backend(&allowed),
-        Some(
-            ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
-                path: "/var/run/app.sock".to_string(),
-                h2c: false,
-            }
-        )
+        Some(ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+            path: "/var/run/app.sock".to_string(),
+            h2c: false,
+        })
     );
 
     // A root that does not contain the socket refuses it, even though the path
@@ -2099,12 +2097,10 @@ fn ingress_resolve_maps_declared_protocol_to_the_unix_wire_protocol() {
         );
         assert_eq!(
             resolved.backend(&allowed),
-            Some(
-                ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
-                    path: "/var/run/app.sock".to_string(),
-                    h2c: expected_h2c,
-                }
-            )
+            Some(ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+                path: "/var/run/app.sock".to_string(),
+                h2c: expected_h2c,
+            })
         );
     }
 }
@@ -2156,7 +2152,9 @@ fn ingress_resolve_rejects_hostile_unix_socket_paths() {
     let long = format!("unix:///{}", "a".repeat(200));
     assert_eq!(
         ingress_entry(8443, AppProtocol::Http, &long).resolve(),
-        Err(IngressListenerUnsupported::InvalidUnixSocketPath(R::TooLong))
+        Err(IngressListenerUnsupported::InvalidUnixSocketPath(
+            R::TooLong
+        ))
     );
 }
 

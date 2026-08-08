@@ -13549,15 +13549,13 @@ impl UnixHttp1Backend {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 8192];
-                    let n = match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        stream.read(&mut buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) if n > 0 => n,
-                        _ => return,
-                    };
+                    let n =
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => return,
+                        };
                     hits.fetch_add(1, Ordering::SeqCst);
                     let request = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let request_line = request.lines().next().unwrap_or("").to_string();
@@ -13625,8 +13623,8 @@ impl UnixH2cBackend {
                     return;
                 };
                 tokio::spawn(async move {
-                    let service = service_fn(
-                        |req: hyper::Request<hyper::body::Incoming>| async move {
+                    let service =
+                        service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
                             let received_timeout = req
                                 .headers()
                                 .get("grpc-timeout")
@@ -13647,7 +13645,10 @@ impl UnixH2cBackend {
                                 tokio::time::sleep(Duration::from_millis(2_000)).await;
                             }
                             let mut trailers = hyper::HeaderMap::new();
-                            trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
+                            trailers.insert(
+                                "grpc-status",
+                                hyper::header::HeaderValue::from_static("0"),
+                            );
                             trailers.insert(
                                 "grpc-message",
                                 hyper::header::HeaderValue::from_static("ok"),
@@ -13665,8 +13666,7 @@ impl UnixH2cBackend {
                                 .body(body)
                                 .expect("h2c grpc response builds");
                             Ok::<_, std::io::Error>(response)
-                        },
-                    );
+                        });
                     let _ = Http2ServerBuilder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -13853,10 +13853,9 @@ async fn plaintext_inbound_grpc(
     grpc_timeout: Option<&str>,
 ) -> Result<(u16, hyper::HeaderMap, hyper::HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    let (mut sender, connection) =
-        hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake(TokioIo::new(stream))
-            .await?;
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(stream))
+        .await?;
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -13869,12 +13868,12 @@ async fn plaintext_inbound_grpc(
         builder = builder.header("grpc-timeout", timeout);
     }
     let request = builder.body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")))?;
-    let response = tokio::time::timeout(Duration::from_secs(15), sender.send_request(request))
-        .await??;
+    let response =
+        tokio::time::timeout(Duration::from_secs(15), sender.send_request(request)).await??;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let collected = tokio::time::timeout(Duration::from_secs(15), response.into_body().collect())
-        .await??;
+    let collected =
+        tokio::time::timeout(Duration::from_secs(15), response.into_body().collect()).await??;
     let trailers = collected.trailers().cloned().unwrap_or_default();
     driver.abort();
     Ok((status, headers, trailers))
@@ -14066,17 +14065,21 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
     // ── (c) deadline enforcement / upstream cancellation ──
     // 5 MILLISECONDS against a backend that sleeps 2s: the gateway must cancel
     // and answer DEADLINE_EXCEEDED rather than hang for the backend.
-    let (slow_status, slow_headers, slow_trailers) =
-        match plaintext_inbound_grpc(inbound_port, authority_9443, "/ferrum.Test/Slow", Some("5m"))
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                let output = captured_output(&temp);
-                kill_child(&mut child);
-                panic!("deadline-bounded gRPC request failed to complete: {e}\n{output}");
-            }
-        };
+    let (slow_status, slow_headers, slow_trailers) = match plaintext_inbound_grpc(
+        inbound_port,
+        authority_9443,
+        "/ferrum.Test/Slow",
+        Some("5m"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("deadline-bounded gRPC request failed to complete: {e}\n{output}");
+        }
+    };
     let slow_code = grpc_status_code(&slow_headers, &slow_trailers);
     if slow_code != Some(4) {
         let output = captured_output(&temp);
@@ -14092,7 +14095,8 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
     // HTTP/1.1 cannot carry gRPC trailers, so this must be a clean gRPC
     // UNAVAILABLE, never a downgraded dial.
     let (h1_grpc_status, h1_grpc_headers, h1_grpc_trailers) =
-        match plaintext_inbound_grpc(inbound_port, authority_8443, "/ferrum.Test/Echo", None).await {
+        match plaintext_inbound_grpc(inbound_port, authority_8443, "/ferrum.Test/Echo", None).await
+        {
             Ok(result) => result,
             Err(e) => {
                 let output = captured_output(&temp);
