@@ -22,6 +22,8 @@ use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshConfigBroadcast;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
 use ferrum_edge::modes::mesh::revision::MeshConfigRevision;
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use tokio::sync::broadcast;
 
 fn make_proxy(id: &str, namespace: &str) -> Proxy {
@@ -111,6 +113,38 @@ fn authoritative_translation(proxy_id: &str, mesh_service: &str) -> GatewayConfi
     translation.mesh = Some(mesh_with_service(mesh_service));
     translation.k8s_mesh_overlay = K8sMeshOverlay::authoritative_translation();
     translation
+}
+
+fn add_slice_carried_l4_route(
+    translation: &mut GatewayConfig,
+    source_namespace: &str,
+    target_host: &str,
+) {
+    const UPSTREAM_ID: &str = "istio-vs-l4-upstream-ferrum-db-tcp-0";
+    let upstream = serde_json::from_value(serde_json::json!({
+        "id": UPSTREAM_ID,
+        "namespace": "ferrum",
+        "name": "db-tcp",
+        "targets": [{"host": target_host, "port": 3306, "weight": 100}],
+    }))
+    .expect("VirtualService L4 upstream fixture");
+    translation.upstreams.push(upstream);
+
+    let mut proxy = make_proxy("istio-vs-l4_ferrum-db-tcp-0", "ferrum");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy.backend_host = target_host.to_string();
+    proxy.backend_port = 3306;
+    proxy.listen_port = Some(3306);
+    proxy.upstream_id = Some(UPSTREAM_ID.to_string());
+    proxy.stream_match = Some(StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            source_namespace: Some(source_namespace.to_string()),
+            ..Default::default()
+        }],
+    });
+    translation.proxies.push(proxy);
 }
 
 fn revision(sequence: u64) -> MeshConfigRevision {
@@ -203,6 +237,18 @@ impl Harness {
             .as_ref()
             .and_then(|overlay| overlay.mesh_revision.clone())
     }
+
+    fn live_slice(&self) -> MeshSlice {
+        let live = self.config_arc.load_full();
+        MeshSlice::from_gateway_config(
+            live.as_ref(),
+            MeshSliceRequest {
+                node_id: "spiffe://cluster.local/ns/ferrum/sa/client".to_string(),
+                namespace: "ferrum".to_string(),
+                ..Default::default()
+            },
+        )
+    }
 }
 
 #[test]
@@ -294,6 +340,55 @@ fn non_mesh_changes_publish_while_equal_revision_mesh_is_retained() {
     );
     assert_eq!(harness.overlay_revision(), Some(revision(50)));
     assert_eq!(live.mesh_revision, Some(revision(50)));
+}
+
+#[test]
+fn equal_revision_retains_slice_carried_l4_proxy_and_upstream_until_advance() {
+    let harness = Harness::new();
+    let mut first = authoritative_translation("gwapi-route-a", "svc-a");
+    add_slice_carried_l4_route(&mut first, "team-a", "10.0.0.10");
+    assert!(harness.publish(&first, Some(&revision(50))).is_some());
+
+    let first_slice = harness.live_slice();
+    assert_eq!(first_slice.virtual_service_l4_proxies.len(), 1);
+    assert_eq!(first_slice.virtual_service_l4_upstreams.len(), 1);
+
+    let mut divergent = authoritative_translation("gwapi-route-a", "svc-a");
+    add_slice_carried_l4_route(&mut divergent, "team-b", "10.0.0.20");
+    assert!(
+        harness.publish(&divergent, Some(&revision(50))).is_none(),
+        "equal revision must withhold changed slice-carried L4 content"
+    );
+
+    let retained_slice = harness.live_slice();
+    assert!(
+        retained_slice.content_eq(&first_slice),
+        "the exact MeshSlice content bound to revision 50 must remain unchanged"
+    );
+    assert_eq!(
+        retained_slice.virtual_service_l4_proxies,
+        first_slice.virtual_service_l4_proxies
+    );
+    assert_eq!(
+        retained_slice.virtual_service_l4_upstreams,
+        first_slice.virtual_service_l4_upstreams
+    );
+
+    assert!(harness.publish(&divergent, Some(&revision(51))).is_some());
+    let advanced_slice = harness.live_slice();
+    assert!(
+        !advanced_slice.content_eq(&first_slice),
+        "an advanced revision must release the changed L4 proxy and upstream"
+    );
+    assert_ne!(
+        advanced_slice.virtual_service_l4_proxies,
+        first_slice.virtual_service_l4_proxies
+    );
+    assert_ne!(
+        advanced_slice.virtual_service_l4_upstreams,
+        first_slice.virtual_service_l4_upstreams
+    );
+    assert_eq!(harness.overlay_revision(), Some(revision(51)));
 }
 
 #[test]

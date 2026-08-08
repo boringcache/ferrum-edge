@@ -55,9 +55,12 @@ pub struct AcceptedK8sOverlay {
     /// snapshot stamped with a revision that did not describe it, or (as before
     /// this change) wipe the revision entirely on the next poll.
     ///
-    /// Bound atomically to `translation.mesh` at publication: an equal scalar
-    /// with divergent mesh retains the previously accepted pair rather than
-    /// storing the divergent candidate under the old sequence.
+    /// Bound atomically to every Kubernetes-owned field that can ride a
+    /// `MeshSlice`: `translation.mesh` plus matcher-bearing Istio
+    /// VirtualService L4 proxies and their referenced upstreams. An equal
+    /// scalar with divergent slice content retains the previously accepted
+    /// fields rather than storing the divergent candidate under the old
+    /// sequence.
     ///
     /// `None` when revision publication is disabled or no convergence evidence
     /// has ever been established.
@@ -880,9 +883,40 @@ fn retain_previously_accepted_k8s_mesh(
 ) {
     effective.mesh = previous.translation.mesh.clone();
     effective.k8s_mesh_overlay = previous.translation.k8s_mesh_overlay.clone();
+
+    // GatewayConfig proxies/upstreams do not normally ride MeshSlice, but the
+    // slice builder deliberately carries matcher-bearing Istio
+    // VirtualService L4 routes. Retain that translator-owned subset too: a
+    // quiet informer scope can pin the aggregate revision while another scope
+    // has already changed a TCP/TLS route or weighted backend set. Publishing
+    // the new objects under the pinned scalar would make the DP's exact
+    // equal-revision content binding quarantine an otherwise healthy CP.
+    let previous_l4_proxies = mesh_slice_l4_proxies(&previous.translation)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let previous_l4_upstreams =
+        mesh_slice_l4_upstreams(&previous.translation, previous_l4_proxies.iter())
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+    effective
+        .proxies
+        .retain(|proxy| !is_mesh_slice_l4_proxy(proxy));
+    effective.proxies.extend(previous_l4_proxies);
+
+    // This prefix is reserved to the translator-owned upstreams carried beside
+    // the retained L4 proxies. Remove candidate orphan/withdrawn entries as
+    // well, both to avoid duplicate ids and to keep the retained overlay a
+    // coherent proxy+upstream snapshot.
+    effective
+        .upstreams
+        .retain(|upstream| !is_mesh_slice_l4_upstream(upstream));
+    effective.upstreams.extend(previous_l4_upstreams);
 }
 
-/// Whether two translations carry the same mesh content protected by
+/// Whether two translations carry the same mesh-slice content protected by
 /// [`MeshConfigRevision`].
 ///
 /// Uses the shared canonical digest so producer retention and the data-plane
@@ -890,16 +924,75 @@ fn retain_previously_accepted_k8s_mesh(
 /// never logged. An uncomputable identity fails closed (not a match).
 fn k8s_published_mesh_content_matches(left: &GatewayConfig, right: &GatewayConfig) -> bool {
     match (
-        k8s_published_mesh_content_identity(left.mesh.as_deref()),
-        k8s_published_mesh_content_identity(right.mesh.as_deref()),
+        k8s_published_mesh_content_identity(left),
+        k8s_published_mesh_content_identity(right),
     ) {
         (Some(left_id), Some(right_id)) => left_id == right_id,
         _ => false,
     }
 }
 
-fn k8s_published_mesh_content_identity(mesh: Option<&MeshConfig>) -> Option<[u8; 32]> {
-    crate::grpc::mesh_slice_drift::canonical_content_digest(&mesh).ok()
+const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+
+fn is_mesh_slice_l4_proxy(proxy: &crate::config::types::Proxy) -> bool {
+    proxy
+        .id
+        .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+        && proxy
+            .stream_match
+            .as_ref()
+            .is_some_and(|criteria| !criteria.is_empty())
+}
+
+fn is_mesh_slice_l4_upstream(upstream: &crate::config::types::Upstream) -> bool {
+    upstream.id.starts_with(MESH_SLICE_L4_UPSTREAM_ID_PREFIX)
+}
+
+fn mesh_slice_l4_proxies(config: &GatewayConfig) -> Vec<&crate::config::types::Proxy> {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| is_mesh_slice_l4_proxy(proxy))
+        .collect()
+}
+
+fn mesh_slice_l4_upstreams<'a, 'p>(
+    config: &'a GatewayConfig,
+    proxies: impl IntoIterator<Item = &'p crate::config::types::Proxy>,
+) -> Vec<&'a crate::config::types::Upstream> {
+    let referenced: BTreeSet<(&str, &str)> = proxies
+        .into_iter()
+        .filter_map(|proxy| {
+            proxy
+                .upstream_id
+                .as_deref()
+                .map(|upstream_id| (proxy.namespace.as_str(), upstream_id))
+        })
+        .collect();
+    config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            is_mesh_slice_l4_upstream(upstream)
+                && referenced.contains(&(upstream.namespace.as_str(), upstream.id.as_str()))
+        })
+        .collect()
+}
+
+fn k8s_published_mesh_content_identity(config: &GatewayConfig) -> Option<[u8; 32]> {
+    let proxies = mesh_slice_l4_proxies(config);
+    let upstreams = mesh_slice_l4_upstreams(config, proxies.iter().copied());
+
+    // Preserve array order exactly: MeshSlice content equality and its
+    // canonical digest treat arrays as order-sensitive. The tuple contains
+    // precisely the Kubernetes-owned GatewayConfig fields that
+    // MeshSlice::from_gateway_config can serialize for any namespace.
+    crate::grpc::mesh_slice_drift::canonical_content_digest(&(
+        config.mesh.as_deref(),
+        proxies,
+        upstreams,
+    ))
+    .ok()
 }
 
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
