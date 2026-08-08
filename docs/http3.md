@@ -8,6 +8,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Dispatch model](#dispatch-model)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
+  - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
 - [Buffering policy](#buffering-policy)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
@@ -156,6 +157,54 @@ Flow:
 9. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
 
 **Early-response cancellation**: the Plain streaming-request path drives the H3 recv reader and `reqwest::send()` concurrently via `tokio::select!`. The native-gRPC H3-to-H2 path instead gives the recv half to a pump task and relays the H2 response concurrently on the send half; every bounded DATA/trailer channel send and the trailer read races a shutdown notification. For recognized gRPC-Web, the absolute RPC deadline is the first biased arm, so a withheld upload or response headers cannot retain the backend request, admission permit, or half-open probe. A backend final response before the client finishes uploading (auth reject, early 413, completed bidi response, etc.) therefore stops the appropriate reader/pump — no stranded task on `recv_data()`, `recv_trailers()`, or a full channel.
+
+### Mesh transport dispatch for the H3→gRPC bridge
+
+The bridge does **not** always dial `target.host:target.port` directly. Before
+reading the request body or dialing, both `dispatch_grpc` (buffered/retryable)
+and `dispatch_grpc_streaming` (channel-backed) resolve the LB-selected target
+through `grpc_proxy::GrpcDispatchTransport::for_target`, which materializes
+exactly one transport and never falls back to a direct dial for a mesh-tagged
+target:
+
+| Selected target | Transport | Notes |
+|---|---|---|
+| No mesh tag | `state.grpc_pool` (direct h2c / TLS) | Unchanged behavior. |
+| `mesh.mtls`, same-cluster | `state.mesh_mtls_pool` (SVID-mTLS HTTP/2) | Destination identity pinned from `mesh.spiffe_id`. |
+| `mesh.mtls`, cross-cluster | same pool, east-west branch | East-west gateway dial + destination-FQDN SNI override (`mesh.eastwest_sni`) + trust-domain-scoped verification (`mesh.trust_domain`). |
+| `mesh.hbone`, same-cluster | nested HTTP/2 over `state.hbone_pool`'s CONNECT byte tunnel | Destination identity pinned; the peer's HBONE relay byte-copies the tunnel to the app socket, so the inner connection is ordinary h2c. |
+| `mesh.hbone`, cross-cluster | same, over the cross-cluster dial | Remote east-west gateway (`mesh.hbone_dial_host` / `mesh.hbone_port`), SNI override, trust-domain scope; the CONNECT authority is the real remote pod from `mesh.hbone_authority_host`. |
+
+Both mesh transports are HTTP/2 end to end, so gRPC framing, `grpc-status` /
+`grpc-message` trailers, flow control, `grpc-timeout` deadline propagation, and
+client cancellation behave exactly as they do on the direct gRPC pool. The
+shared `GrpcBody` is handed through unchanged, so the channel-backed streaming
+path still commits request DATA incrementally and a peer can answer before the
+H3 client half-closes (true bidirectional streaming).
+
+Everything undispatchable **fails closed** with a Trailers-Only gRPC
+`UNAVAILABLE`, before any dial:
+
+- a cross-cluster target with no mesh transport tag;
+- a cross-cluster `mesh.mtls` target missing its SNI override or trust domain;
+- a corrupted target declaring **both** `mesh.mtls` and `mesh.hbone` (the
+  topologies are mutually exclusive, so picking either hop would be a guess);
+- any target whose pinned `mesh.spiffe_id`, HBONE dial host, or CONNECT
+  authority host tag is present but unusable.
+
+Refusal messages name the failed contract and never echo the target's SPIFFE
+ID, SNI, trust domain, or dial address.
+
+Retry rotation re-resolves the transport **per attempt**: rotating onto a
+mesh-tagged target re-dials over that target's own dial plan (never the previous
+target's session), and rotating onto an undispatchable one fails closed. The
+half-open circuit-breaker probe slot a refusal consumes is released.
+
+The H3→HTTP plain bridge, plain requests selected for the native H3 backend
+pool, and the H3 WebSocket bridge are unchanged and still refuse **any**
+mesh-tagged target before dialing: plain HTTP gets a 502 with
+`gateway-error-reason`, and the WebSocket bridge refuses the upgrade with the
+same 502 shape.
 
 ## Buffering policy
 

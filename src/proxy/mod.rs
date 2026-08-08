@@ -27107,9 +27107,14 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+                // The generic HTTP-family mesh path this frontend falls through
+                // to runs an HTTP/1.1 client inside the HBONE byte tunnel, so it
+                // cannot carry `grpc-status` trailers. (The H3 bridge does not
+                // use that path — it runs a nested HTTP/2 client over the same
+                // tunnel; see `GrpcDispatchTransport`, issue #3284.)
+                grpc_proxy::GrpcMeshDispatch::HboneCrossCluster => Some(
                     "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
                     "gRPC over cross-cluster east-west routing requires a destination SNI \
@@ -27118,9 +27123,9 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
-                grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
+                grpc_proxy::GrpcMeshDispatch::Hbone => Some(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 // `MeshMtlsCrossCluster` normally falls through to the generic
                 // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
@@ -37810,9 +37815,7 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
 ) -> std::borrow::Cow<'a, str> {
     if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
         return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-            Some(service_port) => {
-                std::borrow::Cow::Owned(format!("{service_host}:{service_port}"))
-            }
+            Some(service_port) => std::borrow::Cow::Owned(format!("{service_host}:{service_port}")),
             None => std::borrow::Cow::Borrowed(service_host),
         };
     }
@@ -40110,9 +40113,9 @@ async fn proxy_to_backend_mesh_mtls(
             parts.headers = headers;
             (
                 parts,
-                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(
-                    body::ReplayableRequestBody::new(body, trailers),
-                ),
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
+                    body, trailers,
+                )),
             )
         }
     };

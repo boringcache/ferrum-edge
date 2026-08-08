@@ -677,6 +677,16 @@ impl HboneConnectionPool {
         record_hbone_evictions(evicted);
     }
 
+    /// The effective pool configuration for `proxy`.
+    ///
+    /// Exposed for the nested-HTTP/2 gRPC transport (issue #3284), which builds
+    /// its INNER hyper HTTP/2 client over a byte tunnel this pool opened and
+    /// must apply the same per-proxy flow-control / frame-size settings the
+    /// outer HBONE connection uses.
+    pub(crate) fn pool_config_for(&self, proxy: &Proxy) -> PoolConfig {
+        self.pool_config.for_proxy(proxy)
+    }
+
     /// Open a pooled bare HBONE CONNECT byte tunnel. The HTTP/2 connection is
     /// dialed to `dial_host:hbone_port`; the CONNECT `:authority` is
     /// `app_host:app_port`. The ordinary Ambient path passes the same host for
@@ -2193,6 +2203,86 @@ pub fn target_hbone_cross_cluster_trust_domain(
         .get(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
         .filter(|value| !value.is_empty())
         .and_then(|value| crate::identity::spiffe::TrustDomain::new(value.as_str()).ok())
+}
+
+/// Resolved dial parameters for an Ambient HBONE CONNECT, derived ONCE from a
+/// target's mesh tags — the HBONE counterpart of
+/// [`crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan`] (issue #3284).
+///
+/// The inline resolution in `proxy_to_backend_hbone` remains the HTTP path's
+/// own (it maps each failure to its own 502 shape); this type exists so the
+/// nested-HTTP/2 gRPC transport resolves the SAME tags with the SAME
+/// fail-closed rules instead of re-deriving them, and every failure is an
+/// ordinary [`HbonePoolError`] so callers keep one error mapping.
+///
+/// The two shapes:
+/// - **In-cluster** (default): dial the workload/waypoint directly and PIN the
+///   destination identity from `mesh.hbone_peer_spiffe_id` / `mesh.spiffe_id`.
+///   A present-but-corrupt tag fails closed; an absent one keeps the
+///   trust-domain-only verification operator-supplied targets have always had.
+/// - **Cross-cluster** (`mesh.cross_cluster`): dial the REMOTE east-west
+///   gateway (`mesh.hbone_dial_host`), override the ClientHello SNI to the
+///   destination service FQDN (`mesh.eastwest_sni`), and scope verification to
+///   the remote trust domain (`mesh.trust_domain`). Both are mandatory — a
+///   missing one fails closed rather than dialing the gateway address as SNI or
+///   falling back to any-federated verification.
+#[derive(Debug)]
+pub struct HboneDialPlan<'a> {
+    /// Whether this is a cross-cluster east-west dial.
+    pub cross_cluster: bool,
+    /// Outer TCP/TLS host: the workload/waypoint in-cluster, the remote
+    /// east-west gateway cross-cluster.
+    pub dial_host: &'a str,
+    /// Inner CONNECT `:authority` HOST — the REAL destination pod address the
+    /// destination relay dials under the open-relay guard.
+    pub app_host: &'a str,
+    /// Peer HBONE listener port (`mesh.hbone_port`, default `:15008`).
+    pub hbone_port: u16,
+    /// Pinned destination workload identity (in-cluster), or `None`.
+    pub expected_peer: Option<crate::identity::SpiffeId>,
+    /// Remote trust domain verification is scoped to (cross-cluster only).
+    pub expected_trust_domain: Option<crate::identity::spiffe::TrustDomain>,
+    /// ClientHello SNI override (cross-cluster only). Borrowed from the target
+    /// tag to avoid a per-dispatch allocation.
+    pub sni_override: Option<&'a str>,
+}
+
+impl<'a> HboneDialPlan<'a> {
+    /// Resolve the dial plan for `target`, or a fail-closed [`HbonePoolError`].
+    /// Callers map the error to their own protocol-appropriate refusal — never
+    /// a plaintext or non-HBONE fallback.
+    pub fn resolve(target: &'a UpstreamTarget) -> Result<Self, HbonePoolError> {
+        let dial_host = target_hbone_dial_host(target)?;
+        let app_host = target_hbone_authority_host(target)?;
+        let hbone_port = target_hbone_port(target);
+        if target_hbone_cross_cluster(target) {
+            // SNI override THEN trust domain, both mandatory — the same order
+            // the HTTP dispatch path checks them inline.
+            let sni_override =
+                target_hbone_eastwest_sni(target).ok_or(HbonePoolError::MissingCrossClusterSni)?;
+            let trust_domain = target_hbone_cross_cluster_trust_domain(target)
+                .ok_or(HbonePoolError::MissingCrossClusterTrustDomain)?;
+            Ok(Self {
+                cross_cluster: true,
+                dial_host,
+                app_host,
+                hbone_port,
+                expected_peer: None,
+                expected_trust_domain: Some(trust_domain),
+                sni_override: Some(sni_override),
+            })
+        } else {
+            Ok(Self {
+                cross_cluster: false,
+                dial_host,
+                app_host,
+                hbone_port,
+                expected_peer: target_expected_peer_spiffe(target)?,
+                expected_trust_domain: None,
+                sni_override: None,
+            })
+        }
+    }
 }
 
 pub(crate) fn authority_for_host_port(host: &str, port: u16) -> String {

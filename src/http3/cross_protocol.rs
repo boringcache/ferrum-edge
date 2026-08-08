@@ -4477,23 +4477,37 @@ where
 /// under STRICT).
 ///
 /// Both paths now hand the shared `GrpcBody` to whichever authenticated
-/// transport [`grpc_proxy::GrpcDispatchTransport::for_target`] materializes, so
-/// a Sidecar `mesh.mtls` target — same-cluster (pinned peer SVID) or well-formed
-/// cross-cluster east-west (trust-domain scope + destination-FQDN SNI override)
-/// — rides the SVID-mTLS HTTP/2 pool with HTTP/2 framing, trailers, flow
-/// control, and cancellation intact, exactly like the H1/H2 frontend.
+/// transport [`grpc_proxy::GrpcDispatchTransport::for_target`] materializes:
 ///
-/// Everything else still FAILS CLOSED with a gRPC UNAVAILABLE and never falls
-/// back to a direct dial: Ambient `mesh.hbone` (same-cluster or cross-cluster)
-/// has an HTTP/1.1 byte-tunnel inner protocol with no HTTP/2 trailer path, a
-/// cross-cluster target with no transport tag or missing SNI / trust domain is
-/// unmaterializable, and a `mesh.mtls` target whose identity metadata cannot be
-/// resolved is refused before any dial.
+/// * A Sidecar `mesh.mtls` target — same-cluster (pinned peer SVID) or
+///   cross-cluster east-west (trust-domain scope + destination-FQDN SNI
+///   override) — rides the SVID-mTLS HTTP/2 pool.
+/// * An Ambient `mesh.hbone` target — same-cluster (pinned peer SVID) or
+///   cross-cluster east-west — rides a NESTED hyper HTTP/2 connection inside
+///   the authenticated HBONE CONNECT byte tunnel. The destination relay
+///   byte-copies the tunnel to the app socket, so the gRPC server sees an
+///   ordinary h2c connection.
+///
+/// Either way it is HTTP/2 end to end, so framing, `grpc-status` trailers, flow
+/// control, deadline propagation, and cancellation behave exactly as they do on
+/// the direct gRPC pool.
+///
+/// Everything undispatchable still FAILS CLOSED with a gRPC UNAVAILABLE and
+/// never falls back to a direct dial: a cross-cluster target with no transport
+/// tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust
+/// domain, a corrupted target declaring BOTH mesh transports, and any target
+/// whose pinned identity / dial metadata cannot be resolved are all refused
+/// before any dial.
 fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
-    grpc_proxy::GrpcDispatchTransport::for_target(&state.grpc_pool, &state.mesh_mtls_pool, target)
+    grpc_proxy::GrpcDispatchTransport::for_target(
+        &state.grpc_pool,
+        &state.mesh_mtls_pool,
+        &state.hbone_pool,
+        target,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4568,10 +4582,11 @@ where
     // FAIL CLOSED on a target whose mesh transport this bridge cannot dispatch
     // over, BEFORE reading the request body or dialing (issues #2003, #3284,
     // see `resolve_h3_grpc_transport`). A `mesh.mtls` target resolves to the
-    // SVID-mTLS transport and continues; an Ambient HBONE / malformed
-    // cross-cluster / unmaterializable-identity target is refused here. The
-    // probe slot a HALF_OPEN breaker may have admitted is released, mirroring
-    // the pre-dispatch rejects below.
+    // SVID-mTLS transport and a `mesh.hbone` target to the nested-HTTP/2 HBONE
+    // transport, both of which continue; a malformed cross-cluster,
+    // ambiguous-transport, or unmaterializable-identity target is refused here.
+    // The probe slot a HALF_OPEN breaker may have admitted is released,
+    // mirroring the pre-dispatch rejects below.
     let initial_grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
         Ok(transport) => transport,
         Err(transport_error) => {
@@ -6115,10 +6130,13 @@ pub(crate) async fn dispatch_grpc_streaming(
 
     // Resolve the dispatch transport BEFORE dialing (issues #2003, #3284, see
     // `resolve_h3_grpc_transport`). A `mesh.mtls` target streams over the
-    // SVID-mTLS HTTP/2 pool — the channel-backed `GrpcBody` rides it unchanged,
-    // so request DATA still commits incrementally for client-streaming / bidi
-    // RPCs. Anything undispatchable FAILS CLOSED here rather than direct-dialing
-    // past the secured transport. No retry / rotation exists on this path, so
+    // SVID-mTLS HTTP/2 pool and a `mesh.hbone` target over the nested HTTP/2
+    // connection inside its CONNECT tunnel — the channel-backed `GrpcBody`
+    // rides both unchanged, so request DATA still commits incrementally for
+    // client-streaming / bidi RPCs and the peer can respond before the H3
+    // client half-closes. Anything undispatchable FAILS CLOSED rather than
+    // direct-dialing past the secured transport. No retry / rotation exists on
+    // this path, so
     // the single pre-dispatch resolution covers it. The probe slot a HALF_OPEN
     // breaker may have admitted is released, mirroring the buffered path's
     // pre-dispatch rejects.

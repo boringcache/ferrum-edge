@@ -2255,7 +2255,7 @@ fn grpc_mesh_dispatch_same_cluster_hbone_is_out_of_scope_and_fails_closed() {
     let target = target_with_tags(&[(ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&target),
-        GrpcMeshDispatch::RefuseHbone,
+        GrpcMeshDispatch::Hbone,
         "Ambient native gRPC over HBONE is out of scope: the inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
     );
 }
@@ -2306,7 +2306,7 @@ fn grpc_mesh_dispatch_cross_cluster_ambient_hbone_fails_closed() {
     ]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&hbone_xc),
-        GrpcMeshDispatch::RefuseCrossCluster,
+        GrpcMeshDispatch::HboneCrossCluster,
         "cross-cluster Ambient HBONE gRPC must fail closed (HBONE has no trailer path)"
     );
 }
@@ -2382,7 +2382,7 @@ fn grpc_mesh_dispatch_cross_cluster_conflicting_tags_take_the_hbone_refusal() {
     ]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&both_xc),
-        GrpcMeshDispatch::RefuseCrossCluster
+        GrpcMeshDispatch::HboneCrossCluster
     );
 }
 
@@ -2401,7 +2401,7 @@ fn grpc_mesh_dispatch_conflicting_tags_take_the_stricter_refusal() {
     ]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&both),
-        GrpcMeshDispatch::RefuseHbone
+        GrpcMeshDispatch::Hbone
     );
 }
 
@@ -2505,8 +2505,8 @@ fn grpc_request_body_too_large_backend_response_is_trailers_only_resource_exhaus
 fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transports() {
     use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
     for refused in [
-        GrpcMeshDispatch::RefuseHbone,
-        GrpcMeshDispatch::RefuseCrossCluster,
+        GrpcMeshDispatch::Hbone,
+        GrpcMeshDispatch::HboneCrossCluster,
     ] {
         // Pass-through gRPC-Web (no native content-type, no translation
         // marker): body-framed trailers ride the HTTP-family transport.
@@ -2674,39 +2674,63 @@ fn mesh_request_body_limit_grpc_flavor_wins_in_both_knob_orderings() {
 // a resolution failure fails closed instead of silently bypassing SVID-mTLS,
 // identity pinning, and mesh authz identity.
 
-fn transport_test_pools() -> (
-    grpc_proxy::GrpcConnectionPool,
-    ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
-) {
-    let mesh = ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
-        ferrum_edge::config::PoolConfig::default(),
-        ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
-        std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
-        8,
-    );
-    (grpc_proxy::GrpcConnectionPool::default(), mesh)
+struct TransportTestPools {
+    grpc: grpc_proxy::GrpcConnectionPool,
+    mesh_mtls: ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+    hbone: ferrum_edge::proxy::hbone_pool::HboneConnectionPool,
+}
+
+impl TransportTestPools {
+    fn new() -> Self {
+        let svid_slot = || std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
+        Self {
+            grpc: grpc_proxy::GrpcConnectionPool::default(),
+            mesh_mtls: ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
+                ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+                svid_slot(),
+                8,
+            ),
+            hbone: ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
+                ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+                svid_slot(),
+                8,
+            ),
+        }
+    }
+
+    fn resolve(
+        &self,
+        target: Option<&ferrum_edge::config::types::UpstreamTarget>,
+    ) -> Result<grpc_proxy::GrpcDispatchTransport<'_>, grpc_proxy::GrpcTransportError> {
+        grpc_proxy::GrpcDispatchTransport::for_target(
+            &self.grpc,
+            &self.mesh_mtls,
+            &self.hbone,
+            target,
+        )
+    }
 }
 
 #[test]
 fn grpc_transport_for_untagged_and_absent_targets_is_the_direct_pool() {
-    let (grpc_pool, mesh_pool) = transport_test_pools();
-    let direct = grpc_proxy::GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, None)
+    let pools = TransportTestPools::new();
+    let direct = pools
+        .resolve(None)
         .expect("no selected target keeps the direct pool");
     assert_eq!(direct.label(), "direct");
 
     let untagged = target_with_tags(&[("subset", "v2")]);
-    let direct = grpc_proxy::GrpcDispatchTransport::for_target(
-        &grpc_pool,
-        &mesh_pool,
-        Some(&untagged),
-    )
-    .expect("an untagged target keeps the direct pool");
+    let direct = pools
+        .resolve(Some(&untagged))
+        .expect("an untagged target keeps the direct pool");
     assert_eq!(direct.label(), "direct");
 }
 
 #[test]
 fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
-    let (grpc_pool, mesh_pool) = transport_test_pools();
+    let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (
             ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
@@ -2717,9 +2741,9 @@ fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
             "spiffe://cluster.local/ns/default/sa/orders",
         ),
     ]);
-    let transport =
-        grpc_proxy::GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, Some(&target))
-            .expect("same-cluster mesh.mtls must resolve the SVID-mTLS transport");
+    let transport = pools
+        .resolve(Some(&target))
+        .expect("same-cluster mesh.mtls must resolve the SVID-mTLS transport");
     assert_eq!(
         transport.label(),
         "mesh_mtls",
@@ -2729,7 +2753,7 @@ fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
 
 #[test]
 fn grpc_transport_for_wellformed_cross_cluster_mesh_mtls_resolves_the_sidecar_transport() {
-    let (grpc_pool, mesh_pool) = transport_test_pools();
+    let pools = TransportTestPools::new();
     let target = target_with_tags(&[
         (
             ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
@@ -2748,15 +2772,70 @@ fn grpc_transport_for_wellformed_cross_cluster_mesh_mtls_resolves_the_sidecar_tr
             "remote.local",
         ),
     ]);
-    let transport =
-        grpc_proxy::GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, Some(&target))
-            .expect("well-formed cross-cluster mesh.mtls rides the east-west branch");
+    let transport = pools
+        .resolve(Some(&target))
+        .expect("well-formed cross-cluster mesh.mtls rides the east-west branch");
     assert_eq!(transport.label(), "mesh_mtls");
+}
+
+// Issue #3284 requires BOTH mesh transports, same-cluster and cross-cluster.
+// A `mesh.hbone` target must therefore resolve the nested-HTTP/2 HBONE
+// transport, never the direct-dial pool and never a silent refusal.
+#[test]
+fn grpc_transport_for_same_cluster_hbone_resolves_the_ambient_transport() {
+    let pools = TransportTestPools::new();
+    let target = target_with_tags(&[
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+            "spiffe://cluster.local/ns/default/sa/orders",
+        ),
+    ]);
+    let transport = pools
+        .resolve(Some(&target))
+        .expect("same-cluster mesh.hbone must resolve the Ambient HBONE transport");
+    assert_eq!(
+        transport.label(),
+        "hbone",
+        "a mesh.hbone target must never fall back to the direct-dial gRPC pool"
+    );
+}
+
+#[test]
+fn grpc_transport_for_wellformed_cross_cluster_hbone_resolves_the_ambient_transport() {
+    let pools = TransportTestPools::new();
+    let target = target_with_tags(&[
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG,
+            "orders.default.svc.cluster.local",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+            "remote.local",
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_DIAL_HOST_TAG,
+            "10.9.0.7",
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG,
+            "10.244.3.9",
+        ),
+    ]);
+    let transport = pools
+        .resolve(Some(&target))
+        .expect("well-formed cross-cluster mesh.hbone rides the east-west branch");
+    assert_eq!(transport.label(), "hbone");
 }
 
 #[test]
 fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
-    let (grpc_pool, mesh_pool) = transport_test_pools();
+    let pools = TransportTestPools::new();
     // Same-cluster `mesh.mtls` REQUIRES a resolvable `mesh.spiffe_id` pin; a
     // corrupt one must refuse before any dial rather than downgrade to
     // trust-domain-only verification.
@@ -2768,12 +2847,9 @@ fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
             ),
             (ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG, pin),
         ]);
-        let error =
-            grpc_proxy::GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, Some(&target))
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("an unresolvable pinned peer ({pin:?}) must fail closed")
-                });
+        let error = pools.resolve(Some(&target)).err().unwrap_or_else(|| {
+            panic!("an unresolvable pinned peer ({pin:?}) must fail closed")
+        });
         assert!(
             matches!(
                 error,
@@ -2788,9 +2864,83 @@ fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
     }
 }
 
+// A `mesh.hbone` target whose dial metadata is corrupt must fail closed at
+// materialization, exactly like the mesh-mTLS arm — never dial the synthetic
+// cross-cluster identity, never downgrade a corrupt pin to unpinned.
+#[test]
+fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
+    let pools = TransportTestPools::new();
+    let hbone = ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
+    let xc = ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG;
+    let sni = ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG;
+    let secret_sni = "orders.internal.example.com";
+
+    for (label, tags) in [
+        (
+            "corrupt pinned peer",
+            vec![
+                (hbone, "true"),
+                (
+                    ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+                    "not-a-spiffe-id",
+                ),
+            ],
+        ),
+        (
+            "empty dial host override",
+            vec![
+                (hbone, "true"),
+                (ferrum_edge::proxy::hbone_pool::HBONE_DIAL_HOST_TAG, " "),
+            ],
+        ),
+        (
+            "empty CONNECT authority host override",
+            vec![
+                (hbone, "true"),
+                (
+                    ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG,
+                    "  ",
+                ),
+            ],
+        ),
+        (
+            "cross-cluster missing the remote trust domain",
+            vec![(hbone, "true"), (xc, "true"), (sni, secret_sni)],
+        ),
+        (
+            "cross-cluster missing the destination SNI override",
+            vec![
+                (hbone, "true"),
+                (xc, "true"),
+                (
+                    ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+                    "remote.local",
+                ),
+            ],
+        ),
+    ] {
+        let target = target_with_tags(&tags);
+        let error = pools
+            .resolve(Some(&target))
+            .err()
+            .unwrap_or_else(|| panic!("{label} must fail closed, never dial"));
+        assert!(
+            matches!(
+                error,
+                grpc_proxy::GrpcTransportError::UnmaterializableIdentity(_)
+            ),
+            "{label}: expected an unmaterializable-identity refusal, got {error:?}"
+        );
+        assert!(
+            !error.message().contains(secret_sni),
+            "{label}: a client-visible refusal must not leak the target's mesh metadata"
+        );
+    }
+}
+
 #[test]
 fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadata_free_message() {
-    let (grpc_pool, mesh_pool) = transport_test_pools();
+    let pools = TransportTestPools::new();
     let mtls = ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG;
     let hbone = ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
     let xc = ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG;
@@ -2798,10 +2948,6 @@ fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadata_free
     let secret_sni = "orders.internal.example.com";
 
     for (label, tags) in [
-        // Same-cluster Ambient HBONE: HTTP/1.1 inner tunnel, no trailer path.
-        ("same-cluster hbone", vec![(hbone, "true")]),
-        // Cross-cluster Ambient HBONE: same limitation, routed east-west.
-        ("cross-cluster hbone", vec![(hbone, "true"), (xc, "true")]),
         // Cross-cluster with NO transport tag at all: malformed.
         ("cross-cluster untagged", vec![(xc, "true")]),
         // Cross-cluster Sidecar mesh-mTLS missing its remote trust domain.
@@ -2809,12 +2955,22 @@ fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadata_free
             "cross-cluster mtls missing trust domain",
             vec![(mtls, "true"), (xc, "true"), (sni, secret_sni)],
         ),
+        // BOTH transport tags: the topologies are mutually exclusive, so this
+        // is a corrupted target and picking either hop would be a guess.
+        (
+            "ambiguous same-cluster transport",
+            vec![(mtls, "true"), (hbone, "true")],
+        ),
+        (
+            "ambiguous cross-cluster transport",
+            vec![(mtls, "true"), (hbone, "true"), (xc, "true")],
+        ),
     ] {
         let target = target_with_tags(&tags);
-        let error =
-            grpc_proxy::GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, Some(&target))
-                .err()
-                .unwrap_or_else(|| panic!("{label} must fail closed, never direct-dial"));
+        let error = pools
+            .resolve(Some(&target))
+            .err()
+            .unwrap_or_else(|| panic!("{label} must fail closed, never direct-dial"));
         assert!(
             matches!(error, grpc_proxy::GrpcTransportError::Unsupported(_)),
             "{label}: expected an unsupported-transport refusal, got {error:?}"
