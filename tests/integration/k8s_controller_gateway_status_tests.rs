@@ -1186,9 +1186,10 @@ fn tls_listeners_sharing_a_port_in_one_namespace_with_different_credentials_stay
 /// The exact upstream conformance shape: two *different* Gateways in one
 /// namespace both claim port 443 with catch-all HTTPS listeners naming
 /// different Secrets (`GatewaySecretReferenceGrant*` beside
-/// `same-namespace-with-https-listener`). Both must stay Accepted — the
-/// namespace resolves one serving slot, so this is not a physical port
-/// conflict.
+/// `same-namespace-with-https-listener`). Both stay Accepted because this is
+/// not a physical port conflict, but only the deterministic namespace-slot
+/// winner may report Programmed while Ferrum serves one credential per
+/// namespace.
 #[test]
 fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted() {
     let class = object(
@@ -1242,11 +1243,23 @@ fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted()
             "Gateway {gateway} listener must stay Accepted: {accepted:?}"
         );
         let programmed = listener_condition(listener, "Programmed");
+        let expected_programmed = if gateway == "edge" {
+            "True"
+        } else {
+            "False"
+        };
         assert_eq!(
             programmed["status"].as_str(),
-            Some("True"),
-            "Gateway {gateway} listener must stay Programmed: {programmed:?}"
+            Some(expected_programmed),
+            "only the namespace TLS-slot winner may report Programmed: {programmed:?}"
         );
+        if gateway != "edge" {
+            assert_eq!(
+                programmed["reason"].as_str(),
+                Some("NoListeners"),
+                "the accepted non-winner must honestly report that no listener was materialized: {programmed:?}"
+            );
+        }
     }
 }
 
@@ -1311,6 +1324,16 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         names.iter().filter(|name| name.ends_with("-https")).count(),
         1,
         "exactly one TLS MeshService must be exposed for the namespace slot: {names:?}"
+    );
+    assert!(
+        translation.warnings.iter().all(|warning| {
+            !warning.contains("k8s://")
+                && !warning.contains("sha256=")
+                && !warning.contains("#tls.crt")
+                && !warning.contains("#tls.key")
+        }),
+        "namespace-slot warnings must not expose credential source metadata: {:?}",
+        translation.warnings
     );
     // Reversed object order must not promote the non-winner.
     let mut reversed = objects.clone();

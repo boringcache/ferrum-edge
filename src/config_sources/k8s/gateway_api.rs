@@ -1856,12 +1856,8 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         // credential as the installed serving source.
         disable_gateway_frontend_tls_route_materialization(acc, object);
         acc.warnings.push(format!(
-            "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
-            object.metadata.namespace,
-            object.metadata.name,
-            cert_source,
-            source_namespace,
-            existing.cert_path
+            "Gateway API Gateway {}/{} requested a frontend TLS certificate source that differs from namespace {}'s planned serving source; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
+            object.metadata.namespace, object.metadata.name, source_namespace
         ));
         return false;
     }
