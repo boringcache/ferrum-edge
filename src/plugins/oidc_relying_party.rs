@@ -261,11 +261,14 @@ struct FlowState {
 
 struct StateCache {
     entries: DashMap<String, FlowState>,
-    /// States already accepted for callback processing on this instance.
+    /// States already accepted for callback processing on this instance. This
+    /// is a bounded, best-effort local replay aid; the provider's one-time
+    /// authorization code remains the cross-replica replay authority.
     spent: DashMap<String, Instant>,
     expiry_buckets: DashMap<u64, Arc<DashMap<String, ()>>>,
     per_source_entries: DashMap<String, usize>,
     active_entries: AtomicUsize,
+    active_spent: AtomicUsize,
     last_evicted_bucket: AtomicU64,
     origin: Instant,
     max_entries: usize,
@@ -1999,6 +2002,7 @@ impl StateCache {
             expiry_buckets: DashMap::with_shard_amount(shard_amount),
             per_source_entries: DashMap::with_shard_amount(shard_amount),
             active_entries: AtomicUsize::new(0),
+            active_spent: AtomicUsize::new(0),
             last_evicted_bucket: AtomicU64::new(0),
             origin: Instant::now(),
             max_entries,
@@ -2050,12 +2054,19 @@ impl StateCache {
     /// - Wrong binding or already-spent state fails closed without consuming a
     ///   still-valid sibling entry.
     fn admit_callback(&self, state: &str, sealed_binding_hash: &[u8]) -> Result<(), ()> {
+        self.evict_expired();
         let now = Instant::now();
         if let Some(expires_at) = self.spent.get(state).map(|entry| *entry) {
             if expires_at > now {
                 return Err(());
             }
-            self.spent.remove_if(state, |_, expires| *expires <= now);
+            if let Some((_, removed_expiry)) = self
+                .spent
+                .remove_if(state, |_, expires| *expires <= now)
+            {
+                self.remove_expiry_record(state, removed_expiry);
+                decrement_atomic(&self.active_spent);
+            }
         }
 
         if let Some((_, flow)) = self.entries.remove_if(state, |_, flow| {
@@ -2071,8 +2082,38 @@ impl StateCache {
             return Err(());
         }
 
-        self.spent.insert(state.to_string(), now + self.ttl);
+        self.record_spent_best_effort(state, now + self.ttl);
         Ok(())
+    }
+
+    /// Record a local replay marker without allowing local bookkeeping pressure
+    /// to reject a valid callback that completed on another replica. The map is
+    /// capped at the configured pending-flow capacity and expiry-bucketed, so a
+    /// callback stream cannot grow process memory permanently. If the marker
+    /// budget is full, provider-side authorization-code one-time semantics still
+    /// reject a repeated token exchange.
+    fn record_spent_best_effort(&self, state: &str, expires_at: Instant) {
+        if self
+            .active_spent
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_entries).then_some(active + 1)
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        use dashmap::mapref::entry::Entry;
+        match self.spent.entry(state.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(expires_at);
+                self.expiry_buckets
+                    .entry(self.bucket_for(expires_at))
+                    .or_insert_with(|| Arc::new(DashMap::with_shard_amount(self.shard_amount)))
+                    .insert(state.to_string(), ());
+            }
+            Entry::Occupied(_) => decrement_atomic(&self.active_spent),
+        }
     }
 
     fn take_bound(&self, state: &str, sealed_binding_hash: &[u8]) -> Option<FlowState> {
@@ -2129,6 +2170,13 @@ impl StateCache {
             {
                 decrement_atomic(&self.active_entries);
                 self.release_source(&flow.source_ip);
+            }
+            if self
+                .spent
+                .remove_if(state.key(), |_, expires_at| *expires_at <= now)
+                .is_some()
+            {
+                decrement_atomic(&self.active_spent);
             }
         }
     }
@@ -3986,6 +4034,42 @@ mod tests {
                 flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
             )
             .expect("released capacity is reusable");
+    }
+
+    #[test]
+    fn spent_markers_are_bounded_without_blocking_cross_replica_callbacks() {
+        let cache = StateCache::new(2, 2, Duration::from_secs(600), 16);
+
+        for index in 0..32 {
+            assert!(
+                cache
+                    .admit_callback(&format!("remote-state-{index}"), &[7; 32])
+                    .is_ok(),
+                "local replay-marker pressure must not reject a valid cross-replica callback"
+            );
+        }
+
+        assert_eq!(cache.spent.len(), 2);
+        assert_eq!(cache.active_spent.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn expired_spent_markers_are_reclaimed_from_expiry_buckets() {
+        let cache = StateCache::new(2, 2, Duration::from_millis(1), 16);
+        cache
+            .admit_callback("remote-state", &[7; 32])
+            .expect("cross-replica callback is admitted");
+        let expires_at = *cache.spent.get("remote-state").expect("spent marker");
+
+        std::thread::sleep(Duration::from_millis(5));
+        cache.evict_bucket(cache.bucket_for(expires_at), Instant::now());
+
+        assert!(cache.spent.is_empty());
+        assert_eq!(cache.active_spent.load(Ordering::Acquire), 0);
+        assert!(
+            cache.admit_callback("replacement-state", &[8; 32]).is_ok(),
+            "reclaimed replay-marker capacity must be reusable"
+        );
     }
 
     fn discovery_config(discovery_url: &str) -> Value {
