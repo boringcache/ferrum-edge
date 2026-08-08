@@ -1791,9 +1791,11 @@ async fn remote_discovery_loop(
                 let outcome = store.install(entry, task_generation);
                 if outcome.is_live_poll() {
                     if let Some(token) = revision_apply_token {
-                        let _ = ctx
-                            .revision_gate
-                            .commit_applied(candidate.revision.as_ref(), content, token);
+                        let _ = ctx.revision_gate.commit_applied(
+                            candidate.revision.as_ref(),
+                            content,
+                            token,
+                        );
                     }
                 } else {
                     // Admission was provisional. A retired generation installed

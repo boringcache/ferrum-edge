@@ -1782,7 +1782,10 @@ fn equal_revision_with_divergent_content_is_quarantined_and_last_good_retained()
     let rejection = outcome
         .rejection()
         .expect("divergent content at an equal revision must not install");
-    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert_eq!(
+        rejection.reason(),
+        MeshRevisionRejectReason::DivergentContent
+    );
     assert_eq!(rejection.reason().as_metric_label(), "divergent_content");
     assert!(
         rejection.terminates_stream(),
@@ -1862,7 +1865,10 @@ fn xds_consumer_surfaces_divergent_equal_revision_content_as_stream_terminal() {
         .apply_slice(divergent)
         .expect_err("divergent equal-revision content must close ADS");
 
-    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert_eq!(
+        rejection.reason(),
+        MeshRevisionRejectReason::DivergentContent
+    );
     assert!(rejection.terminates_stream());
     assert_eq!(installed_version(&state).as_deref(), Some("xds-v100"));
 
@@ -1972,7 +1978,10 @@ fn kubernetes_minimum_scope_watermark_cannot_displace_accepted_content() {
         .install_slice(from_b)
         .rejection()
         .expect("a lagging replica must not displace accepted content at an equal sequence");
-    assert_eq!(rejection.reason(), MeshRevisionRejectReason::DivergentContent);
+    assert_eq!(
+        rejection.reason(),
+        MeshRevisionRejectReason::DivergentContent
+    );
     assert!(rejection.terminates_stream());
     assert_eq!(installed_version(&state).as_deref(), Some("cp-a"));
     assert_eq!(state.applied_revision(), Some(revision("k8s", 100)));

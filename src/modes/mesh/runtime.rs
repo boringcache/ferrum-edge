@@ -505,9 +505,9 @@ impl MeshRuntimeState {
     /// replica at the same sequence.
     pub fn install_slice(&self, slice: MeshSlice) -> MeshSliceInstall {
         let content = slice_content_identity(&slice);
-        if let Err(rejection) = self
-            .revision_gate
-            .admit(slice.revision.as_ref(), content, Utc::now())
+        if let Err(rejection) =
+            self.revision_gate
+                .admit(slice.revision.as_ref(), content, Utc::now())
         {
             return MeshSliceInstall::Quarantined(rejection);
         }
