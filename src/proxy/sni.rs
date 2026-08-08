@@ -456,7 +456,7 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
     // RFC 8446 §4.1.2: the vector contains two-byte CipherSuite values and
     // cannot be empty. An odd or empty vector is not a provable ClientHello;
     // do not let a trailing byte disappear from the eligibility decision.
-    if cipher_suites_len < 2 || cipher_suites_len % 2 != 0 {
+    if cipher_suites_len < 2 || !cipher_suites_len.is_multiple_of(2) {
         return None;
     }
     let suites_start = pos.checked_add(2)?;
@@ -542,7 +542,7 @@ fn extensions_offer_tls13(mut ext: &[u8]) -> Option<bool> {
             let data = &ext[4..extension_end];
             // ClientHello form: list_len (1) + versions (2 each).
             let list_len = *data.first()? as usize;
-            if list_len < 2 || list_len % 2 != 0 || data.len() != 1 + list_len {
+            if list_len < 2 || !list_len.is_multiple_of(2) || data.len() != 1 + list_len {
                 return None;
             }
             let mut i = 1usize;
