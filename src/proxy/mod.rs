@@ -19663,6 +19663,16 @@ pub(crate) struct NormalizedRejectResponse {
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
     /// terminal metadata in `headers`.
     pub(crate) grpc_trailers: HashMap<String, String>,
+    /// Multiplexed aggregate MCP SSE listener adopted from the request context.
+    ///
+    /// Only ever set when the final representation is still the gateway's own
+    /// `text/event-stream` response (see
+    /// [`finalize_reject_response_with_after_proxy_hooks_and_commit_policy`]).
+    /// When present, [`build_response_from_normalized_reject`] claims the body
+    /// once and selects [`headers_mod::ClientResponseFraming::Streaming`], so
+    /// no `Content-Length` is published for an event stream whose bytes have
+    /// not been written yet.
+    pub(crate) aggregate_sse: Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -20097,6 +20107,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
             failed_websocket_handshake: false,
             body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
+            aggregate_sse: None,
         };
     }
 
@@ -20206,6 +20217,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
         // `grpc_status`; the disposition is unused on that branch.
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
+        aggregate_sse: None,
     }
 }
 
@@ -20291,6 +20303,7 @@ fn build_framed_grpc_unary_reject(
         failed_websocket_handshake: false,
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
+        aggregate_sse: None,
     }
 }
 
@@ -20428,6 +20441,13 @@ pub(crate) fn build_response_from_normalized_reject(
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
+    // Claim the multiplexed SSE body exactly once. The claim is a one-shot
+    // compare-and-swap inside the listener lease, so even if a context clone
+    // still holds a handle it can never produce a second body for this session.
+    let aggregate_sse_body = reject
+        .aggregate_sse
+        .as_ref()
+        .and_then(crate::plugins::mcp_aggregate_sse::AggregateSseListener::take_body);
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -20447,8 +20467,12 @@ pub(crate) fn build_response_from_normalized_reject(
     // or a no-body status) selects `Head` framing. A native gRPC error is
     // trailers-only: gRPC never frames with Content-Length, so the field is
     // removed rather than invented as `0` or preserved from a plugin.
+    // Multiplexed aggregate SSE listeners are inherently streaming: never
+    // publish Content-Length for a long-lived event stream.
     let framing = if is_grpc_error {
         headers_mod::ClientResponseFraming::TrailersOnly
+    } else if aggregate_sse_body.is_some() {
+        headers_mod::ClientResponseFraming::Streaming
     } else {
         headers_mod::ClientResponseFraming::for_final_reject(
             status,
@@ -20460,7 +20484,9 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if is_framed_unary_reject {
+    let body = if let Some(sse) = aggregate_sse_body {
+        body::gateway_streaming_body(sse)
+    } else if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
@@ -21827,7 +21853,7 @@ async fn enforce_final_client_visible_response_header_policy(
 /// Close the buffered response header map after every body/representation/
 /// transport outcome. Unlike the streaming/synthetic finalizer, this phase can
 /// replace the response directly in the client's immutable gRPC flavor.
-async fn enforce_buffered_final_client_visible_response_header_policy(
+pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_status: &mut u16,
@@ -22749,7 +22775,33 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // reading plugin-controlled headers.
     normalized.body_disposition =
         headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+    // Aggregate MCP SSE stages a single-consumer listener lease on the request
+    // context. Adopt it only while the final representation is STILL the
+    // event stream the gateway authored: a later reject-path plugin that
+    // replaced the status or the representation gets an ordinary body, and
+    // dropping the lease here releases the session's single-listener slot so
+    // the client can reattach instead of being locked out.
+    if let Some(listener) = ctx.mcp_aggregate_sse.take()
+        && normalized.http_status == StatusCode::OK
+        && normalized.body.is_empty()
+        && response_headers_select_event_stream(&normalized.headers)
+    {
+        normalized.aggregate_sse = Some(listener);
+    }
     normalized
+}
+
+/// Whether a finalized reject header map still selects a `text/event-stream`
+/// representation. Read as a media-type essence so a charset parameter still
+/// matches and a lookalike type does not.
+pub(crate) fn response_headers_select_event_stream(headers: &HashMap<String, String>) -> bool {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    match content_type {
+        Some((_, value)) => crate::plugins::utils::sse::is_text_event_stream_media_type(value),
+        None => false,
+    }
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -30269,7 +30321,13 @@ async fn handle_proxy_request_inner(
     // collecting it into memory. When effective retries are enabled, we force
     // buffered mode so the collected body bytes can be replayed on connection
     // failures.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        && current_retry_attempt_allowed(
+            route_retry_ceiling,
+            &proxy,
+            upstream_target.as_deref(),
+            0,
+        );
     let stream_request_body = !has_retry && !requires_request_body_buffering;
     // A retry may rotate from an ordinary backend target onto a secured mesh
     // target. Share the pristine field-line representation before the initial
@@ -32008,6 +32066,28 @@ async fn handle_proxy_request_inner(
             .await;
             response_body = ResponseBody::buffered(body);
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
+    // POST-side 202 while privately reserving the event. The ordinary buffered
+    // header policy ran before that legacy final-body hook, over the original
+    // 200 response. Close the newly selected acknowledgement here so the
+    // committed hook never publishes an event whose actual POST response did
+    // not pass final header policy. Synthetic rejects reach the equivalent
+    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        let _ = enforce_buffered_final_client_visible_response_header_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+        )
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -37178,7 +37258,7 @@ fn buffered_collect_retain_failure(
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 ///
 /// The cookie value is the opaque backend-bound token from
-/// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
+/// [`crate::load_balancer::sticky_session_token`]: an HMAC-SHA-256 tag over the
 /// namespace-qualified upstream identity and the selected target's full sticky
 /// identity (dial `host:port`, per-port policy key, tags, locality, and path
 /// override), never the address itself. It therefore leaks no backend topology,
@@ -37204,19 +37284,32 @@ fn buffered_collect_retain_failure(
 /// backend that did not produce its response, and every retry-capable path can
 /// rotate off the target selection bound.
 ///
-/// The derivation is unkeyed and deterministic, so affinity survives a gateway
-/// restart and is identical across replicas of a horizontally scaled gateway.
+/// The derivation is keyed under a process-local authentication key, so a
+/// client cannot forge a binding from predictable route and endpoint metadata.
+/// Affinity survives a config reload; a gateway restart, or a request that
+/// reaches another replica, treats the cookie as stale and transparently
+/// re-pins the client through ordinary selection.
+///
+/// Minting and resolution therefore agree by construction rather than by
+/// coincidence: this site and the per-upstream binding index
+/// (`LoadBalancer::sticky_token_index`) both derive through the single public
+/// [`crate::load_balancer::sticky_session_token`], over the same
+/// namespace-qualified runtime key and the same CONFIGURED target identity.
+/// Deriving a token here from anything else — a per-request dial clone, or an
+/// upstream id that is not namespace-qualified — would produce a value absent
+/// from the index, so every returning client would miss and be re-issued a
+/// fresh cookie on every response.
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     namespace: &str,
     upstream_id: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
-) -> String {
+) -> Option<String> {
     let value = crate::load_balancer::sticky_session_token(
         &crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id),
         target,
-    );
+    )?;
     let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
     if !config.session_cookie {
         cookie.push_str("; Max-Age=");
@@ -37236,7 +37329,7 @@ pub(crate) fn build_sticky_cookie_header(
         cookie.push_str("; SameSite=");
         cookie.push_str(same_site);
     }
-    cookie
+    Some(cookie)
 }
 
 /// Append the gateway-authored Gateway API session-persistence `Set-Cookie` to
@@ -37314,13 +37407,15 @@ pub(crate) fn inject_sticky_affinity_cookie(
         .as_ref()
         .and_then(|u| u.hash_on_cookie_config.as_ref())
         .unwrap_or(&default_cc);
-    let cookie_val = build_sticky_cookie_header(
+    let Some(cookie_val) = build_sticky_cookie_header(
         cookie_name,
         &proxy.namespace,
         upstream_id,
         identity_target,
         cookie_config,
-    );
+    ) else {
+        return false;
+    };
     headers_mod::append_set_cookie_header(response_headers, cookie_val);
     true
 }

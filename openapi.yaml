@@ -7587,6 +7587,26 @@ components:
             proxies produces a validation error (PROXY protocol is TCP-borne).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
+        backend_proxy_protocol:
+          type: [string, "null"]
+          enum: [v2, null]
+          description: |
+            Opt-in outbound PROXY protocol written on backend TCP connects for this
+            stream proxy. When set to `v2`, Ferrum prepends a PROXY protocol v2 binary
+            header carrying the trusted stream client_ip (and port) immediately after
+            the backend TCP connect — before any relayed application bytes, and before
+            the backend TLS handshake when originating TLS. Compatible with passthrough
+            (the header precedes the client's encrypted ClientHello on the wire).
+
+            Source addresses honor the inbound PROXY trust decision: when
+            stream_proxy_protocol is enabled and the peer is trusted, the forwarded
+            client identity is advertised; otherwise the accept-time socket peer is used.
+
+            Only valid for tcp / tcps stream proxies. Setting it on UDP, DTLS, or HTTP
+            proxies produces a validation error (PROXY protocol is TCP-borne). UDP
+            outbound PROXY is intentionally out of scope.
+
+            Default: null (disabled — backends see the gateway egress IP).
         stream_match:
           oneOf:
             - $ref: "#/components/schemas/StreamMatchCriteria"
@@ -24515,7 +24535,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed, and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -24603,6 +24623,105 @@ components:
               default: 16384
               minimum: 1
               description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
+            sse_multiplexing:
+              type: boolean
+              default: true
+              description: >-
+                Aggregate-router only. When true, GET with Accept text/event-stream
+                attaches one multiplexed SSE listener for the downstream session.
+                When false, aggregate GET keeps a 405 rejection. Transparent mode
+                ignores this flag and continues to forward GET upstream.
+            sse_max_streams_per_session:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 1
+              maximum: 4096
+              description: >-
+                Max concurrent OPEN request-stream identities per downstream SSE
+                session. Completing or cancelling a stream returns its capacity;
+                the same bound also caps the retained terminal records that
+                refuse a late or duplicate response.
+            sse_max_retained_events:
+              type: integer
+              format: uint64
+              default: 128
+              minimum: 1
+              maximum: 16384
+              description: >-
+                Capacity of the single retained-event ring, which serves both
+                pre-listener staging and Last-Event-ID replay. An event still
+                owed to a consumer is never evicted: a publish that cannot be
+                admitted fails closed and the POST answers inline instead.
+            sse_max_retained_bytes:
+              type: integer
+              format: uint64
+              default: 1048576
+              minimum: 1
+              maximum: 16777216
+              description: >-
+                The one aggregate retained-byte budget for that ring (framed
+                event bytes). Must leave room for SSE framing above
+                sse_max_event_bytes.
+            sse_max_event_bytes:
+              type: integer
+              format: uint64
+              default: 262144
+              minimum: 1
+              maximum: 2097152
+              description: Max serialized JSON-RPC payload bytes admitted for one multiplexed SSE event.
+            sse_max_replay_events:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 0
+              maximum: 4096
+              description: >-
+                How many already-consumed events stay in the ring for
+                Last-Event-ID resume; must not exceed sse_max_retained_events.
+                0 evicts a consumed event immediately, so only the current
+                delivery watermark can resume and any older cursor fails closed
+                with HTTP 410.
+            sse_max_stream_id_bytes:
+              type: integer
+              format: uint64
+              default: 128
+              minimum: 1
+              maximum: 512
+              description: Max UTF-8 bytes admitted for a JSON-RPC request id used as a stream identity.
+            sse_max_last_event_id_bytes:
+              type: integer
+              format: uint64
+              default: 64
+              minimum: 1
+              maximum: 1024
+              description: Max accepted Last-Event-ID header bytes; values are never logged.
+            sse_listener_max_lifetime_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 5
+              maximum: 86400
+              description: >-
+                Bounded lifetime of one attached SSE listener; the client
+                resumes with Last-Event-ID. The stream ends cleanly at this age
+                whenever the transport is still polling its body, and native
+                HTTP/3 enforces it as a hard bound around its send loop. On
+                HTTP/1.1 and HTTP/2 a peer that stops reading can park the write
+                and with it that timer, so the unconditional guarantee is
+                supersession instead: past this age the session stops routing
+                new responses to that listener and a fresh GET takes the
+                single-listener slot rather than receiving 409.
+            sse_keepalive_seconds:
+              type: integer
+              format: uint64
+              default: 15
+              minimum: 1
+              maximum: 3600
+              description: >-
+                Idle keepalive comment interval; must not exceed
+                sse_listener_max_lifetime_seconds. Also how a vanished peer is
+                discovered on a quiet session.
         capabilities:
           type: object
           properties:

@@ -52,7 +52,7 @@
 //! `.github/workflows/ci.yml`). Locally:
 //!   cargo test --test functional_tests functional_backend_lb_session_persistence -- --ignored --nocapture
 
-use crate::common::{TestGateway, spawn_http_identifying};
+use crate::common::{TestGateway, spawn_http_identifying, spawn_http_status};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -89,6 +89,48 @@ fn affinity_set_cookie(response: &reqwest::Response) -> Option<String> {
         .filter_map(|v| v.to_str().ok())
         .find(|v| v.starts_with(&format!("{COOKIE_NAME}=")))
         .map(str::to_string)
+}
+
+/// Obtain a sticky binding the only way a client ever can: ask the gateway for
+/// one and keep the `Set-Cookie` it minted.
+///
+/// A sticky token is an HMAC-SHA-256 tag under `STICKY_SESSION_TOKEN_KEY`, a
+/// random key private to the spawned gateway process. A test cannot derive one
+/// for a chosen endpoint — that is precisely the unforgeability property the
+/// binding index exists to enforce — so any test that needs a binding for a
+/// SPECIFIC backend has to make that backend serve one response and capture the
+/// cookie minted for it.
+///
+/// `url` must therefore address a route that pins selection to exactly one
+/// endpoint, which makes the returned `name=value` pair a binding for
+/// `expect_server` by construction rather than by inspecting an opaque value.
+/// `expect_status` is the status that endpoint answers with, asserted so a
+/// silent fallback onto a different backend cannot masquerade as a mint.
+async fn mint_binding_through_gateway(
+    client: &reqwest::Client,
+    url: String,
+    expect_status: u16,
+    expect_server: &str,
+) -> String {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("binding mint request for {expect_server} failed: {e}"));
+    assert_eq!(
+        resp.status().as_u16(),
+        expect_status,
+        "the mint route for {expect_server} must reach that backend"
+    );
+    let set_cookie = affinity_set_cookie(&resp)
+        .unwrap_or_else(|| panic!("no binding was issued for {expect_server}"));
+    let pair = cookie_pair_from_set_cookie(&set_cookie, COOKIE_NAME);
+    assert_eq!(
+        parse_server_name(&resp.text().await.expect("binding mint body")),
+        expect_server,
+        "the pinning subset must route the mint request to {expect_server}"
+    );
+    pair
 }
 
 #[ignore]
@@ -324,54 +366,55 @@ plugin_configs: []
 ///
 /// This drives the real binary over the real load-balancer + retry path:
 ///
-/// 1. a cookie bound to a LIVE backend is honored and NOT re-issued (no
+/// 1. a cookie bound to the HEALTHY backend is honored and NOT re-issued (no
 ///    rotation happened) — the control that keeps step 2 from passing simply
 ///    because the gateway re-mints on every response;
-/// 2. a cookie bound to a backend that refuses connections is honored,
-///    dialed, fails pre-wire, rotates to the live backend, and the response
-///    carries a FRESH cookie for the backend that actually served it;
-/// 3. that fresh cookie returns the client to the live backend.
+/// 2. a cookie bound to a backend that answers every request with a retryable
+///    503 is honored, dialed, retried, rotated onto the healthy backend, and
+///    the response carries a FRESH cookie for the backend that actually served
+///    it;
+/// 3. that fresh cookie returns the client to the healthy backend.
 ///
-/// Deterministic: the refusing target is a socket this test OWNS for its whole
-/// lifetime — bound, never listening — so every dial is an immediate
-/// `ECONNREFUSED` with no bind/reuse window another process could win, and no
-/// sleeps, polling, or retry-until-pass anywhere.
+/// # Why both bindings are minted by the gateway
+///
+/// A sticky token is an HMAC-SHA-256 tag under a key private to the spawned
+/// gateway process, so this test cannot derive a binding for an endpoint it
+/// chooses — see [`mint_binding_through_gateway`]. Both bindings below are
+/// therefore captured from `Set-Cookie` headers the gateway itself minted, each
+/// on a route pinned by a single-member subset to exactly one endpoint.
+///
+/// That is also why the failing endpoint answers 503 instead of refusing the
+/// connection outright: the gateway only mints a binding for a backend that
+/// actually produced a response, so a socket that never listens can never be
+/// bound to in the first place, and a binding that cannot exist cannot be
+/// rotated off. The distinction is immaterial to what is under test — pre-wire
+/// `connection_error` and retryable-status failures converge on the same seam,
+/// `backend_dispatch::sticky_cookie_reissue_target`, evaluated once after the
+/// retry loop against the target that finally served — and the connect-refusal
+/// class stays covered by the retry and circuit-breaker functional suites.
+///
+/// Deterministic: the failing backend answers 503 to every request for its
+/// whole lifetime, the two single-member subsets admit exactly one endpoint
+/// each, and retry exclusion leaves exactly one rotation candidate. No sleeps,
+/// polling, port reuse, or retry-until-pass anywhere.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_lb_session_persistence_reissues_after_retry_rotation() {
-    use ferrum_edge::config::types::UpstreamTarget;
-
     let backend_live = spawn_http_identifying("sticky-rotation-live")
         .await
         .expect("spawn sticky-rotation-live");
 
-    // A backend that deterministically REFUSES, with no bind/reuse window: a TCP
-    // socket bound to an ephemeral port and deliberately never moved into the
-    // listening state. Two properties make it exact:
-    //
-    // - the bind is held for the whole test (RAII — the socket lives to the end
-    //   of this body and closes with it), so no parallel test or unrelated
-    //   process can claim the port and start answering on it. Taking a port by
-    //   binding and immediately dropping the listener would be a TOCTOU race:
-    //   between the release and the request, anything may bind it, and the
-    //   "refusing" backend would accept instead;
-    // - a bound socket that never called `listen(2)` has no accept queue, so the
-    //   kernel answers every SYN with RST. The gateway's real connect attempt
-    //   fails ECONNREFUSED before any request byte reaches a backend — the
-    //   pre-wire, `connection_error` class that `retry_on_connect_failure`
-    //   replays (`retry::should_retry`), and the only class that lets the retry
-    //   loop rotate onto the live target.
-    //
-    // No sleeps, no retry-until-pass: the refusal is a property of the socket
-    // state, observed identically on every attempt.
-    let refusing_backend = tokio::net::TcpSocket::new_v4().expect("refusing-backend socket");
-    refusing_backend
-        .bind("127.0.0.1:0".parse().expect("refusing-backend bind addr"))
-        .expect("reserve the refusing-backend port");
-    let refusing_port = refusing_backend
-        .local_addr()
-        .expect("refusing-backend addr")
-        .port();
+    // A backend that deterministically fails in a RETRYABLE way: it answers 503
+    // to every request, forever. Unlike a bind-and-never-listen socket it can
+    // still serve the one response the gateway needs in order to mint a binding
+    // for it, which is what makes step 2 below expressible at all now that
+    // tokens are unforgeable outside the gateway process. `retry::should_retry`
+    // replays it because 503 is in `retryable_status_codes` and GET is in
+    // `retryable_methods`, and retry exclusion then leaves the healthy target as
+    // the only rotation candidate.
+    let backend_failing = spawn_http_status("sticky-rotation-failing", 503)
+        .await
+        .expect("spawn sticky-rotation-failing");
 
     let upstream_id = "rotation-sticky-upstream";
     let config = format!(
@@ -387,9 +430,27 @@ proxies:
     upstream_id: "{upstream_id}"
     retry:
       max_retries: 1
+      retryable_status_codes: [503]
+      retryable_methods: ["GET"]
       retry_on_connect_failure: true
       backoff: !fixed
         delay_ms: 1
+  - id: "mint-live-proxy"
+    listen_path: "/mint-live"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {live}
+    strip_listen_path: true
+    upstream_id: "{upstream_id}"
+    upstream_subset: "live"
+  - id: "mint-failing-proxy"
+    listen_path: "/mint-failing"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {failing}
+    strip_listen_path: true
+    upstream_id: "{upstream_id}"
+    upstream_subset: "failing"
 upstreams:
   - id: "{upstream_id}"
     name: "BackendLBPolicy Cookie sessionPersistence with retry"
@@ -399,18 +460,29 @@ upstreams:
       path: "/"
       session_cookie: true
       http_only: true
+    subsets:
+      - name: "live"
+        labels:
+          lane: "live"
+      - name: "failing"
+        labels:
+          lane: "failing"
     targets:
       - host: "127.0.0.1"
         port: {live}
         weight: 1
+        tags:
+          lane: "live"
       - host: "127.0.0.1"
-        port: {refusing}
+        port: {failing}
         weight: 1
+        tags:
+          lane: "failing"
 consumers: []
 plugin_configs: []
 "#,
         live = backend_live.port,
-        refusing = refusing_port,
+        failing = backend_failing.port,
         upstream_id = upstream_id,
         cookie_name = COOKIE_NAME,
     );
@@ -419,7 +491,7 @@ plugin_configs: []
         .mode_file(config)
         .log_level("warn")
         .reserve_listener_port(backend_live.port)
-        .reserve_listener_port(refusing_port)
+        .reserve_listener_port(backend_failing.port)
         .spawn()
         .await
         .expect("start sticky rotation gateway");
@@ -430,25 +502,28 @@ plugin_configs: []
         .build()
         .expect("http client");
 
-    // The gateway's own binding derivation, so the test presents exactly the
-    // token a prior response would have minted for each target.
-    let scope = format!("ferrum|{upstream_id}");
-    let token_for_port = |port: u16| {
-        ferrum_edge::load_balancer::sticky_session_token(
-            &scope,
-            &UpstreamTarget {
-                host: "127.0.0.1".to_string(),
-                port,
-                service_port_policy_key: None,
-                weight: 1,
-                tags: std::collections::HashMap::new(),
-                locality: None,
-                path: None,
-            },
-        )
-    };
-    let live_cookie = format!("{COOKIE_NAME}={}", token_for_port(backend_live.port));
-    let refusing_cookie = format!("{COOKIE_NAME}={}", token_for_port(refusing_port));
+    // Bindings for each endpoint, minted BY the gateway on subset-pinned routes.
+    // A prior response is the only source of a resolvable token, and each of
+    // these is exactly the cookie a client would be holding after one request
+    // that landed on that endpoint.
+    let live_cookie = mint_binding_through_gateway(
+        &client,
+        gateway.proxy_url("/mint-live/bind"),
+        200,
+        "sticky-rotation-live",
+    )
+    .await;
+    let failing_cookie = mint_binding_through_gateway(
+        &client,
+        gateway.proxy_url("/mint-failing/bind"),
+        503,
+        "sticky-rotation-failing",
+    )
+    .await;
+    assert_ne!(
+        live_cookie, failing_cookie,
+        "two endpoints in one upstream must get distinct bindings"
+    );
 
     // --- Control: an honored binding that needed no rotation is NOT re-issued
     let honored = client
@@ -469,19 +544,19 @@ plugin_configs: []
     assert_eq!(
         parse_server_name(&honored.text().await.expect("honored body")),
         "sticky-rotation-live",
-        "the live binding must be honored, proving the token derivation matches"
+        "the live binding must be honored, proving the minted token resolves"
     );
 
-    // --- A valid binding whose backend refuses: rotate, then RE-ISSUE --------
+    // --- A valid binding whose backend fails: rotate, then RE-ISSUE ----------
     let rotated = client
         .get(gateway.proxy_url("/rotation/rotated"))
-        .header(reqwest::header::COOKIE, &refusing_cookie)
+        .header(reqwest::header::COOKIE, &failing_cookie)
         .send()
         .await
         .expect("rotated binding request");
     assert!(
         rotated.status().is_success(),
-        "a retry must rescue the request off the refusing backend, got {}",
+        "a retry must rescue the request off the failing backend, got {}",
         rotated.status()
     );
     let reissued = affinity_set_cookie(&rotated).expect(
@@ -490,8 +565,8 @@ plugin_configs: []
     );
     let rebound = cookie_pair_from_set_cookie(&reissued, COOKIE_NAME);
     assert_ne!(
-        rebound, refusing_cookie,
-        "the re-issued binding must not point back at the refusing backend"
+        rebound, failing_cookie,
+        "the re-issued binding must not point back at the failing backend"
     );
     assert_eq!(
         rebound, live_cookie,
@@ -518,11 +593,4 @@ plugin_configs: []
         parse_server_name(&confirm.text().await.expect("rebound body")),
         "sticky-rotation-live"
     );
-
-    // Release the refusing backend's port only now that every request that had
-    // to be refused has been made. Explicit rather than implicit so a future
-    // edit cannot reorder the drop above the traffic and quietly reintroduce the
-    // bind/reuse race; `EchoServer` and `TestGateway` clean up through their own
-    // `Drop` after this.
-    drop(refusing_backend);
 }

@@ -1,9 +1,15 @@
-//! Inbound PROXY protocol v1 (text) and v2 (binary) parser.
+//! Inbound PROXY protocol v1 (text) and v2 (binary) parser, plus outbound
+//! PROXY protocol v2 encoder.
 //!
 //! This module parses the PROXY protocol header that a load balancer or
 //! reverse proxy prepends to each TCP connection before forwarding it. The
 //! header carries the original client address so the backend can see the real
 //! source IP rather than the LB's own IP.
+//!
+//! Outbound encoding ([`encode_v2_proxy_header`])
+//! prepends the same v2 binary framing to backend TCP connections when a
+//! stream proxy opts in via `backend_proxy_protocol: v2`, so L4 backends
+//! (PostgreSQL, MySQL, Redis, …) can see the originating client identity.
 //!
 //! # Security model
 //!
@@ -17,6 +23,12 @@
 //! (the LB's own IP) belongs to the configured `FERRUM_TRUSTED_PROXIES` CIDR
 //! set. An un-trusted peer causes the connection to be closed; silently
 //! ignoring the header would mislead downstream authz plugins.
+//!
+//! Outbound PROXY is separately opt-in (`backend_proxy_protocol`). It
+//! advertises the already-trusted `client_ip` from
+//! [`crate::plugins::StreamConnectionContext`] — never an untrusted
+//! application header — so enabling it does not widen the inbound trust
+//! boundary.
 //!
 //! # Spec references
 //!
@@ -504,4 +516,93 @@ pub fn warn_invalid_proxy_header(
         "Closing connection: inbound PROXY protocol is required on this listener but the \
          connection did not start with a valid PROXY header"
     );
+}
+
+// ── v2 encoder (outbound) ────────────────────────────────────────────────────
+
+/// Maximum encoded PROXY v2 header size this module emits (signature + fixed
+/// header + AF_INET6 address block). Callers may stack-allocate against this.
+pub const V2_ENCODED_MAX_LEN: usize = V2_SIG.len() + 4 + 36;
+
+/// Build source/destination socket addresses for an outbound PROXY v2 header.
+///
+/// - `client_ip` / `client_port` are the trusted stream identity (after inbound
+///   PROXY trust gating when that is enabled).
+/// - `destination_ip` / `destination_port` are the complete trusted original
+///   destination tuple (inbound PROXY, `SO_ORIGINAL_DST`, or capture metadata).
+/// - When neither component is present, `local_fallback` supplies the complete
+///   accepted-socket address the client connected to.
+///
+/// Returns `None` when no destination is available or when only half of the
+/// original tuple is populated — callers must fail closed rather than combine
+/// unrelated evidence or invent addresses.
+pub fn outbound_v2_addrs(
+    client_ip: IpAddr,
+    client_port: u16,
+    destination_ip: Option<IpAddr>,
+    destination_port: Option<u16>,
+    local_fallback: Option<SocketAddr>,
+) -> Option<(SocketAddr, SocketAddr)> {
+    let destination = match (destination_ip, destination_port) {
+        (Some(ip), Some(port)) => {
+            SocketAddr::new(crate::util::client_identity::canonical_ip(ip), port)
+        }
+        (None, None) => crate::util::client_identity::canonical_socket_addr(local_fallback?),
+        _ => return None,
+    };
+    let src_ip = crate::util::client_identity::canonical_ip(client_ip);
+    Some((SocketAddr::new(src_ip, client_port), destination))
+}
+
+/// Encode a PROXY protocol v2 binary header (PROXY command, STREAM transport).
+///
+/// When `src` and `dst` share an IPv4 family (after IPv4-mapped canonicalization)
+/// the header uses `AF_INET` (28 bytes total). Mixed or IPv6 pairs are encoded
+/// as `AF_INET6`, promoting any IPv4 address to its IPv4-mapped form so a
+/// single address family is advertised (spec requirement).
+///
+/// The returned buffer never exceeds [`V2_ENCODED_MAX_LEN`] and contains no
+/// TLVs — only the fixed address block.
+pub fn encode_v2_proxy_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let src_ip = crate::util::client_identity::canonical_ip(src.ip());
+    let dst_ip = crate::util::client_identity::canonical_ip(dst.ip());
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => encode_v2_inet(s, d, src.port(), dst.port()),
+        (s, d) => encode_v2_inet6(ip_to_v6(s), ip_to_v6(d), src.port(), dst.port()),
+    }
+}
+
+fn ip_to_v6(ip: IpAddr) -> Ipv6Addr {
+    match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        IpAddr::V6(v6) => v6,
+    }
+}
+
+fn encode_v2_inet(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    // 12 sig + 4 fixed + 12 addr = 28
+    let mut buf = Vec::with_capacity(28);
+    buf.extend_from_slice(V2_SIG);
+    buf.push(0x21); // version=2, command=PROXY
+    buf.push(0x11); // AF_INET + STREAM
+    buf.extend_from_slice(&12u16.to_be_bytes());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf
+}
+
+fn encode_v2_inet6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    // 12 sig + 4 fixed + 36 addr = 52
+    let mut buf = Vec::with_capacity(V2_ENCODED_MAX_LEN);
+    buf.extend_from_slice(V2_SIG);
+    buf.push(0x21); // version=2, command=PROXY
+    buf.push(0x21); // AF_INET6 + STREAM
+    buf.extend_from_slice(&36u16.to_be_bytes());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf
 }
