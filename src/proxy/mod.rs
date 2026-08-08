@@ -27677,7 +27677,14 @@ async fn handle_proxy_request_inner(
                 crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
-                &state.grpc_pool,
+                // Direct-dial only, and provably so: this branch is entered
+                // only for `grpc_uses_native_dispatch`, whose mesh screen above
+                // refuses every non-`Direct` class before dispatch, and a
+                // `mesh.mtls` target is routed onto the generic mesh-mTLS path
+                // by `grpc_mesh_dispatch_falls_through` before that. The H3
+                // bridge is the surface that materializes the mesh transports
+                // (issues #2003, #3284).
+                &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                 &state.dns_cache,
                 owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
@@ -27945,7 +27952,11 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
-                            &state.grpc_pool,
+                            // Direct-dial only, for the same reason as the
+                            // split-path call above: the native-gRPC mesh screen
+                            // refuses every non-`Direct` class and `MeshMtls`
+                            // never reaches this branch (issues #2003, #3284).
+                            &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                             &state.dns_cache,
                             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,

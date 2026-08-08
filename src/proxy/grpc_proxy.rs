@@ -3098,12 +3098,16 @@ async fn open_hbone_grpc_sender(
         builder.max_concurrent_streams(max_streams);
     }
 
-    let (sender, connection) = builder.handshake(TokioIo::new(tunnel)).await.map_err(|e| {
-        HbonePoolError::H2Handshake {
-            host: plan.app_host.to_string(),
-            message: format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {e}"),
-        }
-    })?;
+    let (sender, connection) =
+        builder
+            .handshake(TokioIo::new(tunnel))
+            .await
+            .map_err(|e| HbonePoolError::H2Handshake {
+                host: plan.app_host.to_string(),
+                message: format!(
+                    "nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {e}"
+                ),
+            })?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);
@@ -3958,8 +3962,11 @@ pub(crate) async fn proxy_grpc_request_core(
     let client_host_header = headers
         .get(hyper::header::HOST)
         .and_then(|value| value.to_str().ok());
-    let uri =
-        transport.resolve_backend_uri(backend_url, proxy.preserve_host_header, client_host_header)?;
+    let uri = transport.resolve_backend_uri(
+        backend_url,
+        proxy.preserve_host_header,
+        client_host_header,
+    )?;
 
     // Apply per-route Host override AFTER the proxy_headers merge, mirroring
     // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or

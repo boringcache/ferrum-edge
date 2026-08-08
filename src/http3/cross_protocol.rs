@@ -6136,10 +6136,9 @@ pub(crate) async fn dispatch_grpc_streaming(
     // client-streaming / bidi RPCs and the peer can respond before the H3
     // client half-closes. Anything undispatchable FAILS CLOSED rather than
     // direct-dialing past the secured transport. No retry / rotation exists on
-    // this path, so
-    // the single pre-dispatch resolution covers it. The probe slot a HALF_OPEN
-    // breaker may have admitted is released, mirroring the buffered path's
-    // pre-dispatch rejects.
+    // this path, so the single pre-dispatch resolution covers it. The probe slot
+    // a HALF_OPEN breaker may have admitted is released, mirroring the buffered
+    // path's pre-dispatch rejects.
     let grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
         Ok(transport) => transport,
         Err(transport_error) => {

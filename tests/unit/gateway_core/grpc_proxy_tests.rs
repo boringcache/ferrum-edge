@@ -2399,10 +2399,7 @@ fn grpc_mesh_dispatch_conflicting_tags_take_the_stricter_refusal() {
         ),
         (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
     ]);
-    assert_eq!(
-        classify_grpc_mesh_dispatch(&both),
-        GrpcMeshDispatch::Hbone
-    );
+    assert_eq!(classify_grpc_mesh_dispatch(&both), GrpcMeshDispatch::Hbone);
 }
 
 #[test]
@@ -2504,10 +2501,7 @@ fn grpc_request_body_too_large_backend_response_is_trailers_only_resource_exhaus
 #[test]
 fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transports() {
     use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
-    for refused in [
-        GrpcMeshDispatch::Hbone,
-        GrpcMeshDispatch::HboneCrossCluster,
-    ] {
+    for refused in [GrpcMeshDispatch::Hbone, GrpcMeshDispatch::HboneCrossCluster] {
         // Pass-through gRPC-Web (no native content-type, no translation
         // marker): body-framed trailers ride the HTTP-family transport.
         assert!(
@@ -2847,9 +2841,10 @@ fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
             ),
             (ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG, pin),
         ]);
-        let error = pools.resolve(Some(&target)).err().unwrap_or_else(|| {
-            panic!("an unresolvable pinned peer ({pin:?}) must fail closed")
-        });
+        let error = pools
+            .resolve(Some(&target))
+            .err()
+            .unwrap_or_else(|| panic!("an unresolvable pinned peer ({pin:?}) must fail closed"));
         assert!(
             matches!(
                 error,
