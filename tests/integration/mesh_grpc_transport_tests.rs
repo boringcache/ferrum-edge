@@ -255,6 +255,16 @@ enum GrpcPeerBehavior {
 /// SVID-mTLS socket and the Ambient test drives it over a plain h2c socket
 /// behind the HBONE relay — the same server code, so a difference in the
 /// assertions can only come from the transport under test.
+///
+/// The accepted stream is handled on a SPAWNED task while this task keeps
+/// polling `h2::server::Connection::accept`: that call is the connection's ONLY
+/// I/O driver, so queued response HEADERS/DATA flush — and further request DATA
+/// is read — only while it runs. Handling the stream inline deadlocks the
+/// bidirectional shape: `RespondOnFirstRequestFrame` answers and then waits for
+/// the rest of the client's upload, but the client deliberately withholds it
+/// until it has seen the response, which can never flush while the connection's
+/// only driver is parked on that wait. (Same invariant as
+/// `start_hbone_grpc_relay` below.)
 async fn serve_one_grpc_rpc<T>(
     io: T,
     response_body: Bytes,
@@ -265,7 +275,7 @@ async fn serve_one_grpc_rpc<T>(
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut h2 = h2::server::handshake(io).await.expect("h2 server");
-    let (request, mut respond) = h2.accept().await.expect("gRPC stream").expect("stream ok");
+    let (request, respond) = h2.accept().await.expect("gRPC stream").expect("stream ok");
 
     let header = |name: &str| {
         request
@@ -288,7 +298,38 @@ async fn serve_one_grpc_rpc<T>(
         peer_presented_client_cert,
     });
 
-    let mut recv = request.into_body();
+    let recv = request.into_body();
+    let handler = tokio::spawn(serve_grpc_stream(recv, respond, response_body, behavior));
+
+    // Drive the connection for its whole lifetime: this flushes the handler's
+    // response frames and feeds it the client's continuing upload, and it also
+    // keeps the connection alive until the client is done reading.
+    while let Some(next) = h2.accept().await {
+        if next.is_err() {
+            break;
+        }
+    }
+
+    // Explicit completion coordination, so a handler assertion failure surfaces
+    // instead of vanishing with the task. A `NeverRespond` peer parks forever by
+    // design, so the join is bounded.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handler).await {
+        // Handler finished, or is still deliberately parked.
+        Ok(Ok(())) | Err(_) => {}
+        Ok(Err(join_error)) => std::panic::resume_unwind(join_error.into_panic()),
+    }
+}
+
+/// The accepted stream's half of `serve_one_grpc_rpc`, run on its own task so
+/// the owning `h2::server::Connection` keeps being driven while this awaits the
+/// client. Every await here is on the peer's next request frame, which only
+/// arrives — and whose response only leaves — because that driver is running.
+async fn serve_grpc_stream(
+    mut recv: h2::RecvStream,
+    mut respond: h2::server::SendResponse<Bytes>,
+    response_body: Bytes,
+    behavior: GrpcPeerBehavior,
+) {
     if behavior == GrpcPeerBehavior::NeverRespond {
         // Hold the stream open without answering; the client deadline must fire.
         while let Some(chunk) = recv.data().await {
@@ -342,13 +383,6 @@ async fn serve_one_grpc_rpc<T>(
     trailers.insert("grpc-status", "0".parse().expect("status value"));
     trailers.insert("grpc-message", "ok".parse().expect("message value"));
     send.send_trailers(trailers).expect("send trailers");
-
-    // Keep the connection alive until the client is done reading.
-    while let Some(next) = h2.accept().await {
-        if next.is_err() {
-            break;
-        }
-    }
 }
 
 /// A real SVID-mTLS HTTP/2 listener that serves ONE gRPC RPC — the Sidecar peer.
