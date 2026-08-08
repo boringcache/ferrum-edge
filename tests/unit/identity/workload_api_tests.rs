@@ -909,8 +909,17 @@ async fn fetch_x509svid_rejects_missing_workload_metadata_before_attestation() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// A CA backend with no JWT authority at all (the `StubCa` here, and in
+/// production `FERRUM_MESH_CA_BACKEND=spire`, whose agent streams carry only
+/// X.509 authorities) must fail closed with `UNIMPLEMENTED` on every JWT RPC.
+///
+/// `FetchJWTBundles` in particular must not return `Ok(stream)`: SPIFFE
+/// Workload API §6.2.2 requires at least the local trust-domain JWT bundle, so
+/// an empty `bundles` map reads as "zero trusted JWT authorities" rather than
+/// "unsupported". Backends that *do* own a JWT authority are covered in
+/// `jwt_svid_tests.rs`.
 #[tokio::test]
-async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
+async fn jwt_svid_rpcs_return_unimplemented_when_backend_has_no_jwt_authority() {
     use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use ferrum_edge::identity::workload_api::proto::{
         JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
@@ -934,13 +943,13 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
         }))
         .await
     {
-        Ok(_) => panic!("FetchJWTSVID must not succeed while deferred"),
+        Ok(_) => panic!("FetchJWTSVID must not mint without a JWT signing authority"),
         Err(err) => err,
     };
     assert_eq!(mint_err.code(), Code::Unimplemented);
     assert!(
-        mint_err.message().contains("JWT-SVID issuance"),
-        "mint error should name issuance deferral (got: {})",
+        mint_err.message().contains("cannot mint JWT-SVIDs"),
+        "mint error should name the missing signing authority (got: {})",
         mint_err.message()
     );
 
@@ -955,8 +964,8 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
     };
     assert_eq!(bundles_err.code(), Code::Unimplemented);
     assert!(
-        bundles_err.message().contains("JWT-SVID bundle"),
-        "bundles error should name bundle-stream deferral (got: {})",
+        bundles_err.message().contains("no JWT authority"),
+        "bundles error should name the missing authority (got: {})",
         bundles_err.message()
     );
 
@@ -967,13 +976,13 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
         }))
         .await
     {
-        Ok(_) => panic!("ValidateJWTSVID must not succeed while deferred"),
+        Ok(_) => panic!("ValidateJWTSVID must not succeed without a JWT authority"),
         Err(err) => err,
     };
     assert_eq!(validate_err.code(), Code::Unimplemented);
     assert!(
-        validate_err.message().contains("JWT-SVID validation"),
-        "validate error should name validation deferral (got: {})",
+        validate_err.message().contains("no JWT authority"),
+        "validate error should name the missing authority (got: {})",
         validate_err.message()
     );
 }

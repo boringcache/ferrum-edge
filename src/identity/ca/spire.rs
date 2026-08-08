@@ -413,6 +413,23 @@ impl CertificateAuthority for SpireAgentCa {
         Ok(published)
     }
 
+    /// Publish whatever JWT authorities the agent-supplied bundle carries.
+    ///
+    /// RESIDUAL (issue #3617): the agent's `FetchX509SVID` /
+    /// `FetchX509Bundles` streams — the only ones this backend consumes —
+    /// carry X.509 authorities exclusively, so this is empty in practice
+    /// today and `FetchJWTBundles` / `ValidateJWTSVID` answer `UNIMPLEMENTED`
+    /// under `FERRUM_MESH_CA_BACKEND=spire`. Populating it means consuming the
+    /// agent's own `FetchJWTBundles` stream and converting its JWKS back into
+    /// SPKI PEM.
+    ///
+    /// `jwt_signer()` deliberately keeps the trait default (`None`) and cannot
+    /// be filled in by any amount of local work: a SPIRE agent authorizes
+    /// `FetchJWTSVID` against the *calling process's* attested identity, so a
+    /// proxied mint would return a token whose `sub` is Ferrum's own SPIFFE ID
+    /// rather than the downstream workload's. Minting for an arbitrary
+    /// delegated subject requires SPIRE's admin/delegated-identity API, which
+    /// Ferrum is not granted.
     async fn jwt_authorities(
         &self,
         td: &TrustDomain,

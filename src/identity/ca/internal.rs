@@ -13,10 +13,15 @@
 //!   trust a SAN claim coming from a CSR.
 //! - Publish the trust bundle (the root cert) for verifiers.
 //!
+//! - Own a [`LocalJwtAuthority`] so the Workload API can mint and validate
+//!   JWT-SVIDs for this trust domain, and publish that authority's public
+//!   half as the trust domain's JWT bundle (issue #3617). The JWT signing key
+//!   is independent of the X.509 root: rotating one does not disturb the
+//!   other, and the root private key is never exposed to the JWT path.
+//!
 //! ## Out of scope (deferred to later phases)
 //!
-//! - Intermediate CAs, key escrow, JWT-SVID minting (we expose the JWKS
-//!   plumbing as an empty list for Phase A; later phases plug it in).
+//! - Intermediate CAs and key escrow.
 //! - CRL / OCSP publication.
 //! - Cross-trust-domain federation (the upstream wrappers handle that).
 
@@ -33,6 +38,9 @@ use tracing::{debug, info};
 use super::{
     CaError, CertificateAuthority, IssuanceRequest, PublishedJwtAuthority, PublishedTrustBundle,
     SignedSvid,
+};
+use crate::identity::jwt_svid::{
+    JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, SharedJwtSvidSigner,
 };
 use crate::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 
@@ -105,6 +113,10 @@ pub struct InternalCa {
     bundle_refresh_hint_secs: Option<u64>,
     default_svid_ttl_secs: u64,
     max_svid_ttl_secs: u64,
+    /// JWT signing authority for this trust domain. Independent of the X.509
+    /// root and generated at construction so no request path ever generates a
+    /// key.
+    jwt_authority: Arc<LocalJwtAuthority>,
 }
 
 impl InternalCa {
@@ -135,6 +147,14 @@ impl InternalCa {
             Issuer::from_ca_cert_pem(&config.root_cert_pem, key_pair)
                 .map_err(|e| CaError::Config(format!("invalid root cert PEM: {e}")))?;
 
+        // JWT signing authority for this trust domain. Built eagerly so that
+        // key generation happens once at startup rather than on a mint RPC,
+        // and so a broken crypto backend fails startup instead of first use.
+        let jwt_authority = Arc::new(
+            LocalJwtAuthority::new(LocalJwtAuthorityConfig::new(config.trust_domain.clone()))
+                .map_err(|e| CaError::Config(format!("JWT-SVID authority setup failed: {e}")))?,
+        );
+
         info!(
             trust_domain = %config.trust_domain,
             "internal CA initialised"
@@ -143,6 +163,7 @@ impl InternalCa {
 
         Ok(Self {
             trust_domain: config.trust_domain,
+            jwt_authority,
             root_cert_der,
             issuer,
             bundle_refresh_hint_secs: config.bundle_refresh_hint_secs,
@@ -162,6 +183,15 @@ impl InternalCa {
     /// The trust domain this CA serves.
     pub fn trust_domain(&self) -> &TrustDomain {
         &self.trust_domain
+    }
+
+    /// The JWT signing authority backing this CA's JWT-SVID surface.
+    ///
+    /// Exposed so the background rotation task can drive
+    /// [`LocalJwtAuthority::rotate_if_due`]; nothing on a request path needs
+    /// it.
+    pub fn jwt_authority(&self) -> &Arc<LocalJwtAuthority> {
+        &self.jwt_authority
     }
 
     fn enforce_trust_domain(&self, id: &SpiffeId) -> Result<(), CaError> {
@@ -371,9 +401,14 @@ impl CertificateAuthority for InternalCa {
         if td != &self.trust_domain {
             return Err(CaError::UnknownTrustDomain(td.to_string()));
         }
-        // Phase A: JWT-SVID minting is wired in but no signing keys are
-        // published. Future phases plug a JwtAuthority registry here.
-        Ok(Vec::new())
+        // The active signing key plus every retired key still inside its
+        // rotation overlap, so a token minted just before a rotation stays
+        // verifiable for its whole bounded lifetime.
+        Ok(self.jwt_authority.authorities())
+    }
+
+    fn jwt_signer(&self) -> Option<SharedJwtSvidSigner> {
+        Some(Arc::clone(&self.jwt_authority) as SharedJwtSvidSigner)
     }
 }
 

@@ -10,6 +10,8 @@
 //!   creds, JWT-SVID federation, dev-only static identity).
 //! - [`ca`] — `CertificateAuthority` trait + Ferrum's internal CA + wrappers
 //!   for delegating to Vault PKI / cert-manager / SPIRE.
+//! - [`jwt_svid`] — SPIFFE JWT-SVID mint / validate / JWKS bundles for the
+//!   Workload API's three JWT RPCs.
 //! - [`rotation`] — background task that renews SVIDs and hot-swaps via
 //!   `ArcSwap` for the lock-free TLS-resolver path.
 //!
@@ -28,6 +30,7 @@ use zeroize::Zeroizing;
 pub mod attestation;
 pub mod ca;
 pub mod file_loader;
+pub mod jwt_svid;
 pub mod rotation;
 pub mod spiffe;
 pub mod workload_api;

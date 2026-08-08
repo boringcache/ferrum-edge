@@ -21,6 +21,7 @@ use x509_parser::prelude::*;
 use crate::identity::{
     SvidBundle, TrustBundle, TrustBundleSet,
     ca::{IssuanceRequest, SharedCa},
+    jwt_svid::JwtSvidSigner,
     spiffe::SpiffeId,
 };
 
@@ -114,6 +115,12 @@ async fn rotation_main(config: RotationConfig) {
         };
         sleep(next_tick).await;
 
+        // JWT signing keys rotate on their own schedule, independent of the
+        // X.509 SVID's validity window. Driving it from this tick keeps key
+        // generation off every request path; the authority itself decides
+        // whether anything is due.
+        rotate_jwt_authority_if_due(&config.ca).await;
+
         let snapshot = config.current.load_full();
         let needs_rotation = match snapshot.as_ref() {
             Some(bundle) => is_due_for_rotation(bundle, config.rotate_at_fraction),
@@ -138,6 +145,29 @@ async fn rotation_main(config: RotationConfig) {
                 );
                 warn!(error = %e, spiffe_id = %config.spiffe_id, "SVID rotation failed");
             }
+        }
+    }
+}
+
+/// Ask the CA's JWT signing authority — when it has one — to rotate if its
+/// active key has outlived its configured lifetime.
+///
+/// A CA backend without JWT authority (SPIRE agent, the upstream scaffolds)
+/// returns `None` from `jwt_signer()` and this is a no-op. A rotation failure
+/// is warned and retried on the next tick: the previous key stays active and
+/// every already-minted token remains verifiable, so failing here degrades
+/// nothing.
+async fn rotate_jwt_authority_if_due(ca: &SharedCa) {
+    let Some(signer) = ca.jwt_signer() else {
+        return;
+    };
+    match signer.rotate_if_due().await {
+        Ok(Some(generation)) => {
+            debug!(generation, "JWT-SVID signing key rotated by rotation task");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "JWT-SVID signing key rotation failed; keeping the current key");
         }
     }
 }
@@ -168,6 +198,29 @@ async fn mint_and_install(config: &RotationConfig) -> Result<(), String> {
     );
     crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle(&bundle, "rotation");
 
+    // JWT authorities are best-effort here: a backend that publishes none
+    // (SPIRE agent today) leaves the list empty, and an X.509 SVID must still
+    // install. The Workload API reads authorities from the CA directly, so
+    // this list is a convenience for consumers of `SvidBundle`, not the
+    // source of truth for `FetchJWTBundles`.
+    let jwt_authorities = match config
+        .ca
+        .jwt_authorities(config.spiffe_id.trust_domain())
+        .await
+    {
+        Ok(published) => published
+            .into_iter()
+            .map(|authority| crate::identity::JwtAuthority {
+                key_id: authority.key_id,
+                public_key_pem: authority.public_key_pem,
+            })
+            .collect(),
+        Err(e) => {
+            debug!(error = %e, "rotation: no JWT authorities published for this trust domain");
+            Vec::new()
+        }
+    };
+
     let svid_bundle = SvidBundle {
         spiffe_id: svid.spiffe_id.clone(),
         cert_chain_der: svid.cert_chain_der,
@@ -176,7 +229,7 @@ async fn mint_and_install(config: &RotationConfig) -> Result<(), String> {
             local: TrustBundle {
                 trust_domain: bundle.trust_domain.clone(),
                 x509_authorities: bundle.roots_der.clone(),
-                jwt_authorities: Vec::new(),
+                jwt_authorities,
                 refresh_hint_seconds: bundle.refresh_hint_secs,
             },
             federated: Default::default(),

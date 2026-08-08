@@ -52,7 +52,7 @@ Current mesh HBONE/DNS perf status lives in
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
-| SPIFFE Workload API JWT-SVID mint/validate | [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) | X.509-SVID path complete; JWT RPCs (`FetchJWTSVID` / `FetchJWTBundles` / `ValidateJWTSVID`) return `UNIMPLEMENTED` fail-closed — empty JWT bundle streams are not conformant |
+| SPIFFE Workload API JWT-SVID mint/validate (SPIRE backend) | [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) | Implemented for `FERRUM_MESH_CA_BACKEND=internal` (mint / bundles / validate, ES256, rotation overlap). `spire` still answers `UNIMPLEMENTED` on all three — a delegated mint needs SPIRE's admin API, and JWT bundles need the agent's `FetchJWTBundles` stream. Empty JWT bundle streams remain non-conformant in every posture |
 | Mesh/SPIRE CA-health signal + startup contract | [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) | |
 | CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |

@@ -46,7 +46,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [Gateway-to-Mesh Bridge](#gateway-to-mesh-bridge)
 - [Mesh Identity](#mesh-identity)
   - [SPIRE Agent CA](#spire-agent-ca)
-  - [Workload API JWT-SVID (deferred)](#workload-api-jwt-svid-deferred)
+  - [Workload API JWT-SVID](#workload-api-jwt-svid)
   - [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails)
 - [Node Agent Mode](#node-agent-mode)
 - [VirtualService Translation](#virtualservice-translation)
@@ -2804,9 +2804,28 @@ Identity baggage from the client request is stripped from tunneled inner HBONE r
 
 The SPIRE backend is the recommended production path for mesh identity. `internal` is intended for development and testing only -- it generates a self-signed root CA at startup with no external trust anchor. Explicit file-based `FERRUM_GATEWAY_SVID_*` material takes precedence over `FERRUM_MESH_CA_BACKEND`; when both are configured Ferrum uses the file SVID and does not start automatic CA-backed issuance.
 
-### Workload API JWT-SVID (deferred)
+### Workload API JWT-SVID
 
-Ferrum's supported mesh identity surface is **X.509-SVID** (mTLS / HBONE peer verification). When Ferrum acts as a SPIFFE Workload API server for local workloads, JWT-SVID mint (`FetchJWTSVID`), validation (`ValidateJWTSVID`), and JWT trust-bundle streaming (`FetchJWTBundles`) return gRPC `UNIMPLEMENTED` fail-closed ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)). Operators must not point JWT-SVID-dependent workloads at Ferrum's Workload API until that tracker closes. Mesh `RequestAuthentication` / `jwks_auth` continues to validate application JWTs via its own JWKS fetch and is unrelated to Workload API JWT-SVIDs. See [docs/spire_deployment.md](spire_deployment.md#jwt-svids).
+Ferrum's Workload API serves JWT-SVIDs **when the selected CA backend owns a JWT signing authority**, and fails closed with gRPC `UNIMPLEMENTED` when it does not. Backend support today:
+
+| `FERRUM_MESH_CA_BACKEND` | `FetchJWTSVID` | `FetchJWTBundles` | `ValidateJWTSVID` |
+|---|---|---|---|
+| `internal` | ✅ mint | ✅ stream | ✅ validate |
+| `spire` | `UNIMPLEMENTED` | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+| Vault PKI / cert-manager scaffolds | `UNIMPLEMENTED` | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+
+The `internal` CA generates a dedicated ES256 JWT signing key at startup, independent of its X.509 root. Behaviour:
+
+- **`FetchJWTSVID`** re-runs the attestor chain and mints **only** for the attested identity. The optional `spiffe_id` field is honoured only when byte-equal to the attested SPIFFE ID; any other value is `PERMISSION_DENIED`. At least one non-empty audience is required (max 32 audiences, 512 bytes each); duplicates collapse. Tokens carry `sub` (the SPIFFE ID), `aud`, `exp`, `iat`, `nbf`, and a unique `jti`, are signed `ES256` with a `kid` equal to the key's RFC 7638 JWK thumbprint, and are clamped to a 1 h ceiling (5 min default).
+- **`FetchJWTBundles`** streams a JWKS document per trust domain — always including the local one — and republishes on JWT key rotation, skipping rotation signals that did not change the authority set. It never emits an empty `bundles` map as success: SPIFFE Workload API §6.2.2 requires at least the local trust-domain bundle, so "no authorities" is reported as `UNIMPLEMENTED`, never as an empty map. Malformed or oversized authority material is refused rather than published.
+- **`ValidateJWTSVID`** verifies signature, key id, audience, subject SPIFFE syntax and trust domain, issuer (when present), `exp` (mandatory), `nbf`, and `iat`. It refuses `alg: none`, the HMAC family, unknown or ambiguous key ids, unknown trust domains, unknown critical headers, repeated JSON keys in the header or claims, and oversized tokens or claim documents. Rejection reasons are fixed strings — no token bytes, claim values, or key material appear in an error.
+- **Rotation overlap.** A retired JWT signing key stays published for verification for the maximum token lifetime plus clock-skew leeway, so a token minted an instant before a rotation remains verifiable for its whole bounded lifetime; after that window the key disappears. Retained keys are additionally capped (active + 3 by default), bounding both memory and bundle size. Rotation runs on the background rotation task, never on a request path.
+
+Like `FetchX509Bundles`, the bundle and validate RPCs require the mandatory `workload.spiffe.io: true` metadata header but do not run the attestor chain — they consume public trust material and mint nothing. Private-key and token issuance stay gated on `FetchX509SVID` / `FetchJWTSVID`.
+
+**Residual ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)):** the SPIRE backend cannot mint JWT-SVIDs. A SPIRE agent authorizes `FetchJWTSVID` against the *calling process's* attested identity, so proxying the RPC through Ferrum would return a token whose `sub` is Ferrum's own SPIFFE ID rather than the downstream workload's; minting for a delegated subject requires SPIRE's admin/delegated-identity API, which Ferrum is not granted. Ferrum's SPIRE backend also consumes only the agent's X.509 streams, so it publishes no JWT authorities and the bundle/validate RPCs are `UNIMPLEMENTED` there too.
+
+Mesh `RequestAuthentication` / `jwks_auth` continues to validate application JWTs via its own JWKS fetch and is unrelated to Workload API JWT-SVIDs. See [docs/spire_deployment.md](spire_deployment.md#jwt-svids).
 
 ### Internal Dev CA and Production Guardrails
 

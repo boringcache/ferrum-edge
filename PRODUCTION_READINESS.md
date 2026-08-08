@@ -33,7 +33,7 @@ review loop + full CI + orchestrator review on every PR) → merged.
 | PR-001 | Ambient live-gate row not firewall-proven | Medium (test integrity) | FIXED (PR #2105) |
 | PR-002 | Outbound mesh SPIFFE verification skipped CRLs (inbound-only asymmetry) | Medium (security) | FIXED (PR #2113, 3 codex rounds incl. live-reload slot + race guards) |
 | PR-003 | InternalCa CSR path lacked proof-of-possession | Low (hardening) | FIXED (PR #2114 — real PoP verification) |
-| PR-004 | SPIFFE Workload API JWT-SVID unimplemented (X.509 complete) | Low | STILL OPEN — live tracker [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); X.509-SVID path remains the supported surface; JWT RPCs return `UNIMPLEMENTED` (including `FetchJWTBundles`, which must not stream an empty map) |
+| PR-004 | SPIFFE Workload API JWT-SVID unimplemented (X.509 complete) | Low | PARTIALLY FIXED — tracker [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617). `FERRUM_MESH_CA_BACKEND=internal` implements mint / validate / JWT bundle streaming with rotation overlap. `spire` still returns `UNIMPLEMENTED` on all three: SPIRE authorizes `FetchJWTSVID` by the calling process's identity, so a delegated mint is not expressible over the Workload API Ferrum consumes. `FetchJWTBundles` never streams an empty map in either posture |
 | PR-005 | k8s controller Merge-Patch status writes (SSA TODO); naming-convention proxy-id | Low | FIXED (PR #2152) — intentional mixed strategy: resourceVersion-guarded RMW for Route `status.parents[]` (Gateway API list ownership), SSA + stable `fieldManager` for Gateway/GatewayClass conditions, plus typed proxy-id mapping. Not a blanket "convert everything to SSA" TODO. |
 | PR-006 | Stale "F3 §3.3 UDP not implemented" message | Low (accuracy) | FIXED (PR #2114) |
 | PR-007 | Log schema not applied to WsDisconnectLogEntry | Low | FIXED — `WsDisconnectLogEntry` implements `SchemaSerializable`; see `docs/log_schema.md` WebSocket disconnect family |
@@ -95,7 +95,7 @@ issue body alone.
 | Live OIDC / OAuth2 introspection coverage | #3333 | |
 | NodeWaypoint observability + promotion gates | #3334 | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
-| SPIFFE Workload API JWT-SVID mint/validate | #3617 | X.509 complete; JWT RPCs return `UNIMPLEMENTED` fail-closed until mint/validate ships |
+| SPIFFE Workload API JWT-SVID mint/validate (SPIRE backend) | #3617 | Implemented for the `internal` CA backend; `spire` needs SPIRE's delegated-identity API for mint and its JWT bundle stream for validate |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 | Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
 | CNI ferrum-cni chaining uninstall/rollback | #3609 | Node-agent becomes node-wide pod-creation dependency |

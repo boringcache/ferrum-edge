@@ -106,12 +106,31 @@ pub trait CertificateAuthority: Send + Sync + 'static {
     /// server.
     async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError>;
 
-    /// Publish JWKS authorities for JWT-SVID validation. May be empty when
-    /// the CA does not mint JWT-SVIDs.
+    /// Publish JWKS authorities for JWT-SVID validation. Empty means this CA
+    /// publishes no JWT trust for `td` — the Workload API translates that into
+    /// `UNIMPLEMENTED`, never into an empty (and therefore misleading) JWT
+    /// bundle stream.
     async fn jwt_authorities(
         &self,
         td: &TrustDomain,
     ) -> Result<Vec<PublishedJwtAuthority>, CaError>;
+
+    /// The JWT signing authority this CA owns, if any.
+    ///
+    /// Returning `Some` asserts that this backend can mint JWT-SVIDs *for the
+    /// workload identity the Workload API attested* — not merely that it can
+    /// obtain a JWT from somewhere. The default is `None`, which makes
+    /// `FetchJWTSVID` fail closed with `UNIMPLEMENTED`.
+    ///
+    /// [`spire::SpireAgentCa`] deliberately keeps the default: a SPIRE agent
+    /// authorizes `FetchJWTSVID` against the *calling process's* attested
+    /// identity, so proxying the RPC through Ferrum would mint tokens carrying
+    /// Ferrum's own SPIFFE ID rather than the downstream workload's. It still
+    /// publishes SPIRE's JWT authorities through [`Self::jwt_authorities`], so
+    /// `FetchJWTBundles` and `ValidateJWTSVID` remain available there.
+    fn jwt_signer(&self) -> Option<crate::identity::jwt_svid::SharedJwtSvidSigner> {
+        None
+    }
 }
 
 /// Errors raised by [`CertificateAuthority`] implementations.
