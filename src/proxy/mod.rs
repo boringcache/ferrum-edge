@@ -49,6 +49,12 @@ pub mod http2_pool;
 /// the buffered tokio-rustls accept and the userspace relay.
 #[cfg(target_os = "linux")]
 pub(crate) mod ktls_accept;
+/// TLS control-record classification and the `SOL_TLS` `recvmsg`/`sendmsg`
+/// ancillary contract used by the kTLS splice relay (issue #3619). The
+/// classification half is platform-independent so it can be tested anywhere;
+/// the syscall wrappers are Linux-only.
+#[allow(dead_code)] // Several code points/helpers are exercised only by tests.
+pub mod ktls_record;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;

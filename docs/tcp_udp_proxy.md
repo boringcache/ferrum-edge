@@ -488,6 +488,16 @@ failure is still recoverable; with no keys installed the ULP is the kernel's
 transparent `TLS_BASE` variant, so the userspace relay on the decline path is
 unaffected.
 
+`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` is **one budget for the whole
+frontend admission**, not one allowance per stage. The deadline is opened once
+in `accept_frontend_tls` and shared by the ClientHello peek, the unbuffered
+kTLS handshake, and the buffered fallback, so a peer that dribbles a partial
+hello cannot spend the budget on the kTLS attempt and then be granted a fresh
+full timer on the fallback. A refusal made before the point of no return
+records no handshake metric and leaves the socket pristine; the timeout/failure
+metric is recorded exactly once, by whichever path actually terminates the
+connection.
+
 Handshake failures, peer I/O errors, and handshake timeouts terminate the
 connection exactly as they would on the buffered path, with the same
 `StreamSetupKind::FrontendTlsHandshake` attribution and the same mesh mTLS
@@ -509,12 +519,39 @@ userspace, so it feeds the same splice loops as a plain-to-plain relay. SNI on
 the kTLS path is parsed from the peeked ClientHello rather than read back from
 a `ServerConnection`.
 
-One kernel-specific detail is handled explicitly: a kTLS receive side returns
-`EINVAL` from `splice(2)` for any non-application record, which is how a
-routine rustls `close_notify` arrives. The client-leg splice loop maps that to
-a clean EOF, so a graceful TLS close is not reported as a relay failure and
-does not charge the backend circuit breaker. The io_uring splice path is not
-used for kTLS connections.
+### TLS close handshake on a spliced connection
+
+Both halves of the TLS shutdown are handled explicitly, because a kernel-owned
+record layer changes how each one surfaces.
+
+**Receive.** A kTLS receive side returns `EINVAL` from `splice(2)` for *any*
+non-application record and **leaves that record queued** — `EINVAL` is not a
+synonym for `close_notify`. It also covers fatal alerts, other warning alerts,
+renegotiation handshake records, and ChangeCipherSpec, and `splice(2)` can
+return `EINVAL` for reasons unrelated to TLS. The client-leg splice loop
+therefore reads the pending record back with the `SOL_TLS` /
+`TLS_GET_RECORD_TYPE` `recvmsg(2)` ancillary contract and classifies it
+(`src/proxy/ktls_record.rs`). Only an **authenticated TLS 1.2 warning-level
+`close_notify`** — the kernel delivers a record only after its AEAD tag
+verifies, so it cannot be spoofed into an established session — is treated as a
+clean EOF, and only then is the close not reported as a relay failure or
+charged to the backend circuit breaker. A fatal alert, any other alert, an
+unexpected control record, a malformed (non-two-byte) alert body, and an
+unrelated `EINVAL` all remain attributed relay errors.
+
+**Transmit.** A graceful backend EOF is propagated to the client as exactly one
+TLS 1.2 warning `close_notify`, emitted through kTLS TX with the matching
+`TLS_SET_RECORD_TYPE` `sendmsg(2)` ancillary message **after** the last
+application byte and **before** the raw `shutdown(SHUT_WR)`. Without it a
+conformant TLS client sees a truncated session rather than a clean close. The
+send is non-blocking and bounded (250 ms): a peer that stopped reading cannot
+wedge teardown, and the raw half-close still follows. Half-close semantics are
+preserved in both directions — receiving the client's `close_notify` half-closes
+only the client→backend direction, so the backend's remaining response bytes
+still reach the client and the reciprocal `close_notify` is sent after they
+drain.
+
+The io_uring splice path is not used for kTLS connections.
 
 Secret material never leaves `Zeroizing` buffers, is never logged, and the
 `KernelConnection` handle rustls returns alongside the secrets is dropped

@@ -5374,8 +5374,17 @@ enum FrontendTlsAccepted {
 /// The kTLS attempt is strictly additive: it only ever peeks the ClientHello
 /// before deciding, and any refusal returns the socket untouched so the
 /// buffered tokio-rustls accept below runs exactly as it did before. Frontend
-/// admission ordering, the handshake timeout, mTLS peer verification, and the
-/// mesh handshake metrics are identical on both branches.
+/// admission ordering, mTLS peer verification, and the mesh handshake metrics
+/// are identical on both branches.
+///
+/// `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` is **one budget for the
+/// whole admission**, not one per stage: the deadline is computed once here and
+/// shared by the ClientHello peek, the unbuffered kTLS handshake, and the
+/// buffered fallback. A peer that dribbles a partial hello therefore cannot
+/// spend the budget on the kTLS attempt and then receive a fresh full timer on
+/// the fallback. Exactly one path records the timeout/failure metric: a kTLS
+/// refusal before the point of no return records nothing and leaves the socket
+/// pristine, and everything after it is terminal for the connection.
 async fn accept_frontend_tls(
     client_stream: TcpStream,
     tls_config: &Arc<rustls::ServerConfig>,
@@ -5384,11 +5393,15 @@ async fn accept_frontend_tls(
     record_mesh_mtls_metric: bool,
     ktls_eligible: bool,
 ) -> std::io::Result<FrontendTlsAccepted> {
+    let deadline =
+        crate::tls::frontend_tls_handshake_deadline(frontend_tls_handshake_timeout_seconds);
+
     #[cfg(target_os = "linux")]
     let client_stream = if ktls_eligible {
         match crate::proxy::ktls_accept::try_ktls_accept(
             client_stream,
             tls_config,
+            deadline,
             frontend_tls_handshake_timeout_seconds,
             remote_addr,
             record_mesh_mtls_metric,
@@ -5408,9 +5421,10 @@ async fn accept_frontend_tls(
     let _ = ktls_eligible;
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-    let tls_stream = crate::tls::accept_with_optional_timeout(
+    let tls_stream = crate::tls::accept_with_optional_deadline(
         &acceptor,
         client_stream,
+        deadline,
         frontend_tls_handshake_timeout_seconds,
         remote_addr,
         record_mesh_mtls_metric,
@@ -6841,11 +6855,20 @@ async fn sleep_for_cap(half_close_cap: Option<Duration>) {
 /// if no data is received on either side for the given duration.
 ///
 /// `client_is_ktls` marks the client leg as kernel-TLS terminated (issue
-/// #3619). A kTLS receive side returns `EINVAL` from `splice(2)` for any
-/// non-application record, which is how an ordinary rustls `close_notify`
-/// arrives; with the flag set that is treated as a clean EOF instead of a
-/// relay failure, so a graceful TLS close is not attributed as an error or
-/// charged to the backend circuit breaker.
+/// #3619) and turns on both halves of the TLS close handshake:
+///
+/// * **Receive.** A kTLS receive side returns `EINVAL` from `splice(2)` for
+///   *any* non-application record and leaves it queued. The client→backend
+///   direction reads that record back with the `SOL_TLS`/`TLS_GET_RECORD_TYPE`
+///   `recvmsg` contract and only treats an authenticated warning-level
+///   `close_notify` as a clean EOF; fatal alerts, other alerts, unexpected
+///   control records, and unrelated `EINVAL`s stay attributed failures.
+/// * **Transmit.** The backend→client direction emits exactly one TLS 1.2
+///   warning `close_notify` through kTLS TX after the last application byte
+///   and before half-closing the write side, so a graceful backend close does
+///   not look like a truncated TLS session — and so the client's own
+///   `close_notify` is reciprocated only after the remaining response bytes
+///   have drained.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn bidirectional_splice(
@@ -6930,6 +6953,8 @@ async fn bidirectional_splice(
         None,
         c2b_write_watermark.clone(),
         client_is_ktls,
+        // Backend leg is always a plain socket on the kTLS path.
+        false,
     );
     let b2c_fut = splice_one_direction_no_guard(
         &backend,
@@ -6941,6 +6966,9 @@ async fn bidirectional_splice(
         b2c_read_watermark.clone(),
         None,
         false,
+        // Backend EOF must reach a kTLS client as a real TLS `close_notify`,
+        // not a bare half-close that reads as a truncation attack.
+        client_is_ktls,
     );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
@@ -8240,6 +8268,7 @@ async fn splice_one_direction_no_guard(
     read_watermark: Option<Arc<AtomicU64>>,
     write_watermark: Option<Arc<AtomicU64>>,
     src_is_ktls: bool,
+    dst_is_ktls: bool,
 ) -> Result<(), (StreamIoSide, anyhow::Error)> {
     use std::os::unix::io::AsRawFd;
 
@@ -8258,17 +8287,31 @@ async fn splice_one_direction_no_guard(
         {
             Ok(n) => n,
             Err(err) => {
-                // A kTLS receive side surfaces every NON-application record
-                // (close_notify and any other alert) as `EINVAL` from
-                // `splice(2)` — the kernel will not hand a control record to a
-                // pipe. rustls clients always send `close_notify` before FIN,
-                // so treating that as an error would attribute an ordinary
-                // graceful close as a relay failure and charge the backend
-                // circuit breaker for it. Terminate this direction the same
-                // way a plain EOF does: propagate the half-close and exit Ok.
+                // A kTLS receive side refuses to splice ANY non-application
+                // record with `EINVAL`, leaving that record queued. `EINVAL` is
+                // therefore not a synonym for `close_notify`: it also covers
+                // fatal alerts, renegotiation attempts, and plain syscall
+                // misuse. Read the pending record and decide from its actual
+                // content type — only an authenticated warning-level
+                // `close_notify` is a clean end of stream.
                 if src_is_ktls && err.raw_os_error() == Some(libc::EINVAL) {
-                    shutdown_write_fd(dst_fd);
-                    return Ok(());
+                    match resolve_ktls_splice_einval(
+                        src,
+                        dst,
+                        last_activity.as_deref(),
+                        bytes.as_ref(),
+                        read_watermark.as_deref(),
+                        write_watermark.as_deref(),
+                    )
+                    .await
+                    {
+                        KtlsSpliceEinval::CleanEof => {
+                            half_close_relay_write_side(dst, dst_is_ktls).await;
+                            return Ok(());
+                        }
+                        KtlsSpliceEinval::Resume => continue,
+                        KtlsSpliceEinval::Failed(side, e) => return Err((side, e)),
+                    }
                 }
                 return Err((
                     StreamIoSide::Read,
@@ -8318,16 +8361,204 @@ async fn splice_one_direction_no_guard(
                     // See the synchronous libc fallback above: a clean
                     // terminal write-side condition should still propagate
                     // the relay half-close before this direction exits Ok.
-                    shutdown_write_fd(dst_fd);
+                    half_close_relay_write_side(dst, dst_is_ktls).await;
                     return Ok(());
                 }
             }
         } else if n == 0 {
             // EOF — source closed
-            shutdown_write_fd(dst_fd);
+            half_close_relay_write_side(dst, dst_is_ktls).await;
             return Ok(());
         }
     }
+}
+
+/// How a `splice(2)` `EINVAL` on a kTLS receive side resolved once the pending
+/// record was actually read.
+#[cfg(target_os = "linux")]
+enum KtlsSpliceEinval {
+    /// Authenticated warning-level `close_notify`: end this direction cleanly.
+    CleanEof,
+    /// Nothing terminal happened — the record was application data that has
+    /// now been forwarded. Re-drive the splice.
+    Resume,
+    /// Attributed relay failure. Fatal alerts, other alerts, unexpected
+    /// control records, and I/O errors all land here — none of them may be
+    /// laundered into a successful-looking connection.
+    Failed(StreamIoSide, anyhow::Error),
+}
+
+/// Longest the relay will wait for kTLS TX to accept the two-byte
+/// `close_notify` record. Teardown must not be hostage to a peer that stopped
+/// reading, so the send is abandoned (and the raw half-close still issued)
+/// once this elapses.
+#[cfg(target_os = "linux")]
+const KTLS_CLOSE_NOTIFY_SEND_GRACE: Duration = Duration::from_millis(250);
+
+/// Half-close the relay's write side toward `dst`.
+///
+/// For a kTLS peer this emits exactly one TLS 1.2 warning `close_notify`
+/// **after** every application byte has been written and **before** the raw
+/// `shutdown(SHUT_WR)`, so a graceful backend EOF reaches the client as a
+/// proper TLS shutdown instead of a truncated session. Each direction reaches
+/// this at most once, on its single terminal path, which is what makes the
+/// "exactly one close_notify" property hold — including the reciprocal
+/// close_notify owed after the client's own close_notify, which is emitted
+/// only once the remaining backend→client response bytes have drained.
+#[cfg(target_os = "linux")]
+async fn half_close_relay_write_side(dst: &TcpStream, dst_is_ktls: bool) {
+    use std::os::unix::io::AsRawFd;
+
+    if dst_is_ktls {
+        send_ktls_close_notify_bounded(dst).await;
+    }
+    shutdown_write_fd(dst.as_raw_fd());
+}
+
+/// Emit one `close_notify` through kTLS TX without blocking the runtime.
+///
+/// Best effort by design: a peer that has already reset or stopped reading
+/// must not wedge connection teardown, and failing to deliver a courtesy alert
+/// is not a relay failure. The raw half-close still follows.
+#[cfg(target_os = "linux")]
+async fn send_ktls_close_notify_bounded(dst: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = dst.as_raw_fd();
+    let send = async {
+        loop {
+            if dst.writable().await.is_err() {
+                return;
+            }
+            match dst.try_io(tokio::io::Interest::WRITABLE, || {
+                crate::proxy::ktls_record::send_close_notify(fd)
+            }) {
+                Ok(_) => return,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    debug!("kTLS: close_notify could not be sent to the client: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(KTLS_CLOSE_NOTIFY_SEND_GRACE, send).await;
+}
+
+/// Consume and classify the record that made `splice(2)` return `EINVAL` on a
+/// kTLS receive side.
+///
+/// The kernel leaves the offending record queued, so it is still readable with
+/// `recvmsg(2)` plus the `SOL_TLS`/`TLS_GET_RECORD_TYPE` ancillary contract.
+/// Only a warning-level `close_notify` ends the direction cleanly. Application
+/// data is possible only if the `EINVAL` came from something other than a
+/// control record; because `recvmsg` has already consumed it, it is forwarded
+/// (and accounted) rather than dropped.
+#[cfg(target_os = "linux")]
+async fn resolve_ktls_splice_einval(
+    src: &TcpStream,
+    dst: &TcpStream,
+    last_activity: Option<&AtomicU64>,
+    bytes: &AtomicU64,
+    read_watermark: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
+) -> KtlsSpliceEinval {
+    use crate::proxy::ktls_record::{
+        KtlsRecvOutcome, MAX_TLS_PLAINTEXT_RECORD_LEN, classify_ktls_control_record,
+        recv_ktls_record,
+    };
+    use std::os::unix::io::AsRawFd;
+
+    let src_fd = src.as_raw_fd();
+    // One decrypted record. Allocated only on this cold teardown path, never
+    // per relayed byte, so the splice hot loop keeps its zero-copy profile.
+    let mut buf = vec![0u8; MAX_TLS_PLAINTEXT_RECORD_LEN];
+
+    let outcome = loop {
+        if let Err(e) = src.ready(tokio::io::Interest::READABLE).await {
+            return KtlsSpliceEinval::Failed(
+                StreamIoSide::Read,
+                anyhow::anyhow!("kTLS control record readiness error: {}", e),
+            );
+        }
+        match src.try_io(tokio::io::Interest::READABLE, || {
+            recv_ktls_record(src_fd, &mut buf)
+        }) {
+            Ok(outcome) => break outcome,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                return KtlsSpliceEinval::Failed(
+                    StreamIoSide::Read,
+                    anyhow::anyhow!("kTLS control record read failed: {}", e),
+                );
+            }
+        }
+    };
+
+    match outcome {
+        // No record pending after all: the peer's write side is simply closed.
+        // End the direction here rather than resuming, both because it is the
+        // same outcome the ordinary `n == 0` path produces and because
+        // resuming into a socket that keeps answering `EINVAL` would spin.
+        KtlsRecvOutcome::Eof => KtlsSpliceEinval::CleanEof,
+        KtlsRecvOutcome::ApplicationData { len } => {
+            let now = coarse_now_ms();
+            if let Some(la) = last_activity {
+                la.store(now, Ordering::Relaxed);
+            }
+            if let Some(wm) = read_watermark {
+                wm.store(now, Ordering::Relaxed);
+            }
+            if let Some(wm) = write_watermark {
+                wm.store(now, Ordering::Relaxed);
+            }
+            if let Err(e) = write_all_to_stream(dst, &buf[..len]).await {
+                return KtlsSpliceEinval::Failed(
+                    StreamIoSide::Write,
+                    anyhow::anyhow!("kTLS out-of-band record forward failed: {}", e),
+                );
+            }
+            bytes.fetch_add(len as u64, Ordering::Relaxed);
+            refresh_splice_write_progress(last_activity, write_watermark);
+            KtlsSpliceEinval::Resume
+        }
+        KtlsRecvOutcome::Control { record_type, len } => {
+            let record = classify_ktls_control_record(record_type, &buf[..len]);
+            if record.is_clean_eof() {
+                debug!("kTLS: client sent close_notify; ending this relay direction cleanly");
+                return KtlsSpliceEinval::CleanEof;
+            }
+            // Fatal alerts, non-close warning alerts, renegotiation handshake
+            // records, and malformed alert bodies are all real failures. The
+            // alert level/description are protocol metadata, not secrets.
+            KtlsSpliceEinval::Failed(
+                StreamIoSide::Read,
+                anyhow::anyhow!("kTLS receive side: {}", record),
+            )
+        }
+    }
+}
+
+/// Write every byte of `buf` to `dst` using tokio readiness, never blocking a
+/// runtime worker. Used only for a record `recvmsg` had to consume out of band.
+#[cfg(target_os = "linux")]
+async fn write_all_to_stream(dst: &TcpStream, buf: &[u8]) -> std::io::Result<()> {
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        dst.writable().await?;
+        match dst.try_write(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "peer accepted no bytes",
+                ));
+            }
+            Ok(n) => remaining = &remaining[n..],
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// RAII guard that closes pipe file descriptors on drop.

@@ -339,9 +339,52 @@ pub async fn accept_with_optional_timeout<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    accept_with_optional_deadline(
+        acceptor,
+        stream,
+        frontend_tls_handshake_deadline(timeout_secs),
+        timeout_secs,
+        peer,
+        record_mesh_mtls_metric,
+    )
+    .await
+}
+
+/// Start-of-handshake deadline for `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
+///
+/// `0` disables the clock and yields `None`. Computing the deadline once — and
+/// then passing the *same* `Instant` to every stage of frontend TLS admission —
+/// is what keeps the configured value a single end-to-end budget instead of a
+/// per-stage allowance (issue #3619: a slow partial ClientHello consumed the
+/// kTLS pre-handshake budget and the buffered fallback then started a fresh
+/// full timer, so a stalled peer could hold a frontend slot for twice the
+/// configured seconds).
+pub fn frontend_tls_handshake_deadline(timeout_secs: u64) -> Option<tokio::time::Instant> {
+    (timeout_secs > 0)
+        .then(|| tokio::time::Instant::now() + Duration::from_secs(timeout_secs))
+}
+
+/// Accept a frontend TLS stream bounded by an already-established deadline.
+///
+/// `budget_secs` is used only to describe the configured budget in the timeout
+/// log line; the deadline is authoritative. An already-elapsed deadline fails
+/// immediately with the same `TimedOut` error and the same single metric
+/// record, which is the correct outcome when an earlier admission stage
+/// consumed the whole budget.
+pub async fn accept_with_optional_deadline<S>(
+    acceptor: &TlsAcceptor,
+    stream: S,
+    deadline: Option<tokio::time::Instant>,
+    budget_secs: u64,
+    peer: &SocketAddr,
+    record_mesh_mtls_metric: bool,
+) -> io::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let accept_fut = acceptor.accept(stream);
-    let result = if timeout_secs > 0 {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
+    let result = if let Some(deadline) = deadline {
+        match tokio::time::timeout_at(deadline, accept_fut).await {
             Ok(result) => result,
             Err(_) => {
                 if record_mesh_mtls_metric {
@@ -356,7 +399,7 @@ where
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
                     peer.ip(),
-                    timeout_secs
+                    budget_secs
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

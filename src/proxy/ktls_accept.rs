@@ -140,9 +140,19 @@ pub(crate) enum KtlsAcceptOutcome {
 /// install for this exact cipher on a real loopback socket, and (b) the
 /// `TCP_ULP` install performed on *this* socket before the handshake starts.
 /// What remains is ENOMEM-class kernel failure.
+///
+/// ## Handshake budget
+///
+/// `deadline` is the caller's *single* frontend-TLS admission deadline, not a
+/// fresh per-stage allowance. Everything this function does — ClientHello
+/// peeking and the unbuffered handshake alike — draws from it, and the caller
+/// passes the same `Instant` to the buffered fallback, so a peer that dribbles
+/// a partial hello cannot consume the budget here and then be granted a second
+/// full one on the fallback path.
 pub(crate) async fn try_ktls_accept(
     stream: TcpStream,
     config: &Arc<ServerConfig>,
+    deadline: Option<Instant>,
     handshake_timeout_secs: u64,
     peer: &SocketAddr,
     record_mesh_mtls_metric: bool,
@@ -160,12 +170,6 @@ pub(crate) async fn try_ktls_accept(
         debug!("kTLS: kernel probe reports no usable cipher, declining");
         return KtlsAcceptOutcome::Declined(stream);
     }
-
-    let deadline = if handshake_timeout_secs > 0 {
-        Some(Instant::now() + Duration::from_secs(handshake_timeout_secs))
-    } else {
-        None
-    };
 
     // The ClientHello is peeked, never consumed: declining below leaves the
     // buffered acceptor a byte-for-byte untouched stream.

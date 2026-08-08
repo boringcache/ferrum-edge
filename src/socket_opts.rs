@@ -1340,7 +1340,10 @@ pub mod ktls {
     use zeroize::{Zeroize, Zeroizing};
 
     // Linux TLS ULP constants (from <linux/tls.h>)
-    const SOL_TLS: libc::c_int = 282;
+    /// `setsockopt`/`cmsg` level for the kernel TLS ULP. Also used by
+    /// [`crate::proxy::ktls_record`] for the record-type ancillary contract, so
+    /// the two cannot drift.
+    pub const SOL_TLS: libc::c_int = 282;
     const TLS_TX: libc::c_int = 1;
     const TLS_RX: libc::c_int = 2;
 
