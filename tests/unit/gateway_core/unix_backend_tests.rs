@@ -11,14 +11,13 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::proxy::unix_backend::{UnixBackendError, connect_admitted};
-use ferrum_edge::util::unix_socket::{AdmittedUnixSocket, admit_socket_for_connect};
+use ferrum_edge::util::unix_socket::admit_socket_for_connect;
 
 /// A listener that accepts and then counts every byte it is ever sent.
 ///
@@ -123,46 +122,29 @@ async fn a_socket_swapped_after_admission_is_refused_before_any_request_byte() {
     );
 }
 
-/// The connected-peer credential gate: the peer's uid must equal the CHECKED
-/// socket owner's uid exactly. Asserted by handing `connect_admitted` an
-/// identity that claims a different owner for a socket this process really
-/// owns — the mismatch is refused after `connect(2)` and before any byte.
-#[tokio::test]
-async fn a_peer_uid_that_differs_from_the_checked_owner_is_refused_before_any_request_byte() {
+/// The connected-peer credential gate uses exact checked-owner equality, not
+/// membership in the broader configured allowlist. Exercise that comparison on
+/// an identity returned by real admission rather than exposing a constructor
+/// that could fabricate the security type.
+#[test]
+fn connected_peer_uid_must_exactly_match_the_checked_owner() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let root = canonical_root(&temp);
     let path = root.join("app.sock");
-    let peer = CountingPeer::bind(&path);
+    let _peer = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+    let admitted = admit_socket_for_connect(path.to_str().expect("utf-8"), &roots(&root), &[])
+        .expect("the socket is admitted");
 
-    let metadata = std::fs::symlink_metadata(&path).expect("stat socket");
     // SAFETY: `geteuid` takes no arguments, reads process state, never fails.
     let euid = unsafe { libc::geteuid() };
     let foreign_uid = euid.wrapping_add(1);
-    let claimed =
-        AdmittedUnixSocket::new(path.clone(), foreign_uid, metadata.dev(), metadata.ino());
-
-    let outcome = connect_admitted(&claimed, 2_000).await;
-    match outcome {
-        Err(UnixBackendError::PeerUidMismatch { expected, actual }) => {
-            assert_eq!(expected, foreign_uid);
-            assert_eq!(actual, euid);
-        }
-        other => panic!("a peer uid mismatch must be refused, got {other:?}"),
-    }
-
-    settle().await;
-    assert_eq!(
-        peer.bytes_received(),
-        0,
-        "a peer whose uid does not match the checked owner must never receive a request byte"
-    );
-
-    // The SAME peer is accepted once the identity names its real owner, proving
-    // the refusal above was the uid comparison and nothing else.
-    let honest = AdmittedUnixSocket::new(path, euid, metadata.dev(), metadata.ino());
     assert!(
-        connect_admitted(&honest, 2_000).await.is_ok(),
-        "the real owner's identity must still connect"
+        !admitted.peer_uid_matches(foreign_uid),
+        "a different allowlisted uid must not match this checked socket owner"
+    );
+    assert!(
+        admitted.peer_uid_matches(euid),
+        "the checked socket owner must match exactly"
     );
 }
 

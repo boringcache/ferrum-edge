@@ -354,7 +354,7 @@ pub async fn connect_admitted(
     };
 
     let peer_uid = connected_peer_uid(&stream)?;
-    if peer_uid != admitted.owner_uid() {
+    if !admitted.peer_uid_matches(peer_uid) {
         return Err(UnixBackendError::PeerUidMismatch {
             expected: admitted.owner_uid(),
             actual: peer_uid,

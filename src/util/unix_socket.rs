@@ -375,12 +375,12 @@ pub struct AdmittedUnixSocket {
 }
 
 impl AdmittedUnixSocket {
-    /// Construct a checked identity.
+    /// Construct a checked identity inside the admission module only.
     ///
-    /// Constructing one is an ASSERTION that `resolved_path` is a canonical,
-    /// admitted socket path whose owner uid and `(dev, ino)` are as given.
-    /// Production code obtains one only from [`admit_socket_for_connect`].
-    pub fn new(resolved_path: std::path::PathBuf, owner_uid: u32, dev: u64, ino: u64) -> Self {
+    /// Keeping this private makes the type itself enforce its contract: callers
+    /// cannot fabricate an "admitted" identity that never passed the path,
+    /// ownership, mode, and ancestor-chain checks above.
+    fn new(resolved_path: std::path::PathBuf, owner_uid: u32, dev: u64, ino: u64) -> Self {
         Self {
             resolved_path,
             owner_uid,
@@ -400,6 +400,16 @@ impl AdmittedUnixSocket {
     /// allowlist — or the connection is refused unused.
     pub fn owner_uid(&self) -> u32 {
         self.owner_uid
+    }
+
+    /// Whether a connected peer uid is exactly the checked socket owner.
+    ///
+    /// This predicate exposes the comparison for focused external regression
+    /// coverage without exposing a constructor that could forge an admitted
+    /// identity. Membership in the configured uid allowlist is deliberately
+    /// insufficient here: the connection must reach the owner of this socket.
+    pub fn peer_uid_matches(&self, peer_uid: u32) -> bool {
+        peer_uid == self.owner_uid
     }
 
     /// Whether the checked path STILL names the same filesystem object.
