@@ -83,6 +83,7 @@
 //! mesh startup treats them as fatal when the surface is enabled, so a
 //! misconfigured Workload API never degrades silently into "not listening".
 
+use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -239,6 +240,16 @@ pub struct WorkloadApiListener {
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     join: JoinHandle<()>,
+}
+
+impl fmt::Debug for WorkloadApiListener {
+    /// Only the bound path — operator-supplied configuration they already hold.
+    /// Nothing about the served identities or their material.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkloadApiListener")
+            .field("socket_path", &self.socket_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkloadApiListener {

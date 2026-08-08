@@ -51,13 +51,20 @@ pub mod jwks;
 mod strict_json;
 pub mod validate;
 
+// `#[allow(unused_imports)]` on each re-export, matching `workload_api::mod`:
+// the binary target compiles these modules directly, so a re-export consumed
+// only from `tests/` (or only as a return type) is an unused import *there*
+// even though the library surface needs it.
+#[allow(unused_imports)]
 pub use authority::{
     JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, MintedJwtSvid, SharedJwtSvidSigner,
 };
+#[allow(unused_imports)]
 pub use jwks::{
     authorities_from_jwks, decoding_key_for_authority, jwks_document, published_authority_key_id,
     validate_published_authorities,
 };
+#[allow(unused_imports)]
 pub use validate::{ValidatedJwtSvid, validate_jwt_svid};
 
 pub(crate) use strict_json::parse_strict_json_object;
