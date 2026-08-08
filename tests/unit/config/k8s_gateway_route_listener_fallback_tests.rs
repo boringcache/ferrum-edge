@@ -11,10 +11,12 @@
 //!
 //! The same gate applies to conflict keys: an unmaterializable declared parent
 //! must not invent a cross-kind traffic-ownership domain. HTTPRoute + GRPCRoute
-//! on the same absent / hostname-mismatched Gateway keep the attachment-failure
-//! status (`Programmed=False`) and never report `Conflicted`. The deliberately
-//! parentless legacy shape (`spec.parentRefs` absent) still materializes a
-//! listener-less claim and still arbitrates cross-kind on that global claim.
+//! on a hostname-mismatched managed Gateway keep the attachment-failure status
+//! (`Programmed=False`) and never report `Conflicted`. An absent Gateway cannot
+//! prove controller ownership, so Ferrum opens no traffic and correctly leaves
+//! status untouched. The deliberately parentless legacy shape
+//! (`spec.parentRefs` absent) still materializes a listener-less claim and still
+//! arbitrates cross-kind on that global claim, without claiming route status.
 
 use std::collections::HashMap;
 
@@ -220,6 +222,16 @@ fn assert_status_not_programmed(objects: &[K8sObject], kind: &str, name: &str, r
     );
 }
 
+fn assert_no_ferrum_route_status(objects: &[K8sObject]) {
+    let updates = plan_gateway_api_status_updates(objects, options(), &[]);
+    assert!(
+        updates
+            .iter()
+            .all(|update| !matches!(update.kind.as_str(), "HTTPRoute" | "GRPCRoute")),
+        "Ferrum must not claim status without a parent owned by its controller: {updates:?}"
+    );
+}
+
 /// Shared assertion for HTTPRoute + GRPCRoute on an unmaterializable parent:
 /// neither route serves traffic, neither invents a Conflicted ownership loss,
 /// and both keep the attachment-failure reason with Programmed=False.
@@ -293,12 +305,14 @@ fn a_route_without_parent_refs_materializes_a_listener_less_claim() {
     assert_eq!(result.config.proxies[0].backend_port, 8080);
 }
 
-/// A declared Gateway parent naming an absent Gateway must open nothing.
+/// A declared Gateway parent naming an absent Gateway must open nothing. Since
+/// the missing object cannot prove controller ownership, Ferrum must also leave
+/// the Route status untouched.
 #[test]
 fn httproute_with_unknown_gateway_parent_materializes_no_traffic() {
     let route = http_route("sample", Some(json!([{"name": "not-in-this-snapshot"}])));
     assert_no_http_family_traffic(&[route.clone()], "HTTPRoute", "sample");
-    assert_status_not_programmed(&[route], "HTTPRoute", "sample", "NoMatchingParent");
+    assert_no_ferrum_route_status(&[route]);
 }
 
 /// Same fail-closed gate for GRPCRoute.
@@ -306,7 +320,7 @@ fn httproute_with_unknown_gateway_parent_materializes_no_traffic() {
 fn grpcroute_with_unknown_gateway_parent_materializes_no_traffic() {
     let route = grpc_route("sample", Some(json!([{"name": "not-in-this-snapshot"}])));
     assert_no_http_family_traffic(&[route.clone()], "GRPCRoute", "sample");
-    assert_status_not_programmed(&[route], "GRPCRoute", "sample", "NoMatchingParent");
+    assert_no_ferrum_route_status(&[route]);
 }
 
 /// A Gateway that exists but shares no hostname intersection with the route
@@ -367,8 +381,8 @@ fn grpcroute_with_mismatched_gateway_listener_materializes_no_traffic() {
 }
 
 /// HTTPRoute + GRPCRoute naming the same absent Gateway must not invent a
-/// cross-kind Conflicted loss: neither attaches, so both stay on the
-/// attachment-failure reason with Programmed=False.
+/// cross-kind Conflicted loss. Neither attaches, and Ferrum cannot claim status
+/// for a parent whose controller ownership is unknown.
 #[test]
 fn httproute_and_grpcroute_on_absent_gateway_do_not_conflict() {
     let mut http = http_route_with_hostname(
@@ -384,7 +398,12 @@ fn httproute_and_grpcroute_on_absent_gateway_do_not_conflict() {
     );
     grpc.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
 
-    assert_unresolved_cross_kind_pair_is_attachment_failure(&[http, grpc], "NoMatchingParent");
+    let objects = [http, grpc];
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    assert!(result.config.proxies.is_empty());
+    assert!(result.materialized_route_parents.is_empty());
+    assert!(result.route_conflicts.is_empty());
+    assert_no_ferrum_route_status(&objects);
 }
 
 /// Same rule when the Gateway exists but its listener hostname matches neither
@@ -450,11 +469,12 @@ fn parentless_httproute_and_grpcroute_still_conflict_on_shared_hostname() {
     );
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &result.route_conflicts);
-    let (accepted_status, accepted_reason) =
-        parent_condition_status(&updates, "GRPCRoute", "grpc", "Accepted")
-            .expect("losing GRPCRoute Accepted condition");
-    assert_eq!(accepted_status, "False");
-    assert_eq!(accepted_reason, "Conflicted");
+    assert!(
+        updates
+            .iter()
+            .all(|update| !matches!(update.kind.as_str(), "HTTPRoute" | "GRPCRoute")),
+        "parentless routes have no controller-owned parent status entry: {updates:?}"
+    );
 }
 
 /// Once the Gateway listener IS in the snapshot, the claim is stamped with
