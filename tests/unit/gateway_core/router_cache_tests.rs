@@ -1821,3 +1821,36 @@ fn same_protocol_distinct_ports_require_exact_frontend_match() {
         "multiple nontls listen_ports disable protocol remap"
     );
 }
+
+#[test]
+fn port_scoped_regex_beats_its_port_agnostic_fallback_on_the_exact_listener() {
+    let mut fallback = test_proxy("fallback", "~^/items/(?P<id>[^/]+)$");
+    fallback.hosts = vec!["app.example.com".into()];
+
+    let mut scoped = test_proxy("scoped", "~^/items/(?P<id>[^/]+)$");
+    scoped.hosts = vec!["app.example.com".into()];
+    scoped.listen_port = Some(9001);
+
+    // A second plaintext listener disables the documented single-listener
+    // protocol remap, leaving the agnostic route as the fallback off :9001.
+    let mut other_listener = test_proxy("other-listener", "/other");
+    other_listener.hosts = vec!["other.example.com".into()];
+    other_listener.listen_port = Some(9003);
+
+    // Put the agnostic route first to pin the regression: regex lookup used to
+    // return the first admissible config-order match without applying the port
+    // rank shared by exact, prefix, and host-only routes.
+    let config = test_config(vec![fallback, scoped, other_listener]);
+    let cache = RouterCache::new(&config, 100);
+
+    let exact = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9001), false)
+        .expect("the exact listener-scoped regex must match");
+    assert_eq!(exact.proxy.id, "scoped");
+    assert_eq!(exact.path_params, vec![("id".to_string(), "42".to_string())]);
+
+    let elsewhere = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9002), false)
+        .expect("the agnostic regex remains the fallback elsewhere");
+    assert_eq!(elsewhere.proxy.id, "fallback");
+}

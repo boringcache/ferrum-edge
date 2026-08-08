@@ -1090,9 +1090,14 @@ fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
         .as_ref()
         .map(|mesh| mesh.services.as_slice())
         .unwrap_or(&[]);
-    let names: Vec<&str> = services.iter().map(|service| service.name.as_str()).collect();
+    let names: Vec<&str> = services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
     assert!(
-        !names.iter().any(|name| *name == "edge-plain" || *name == "edge-secure"),
+        !names
+            .iter()
+            .any(|name| *name == "edge-plain" || *name == "edge-secure"),
         "refused same-port listeners must not become MeshServices: {names:?}"
     );
     assert!(
@@ -1243,11 +1248,7 @@ fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted()
             "Gateway {gateway} listener must stay Accepted: {accepted:?}"
         );
         let programmed = listener_condition(listener, "Programmed");
-        let expected_programmed = if gateway == "edge" {
-            "True"
-        } else {
-            "False"
-        };
+        let expected_programmed = if gateway == "edge" { "True" } else { "False" };
         assert_eq!(
             programmed["status"].as_str(),
             Some(expected_programmed),
@@ -1311,13 +1312,18 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         .as_ref()
         .map(|mesh| mesh.services.as_slice())
         .unwrap_or(&[]);
-    let names: Vec<&str> = services.iter().map(|service| service.name.as_str()).collect();
+    let names: Vec<&str> = services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
     assert!(
         names.iter().any(|name| *name == "edge-https"),
         "planned namespace TLS winner must remain exposed: {names:?}"
     );
     assert!(
-        !names.iter().any(|name| *name == "reference-grant-edge-https"),
+        !names
+            .iter()
+            .any(|name| *name == "reference-grant-edge-https"),
         "non-winning same-namespace Gateway must not advertise a MeshService under the wrong serving slot: {names:?}"
     );
     assert_eq!(

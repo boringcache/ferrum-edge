@@ -227,6 +227,11 @@ pub struct GatewayListenerBindFailure {
 
 type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
 
+struct DrainingListenerTask {
+    port: u16,
+    task: ListenerTask,
+}
+
 struct LiveListener {
     class: GatewayListenerClass,
     shutdown_tx: watch::Sender<bool>,
@@ -317,10 +322,11 @@ pub struct GatewayListenerManager {
     tls: GatewayListenerTls,
     http3: Option<GatewayListenerHttp3>,
     listeners: Mutex<BTreeMap<u16, LiveListener>>,
-    /// Draining listeners whose port left the config. Finished handles are
-    /// reaped on every reconcile and the rest are awaited at shutdown, so a
-    /// removal never leaks a task past process exit.
-    draining: Mutex<Vec<ListenerTask>>,
+    /// Retiring listener tasks keyed by the port whose accept socket they may
+    /// still own. Finished handles are reaped on every reconcile and the rest
+    /// are awaited at shutdown, so a removal never leaks a task past process
+    /// exit or permits an incompatible replacement to bind early.
+    draining: Mutex<Vec<DrainingListenerTask>>,
     /// Config-publication receiver, created in [`Self::new`] — before the
     /// mode's readiness reconcile — and consumed by [`Self::run`]. Subscribing
     /// inside `run` would mark every publication since construction as already
@@ -458,7 +464,11 @@ impl GatewayListenerManager {
                 let _ = listener.shutdown_tx.send(true);
                 let (error, pending) = Self::describe_ended_listener(listener).await;
                 if !pending.is_empty() {
-                    self.draining.lock().await.extend(pending);
+                    self.draining.lock().await.extend(
+                        pending
+                            .into_iter()
+                            .map(|task| DrainingListenerTask { port, task }),
+                    );
                 }
                 error!(port, "Gateway API listener ended unexpectedly: {error}");
                 failures.push(GatewayListenerBindFailure { port, error });
@@ -523,15 +533,46 @@ impl GatewayListenerManager {
                     warn!(port, "Gateway API listener class flip deferred: {error}");
                     failures.push(GatewayListenerBindFailure { port, error });
                     defer_rebind.insert(port);
-                    self.draining.lock().await.extend(pending);
+                    self.draining.lock().await.extend(
+                        pending
+                            .into_iter()
+                            .map(|task| DrainingListenerTask { port, task }),
+                    );
                 }
             } else {
-                self.draining.lock().await.extend(listener.tasks());
+                self.draining.lock().await.extend(
+                    listener
+                        .tasks()
+                        .into_iter()
+                        .map(|task| DrainingListenerTask { port, task }),
+                );
             }
         }
 
+        // A timed-out retiring task may still own an SO_REUSEPORT accept
+        // socket. Keep its port unavailable across later reconcile passes —
+        // not only the pass that initiated retirement — until every old task
+        // actually exits. Otherwise the next retry could bind a replacement
+        // of the opposite TLS class beside the wedged generation.
+        self.reap_finished_drains().await;
+        let retiring_ports: BTreeSet<u16> = self
+            .draining
+            .lock()
+            .await
+            .iter()
+            .map(|drain| drain.port)
+            .collect();
+
         for (port, class) in &plan.ports {
-            if defer_rebind.contains(port) {
+            if defer_rebind.contains(port) || retiring_ports.contains(port) {
+                if !failures.iter().any(|failure| failure.port == *port) {
+                    let error = format!(
+                        "port {port} still has a retiring Gateway listener task; the replacement \
+                         listener remains deferred until every previous accept socket closes"
+                    );
+                    warn!(port = *port, "Gateway API listener rebind deferred: {error}");
+                    failures.push(GatewayListenerBindFailure { port: *port, error });
+                }
                 continue;
             }
             if let Some(listener) = live.get_mut(port) {
@@ -581,11 +622,11 @@ impl GatewayListenerManager {
     async fn reap_finished_drains(&self) {
         let mut draining = self.draining.lock().await;
         let mut retained = Vec::with_capacity(draining.len());
-        for task in std::mem::take(&mut *draining) {
-            if task.is_finished() {
-                Self::log_listener_task_outcome(task.await);
+        for drain in std::mem::take(&mut *draining) {
+            if drain.task.is_finished() {
+                Self::log_listener_task_outcome(drain.task.await);
             } else {
-                retained.push(task);
+                retained.push(drain);
             }
         }
         *draining = retained;
@@ -790,7 +831,11 @@ impl GatewayListenerManager {
             let _ = listener.shutdown_tx.send(true);
             tasks.extend(listener.tasks());
         }
-        tasks.append(&mut *self.draining.lock().await);
+        tasks.extend(
+            std::mem::take(&mut *self.draining.lock().await)
+                .into_iter()
+                .map(|drain| drain.task),
+        );
         for task in tasks {
             // Both halves are logged: a listener that returned an error and a
             // task that panicked are different faults and neither may be
@@ -1017,6 +1062,47 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        manager.shutdown_all().await;
+    }
+
+    /// A retiring task that outlives one reconcile must keep ownership of its
+    /// port visible to every later pass. Rebinding while it may still hold an
+    /// SO_REUSEPORT socket would let plaintext and TLS accept loops coexist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_retirement_blocks_rebind_across_reconcile_passes() {
+        let port = free_port().await;
+        let manager = GatewayListenerManager::new(
+            test_state(port_scoped_config(port)),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        );
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        manager
+            .draining
+            .lock()
+            .await
+            .push(DrainingListenerTask { port, task });
+
+        for _ in 0..2 {
+            let failures = manager.reconcile().await;
+            assert!(
+                failures.iter().any(|failure| failure.port == port),
+                "the deferred port must stay operator-visible: {failures:?}"
+            );
+            assert!(
+                manager.active_ports().await.is_empty(),
+                "no replacement may bind while an earlier accept task can still own the port"
+            );
+        }
+
+        let mut draining = manager.draining.lock().await;
+        let drain = draining.pop().expect("pending drain");
+        drop(draining);
+        drain.task.abort();
+        let _ = drain.task.await;
         manager.shutdown_all().await;
     }
 }

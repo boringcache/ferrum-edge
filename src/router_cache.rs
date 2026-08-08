@@ -3018,39 +3018,59 @@ fn find_regex_match_indexed(
         return None;
     }
 
-    let try_entry = |entry: &RegexRouteEntry| -> Option<RouteMatch> {
-        if entry.candidate.match_priority(port_ctx).is_none() {
-            return None;
-        }
-        let captures = entry.pattern.captures(path)?;
-        let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
-        let path_params: Vec<(String, String)> = entry
-            .capture_names
-            .iter()
-            .filter_map(|name| {
-                captures
-                    .name(name)
-                    .map(|m| (name.clone(), m.as_str().to_string()))
-            })
-            .collect();
-        Some(RouteMatch {
-            proxy: Arc::clone(&entry.candidate.proxy),
-            path_params,
-            matched_prefix_len: matched_len,
-        })
-    };
-
+    // RegexSet preserves config order, but listener scope has to be ranked
+    // before that order: an earlier port-agnostic regex is the fallback on
+    // other frontends and must not shadow an exact-port sibling on its own
+    // listener. Among entries with the same port rank, first match still wins.
+    let mut best: Option<(&RegexRouteEntry, u8)> = None;
     if let Some(regex_set) = &routes.regex_set {
         let matches = regex_set.matches(path);
-        for winner_idx in matches.iter() {
-            if let Some(route_match) = try_entry(&routes.entries[winner_idx]) {
-                return Some(route_match);
+        for idx in matches.iter() {
+            let entry = &routes.entries[idx];
+            let Some(priority) = entry.candidate.match_priority(port_ctx) else {
+                continue;
+            };
+            if best.is_none_or(|(_, current)| priority < current) {
+                best = Some((entry, priority));
+                if priority == 0 {
+                    break;
+                }
             }
         }
-        None
     } else {
-        routes.entries.iter().find_map(try_entry)
+        for entry in &routes.entries {
+            let Some(priority) = entry.candidate.match_priority(port_ctx) else {
+                continue;
+            };
+            if !entry.pattern.is_match(path) {
+                continue;
+            }
+            if best.is_none_or(|(_, current)| priority < current) {
+                best = Some((entry, priority));
+                if priority == 0 {
+                    break;
+                }
+            }
+        }
     }
+
+    let entry = best?.0;
+    let captures = entry.pattern.captures(path)?;
+    let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
+    let path_params: Vec<(String, String)> = entry
+        .capture_names
+        .iter()
+        .filter_map(|name| {
+            captures
+                .name(name)
+                .map(|m| (name.clone(), m.as_str().to_string()))
+        })
+        .collect();
+    Some(RouteMatch {
+        proxy: Arc::clone(&entry.candidate.proxy),
+        path_params,
+        matched_prefix_len: matched_len,
+    })
 }
 
 /// Check if a proxy uses a regex listen_path.
