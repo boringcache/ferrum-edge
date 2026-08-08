@@ -552,9 +552,15 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
+// The library exposes this carrier to the external kTLS conformance tests;
+// the ferrum-edge binary compiles the same module as an internal tree and has
+// no direct consumer for that public re-export.
+#[allow(unused_imports)]
 pub use linux::AlignedCmsgBuf;
 #[cfg(target_os = "linux")]
-pub use linux::{
-    KtlsRecvOutcome, TLS_GET_RECORD_TYPE, TLS_SET_RECORD_TYPE, TlsRecordTypeControl,
-    recv_ktls_record, send_close_notify,
-};
+pub use linux::{KtlsRecvOutcome, recv_ktls_record, send_close_notify};
+#[cfg(target_os = "linux")]
+// Public protocol constants/control construction are pinned by the external
+// kTLS tests but are intentionally not consumed by the binary target itself.
+#[allow(unused_imports)]
+pub use linux::{TLS_GET_RECORD_TYPE, TLS_SET_RECORD_TYPE, TlsRecordTypeControl};
