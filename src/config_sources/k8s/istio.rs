@@ -12,12 +12,12 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PortPatternAdmission, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
-    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
-    is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
-    validate_mesh_export_to,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PolicyTargetAttachment,
+    PortPatternAdmission, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
+    TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    admit_request_match_port_pattern, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, validate_mesh_condition_ip_block, validate_mesh_export_to,
 };
 
 use super::{
@@ -61,7 +61,7 @@ pub(super) fn translate(
         "AuthorizationPolicy" => {
             acc.mesh
                 .mesh_policies
-                .push(authorization_policy(&acc.options, object)?);
+                .push(authorization_policy(acc, object)?);
             Ok(true)
         }
         "PeerAuthentication" => {
@@ -122,7 +122,7 @@ pub(super) fn translate(
 }
 
 fn authorization_policy(
-    options: &K8sTranslationOptions,
+    acc: &K8sAccumulator,
     object: &K8sObject,
 ) -> Result<MeshPolicy, K8sTranslateError> {
     let action = match string_field(&object.spec, "action").unwrap_or("ALLOW") {
@@ -137,14 +137,21 @@ fn authorization_policy(
         }
     };
 
-    if object.spec.get("targetRefs").is_some() {
+    let has_selector = object.spec.get("selector").is_some();
+    let has_target_refs = object.spec.get("targetRefs").is_some();
+    if has_selector && has_target_refs {
         return Err(invalid_resource(
             object,
-            "AuthorizationPolicy targetRefs are not supported yet; use selector or namespace scope",
+            "AuthorizationPolicy must set at most one of selector or targetRefs",
         ));
     }
 
-    let scope = istio_policy_scope(options, object, object.spec.get("selector"));
+    let scope = if has_target_refs {
+        let attachments = resolve_authorization_policy_target_refs(acc, object)?;
+        PolicyScope::TargetRefs { attachments }
+    } else {
+        istio_policy_scope(&acc.options, object, object.spec.get("selector"))
+    };
 
     let mut rules = Vec::new();
     for rule in object
@@ -171,6 +178,291 @@ fn authorization_policy(
         scope,
         rules,
     })
+}
+
+const AUTHZ_TARGET_REF_MAX: usize = crate::modes::mesh::config::MAX_POLICY_TARGET_REFS;
+const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
+const ISTIO_NETWORKING_GROUP: &str = "networking.istio.io";
+
+fn resolve_authorization_policy_target_refs(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<Vec<PolicyTargetAttachment>, K8sTranslateError> {
+    let raw = object
+        .spec
+        .get("targetRefs")
+        .ok_or_else(|| invalid_resource(object, "AuthorizationPolicy targetRefs is required"))?;
+    let entries = raw.as_array().ok_or_else(|| {
+        invalid_resource(object, "AuthorizationPolicy targetRefs must be an array")
+    })?;
+    if entries.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy targetRefs must not be empty",
+        ));
+    }
+    if entries.len() > AUTHZ_TARGET_REF_MAX {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy targetRefs supports at most {AUTHZ_TARGET_REF_MAX} entries"
+            ),
+        ));
+    }
+
+    let mut attachments = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        attachments.push(resolve_one_authorization_policy_target_ref(
+            acc, object, index, entry,
+        )?);
+    }
+    Ok(attachments)
+}
+
+fn resolve_one_authorization_policy_target_ref(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    index: usize,
+    entry: &Value,
+) -> Result<PolicyTargetAttachment, K8sTranslateError> {
+    use crate::modes::mesh::config::{
+        MAX_POLICY_TARGET_REF_GROUP_LEN, MAX_POLICY_TARGET_REF_KIND_LEN,
+        MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+    };
+
+    let path = format!("targetRefs[{index}]");
+    let kind = string_field(entry, "kind").ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("AuthorizationPolicy {path}.kind is required"),
+        )
+    })?;
+    if kind.len() > MAX_POLICY_TARGET_REF_KIND_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.kind must be at most {MAX_POLICY_TARGET_REF_KIND_LEN} characters"
+            ),
+        ));
+    }
+    let name = string_field(entry, "name").ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("AuthorizationPolicy {path}.name is required"),
+        )
+    })?;
+    if name.trim().is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("AuthorizationPolicy {path}.name must be non-empty"),
+        ));
+    }
+    if name.len() > MAX_POLICY_TARGET_REF_NAME_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.name must be at most {MAX_POLICY_TARGET_REF_NAME_LEN} characters"
+            ),
+        ));
+    }
+    let group = string_field(entry, "group").unwrap_or("");
+    if group.len() > MAX_POLICY_TARGET_REF_GROUP_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path}.group must be at most {MAX_POLICY_TARGET_REF_GROUP_LEN} characters"
+            ),
+        ));
+    }
+    let normalized_group = normalize_target_ref_group(group);
+    let target_namespace = match string_field(entry, "namespace") {
+        Some(ns) if !ns.trim().is_empty() => {
+            if ns.len() > MAX_POLICY_TARGET_REF_NAMESPACE_LEN {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path}.namespace must be at most {MAX_POLICY_TARGET_REF_NAMESPACE_LEN} characters"
+                    ),
+                ));
+            }
+            ns.to_string()
+        }
+        Some(_) => {
+            return Err(invalid_resource(
+                object,
+                format!("AuthorizationPolicy {path}.namespace must be non-empty when set"),
+            ));
+        }
+        None => object.metadata.namespace.clone(),
+    };
+
+    match (normalized_group.as_str(), kind) {
+        ("", "Service") => {
+            ensure_authz_target_ref_same_namespace(
+                object,
+                &path,
+                &target_namespace,
+                "Service",
+                name,
+            )?;
+            if !acc.service_exists(&target_namespace, name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} Service '{target_namespace}/{name}' was not found; \
+                         targeted policies fail closed when the target is missing"
+                    ),
+                ));
+            }
+            Ok(PolicyTargetAttachment::Service {
+                namespace: target_namespace,
+                name: name.to_string(),
+            })
+        }
+        (GATEWAY_API_GROUP, "Gateway") => {
+            ensure_authz_target_ref_same_namespace(
+                object,
+                &path,
+                &target_namespace,
+                "Gateway",
+                name,
+            )?;
+            if !acc.waypoint_gateway_exists(&target_namespace, name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} Gateway '{target_namespace}/{name}' was not found \
+                         or is not a waypoint Gateway (istio-waypoint/ferrum-waypoint); \
+                         targeted policies fail closed when the target is missing"
+                    ),
+                ));
+            }
+            Ok(PolicyTargetAttachment::Gateway {
+                namespace: target_namespace,
+                name: name.to_string(),
+            })
+        }
+        (GATEWAY_API_GROUP, "GatewayClass") => {
+            if object.metadata.namespace != acc.options.istio_root_namespace {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} GatewayClass attachments must live in the Istio \
+                         root namespace ('{}')",
+                        acc.options.istio_root_namespace
+                    ),
+                ));
+            }
+            if string_field(entry, "namespace").is_some() {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} GatewayClass must not set namespace \
+                         (GatewayClass is cluster-scoped)"
+                    ),
+                ));
+            }
+            let known = acc.mesh.waypoint_bindings.iter().any(|binding| {
+                binding
+                    .gateway_class_name
+                    .as_deref()
+                    .is_some_and(|class| class == name)
+            }) || super::gateway_api::is_supported_waypoint_gateway_class(name);
+            if !known {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} GatewayClass '{name}' is unsupported; \
+                         Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
+                    ),
+                ));
+            }
+            // Supported waypoint class names alone are not enough — the
+            // cluster-scoped GatewayClass object must be present (fail closed).
+            // Presence is independent of Ferrum ownership; Istio-owned
+            // `istio-waypoint` classes are valid attachment targets.
+            if !acc.gateway_class_exists(name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "AuthorizationPolicy {path} GatewayClass '{name}' was not found; \
+                         targeted policies fail closed when the target is missing"
+                    ),
+                ));
+            }
+            Ok(PolicyTargetAttachment::GatewayClass {
+                name: name.to_string(),
+            })
+        }
+        // Istio lists same-namespace `ServiceEntry` as a supported attachment,
+        // but Ferrum has no ServiceEntry ↔ waypoint association model: waypoint
+        // bindings enumerate Kubernetes Services only, and destination policy
+        // scopes are indexed by `MeshService` identity. Accepting one would
+        // either be silently inert or — worse — attach to an unrelated
+        // same-named Kubernetes Service. Refuse it until the model exists
+        // rather than translate an accepted-but-unenforced security policy.
+        (ISTIO_NETWORKING_GROUP, "ServiceEntry") => Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path} ServiceEntry attachments are not supported yet; \
+                 Ferrum has no ServiceEntry-to-waypoint association model, so such a policy \
+                 could not be enforced on ServiceEntry traffic. Use a Service, Gateway, or \
+                 GatewayClass targetRef, or a workload selector"
+            ),
+        )),
+        (group, kind) => Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy {path} group '{group}' kind '{kind}' is unsupported; \
+                 supported attachments are Service (core) and Gateway/GatewayClass \
+                 (gateway.networking.k8s.io)"
+            ),
+        )),
+    }
+}
+
+fn normalize_target_ref_group(group: &str) -> String {
+    let trimmed = group.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("core") {
+        String::new()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+/// Istio's AuthorizationPolicy contract lists `Gateway`, `Service`, and
+/// `ServiceEntry` `targetRefs` as **same namespace only**
+/// (<https://istio.io/latest/docs/reference/config/security/authorization-policy/>).
+/// `PolicyTargetReference.namespace` exists on the shared type, but the
+/// AuthorizationPolicy support contract does not widen those kinds, and Gateway
+/// API `ReferenceGrant` governs Gateway API routes — not Istio policy
+/// attachment.
+///
+/// Ferrum enforces it fail-closed rather than accepting a ReferenceGrant,
+/// because a cross-namespace attachment could not work end to end anyway: the
+/// CP's `policy_scope_can_apply_to_namespace` runs
+/// `resource_owner_can_apply_to_namespace` first, so a non-root policy owner is
+/// filtered out before the target namespace's DP slice is built. Accepting it
+/// would report `Accepted` for a policy that never reaches its destination.
+fn ensure_authz_target_ref_same_namespace(
+    object: &K8sObject,
+    path: &str,
+    target_namespace: &str,
+    to_kind: &str,
+    to_name: &str,
+) -> Result<(), K8sTranslateError> {
+    if target_namespace == object.metadata.namespace {
+        return Ok(());
+    }
+    Err(invalid_resource(
+        object,
+        format!(
+            "AuthorizationPolicy {path} references {to_kind} '{target_namespace}/{to_name}' in \
+             another namespace; Istio AuthorizationPolicy targetRefs to {to_kind} are \
+             same-namespace only (policy namespace '{}')",
+            object.metadata.namespace
+        ),
+    ))
 }
 
 fn allow_nothing_rule() -> MeshRule {
@@ -633,7 +925,9 @@ fn peer_authentication(
     let scope = istio_policy_scope(options, object, selector);
     let selector = match &scope {
         PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
+            None
+        }
     };
 
     Ok(PeerAuthentication {
@@ -3090,11 +3384,11 @@ fn l4_route_backend_binding(
             Ok((backend.host, backend.port, None, None))
         }
         _ => {
-            let upstream_id = resource_id(
-                "istio-vs-l4-upstream",
+            let upstream_id = virtual_service_l4_upstream_id(
+                kind,
                 &object.metadata.namespace,
                 &object.metadata.name,
-                &format!("{kind}-{block_index}"),
+                block_index,
             );
             let Some(first) = backends.first() else {
                 return Err(invalid_resource(
@@ -3117,6 +3411,70 @@ fn l4_route_backend_binding(
             ))
         }
     }
+}
+
+/// Reconciler-managed prefix for generated weighted-L4 upstreams. Must stay
+/// listed in `K8S_MANAGED_UPSTREAM_ID_PREFIXES` (`src/k8s_controller/reconciler.rs`)
+/// — that list is the only withdrawal mechanism for translator-generated
+/// upstreams, so a prefix missing from it makes every compose append another
+/// copy instead of replacing it.
+const L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+
+/// Hex characters of the identity digest every generated L4 upstream id
+/// carries. 64 bits is far past birthday relevance for the per-cluster
+/// population of VirtualService `tcp[]`/`tls[]` route blocks.
+const L4_UPSTREAM_ID_DIGEST_HEX_LEN: usize = 16;
+
+/// The `__` separator plus the digest: the fixed tail every generated id ends
+/// with, reserved out of the id budget below.
+const L4_UPSTREAM_ID_SUFFIX_LEN: usize = 2 + L4_UPSTREAM_ID_DIGEST_HEX_LEN;
+
+/// Budget for the human-readable half of the id, so the whole id always fits
+/// `config::types::MAX_ID_LENGTH` and can never be rejected by
+/// `GatewayConfig::validate_resource_ids` for a long VirtualService name.
+const L4_UPSTREAM_ID_BODY_BUDGET: usize =
+    crate::config::types::MAX_ID_LENGTH - L4_UPSTREAM_ID_PREFIX.len() - L4_UPSTREAM_ID_SUFFIX_LEN;
+
+fn virtual_service_l4_upstream_id(
+    route_kind: &str,
+    namespace: &str,
+    vs_name: &str,
+    block_index: usize,
+) -> String {
+    // Two different `(namespace, name)` pairs must never derive one id.
+    // `exportTo` copies the projected upstream into the CONSUMER namespace, so
+    // a collision there lets one tenant's VirtualService silently REPLACE
+    // another tenant's L4 destination. `resource_id`'s `-` join is lossy in
+    // exactly that way: namespace `team-a` + name `db` and namespace `team` +
+    // name `a-db` both render `istio-vs-l4-upstream-team-a-db-tcp-0`.
+    //
+    // Uniqueness rests on the trailing digest, NOT on the readable body. The
+    // digest is taken over the LENGTH-FRAMED, UNSANITIZED components, so it
+    // survives both the `/`/`.` sanitization below and the length trim. Neither
+    // a separator nor a length prefix can carry uniqueness on its own here:
+    // that sanitization is length-preserving, so a VirtualService named
+    // `my.app` and one named `my-app` (both legal DNS-1123 subdomains) collapse
+    // to the same bytes and the same component lengths. The `__` separators are
+    // kept only so the common case stays readable — Kubernetes namespaces and
+    // object names cannot contain `_`.
+    let kind_len = route_kind.len();
+    let ns_len = namespace.len();
+    let name_len = vs_name.len();
+    let identity =
+        format!("{kind_len}|{route_kind}|{ns_len}|{namespace}|{name_len}|{vs_name}|{block_index}");
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    let digest = &digest[..L4_UPSTREAM_ID_DIGEST_HEX_LEN];
+
+    let readable = format!("{route_kind}__{namespace}__{vs_name}__{block_index}");
+    let mut body = readable.replace(['/', '.'], "-");
+    if body.len() > L4_UPSTREAM_ID_BODY_BUDGET {
+        let mut end = L4_UPSTREAM_ID_BODY_BUDGET;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    format!("{L4_UPSTREAM_ID_PREFIX}{body}__{digest}")
 }
 
 fn virtual_service_l4_proxy_id(
@@ -6733,11 +7091,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_authorization_policy_target_refs_until_supported() {
+    fn translates_authorization_policy_service_target_refs() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "payments",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "payments"},
+                        "ports": [{"port": 8080, "name": "http"}]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "",
+                            "kind": "Service",
+                            "name": "payments"
+                        }],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("Service targetRefs must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => {
+                assert_eq!(attachments.len(), 1);
+                match &attachments[0] {
+                    PolicyTargetAttachment::Service { namespace, name } => {
+                        assert_eq!(namespace, "default");
+                        assert_eq!(name, "payments");
+                    }
+                    other => panic!("expected Service attachment, got {other:?}"),
+                }
+            }
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_authorization_policy_selector_and_target_refs_together() {
         let err = translate_k8s_objects(
             &[object(
                 "AuthorizationPolicy",
                 serde_json::json!({
+                    "selector": {"matchLabels": {"app": "api"}},
                     "targetRefs": [{
                         "kind": "Service",
                         "name": "payments"
@@ -6747,10 +7155,493 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("targetRefs must fail closed until target scoping is implemented");
+        .expect_err("selector + targetRefs must fail closed");
 
-        assert!(err.to_string().contains("targetRefs"));
-        assert!(err.to_string().contains("not supported"));
+        assert!(
+            err.to_string()
+                .contains("at most one of selector or targetRefs")
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_unsupported_target_refs_kind() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "targetRefs": [{
+                        "group": "apps",
+                        "kind": "Deployment",
+                        "name": "payments"
+                    }],
+                    "rules": [{}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported targetRefs kind must fail closed");
+
+        assert!(err.to_string().contains("unsupported"));
+        assert!(err.to_string().contains("Deployment"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_missing_service_target_ref() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "targetRefs": [{
+                        "kind": "Service",
+                        "name": "missing"
+                    }],
+                    "rules": [{}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing Service targetRefs must fail closed");
+
+        assert!(err.to_string().contains("was not found"));
+    }
+
+    #[test]
+    fn translates_authorization_policy_gateway_target_refs() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Gateway",
+                    "gateway.networking.k8s.io/v1",
+                    "waypoint",
+                    "default",
+                    serde_json::json!({
+                        "gatewayClassName": "istio-waypoint",
+                        "listeners": [{
+                            "name": "mesh",
+                            "port": 15008,
+                            "protocol": "HBONE"
+                        }]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "gateway.networking.k8s.io",
+                            "kind": "Gateway",
+                            "name": "waypoint"
+                        }],
+                        "action": "ALLOW",
+                        "rules": [{
+                            "to": [{"operation": {"methods": ["GET"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("Gateway targetRefs must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+                PolicyTargetAttachment::Gateway { namespace, name } => {
+                    assert_eq!(namespace, "default");
+                    assert_eq!(name, "waypoint");
+                }
+                other => panic!("expected Gateway attachment, got {other:?}"),
+            },
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_gateway_class_target_refs_for_each_supported_class() {
+        for class_name in ["istio-waypoint", "ferrum-waypoint"] {
+            // Interoperable waypoint classes may be owned by a non-Ferrum
+            // controller; presence (not Ferrum ownership) gates acceptance.
+            let controller_name = if class_name == "ferrum-waypoint" {
+                "ferrum.io/gateway-controller"
+            } else {
+                "istio.io/gateway-controller"
+            };
+            let mut gateway_class = object_with_metadata(
+                "GatewayClass",
+                "gateway.networking.k8s.io/v1",
+                class_name,
+                "",
+                serde_json::json!({ "controllerName": controller_name }),
+            );
+            gateway_class.metadata.namespace.clear();
+
+            let result = translate_k8s_objects(
+                &[
+                    gateway_class,
+                    object_with_metadata(
+                        "Gateway",
+                        "gateway.networking.k8s.io/v1",
+                        "waypoint",
+                        "istio-system",
+                        serde_json::json!({
+                            "gatewayClassName": class_name,
+                            "listeners": [{
+                                "name": "mesh",
+                                "port": 15008,
+                                "protocol": "HBONE"
+                            }]
+                        }),
+                    ),
+                    object_with_metadata(
+                        "AuthorizationPolicy",
+                        "security.istio.io/v1",
+                        "class-deny",
+                        "istio-system",
+                        serde_json::json!({
+                            "targetRefs": [{
+                                "group": "gateway.networking.k8s.io",
+                                "kind": "GatewayClass",
+                                "name": class_name
+                            }],
+                            "action": "DENY",
+                            "rules": [{
+                                "from": [{"source": {"namespaces": ["evil"]}}]
+                            }]
+                        }),
+                    ),
+                ],
+                options_for_namespace("istio-system")
+                    .with_istio_root_namespace("istio-system".to_string()),
+            )
+            .unwrap_or_else(|err| panic!("GatewayClass {class_name} must translate: {err}"));
+
+            let mesh = result.config.mesh.expect("mesh config");
+            match &mesh.mesh_policies[0].scope {
+                PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+                    PolicyTargetAttachment::GatewayClass { name } => {
+                        assert_eq!(name, class_name);
+                    }
+                    other => panic!("expected GatewayClass attachment, got {other:?}"),
+                },
+                other => panic!("expected TargetRefs scope, got {other:?}"),
+            }
+            assert_eq!(
+                mesh.waypoint_bindings[0].gateway_class_name.as_deref(),
+                Some(class_name)
+            );
+        }
+    }
+
+    #[test]
+    fn translates_authorization_policy_multiple_target_refs_or_semantics() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "reviews",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "reviews"},
+                        "ports": [{"port": 9080}]
+                    }),
+                ),
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "ratings",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "ratings"},
+                        "ports": [{"port": 9080}]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [
+                            {"kind": "Service", "name": "reviews"},
+                            {"kind": "Service", "name": "ratings"}
+                        ],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("multiple Service targetRefs must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        match &mesh.mesh_policies[0].scope {
+            PolicyScope::TargetRefs { attachments } => {
+                assert_eq!(attachments.len(), 2);
+                assert!(matches!(
+                    &attachments[0],
+                    PolicyTargetAttachment::Service { name, .. } if name == "reviews"
+                ));
+                assert!(matches!(
+                    &attachments[1],
+                    PolicyTargetAttachment::Service { name, .. } if name == "ratings"
+                ));
+            }
+            other => panic!("expected TargetRefs scope, got {other:?}"),
+        }
+    }
+
+    /// Istio's AuthorizationPolicy contract lists same-namespace `ServiceEntry`
+    /// attachments, but Ferrum has no ServiceEntry-to-waypoint association
+    /// model, so accepting one would translate a policy that could never be
+    /// enforced on the ServiceEntry's traffic (or, worse, one that latched onto
+    /// a same-named Kubernetes Service). It must fail closed, not translate.
+    #[test]
+    fn rejects_authorization_policy_service_entry_target_refs_until_modeled() {
+        let err = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "ServiceEntry",
+                    "networking.istio.io/v1",
+                    "ext",
+                    "default",
+                    serde_json::json!({
+                        "hosts": ["ext.example.com"],
+                        "location": "MESH_EXTERNAL",
+                        "ports": [{"number": 443, "name": "https", "protocol": "HTTPS"}],
+                        "resolution": "DNS",
+                        "workloadSelector": {"labels": {"app": "ext"}}
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "networking.istio.io",
+                            "kind": "ServiceEntry",
+                            "name": "ext"
+                        }],
+                        "action": "ALLOW",
+                        "rules": [{
+                            "to": [{"operation": {"methods": ["GET"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect_err("ServiceEntry targetRefs must fail closed until the model exists");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ServiceEntry attachments are not supported yet"),
+            "diagnostic must scope the refusal to ServiceEntry: {message}"
+        );
+    }
+
+    /// A ServiceEntry targetRef must fail closed even when a same-named
+    /// Kubernetes Service exists in the same namespace — the exact
+    /// mis-association a name-only ServiceEntry model would produce.
+    #[test]
+    fn service_entry_target_ref_does_not_latch_onto_same_named_service() {
+        let err = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "ext",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "ext"},
+                        "ports": [{"port": 8080}]
+                    }),
+                ),
+                object_with_metadata(
+                    "ServiceEntry",
+                    "networking.istio.io/v1",
+                    "ext",
+                    "default",
+                    serde_json::json!({
+                        "hosts": ["ext.example.com"],
+                        "location": "MESH_EXTERNAL",
+                        "ports": [{"number": 443, "name": "https", "protocol": "HTTPS"}],
+                        "resolution": "DNS"
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "networking.istio.io",
+                            "kind": "ServiceEntry",
+                            "name": "ext"
+                        }],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect_err("a same-named Service must not make a ServiceEntry targetRef translate");
+
+        assert!(
+            err.to_string()
+                .contains("ServiceEntry attachments are not supported yet")
+        );
+    }
+
+    /// Istio lists Gateway / Service / ServiceEntry `targetRefs` as
+    /// same-namespace only. A Gateway API `ReferenceGrant` does not widen the
+    /// Istio policy-attachment contract, and Ferrum's CP namespace filter would
+    /// drop such a policy before the target DP slice anyway — so accepting it
+    /// would report `Accepted` for an inert policy.
+    #[test]
+    fn rejects_authorization_policy_cross_namespace_service_target_even_with_reference_grant() {
+        let err = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "payments",
+                    "other",
+                    serde_json::json!({
+                        "selector": {"app": "payments"},
+                        "ports": [{"port": 8080}]
+                    }),
+                ),
+                object_with_metadata(
+                    "ReferenceGrant",
+                    "gateway.networking.k8s.io/v1beta1",
+                    "allow-authz",
+                    "other",
+                    serde_json::json!({
+                        "from": [{
+                            "group": "security.istio.io",
+                            "kind": "AuthorizationPolicy",
+                            "namespace": "default"
+                        }],
+                        "to": [{
+                            "group": "",
+                            "kind": "Service",
+                            "name": "payments"
+                        }]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "kind": "Service",
+                            "name": "payments",
+                            "namespace": "other"
+                        }],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+        )
+        .expect_err("a ReferenceGrant must not authorize a cross-namespace targetRef");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("same-namespace only"),
+            "diagnostic must state the same-namespace contract: {message}"
+        );
+        assert!(
+            !message.contains("ReferenceGrant"),
+            "the ReferenceGrant path is gone; the diagnostic must not suggest it: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_cross_namespace_gateway_target_ref() {
+        let err = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Gateway",
+                    "gateway.networking.k8s.io/v1",
+                    "waypoint",
+                    "other",
+                    serde_json::json!({
+                        "gatewayClassName": "istio-waypoint",
+                        "listeners": [{
+                            "name": "mesh",
+                            "port": 15008,
+                            "protocol": "HBONE"
+                        }]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "group": "gateway.networking.k8s.io",
+                            "kind": "Gateway",
+                            "name": "waypoint",
+                            "namespace": "other"
+                        }],
+                        "rules": [{}]
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+        )
+        .expect_err("cross-namespace Gateway targetRefs must fail closed");
+
+        assert!(err.to_string().contains("same-namespace only"));
+    }
+
+    /// An explicit `namespace` that simply repeats the policy's own namespace is
+    /// legal (Istio: "when unspecified, the local namespace is inferred").
+    #[test]
+    fn accepts_explicit_same_namespace_target_ref() {
+        let result = translate_k8s_objects(
+            &[
+                object_with_metadata(
+                    "Service",
+                    "v1",
+                    "payments",
+                    "default",
+                    serde_json::json!({
+                        "selector": {"app": "payments"},
+                        "ports": [{"port": 8080}]
+                    }),
+                ),
+                object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "targetRefs": [{
+                            "kind": "Service",
+                            "name": "payments",
+                            "namespace": "default"
+                        }],
+                        "action": "DENY",
+                        "rules": [{
+                            "from": [{"source": {"namespaces": ["evil"]}}]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("an explicit same-namespace targetRef must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(matches!(
+            &mesh.mesh_policies[0].scope,
+            PolicyScope::TargetRefs { attachments }
+                if matches!(
+                    &attachments[0],
+                    PolicyTargetAttachment::Service { namespace, name }
+                        if namespace == "default" && name == "payments"
+                )
+        ));
     }
 
     #[test]
