@@ -156,6 +156,8 @@ The read-only mode is implemented through:
 ### Security Considerations
 - **Authentication**: Management endpoints require an admin JWT. Observability endpoints retain their documented tiering: `/live` is minimal and unauthenticated; `/health`, `/status`, and `/overload` expose only coarse unauthenticated state; `/metrics` and detailed diagnostics require an accepted admin or metrics credential/policy.
 - **Network Isolation**: Read-only mode is enforced at the application level
+- **Blocked Write Observability**: Admission paths emit a bounded structured `warn!` log (HTTP method, sanitized path, namespace, and `outcome=forbidden` only — never request bodies, tokens, or credentials) and increment the `ferrum_admin_read_only_rejected_mutations_total` Prometheus counter. Observe-only surfaces such as `/health` do not increment the counter or emit these warnings, so health probes cannot inflate the signal.
+- **Audit Events**: Blocked read-only mutations do **not** produce admin audit events; the durable audit pipeline runs only after read-only admission succeeds. Use the structured warning log and Prometheus counter for alerting and compliance evidence.
 - **Sensitive Reads**: Read-only mode blocks mutations only; it does not make management-plane reads, diagnostics, or bearer tokens safe to expose on an untrusted network
 - **Graceful Degradation**: Read operations continue to work during read-only enforcement
 
@@ -209,5 +211,5 @@ This setting cannot enable mutations in `file`, `dp`, `mesh`, or `node_agent` mo
 2. **Development**: Keep read-write mode for development and testing
 3. **File/Data Plane/Mesh/Node Agent**: Rely on the automatic read-only behavior; the variable cannot make these modes writable
 4. **Control Plane**: Use environment variables, not code changes, to control read-only mode
-5. **Monitoring**: Set up monitoring to alert on write attempts in read-only mode
+5. **Monitoring**: Alert on `increase(ferrum_admin_read_only_rejected_mutations_total[15m]) > 0` and on the structured `admin mutation blocked by read-only mode` warning log
 6. **Documentation**: Document your read-only mode configuration in runbooks
