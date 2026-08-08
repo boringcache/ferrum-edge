@@ -685,6 +685,7 @@ fn watch_scope_shrink_withdraws_objects_outside_every_service_namespace() {
             name: "shared-waypoint".to_string(),
             namespace: "mesh-system".to_string(),
             waypoint_for: "service".to_string(),
+            gateway_class_name: None,
             services: Vec::new(),
         }],
         services: vec![native_mesh_service("payments", "checkout")],
@@ -1352,6 +1353,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             name: name("waypoint"),
             namespace: "mesh-system".to_string(),
             waypoint_for: marker.to_string(),
+            gateway_class_name: None,
             services: Vec::new(),
         }],
         ..MeshConfig::default()

@@ -530,12 +530,43 @@ fn authorization_policy_status(
                     .and_then(Value::as_array)
                     .map(|v| v.len())
                     .unwrap_or(0);
-                let message =
-                    format!("Ferrum accepted this AuthorizationPolicy ({rule_count} rule(s))");
+                let target_refs = object
+                    .spec
+                    .get("targetRefs")
+                    .and_then(Value::as_array)
+                    .map(|refs| {
+                        refs.iter()
+                            .filter_map(|entry| {
+                                let kind = entry.get("kind")?.as_str()?;
+                                let name = entry.get("name")?.as_str()?;
+                                let group =
+                                    entry.get("group").and_then(Value::as_str).unwrap_or("");
+                                Some(json!({
+                                    "group": group,
+                                    "kind": kind,
+                                    "name": name,
+                                    "namespace": entry
+                                        .get("namespace")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(&object.metadata.namespace),
+                                }))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let message = if target_refs.is_empty() {
+                    format!("Ferrum accepted this AuthorizationPolicy ({rule_count} rule(s))")
+                } else {
+                    format!(
+                        "Ferrum accepted this AuthorizationPolicy ({rule_count} rule(s), {} targetRefs attachment(s))",
+                        target_refs.len()
+                    )
+                };
                 let detail = json!({
                     "translation": {
                         "action": action,
                         "rules_translated": rule_count,
+                        "target_refs": target_refs,
                     }
                 });
                 (true, "Accepted", message, Some(detail))

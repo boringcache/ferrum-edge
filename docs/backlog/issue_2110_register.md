@@ -63,7 +63,7 @@ Current mesh HBONE/DNS perf status lives in
 | TCP outbound PROXY protocol v2 | [#3618](https://github.com/ferrum-edge/ferrum-edge/issues/3618) | |
 | TCP/kTLS kernel splice (frontend-TLS relay) | [#3619](https://github.com/ferrum-edge/ferrum-edge/issues/3619) | |
 | HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | [#3620](https://github.com/ferrum-edge/ferrum-edge/issues/3620) | |
-| Ambient UDP enrolled-destination round trip | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | |
+| Ambient UDP enrolled-destination round trip | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | Source-capture live gate exists; destination pod-netns relay not yet live-gated |
 | Direct-H2 in-path body-size limits | [#3622](https://github.com/ferrum-edge/ferrum-edge/issues/3622) | |
 | Admin read-only write audit logging | [#3623](https://github.com/ferrum-edge/ferrum-edge/issues/3623) | |
 | Env-only reads ignoring `ferrum.conf` | [#3624](https://github.com/ferrum-edge/ferrum-edge/issues/3624) | |

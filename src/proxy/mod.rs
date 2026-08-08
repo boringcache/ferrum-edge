@@ -31254,6 +31254,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             };
+            // Retry helpers can reject the selected target before dialing it
+            // (most notably when the egress policy blocks its resolved
+            // address). Do not let the response path mistake that target for
+            // the backend that served the response and mint affinity for it.
+            sticky_dispatch_refused = matches!(
+                result.error_class,
+                Some(retry::ErrorClass::DispatchPolicyRejected)
+            );
             // If H3 was attempted and produced a transport-level failure,
             // downgrade the cached capability so subsequent requests (and
             // any future retry that rotates BACK to this target) skip the

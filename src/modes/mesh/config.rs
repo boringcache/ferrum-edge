@@ -317,8 +317,71 @@ pub enum PolicyScope {
     Namespace {
         namespace: String,
     },
+    /// Istio `AuthorizationPolicy.spec.targetRefs` attachment scope.
+    ///
+    /// A policy matches when **any** attachment applies (OR). Attachments are
+    /// resolved at translation time against the resource graph; unsupported
+    /// group/kind combinations and selector+targetRefs exclusivity fail closed
+    /// before a `MeshPolicy` is emitted. Do not broaden these into namespace
+    /// or mesh-wide scope when a target is missing — omit/reject instead.
+    ///
+    /// **Slice retention is OR over the whole list, so retention alone proves
+    /// nothing about which attachment matched.** Every runtime consumer must
+    /// re-check the exact attachment against its own authoritative evidence
+    /// ([`WaypointAttachment::matches`] for Gateway/GatewayClass,
+    /// [`policy_target_attachment_applies_to_service`] for Service). A policy
+    /// listing `{Service reviews, Gateway other-waypoint}` is legitimately
+    /// retained at `reviews`' waypoint, and the unmatched Gateway arm must
+    /// still not apply to any other destination there.
+    TargetRefs {
+        attachments: Vec<PolicyTargetAttachment>,
+    },
     #[default]
     MeshWide,
+}
+
+/// Upper bound on `AuthorizationPolicy` / `MeshPolicy` `targetRefs` attachments
+/// accepted at the native/file/xDS config boundary (matches the K8s translator).
+pub const MAX_POLICY_TARGET_REFS: usize = 16;
+
+/// DNS-1123 subdomain / API-group length bound for TargetRef `group` strings
+/// at the native/file and K8s translation boundaries.
+pub const MAX_POLICY_TARGET_REF_GROUP_LEN: usize = 253;
+
+/// Kubernetes kind-name length bound for TargetRef `kind` strings.
+pub const MAX_POLICY_TARGET_REF_KIND_LEN: usize = 63;
+
+/// TargetRef resource name length bound (DNS-1123 subdomain; same ceiling as
+/// the WaypointGatewayClass ECDS carrier).
+pub const MAX_POLICY_TARGET_REF_NAME_LEN: usize = 253;
+
+/// TargetRef namespace length bound (reuses the shared Ferrum namespace ceiling).
+pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize = crate::config::types::MAX_NAMESPACE_LENGTH;
+
+/// One resolved `AuthorizationPolicy` / policy `targetRefs[]` attachment.
+///
+/// Captures the concrete resource the policy attaches to. Attachments carry
+/// resource IDENTITY only — never selector labels: membership is always exact
+/// namespace/name (or exact waypoint name / gateway class), so two Services
+/// that happen to share a pod selector can never inherit each other's policies.
+///
+/// Istio's supported attachment set (`Gateway`, `GatewayClass`, `Service`,
+/// `ServiceEntry`) is deliberately NOT fully modelled here: `ServiceEntry`
+/// attachments are refused at translation because Ferrum has no ServiceEntry ↔
+/// waypoint association model, and an accepted-but-inert security policy is
+/// worse than a rejected one. See `docs/mesh.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyTargetAttachment {
+    /// `group: ""` / `core`, `kind: Service` — waypoint destination attachment.
+    /// Same namespace as the owning policy (Istio contract).
+    Service { namespace: String, name: String },
+    /// `group: gateway.networking.k8s.io`, `kind: Gateway` — waypoint Gateway.
+    /// Same namespace as the owning policy (Istio contract).
+    Gateway { namespace: String, name: String },
+    /// `group: gateway.networking.k8s.io`, `kind: GatewayClass` (cluster-scoped;
+    /// the owning policy must live in the Istio root namespace).
+    GatewayClass { name: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -764,20 +827,20 @@ impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
 ///   `(key, value)` in `selector.labels` is present in `proxy_labels` with the
 ///   same value (subset match — empty selector labels means "any workload in
 ///   the optional namespace").
+/// - [`PolicyScope::TargetRefs`] — never matches via bare namespace/labels alone.
+///   Waypoint Gateway / GatewayClass attachments require
+///   [`policy_scope_applies_with_waypoint`]; Service attachments match
+///   destination identity through exact service namespace/name membership
+///   ([`policy_target_attachment_applies_to_service`],
+///   [`crate::modes::mesh::runtime::PolicyScopeCache::policy_applies_for_destination`],
+///   ServiceWaypoint narrowing). Targeted policies never broaden onto Sidecar
+///   workloads or sibling Services that share selector labels.
 pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
     policy: &MeshPolicy,
     proxy_namespace: &str,
     proxy_labels: &L,
 ) -> bool {
-    match &policy.scope {
-        PolicyScope::MeshWide => true,
-        PolicyScope::Namespace {
-            namespace: policy_namespace,
-        } => policy_namespace == proxy_namespace,
-        PolicyScope::WorkloadSelector { selector } => {
-            workload_selector_matches(selector, proxy_namespace, proxy_labels)
-        }
-    }
+    scope_applies_to_workload(&policy.scope, proxy_namespace, proxy_labels)
 }
 
 /// Returns `true` when a [`PolicyScope`] applies to a workload whose
@@ -799,7 +862,120 @@ pub fn scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
         PolicyScope::WorkloadSelector { selector } => {
             workload_selector_matches(selector, proxy_namespace, proxy_labels)
         }
+        // AuthorizationPolicy targetRefs are waypoint/attachment scoped; bare
+        // label matching would broaden them onto Sidecar workloads.
+        PolicyScope::TargetRefs { .. } => false,
     }
+}
+
+/// The exact waypoint identity a targeted policy attachment is evaluated
+/// against.
+///
+/// This is the ONE place Gateway / GatewayClass `targetRefs` matching is
+/// decided, shared by slice narrowing, the `mesh_authz` cold-path retain, and
+/// the request-path destination check. Retention uses OR semantics over the
+/// whole attachment list and never prunes the non-matching arms, so a runtime
+/// consumer that assumed "the policy is here, therefore its Gateway arm
+/// matched" would let a policy targeting `{Service reviews, Gateway wp-b}`
+/// apply to EVERY destination at `wp-a`. Carrying the exact context and
+/// re-checking is what keeps true OR semantics without that broadening.
+///
+/// All fields are borrowed and `Copy`; constructing one per request allocates
+/// nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WaypointAttachment<'a> {
+    /// Namespace of the waypoint proxy serving this slice.
+    pub namespace: &'a str,
+    /// `Gateway.metadata.name` of the waypoint, when this IS a waypoint slice.
+    /// `None` means "not a waypoint" and makes every attachment fail closed:
+    /// Istio only applies `targetRefs` policies at waypoint proxies.
+    pub name: Option<&'a str>,
+    /// Authoritative `Gateway.spec.gatewayClassName` for [`Self::name`].
+    /// `None` (unknown class) fails GatewayClass attachments closed.
+    pub gateway_class: Option<&'a str>,
+}
+
+impl WaypointAttachment<'_> {
+    /// Whether this exact waypoint is the resource `attachment` names.
+    ///
+    /// `Service` attachments are destination-resource identity and are never
+    /// decided here — see [`policy_target_attachment_applies_to_service`].
+    #[inline]
+    pub fn matches(&self, attachment: &PolicyTargetAttachment) -> bool {
+        let Some(waypoint_name) = self.name else {
+            return false;
+        };
+        match attachment {
+            PolicyTargetAttachment::Gateway { namespace, name } => {
+                waypoint_name == name.as_str() && namespace == self.namespace
+            }
+            PolicyTargetAttachment::GatewayClass { name } => self
+                .gateway_class
+                .is_some_and(|class| class == name.as_str()),
+            PolicyTargetAttachment::Service { .. } => false,
+        }
+    }
+}
+
+/// Waypoint-aware policy scope predicate.
+///
+/// Extends [`policy_scope_applies_to_workload`] so Gateway / GatewayClass
+/// `targetRefs` attachments apply inside the matching ServiceWaypoint slice
+/// without broadening onto Sidecar / Ambient workloads.
+///
+/// `waypoint_gateway_class` must be the authoritative
+/// `Gateway.spec.gatewayClassName` for this waypoint (from
+/// [`MeshWaypointBinding::gateway_class_name`]). A `GatewayClass` attachment
+/// matches only that exact class — `istio-waypoint` never attaches to a
+/// `ferrum-waypoint` Gateway (and vice versa). Missing class evidence, and a
+/// non-waypoint proxy, both fail closed.
+pub fn policy_scope_applies_with_waypoint<L: WorkloadLabels + ?Sized>(
+    policy: &MeshPolicy,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+    waypoint_name: Option<&str>,
+    waypoint_gateway_class: Option<&str>,
+) -> bool {
+    match &policy.scope {
+        PolicyScope::TargetRefs { attachments } => {
+            let waypoint = WaypointAttachment {
+                namespace: proxy_namespace,
+                name: waypoint_name,
+                gateway_class: waypoint_gateway_class,
+            };
+            attachments
+                .iter()
+                .any(|attachment| waypoint.matches(attachment))
+        }
+        _ => policy_scope_applies_to_workload(policy, proxy_namespace, proxy_labels),
+    }
+}
+
+/// Returns `true` when a Service-targeted attachment names this exact service.
+///
+/// Used by ServiceWaypoint narrowing so a policy attached to Service `reviews`
+/// is kept when that service is bound to the waypoint, even though the waypoint
+/// pod's own labels have nothing to do with the Service's pod selector.
+/// Membership is exact `(namespace, name)` — never a label overlap.
+pub fn policy_target_attachment_applies_to_service(
+    attachment: &PolicyTargetAttachment,
+    service_namespace: &str,
+    service_name: &str,
+) -> bool {
+    match attachment {
+        PolicyTargetAttachment::Service { namespace, name } => {
+            namespace == service_namespace && name == service_name
+        }
+        PolicyTargetAttachment::Gateway { .. } | PolicyTargetAttachment::GatewayClass { .. } => {
+            false
+        }
+    }
+}
+
+/// Supported waypoint `GatewayClass` names (`istio-waypoint` / `ferrum-waypoint`).
+#[inline]
+pub fn is_supported_waypoint_gateway_class_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("istio-waypoint") || name.eq_ignore_ascii_case("ferrum-waypoint")
 }
 
 /// Returns `true` when a [`WorkloadSelector`] matches a workload whose
@@ -1387,7 +1563,11 @@ impl PeerAuthentication {
     pub fn has_workload_selector(&self) -> bool {
         match self.scope.as_ref() {
             Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
-            Some(PolicyScope::MeshWide | PolicyScope::Namespace { .. }) => false,
+            Some(
+                PolicyScope::MeshWide
+                | PolicyScope::Namespace { .. }
+                | PolicyScope::TargetRefs { .. },
+            ) => false,
             None => self
                 .selector
                 .as_ref()
@@ -3113,6 +3293,12 @@ pub struct MeshWaypointBinding {
     /// enum values without requiring a Ferrum-side migration.
     #[serde(default = "default_waypoint_for")]
     pub waypoint_for: String,
+    /// Gateway API `spec.gatewayClassName` when this binding came from a
+    /// waypoint `Gateway`. Used to resolve AuthorizationPolicy
+    /// `targetRefs` to `GatewayClass`. Absent for Service-only binding
+    /// shells created before the Gateway is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_class_name: Option<String>,
     /// Bound services. Empty when the Gateway resource exists but no
     /// `Service` annotation references it; the slice builder treats an
     /// empty binding as "no services pass through this waypoint" and
@@ -3199,6 +3385,13 @@ pub enum OutboundTrafficPolicy {
 
 impl MeshConfig {
     pub fn validate(&self) -> Vec<String> {
+        // `normalize()` folds a blank root namespace back to the default;
+        // validation may run before it, so resolve the same effective value
+        // here rather than skipping the GatewayClass ownership rule.
+        let root_namespace = match self.istio_root_namespace.trim() {
+            "" => default_istio_root_namespace(),
+            trimmed => trimmed.to_string(),
+        };
         let mut errors = validate_mesh_config_internal(
             &self.workloads,
             &self.services,
@@ -3210,6 +3403,8 @@ impl MeshConfig {
             &self.destination_rules,
             &self.proxy_configs,
             &self.sidecars,
+            &self.waypoint_bindings,
+            &root_namespace,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         );
@@ -3609,6 +3804,11 @@ pub fn validate_mesh_config(
         &[],
         &[],
         &[],
+        &[],
+        // Trust-bundle-only entrypoint: no root-namespace concept is available
+        // here, so GatewayClass ownership is not evaluated (see
+        // `validate_mesh_policy_target_refs_scope`).
+        "",
         trust_bundles,
         None,
     )
@@ -3750,6 +3950,8 @@ fn validate_mesh_config_internal(
     destination_rules: &[MeshDestinationRule],
     proxy_configs: &[MeshProxyConfig],
     sidecars: &[MeshSidecar],
+    waypoint_bindings: &[MeshWaypointBinding],
+    istio_root_namespace: &str,
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
@@ -3941,6 +4143,23 @@ fn validate_mesh_config_internal(
     // Policies
     for policy in policies {
         validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
+        validate_non_empty_string(
+            format!("MeshPolicy '{}'.namespace", policy.name),
+            &policy.namespace,
+            &mut errors,
+        );
+        validate_mesh_policy_target_refs_scope(
+            &MeshPolicyTargetRefsIdentity {
+                resource_kind: "MeshPolicy",
+                resource_name: &policy.name,
+                policy_namespace: &policy.namespace,
+            },
+            &policy.scope,
+            services,
+            waypoint_bindings,
+            istio_root_namespace,
+            &mut errors,
+        );
         for (i, rule) in policy.rules.iter().enumerate() {
             for (j, principal) in rule.from.iter().enumerate() {
                 if principal.spiffe_id_pattern.is_none()
@@ -4092,6 +4311,14 @@ fn validate_mesh_config_internal(
             &pa.namespace,
             &mut errors,
         );
+        if let Some(scope) = pa.scope.as_ref() {
+            reject_unsupported_target_refs_scope(
+                "PeerAuthentication",
+                &pa.name,
+                scope,
+                &mut errors,
+            );
+        }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
                 format!("PeerAuthentication '{}'.port_overrides[{}]", pa.name, port),
@@ -4125,6 +4352,12 @@ fn validate_mesh_config_internal(
         validate_non_empty_string(
             format!("MeshRequestAuthentication '{}'.namespace", ra.name),
             &ra.namespace,
+            &mut errors,
+        );
+        reject_unsupported_target_refs_scope(
+            "MeshRequestAuthentication",
+            &ra.name,
+            &ra.scope,
             &mut errors,
         );
         for (i, rule) in ra.jwt_rules.iter().enumerate() {
@@ -4194,6 +4427,12 @@ fn validate_mesh_config_internal(
         validate_non_empty_string(
             format!("MeshTelemetryResource '{}'.namespace", telemetry.name),
             &telemetry.namespace,
+            &mut errors,
+        );
+        reject_unsupported_target_refs_scope(
+            "MeshTelemetryResource",
+            &telemetry.name,
+            &telemetry.scope,
             &mut errors,
         );
         if let Some(tracing) = telemetry.config.tracing.as_ref() {
@@ -4323,6 +4562,12 @@ fn validate_mesh_config_internal(
             &proxy_config.namespace,
             &mut errors,
         );
+        reject_unsupported_target_refs_scope(
+            "MeshProxyConfig",
+            &proxy_config.name,
+            &proxy_config.scope,
+            &mut errors,
+        );
         validate_percentage(
             format!("MeshProxyConfig '{}'.tracing_sampling", proxy_config.name),
             proxy_config.tracing_sampling,
@@ -4417,15 +4662,239 @@ fn validate_mesh_config_internal(
     errors
 }
 
+/// Reject `PolicyScope::TargetRefs` on shared-scope consumers that do not yet
+/// implement end-to-end targetRefs attachment (PeerAuthentication,
+/// RequestAuthentication, Telemetry, ProxyConfig). AuthorizationPolicy /
+/// MeshPolicy validate attachments separately.
+fn reject_unsupported_target_refs_scope(
+    resource_kind: &str,
+    resource_name: &str,
+    scope: &PolicyScope,
+    errors: &mut Vec<String>,
+) {
+    if matches!(scope, PolicyScope::TargetRefs { .. }) {
+        errors.push(format!(
+            "{resource_kind} '{resource_name}': PolicyScope::target_refs is not supported; \
+             only AuthorizationPolicy/MeshPolicy implement targetRefs attachment"
+        ));
+    }
+}
+
+/// Immutable resource/policy identity used by targetRefs scope diagnostics.
+struct MeshPolicyTargetRefsIdentity<'a> {
+    resource_kind: &'a str,
+    resource_name: &'a str,
+    policy_namespace: &'a str,
+}
+
+/// Fail-closed validation for AuthorizationPolicy / MeshPolicy `targetRefs`.
+///
+/// Mirrors the Istio AuthorizationPolicy support contract at the native/file
+/// boundary so a hand-authored `MeshConfig` cannot express something the K8s
+/// translator refuses:
+///
+/// * `Service` and `Gateway` attachments are **same namespace as the owning
+///   policy**. Istio lists both as same-namespace only, and Ferrum's CP
+///   namespace filter (`resource_owner_can_apply_to_namespace`) would drop a
+///   cross-namespace attachment before it ever reached the target DP slice —
+///   an accepted-but-inert security policy.
+/// * `GatewayClass` is cluster-scoped and only the Istio **root namespace** may
+///   own such a policy. This is an **ownership** rule, so it hard-fails even
+///   alongside a valid sibling attachment (see below).
+/// * A missing / inapplicable sibling attachment must **not** invalidate the
+///   whole policy when another attachment is still valid and applicable —
+///   retention is OR and runtime matching stays exact, so an unmatched arm
+///   never becomes a wildcard. A policy whose *every* attachment is
+///   unresolved still fails closed rather than silently broadening.
+///   Deferral covers **inventory** misses only (an absent Service / Gateway
+///   named by exact `(namespace, name)`, which nothing can match). Structural
+///   and ownership refusals — malformed fields, cross-namespace
+///   Service/Gateway, unsupported class names, and non-root `GatewayClass`
+///   ownership — are always hard errors, because those arms stay live and
+///   matchable in the retained scope.
+/// * Gateway presence is checked only when `waypoint_bindings` is a real
+///   inventory. DP slices reconstruct `MeshConfig` without bindings (matching
+///   uses the live `waypoint_name` / class stamp), so an empty bindings list
+///   cannot prove a Gateway target is missing.
+fn validate_mesh_policy_target_refs_scope(
+    identity: &MeshPolicyTargetRefsIdentity<'_>,
+    scope: &PolicyScope,
+    services: &[MeshService],
+    waypoint_bindings: &[MeshWaypointBinding],
+    istio_root_namespace: &str,
+    errors: &mut Vec<String>,
+) {
+    let PolicyScope::TargetRefs { attachments } = scope else {
+        return;
+    };
+    let context = format!(
+        "{} '{}'.scope.target_refs",
+        identity.resource_kind, identity.resource_name
+    );
+    let policy_namespace = identity.policy_namespace;
+    if attachments.is_empty() {
+        errors.push(format!(
+            "{context}: attachments must not be empty (targeted policies fail closed)"
+        ));
+        return;
+    }
+    if attachments.len() > MAX_POLICY_TARGET_REFS {
+        errors.push(format!(
+            "{context}: supports at most {MAX_POLICY_TARGET_REFS} attachments"
+        ));
+    }
+
+    // Inventory-miss failures are deferred: one unresolved arm must not reject
+    // a mixed policy that still has a valid applicable target. Emit them only
+    // when *no* attachment remains valid, so an all-invalid policy cannot
+    // silently broaden. Structural and ownership refusals are NOT deferred —
+    // those arms remain live and matchable in the retained scope.
+    let mut valid_attachments = 0usize;
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let path = format!("{context}[{index}]");
+        match attachment {
+            PolicyTargetAttachment::Service { namespace, name }
+            | PolicyTargetAttachment::Gateway { namespace, name } => {
+                let kind = match attachment {
+                    PolicyTargetAttachment::Service { .. } => "Service",
+                    _ => "Gateway",
+                };
+                let errors_before = errors.len();
+                validate_non_empty_string(format!("{path}.namespace"), namespace, errors);
+                validate_bounded_string(
+                    format!("{path}.namespace"),
+                    namespace,
+                    MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
+                    errors,
+                );
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
+                if errors.len() > errors_before {
+                    continue;
+                }
+                if namespace != policy_namespace {
+                    errors.push(format!(
+                        "{path}: {kind} '{namespace}/{name}' is in another namespace; \
+                         Istio AuthorizationPolicy targetRefs to {kind} are same-namespace only \
+                         (policy namespace '{policy_namespace}')"
+                    ));
+                    continue;
+                }
+                let is_service = matches!(attachment, PolicyTargetAttachment::Service { .. });
+                if is_service {
+                    let present = services
+                        .iter()
+                        .any(|service| service.namespace == *namespace && service.name == *name);
+                    if present {
+                        valid_attachments += 1;
+                    } else {
+                        unresolved.push(format!(
+                            "{path}: Service '{namespace}/{name}' was not found in services; \
+                             targeted policies fail closed when the target is missing"
+                        ));
+                    }
+                } else if waypoint_bindings.is_empty() {
+                    // No bindings inventory on this validation path (typical DP
+                    // slice reconstruction). Presence cannot be proven or
+                    // disproven; runtime attachment matching remains exact and
+                    // fail-closed.
+                    valid_attachments += 1;
+                } else if waypoint_bindings
+                    .iter()
+                    .any(|binding| binding.namespace == *namespace && binding.name == *name)
+                {
+                    valid_attachments += 1;
+                } else {
+                    unresolved.push(format!(
+                        "{path}: Gateway '{namespace}/{name}' was not found in \
+                         waypoint_bindings; targeted policies fail closed when the \
+                         target is missing"
+                    ));
+                }
+            }
+            PolicyTargetAttachment::GatewayClass { name } => {
+                let errors_before = errors.len();
+                validate_non_empty_string(format!("{path}.name"), name, errors);
+                validate_bounded_string(
+                    format!("{path}.name"),
+                    name,
+                    MAX_POLICY_TARGET_REF_NAME_LEN,
+                    errors,
+                );
+                if errors.len() > errors_before {
+                    continue;
+                }
+                // GatewayClass is cluster-scoped: only the root namespace may
+                // own a class-wide policy. An empty configured root namespace
+                // means the caller has no root-namespace concept (the
+                // trust-bundle-only `validate_mesh_config` entrypoint), so the
+                // ownership rule is not evaluated there.
+                //
+                // This is an ownership refusal, NOT an inventory miss, so it is
+                // never deferred: the class exists and is supported, and
+                // `WaypointAttachment::matches` compares the class name ALONE
+                // (no namespace, no Gateway name). A retained non-root arm is
+                // therefore a live cluster-wide wildcard over every waypoint of
+                // that class, not an arm that simply fails to resolve. Deferring
+                // it would let any namespace buy class-wide reach by pairing it
+                // with one valid same-namespace Service arm — exactly what the
+                // K8s translator rejects unconditionally (`istio.rs`).
+                if !istio_root_namespace.is_empty() && policy_namespace != istio_root_namespace {
+                    errors.push(format!(
+                        "{path}: GatewayClass attachments must be owned by a policy in the Istio \
+                         root namespace ('{istio_root_namespace}'), not '{policy_namespace}'"
+                    ));
+                    continue;
+                }
+                if !is_supported_waypoint_gateway_class_name(name) {
+                    let known_on_binding = waypoint_bindings.iter().any(|binding| {
+                        binding
+                            .gateway_class_name
+                            .as_deref()
+                            .is_some_and(|class| class == name.as_str())
+                    });
+                    if !known_on_binding {
+                        // Unsupported class name is a structural refusal, not an
+                        // inventory miss — always hard-fail.
+                        errors.push(format!(
+                            "{path}: GatewayClass '{name}' is unsupported; \
+                             Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
+                        ));
+                        continue;
+                    }
+                }
+                valid_attachments += 1;
+            }
+        }
+    }
+
+    if valid_attachments == 0 {
+        errors.extend(unresolved);
+    }
+}
+
 fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {
     if value.trim().is_empty() {
         errors.push(format!("{context}: must not be empty"));
     }
 }
 
-/// Upper bound on `exportTo` entries. Visibility lists are authored by hand
-/// and a mesh has far fewer namespaces than this; the cap keeps a hostile
-/// config from turning every visibility check into an unbounded scan.
+fn validate_bounded_string(context: String, value: &str, max_len: usize, errors: &mut Vec<String>) {
+    if !value.trim().is_empty() && value.len() > max_len {
+        errors.push(format!(
+            "{context}: must be at most {max_len} characters (got {})",
+            value.len()
+        ));
+    }
+}
+
 pub const MESH_EXPORT_TO_MAX_ENTRIES: usize = 64;
 
 /// Validate an `exportTo` visibility list (issue #2465).

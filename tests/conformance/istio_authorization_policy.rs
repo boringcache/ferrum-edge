@@ -428,3 +428,134 @@ fn authz_rejects_malformed_not_ports_wildcard_patterns() {
         "notPorts diagnostic must not echo the operator-supplied value: {message}"
     );
 }
+
+#[test]
+fn authz_target_refs_service_attachment_is_preserved() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "targetRefs → Service attachment scope",
+        status = Status::Supported,
+        notes = "AuthorizationPolicy targetRefs to a SAME-NAMESPACE Service resolve into \
+                 PolicyScope::TargetRefs carrying resource identity only (no selector labels); \
+                 runtime attachment is exact Service namespace/name membership at a waypoint. \
+                 selector + targetRefs exclusivity, unsupported group/kind, and cross-namespace \
+                 references all fail closed.",
+    );
+
+    use ferrum_edge::modes::mesh::config::PolicyTargetAttachment;
+
+    let service = K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        metadata: K8sMetadata {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ..K8sMetadata::default()
+        },
+        spec: json!({
+            "selector": {"app": "reviews"},
+            "ports": [{"port": 9080, "name": "http"}]
+        }),
+        status: Value::Object(serde_json::Map::new()),
+    };
+    let policy = authz_policy(json!({
+        "targetRefs": [{
+            "group": "",
+            "kind": "Service",
+            "name": "reviews"
+        }],
+        "action": "DENY",
+        "rules": [{
+            "from": [{"source": {"namespaces": ["evil"]}}]
+        }]
+    }));
+    let result = translate_k8s_objects(&[service, policy], options())
+        .expect("targetRefs Service translates");
+    let mesh = result.config.mesh.expect("mesh");
+    match &mesh.mesh_policies[0].scope {
+        PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+            PolicyTargetAttachment::Service { namespace, name } => {
+                assert_eq!(namespace, "default");
+                assert_eq!(name, "reviews");
+            }
+            other => panic!("expected Service attachment, got {other:?}"),
+        },
+        other => panic!("expected TargetRefs scope, got {other:?}"),
+    }
+
+    let err = translate_k8s_objects(
+        &[authz_policy(json!({
+            "selector": {"matchLabels": {"app": "reviews"}},
+            "targetRefs": [{"kind": "Service", "name": "reviews"}],
+            "rules": [{}]
+        }))],
+        options(),
+    )
+    .expect_err("selector + targetRefs must fail closed");
+    assert!(
+        err.to_string()
+            .contains("at most one of selector or targetRefs")
+    );
+}
+
+/// Istio's contract lists `Gateway` / `Service` / `ServiceEntry` `targetRefs`
+/// as same-namespace only, and `GatewayClass` as root-namespace. Ferrum matches
+/// the namespace rules and declares `ServiceEntry` unsupported rather than
+/// translating a policy it cannot enforce.
+#[test]
+fn authz_target_refs_namespace_and_kind_boundaries_fail_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "targetRefs namespace + kind boundaries",
+        status = Status::Supported,
+        maturity = Maturity::Beta,
+        notes = "Gateway/Service targetRefs are same-namespace only (a Gateway API \
+                 ReferenceGrant does NOT widen the Istio policy-attachment contract, and \
+                 Ferrum's CP owner-namespace filter would drop such a policy before the \
+                 target data plane). GatewayClass requires the Istio root namespace and an \
+                 observed cluster-scoped object. ServiceEntry attachments are REJECTED with a \
+                 scoped diagnostic: Ferrum has no ServiceEntry-to-waypoint association model, \
+                 so accepting one would report Accepted for an unenforceable policy.",
+    );
+
+    let remote_service = K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        metadata: K8sMetadata {
+            name: "payments".to_string(),
+            namespace: "other".to_string(),
+            ..K8sMetadata::default()
+        },
+        spec: json!({"selector": {"app": "payments"}, "ports": [{"port": 8080}]}),
+        status: Value::Object(serde_json::Map::new()),
+    };
+    let cross_namespace = authz_policy(json!({
+        "targetRefs": [{"kind": "Service", "name": "payments", "namespace": "other"}],
+        "rules": [{}]
+    }));
+    let err = translate_k8s_objects(
+        &[remote_service, cross_namespace],
+        options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+    )
+    .expect_err("cross-namespace Service targetRefs must fail closed");
+    assert!(
+        err.to_string().contains("same-namespace only"),
+        "diagnostic must state the same-namespace contract: {err}"
+    );
+
+    let service_entry_ref = authz_policy(json!({
+        "targetRefs": [{
+            "group": "networking.istio.io",
+            "kind": "ServiceEntry",
+            "name": "ext"
+        }],
+        "rules": [{}]
+    }));
+    let err = translate_k8s_objects(&[service_entry_ref], options())
+        .expect_err("ServiceEntry targetRefs must fail closed");
+    assert!(
+        err.to_string()
+            .contains("ServiceEntry attachments are not supported yet"),
+        "diagnostic must scope the refusal to ServiceEntry: {err}"
+    );
+}

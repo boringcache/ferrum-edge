@@ -107,7 +107,7 @@ issue body alone.
 | TCP outbound PROXY protocol v2 | #3618 | Inbound only today |
 | TCP/kTLS kernel splice (frontend-TLS relay) | #3619 | Unbuffered rustls handshake leaves splice inert |
 | HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | #3620 | H3 retry rotation must skip fail-closed targets |
-| Ambient UDP enrolled-destination round trip | #3621 | Restore live tracker after #2013/#2038 closure |
+| Ambient UDP enrolled-destination round trip | #3621 | Source-capture live gate exists; destination pod-netns relay + tc-inbound admit not yet live-gated |
 | Direct-H2 in-path body-size limits | #3622 | Default nonzero limits still force reqwest path |
 | Admin read-only write audit logging | #3623 | Docs promise logging/counts that do not exist |
 | Env-only reads ignoring `ferrum.conf` | #3624 | `FERRUM_LOG_REDACT_METADATA_KEYS`, `FERRUM_NODE_ID`, validation-client gates |
