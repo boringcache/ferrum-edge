@@ -30550,17 +30550,15 @@ mod tests {
             "a host-less external UDP ServiceEntry must materialize no egress routes"
         );
         assert!(
-            !config
-                .upstreams
-                .iter()
-                .any(|upstream| upstream.id.starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)),
+            !config.upstreams.iter().any(|upstream| upstream
+                .id
+                .starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)),
             "no external UDP upstream may be synthesized for a host-less entry"
         );
         assert!(
-            !config
-                .proxies
-                .iter()
-                .any(|proxy| proxy.id.starts_with(MESH_EXTERNAL_UDP_RELAY_PROXY_ID_PREFIX)),
+            !config.proxies.iter().any(|proxy| proxy
+                .id
+                .starts_with(MESH_EXTERNAL_UDP_RELAY_PROXY_ID_PREFIX)),
             "no external UDP relay proxy may be synthesized for a host-less entry"
         );
     }
