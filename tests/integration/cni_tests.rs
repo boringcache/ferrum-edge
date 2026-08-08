@@ -2759,6 +2759,11 @@ mod install_lifecycle {
             neighbour_before,
             "the neighbouring release's chain is never touched"
         );
+        assert_eq!(
+            read_json(&node.manifest_path())["binaryOwned"],
+            false,
+            "content equality with another owner's binary is not ownership evidence"
+        );
         node.assert_primary_untouched();
     }
 
@@ -2794,6 +2799,39 @@ mod install_lifecycle {
     // ---------------------------------------------------------------------
     // `previousBinarySha256` is an attestation, not an observation.
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_byte_identical_unattested_binary_is_reused_but_never_claimed() {
+        let node = Node::new();
+        let bytes = fs::read(&node.source_binary).expect("source binary");
+        fs::write(node.binary_path(), &bytes).expect("plant operator binary");
+        let before = fs::metadata(node.binary_path()).expect("operator binary metadata");
+
+        node.install(OWNER, "gen-1");
+        let manifest = read_json(&node.manifest_path());
+        assert_eq!(
+            manifest["binaryOwned"], false,
+            "reusing identical bytes must not claim an inode Ferrum never published"
+        );
+        let after = fs::metadata(node.binary_path()).expect("reused binary metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino(), "identical bytes should be reused");
+        }
+        let _ = (before, after);
+
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "an unattested identical binary must be retained: {report:?}"
+        );
+        assert_eq!(
+            fs::read(node.binary_path()).expect("retained operator binary"),
+            bytes
+        );
+    }
 
     #[test]
     fn an_unproved_pre_existing_binary_is_never_made_removable_by_observation() {

@@ -40,6 +40,11 @@
 //! field is written `null`, and cleanup can never be talked into deleting a
 //! binary this installer merely hashed. Retaining an unreferenced binary is
 //! inert and never fails chain cleanup, so the safe direction is cheap.
+//! The manifest's `binaryOwned` bit applies the same rule to its current
+//! digest: publishing the staged inode sets it, as does reusing an inode a
+//! prior same-owner manifest already attested. Merely finding byte-identical
+//! bytes at the shared path leaves it false, so an operator-provided binary
+//! cannot become removable through content equality alone.
 //!
 //! Install applies the same shared-binary rule cleanup does: while any other
 //! `.conf` / `.conflist` / `.json` on the node still names `ferrum-cni`, the
@@ -560,12 +565,20 @@ fn install_under_lock(
     //    module docs); merely hashing whatever occupied the path proves
     //    nothing and authorizes nothing.
     let previous_sha256 = attested_previous_binary_digest(host_conf_dir, config, &installed)?;
+    // Reusing byte-identical bytes is not proof that Ferrum published the
+    // inode already occupying this shared path. Claim it only when this run
+    // will publish the staged inode, or prior same-owner evidence already
+    // attested the installed one. Otherwise cleanup may remove the chain but
+    // must retain the pre-existing binary.
+    let binary_owned =
+        matches!(publication, BinaryPublication::Publish) || previous_sha256.is_some();
     write_ownership_manifest(
         host_conf_dir,
         &config.ownership,
         &config.conf_file_name,
         &staged.sha256,
         previous_sha256.as_deref(),
+        binary_owned,
     )?;
 
     // 5. The binary is published before anything can reference it, by an
@@ -855,6 +868,7 @@ struct OwnershipManifest {
     ownership: CniOwnership,
     conf_file_name: String,
     binary_file_name: String,
+    binary_owned: bool,
     binary_sha256: String,
     previous_binary_sha256: Option<String>,
     identity: FileIdentity,
@@ -872,7 +886,9 @@ impl OwnershipManifest {
     /// replaced, so a crash between the manifest write and the binary swap
     /// still leaves whichever of the two is on disk provably ours.
     fn digest_matches(&self, digest: &str) -> bool {
-        self.binary_sha256 == digest || self.previous_binary_sha256.as_deref() == Some(digest)
+        self.binary_owned
+            && (self.binary_sha256 == digest
+                || self.previous_binary_sha256.as_deref() == Some(digest))
     }
 }
 
@@ -996,6 +1012,7 @@ fn classify_installed_binary(path: &Path) -> Result<InstalledBinary, CniInstallE
 }
 
 /// Whether this run publishes its staged binary or reuses what is installed.
+#[derive(Clone, Copy)]
 enum BinaryPublication {
     Publish,
     ReuseInstalled,
@@ -1164,6 +1181,7 @@ fn write_ownership_manifest(
     conf_file_name: &str,
     binary_sha256: &str,
     previous_binary_sha256: Option<&str>,
+    binary_owned: bool,
 ) -> Result<(), CniInstallError> {
     let path = conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME);
     let manifest = serde_json::json!({
@@ -1173,6 +1191,7 @@ fn write_ownership_manifest(
         "generation": ownership.generation,
         "confFileName": conf_file_name,
         "binaryFileName": FERRUM_PLUGIN_TYPE,
+        "binaryOwned": binary_owned,
         "binarySha256": binary_sha256,
         "previousBinarySha256": previous_binary_sha256,
     });
@@ -1224,17 +1243,18 @@ fn read_ownership_manifest(path: &Path) -> Result<ManifestState, CniInstallError
             "ownership manifest has an unrecognized schema or managedBy marker",
         ));
     }
-    let (Some(owner), Some(generation), Some(binary_sha256)) = (
+    let (Some(owner), Some(generation), Some(binary_owned), Some(binary_sha256)) = (
         value.get("owner").and_then(Value::as_str),
         value.get("generation").and_then(Value::as_str),
+        value.get("binaryOwned").and_then(Value::as_bool),
         value.get("binarySha256").and_then(Value::as_str),
     ) else {
         tracing::warn!(
             path = %path.display(),
-            "Ignoring CNI ownership manifest missing owner/generation/binarySha256"
+            "Ignoring CNI ownership manifest missing owner/generation/binaryOwned/binarySha256"
         );
         return Ok(ManifestState::Unusable(
-            "ownership manifest is missing owner/generation/binarySha256",
+            "ownership manifest is missing owner/generation/binaryOwned/binarySha256",
         ));
     };
     let (Some(conf_file_name), Some(binary_file_name)) = (
@@ -1256,6 +1276,7 @@ fn read_ownership_manifest(path: &Path) -> Result<ManifestState, CniInstallError
         },
         conf_file_name: conf_file_name.to_string(),
         binary_file_name: binary_file_name.to_string(),
+        binary_owned,
         binary_sha256: binary_sha256.to_string(),
         previous_binary_sha256: value
             .get("previousBinarySha256")

@@ -571,6 +571,10 @@ Removal is gated on evidence written at install time, never on a path guess:
   case records `null`: a pre-existing operator or third-party binary can never
   be made removable merely because the installer read it. Because an
   unreferenced binary is inert, retaining it never fails chain cleanup.
+- The manifest's `binaryOwned` bit applies the same proof to its current
+  digest. Publishing the staged inode sets it; reusing an inode sets it only
+  when prior same-owner evidence already attested that inode's digest.
+  Byte-identical operator-provided contents alone never transfer ownership.
 - Install applies the shared-binary rule in the other direction too: while any
   remaining `.conf`/`.conflist`/`.json` still names `ferrum-cni`, the shared
   executable is not replaced with different bytes. Byte-identical
