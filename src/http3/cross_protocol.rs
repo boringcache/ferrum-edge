@@ -4591,10 +4591,12 @@ where
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();
+            let diagnostic = transport_error.diagnostic().as_str();
             warn!(
                 proxy_id = %proxy.id,
                 target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
                 target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                diagnostic,
                 refusal = ?transport_error,
                 message,
                 "cross-protocol H3→gRPC: no dispatchable mesh transport for the selected target; \
@@ -5020,6 +5022,7 @@ where
                     Ok(transport) => transport,
                     Err(transport_error) => {
                         let message = transport_error.message();
+                        let diagnostic = transport_error.diagnostic().as_str();
                         warn!(
                             proxy_id = %proxy.id,
                             target_host = current_target
@@ -5027,6 +5030,7 @@ where
                                 .map(|t| t.host.as_str())
                                 .unwrap_or(""),
                             target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                            diagnostic,
                             refusal = ?transport_error,
                             message,
                             "cross-protocol H3→gRPC: retry rotated onto a target with no \
@@ -6145,10 +6149,12 @@ pub(crate) async fn dispatch_grpc_streaming(
         Ok(transport) => transport,
         Err(transport_error) => {
             let message = transport_error.message();
+            let diagnostic = transport_error.diagnostic().as_str();
             warn!(
                 proxy_id = %proxy.id,
                 target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
                 target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                diagnostic,
                 refusal = ?transport_error,
                 message,
                 "cross-protocol H3→gRPC streaming: no dispatchable mesh transport for the \

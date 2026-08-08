@@ -2892,13 +2892,28 @@ async fn grpc_transport_for_mesh_mtls_without_a_pinned_peer_fails_closed() {
         assert!(
             matches!(
                 error,
-                grpc_proxy::GrpcTransportError::UnmaterializableIdentity(_)
+                grpc_proxy::GrpcTransportError::UnmaterializableIdentity { .. }
             ),
             "expected an unmaterializable-identity refusal, got {error:?}"
+        );
+        assert_eq!(
+            error.diagnostic(),
+            grpc_proxy::GrpcTransportDiagnostic::MeshSpiffeId,
+            "a missing/corrupt pin must name mesh.spiffe_id, not a collapsed generic"
+        );
+        assert_eq!(
+            error.diagnostic().as_str(),
+            "mesh.spiffe_id",
+            "the redacted diagnostic label is the tag name only"
         );
         assert!(
             !error.message().contains(pin) || pin.is_empty(),
             "a refusal message must not echo the target's identity metadata"
+        );
+        let debug = format!("{error:?}");
+        assert!(
+            !debug.contains(pin) || pin.is_empty(),
+            "Debug must not echo the raw pin either"
         );
     }
 }
@@ -2914,7 +2929,7 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
     let sni = ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG;
     let secret_sni = "orders.internal.example.com";
 
-    for (label, tags) in [
+    for (label, tags, expected) in [
         (
             "corrupt pinned peer",
             vec![
@@ -2924,6 +2939,7 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
                     "not-a-spiffe-id",
                 ),
             ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshSpiffeId,
         ),
         (
             "empty dial host override",
@@ -2931,6 +2947,7 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
                 (hbone, "true"),
                 (ferrum_edge::proxy::hbone_pool::HBONE_DIAL_HOST_TAG, " "),
             ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshHboneDialHost,
         ),
         (
             "empty CONNECT authority host override",
@@ -2941,10 +2958,12 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
                     "  ",
                 ),
             ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshHboneAuthorityHost,
         ),
         (
             "cross-cluster missing the remote trust domain",
             vec![(hbone, "true"), (xc, "true"), (sni, secret_sni)],
+            grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain,
         ),
         (
             "cross-cluster missing the destination SNI override",
@@ -2956,6 +2975,7 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
                     "remote.local",
                 ),
             ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni,
         ),
     ] {
         let target = target_with_tags(&tags);
@@ -2966,13 +2986,27 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
         assert!(
             matches!(
                 error,
-                grpc_proxy::GrpcTransportError::UnmaterializableIdentity(_)
+                grpc_proxy::GrpcTransportError::UnmaterializableIdentity { .. }
             ),
             "{label}: expected an unmaterializable-identity refusal, got {error:?}"
         );
+        assert_eq!(
+            error.diagnostic(),
+            expected,
+            "{label}: diagnostic must name the failed mesh tag/contract"
+        );
         assert!(
-            !error.message().contains(secret_sni),
+            !error.message().contains(secret_sni)
+                && !error.message().contains("not-a-spiffe-id")
+                && !error.message().contains("remote.local"),
             "{label}: a client-visible refusal must not leak the target's mesh metadata"
+        );
+        let debug = format!("{error:?}");
+        assert!(
+            !debug.contains(secret_sni)
+                && !debug.contains("not-a-spiffe-id")
+                && !debug.contains("remote.local"),
+            "{label}: Debug must stay redacted of tag values"
         );
     }
 }
@@ -2986,23 +3020,43 @@ async fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadat
     let sni = ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG;
     let secret_sni = "orders.internal.example.com";
 
-    for (label, tags) in [
+    for (label, tags, expected) in [
         // Cross-cluster with NO transport tag at all: malformed.
-        ("cross-cluster untagged", vec![(xc, "true")]),
+        (
+            "cross-cluster untagged",
+            vec![(xc, "true")],
+            grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport,
+        ),
         // Cross-cluster Sidecar mesh-mTLS missing its remote trust domain.
         (
             "cross-cluster mtls missing trust domain",
             vec![(mtls, "true"), (xc, "true"), (sni, secret_sni)],
+            grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain,
+        ),
+        // Cross-cluster Sidecar mesh-mTLS missing its destination SNI.
+        (
+            "cross-cluster mtls missing SNI",
+            vec![
+                (mtls, "true"),
+                (xc, "true"),
+                (
+                    ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+                    "remote.local",
+                ),
+            ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni,
         ),
         // BOTH transport tags: the topologies are mutually exclusive, so this
         // is a corrupted target and picking either hop would be a guess.
         (
             "ambiguous same-cluster transport",
             vec![(mtls, "true"), (hbone, "true")],
+            grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports,
         ),
         (
             "ambiguous cross-cluster transport",
             vec![(mtls, "true"), (hbone, "true"), (xc, "true")],
+            grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports,
         ),
     ] {
         let target = target_with_tags(&tags);
@@ -3011,13 +3065,147 @@ async fn grpc_transport_for_unsupported_mesh_classes_fails_closed_with_a_metadat
             .err()
             .unwrap_or_else(|| panic!("{label} must fail closed, never direct-dial"));
         assert!(
-            matches!(error, grpc_proxy::GrpcTransportError::Unsupported(_)),
+            matches!(error, grpc_proxy::GrpcTransportError::Unsupported { .. }),
             "{label}: expected an unsupported-transport refusal, got {error:?}"
+        );
+        assert_eq!(
+            error.diagnostic(),
+            expected,
+            "{label}: diagnostic must name the failed mesh tag/contract"
         );
         assert!(
             !error.message().contains(secret_sni)
-                && !error.message().contains("orders.default.svc.cluster.local"),
+                && !error.message().contains("orders.default.svc.cluster.local")
+                && !error.message().contains("remote.local"),
             "{label}: a client-visible refusal must not leak the target's mesh metadata"
         );
+        let debug = format!("{error:?}");
+        assert!(
+            !debug.contains(secret_sni) && !debug.contains("remote.local"),
+            "{label}: Debug must stay redacted of tag values"
+        );
     }
+}
+
+#[tokio::test]
+async fn grpc_transport_diagnostic_labels_are_tag_names_never_values() {
+    // Closed set of redacted labels: every category is either a mesh tag name
+    // or a contract id. None may embed a sample secret from a refusal fixture.
+    let secret_spiffe = "spiffe://cluster.local/ns/payments/sa/ledger";
+    let secret_sni = "ledger.payments.svc.cluster.local";
+    let secret_td = "payments.remote.local";
+    let secret_host = "10.244.9.9";
+
+    for category in [
+        grpc_proxy::GrpcTransportDiagnostic::MeshSpiffeId,
+        grpc_proxy::GrpcTransportDiagnostic::MeshHboneDialHost,
+        grpc_proxy::GrpcTransportDiagnostic::MeshHboneAuthorityHost,
+        grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni,
+        grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain,
+        grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports,
+        grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport,
+    ] {
+        let label = category.as_str();
+        assert!(
+            !label.is_empty() && !label.contains(secret_spiffe) && !label.contains(secret_sni),
+            "diagnostic label must stay field-shaped: {label}"
+        );
+        assert!(
+            !label.contains(secret_td) && !label.contains(secret_host),
+            "diagnostic label must not embed sample secrets: {label}"
+        );
+    }
+
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshSpiffeId.as_str(),
+        "mesh.spiffe_id"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshHboneDialHost.as_str(),
+        "mesh.hbone_dial_host"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshHboneAuthorityHost.as_str(),
+        "mesh.hbone_authority_host"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni.as_str(),
+        "mesh.eastwest_sni"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain.as_str(),
+        "mesh.trust_domain"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports.as_str(),
+        "conflicting_mesh_transports"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport.as_str(),
+        "cross_cluster_missing_transport"
+    );
+}
+
+#[tokio::test]
+async fn grpc_transport_mesh_mtls_cross_cluster_dial_plan_failures_are_field_specific() {
+    // When classification admits a well-formed cross-cluster mesh.mtls target
+    // but dial-plan re-resolution later fails (tags mutated / empty), the
+    // diagnostic must still name the failed east-west field — not collapse to
+    // a generic unmaterializable bucket.
+    let pools = TransportTestPools::new();
+    let mtls = ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG;
+    let xc = ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG;
+    let sni = ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG;
+    let td = ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG;
+    let secret_sni = "orders.internal.example.com";
+    let secret_td = "remote.local";
+
+    // Classifier-level malformed path (Unsupported) already covered above; here
+    // the same missing fields go through dial-plan resolve for an HBONE-shaped
+    // same-cluster pin failure on mesh.mtls.
+    let empty_pin = target_with_tags(&[
+        (mtls, "true"),
+        (ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG, ""),
+    ]);
+    let err = pools
+        .resolve(Some(&empty_pin))
+        .err()
+        .expect("empty mesh.spiffe_id must fail closed");
+    assert_eq!(
+        err.diagnostic(),
+        grpc_proxy::GrpcTransportDiagnostic::MeshSpiffeId
+    );
+    assert!(!err.message().contains(secret_sni));
+
+    // Cross-cluster mtls missing SNI is Unsupported + MeshEastwestSni (classifier).
+    let missing_sni = target_with_tags(&[(mtls, "true"), (xc, "true"), (td, secret_td)]);
+    let err = pools
+        .resolve(Some(&missing_sni))
+        .err()
+        .expect("missing SNI must fail closed");
+    assert!(matches!(
+        err,
+        grpc_proxy::GrpcTransportError::Unsupported { .. }
+    ));
+    assert_eq!(
+        err.diagnostic(),
+        grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni
+    );
+    assert!(!err.message().contains(secret_td));
+
+    // Cross-cluster mtls missing trust domain is Unsupported + MeshTrustDomain.
+    let missing_td = target_with_tags(&[(mtls, "true"), (xc, "true"), (sni, secret_sni)]);
+    let err = pools
+        .resolve(Some(&missing_td))
+        .err()
+        .expect("missing trust domain must fail closed");
+    assert!(matches!(
+        err,
+        grpc_proxy::GrpcTransportError::Unsupported { .. }
+    ));
+    assert_eq!(
+        err.diagnostic(),
+        grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain
+    );
+    assert!(!err.message().contains(secret_sni));
 }

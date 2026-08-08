@@ -2462,6 +2462,13 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
         2,
         "the initial target and every rotated retry target must each be resolved"
     );
+    assert_eq!(
+        buffered
+            .matches("transport_error.diagnostic().as_str()")
+            .count(),
+        2,
+        "initial and retry-rotated transport refusals must both log the redacted diagnostic"
+    );
 
     let streaming = source
         .split("pub(crate) async fn dispatch_grpc_streaming(")
@@ -2490,6 +2497,12 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
                 && body.contains("grpc_proxy::grpc_status::UNAVAILABLE"),
             "the {path} H3→gRPC path must still fail closed with gRPC UNAVAILABLE when no \
              dispatchable transport exists"
+        );
+        assert!(
+            body.contains("transport_error.diagnostic().as_str()")
+                && body.contains("diagnostic,"),
+            "the {path} H3→gRPC refusal warning must expose the redacted field/contract \
+             diagnostic category (issue #3284)"
         );
     }
 }

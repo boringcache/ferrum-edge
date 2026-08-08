@@ -2790,6 +2790,57 @@ const UNRESOLVABLE_HBONE_IDENTITY: &str =
 const AMBIGUOUS_MESH_TRANSPORT: &str =
     "gRPC dispatch refused: the selected target declares two conflicting mesh transports";
 
+/// Client-visible refusal for a cross-cluster Sidecar mesh-mTLS target whose
+/// east-west SNI / trust-domain metadata is incomplete. Fixed wording — which
+/// field failed is carried only by [`GrpcTransportDiagnostic`].
+const CROSS_CLUSTER_MALFORMED_METADATA: &str =
+    "gRPC over cross-cluster east-west routing requires a destination SNI override \
+     and a remote trust domain";
+
+/// Client-visible refusal for a cross-cluster target with no mesh transport tag.
+const CROSS_CLUSTER_MISSING_TRANSPORT: &str =
+    "gRPC over cross-cluster east-west routing requires a mesh transport tag";
+
+/// Redacted, field-shaped diagnostic for a gRPC transport materialization
+/// refusal (issue #3284). Identifies WHICH mesh tag / contract failed without
+/// echoing any tag value, SPIFFE ID, SNI name, trust domain, dial address,
+/// credential, or other target secret. Safe to log on every H3→gRPC refusal
+/// path; the client-visible [`GrpcTransportError::message`] stays a fixed
+/// metadata-free constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcTransportDiagnostic {
+    /// `mesh.spiffe_id` (or HBONE peer-SPIFFE override) missing or unparseable.
+    MeshSpiffeId,
+    /// `mesh.hbone_dial_host` present but empty / invalid.
+    MeshHboneDialHost,
+    /// `mesh.hbone_authority_host` missing (cross-cluster) or empty / invalid.
+    MeshHboneAuthorityHost,
+    /// `mesh.eastwest_sni` missing or empty.
+    MeshEastwestSni,
+    /// `mesh.trust_domain` missing, empty, or unparseable.
+    MeshTrustDomain,
+    /// Target declares both `mesh.mtls` and `mesh.hbone`.
+    ConflictingMeshTransports,
+    /// `mesh.cross_cluster` without any mesh transport tag.
+    CrossClusterMissingTransport,
+}
+
+impl GrpcTransportDiagnostic {
+    /// Stable, redacted label for structured logs and metrics. Tag *names* only —
+    /// never tag values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MeshSpiffeId => "mesh.spiffe_id",
+            Self::MeshHboneDialHost => "mesh.hbone_dial_host",
+            Self::MeshHboneAuthorityHost => "mesh.hbone_authority_host",
+            Self::MeshEastwestSni => "mesh.eastwest_sni",
+            Self::MeshTrustDomain => "mesh.trust_domain",
+            Self::ConflictingMeshTransports => "conflicting_mesh_transports",
+            Self::CrossClusterMissingTransport => "cross_cluster_missing_transport",
+        }
+    }
+}
+
 /// Why a gRPC dispatch could not materialize a transport for its selected
 /// target. Every variant is FAIL CLOSED — the caller answers with a gRPC
 /// UNAVAILABLE and never falls back to an unauthenticated direct dial.
@@ -2798,15 +2849,21 @@ pub enum GrpcTransportError {
     /// The target is not dispatchable at all: cross-cluster with no transport
     /// tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust
     /// domain, or a corrupted target declaring BOTH mesh transports. Carries
-    /// the client-visible reason.
-    Unsupported(&'static str),
+    /// the client-visible reason plus a redacted field/contract diagnostic.
+    Unsupported {
+        message: &'static str,
+        diagnostic: GrpcTransportDiagnostic,
+    },
     /// The transport class IS supported but the target's identity / dial
     /// metadata is unmaterializable: a missing / corrupt `mesh.spiffe_id` pin,
     /// a corrupt HBONE dial-host / authority-host tag, or a cross-cluster
     /// target whose SNI / trust-domain tags did not survive re-resolution.
-    /// Field-specific detail is logged by the caller from [`Self::message`];
-    /// nothing identity-bearing reaches the client.
-    UnmaterializableIdentity(&'static str),
+    /// Field-specific detail is the redacted [`GrpcTransportDiagnostic`];
+    /// nothing identity-bearing reaches the client via [`Self::message`].
+    UnmaterializableIdentity {
+        message: &'static str,
+        diagnostic: GrpcTransportDiagnostic,
+    },
 }
 
 impl GrpcTransportError {
@@ -2815,8 +2872,82 @@ impl GrpcTransportError {
     /// mesh identity metadata of a target the caller could not reach.
     pub fn message(self) -> &'static str {
         match self {
-            Self::Unsupported(message) | Self::UnmaterializableIdentity(message) => message,
+            Self::Unsupported { message, .. } | Self::UnmaterializableIdentity { message, .. } => {
+                message
+            }
         }
+    }
+
+    /// Redacted field/contract category for operator diagnostics. Safe to log;
+    /// never contains raw tag values or identity secrets.
+    pub fn diagnostic(self) -> GrpcTransportDiagnostic {
+        match self {
+            Self::Unsupported { diagnostic, .. }
+            | Self::UnmaterializableIdentity { diagnostic, .. } => diagnostic,
+        }
+    }
+}
+
+/// Map a Sidecar mesh-mTLS dial-plan failure onto a fail-closed transport error
+/// whose diagnostic names the failed tag and whose client message stays fixed.
+fn grpc_transport_error_from_mesh_mtls_dial(
+    err: crate::proxy::mesh_mtls_pool::MeshMtlsDialError,
+) -> GrpcTransportError {
+    use crate::proxy::mesh_mtls_pool::MeshMtlsDialError;
+    let diagnostic = match &err {
+        MeshMtlsDialError::PinnedPeer(_) => GrpcTransportDiagnostic::MeshSpiffeId,
+        MeshMtlsDialError::MissingCrossClusterSni => GrpcTransportDiagnostic::MeshEastwestSni,
+        MeshMtlsDialError::MissingCrossClusterTrustDomain => {
+            GrpcTransportDiagnostic::MeshTrustDomain
+        }
+    };
+    GrpcTransportError::UnmaterializableIdentity {
+        message: UNRESOLVABLE_MESH_MTLS_IDENTITY,
+        diagnostic,
+    }
+}
+
+/// Map an Ambient HBONE dial-plan failure onto a fail-closed transport error
+/// whose diagnostic names the failed tag and whose client message stays fixed.
+/// Dial-plan resolve only surfaces identity / dial-tag shapes; any other
+/// [`HbonePoolError`] variant is treated as an unmaterializable dial contract
+/// without inventing a field name that did not fail.
+fn grpc_transport_error_from_hbone_dial(
+    err: crate::proxy::hbone_pool::HbonePoolError,
+) -> GrpcTransportError {
+    use crate::proxy::hbone_pool::HbonePoolError;
+    let diagnostic = match &err {
+        HbonePoolError::InvalidDialHostTag { .. } => GrpcTransportDiagnostic::MeshHboneDialHost,
+        HbonePoolError::InvalidAuthorityHostTag { .. }
+        | HbonePoolError::MissingCrossClusterAuthorityHost => {
+            GrpcTransportDiagnostic::MeshHboneAuthorityHost
+        }
+        HbonePoolError::InvalidPeerSpiffeTag { .. } => GrpcTransportDiagnostic::MeshSpiffeId,
+        HbonePoolError::MissingCrossClusterSni => GrpcTransportDiagnostic::MeshEastwestSni,
+        HbonePoolError::MissingCrossClusterTrustDomain => GrpcTransportDiagnostic::MeshTrustDomain,
+        // `HboneDialPlan::resolve` only surfaces the dial-plan / identity arms
+        // above. Keep fail-closed if a non-dial-plan shape ever appears, and pin
+        // the diagnostic to the first resolve check (`mesh.hbone_dial_host`)
+        // rather than inventing a secret-bearing label.
+        _ => GrpcTransportDiagnostic::MeshHboneDialHost,
+    };
+    GrpcTransportError::UnmaterializableIdentity {
+        message: UNRESOLVABLE_HBONE_IDENTITY,
+        diagnostic,
+    }
+}
+
+/// Field-specific diagnostic for a classifier-level
+/// [`GrpcMeshDispatch::RefuseCrossClusterMalformed`]: re-check SNI then trust
+/// domain (same order as the classifier) so the H3 warning names the missing
+/// contract without echoing its value.
+fn cross_cluster_malformed_diagnostic(
+    target: &crate::config::types::UpstreamTarget,
+) -> GrpcTransportDiagnostic {
+    if crate::proxy::mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target).is_none() {
+        GrpcTransportDiagnostic::MeshEastwestSni
+    } else {
+        GrpcTransportDiagnostic::MeshTrustDomain
     }
 }
 
@@ -2844,10 +2975,8 @@ impl<'a> GrpcDispatchTransport<'a> {
                 // fails closed rather than dialing with a missing pin/scope.
                 let plan = match crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
                     Ok(plan) => plan,
-                    Err(_) => {
-                        return Err(GrpcTransportError::UnmaterializableIdentity(
-                            UNRESOLVABLE_MESH_MTLS_IDENTITY,
-                        ));
+                    Err(err) => {
+                        return Err(grpc_transport_error_from_mesh_mtls_dial(err));
                     }
                 };
                 Ok(Self::MeshMtls(MeshMtlsGrpcTransport {
@@ -2862,7 +2991,10 @@ impl<'a> GrpcDispatchTransport<'a> {
                 // dialing HBONE: the topologies are mutually exclusive, so this
                 // is a corrupted target and either choice would be a guess.
                 if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
-                    return Err(GrpcTransportError::Unsupported(AMBIGUOUS_MESH_TRANSPORT));
+                    return Err(GrpcTransportError::Unsupported {
+                        message: AMBIGUOUS_MESH_TRANSPORT,
+                        diagnostic: GrpcTransportDiagnostic::ConflictingMeshTransports,
+                    });
                 }
                 // Same re-resolution contract as the mesh-mTLS arm: this is what
                 // binds the dial host, CONNECT authority host, pinned peer, and
@@ -2870,10 +3002,8 @@ impl<'a> GrpcDispatchTransport<'a> {
                 // incomplete tag set fails closed here instead of dialing.
                 let plan = match crate::proxy::hbone_pool::HboneDialPlan::resolve(target) {
                     Ok(plan) => plan,
-                    Err(_) => {
-                        return Err(GrpcTransportError::UnmaterializableIdentity(
-                            UNRESOLVABLE_HBONE_IDENTITY,
-                        ));
+                    Err(err) => {
+                        return Err(grpc_transport_error_from_hbone_dial(err));
                     }
                 };
                 Ok(Self::Hbone(HboneGrpcTransport {
@@ -2882,14 +3012,15 @@ impl<'a> GrpcDispatchTransport<'a> {
                     plan,
                 }))
             }
-            GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported(
-                "gRPC over cross-cluster east-west routing requires a destination SNI override \
-                 and a remote trust domain",
-            )),
+            GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported {
+                message: CROSS_CLUSTER_MALFORMED_METADATA,
+                diagnostic: cross_cluster_malformed_diagnostic(target),
+            }),
             GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
-                Err(GrpcTransportError::Unsupported(
-                    "gRPC over cross-cluster east-west routing requires a mesh transport tag",
-                ))
+                Err(GrpcTransportError::Unsupported {
+                    message: CROSS_CLUSTER_MISSING_TRANSPORT,
+                    diagnostic: GrpcTransportDiagnostic::CrossClusterMissingTransport,
+                })
             }
         }
     }
