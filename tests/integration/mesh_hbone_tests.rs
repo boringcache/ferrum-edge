@@ -1142,9 +1142,9 @@ fn issue_spiffe_svid(
 
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
-    params.subject_alt_names.push(
-        ferrum_edge::identity::spiffe::spiffe_id_to_san(spiffe_id).expect("spiffe san"),
-    );
+    params
+        .subject_alt_names
+        .push(ferrum_edge::identity::spiffe::spiffe_id_to_san(spiffe_id).expect("spiffe san"));
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -1311,8 +1311,7 @@ fn source_sidecar_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
         dns_response_cache_max_entries: 4096,
         cluster_domain: "cluster.local".to_string(),
         capture_mode: ferrum_edge::capture::CaptureMode::Explicit,
-        outbound_traffic_policy:
-            ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+        outbound_traffic_policy: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
         outbound_registry_reject_status: 502,
         sidecar_enforced: false,
         sidecar_enforced_dry_run: false,

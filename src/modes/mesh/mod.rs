@@ -5662,14 +5662,21 @@ pub(crate) fn mesh_external_udp_relay_proxy(
 /// `IP:service port`, which is precisely the endpoint-derived admission the
 /// gateway allowlist grants — so the gateway dials that one endpoint and never
 /// resolves a name.
+///
+/// **Shared opt-in.** Source-side materialization is gated by the same
+/// `FERRUM_MESH_EGRESS_STREAM_ENABLED` / [`MeshRuntimeConfig::egress_stream_enabled`]
+/// flag the gateway allowlist uses. With the flag off the route set is cleared
+/// and nothing is published, so a flag-off gateway cannot be paired with
+/// still-materialized source routes that would black-hole captured datagrams.
 fn materialize_mesh_external_udp_egress_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
     // Rebuilt from scratch on EVERY apply and assigned unconditionally, so an
-    // update/delete/topology-flip that withdraws a ServiceEntry withdraws the
-    // captured-datagram route with it (mirrors `egress_udp_destinations`).
+    // update/delete/topology-flip/flag-off that withdraws a ServiceEntry
+    // withdraws the captured-datagram route with it (mirrors
+    // `egress_udp_destinations`).
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.external_udp_egress_routes.clear();
     }
@@ -5677,6 +5684,13 @@ fn materialize_mesh_external_udp_egress_upstreams(
         runtime.topology,
         MeshTopology::Sidecar | MeshTopology::Ambient
     ) {
+        return;
+    }
+    // Match the gateway-side allowlist contract: the documented opt-in is
+    // all-or-nothing across both halves. Flag-off clears above and publishes
+    // nothing here — never a half-armed source route into a gateway that
+    // admits no external UDP.
+    if !runtime.egress_stream_enabled {
         return;
     }
 
@@ -16206,13 +16220,16 @@ fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
 /// - one set without the other ⇒ hard startup error naming the missing variable
 ///   — an address without a pinned identity would dial an unverified peer, and
 ///   an identity without an address has nothing to dial;
-/// - a malformed `host:port`, port `0`, empty host, or invalid SPIFFE id ⇒ hard
-///   startup error naming the offending variable.
+/// - a malformed `host:port`, port `0`, empty/invalid/overlong host, wildcard,
+///   URL/userinfo/path/query/fragment material, whitespace/control characters,
+///   or invalid SPIFFE id ⇒ hard startup error naming the offending variable.
 ///
-/// The host is NOT required to be an IP literal: an EgressGateway is normally
-/// reached by its in-cluster Service FQDN. It is resolved at dial time by the
-/// mesh-mTLS pool, and the handshake still pins [`SpiffeId`] as the expected
-/// peer, so name resolution cannot substitute a different gateway identity.
+/// Host shape is a bounded DNS hostname, an IPv4 literal, or a bracketed IPv6
+/// literal — an EgressGateway is normally reached by its in-cluster Service
+/// FQDN. The FQDN is resolved at dial time by the mesh-mTLS pool, and the
+/// handshake still pins [`SpiffeId`] as the expected peer, so name resolution
+/// cannot substitute a different gateway identity. Diagnostics name the field
+/// and the violation class; they never echo the raw configured value.
 fn parse_egress_gateway_endpoint(
     addr_raw: Option<&str>,
     spiffe_raw: Option<&str>,
@@ -16222,65 +16239,210 @@ fn parse_egress_gateway_endpoint(
     let (addr_raw, spiffe_raw) = match (addr_raw, spiffe_raw) {
         (None, None) => return Ok(None),
         (Some(_), None) => {
-            return Err(
-                "FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID is required when \
+            return Err("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID is required when \
                  FERRUM_MESH_EGRESS_GATEWAY_ADDR is set: the egress gateway's SVID identity is \
                  pinned as the expected mTLS peer, and dialing it unpinned would let any \
                  reachable peer terminate external UDP egress"
-                    .to_string(),
-            );
+                .to_string());
         }
         (None, Some(_)) => {
-            return Err(
-                "FERRUM_MESH_EGRESS_GATEWAY_ADDR is required when \
+            return Err("FERRUM_MESH_EGRESS_GATEWAY_ADDR is required when \
                  FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID is set: there is no default egress gateway \
                  address and Ferrum never guesses one"
-                    .to_string(),
-            );
+                .to_string());
         }
         (Some(addr), Some(spiffe)) => (addr, spiffe),
     };
 
-    // `host:port` where the host may be a name, an IPv4 literal, or a bracketed
-    // IPv6 literal. `rsplit_once(':')` is correct for the first two; the
-    // bracketed form is split on the closing bracket first.
+    if addr_raw
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c.is_control())
+        || addr_raw.contains(['/', '?', '#', '@'])
+        || addr_raw.contains("://")
+    {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '<host>:<port>' or '[<ipv6>]:<port>' without \
+             whitespace, control characters, URL scheme, userinfo, path, query, or fragment \
+             material"
+                .to_string(),
+        );
+    }
+
+    // `host:port` where the host may be a DNS name, an IPv4 literal, or a
+    // bracketed IPv6 literal. `rsplit_once(':')` is correct for the first two;
+    // the bracketed form is split on the closing bracket first.
     let (host, port_raw) = if let Some(rest) = addr_raw.strip_prefix('[') {
         let Some((host, tail)) = rest.split_once(']') else {
-            return Err(format!(
-                "FERRUM_MESH_EGRESS_GATEWAY_ADDR has an unterminated IPv6 literal (got \
-                 '{addr_raw}'); expected '[<ipv6>]:<port>'"
-            ));
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR has an unterminated IPv6 literal; expected \
+                 '[<ipv6>]:<port>'"
+                    .to_string(),
+            );
         };
         let Some(port_raw) = tail.strip_prefix(':') else {
-            return Err(format!(
-                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '[<ipv6>]:<port>' (got '{addr_raw}')"
-            ));
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 form must be '[<ipv6>]:<port>'"
+                    .to_string(),
+            );
         };
-        (host, port_raw)
+        if host.is_empty() {
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty IPv6 literal inside brackets"
+                    .to_string(),
+            );
+        }
+        if host
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_control())
+            || host.contains(['/', '?', '#', '@', '*'])
+        {
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 literal must not contain whitespace, \
+                 control characters, wildcards, or URL material"
+                    .to_string(),
+            );
+        }
+        let Ok(v6) = host.parse::<std::net::Ipv6Addr>() else {
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 literal is not a valid IPv6 address"
+                    .to_string(),
+            );
+        };
+        (v6.to_string(), port_raw)
     } else {
         let Some((host, port_raw)) = addr_raw.rsplit_once(':') else {
-            return Err(format!(
-                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '<host>:<port>' (got '{addr_raw}'); the \
-                 port names the gateway's mesh mTLS listener (conventionally 15090)"
-            ));
+            return Err(
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR must be '<host>:<port>'; the port names the \
+                 gateway's mesh mTLS listener (conventionally 15090)"
+                    .to_string(),
+            );
         };
-        (host, port_raw)
+        (validate_egress_gateway_host(host)?, port_raw)
     };
-    let host = host.trim();
-    if host.is_empty() {
-        return Err(format!(
-            "FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty host (got '{addr_raw}')"
-        ));
-    }
-    let port = parse_port("FERRUM_MESH_EGRESS_GATEWAY_ADDR", port_raw.trim())?;
-    let spiffe_id = spiffe_raw.parse::<crate::identity::SpiffeId>().map_err(|e| {
-        format!("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID must be a valid SPIFFE id: {e}")
-    })?;
+
+    let port = parse_egress_gateway_port(port_raw)?;
+    let spiffe_id = spiffe_raw
+        .parse::<crate::identity::SpiffeId>()
+        .map_err(|e| {
+            format!("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID must be a valid SPIFFE id: {e}")
+        })?;
     Ok(Some(MeshEgressGatewayEndpoint {
-        host: host.to_ascii_lowercase(),
+        host,
         port,
         spiffe_id,
     }))
+}
+
+/// Normalize and admit the host portion of `FERRUM_MESH_EGRESS_GATEWAY_ADDR`.
+///
+/// Accepts a bounded DNS hostname or an IPv4 literal. Bracketed IPv6 is handled
+/// by the caller before this runs (so a bare `:` here is always a reject). Never
+/// echoes the operator-supplied value.
+fn validate_egress_gateway_host(host: &str) -> Result<String, String> {
+    const MAX_HOST_LEN: usize = crate::config::types::MAX_HOST_LENGTH;
+
+    if host.is_empty() {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty host".to_string(),
+        );
+    }
+    if host.len() > MAX_HOST_LEN {
+        return Err(format!(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR host must not exceed {MAX_HOST_LEN} characters"
+        ));
+    }
+    if host
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c.is_control())
+        || host.contains(['/', '?', '#', '@', '*'])
+        || host.contains("://")
+    {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR host must be a DNS hostname or IPv4 literal without \
+             wildcards, whitespace, control characters, URL scheme, userinfo, path, query, or \
+             fragment material"
+                .to_string(),
+        );
+    }
+
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return Ok(v4.to_string());
+    }
+    // Unbracketed IPv6 (or any other colon-bearing host) is refused: the only
+    // supported IPv6 shape is `[<ipv6>]:<port>`, already handled by the caller.
+    if host.contains(':') {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 literals must be written as '[<ipv6>]:<port>'"
+                .to_string(),
+        );
+    }
+
+    let lower = host.to_ascii_lowercase();
+    if !is_valid_egress_gateway_dns_hostname(&lower) {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR host must be a valid DNS hostname or IPv4 literal"
+                .to_string(),
+        );
+    }
+    Ok(lower)
+}
+
+/// DNS hostname label rules for the egress-gateway dial host (no wildcards).
+fn is_valid_egress_gateway_dns_hostname(hostname: &str) -> bool {
+    const MAX_LABEL_LEN: usize = 63;
+
+    if hostname.is_empty() || hostname.len() > crate::config::types::MAX_HOST_LENGTH {
+        return false;
+    }
+
+    let mut label_len = 0usize;
+    let mut previous = b'.';
+    for &byte in hostname.as_bytes() {
+        if byte == b'.' {
+            if label_len == 0 || label_len > MAX_LABEL_LEN || previous == b'-' {
+                return false;
+            }
+            label_len = 0;
+            previous = byte;
+            continue;
+        }
+        if !byte.is_ascii_alphanumeric() && byte != b'-' {
+            return false;
+        }
+        if label_len == 0 && byte == b'-' {
+            return false;
+        }
+        label_len += 1;
+        if label_len > MAX_LABEL_LEN {
+            return false;
+        }
+        previous = byte;
+    }
+    label_len > 0 && previous != b'-'
+}
+
+/// Parse the port portion of `FERRUM_MESH_EGRESS_GATEWAY_ADDR` without echoing
+/// the raw text (which may be hostile / overlong).
+fn parse_egress_gateway_port(port_raw: &str) -> Result<u16, String> {
+    if port_raw.is_empty()
+        || !port_raw.bytes().all(|b| b.is_ascii_digit())
+        || port_raw.len() > 5
+    {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR port must be a decimal TCP port in 1..=65535"
+                .to_string(),
+        );
+    }
+    let port: u16 = port_raw.parse().map_err(|_| {
+        "FERRUM_MESH_EGRESS_GATEWAY_ADDR port must be a decimal TCP port in 1..=65535".to_string()
+    })?;
+    if port == 0 {
+        return Err(
+            "FERRUM_MESH_EGRESS_GATEWAY_ADDR port must be a decimal TCP port in 1..=65535"
+                .to_string(),
+        );
+    }
+    Ok(port)
 }
 
 /// The NodeWaypoint **transparent inbound capture** listener address, resolved
@@ -29939,6 +30101,100 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn parse_egress_gateway_endpoint_accepts_hostname_ipv4_and_bracketed_ipv6() {
+        let endpoint = parse_egress_gateway_endpoint(
+            Some("Ferrum-Egress.Istio-System.svc.cluster.local:15090"),
+            Some("spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"),
+        )
+        .expect("hostname form")
+        .expect("configured");
+        assert_eq!(
+            endpoint.host,
+            "ferrum-egress.istio-system.svc.cluster.local"
+        );
+        assert_eq!(endpoint.port, 15090);
+
+        let endpoint = parse_egress_gateway_endpoint(
+            Some("203.0.113.10:15090"),
+            Some("spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"),
+        )
+        .expect("ipv4 form")
+        .expect("configured");
+        assert_eq!(endpoint.host, "203.0.113.10");
+        assert_eq!(endpoint.port, 15090);
+
+        let endpoint = parse_egress_gateway_endpoint(
+            Some("[2001:DB8::10]:15090"),
+            Some("spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"),
+        )
+        .expect("ipv6 form")
+        .expect("configured");
+        assert_eq!(endpoint.host, "2001:db8::10");
+        assert_eq!(endpoint.port, 15090);
+
+        assert!(
+            parse_egress_gateway_endpoint(None, None)
+                .expect("both unset")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_egress_gateway_endpoint_rejects_hostile_and_malformed_boundaries() {
+        let spiffe = "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress";
+        let overlong_host = format!("{}.example.com:15090", "a".repeat(250));
+        let cases = [
+            ("*.example.com:15090", "wildcard"),
+            ("http://egress.example.com:15090", "scheme"),
+            ("user:pass@egress.example.com:15090", "userinfo"),
+            ("egress.example.com/path:15090", "path-shaped host"),
+            ("egress.example.com:15090/path", "path after port"),
+            ("egress.example.com:15090?x=1", "query"),
+            ("egress.example.com:15090#frag", "fragment"),
+            ("egress.example.com:0", "port zero"),
+            ("egress.example.com:", "empty port"),
+            (":15090", "empty host"),
+            ("egress example.com:15090", "whitespace"),
+            ("egress.example.com:\t15090", "control in port"),
+            ("2001:db8::10:15090", "unbracketed ipv6"),
+            ("[not-an-ipv6]:15090", "invalid ipv6 literal"),
+            ("[-]:15090", "invalid ipv6 literal short"),
+            ("egress..example.com:15090", "empty dns label"),
+            ("-egress.example.com:15090", "leading hyphen label"),
+            ("egress.example.com-:15090", "trailing hyphen label"),
+            (overlong_host.as_str(), "overlong host"),
+        ];
+        for (addr, label) in cases {
+            let err = parse_egress_gateway_endpoint(Some(addr), Some(spiffe))
+                .expect_err(label);
+            assert!(
+                err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"),
+                "{label}: diagnostic must name the field, got {err}"
+            );
+            assert!(
+                !err.contains(addr),
+                "{label}: diagnostic must not echo hostile raw value; got {err}"
+            );
+            // Oversized / control-bearing inputs must not leak into the message.
+            assert!(
+                !err.contains('\0') && !err.contains('\t') && !err.contains('\n'),
+                "{label}: diagnostic must not carry control characters"
+            );
+        }
+
+        let err = parse_egress_gateway_endpoint(
+            Some("egress.example.com:15090"),
+            None,
+        )
+        .expect_err("spiffe required");
+        assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"));
+        assert!(!err.contains("egress.example.com"));
+
+        let err = parse_egress_gateway_endpoint(None, Some(spiffe)).expect_err("addr required");
+        assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"));
     }
 
     #[test]

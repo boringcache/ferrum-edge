@@ -2968,10 +2968,14 @@ pub struct MeshConfig {
     /// Runtime-only allowlist of external UDP destinations this **EgressGateway**
     /// may relay datagram-over-mesh traffic to (issue #3263). Materialized by
     /// `materialize_egress_gateway_proxies` from `MESH_EXTERNAL` `ServiceEntry`
-    /// ports whose protocol is `UDP`, and consumed on the request path by
-    /// `crate::proxy::mesh_egress_udp_destination_dial_endpoint` /
-    /// `crate::proxy::mesh_egress_udp_destination_allowed` to admit a
-    /// `udp`-marked mesh CONNECT whose `:authority` names an external host.
+    /// ports whose protocol is `UDP`. Admission at CONNECT-authority time uses
+    /// `crate::proxy::mesh_egress_udp_destination_dial_endpoint` (route-miss
+    /// synthesis); `handle_hbone_udp_request` then re-checks the **effective**
+    /// post-route-override destination via
+    /// `crate::proxy::mesh_egress_udp_destination_allowed` before opening any
+    /// socket — the synthesized relay proxy inherits the global plugin chain, so
+    /// a route-override plugin could otherwise move the dial target outside the
+    /// operator-declared set after the build-time lookup ran.
     ///
     /// **Fail closed by construction.** The vector is assigned UNCONDITIONALLY on
     /// every mesh apply — empty for every non-`EgressGateway` topology, when
@@ -2996,7 +3000,9 @@ pub struct MeshConfig {
     /// **Fail closed by construction**, exactly like
     /// [`Self::egress_udp_destinations`]: assigned UNCONDITIONALLY on every mesh
     /// apply and empty whenever the topology has no source-side UDP producer,
-    /// the EgressGateway endpoint/identity is unset, or the entry declares no
+    /// `FERRUM_MESH_EGRESS_STREAM_ENABLED` / stream-family egress is disabled
+    /// (the same all-or-nothing opt-in the gateway allowlist uses), the
+    /// EgressGateway endpoint/identity is unset, or the entry declares no
     /// admissible `STATIC` endpoint. A withdrawn ServiceEntry therefore
     /// withdraws the route, and an empty list routes nothing.
     ///

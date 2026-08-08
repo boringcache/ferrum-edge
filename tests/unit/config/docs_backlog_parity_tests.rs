@@ -158,7 +158,9 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         ISSUE_2110_REGISTER.contains("intentional mixed strategy"),
         "k8s status ownership must document the intentional RMW+SSA mixed strategy"
     );
-    for issue in ["#3228", "#3299", "#3302", "#3304", "#3331", "#3332", "#3621"] {
+    for issue in [
+        "#3228", "#3299", "#3302", "#3304", "#3331", "#3332", "#3621",
+    ] {
         assert!(
             ISSUE_2110_REGISTER.contains(issue),
             "register must cite live tracker {issue}"

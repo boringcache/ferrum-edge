@@ -605,7 +605,12 @@ fn se_udp_egress_destinations_are_withdrawn_on_reload() {
 
     // Delete: no ServiceEntry at all leaves an EMPTY allowlist, which denies.
     let deleted = translate_k8s_objects(
-        &[external_se("kafka", vec!["kafka.external.com"], 9092, "TCP")],
+        &[external_se(
+            "kafka",
+            vec!["kafka.external.com"],
+            9092,
+            "TCP",
+        )],
         options(),
     )
     .expect("translation succeeds");
@@ -860,7 +865,10 @@ fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
         target.port, 514,
         "target.port is the CONNECT authority port (the ServiceEntry service port)"
     );
-    assert_eq!(target.tags.get("mesh.mtls").map(String::as_str), Some("true"));
+    assert_eq!(
+        target.tags.get("mesh.mtls").map(String::as_str),
+        Some("true")
+    );
     assert_eq!(
         target.tags.get("mesh.mtls_port").map(String::as_str),
         Some("15090"),
@@ -872,7 +880,10 @@ fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
         "the gateway identity must be pinned for the outbound handshake"
     );
     assert_eq!(
-        target.tags.get("mesh.mtls_authority_host").map(String::as_str),
+        target
+            .tags
+            .get("mesh.mtls_authority_host")
+            .map(String::as_str),
         Some("203.0.113.7"),
         "the CONNECT authority names the EXTERNAL endpoint the gateway admits"
     );
@@ -923,6 +934,65 @@ fn se_udp_source_side_without_configured_gateway_materializes_nothing() {
             .iter()
             .any(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-")),
         "no gateway upstream may materialize without a configured gateway"
+    );
+}
+
+/// Fail closed by the shared opt-in: with `FERRUM_MESH_EGRESS_STREAM_ENABLED=false`
+/// the Sidecar/Ambient source publishes no external UDP routes — matching the
+/// gateway allowlist contract so the two halves cannot disagree.
+#[test]
+fn se_udp_source_side_routes_require_stream_egress_opt_in() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP routes require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
+        status = Status::Supported,
+        notes = "#3263: source and gateway share the stream-egress opt-in; flag-off clears source routes and admits nothing on the gateway, never a black-hole half-pair.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let mut runtime = sidecar_source_runtime_with_gateway();
+
+    // Flag on: STATIC source routes materialize.
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config.clone(), &runtime).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .len(),
+        1,
+        "opt-in on must publish the STATIC source-side route"
+    );
+
+    // Flag off on a subsequent apply must withdraw the prior route set.
+    runtime.egress_stream_enabled = false;
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty(),
+        "flag-off must withdraw source-side external UDP routes"
+    );
+    assert!(
+        !prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-")),
+        "flag-off must not leave a source-side external UDP upstream behind"
     );
 }
 
@@ -1015,7 +1085,12 @@ fn se_udp_source_side_routes_are_withdrawn_on_reload() {
 
     // Delete: nothing external left ⇒ no routes at all.
     let deleted = translate_k8s_objects(
-        &[external_se("kafka", vec!["kafka.external.com"], 9092, "TCP")],
+        &[external_se(
+            "kafka",
+            vec!["kafka.external.com"],
+            9092,
+            "TCP",
+        )],
         options(),
     )
     .expect("translation succeeds");

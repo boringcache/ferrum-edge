@@ -2345,11 +2345,15 @@ fn mesh_egress_udp_destination_dial_endpoint(
 /// EITHER an admitted authority (ServiceEntry host / endpoint IP + service port)
 /// or one of that destination's precomputed dial endpoints.
 ///
-/// The dial-endpoint arm exists because `handle_hbone_udp_request` re-runs this
-/// guard on the EFFECTIVE destination AFTER route overrides, by which point the
-/// synthesized relay proxy already carries the selected dial endpoint. Every
-/// endpoint here is operator-declared on the same ServiceEntry, so accepting
-/// either form never admits a destination the operator did not name.
+/// This is the live post-route-override guard in `handle_hbone_udp_request`.
+/// Route-miss synthesis already selected an admitted dial endpoint from the
+/// CONNECT authority, but the synthesized relay proxy inherits the global
+/// plugin chain and a `before_proxy` route-override can rewrite `app_host` /
+/// `app_port` before any socket opens. Re-checking here is therefore necessary
+/// and nonredundant: an override that lands on an operator-declared authority
+/// or dial endpoint stays admitted, and anything else is refused. The
+/// dial-endpoint arm is required because the un-overridden effective
+/// destination *is* the selected dial endpoint, not the original authority.
 fn mesh_egress_udp_destination_allowed(
     host: &str,
     port: u16,
@@ -2364,9 +2368,10 @@ fn mesh_egress_udp_destination_allowed(
     let host = hbone_relay_authority_host_for_mesh(host);
     mesh.egress_udp_destinations.iter().any(|dest| {
         (dest.port == port && dest.host.eq_ignore_ascii_case(host))
-            || dest.dial_endpoints.iter().any(|endpoint| {
-                endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host)
-            })
+            || dest
+                .dial_endpoints
+                .iter()
+                .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
     })
 }
 
