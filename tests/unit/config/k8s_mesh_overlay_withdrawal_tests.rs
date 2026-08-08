@@ -915,7 +915,12 @@ fn overlay_slot_does_not_resurrect_an_authoritatively_withdrawn_mesh() {
         "the accepted overlay must supply mesh on a CP full reload"
     );
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed, None);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
 
     assert!(
         compose_db_with_k8s_overlay(&GatewayConfig::default(), &overlay_slot)
@@ -954,7 +959,12 @@ fn overlay_slot_compose_preserves_same_namespace_mesh_from_a_non_kubernetes_base
         "the overlay must layer onto the non-Kubernetes mesh base, not replace it"
     );
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed, None);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
     let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
     let mesh = mesh_of(&withdrawn);
@@ -993,7 +1003,12 @@ fn overlay_slot_compose_restores_a_non_kubernetes_object_the_overlay_shadowed() 
     assert_eq!(mesh_of(&composed).services.len(), 1);
     assert!(mesh_of(&composed).services[0].cluster_ips.is_empty());
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed, None);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
     let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
     assert_eq!(mesh_of(&withdrawn).services, vec![base_service]);

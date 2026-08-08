@@ -53,12 +53,16 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use ferrum_edge::_test_support::{K8sWatchScopeForTest, k8s_watch_scope_with_revision_for_test};
 use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
 use ferrum_edge::config::types::{Consumer, GatewayConfig};
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::dp_client::GrpcJwtSecret;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use ferrum_edge::k8s_controller::revision::{
+    K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version, watch_scope_key,
+};
 use ferrum_edge::modes::control_plane::{
     CpFullLoadSource, load_full_config_multi_with_sequence_for_test,
 };
@@ -69,10 +73,6 @@ use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
 };
 use ferrum_edge::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
-use ferrum_edge::_test_support::{K8sWatchScopeForTest, k8s_watch_scope_with_revision_for_test};
-use ferrum_edge::k8s_controller::revision::{
-    K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version, watch_scope_key,
-};
 use ferrum_edge::modes::mesh::revision::{
     KUBERNETES_AUTHORITY_DOMAIN, MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder,
     MeshRevisionPolicy, MeshRevisionRejectReason, is_kubernetes_authority, kubernetes_authority,
