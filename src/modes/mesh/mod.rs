@@ -30272,8 +30272,8 @@ mod tests {
             (format!("\t{addr}"), "leading tab addr"),
             (format!("{addr}\n"), "trailing newline addr"),
         ] {
-            let err = parse_egress_gateway_endpoint(Some(&padded_addr), Some(spiffe))
-                .expect_err(label);
+            let err =
+                parse_egress_gateway_endpoint(Some(&padded_addr), Some(spiffe)).expect_err(label);
             assert!(
                 err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"),
                 "{label}: must name ADDR, got {err}"
@@ -30282,7 +30282,10 @@ mod tests {
                 err.contains("surrounding whitespace") || err.contains("control characters"),
                 "{label}: must refuse boundary whitespace/control, got {err}"
             );
-            assert!(!err.contains(addr), "{label}: must not echo addr; got {err}");
+            assert!(
+                !err.contains(addr),
+                "{label}: must not echo addr; got {err}"
+            );
         }
 
         for (padded_spiffe, label) in [
@@ -30290,8 +30293,8 @@ mod tests {
             (format!("{spiffe} "), "trailing space spiffe"),
             (format!("\t{spiffe}"), "leading tab spiffe"),
         ] {
-            let err = parse_egress_gateway_endpoint(Some(addr), Some(&padded_spiffe))
-                .expect_err(label);
+            let err =
+                parse_egress_gateway_endpoint(Some(addr), Some(&padded_spiffe)).expect_err(label);
             assert!(
                 err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"),
                 "{label}: must name SPIFFE_ID, got {err}"
@@ -30310,8 +30313,8 @@ mod tests {
         // error: SpiffeIdError embeds the raw identity, so formatting `{e}`
         // would leak them.
         let hostile = "spiffe://cluster.local/ns/default/sa/<script>alert(1)</script>";
-        let err = parse_egress_gateway_endpoint(Some(addr), Some(hostile))
-            .expect_err("hostile spiffe");
+        let err =
+            parse_egress_gateway_endpoint(Some(addr), Some(hostile)).expect_err("hostile spiffe");
         assert!(err.contains("FERRUM_MESH_EGRESS_GATEWAY_SPIFFE_ID"));
         assert!(
             err.contains("must be a valid SPIFFE id"),
