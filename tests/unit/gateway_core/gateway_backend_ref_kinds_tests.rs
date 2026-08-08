@@ -105,6 +105,30 @@ fn tcp_route(name: &str, namespace: &str, backend_refs: Value) -> K8sObject {
     )
 }
 
+fn grpc_route(name: &str, namespace: &str, backend_refs: Value) -> K8sObject {
+    object(
+        "GRPCRoute",
+        name,
+        namespace,
+        "gateway.networking.k8s.io/v1",
+        json!({
+            "rules": [{ "backendRefs": backend_refs }]
+        }),
+    )
+}
+
+fn tls_route(name: &str, namespace: &str, backend_refs: Value) -> K8sObject {
+    object(
+        "TLSRoute",
+        name,
+        namespace,
+        "gateway.networking.k8s.io/v1alpha2",
+        json!({
+            "rules": [{ "backendRefs": backend_refs }]
+        }),
+    )
+}
+
 fn ferrum_gateway_class() -> K8sObject {
     object(
         "GatewayClass",
@@ -610,4 +634,33 @@ fn stream_service_import_uses_stable_dns_and_derives_single_port() {
         "store.default.svc.clusterset.local"
     );
     assert_eq!(translation.config.proxies[0].backend_port, 8080);
+}
+
+#[test]
+fn supported_route_families_retain_service_import_materialization() {
+    // HTTP is covered elsewhere; pin GRPC/TCP/TLS positive admission so the
+    // route-kind capability gate cannot accidentally drop Extended support.
+    let backend_refs = json!([{
+        "group": "multicluster.x-k8s.io",
+        "kind": "ServiceImport",
+        "name": "store",
+        "port": 8080
+    }]);
+    let import = service_import("store", "default", 8080);
+
+    for route in [
+        grpc_route("store", "default", backend_refs.clone()),
+        tcp_route("store", "default", backend_refs.clone()),
+        tls_route("store", "default", backend_refs),
+    ] {
+        let kind = route.kind.clone();
+        let translation = translate_k8s_objects(&[route, import.clone()], options())
+            .unwrap_or_else(|error| panic!("{kind} ServiceImport should translate: {error}"));
+        assert_eq!(
+            translation.config.proxies[0].backend_host,
+            "store.default.svc.clusterset.local",
+            "{kind} should keep ClusterSet DNS"
+        );
+        assert_eq!(translation.config.proxies[0].backend_port, 8080);
+    }
 }

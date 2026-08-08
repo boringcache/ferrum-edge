@@ -2,6 +2,8 @@
 //!
 //! Route translation and Gateway API `ResolvedRefs` status share this adapter
 //! boundary so status cannot claim support that traffic does not receive.
+//! Classification is Route-kind-aware: HTTPRoute/GRPCRoute/TCPRoute/TLSRoute
+//! admit MCS `ServiceImport`, while UDPRoute remains core-Service-only.
 //! Resolution and materialization run at reconcile/load time only.
 
 use std::collections::HashMap;
@@ -64,10 +66,12 @@ impl BackendKind {
     }
 }
 
-/// Classify a `backendRef` `(group, kind)` pair.
+/// Classify a `backendRef` `(group, kind)` pair against the global inventory of
+/// kinds Ferrum understands at all.
 ///
-/// Unknown combinations remain fail-closed; callers map [`Err`] to
-/// `InvalidKind` for both translation faults and route status.
+/// Prefer [`classify_backend_kind_for_route`] at translation and status call
+/// sites: a globally known kind may still be unsupported for a concrete Route
+/// family (UDPRoute never materializes `ServiceImport`).
 pub(crate) fn classify_backend_kind(group: &str, kind: &str) -> Result<BackendKind, ()> {
     match (group, kind) {
         ("", "Service") => Ok(BackendKind::Service),
@@ -76,12 +80,68 @@ pub(crate) fn classify_backend_kind(group: &str, kind: &str) -> Result<BackendKi
     }
 }
 
-/// Field-specific diagnostics for an unsupported `backendRef` target kind.
-pub(crate) fn unsupported_backend_kind_message(group: &str, kind: &str) -> String {
-    format!(
-        "unsupported backendRef target group '{group}' kind '{kind}'; \
-         supported kinds are core Service and {SERVICE_IMPORT_GROUP}/{SERVICE_IMPORT_KIND}"
+/// Whether this Gateway API Route kind can materialize MCS `ServiceImport`.
+///
+/// HTTPRoute, GRPCRoute, TCPRoute, and TLSRoute retain GEP-1748 support.
+/// UDPRoute stays core-Service-only: datagram translation rejects every
+/// non-Service backend, and status must report the same `InvalidKind`.
+pub(crate) fn route_supports_service_import(route_kind: &str) -> bool {
+    matches!(
+        route_kind,
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
     )
+}
+
+/// Whether a classified backend kind can be materialized for this Route kind.
+///
+/// Shared by translation and `ResolvedRefs` so status cannot claim a backend
+/// resolved when the Route family refuses to accept it.
+pub(crate) fn route_supports_backend_kind(route_kind: &str, kind: BackendKind) -> bool {
+    match kind {
+        BackendKind::Service => true,
+        BackendKind::ServiceImport => route_supports_service_import(route_kind),
+    }
+}
+
+/// Classify a `backendRef` `(group, kind)` pair for a concrete Route kind.
+///
+/// Unknown combinations and kinds the Route cannot materialize remain
+/// fail-closed; callers map [`Err`] to `InvalidKind` for both translation
+/// faults and route status. Capability is evaluated before ReferenceGrant so a
+/// grant cannot authorize a target the Route will never accept.
+pub(crate) fn classify_backend_kind_for_route(
+    route_kind: &str,
+    group: &str,
+    kind: &str,
+) -> Result<BackendKind, ()> {
+    let backend_kind = classify_backend_kind(group, kind)?;
+    if route_supports_backend_kind(route_kind, backend_kind) {
+        Ok(backend_kind)
+    } else {
+        Err(())
+    }
+}
+
+/// Field-specific diagnostics for an unsupported `backendRef` target kind.
+///
+/// Message text is Route-kind-aware so UDPRoute operators are not told that
+/// `ServiceImport` is supported when translation and status both reject it.
+pub(crate) fn unsupported_backend_kind_message(
+    route_kind: &str,
+    group: &str,
+    kind: &str,
+) -> String {
+    if route_supports_service_import(route_kind) {
+        format!(
+            "unsupported backendRef target group '{group}' kind '{kind}'; \
+             supported kinds are core Service and {SERVICE_IMPORT_GROUP}/{SERVICE_IMPORT_KIND}"
+        )
+    } else {
+        format!(
+            "unsupported backendRef target group '{group}' kind '{kind}'; \
+             {route_kind} only supports core Service backendRefs"
+        )
+    }
 }
 
 /// Stable tokens matched by status/translator fault classification. Keep these
@@ -100,8 +160,9 @@ pub(crate) fn message_is_backend_not_found(message: &str) -> bool {
 /// Authorize a cross-namespace `backendRef` and return its resolved namespace.
 ///
 /// Same-namespace refs skip ReferenceGrant. Cross-namespace refs require an
-/// exact grant for the typed `(group, kind)` pair. Unknown kinds fail closed
-/// before grant evaluation so an overly broad grant cannot bless them.
+/// exact grant for the typed `(group, kind)` pair. Unknown kinds and kinds the
+/// Route cannot materialize fail closed before grant evaluation so an overly
+/// broad grant cannot bless them.
 pub(crate) fn checked_backend_namespace(
     object: &K8sObject,
     backend_ref: &Value,
@@ -112,9 +173,13 @@ pub(crate) fn checked_backend_namespace(
         string_field(backend_ref, "namespace").unwrap_or(&object.metadata.namespace);
     let to_group = string_field(backend_ref, "group").unwrap_or_default();
     let to_kind = string_field(backend_ref, "kind").unwrap_or("Service");
-    let backend_kind = classify_backend_kind(to_group, to_kind).map_err(|()| {
-        invalid_resource(object, unsupported_backend_kind_message(to_group, to_kind))
-    })?;
+    let backend_kind =
+        classify_backend_kind_for_route(from_kind, to_group, to_kind).map_err(|()| {
+            invalid_resource(
+                object,
+                unsupported_backend_kind_message(from_kind, to_group, to_kind),
+            )
+        })?;
 
     if backend_namespace == object.metadata.namespace {
         return Ok((backend_kind, backend_namespace.to_string()));
@@ -340,6 +405,10 @@ pub(crate) struct BackendRefStatusInventory<'a> {
 /// `RouteConditionReason` vocabulary (`InvalidKind`, `RefNotPermitted`,
 /// `BackendNotFound`).
 ///
+/// Kind capability uses the same Route-kind predicate as translation, so a
+/// present `ServiceImport` stays `InvalidKind` on UDPRoute. ReferenceGrant is
+/// evaluated only after that capability gate.
+///
 /// `reference_grant_allows` receives `(to_namespace, to_group, to_kind, to_name)`.
 pub(crate) fn unresolved_backend_ref_reason<'a, F>(
     route: &K8sObject,
@@ -358,7 +427,11 @@ where
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("Service");
-    let Ok(backend_kind) = classify_backend_kind(to_group, to_kind) else {
+    // Route-kind capability shares the translator predicate: a present
+    // ServiceImport stays InvalidKind on UDPRoute even when inventory and a
+    // ReferenceGrant would otherwise authorize it.
+    let Ok(backend_kind) = classify_backend_kind_for_route(route.kind.as_str(), to_group, to_kind)
+    else {
         return Some("InvalidKind");
     };
 

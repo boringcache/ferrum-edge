@@ -302,10 +302,7 @@ fn udp_route_rejects_non_service_backend_kind() {
     assert!(
         message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
     );
-    assert!(
-        message
-            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
-    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]
@@ -518,6 +515,136 @@ fn udp_route_status_reports_unresolved_missing_backend() {
     assert_eq!(
         route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
         Some("False")
+    );
+}
+
+#[test]
+fn udp_route_rejects_present_service_import_with_invalid_kind_status_parity() {
+    // A fully present TCP ServiceImport is still InvalidKind on UDPRoute:
+    // translation refuses non-Service backends and ResolvedRefs must not claim
+    // the inventory resolved (#3270 status/traffic parity).
+    let import = object_in(
+        "ServiceImport",
+        "multicluster.x-k8s.io/v1alpha1",
+        "default",
+        "dns-import",
+        json!({
+            "type": "ClusterSetIP",
+            "ports": [{ "port": 5353, "protocol": "TCP" }]
+        }),
+    );
+    let route = udp_route(
+        "dns",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{
+                "backendRefs": [{
+                    "group": "multicluster.x-k8s.io",
+                    "kind": "ServiceImport",
+                    "name": "dns-import",
+                    "port": 5353
+                }]
+            }]
+        }),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        import,
+        route,
+    ];
+
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("UDPRoute must reject ServiceImport backends");
+    let message = err.to_string();
+    assert!(message.contains(
+        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+    ));
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("InvalidKind")
+    );
+}
+
+#[test]
+fn udp_route_service_import_reference_grant_cannot_override_invalid_kind() {
+    // Fail-closed ordering: capability classification precedes ReferenceGrant.
+    // A grant for ServiceImport must not authorize a kind UDPRoute cannot
+    // materialize, and status must stay InvalidKind (not RefNotPermitted or
+    // ResolvedRefs=True).
+    let import = object_in(
+        "ServiceImport",
+        "multicluster.x-k8s.io/v1alpha1",
+        "backends",
+        "dns-import",
+        json!({
+            "type": "ClusterSetIP",
+            "ports": [{ "port": 5353, "protocol": "TCP" }]
+        }),
+    );
+    let grant = object_in(
+        "ReferenceGrant",
+        "gateway.networking.k8s.io/v1beta1",
+        "backends",
+        "allow-import",
+        json!({
+            "from": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "namespace": "default"
+            }],
+            "to": [{
+                "group": "multicluster.x-k8s.io",
+                "kind": "ServiceImport"
+            }]
+        }),
+    );
+    let route = udp_route(
+        "dns",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{
+                "backendRefs": [{
+                    "group": "multicluster.x-k8s.io",
+                    "kind": "ServiceImport",
+                    "name": "dns-import",
+                    "namespace": "backends",
+                    "port": 5353
+                }]
+            }]
+        }),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        import,
+        grant,
+        route,
+    ];
+
+    let err = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect_err("a ServiceImport grant must not authorize UDPRoute");
+    let message = err.to_string();
+    assert!(message.contains(
+        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+    ));
+    assert!(!message.contains("ReferenceGrant"));
+
+    let updates = plan_gateway_api_status_updates(&objects, multi_namespace_options(), &[]);
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("InvalidKind")
     );
 }
 
@@ -1010,10 +1137,7 @@ fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
     assert!(
         message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
     );
-    assert!(
-        message
-            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
-    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]
@@ -1055,10 +1179,7 @@ fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
     assert!(
         message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
     );
-    assert!(
-        message
-            .contains("supported kinds are core Service and multicluster.x-k8s.io/ServiceImport")
-    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]

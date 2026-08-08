@@ -6410,23 +6410,12 @@ fn udp_rule_backends(
         // an unauthorized cross-namespace reference or unsupported target.
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let (backend_kind, backend_namespace) =
+        // Route-kind capability lives in `checked_backend_namespace` /
+        // `classify_backend_kind_for_route`: UDPRoute rejects ServiceImport
+        // (and every other non-Service kind) as InvalidKind before any
+        // ReferenceGrant can authorize it, matching `ResolvedRefs` status.
+        let (_, backend_namespace) =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        // UDPRoute claims only core Service backendRefs. ServiceImport and any
-        // other typed non-Service kind stay whole-route hard errors rather than
-        // soft blackholes, matching unsupported-kind fail-closed on TCP/TLS.
-        if !matches!(backend_kind, super::backend_ref::BackendKind::Service) {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "unsupported backendRef target group '{}' kind '{}'; \
-                     {} only supports core Service backendRefs",
-                    backend_kind.group(),
-                    backend_kind.kind(),
-                    object.kind
-                ),
-            ));
-        }
         if weight == 0 {
             skipped_zero += 1;
             continue;
