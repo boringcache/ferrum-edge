@@ -106,9 +106,7 @@ fn mesh_with_service(name: &str) -> Box<MeshConfig> {
 
 fn authoritative_translation(proxy_id: &str, mesh_service: &str) -> GatewayConfig {
     let mut translation = GatewayConfig::default();
-    translation
-        .proxies
-        .push(make_proxy(proxy_id, "ferrum"));
+    translation.proxies.push(make_proxy(proxy_id, "ferrum"));
     translation.mesh = Some(mesh_with_service(mesh_service));
     translation.k8s_mesh_overlay = K8sMeshOverlay::authoritative_translation();
     translation
@@ -217,13 +215,13 @@ fn equal_revision_with_changed_mesh_retains_prior_mesh() {
     // Equal scalar + changed mesh: retain prior mesh. Non-mesh identical → no
     // content change to broadcast, but the overlay must still hold svc-a.
     assert!(harness.publish(&divergent, Some(&revision(664))).is_none());
-    assert_eq!(harness.overlay_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(
+        harness.overlay_mesh_service_names(),
+        vec!["svc-a".to_string()]
+    );
     assert_eq!(harness.live_mesh_service_names(), vec!["svc-a".to_string()]);
     assert_eq!(harness.overlay_revision(), Some(revision(664)));
-    assert_eq!(
-        harness.config_arc.load().mesh_revision,
-        Some(revision(664))
-    );
+    assert_eq!(harness.config_arc.load().mesh_revision, Some(revision(664)));
 }
 
 #[test]
@@ -234,7 +232,10 @@ fn equal_revision_with_identical_mesh_is_idempotent() {
 
     let replay = authoritative_translation("gwapi-route-a", "svc-a");
     assert!(harness.publish(&replay, Some(&revision(100))).is_none());
-    assert_eq!(harness.overlay_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(
+        harness.overlay_mesh_service_names(),
+        vec!["svc-a".to_string()]
+    );
     assert_eq!(harness.overlay_revision(), Some(revision(100)));
 }
 
@@ -286,7 +287,10 @@ fn non_mesh_changes_publish_while_equal_revision_mesh_is_retained() {
         vec!["svc-a".to_string()],
         "divergent mesh under an equal revision must be retained"
     );
-    assert_eq!(harness.overlay_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(
+        harness.overlay_mesh_service_names(),
+        vec!["svc-a".to_string()]
+    );
     assert_eq!(harness.overlay_revision(), Some(revision(50)));
     assert_eq!(live.mesh_revision, Some(revision(50)));
 }
@@ -350,11 +354,11 @@ fn missing_revision_after_versioned_publication_retains_prior_mesh() {
 
     let divergent = authoritative_translation("gwapi-route-a", "svc-withheld");
     assert!(harness.publish(&divergent, None).is_none());
-    assert_eq!(harness.overlay_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(
+        harness.overlay_mesh_service_names(),
+        vec!["svc-a".to_string()]
+    );
     assert_eq!(harness.live_mesh_service_names(), vec!["svc-a".to_string()]);
     assert_eq!(harness.overlay_revision(), Some(revision(100)));
-    assert_eq!(
-        harness.config_arc.load().mesh_revision,
-        Some(revision(100))
-    );
+    assert_eq!(harness.config_arc.load().mesh_revision, Some(revision(100)));
 }
