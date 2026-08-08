@@ -9,6 +9,16 @@ use ferrum_edge::config::types::HttpFlavor;
 use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use http::StatusCode;
 
+/// Normalize source before matching a source-shape needle: collapse every run
+/// of whitespace away, then drop rustfmt's wrapped-call trailing comma so
+/// `foo(\n    a,\n    b,\n)` and `foo(a, b)` produce the same text. Needles
+/// written against this form survive reflow when an argument list grows past
+/// `fn_call_width` — an exact one-line substring does not.
+fn squeeze(source: &str) -> String {
+    let collapsed: String = source.split_whitespace().collect();
+    collapsed.replace(",)", ")")
+}
+
 #[test]
 fn h3_terminal_final_body_dispatch_follows_path_policy_and_precedes_breaker() {
     let source = include_str!("../../../src/http3/server.rs");
@@ -141,19 +151,19 @@ fn h3_deferred_destination_override_is_rebound_before_dispatch() {
 
 #[test]
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
-    let source = include_str!("../../../src/http3/server.rs");
-    // Match without the `let` binder: selection is `mut` so deferred rebind can
-    // replace it; the first occurrence is still the pre-deferred lookup.
+    let source = squeeze(include_str!("../../../src/http3/server.rs"));
+    // `selection` is mutable so a deferred destination claim can replace it;
+    // the first occurrence is still the pre-deferred lookup pinned here.
     let selection = source
-        .find("selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("letmutselection=crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
 
     let cap = after_selection
-        .find("let mut selected_base_proxy =")
+        .find("letmutselected_base_proxy=crate::proxy::cap_proxy_retry_for_target(")
         .expect("H3 frontend must cap retry policy by selected target");
     let effective = after_selection
-        .find("let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(")
+        .find("leteffective_proxy=crate::proxy::resolve_effective_proxy_for_target(")
         .expect("H3 frontend must resolve selected-target effective proxy");
     assert!(
         after_selection.contains("route_retry_ceiling"),
@@ -163,18 +173,39 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
         after_selection[effective..].contains("&selected_base_proxy"),
         "H3 effective proxy resolution must use the post-selection selected base proxy"
     );
+    // `cap_proxy_retry_for_target` deliberately returns the proxy with
+    // `Proxy.retry` UNCHANGED at the original route ceiling, so that a retry
+    // rotation is not permanently pinned to the initial port's DestinationRule
+    // cap. That makes the seam above a positioning contract only: the selected
+    // target's own `maxRetries` still has to be re-checked here, or a
+    // `maxRetries: 0` target reads a retry-enabled `Proxy.retry` and forces
+    // request-body buffering on a path that can never retry.
+    let target_retry_gate = after_selection
+        .find("letselected_target_allows_retry=crate::proxy::current_retry_attempt_allowed(")
+        .expect("H3 retry-dependent decisions must re-check the selected target's retry budget");
     let has_retry = after_selection
-        .find("let has_retry = match backend_http_flavor")
+        .find("lethas_retry=")
         .expect("retry-dependent buffering decision must remain present");
     let native_h3_decision = after_selection
-        .find("let backend_supports_native_h3 =")
+        .find("letbackend_supports_native_h3=")
         .expect("native-H3 dispatch decision must remain present");
     let circuit_breaker = after_selection
         .find("check_circuit_breaker(")
         .expect("H3 circuit-breaker check must remain present");
 
     assert!(
-        cap < has_retry,
+        after_selection[target_retry_gate..has_retry]
+            .contains("route_retry_ceiling,&proxy,upstream_target.as_deref(),0)"),
+        "the selected-target retry budget must be evaluated for the selected target at \
+         attempt 0 against the original route ceiling"
+    );
+    assert!(
+        after_selection[has_retry..].starts_with("lethas_retry=selected_target_allows_retry&&"),
+        "the retry-dependent buffering decision must be gated on the selected target's \
+         retry budget, not on the uncapped route-level Proxy.retry alone"
+    );
+    assert!(
+        cap < target_retry_gate && target_retry_gate < has_retry,
         "retry cap must run before retry-dependent buffering/native-H3 gates"
     );
     assert!(
@@ -532,9 +563,10 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
         source[bridge..].contains("flavor: backend_http_flavor,"),
         "the backend bridge must receive the translation-aware transport flavor"
     );
+    let squeezed = squeeze(source);
     assert!(
-        source.contains("let has_retry = match backend_http_flavor")
-            && source.contains("let use_native_h3_grpc = backend_http_flavor == HttpFlavor::Grpc"),
+        squeezed.contains("lethas_retry=selected_target_allows_retry&&matchbackend_http_flavor{")
+            && squeezed.contains("letuse_native_h3_grpc=backend_http_flavor==HttpFlavor::Grpc"),
         "retry and native-gRPC transport decisions must use backend flavor"
     );
 

@@ -1765,6 +1765,8 @@ impl DatabaseStore {
     ) -> Result<Self, anyhow::Error> {
         // Install all drivers
         sqlx::any::install_default_drivers();
+        // Debug-only: arm functional-test DB outage control when configured.
+        crate::config::test_db_fault::arm_from_env().await;
 
         let pool = connect_any_pool_with_timeout(
             Self::build_pool_options_from_config(&pool_config, db_type),
@@ -6713,7 +6715,16 @@ impl DatabaseStore {
     ///
     /// Returns an owned clone (cheap — `AnyPool` is `Arc`-based internally).
     /// The returned handle remains valid even if `reconnect()` swaps the pool.
+    ///
+    /// Under debug builds, a TEST-ONLY fault control (see
+    /// [`crate::config::test_db_fault`]) may substitute a pre-closed pool so
+    /// admin/poll paths observe ordinary connectivity errors without corrupting
+    /// live SQLite mappings. Release builds never take that branch. Not used on
+    /// the proxy request hot path.
     pub fn pool(&self) -> AnyPool {
+        if let Some(fault_pool) = crate::config::test_db_fault::tripped_fault_pool() {
+            return fault_pool;
+        }
         (**self.pool.load()).clone()
     }
 

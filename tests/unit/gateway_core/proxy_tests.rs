@@ -3675,25 +3675,39 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
 }
 
 #[test]
-fn test_direct_http2_pool_dispatch_disabled_by_body_limits() {
+fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
+    // Issue #3622: nonzero body limits are enforced in-path on direct-H2
+    // (413 / 502), so they must not disqualify ordinary dispatch.
     assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
-    assert!(!can_dispatch_direct_http2_pool(true, false, false, 1, 0));
-    assert!(!can_dispatch_direct_http2_pool(true, false, false, 0, 1));
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 0));
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 1));
+    assert!(can_dispatch_direct_http2_pool(
+        true, false, false, 10_485_760, 10_485_760
+    ));
+    // Retry body replay / request-body buffering still force reqwest.
     assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
+    assert!(!can_dispatch_direct_http2_pool(
+        true, false, true, 10_485_760, 10_485_760
+    ));
+    assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
 }
 
 #[test]
-fn test_direct_http2_sni_uses_body_compat_gate_not_body_limit_gate() {
-    // Issue #2954: SNI cannot fall back to reqwest, so nonzero body limits
-    // must not disqualify direct-H2 when retries/buffering are absent.
-    // Callers use can_use_direct_http2_pool for the SNI path.
-    assert!(can_use_direct_http2_pool(true, false, false));
-    assert!(!can_use_direct_http2_pool(true, true, false));
-    assert!(!can_use_direct_http2_pool(true, false, true));
-    // Ordinary preference still requires both body limits at 0.
-    assert!(!can_dispatch_direct_http2_pool(
-        true, false, false, 10_485_760, 10_485_760
-    ));
+fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
+    // Ordinary and SNI routes share the same body-compat gate; body-size
+    // limits no longer fork the predicate.
+    assert_eq!(
+        can_use_direct_http2_pool(true, false, false),
+        can_dispatch_direct_http2_pool(true, false, false, 10_485_760, 10_485_760)
+    );
+    assert_eq!(
+        can_use_direct_http2_pool(true, true, false),
+        can_dispatch_direct_http2_pool(true, true, false, 0, 0)
+    );
+    assert_eq!(
+        can_use_direct_http2_pool(true, false, true),
+        can_dispatch_direct_http2_pool(true, false, true, 0, 0)
+    );
 }
 
 #[test]

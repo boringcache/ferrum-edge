@@ -2613,32 +2613,34 @@ pub(crate) fn can_use_direct_http2_pool(
 /// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
 ///
 /// `get_sender()` may dial or probe the backend, so callers must use this
-/// stricter predicate before opening an H2 sender. When body-size limits are
-/// enabled, ordinary (non-SNI) requests stay on the reqwest path so local
-/// request-size checks and deferred backend admission run before any backend
-/// interaction. Backend TLS SNI overrides cannot use reqwest, so callers that
-/// require direct-H2 for SNI should consult [`can_use_direct_http2_pool`]
-/// instead and enforce limits in-path (413 / 502) on the H2 sender.
+/// predicate before opening an H2 sender. Body-size limits are enforced
+/// in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
+/// frame-by-frame when `Content-Length` is absent — so nonzero
+/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
+/// (non-SNI) routes from the multiplexed pool. The retained size-limit
+/// parameters keep call-site signatures stable; they do not gate
+/// dispatch. Retry body replay and request-body-buffering plugins still
+/// force the reqwest path via [`can_use_direct_http2_pool`].
 pub(crate) fn can_dispatch_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
     requires_request_body_buffering: bool,
-    max_request_body_size_bytes: usize,
-    max_response_body_size_bytes: usize,
+    _max_request_body_size_bytes: usize,
+    _max_response_body_size_bytes: usize,
 ) -> bool {
     can_use_direct_http2_pool(
         enable_http2,
         retain_request_body,
         requires_request_body_buffering,
-    ) && max_request_body_size_bytes == 0
-        && max_response_body_size_bytes == 0
+    )
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
-/// `can_dispatch` is the body/limit/`enable_http2` gate
+/// `can_dispatch` is the body-compat/`enable_http2` gate
 /// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
@@ -19661,6 +19663,16 @@ pub(crate) struct NormalizedRejectResponse {
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
     /// terminal metadata in `headers`.
     pub(crate) grpc_trailers: HashMap<String, String>,
+    /// Multiplexed aggregate MCP SSE listener adopted from the request context.
+    ///
+    /// Only ever set when the final representation is still the gateway's own
+    /// `text/event-stream` response (see
+    /// [`finalize_reject_response_with_after_proxy_hooks_and_commit_policy`]).
+    /// When present, [`build_response_from_normalized_reject`] claims the body
+    /// once and selects [`headers_mod::ClientResponseFraming::Streaming`], so
+    /// no `Content-Length` is published for an event stream whose bytes have
+    /// not been written yet.
+    pub(crate) aggregate_sse: Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -20095,6 +20107,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
             failed_websocket_handshake: false,
             body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
+            aggregate_sse: None,
         };
     }
 
@@ -20204,6 +20217,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
         // `grpc_status`; the disposition is unused on that branch.
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
+        aggregate_sse: None,
     }
 }
 
@@ -20289,6 +20303,7 @@ fn build_framed_grpc_unary_reject(
         failed_websocket_handshake: false,
         body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
+        aggregate_sse: None,
     }
 }
 
@@ -20426,6 +20441,13 @@ pub(crate) fn build_response_from_normalized_reject(
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
+    // Claim the multiplexed SSE body exactly once. The claim is a one-shot
+    // compare-and-swap inside the listener lease, so even if a context clone
+    // still holds a handle it can never produce a second body for this session.
+    let aggregate_sse_body = reject
+        .aggregate_sse
+        .as_ref()
+        .and_then(crate::plugins::mcp_aggregate_sse::AggregateSseListener::take_body);
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -20445,8 +20467,12 @@ pub(crate) fn build_response_from_normalized_reject(
     // or a no-body status) selects `Head` framing. A native gRPC error is
     // trailers-only: gRPC never frames with Content-Length, so the field is
     // removed rather than invented as `0` or preserved from a plugin.
+    // Multiplexed aggregate SSE listeners are inherently streaming: never
+    // publish Content-Length for a long-lived event stream.
     let framing = if is_grpc_error {
         headers_mod::ClientResponseFraming::TrailersOnly
+    } else if aggregate_sse_body.is_some() {
+        headers_mod::ClientResponseFraming::Streaming
     } else {
         headers_mod::ClientResponseFraming::for_final_reject(
             status,
@@ -20458,7 +20484,9 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if is_framed_unary_reject {
+    let body = if let Some(sse) = aggregate_sse_body {
+        body::gateway_streaming_body(sse)
+    } else if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
@@ -21825,7 +21853,7 @@ async fn enforce_final_client_visible_response_header_policy(
 /// Close the buffered response header map after every body/representation/
 /// transport outcome. Unlike the streaming/synthetic finalizer, this phase can
 /// replace the response directly in the client's immutable gRPC flavor.
-async fn enforce_buffered_final_client_visible_response_header_policy(
+pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_status: &mut u16,
@@ -22747,7 +22775,33 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // reading plugin-controlled headers.
     normalized.body_disposition =
         headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+    // Aggregate MCP SSE stages a single-consumer listener lease on the request
+    // context. Adopt it only while the final representation is STILL the
+    // event stream the gateway authored: a later reject-path plugin that
+    // replaced the status or the representation gets an ordinary body, and
+    // dropping the lease here releases the session's single-listener slot so
+    // the client can reattach instead of being locked out.
+    if let Some(listener) = ctx.mcp_aggregate_sse.take()
+        && normalized.http_status == StatusCode::OK
+        && normalized.body.is_empty()
+        && response_headers_select_event_stream(&normalized.headers)
+    {
+        normalized.aggregate_sse = Some(listener);
+    }
     normalized
+}
+
+/// Whether a finalized reject header map still selects a `text/event-stream`
+/// representation. Read as a media-type essence so a charset parameter still
+/// matches and a lookalike type does not.
+pub(crate) fn response_headers_select_event_stream(headers: &HashMap<String, String>) -> bool {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    match content_type {
+        Some((_, value)) => crate::plugins::utils::sse::is_text_event_stream_media_type(value),
+        None => false,
+    }
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -30334,7 +30388,13 @@ async fn handle_proxy_request_inner(
     // collecting it into memory. When effective retries are enabled, we force
     // buffered mode so the collected body bytes can be replayed on connection
     // failures.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        && current_retry_attempt_allowed(
+            route_retry_ceiling,
+            &proxy,
+            upstream_target.as_deref(),
+            0,
+        );
     let stream_request_body = !has_retry && !requires_request_body_buffering;
     // A retry may rotate from an ordinary backend target onto a secured mesh
     // target. Share the pristine field-line representation before the initial
@@ -32073,6 +32133,28 @@ async fn handle_proxy_request_inner(
             .await;
             response_body = ResponseBody::buffered(body);
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
+    // POST-side 202 while privately reserving the event. The ordinary buffered
+    // header policy ran before that legacy final-body hook, over the original
+    // 200 response. Close the newly selected acknowledgement here so the
+    // committed hook never publishes an event whose actual POST response did
+    // not pass final header policy. Synthetic rejects reach the equivalent
+    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        let _ = enforce_buffered_final_client_visible_response_header_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+        )
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -35641,26 +35723,17 @@ async fn proxy_to_backend(
         let direct_h2_supports = direct_h2_capability
             .as_ref()
             .is_some_and(|record| record.plain_http.h2_tls.is_supported());
-        let direct_h2_compatible = can_use_direct_http2_pool(
+        // Body-size limits are enforced in-path on the direct-H2 sender /
+        // response collectors (413 / 502), including for ordinary
+        // (non-SNI) routes — same semantics as the SNI arm and the
+        // reqwest path's ErrorClass / connection_error contracts.
+        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
+            effective_max_request_body_size_bytes,
+            effective_max_response_body_size_bytes,
         );
-        // Backend TLS SNI cannot fall back to reqwest. Body-size limits are
-        // enforced in-path on the direct-H2 sender / response collectors
-        // (413 / 502), so nonzero FERRUM_MAX_*_BODY_SIZE_BYTES must not
-        // disqualify SNI routes the way they do for ordinary H2 preference.
-        let direct_h2_can_dispatch = if requires_direct_h2_for_sni {
-            direct_h2_compatible
-        } else {
-            can_dispatch_direct_http2_pool(
-                pool_config.enable_http2,
-                retain_request_body,
-                requires_request_body_buffering,
-                effective_max_request_body_size_bytes,
-                effective_max_response_body_size_bytes,
-            )
-        };
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
@@ -35710,9 +35783,9 @@ async fn proxy_to_backend(
         let direct_h2_dispatch = direct_h2_dispatch && sni_dial.is_none();
         if direct_h2_dispatch {
             // 413 on an oversized declared Content-Length BEFORE dial/admission,
-            // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
-            // size violation — especially important for SNI routes that must
-            // stay on direct-H2 under nonzero body limits.
+            // matching HBONE/mesh-mTLS / reqwest ordering so a capacity 503
+            // cannot mask a size violation on direct-H2 under nonzero body
+            // limits (ordinary routes and SNI alike).
             if let Some(reject) = oversized_request_body_dispatch_reject(
                 effective_max_request_body_size_bytes,
                 method,
@@ -35903,16 +35976,6 @@ async fn proxy_to_backend(
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
             // after its own request-body collection / final-body hooks.
-        } else if direct_h2_compatible
-            && !direct_h2_can_dispatch
-            && (direct_h2_supports || requires_direct_h2_for_sni)
-        {
-            debug!(
-                proxy_id = %proxy.id,
-                max_request_body_size_bytes = effective_max_request_body_size_bytes,
-                max_response_body_size_bytes = effective_max_response_body_size_bytes,
-                "H2 pool bypassed because body-size limits are enabled"
-            );
         }
         if requires_direct_h2_for_sni && sni_dial.is_none() {
             // Retry body replay, a request-body-buffering plugin, or
@@ -41010,12 +41073,11 @@ async fn proxy_to_backend_http2(
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
     //
-    // The channel is installed only when `max_request_body_size_bytes > 0`, and
-    // limits-on requests reach direct-H2 only through a backend TLS SNI override
-    // (`can_dispatch_direct_http2_pool` requires a zero limit otherwise). So the
-    // gate — and the interleaving it gives up, a genuinely full-duplex non-gRPC
-    // H2 app now sees response headers withheld until its upload terminates —
-    // is scoped to SNI-override routes that have a request-size limit set.
+    // The channel is installed only when `max_request_body_size_bytes > 0`.
+    // Ordinary and SNI direct-H2 routes both enforce nonzero request limits
+    // in-path, so the gate — and the interleaving it gives up, a genuinely
+    // full-duplex non-gRPC H2 app now sees response headers withheld until
+    // its upload terminates — applies whenever a request-size limit is set.
     if let Some(body_completion_rx) = body_completion_rx {
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
