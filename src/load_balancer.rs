@@ -2023,17 +2023,28 @@ const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v3";
 /// in the same process retains the key; a restart or another replica naturally
 /// treats the old cookie as stale and re-pins the client through normal
 /// selection.
-static STICKY_SESSION_TOKEN_KEY: LazyLock<crate::fips::approved::HmacSha256Key> =
+static STICKY_SESSION_TOKEN_KEY: LazyLock<Option<crate::fips::approved::HmacSha256Key>> =
     LazyLock::new(|| {
         let mut key = [0u8; 32];
-        // An operational cryptographic provider is a startup invariant: the
-        // proxy already depends on it for TLS and every other secure random
-        // value. Refusing to continue is safer than minting forgeable tokens.
-        SystemRandom::new()
-            .fill(&mut key)
-            .expect("configured cryptographic provider must supply secure randomness");
-        crate::fips::approved::HmacSha256Key::new_from_slice(&key)
-            .expect("HMAC-SHA-256 accepts a 32-byte key")
+        if SystemRandom::new().fill(&mut key).is_err() {
+            tracing::error!(
+                event = "sticky_session_auth_disabled",
+                reason = "secure_random_unavailable",
+                "Sticky-session token authentication disabled"
+            );
+            return None;
+        }
+        match crate::fips::approved::HmacSha256Key::new_from_slice(&key) {
+            Ok(key) => Some(key),
+            Err(_) => {
+                tracing::error!(
+                    event = "sticky_session_auth_disabled",
+                    reason = "hmac_key_rejected",
+                    "Sticky-session token authentication disabled"
+                );
+                None
+            }
+        }
     });
 
 /// A sticky-session token is a lowercase hex HMAC-SHA-256 tag: 64 characters.
@@ -2074,12 +2085,19 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// through [`LoadBalancer::configured_sticky_identity_target`] first; the
 /// binding index is built from the configured targets, so a token derived from
 /// anything else cannot resolve.
-pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
-    let mut hasher = STICKY_SESSION_TOKEN_KEY.begin();
+///
+/// Returns `None` when the cryptographic provider cannot initialize the
+/// process-local key. Callers fail closed by building no binding and emitting
+/// no cookie; the lazy initializer records one fixed diagnostic.
+pub fn sticky_session_token(
+    upstream_runtime_key: &str,
+    target: &UpstreamTarget,
+) -> Option<String> {
+    let mut hasher = STICKY_SESSION_TOKEN_KEY.as_ref()?.begin();
     hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
     hasher.update([0x1fu8]);
     write_sticky_target_identity(&mut hasher, upstream_runtime_key, target);
-    hex::encode(hasher.finalize())
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// The incremental hasher the sticky-identity encoder feeds.
@@ -3310,8 +3328,9 @@ impl LoadBalancer {
         if mints_sticky_tokens {
             sticky_token_index.reserve(targets.len());
             for (i, target) in targets.iter().enumerate() {
-                let token = sticky_session_token(upstream_id, target);
-                sticky_token_index.entry(token).or_insert(i);
+                if let Some(token) = sticky_session_token(upstream_id, target) {
+                    sticky_token_index.entry(token).or_insert(i);
+                }
             }
         }
         // A wildcard-hosted target is dialed through a per-request concretized

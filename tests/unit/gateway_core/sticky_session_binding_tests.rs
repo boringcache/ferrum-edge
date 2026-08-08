@@ -113,6 +113,7 @@ fn scope(namespace: &str, upstream_id: &str) -> String {
 
 fn token_for(namespace: &str, upstream_id: &str, target: &UpstreamTarget) -> String {
     sticky_session_token(&scope(namespace, upstream_id), target)
+        .expect("test cryptographic provider must initialize the sticky-session key")
 }
 
 #[test]

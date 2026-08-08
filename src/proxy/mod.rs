@@ -37234,11 +37234,11 @@ pub(crate) fn build_sticky_cookie_header(
     upstream_id: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
-) -> String {
+) -> Option<String> {
     let value = crate::load_balancer::sticky_session_token(
         &crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id),
         target,
-    );
+    )?;
     let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
     if !config.session_cookie {
         cookie.push_str("; Max-Age=");
@@ -37258,7 +37258,7 @@ pub(crate) fn build_sticky_cookie_header(
         cookie.push_str("; SameSite=");
         cookie.push_str(same_site);
     }
-    cookie
+    Some(cookie)
 }
 
 /// Append the gateway-authored Gateway API session-persistence `Set-Cookie` to
@@ -37336,13 +37336,15 @@ pub(crate) fn inject_sticky_affinity_cookie(
         .as_ref()
         .and_then(|u| u.hash_on_cookie_config.as_ref())
         .unwrap_or(&default_cc);
-    let cookie_val = build_sticky_cookie_header(
+    let Some(cookie_val) = build_sticky_cookie_header(
         cookie_name,
         &proxy.namespace,
         upstream_id,
         identity_target,
         cookie_config,
-    );
+    ) else {
+        return false;
+    };
     headers_mod::append_set_cookie_header(response_headers, cookie_val);
     true
 }
