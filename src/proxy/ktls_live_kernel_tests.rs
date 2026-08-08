@@ -128,8 +128,7 @@ fn kernel_supports_live_ktls() -> bool {
 fn live_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     let mut provider = crate::fips::base_crypto_provider();
     provider.cipher_suites.retain(|suite| {
-        suite.suite()
-            == rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        suite.suite() == rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
     });
     assert_eq!(
         provider.cipher_suites.len(),
