@@ -944,7 +944,8 @@ fn se_udp_source_side_without_configured_gateway_materializes_nothing() {
 fn se_udp_source_side_routes_require_stream_egress_opt_in() {
     register_feature!(
         category = CATEGORY,
-        feature = "Source-side external UDP routes require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
+        feature =
+            "Source-side external UDP routes require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
         status = Status::Supported,
         notes = "#3263: source and gateway share the stream-egress opt-in; flag-off clears source routes and admits nothing on the gateway, never a black-hole half-pair.",
     );

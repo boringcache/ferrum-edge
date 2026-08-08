@@ -16281,8 +16281,7 @@ fn parse_egress_gateway_endpoint(
         };
         let Some(port_raw) = tail.strip_prefix(':') else {
             return Err(
-                "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 form must be '[<ipv6>]:<port>'"
-                    .to_string(),
+                "FERRUM_MESH_EGRESS_GATEWAY_ADDR IPv6 form must be '[<ipv6>]:<port>'".to_string(),
             );
         };
         if host.is_empty() {
@@ -16342,9 +16341,7 @@ fn validate_egress_gateway_host(host: &str) -> Result<String, String> {
     const MAX_HOST_LEN: usize = crate::config::types::MAX_HOST_LENGTH;
 
     if host.is_empty() {
-        return Err(
-            "FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty host".to_string(),
-        );
+        return Err("FERRUM_MESH_EGRESS_GATEWAY_ADDR must name a non-empty host".to_string());
     }
     if host.len() > MAX_HOST_LEN {
         return Err(format!(
@@ -16424,10 +16421,7 @@ fn is_valid_egress_gateway_dns_hostname(hostname: &str) -> bool {
 /// Parse the port portion of `FERRUM_MESH_EGRESS_GATEWAY_ADDR` without echoing
 /// the raw text (which may be hostile / overlong).
 fn parse_egress_gateway_port(port_raw: &str) -> Result<u16, String> {
-    if port_raw.is_empty()
-        || !port_raw.bytes().all(|b| b.is_ascii_digit())
-        || port_raw.len() > 5
-    {
+    if port_raw.is_empty() || !port_raw.bytes().all(|b| b.is_ascii_digit()) || port_raw.len() > 5 {
         return Err(
             "FERRUM_MESH_EGRESS_GATEWAY_ADDR port must be a decimal TCP port in 1..=65535"
                 .to_string(),
@@ -30168,8 +30162,7 @@ mod tests {
             (overlong_host.as_str(), "overlong host"),
         ];
         for (addr, label) in cases {
-            let err =
-                parse_egress_gateway_endpoint(Some(addr), Some(spiffe)).expect_err(label);
+            let err = parse_egress_gateway_endpoint(Some(addr), Some(spiffe)).expect_err(label);
             assert!(
                 err.contains("FERRUM_MESH_EGRESS_GATEWAY_ADDR"),
                 "{label}: diagnostic must name the field, got {err}"
