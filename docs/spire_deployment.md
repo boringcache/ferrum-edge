@@ -420,8 +420,9 @@ File-backed sources stay on the 1s cadence above. A `k8s://` source uses the
 same provider polling cadence; it does not register a separate Kubernetes
 Secret watch.
 
-Comparison is by material byte fingerprint, so a same-value fetch does not
-churn the SVID slot or backend pools. A change to any one source reloads all
+Comparison is by configured source identity plus material byte fingerprint
+(and stable kind/scheme); provider version metadata alone does not churn the
+SVID slot or backend pools. A change to any one source reloads all
 three together, so cert, key, and trust bundle never mix generations; a torn
 update fails the key-match check and is refused. A refused reload or an
 unreachable provider keeps the last known-good SVID and does not advance the

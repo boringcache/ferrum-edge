@@ -14,7 +14,8 @@
 //!   `ArcSwap` for the lock-free TLS-resolver path.
 //! - [`svid_source_watch`] — polls the configured gateway SVID material
 //!   sources (files and external providers) and republishes the bundle when
-//!   their bytes change.
+//!   material bytes or configured source identity change (provider version
+//!   metadata alone does not).
 //!
 //! Mesh mode wires the Workload API / internal rotation pieces into the
 //! gateway SVID slot when `FERRUM_MESH_CA_BACKEND` is enabled. The TLS builders

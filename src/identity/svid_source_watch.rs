@@ -6,8 +6,12 @@
 //! typed provider URI (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`,
 //! `acme://`, `managed://`). Provider-issued SVIDs are short-lived by design,
 //! so this watcher re-fetches every refreshable source and republishes the
-//! bundle when its bytes change — the same contract the frontend/admin,
-//! backend, and database TLS watchers already provide for external sources.
+//! bundle when its material bytes (or configured source identity / kind /
+//! scheme) change — the same *intent* as the frontend/admin, backend, and
+//! database TLS watchers. The gateway SVID rotation predicate deliberately
+//! ignores provider-returned `version` metadata: a `k8s://` Secret
+//! `resourceVersion` bump, or an ACME/Azure/managed version id for identical
+//! bytes, must not churn the SVID slot or backend pools.
 //!
 //! Three properties are load-bearing and must survive any refactor:
 //!
@@ -78,6 +82,40 @@ const MAX_WATCH_SLEEP: Duration = Duration::from_secs(60);
 const CERT_LABEL: &str = "gateway_svid_cert";
 const KEY_LABEL: &str = "gateway_svid_key";
 const TRUST_BUNDLE_LABEL: &str = "gateway_svid_trust_bundle";
+
+/// Gateway SVID rotation equality for one fingerprint entry.
+///
+/// Compares configured source identity (`label`, `source_id`), material bytes
+/// (`fingerprint`), and the stable role/scheme fields (`kind`, `source_kind`).
+/// Provider-returned [`MaterialFingerprintEntry::version`] is observability
+/// metadata only — a `k8s://` `resourceVersion` bump (or ACME/Azure/managed
+/// version id) for identical bytes must not count as a rotation.
+pub fn gateway_svid_entry_rotation_equivalent(
+    left: &MaterialFingerprintEntry,
+    right: &MaterialFingerprintEntry,
+) -> bool {
+    left.label == right.label
+        && left.source_id == right.source_id
+        && left.fingerprint == right.fingerprint
+        && left.source_kind == right.source_kind
+        && left.kind == right.kind
+}
+
+/// Gateway SVID rotation equality for a complete cert/key/trust-bundle set.
+///
+/// Used by [`GatewaySvidSourceTracker::poll`] (and the rebuild failure latch)
+/// instead of derived [`PartialEq`] on [`MaterialFingerprintEntry`], which
+/// includes `version`.
+pub fn gateway_svid_rotation_equivalent(
+    left: &[MaterialFingerprintEntry],
+    right: &[MaterialFingerprintEntry],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| gateway_svid_entry_rotation_equivalent(a, b))
+}
 
 /// How often one configured gateway SVID source is re-read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,9 +248,11 @@ pub enum GatewaySvidPollOutcome {
     Idle,
     /// The first complete read established the comparison baseline.
     Baseline,
-    /// Every source that was due fingerprinted to the same bytes.
+    /// Every source that was due is rotation-equivalent to the published set
+    /// (same source identity, material bytes, kind, and scheme; provider
+    /// `version` may differ).
     Unchanged,
-    /// At least one source's bytes changed; the caller should reload.
+    /// At least one source is not rotation-equivalent; the caller should reload.
     Changed,
     /// A due source could not be read; the caller keeps the last-good bundle.
     SourceUnavailable,
@@ -236,11 +276,13 @@ struct TrackedSource {
     due_at: Option<Instant>,
 }
 
-/// Per-source byte-fingerprint tracker for the gateway SVID material set.
+/// Per-source fingerprint tracker for the gateway SVID material set.
 ///
 /// Each source is re-read on its own cadence; the *set* of latest fingerprints
-/// is what the rotation predicate compares, so a change to any one member
-/// triggers one coherent reload of all three.
+/// is what [`gateway_svid_rotation_equivalent`] compares, so a material-byte
+/// or source-identity change on any one member triggers one coherent reload of
+/// all three. Provider `version` is retained on entries for observability but
+/// is not part of that predicate.
 pub struct GatewaySvidSourceTracker {
     sources: Vec<TrackedSource>,
     published: Option<Vec<MaterialFingerprintEntry>>,
@@ -358,7 +400,44 @@ impl GatewaySvidSourceTracker {
             };
         };
 
-        let outcome = if self.published.is_none() {
+        let outcome = self.classify_complete_set(current);
+        GatewaySvidPollReport {
+            outcome,
+            refreshed,
+            failures,
+        }
+    }
+
+    /// Adopt `entries` as the latest complete fingerprint set and classify
+    /// them against the published baseline with
+    /// [`gateway_svid_rotation_equivalent`].
+    ///
+    /// [`Self::poll`] reads due sources then classifies through the same path.
+    /// Callers that already hold a complete set — including coverage that
+    /// injects provider-version metadata file fixtures cannot produce — can
+    /// classify without re-fetching.
+    pub fn observe_complete_set(
+        &mut self,
+        entries: Vec<MaterialFingerprintEntry>,
+    ) -> GatewaySvidPollOutcome {
+        if entries.len() != self.sources.len() {
+            return GatewaySvidPollOutcome::Idle;
+        }
+        for (source, entry) in self.sources.iter_mut().zip(entries) {
+            source.last = Some(entry);
+            source.unavailable = false;
+        }
+        let Some(current) = self.current_fingerprints() else {
+            return GatewaySvidPollOutcome::Idle;
+        };
+        self.classify_complete_set(current)
+    }
+
+    fn classify_complete_set(
+        &mut self,
+        current: Vec<MaterialFingerprintEntry>,
+    ) -> GatewaySvidPollOutcome {
+        if self.published.is_none() {
             if self.forced_first_publish {
                 // The synchronous startup prime never read a complete set, so
                 // there is no anchor proving the live slot matches these bytes:
@@ -373,15 +452,21 @@ impl GatewaySvidSourceTracker {
                 self.published = Some(current);
                 GatewaySvidPollOutcome::Baseline
             }
-        } else if self.published.as_deref() == Some(current.as_slice()) {
+        } else if self
+            .published
+            .as_ref()
+            .is_some_and(|published| gateway_svid_rotation_equivalent(published, &current))
+        {
+            // Refresh published when only ignored fields (provider version)
+            // drifted, so observability keeps the latest metadata without
+            // treating that drift as a rotation. Full equality here avoids a
+            // redundant clone when nothing changed at all.
+            if self.published.as_ref() != Some(&current) {
+                self.published = Some(current);
+            }
             GatewaySvidPollOutcome::Unchanged
         } else {
             GatewaySvidPollOutcome::Changed
-        };
-        GatewaySvidPollReport {
-            outcome,
-            refreshed,
-            failures,
         }
     }
 
@@ -614,10 +699,15 @@ impl FailureReporter {
         true
     }
 
-    /// `true` when this exact candidate is not already reported as an
-    /// unpublishable reload.
+    /// `true` when this candidate is not already reported as an unpublishable
+    /// reload. Uses [`gateway_svid_rotation_equivalent`] so a provider-version
+    /// bump on the same refused bytes does not rewrite the TLS event store.
     fn arm_rebuild(&mut self, entries: &[MaterialFingerprintEntry]) -> bool {
-        if self.rebuild.as_deref() == Some(entries) {
+        if self
+            .rebuild
+            .as_ref()
+            .is_some_and(|prior| gateway_svid_rotation_equivalent(prior, entries))
+        {
             return false;
         }
         self.rebuild = Some(entries.to_vec());
