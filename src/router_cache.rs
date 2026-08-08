@@ -3305,6 +3305,7 @@ pub(crate) fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::BackendScheme;
 
     // ── CountMinSketch tests ────────────────────────────────────────────
 
