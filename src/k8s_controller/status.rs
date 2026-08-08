@@ -15,7 +15,7 @@ use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
     GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
     K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
     gateway_api_route_conflict_keys_with_acc, gateway_api_status_conflict_context,
     merge_backend_lb_policy_status, namespace_selector_matches,
     parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
@@ -223,7 +223,10 @@ async fn patch_route_status_with_retry(
 }
 
 fn route_status_kind(kind: &str) -> bool {
-    matches!(kind, "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute")
+    matches!(
+        kind,
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute"
+    )
 }
 
 /// Kinds whose status is a Gateway API `PolicyStatus` (`status.ancestors[]`)
@@ -503,7 +506,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 "ReferenceGrant" => {
                     reference_grant_permissions.ingest(object);
                 }
-                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
                     let mut seen_parents = HashSet::new();
                     for parent_ref in route_parent_refs_borrowed(object) {
                         let Some((namespace, name)) = parent_ref_gateway_target(object, parent_ref)
@@ -812,7 +815,7 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.translation_result,
             ctx.status_context,
         ),
-        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => route_status(
             object,
             ctx.indexes,
             ctx.translation_result,
@@ -1601,6 +1604,7 @@ fn listener_protocol_route_kinds(protocol: &str) -> Vec<&'static str> {
         "GRPC" | "GRPCS" => vec!["GRPCRoute"],
         "TCP" => vec!["TCPRoute"],
         "TLS" => vec!["TLSRoute"],
+        "UDP" => vec!["UDPRoute"],
         _ => Vec::new(),
     }
 }
@@ -1804,6 +1808,19 @@ fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
             conflict.winner.name
         );
     }
+    if conflict.loser.kind == "UDPRoute" {
+        // UDPRoute same-listener arbitration suppresses traffic ownership only:
+        // the loser stays Accepted (attached) under the upstream multiple-route
+        // attachment contract, while Programmed/Conflicted carry non-effective
+        // ownership. Do not phrase this as an Accepted rejection.
+        return format!(
+            "Ferrum did not program this UDPRoute on parent={} because another UDPRoute already owns effective traffic on the same UDP listener ({}); winner is {}/{}",
+            conflict.key.parent_ref,
+            conflict.key.listen_path,
+            conflict.winner.namespace,
+            conflict.winner.name
+        );
+    }
     format!(
         "Ferrum rejected part of this route because it conflicts on parent={} host={} path={}; winner is {}/{}",
         conflict.key.parent_ref,
@@ -1922,6 +1939,26 @@ fn route_status(
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
+                } else if error_is_unsupported_shape(error) {
+                    // An object that is valid under the pinned Gateway API CRD
+                    // but names a shape Ferrum does not implement is
+                    // `Accepted=False` / `UnsupportedValue` — the upstream
+                    // constant for exactly this — not the generic `Invalid`,
+                    // which would report a well-formed object as malformed.
+                    // Reference resolution is independent of the unsupported
+                    // field, so it is still reported on its own terms.
+                    let unresolved_refs_reason =
+                        route_unresolved_backend_ref_reason(object, indexes);
+                    let resolved_refs = unresolved_refs_reason.is_none();
+                    let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
+                    (
+                        false,
+                        resolved_refs,
+                        false,
+                        "UnsupportedValue",
+                        resolved_refs_reason,
+                        format!("Ferrum does not implement this route shape: {error}"),
+                    )
                 } else {
                     (
                         false,
@@ -1958,6 +1995,14 @@ fn route_status(
             && parent_route_keys
                 .iter()
                 .all(|key| parent_conflict_keys.contains(key));
+        // Gateway API UDPRoute multiple-route attachment: two otherwise-valid
+        // UDPRoutes on one listener both report Accepted=True; only the oldest
+        // is effective/Programmed. Do not use same-kind UDP conflict to flip
+        // Accepted false (HTTP/GRPC cross-kind and same-path acceptance stay
+        // on the conflict-rejects path below).
+        let conflict_rejects_acceptance =
+            all_parent_matches_conflicted && object.kind != "UDPRoute";
+        let udp_fully_shadowed = object.kind == "UDPRoute" && all_parent_matches_conflicted;
         let conflict_message = parent_conflicts
             .first()
             .map(|conflict| route_conflict_message(conflict));
@@ -1972,11 +2017,11 @@ fn route_status(
             && !not_allowed_by_listener
             && !route_parent_ref_has_matching_listener(object, parent_ref, indexes);
         let accepted_for_parent = accepted
-            && !all_parent_matches_conflicted
+            && !conflict_rejects_acceptance
             && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
-        let accepted_reason = if all_parent_matches_conflicted {
+        let accepted_reason = if conflict_rejects_acceptance {
             "Conflicted"
         } else if not_allowed_by_listener {
             "NotAllowedByListeners"
@@ -1984,10 +2029,15 @@ fn route_status(
             "NoMatchingParent"
         } else if no_matching_listener_hostname {
             "NoMatchingListenerHostname"
+        } else if udp_fully_shadowed {
+            // Attachment is accepted; empty materialization here means the
+            // newer route lost traffic ownership, not that the route had no
+            // rules — keep reason Accepted (not NoRules/Conflicted).
+            "Accepted"
         } else {
             accepted_reason
         };
-        let accepted_message = if all_parent_matches_conflicted {
+        let accepted_message = if conflict_rejects_acceptance {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
             "Ferrum rejected this route attachment because it is not permitted by the target Gateway listener"
@@ -1995,6 +2045,8 @@ fn route_status(
             "Ferrum rejected this route attachment because no matching parent listener was found"
         } else if no_matching_listener_hostname {
             "Ferrum rejected this route attachment because no matching listener hostname was found"
+        } else if udp_fully_shadowed {
+            "Ferrum accepted this route attachment"
         } else {
             &message
         };
@@ -2638,7 +2690,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             object.metadata.namespace.as_str(),
             object.metadata.name.as_str(),
         )),
-        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
             // Borrowed predicate only — do not deep-clone parentRefs before the
             // fair work budget selects the expensive status window (#2397).
             route_has_managed_parent_ref_indexed(object, indexes)
@@ -3099,6 +3151,23 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
     }
 }
 
+/// True when the translator rejected an object that is **valid** under the
+/// pinned Gateway API CRD schema because Ferrum does not implement that shape.
+///
+/// The diagnostic carries [`UNSUPPORTED_SHAPE_MARKER`] verbatim and names the
+/// offending field, so the route reports the upstream `UnsupportedValue`
+/// reason instead of the generic `Invalid`. A malformed object (a field the
+/// CRD does not define, a value outside the CRD's own bounds) is not tagged
+/// and keeps reporting `Invalid`.
+fn error_is_unsupported_shape(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains(UNSUPPORTED_SHAPE_MARKER)
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
 fn is_status_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -3108,6 +3177,7 @@ fn is_status_kind(kind: &str) -> bool {
             | "GRPCRoute"
             | "TCPRoute"
             | "TLSRoute"
+            | "UDPRoute"
             | "BackendTLSPolicy"
             | "BackendLBPolicy"
             | "XBackendTrafficPolicy"
@@ -3123,6 +3193,7 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("GRPCRoute", "v1") => "grpcroutes",
         ("TCPRoute", "v1alpha2") => "tcproutes",
         ("TLSRoute", "v1alpha2") => "tlsroutes",
+        ("UDPRoute", "v1alpha2") => "udproutes",
         // Both channels Ferrum watches. An object served under any other
         // version is skipped rather than patched through a guessed plural.
         ("BackendTLSPolicy", "v1" | "v1alpha3") => "backendtlspolicies",

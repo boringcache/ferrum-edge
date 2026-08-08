@@ -325,12 +325,12 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
             window.contains("finalize_h3_upload_deadline_rejection("),
             "phase {phase} must finalize the deadline rejection before returning"
         );
-        // After a mid-recv_data cancel, STOP_SENDING must not run in this arm:
-        // h3-quinn would unwrap-abort under panic=abort. Quinn Drop still stops
-        // the peer when the RequestStream is released after HEADERS are written.
+        // The arm must not halt before the rejection is finalized and written.
+        // The shared full-stream writer halts afterward through the vendored
+        // h3-quinn transport, which remains reachable after the cancelled read.
         assert!(
             !window.contains("halt_cancelled_h3_upload("),
-            "phase {phase} must not STOP_SENDING after a cancelled mid-recv drain"
+            "phase {phase} must not reverse response-before-teardown ordering"
         );
     }
 
@@ -371,14 +371,14 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     let bridge = &source[start..start + end];
     assert!(bridge.contains("collect_h3_request_body_with_deadline("));
     assert!(bridge.contains("drain_h3_body("));
-    // too-large and read rely on write_grpc_error_for_request (HEADERS then
+    // Too-large and read rely on write_grpc_error_for_request (HEADERS then
     // halt). Pre-write STOP_SENDING would reverse that order and duplicate the
-    // writer's halt. Timed-out / deadline drains cancel mid-recv_data and must
-    // skip STOP_SENDING so h3-quinn cannot unwrap-abort under panic=abort.
+    // writer's halt. Timed-out drains likewise halt only after their bounded
+    // terminal write; deadline drains delegate that ordering to the finalizer.
     assert_eq!(
         bridge.matches("halt_request_body(stream)").count(),
-        0,
-        "too-large/read must not pre-halt before write_grpc_error_for_request; cancel exits must not STOP_SENDING"
+        1,
+        "only the timed-out arm halts directly, after its bounded terminal write"
     );
     assert!(bridge.contains("write_grpc_error_for_request("));
     assert!(bridge.contains("write_grpc_error_for_request_with_recv_halt("));
@@ -392,8 +392,8 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         .next()
         .expect("bounded timed-out bridge arm");
     assert!(
-        !timed_out.contains("halt_request_body(stream)"),
-        "timed-out bridge arm must skip STOP_SENDING after mid-recv cancel"
+        timed_out.contains("halt_request_body(stream)"),
+        "timed-out bridge arm must halt after the bounded terminal write"
     );
     assert!(
         timed_out.contains("write_grpc_error_for_request_with_recv_halt(")
@@ -410,7 +410,7 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         .expect("deadline bridge arm");
     assert!(
         !deadline.contains("halt_request_body(stream)"),
-        "deadline bridge arm must skip STOP_SENDING after mid-recv cancel"
+        "deadline bridge arm must delegate the post-write halt to its finalizer"
     );
     assert!(
         deadline.contains("write_final_body_reject("),

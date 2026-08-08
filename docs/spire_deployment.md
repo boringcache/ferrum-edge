@@ -51,12 +51,16 @@ Ferrum supports two CA backends selected by [`FERRUM_MESH_CA_BACKEND`](configura
 | `internal` | **Development, single-node tests, demos.** Ferrum self-issues SVIDs from a root key on disk. | Holds the CA private key locally, signs SVIDs in-process. Convenient because there are no external dependencies, but the operator owns the root key and has no rotation story beyond restarting Ferrum with new files. |
 | `spire` | **Production.** | Delegates issuance and rotation to a separately-operated SPIRE Agent over its Workload API UDS. Ferrum never sees a CA private key. |
 
-Production deployments should always use `spire`. The implementation is in
-[`src/identity/ca/spire.rs`](../src/identity/ca/spire.rs) — at startup, Ferrum
-opens the streaming `FetchX509SVID` RPC against the agent socket and parks a
-background task that continuously refreshes a lock-free `ArcSwap` snapshot of
-the current SVID and trust bundles. All identity reads (TLS resolvers,
-backend-pool key derivation) come from that snapshot.
+Production deployments should always use `spire`. The wired mesh runtime path
+is `start_spire_agent_mesh_svid_source` in
+[`src/modes/mesh/mod.rs`](../src/modes/mesh/mod.rs), backed by the long-lived
+[`workload_api::fetch_loop`](../src/identity/workload_api/fetch_loop.rs). It
+opens the streaming `FetchX509SVID` RPC against the agent socket and
+continuously refreshes a lock-free `ArcSwap` snapshot of the current SVID and
+trust bundles. All identity reads (TLS resolvers, backend-pool key derivation)
+come from that snapshot. `SpireAgentCa` in `src/identity/ca/spire.rs` remains a
+library CA implementation and is not constructed by the production mesh
+runtime.
 
 For the **gateway-to-mesh** path (a north-south `database`/`file`/`dp`-mode
 gateway that originates HBONE traffic into the mesh), Ferrum reads SVID
@@ -366,10 +370,13 @@ distinct SPIFFE ID and downstream policy can pin the exact node waypoint peer.
 The Kubernetes discovery path resolves that token from `spec.nodeName` when it
 publishes `Workload.node_waypoint.spiffe_id`.
 
-The startup contract is implemented in [`SpireAgentCa::new`](../src/identity/ca/spire.rs):
-Ferrum waits up to 30s for the first SVID to arrive from the agent. If it does
-not arrive in time, startup continues with the CA in a degraded state and
-serves once the agent pushes one — incoming mTLS handshakes fail until then.
+The startup contract is implemented by `start_spire_agent_mesh_svid_source` in
+[`src/modes/mesh/mod.rs`](../src/modes/mesh/mod.rs): Ferrum waits up to 30s for
+the first matching SVID to arrive from the agent. If it does not arrive in
+time, startup returns an error and refuses to bind mesh listeners without a
+runtime identity. The deployment supervisor must restart or reschedule the
+pod after the SPIRE Agent path recovers; Ferrum does not start in a degraded
+identity state.
 
 ### North-south gateway pods (database / file / dp / cp modes)
 
@@ -430,7 +437,7 @@ The defaults are conservative and match SPIFFE community guidance:
 | Material | SPIRE default TTL | SPIRE rotation trigger | Ferrum behavior |
 |---|---|---|---|
 | Agent SVID | 1h | Agent rotates at half-life (~30m) | Transparent to Ferrum — the Workload API stream continues across rotation |
-| Workload X.509-SVID | 1h (configurable per entry) | Agent pushes a fresh SVID over the streaming `FetchX509SVID` RPC roughly halfway through the TTL | `SpireAgentCa`'s background task `ArcSwap::store`s the new snapshot; reads are lock-free |
+| Workload X.509-SVID | 1h (configurable per entry) | Agent pushes a fresh SVID over the streaming `FetchX509SVID` RPC roughly halfway through the TTL | The production Workload API fetch loop publishes the new snapshot through `SvidFetchHandle`; reads are lock-free |
 | Trust bundle | rotates with CA TTL (24h default) | Pushed in the same stream when it changes | Ferrum re-validates and stores; mTLS verifiers pick it up via the same `ArcSwap` |
 | Gateway file SVID | matches the file producer (SPIFFE Helper TTL, typically 1h) | File producer writes new content | Ferrum's 1s file-fingerprint poll detects change → bundle reloaded → `backend_svid_rotation_tx` revision bumped → backend TLS configs drained, active HTTP health probes restarted, optional pool drain after [`FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`](configuration.md) |
 
@@ -446,7 +453,7 @@ Ferrum exposes these mesh identity series on the Prometheus endpoint
 
 | Metric | What it tracks |
 |---|---|
-| `ferrum_mesh_cert_expiry_seconds{spiffe_id,source}` | Seconds until the observed X.509-SVID expires. `source="spire_agent"` for the Workload API path, `source="rotation"` for Ferrum-as-issuer, `source="workload_api"` for the in-process Workload API server. |
+| `ferrum_mesh_cert_expiry_seconds{spiffe_id,source}` | Seconds until the observed X.509-SVID expires. `source="spire_agent"` identifies the production SPIRE mesh path, `source="rotation"` identifies Ferrum's rotation manager, and `source="workload_api"` identifies generic Workload API fetch-loop consumers. |
 | `ferrum_mesh_cert_rotation_failures_total{spiffe_id,source}` | Counter of failed SVID fetches or rotation attempts. |
 | `ferrum_mesh_ca_health{ca_type}` | `1` healthy, `0` unhealthy. `ca_type="spire_agent"` flips to `0` on stream disconnect or fetch failure. |
 | `ferrum_mesh_trust_bundle_version{trust_domain,source}` | Monotonic version incremented when the observed trust bundle roots change. |
@@ -552,15 +559,18 @@ the federated bundle is being honored.
 
 **Symptoms**: `ferrum_mesh_ca_health{ca_type="spire_agent"} == 0`,
 `ferrum_mesh_cert_rotation_failures_total` increasing,
-`"SPIRE agent CA: failed to connect"` / `"stream RPC failed"` log lines.
+`"failed to connect to Workload API agent"`, `"Workload API stream RPC failed"`,
+or `"SVID fetch stream error"` log lines.
 
-**Ferrum behavior**: the background task in [`SpireAgentCa::stream_loop`](../src/identity/ca/spire.rs)
-keeps the last-good SVID snapshot serving for as long as the leaf certificate
-remains valid, while it reconnects with jittered exponential backoff
-(1s → 30s cap). Reads from `issue_svid` / `trust_bundle` return successfully
-until the cached SVID expires. Once the cached SVID expires and the agent is
-still unreachable, new mTLS handshakes fail closed (the rustls verifier has
-no usable chain).
+**Ferrum behavior after startup**: the production
+[`workload_api::fetch_loop`](../src/identity/workload_api/fetch_loop.rs) keeps
+the last-good SVID snapshot serving for as long as the leaf certificate
+remains valid, while it reconnects with exponential backoff (1s → 30s cap).
+The health gauge stays at `0` during the outage and returns to `1` only after a
+valid bundle is installed. Once the cached SVID expires and the agent is still
+unreachable, new mTLS handshakes fail closed because there is no usable chain.
+During initial startup, no last-good snapshot exists, so the 30-second timeout
+described above aborts startup before mesh listeners bind.
 
 **Recovery**:
 

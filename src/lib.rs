@@ -128,6 +128,7 @@ pub mod _test_support {
             target,
             config,
         )
+        .expect("test cryptographic provider must initialize the sticky-session key")
     }
 
     /// Test-only view of the SINGLE sticky-affinity `Set-Cookie` mint site every
@@ -5383,6 +5384,140 @@ pub mod _test_support {
     ) {
         let deadline = deadline_enabled.then(tokio::time::Instant::now);
         crate::proxy::strip_content_length_for_streaming_grpc_deadline(response_headers, deadline);
+    }
+
+    /// Terminal request-upload faults the full-duplex native-H3 gRPC relay can
+    /// observe (issue #3283). Mirrors `http3::server::H3GrpcUploadFault` so unit
+    /// tests can pin the signalling / RPC-termination contract without widening
+    /// the runtime API.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum H3GrpcUploadFaultKind {
+        ClientAbort,
+        MalformedTrailers,
+        Oversize,
+        BackendUploadHalted,
+    }
+
+    fn h3_grpc_upload_fault_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> crate::http3::server::H3GrpcUploadFault {
+        match kind {
+            H3GrpcUploadFaultKind::ClientAbort => {
+                crate::http3::server::H3GrpcUploadFault::ClientAbort
+            }
+            H3GrpcUploadFaultKind::MalformedTrailers => {
+                crate::http3::server::H3GrpcUploadFault::MalformedTrailers
+            }
+            H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
+            H3GrpcUploadFaultKind::BackendUploadHalted => {
+                crate::http3::server::H3GrpcUploadFault::BackendUploadHalted
+            }
+        }
+    }
+
+    /// Client-visible `(grpc-status, grpc-message)` for a native-H3 gRPC
+    /// request-upload fault, or `None` when the fault does not end the RPC and
+    /// therefore has no client-visible signalling at all — the type system
+    /// enforces that: only `H3GrpcUploadFault::terminating()` mints the value
+    /// that carries a signal.
+    pub fn h3_grpc_upload_fault_signal_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> Option<(u32, &'static str)> {
+        h3_grpc_upload_fault_for_test(kind)
+            .terminating()
+            .map(|fault| fault.grpc_signal())
+    }
+
+    /// Whether observing this upload fault must END the RPC. A backend that
+    /// stops accepting request DATA after it has everything it needs must NOT.
+    pub fn h3_grpc_upload_fault_terminates_rpc_for_test(kind: H3GrpcUploadFaultKind) -> bool {
+        h3_grpc_upload_fault_for_test(kind).terminating().is_some()
+    }
+
+    /// Return true when publishing `kind` on the shared upload state wakes the
+    /// response relay's terminating-fault wait, and false when the wait stays
+    /// parked (a non-terminating fault). Times out rather than hanging.
+    pub async fn h3_grpc_upload_fault_wakes_relay_for_test(
+        kind: H3GrpcUploadFaultKind,
+        publish_before_wait: bool,
+    ) -> bool {
+        let state = std::sync::Arc::new(crate::http3::server::H3GrpcUploadState::new());
+        let fault = h3_grpc_upload_fault_for_test(kind);
+        if publish_before_wait {
+            state.publish_fault(fault);
+        } else {
+            let publisher = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                publisher.publish_fault(fault);
+            });
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            crate::http3::server::h3_grpc_terminating_upload_fault(&state),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// The first fault latches: a later one never rewrites the RPC's outcome.
+    pub fn h3_grpc_upload_fault_latches_first_for_test(
+        first: H3GrpcUploadFaultKind,
+        second: H3GrpcUploadFaultKind,
+    ) -> H3GrpcUploadFaultKind {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        state.publish_fault(h3_grpc_upload_fault_for_test(first));
+        state.publish_fault(h3_grpc_upload_fault_for_test(second));
+        match state.fault() {
+            Some(crate::http3::server::H3GrpcUploadFault::ClientAbort) => {
+                H3GrpcUploadFaultKind::ClientAbort
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
+                H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
+                H3GrpcUploadFaultKind::Oversize
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
+                H3GrpcUploadFaultKind::BackendUploadHalted
+            }
+            None => unreachable!("a published fault must latch"),
+        }
+    }
+
+    /// Shape of the native-H3 gRPC request upload at the instant the
+    /// response-header wait expires (issue #3283).
+    ///
+    /// Mirrors what the relay can observe on the shared upload state so unit
+    /// tests can pin the attribution contract without a live QUIC backend.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct H3GrpcHeaderWaitScenario {
+        /// The upload reached a clean FIN before the wait expired.
+        pub upload_complete: bool,
+        /// The pump is parked on a backend write / FIN, not on the client.
+        pub blocked_on_backend: bool,
+        /// A latched fault, if any.
+        pub fault: Option<H3GrpcUploadFaultKind>,
+    }
+
+    /// Whether a native-H3 gRPC response-header wait expiry with this shape is
+    /// charged to the BACKEND (a real read timeout that must reach CB / passive
+    /// health / adaptive concurrency / fallback) rather than to a stalled client.
+    pub fn h3_grpc_header_wait_expiry_blames_backend_for_test(
+        scenario: H3GrpcHeaderWaitScenario,
+    ) -> bool {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        if scenario.upload_complete {
+            state.mark_complete();
+        }
+        state.set_blocked_on_backend(scenario.blocked_on_backend);
+        if let Some(kind) = scenario.fault {
+            state.publish_fault(h3_grpc_upload_fault_for_test(kind));
+        }
+        matches!(
+            crate::http3::server::classify_h3_grpc_header_wait_expiry(&state),
+            crate::http3::server::H3GrpcHeaderWaitExpiry::BackendStalled
+        )
     }
 
     /// Return true when an indefinitely stalled downstream H3 write is

@@ -16,6 +16,7 @@ rules:
       - grpcroutes
       - tlsroutes
       - tcproutes
+      - udproutes
       - referencegrants
       - backendtlspolicies
     verbs: ["get", "list", "watch"]
@@ -43,6 +44,7 @@ rules:
       - grpcroutes/status
       - tlsroutes/status
       - tcproutes/status
+      - udproutes/status
       # BackendTLSPolicy status is a Gateway API PolicyStatus
       # (`status.ancestors[]`). The writer reads live status first so
       # third-party controllers' ancestors are preserved.

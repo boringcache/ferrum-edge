@@ -34,15 +34,6 @@ capabilities:
     # reaches a subscriber outside its declared visibility.
     live_assertions:
       - sidecar.destination_rule.export_to_namespace_visibility
-    live_deferred: >-
-      Deferred for THIS suite only: Trusted Cross policy forbids PR-authored
-      mesh-e2e-sidecar executable and configuration changes, so the kind/SPIRE
-      assertion above is not emitted yet. A real multi-namespace datapath
-      acceptance DOES run the shipped binary: the namespace-local-rule case and
-      its visible-rule control in
-      tests/functional/functional_mesh_mode_test.rs, alongside semantic
-      enforcement in tests/conformance/istio_destination_rule.rs and
-      tests/integration/mesh_destination_rule_visibility_tests.rs (#2465).
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh
@@ -64,15 +55,6 @@ capabilities:
     # outright, independent of lexical namespace ordering.
     live_assertions:
       - sidecar.destination_rule.lookup_tier_client_wins
-    live_deferred: >-
-      Deferred for THIS suite only: Trusted Cross policy forbids PR-authored
-      mesh-e2e-sidecar executable and configuration changes, so the kind/SPIRE
-      assertion above is not emitted yet. A real datapath acceptance DOES run
-      the shipped binary: the client-tier-wins case in
-      tests/functional/functional_mesh_mode_test.rs, alongside semantic
-      enforcement in
-      tests/conformance/istio_destination_rule.rs and
-      tests/integration/mesh_destination_rule_visibility_tests.rs (#2469).
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh
