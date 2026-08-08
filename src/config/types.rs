@@ -2201,7 +2201,7 @@ pub enum ResponseBodyMode {
 
 /// Outbound PROXY protocol version written on backend TCP connects.
 ///
-/// When set on a `tcp` / `tcp_tls` stream proxy, Ferrum prepends a PROXY
+/// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
 /// protocol v2 binary header to every backend connection **before** any
 /// relayed application bytes (and before backend TLS handshake when
 /// originating TLS). UDP/DTLS are rejected at validation — PROXY is
@@ -2545,7 +2545,7 @@ pub struct Proxy {
     /// and before backend TLS handshake when originating TLS. Compatible with
     /// passthrough (header precedes the client's encrypted ClientHello).
     ///
-    /// Only valid for `tcp` / `tcp_tls` stream proxies. Setting it on UDP,
+    /// Only valid for `tcp` / `tcps` stream proxies. Setting it on UDP,
     /// DTLS, or HTTP proxies produces a validation error. UDP outbound PROXY
     /// is intentionally out of scope (session semantics differ).
     ///
@@ -4507,7 +4507,7 @@ impl GatewayConfig {
                 if !is_tcp_stream {
                     errors.push(format!(
                         "Proxy '{}' (scheme {}) sets backend_proxy_protocol but outbound PROXY \
-                         protocol is only valid for tcp/tcp_tls stream proxies",
+                         protocol is only valid for tcp/tcps stream proxies",
                         proxy.id,
                         proxy.scheme_display()
                     ));

@@ -417,17 +417,17 @@ async fn encode_v2_mixed_family_promotes_to_ipv6_mapped() {
 }
 
 #[test]
-fn outbound_v2_addrs_prefer_destination_ip_and_listen_port() {
+fn outbound_v2_addrs_preserve_original_destination_tuple() {
     use ferrum_edge::proxy::proxy_protocol::outbound_v2_addrs;
     use std::net::Ipv4Addr;
 
     let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
     let dest = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
-    let (src, dst) = outbound_v2_addrs(client, 4321, Some(dest), 5432, Some(local))
+    let (src, dst) = outbound_v2_addrs(client, 4321, Some(dest), Some(8443), Some(local))
         .expect("addrs should resolve");
     assert_eq!(src, SocketAddr::new(client, 4321));
-    assert_eq!(dst, SocketAddr::new(dest, 5432));
+    assert_eq!(dst, SocketAddr::new(dest, 8443));
 }
 
 #[test]
@@ -437,15 +437,27 @@ fn outbound_v2_addrs_fall_back_to_local_listener() {
 
     let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
-    let (src, dst) =
-        outbound_v2_addrs(client, 4321, None, 5432, Some(local)).expect("fallback should work");
+    let (src, dst) = outbound_v2_addrs(client, 4321, None, None, Some(local))
+        .expect("fallback should work");
     assert_eq!(src.port(), 4321);
     assert_eq!(dst.ip(), local.ip());
     assert_eq!(
         dst.port(),
-        5432,
-        "destination port is listen_port, not local ephemeral"
+        local.port(),
+        "fallback preserves the accepted socket's complete local tuple"
     );
+}
+
+#[test]
+fn outbound_v2_addrs_reject_half_populated_original_destination() {
+    use ferrum_edge::proxy::proxy_protocol::outbound_v2_addrs;
+    use std::net::Ipv4Addr;
+
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let dest = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+    assert!(outbound_v2_addrs(client, 4321, Some(dest), None, Some(local)).is_none());
+    assert!(outbound_v2_addrs(client, 4321, None, Some(8443), Some(local)).is_none());
 }
 
 #[test]
@@ -454,7 +466,7 @@ fn outbound_v2_addrs_fail_closed_without_destination() {
     use std::net::Ipv4Addr;
 
     let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
-    assert!(outbound_v2_addrs(client, 4321, None, 5432, None).is_none());
+    assert!(outbound_v2_addrs(client, 4321, None, None, None).is_none());
 }
 
 // ── Boundary size test ────────────────────────────────────────────────────────

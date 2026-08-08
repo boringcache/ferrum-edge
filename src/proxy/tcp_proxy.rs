@@ -1655,7 +1655,7 @@ async fn run_tcp_accept_loop(
 
                     // `client_ip` will be overwritten if PROXY protocol supplies a forwarded addr.
                     // `client_port` tracks the matching TCP port (forwarded src port, or peer).
-                    let (client_ip, client_port) = if proxy_protocol_enabled {
+                    let (client_ip, client_port, forwarded_dst) = if proxy_protocol_enabled {
                         let peer_addr = remote_addr;
                         let peer_ip = peer_addr.ip();
                         // Only honor the PROXY header when the LB's IP is in FERRUM_TRUSTED_PROXIES.
@@ -1675,20 +1675,25 @@ async fn run_tcp_accept_loop(
                         .await
                         {
                             Ok(result) => {
-                                let forwarded_port = match &result {
+                                let (forwarded_port, forwarded_destination) = match &result {
                                     crate::proxy::proxy_protocol::ProxyProtocolResult::Forwarded {
                                         src,
-                                        ..
-                                    } => src.port(),
+                                        dst,
+                                    } => (
+                                        src.port(),
+                                        Some(crate::util::client_identity::canonical_socket_addr(
+                                            *dst,
+                                        )),
+                                    ),
                                     crate::proxy::proxy_protocol::ProxyProtocolResult::NoAddress => {
-                                        peer_addr.port()
+                                        (peer_addr.port(), None)
                                     }
                                 };
                                 let (resolved, _direct) =
                                     crate::proxy::proxy_protocol::apply_proxy_result(
                                         result, &peer_addr,
                                     );
-                                (resolved, forwarded_port)
+                                (resolved, forwarded_port, forwarded_destination)
                             }
                             Err(e) => {
                                 crate::proxy::proxy_protocol::warn_invalid_proxy_header(
@@ -1700,7 +1705,7 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     } else {
-                        (direct_client_ip.clone(), remote_addr.port())
+                        (direct_client_ip.clone(), remote_addr.port(), None)
                     };
 
                     // Node-waypoint per-pod policy scoping (parity with the
@@ -1759,12 +1764,17 @@ async fn run_tcp_accept_loop(
                             .plugin_cache
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
-                    // Capture original destination for L4 destinationSubnets
-                    // before any splice/dial. Missing evidence denies the
-                    // predicate rather than matching by absence.
-                    stream_ctx.destination_ip = node_waypoint_orig_dst
+                    // A trusted inbound PROXY tuple is the earliest
+                    // authoritative destination. Otherwise keep the complete
+                    // kernel/capture socket address; dropping its port would
+                    // mis-advertise fixed capture listeners (for example
+                    // :15001) as the application's original destination.
+                    let original_destination = forwarded_dst
+                        .or(node_waypoint_orig_dst)
                         .or_else(|| crate::socket_opts::original_dst(&stream))
-                        .map(|addr| crate::util::client_identity::canonical_ip(addr.ip()));
+                        .map(crate::util::client_identity::canonical_socket_addr);
+                    stream_ctx.destination_ip = original_destination.map(|addr| addr.ip());
+                    stream_ctx.destination_port = original_destination.map(|addr| addr.port());
                     // Gateway binding is process/listener configuration — never
                     // inferred from wire data. EnvConfig supplies `mesh` only
                     // for mesh Sidecar topology; every other default is no
@@ -5751,7 +5761,7 @@ fn resolve_outbound_proxy_v2_header(
                 client_ip,
                 stream_ctx.client_port,
                 stream_ctx.destination_ip,
-                stream_ctx.listen_port,
+                stream_ctx.destination_port,
                 client_local_addr,
             )
             .ok_or_else(|| {

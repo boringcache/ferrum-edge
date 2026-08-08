@@ -562,7 +562,7 @@ Ferrum can prepend a [PROXY protocol v2](https://www.haproxy.org/download/1.8/do
 
 ### Enabling outbound PROXY
 
-Set `backend_proxy_protocol: v2` on any `tcp` or `tcp_tls` proxy:
+Set `backend_proxy_protocol: v2` on any `tcp` or `tcps` proxy:
 
 ```yaml
 proxies:
@@ -583,7 +583,7 @@ The header is written **immediately after** the backend TCP connect and **before
 | Field | Value |
 |-------|-------|
 | Source IP / port | Trusted stream `client_ip` + port (after inbound PROXY trust gating when enabled; otherwise the accept-time socket peer) |
-| Destination IP / port | Original destination when known (`SO_ORIGINAL_DST` / capture metadata), otherwise the listener local address; port is the stream `listen_port` |
+| Destination IP / port | Trusted inbound-PROXY destination when present; otherwise the complete original destination (`SO_ORIGINAL_DST` / capture metadata), falling back to the accepted socket's local address. The original port is preserved and is never replaced by a transparent capture listener port. |
 
 IPv4 pairs encode as `AF_INET`; mixed or IPv6 pairs encode as `AF_INET6` (IPv4 addresses are promoted to IPv4-mapped form). There are no TLVs.
 
@@ -602,7 +602,7 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - HTTP proxies must not set `listen_port`
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
-- `backend_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
+- `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 
 ### Port Availability Enforcement

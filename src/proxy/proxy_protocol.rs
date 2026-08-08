@@ -528,29 +528,31 @@ pub const V2_ENCODED_MAX_LEN: usize = V2_SIG.len() + 4 + 36;
 ///
 /// - `client_ip` / `client_port` are the trusted stream identity (after inbound
 ///   PROXY trust gating when that is enabled).
-/// - `destination_ip` is the original destination when known (`SO_ORIGINAL_DST`
-///   / capture metadata); otherwise `local_fallback` supplies the listener
-///   address the client connected to.
-/// - Destination port is always the stream proxy `listen_port`.
+/// - `destination_ip` / `destination_port` are the complete trusted original
+///   destination tuple (inbound PROXY, `SO_ORIGINAL_DST`, or capture metadata).
+/// - When neither component is present, `local_fallback` supplies the complete
+///   accepted-socket address the client connected to.
 ///
-/// Returns `None` only when neither a destination IP nor a local fallback is
-/// available — callers must fail closed rather than invent addresses.
+/// Returns `None` when no destination is available or when only half of the
+/// original tuple is populated — callers must fail closed rather than combine
+/// unrelated evidence or invent addresses.
 pub fn outbound_v2_addrs(
     client_ip: IpAddr,
     client_port: u16,
     destination_ip: Option<IpAddr>,
-    listen_port: u16,
+    destination_port: Option<u16>,
     local_fallback: Option<SocketAddr>,
 ) -> Option<(SocketAddr, SocketAddr)> {
-    let dst_ip = match destination_ip {
-        Some(ip) => crate::util::client_identity::canonical_ip(ip),
-        None => crate::util::client_identity::canonical_ip(local_fallback?.ip()),
+    let destination = match (destination_ip, destination_port) {
+        (Some(ip), Some(port)) => SocketAddr::new(
+            crate::util::client_identity::canonical_ip(ip),
+            port,
+        ),
+        (None, None) => crate::util::client_identity::canonical_socket_addr(local_fallback?),
+        _ => return None,
     };
     let src_ip = crate::util::client_identity::canonical_ip(client_ip);
-    Some((
-        SocketAddr::new(src_ip, client_port),
-        SocketAddr::new(dst_ip, listen_port),
-    ))
+    Some((SocketAddr::new(src_ip, client_port), destination))
 }
 
 /// Encode a PROXY protocol v2 binary header (PROXY command, STREAM transport).

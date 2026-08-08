@@ -1290,24 +1290,26 @@ plugin_configs: []
     light.abort();
 }
 
+type ObservedProxyV2Tuple = (std::net::SocketAddr, std::net::SocketAddr);
+
 /// Start a TCP backend that requires a PROXY v2 header, then echoes the remainder.
-/// Captures the parsed source IP into `observed_src` for assertions.
+/// Captures the parsed source/destination tuple for assertions.
 async fn start_proxy_v2_expecting_echo_server_on(
     listener: TcpListener,
-    observed_src: Arc<tokio::sync::Mutex<Option<std::net::SocketAddr>>>,
+    observed_tuple: Arc<tokio::sync::Mutex<Option<ObservedProxyV2Tuple>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((mut stream, _addr)) = listener.accept().await {
-            let observed_src = Arc::clone(&observed_src);
+            let observed_tuple = Arc::clone(&observed_tuple);
             tokio::spawn(async move {
                 match ferrum_edge::proxy::proxy_protocol::read_proxy_header(&mut stream, Some(2))
                     .await
                 {
                     Ok(ferrum_edge::proxy::proxy_protocol::ProxyProtocolResult::Forwarded {
                         src,
-                        ..
+                        dst,
                     }) => {
-                        *observed_src.lock().await = Some(src);
+                        *observed_tuple.lock().await = Some((src, dst));
                     }
                     Ok(_) | Err(_) => {
                         return;
@@ -1349,9 +1351,12 @@ fn v2_header_tcp4_bytes(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16
 async fn test_tcp_outbound_proxy_protocol_v2_direct_client() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let observed_src = Arc::new(tokio::sync::Mutex::new(None));
-    let backend =
-        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_src)).await;
+    let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
+    let backend = start_proxy_v2_expecting_echo_server_on(
+        backend_listener,
+        Arc::clone(&observed_tuple),
+    )
+    .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
@@ -1387,13 +1392,16 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let src = (*observed_src.lock().await).expect("backend must observe PROXY header");
+    let (src, dst) =
+        (*observed_tuple.lock().await).expect("backend must observe PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         "outbound PROXY src must be the direct client IP"
     );
     assert_ne!(src.port(), 0);
+    assert_eq!(dst.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    assert_eq!(dst.port(), proxy_port);
 
     shutdown_gateway(&mut gateway);
     backend.abort();
@@ -1405,9 +1413,12 @@ plugin_configs: []
 async fn test_tcp_outbound_proxy_protocol_v2_chained_inbound() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let observed_src = Arc::new(tokio::sync::Mutex::new(None));
-    let backend =
-        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_src)).await;
+    let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
+    let backend = start_proxy_v2_expecting_echo_server_on(
+        backend_listener,
+        Arc::clone(&observed_tuple),
+    )
+    .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
         |proxy_port| {
@@ -1436,7 +1447,12 @@ plugin_configs: []
 
     let mut stream = connect_tcp_proxy(proxy_port).await;
     // Pretend to be an LB: advertise a distinct public client identity.
-    let inbound = v2_header_tcp4_bytes([203, 0, 113, 50], [127, 0, 0, 1], 40000, proxy_port);
+    let inbound = v2_header_tcp4_bytes(
+        [203, 0, 113, 50],
+        [192, 0, 2, 10],
+        40000,
+        15432,
+    );
     stream
         .write_all(&inbound)
         .await
@@ -1451,13 +1467,19 @@ plugin_configs: []
         .expect("read error");
     assert_eq!(&buf[..n], payload);
 
-    let src = (*observed_src.lock().await).expect("backend must observe outbound PROXY header");
+    let (src, dst) = (*observed_tuple.lock().await)
+        .expect("backend must observe outbound PROXY header");
     assert_eq!(
         src.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50)),
         "outbound PROXY must advertise the inbound-forwarded client IP"
     );
     assert_eq!(src.port(), 40000);
+    assert_eq!(
+        dst,
+        std::net::SocketAddr::from(([192, 0, 2, 10], 15432)),
+        "trusted inbound destination tuple must be re-advertised unchanged"
+    );
 
     shutdown_gateway(&mut gateway);
     backend.abort();

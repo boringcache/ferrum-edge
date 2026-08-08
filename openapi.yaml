@@ -7589,7 +7589,7 @@ components:
             Default: null / false (disabled; socket peer is always used as client_ip).
         backend_proxy_protocol:
           type: [string, "null"]
-          enum: [v2]
+          enum: [v2, null]
           description: |
             Opt-in outbound PROXY protocol written on backend TCP connects for this
             stream proxy. When set to `v2`, Ferrum prepends a PROXY protocol v2 binary
@@ -7602,7 +7602,7 @@ components:
             stream_proxy_protocol is enabled and the peer is trusted, the forwarded
             client identity is advertised; otherwise the accept-time socket peer is used.
 
-            Only valid for tcp / tcp_tls stream proxies. Setting it on UDP, DTLS, or HTTP
+            Only valid for tcp / tcps stream proxies. Setting it on UDP, DTLS, or HTTP
             proxies produces a validation error (PROXY protocol is TCP-borne). UDP
             outbound PROXY is intentionally out of scope.
 

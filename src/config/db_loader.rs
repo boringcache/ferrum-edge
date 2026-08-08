@@ -10319,9 +10319,8 @@ fn row_to_proxy_inner(
                         crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
                             || {
                                 anyhow::anyhow!(
-                                    "Proxy {}: invalid backend_proxy_protocol value {:?}",
-                                    pid,
-                                    trimmed
+                                    "Proxy {}: invalid backend_proxy_protocol value",
+                                    pid
                                 )
                             },
                         )?,
