@@ -73,6 +73,7 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),

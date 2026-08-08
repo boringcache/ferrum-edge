@@ -42,6 +42,7 @@ use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancerCache, STICKY_SESSION_TOKEN_LEN, is_sticky_session_token,
     sticky_session_token,
 };
+use sha2::{Digest, Sha256};
 
 const NAMESPACE: &str = "ferrum";
 const UPSTREAM_ID: &str = "gwapi-route-upstream-default-sample-r0";
@@ -112,6 +113,7 @@ fn scope(namespace: &str, upstream_id: &str) -> String {
 
 fn token_for(namespace: &str, upstream_id: &str, target: &UpstreamTarget) -> String {
     sticky_session_token(&scope(namespace, upstream_id), target)
+        .expect("test cryptographic provider must initialize the sticky-session key")
 }
 
 #[test]
@@ -157,6 +159,90 @@ fn distinct_backends_mint_distinct_tokens() {
     let token_other_port = token_for(NAMESPACE, UPSTREAM_ID, &other_port);
     assert_ne!(token_a, token_b);
     assert_ne!(token_a, token_other_port);
+}
+
+#[test]
+fn predictable_route_and_backend_metadata_cannot_forge_a_binding() {
+    let backend = target("10.1.0.11", 8080);
+    let cache = cache_for(sticky_upstream(vec![backend.clone()]));
+    let snapshot = cache.load();
+
+    // This mirrors the vulnerable unkeyed construction: knowing the public
+    // domain, route scope, and endpoint was sufficient to manufacture a token.
+    let mut digest = Sha256::new();
+    digest.update(b"ferrum-sticky-session-v3");
+    digest.update([0x1f]);
+    digest.update((scope(NAMESPACE, UPSTREAM_ID).len() as u64).to_be_bytes());
+    digest.update(scope(NAMESPACE, UPSTREAM_ID));
+    digest.update((backend.host.len() as u64).to_be_bytes());
+    digest.update(backend.host.as_bytes());
+    digest.update(backend.port.to_be_bytes());
+    digest.update([0, 0, 0]);
+    digest.update([0, 0]);
+    digest.update(0u64.to_be_bytes());
+    let forged = hex::encode(digest.finalize());
+
+    assert!(is_sticky_session_token(&forged));
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &snapshot,
+            NAMESPACE,
+            UPSTREAM_ID,
+            &forged,
+            None,
+            None,
+            None,
+        )
+        .is_none(),
+        "an unkeyed digest of predictable metadata must not authenticate"
+    );
+}
+
+#[test]
+fn a_reload_keeps_outstanding_bindings_resolvable() {
+    let pinned = target("10.1.0.10", 8080);
+    let targets = vec![pinned.clone(), target("10.1.0.11", 8080)];
+    let cache = cache_for(sticky_upstream(targets.clone()));
+    let token = token_for(NAMESPACE, UPSTREAM_ID, &pinned);
+
+    assert!(
+        LoadBalancerCache::select_sticky_from(
+            &cache.load(),
+            NAMESPACE,
+            UPSTREAM_ID,
+            &token,
+            None,
+            None,
+            None,
+        )
+        .is_some(),
+        "the freshly minted binding must resolve before the reload"
+    );
+
+    // The authentication key is process-local, NOT per-balancer. A reload
+    // rebuilds every binding index from the configured targets, and those
+    // indexes must still be keyed by the tokens clients are already holding.
+    // Were the key re-derived per build, every outstanding session would miss,
+    // fall back to ordinary selection, and be handed a fresh cookie on every
+    // response — the reissue churn that mint/index disagreement produces.
+    cache.rebuild(&GatewayConfig {
+        upstreams: vec![sticky_upstream(targets)],
+        ..GatewayConfig::default()
+    });
+
+    let after = cache.load();
+    let bound = LoadBalancerCache::select_sticky_from(
+        &after,
+        NAMESPACE,
+        UPSTREAM_ID,
+        &token,
+        None,
+        None,
+        None,
+    )
+    .expect("a reload must not invalidate an outstanding binding");
+    assert_eq!(bound.host, pinned.host);
+    assert_eq!(bound.port, pinned.port);
 }
 
 #[test]
