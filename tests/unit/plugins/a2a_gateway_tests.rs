@@ -2167,20 +2167,17 @@ async fn grpc_default_service_is_the_canonical_a2a_03_identity() {
     );
 }
 
-/// A2A 1.0's service is not enabled by default, so 1.0 traffic is not silently
-/// pulled into a 0.3 gateway's card path at all.
+/// A2A 1.0 remains detected by default so upgrades cannot bypass existing
+/// method policy. Its declared schema still prevents 0.3 card decoding.
 #[tokio::test]
-async fn grpc_a2a_10_service_is_not_detected_by_default() {
+async fn grpc_a2a_10_service_is_detected_by_default() {
     let plugin = plugin(json!({
         "discovery": {"public_base_url": "https://gateway.example.com"}
     }));
     let (ctx, detected) =
         detect_grpc_card_on_service(&plugin, "lf.a2a.v1.A2AService", "GetAgentCard").await;
-    assert!(
-        !detected,
-        "lf.a2a.v1.A2AService is A2A 1.0 and must not be a 0.3 gateway's default"
-    );
-    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(detected, "A2A 1.0 traffic must remain subject to policy");
+    assert!(plugin.should_buffer_response_body(&ctx));
 }
 
 /// **The load-bearing regression.** Even when an operator explicitly configures
@@ -3505,6 +3502,28 @@ async fn grpc_policy_deny_returns_reject_for_proxy_normalization() {
 }
 
 #[tokio::test]
+async fn grpc_policy_deny_applies_to_legacy_default_a2a_10_service() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("SendMessage", "application/grpc");
+    ctx.path = "/lf.a2a.v1.A2AService/SendMessage".to_string();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn task_id_metadata_uses_known_a2a_locations_only() {
     let plugin = plugin(json!({}));
     let (mut ctx, mut headers) = jsonrpc_ctx(json!({
@@ -4148,9 +4167,14 @@ fn openapi_grpc_services_default_is_the_canonical_a2a_03_service() {
     }
     assert!(inside, "A2aGatewayConfig schema section not found");
     let section = section.as_str();
+    // Both published identities are recognized by default so a deployment that
+    // relied on the former 1.0 default keeps method-policy enforcement, but the
+    // 0.3 service stays FIRST: it is the primary identity, and the only one
+    // eligible for Agent Card rewriting.
     assert!(
-        section.contains(r#"default: ["a2a.v1.A2AService"]"#),
-        "endpoint.grpc_services must default to the canonical A2A 0.3 service"
+        section.contains(r#"default: ["a2a.v1.A2AService", "lf.a2a.v1.A2AService"]"#),
+        "endpoint.grpc_services must default to the canonical A2A 0.3 service first, \
+         with A2A 1.0 recognized for policy"
     );
     assert!(
         !section.contains(r#"default: ["lf.a2a.v1.A2AService"]"#),
@@ -4184,7 +4208,7 @@ async fn default_grpc_service_detection_matches_the_published_default() {
     let plugin = plugin(json!({}));
     for (service, expected) in [
         ("a2a.v1.A2AService", true),
-        ("lf.a2a.v1.A2AService", false),
+        ("lf.a2a.v1.A2AService", true),
         ("acme.agents.v1.AgentService", false),
     ] {
         let (_, detected) = detect_grpc_card_on_service(&plugin, service, "GetTask").await;
