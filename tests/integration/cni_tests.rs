@@ -2817,7 +2817,11 @@ mod install_lifecycle {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(before.ino(), after.ino(), "identical bytes should be reused");
+            assert_eq!(
+                before.ino(),
+                after.ino(),
+                "identical bytes should be reused"
+            );
         }
         let _ = (before, after);
 

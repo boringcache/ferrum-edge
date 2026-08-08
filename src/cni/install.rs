@@ -166,18 +166,15 @@ const REASON_TARGET_OTHER_OWNER: &str =
     "existing configuration is owned by a different Ferrum install";
 /// Another CNI configuration still chains to the shared plugin binary and the
 /// staged bytes differ from the installed ones.
-const REASON_SHARED_BINARY_REFERENCED: &str =
-    "another CNI configuration on this node still references the ferrum-cni plugin, \
+const REASON_SHARED_BINARY_REFERENCED: &str = "another CNI configuration on this node still references the ferrum-cni plugin, \
      and the staged binary differs from the installed one";
 /// The installed plugin binary could not be classified, so its bytes are
 /// unknown, while another configuration still chains to it.
-const REASON_SHARED_BINARY_UNCLASSIFIABLE: &str =
-    "the installed plugin binary could not be classified as a plain regular file, \
+const REASON_SHARED_BINARY_UNCLASSIFIABLE: &str = "the installed plugin binary could not be classified as a plain regular file, \
      and another CNI configuration on this node still references it";
 /// The directory scan that decides whether the binary is shared could not be
 /// completed, so replacement is refused rather than guessed at.
-const REASON_SHARED_BINARY_UNPROVABLE: &str =
-    "the CNI configuration directory could not be scanned for other ferrum-cni references, \
+const REASON_SHARED_BINARY_UNPROVABLE: &str = "the CNI configuration directory could not be scanned for other ferrum-cni references, \
      so the shared plugin binary is not replaced";
 
 /// Install-time identity stamped onto every generated artifact.
