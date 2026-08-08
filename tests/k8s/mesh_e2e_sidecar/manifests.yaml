@@ -931,6 +931,120 @@ spec:
             path: /run/spire/sockets
             type: DirectoryOrCreate
 ---
+# ── DestinationRule visibility backends (MESH_EXTERNAL ServiceEntry ends) ──
+# Plain echo pods (no sidecar, no SPIRE). The client ConfigMap declares them as
+# static endpoints of a ServiceEntry owned by namespace `beta`, so DestinationRule
+# exportTo / lookup-tier probes can distinguish round-robin from consistent-hash
+# by observing which labelled body answers. Bodies are fixed markers, not the
+# shared __APP_BODY__, so they cannot collide with the svc STRICT-mTLS probes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dr-backend-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dr-backend-a
+  template:
+    metadata:
+      labels:
+        app: dr-backend-a
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"backend-a\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dr-backend-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dr-backend-b
+  template:
+    metadata:
+      labels:
+        app: dr-backend-b
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"backend-b\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+---
 # ── Rogue client pod (dest-side authz negative) ─────────────────────────────
 # Identical to the client but running as sa/rogue: it completes valid
 # same-trust-domain mTLS to the destination and is then DENIED at the

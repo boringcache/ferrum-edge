@@ -34,8 +34,9 @@ RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 `mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
 visibility and lookup-namespace resolution are also GA-enrolled and live
-blocking: the sidecar fixture runs focused, three-namespace shipped-binary
-datapath probes and requires both emitted assertion IDs to pass. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
+blocking: the sidecar fixture drives those behaviors on the captured client
+egress datapath against a multi-namespace DestinationRule model and requires
+both emitted assertion IDs to pass. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
 plugin onto its materialized outbound routes. **SPIFFE identity plumbing
 (SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):
@@ -74,13 +75,16 @@ CI today."
   evidence is authoritative over a conflicting upstream container namespace, and
   VirtualService-derived CORS
   policy narrows through the SAME shared `exportTo` evaluator at the same
-  enforcement points a DestinationRule does. These new DestinationRule semantics are pinned by
-  Rust conformance/integration gates and are explicitly live-deferred under
-  Trusted Cross policy. The existing sidecar traffic surface **and the native
+  enforcement points a DestinationRule does. These DestinationRule semantics are
+  pinned by Rust conformance/integration gates **and** by live
+  `sidecar.destination_rule.export_to_namespace_visibility` /
+  `sidecar.destination_rule.lookup_tier_client_wins` assertions from the
+  `mesh-e2e-sidecar` suite. The existing sidecar traffic surface **and the native
   config transport** remain **live-verified
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
   captured datapath (STRICT mTLS positive + plaintext-rejected negative,
-  destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
+  destination-side authz 403, JWT valid/missing/invalid, DR exportTo visibility
+  + lookup hierarchy, DR connectTimeout
   two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
   CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
   end) on every relevant PR and every main push, the artifact is
