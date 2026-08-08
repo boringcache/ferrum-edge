@@ -13901,7 +13901,10 @@ async fn h3_mesh_serve_one_rpc(
     }
     let mut trailers = hyper::HeaderMap::new();
     trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
-    trailers.insert("grpc-message", hyper::header::HeaderValue::from_static("ok"));
+    trailers.insert(
+        "grpc-message",
+        hyper::header::HeaderValue::from_static("ok"),
+    );
     trailers.insert(
         "x-mesh-peer-trailer",
         hyper::header::HeaderValue::from_static("real-http2-trailer"),
@@ -14432,7 +14435,10 @@ fn h3_mesh_mtls_tags(peer_port: u16, pinned_peer: &str) -> Vec<(&'static str, St
         ("mesh.mtls", "true".to_string()),
         ("mesh.mtls_port", peer_port.to_string()),
         ("mesh.spiffe_id", pinned_peer.to_string()),
-        ("mesh.mtls_authority_host", H3_MESH_SERVICE_AUTHORITY.to_string()),
+        (
+            "mesh.mtls_authority_host",
+            H3_MESH_SERVICE_AUTHORITY.to_string(),
+        ),
     ]
 }
 
@@ -14528,8 +14534,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     assert_eq!(observed.te.as_deref(), Some("trailers"));
     assert_eq!(observed.content_type.as_deref(), Some("application/grpc"));
     assert_eq!(
-        observed.body,
-        payload,
+        observed.body, payload,
         "the H3 request DATA must reach the peer byte-for-byte"
     );
 
@@ -15165,7 +15170,12 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         config_for(&h3_mesh_mtls_tags(peer_a.port, H3_MESH_PEER_SPIFFE)),
         &svids[0],
         &frontend,
-        &[dead_backend_port, peer_a.port, peer_b.port, declared_app_port],
+        &[
+            dead_backend_port,
+            peer_a.port,
+            peer_b.port,
+            declared_app_port,
+        ],
     )
     .await;
 

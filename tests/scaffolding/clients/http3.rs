@@ -452,7 +452,9 @@ impl Http3Client {
         for (name, value) in extra_headers {
             builder = builder.header(*name, *value);
         }
-        let req = builder.body(()).map_err(|e| format!("build request: {e}"))?;
+        let req = builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
         let stream = tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
             .await
             .map_err(|_| "send_request timed out")?
