@@ -9289,6 +9289,15 @@ impl ProxyState {
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
+        // Listener TLS class is route-table input resolved onto
+        // `PortScopedProxy` at build time, but it lives on GatewayConfig rather
+        // than the Proxy and therefore never appears in ConfigDelta. A pure
+        // HTTP<->HTTPS class flip must rebuild the table even when every proxy
+        // object and timestamp is byte-identical.
+        if old_config.http_tls_listen_ports != new_config.http_tls_listen_ports {
+            return true;
+        }
+
         // Keyed by `(namespace, id)`: a bare-id index would let one tenant's
         // same-id proxy stand in for another's, masking a real projected
         // route-content change (or inventing one that never happened).
@@ -10145,9 +10154,10 @@ impl ProxyState {
                     let mesh_changed = current.config.mesh != new_config.mesh;
                     // DestinationRule-derived projections
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
-                    // `resolved_tls`, stream-relay dispatch maps) are
-                    // `#[serde(skip)]` and invisible to ConfigDelta's
-                    // `updated_at` comparison. A DR-only edit that left every
+                    // `resolved_tls`, stream-relay dispatch maps) and the
+                    // Gateway-level `http_tls_listen_ports` classification are
+                    // invisible to ConfigDelta's `updated_at` comparison. A
+                    // DR-only edit or listener-class flip that left every
                     // resource timestamp unchanged must still republish the
                     // route table (and LB, which also consumes DR-derived
                     // upstream policy) before any status/revision ACK — otherwise

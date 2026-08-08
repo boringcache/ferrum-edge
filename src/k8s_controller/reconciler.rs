@@ -1200,7 +1200,7 @@ pub fn merge_k8s_translation(
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
     merge_k8s_frontend_tls(&mut merged, k8s_config);
-    merge_http_tls_listen_ports(&mut merged, k8s_config);
+    merge_http_tls_listen_ports(&mut merged, k8s_config, managed_namespaces);
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -1287,7 +1287,11 @@ fn merge_k8s_mesh_overlay(merged: &mut GatewayConfig, k8s_config: &GatewayConfig
 ///
 /// Dropping this step is not cosmetic — an HTTPS listener's routes would be
 /// published classified as plaintext and every TLS request to them would 404.
-fn merge_http_tls_listen_ports(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
+fn merge_http_tls_listen_ports(
+    merged: &mut GatewayConfig,
+    k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+) {
     let claimed: BTreeSet<(String, u16)> = merged
         .proxies
         .iter()
@@ -1299,7 +1303,14 @@ fn merge_http_tls_listen_ports(merged: &mut GatewayConfig, k8s_config: &GatewayC
         .collect();
     merged
         .http_tls_listen_ports
-        .retain(|entry| claimed.contains(entry));
+        .retain(|entry| {
+            // A current translation is authoritative for every managed
+            // namespace. Do not infer ownership from a surviving proxy at the
+            // same `(namespace, port)`: that proxy may be file/native-authored,
+            // and retaining the old Kubernetes bit would silently reclassify
+            // it as TLS after the Gateway listener was deleted.
+            !namespace_is_managed(&entry.0, managed_namespaces) && claimed.contains(entry)
+        });
     merged
         .http_tls_listen_ports
         .extend(k8s_config.http_tls_listen_ports.iter().cloned());
