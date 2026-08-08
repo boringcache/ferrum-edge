@@ -192,6 +192,7 @@ pub struct ServeHandles {
     /// Gateway API listener-port lifecycle. Exposed so in-process callers can
     /// read the ports actually bound and any refusal / bind failure, rather
     /// than inferring listener state from traffic.
+    #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listeners: Arc<GatewayListenerManager>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build

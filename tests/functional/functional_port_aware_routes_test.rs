@@ -12,7 +12,9 @@
 //!   backend, with the global process bind failing closed;
 //! - an HTTP listener and an HTTPS listener on **distinct** ports, each
 //!   reaching only its own backend on the correct protocol;
-//! - SIGHUP reload that adds a listener port and withdraws another.
+//! - SIGHUP reload that adds a listener port and withdraws another;
+//! - two **TLS** listener ports with HTTP/3 enabled, served over both TCP and
+//!   QUIC, with the QUIC socket following a SIGHUP withdrawal.
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
@@ -379,6 +381,11 @@ fn sighup(gateway: &TestGateway) {
 /// TLS listener port must get its own QUIC socket. This drives the real binary
 /// over HTTP/1.1-or-2 **and** HTTP/3 on both ports, and then withdraws one
 /// listener by SIGHUP to prove the QUIC socket follows the lifecycle.
+///
+/// The routes are keyed on the `127.0.0.1` authority the clients actually send,
+/// so no `Host` header is added: HTTP/2 and HTTP/3 reject a `Host` that
+/// disagrees with `:authority`, and the point here is the listener port, not
+/// host matching.
 #[cfg(unix)]
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
@@ -401,8 +408,8 @@ proxies:{}{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-a", port_a, backend_a),
-        plaintext_proxy("gw-b", port_b, backend_b),
+        loopback_proxy("gw-a", port_a, backend_a),
+        loopback_proxy("gw-b", port_b, backend_b),
     );
 
     let gateway = TestGateway::builder()
@@ -422,8 +429,8 @@ plugin_configs: []
         .danger_accept_invalid_certs(true)
         .build()
         .expect("build TLS client");
-    assert_eq!(get_on_tls_port(&client, port_a, "/api/x").await.1, "tls-a");
-    assert_eq!(get_on_tls_port(&client, port_b, "/api/x").await.1, "tls-b");
+    assert_eq!(tls_body(&client, port_a, "/api/x").await, "tls-a");
+    assert_eq!(tls_body(&client, port_b, "/api/x").await, "tls-b");
 
     // HTTP/3 on BOTH TLS listener ports — the case a single global UDP socket
     // cannot cover.
@@ -444,7 +451,7 @@ proxies:{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-a", port_a, backend_a),
+        loopback_proxy("gw-a", port_a, backend_a),
     );
     std::fs::write(config_path, only_a).expect("rewrite config");
     sighup(&gateway);
@@ -458,7 +465,7 @@ plugin_configs: []
         let attempt = client
             .get_with_options(
                 &format!("https://127.0.0.1:{port_b}/api/x"),
-                GetOptions::default().header("host", HOST),
+                GetOptions::default(),
             )
             .await;
         if attempt.is_err() {
@@ -473,6 +480,37 @@ plugin_configs: []
     assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
 }
 
+/// A route keyed on the loopback authority the test clients send.
+#[cfg(unix)]
+fn loopback_proxy(id: &str, listen_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+  - id: "{id}"
+    hosts: ["127.0.0.1"]
+    listen_path: "/api"
+    listen_port: {listen_port}
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true"#
+    )
+}
+
+#[cfg(unix)]
+async fn tls_body(client: &reqwest::Client, port: u16, path: &str) -> String {
+    let response = client
+        .get(format!("https://127.0.0.1:{port}{path}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("HTTPS GET to port {port} failed: {e}"));
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "TLS Gateway listener port {port} must serve"
+    );
+    response.text().await.unwrap_or_default()
+}
+
 /// One HTTP/3 GET against a Gateway listener port, retried until the QUIC
 /// socket is accepting (listener bind is asynchronous relative to readiness).
 #[cfg(unix)]
@@ -483,10 +521,7 @@ async fn h3_body(port: u16, path: &str) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let client = Http3Client::insecure().expect("H3 client");
-        match client
-            .get_with_options(&url, GetOptions::default().header("host", HOST))
-            .await
-        {
+        match client.get_with_options(&url, GetOptions::default()).await {
             Ok(response) => {
                 assert_eq!(
                     response.status.as_u16(),

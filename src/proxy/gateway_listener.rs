@@ -321,12 +321,16 @@ impl GatewayListenerManager {
     }
 
     /// Ports currently bound by this manager, for tests and diagnostics.
+    // The binary target re-declares these modules, so a `pub` item consumed
+    // only by `tests/` reads as dead code there.
+    #[allow(dead_code)]
     pub async fn active_ports(&self) -> Vec<u16> {
         self.listeners.lock().await.keys().copied().collect()
     }
 
     /// Ports that currently have a live QUIC listener, for tests and
     /// diagnostics.
+    #[allow(dead_code)]
     pub async fn active_http3_ports(&self) -> Vec<u16> {
         self.listeners
             .lock()
