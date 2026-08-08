@@ -2228,8 +2228,6 @@ pub fn target_hbone_cross_cluster_trust_domain(
 ///   falling back to any-federated verification.
 #[derive(Debug)]
 pub struct HboneDialPlan<'a> {
-    /// Whether this is a cross-cluster east-west dial.
-    pub cross_cluster: bool,
     /// Outer TCP/TLS host: the workload/waypoint in-cluster, the remote
     /// east-west gateway cross-cluster.
     pub dial_host: &'a str,
@@ -2263,7 +2261,6 @@ impl<'a> HboneDialPlan<'a> {
             let trust_domain = target_hbone_cross_cluster_trust_domain(target)
                 .ok_or(HbonePoolError::MissingCrossClusterTrustDomain)?;
             Ok(Self {
-                cross_cluster: true,
                 dial_host,
                 app_host,
                 hbone_port,
@@ -2273,7 +2270,6 @@ impl<'a> HboneDialPlan<'a> {
             })
         } else {
             Ok(Self {
-                cross_cluster: false,
                 dial_host,
                 app_host,
                 hbone_port,

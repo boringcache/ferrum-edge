@@ -2694,10 +2694,13 @@ impl TransportTestPools {
         }
     }
 
-    fn resolve(
-        &self,
-        target: Option<&ferrum_edge::config::types::UpstreamTarget>,
-    ) -> Result<grpc_proxy::GrpcDispatchTransport<'_>, grpc_proxy::GrpcTransportError> {
+    /// One named lifetime ties the pools and the target together, because
+    /// `for_target` borrows all four for the SAME lifetime as the transport it
+    /// returns.
+    fn resolve<'a>(
+        &'a self,
+        target: Option<&'a ferrum_edge::config::types::UpstreamTarget>,
+    ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
         grpc_proxy::GrpcDispatchTransport::for_target(
             &self.grpc,
             &self.mesh_mtls,

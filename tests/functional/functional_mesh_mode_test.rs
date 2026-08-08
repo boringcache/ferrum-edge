@@ -14336,7 +14336,7 @@ async fn spawn_h3_mesh_gateway(
     for port in reserved_ports {
         builder = builder.reserve_listener_port(*port);
     }
-    let mut gateway = builder.spawn().await.expect("spawn H3 mesh gRPC gateway");
+    let gateway = builder.spawn().await.expect("spawn H3 mesh gRPC gateway");
     gateway
         .wait_for_proxy_port(Duration::from_secs(15))
         .await
