@@ -12,6 +12,7 @@
 //!
 //! - [`spec`] — the CNI specification's stdin/stdout JSON, plus the
 //!   parsed-env representation of `CNI_*` invocation variables.
+//!
 //! Two more modules cover the host-side install lifecycle rather than the
 //! wire: [`install`] writes and provably removes the Ferrum-owned binary and
 //! chained conflist, and [`lifecycle`] rolls that install back when the

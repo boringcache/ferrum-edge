@@ -262,7 +262,7 @@ impl CniArtifactOutcome {
         match self {
             Self::Removed => "Ferrum ownership marker matched",
             Self::AlreadyAbsent => "no artifact present",
-            Self::RetainedForeign(reason) | Self::RetainedDeliberate(reason) => *reason,
+            Self::RetainedForeign(reason) | Self::RetainedDeliberate(reason) => reason,
             Self::RetainedOtherOwner => "a different Ferrum install owns this artifact",
             Self::RetainedOtherGeneration => {
                 "a different generation of this install owns this artifact"
@@ -554,7 +554,7 @@ pub fn uninstall(config: &CniUninstallConfig) -> Result<CniUninstallReport, CniI
     //    able to finish the job.
     let manifest_outcome = match &manifest_state {
         ManifestState::Absent => CniArtifactOutcome::AlreadyAbsent,
-        ManifestState::Unusable(reason) => CniArtifactOutcome::RetainedForeign(*reason),
+        ManifestState::Unusable(reason) => CniArtifactOutcome::RetainedForeign(reason),
         ManifestState::Present(manifest) => {
             if !conflist.is_cleared() || !binary.is_cleared() {
                 CniArtifactOutcome::RetainedDeliberate(
