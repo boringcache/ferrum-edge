@@ -565,9 +565,10 @@ nodeAgent:
     # state that is still required.
     uninstall:
       enabled: true
-      # How long the wait Job gives every node's cleanup pod to finish. Must
-      # fit inside `helm uninstall --timeout` (default 5m) or Helm gives up
-      # first and you lose the specific "N of M nodes" diagnostic.
+      # Shared end-to-end budget for every node's cleanup pod to finish and
+      # for the wait Job to delete the cleanup DaemonSet afterward. Must fit
+      # inside `helm uninstall --timeout` (default 5m) or Helm gives up first
+      # and you lose the specific "N of M nodes" diagnostic.
       timeoutSeconds: 240
       # Extra tolerations for the cleanup DaemonSet. The hook already
       # tolerates every taint by default so cleanup reaches nodes the

@@ -383,8 +383,13 @@ pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWait
         .await
         .map_err(|err| format!("could not build a Kubernetes client: {err}"))?;
     let api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
+    // `CLEANUP_TIMEOUT_SECS` is the budget for this entire pre-delete phase,
+    // not one full budget for readiness followed by another full budget for
+    // deletion. Keeping one deadline ensures the hook fits inside the Helm
+    // timeout operators configure around it.
+    let deadline = Instant::now() + config.timeout;
 
-    let report = await_cleanup_daemonset(&api, config).await?;
+    let report = await_cleanup_daemonset(&api, config, deadline).await?;
     if !report.release_deletion_is_safe() {
         return Err(
             "the cleanup DaemonSet scheduled onto no node, so no node was cleaned. The release \
@@ -399,7 +404,7 @@ pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWait
     // it is this Job's job, and it happens only after every node reported
     // success: while it exists, the pods it owns keep holding, and the release
     // is not yet allowed to disappear underneath them.
-    delete_cleanup_daemonset(&api, config).await?;
+    delete_cleanup_daemonset(&api, config, deadline).await?;
     Ok(report)
 }
 
@@ -412,8 +417,8 @@ pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWait
 async fn await_cleanup_daemonset(
     api: &kube::Api<k8s_openapi::api::apps::v1::DaemonSet>,
     config: &CleanupWaitConfig,
+    deadline: Instant,
 ) -> Result<CleanupWaitReport, String> {
-    let deadline = Instant::now() + config.timeout;
     let mut last = CleanupWaitReport {
         desired: 0,
         ready: 0,
@@ -496,10 +501,20 @@ async fn await_cleanup_daemonset(
 async fn delete_cleanup_daemonset(
     api: &kube::Api<k8s_openapi::api::apps::v1::DaemonSet>,
     config: &CleanupWaitConfig,
+    deadline: Instant,
 ) -> Result<(), String> {
     use kube::api::{DeleteParams, PropagationPolicy};
 
-    let deadline = Instant::now() + config.timeout;
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "cleanup finished on every node but the shared {}s cleanup phase budget expired \
+             before the DaemonSet could be deleted. Its pods are still running; inspect \
+             `kubectl -n {} get daemonset {}` and re-run `helm uninstall`.",
+            config.timeout.as_secs(),
+            config.namespace,
+            config.daemonset_name
+        ));
+    }
     let params = DeleteParams {
         propagation_policy: Some(PropagationPolicy::Foreground),
         ..DeleteParams::default()
