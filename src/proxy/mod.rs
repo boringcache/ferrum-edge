@@ -78,11 +78,11 @@ use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -108,6 +108,10 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::svid_source_watch::{
+    GATEWAY_SVID_FILE_POLL_INTERVAL, GatewaySvidPublishFn, GatewaySvidSourceSet,
+    GatewaySvidWatchConfig, run_gateway_svid_source_rotation_loop,
+};
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
@@ -5946,15 +5950,15 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
     Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
-#[derive(Debug, Clone)]
-struct GatewaySvidFilePaths {
-    cert: PathBuf,
-    key: PathBuf,
-    trust_bundle: PathBuf,
-    expected_spiffe_id: Option<String>,
-}
-
-fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvidFilePaths> {
+/// Collect the configured gateway SVID material sources for the rotation
+/// watcher.
+///
+/// Every supported source form participates — filesystem paths, `file://`,
+/// inline PEM, and provider URIs — because the watcher classifies each source's
+/// own refresh cadence (see [`crate::identity::svid_source_watch`]). Inline PEM
+/// contributes no cadence and stays static until config reload, so a fully
+/// inline triple makes the watcher exit immediately.
+fn gateway_svid_source_set_from_env(env_config: &EnvConfig) -> Option<GatewaySvidSourceSet> {
     let (Some(cert), Some(key), Some(trust_bundle)) = (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
@@ -5962,25 +5966,13 @@ fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ) else {
         return None;
     };
-    let cert_source = CertSource::parse(cert, MaterialKind::Cert);
-    let key_source = CertSource::parse(key, MaterialKind::Key);
-    let trust_bundle_source = CertSource::parse(trust_bundle, MaterialKind::CaBundle);
 
-    let (Some(cert), Some(key), Some(trust_bundle)) = (
-        cert_source.as_file_path(),
-        key_source.as_file_path(),
-        trust_bundle_source.as_file_path(),
-    ) else {
-        info!("Gateway SVID source includes non-file material; file rotation watcher disabled");
-        return None;
-    };
-
-    Some(GatewaySvidFilePaths {
-        cert,
-        key,
-        trust_bundle,
-        expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
-    })
+    Some(GatewaySvidSourceSet::new(
+        cert.to_string(),
+        key.to_string(),
+        trust_bundle.to_string(),
+        env_config.gateway_spiffe_id.clone(),
+    ))
 }
 
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
@@ -6144,135 +6136,6 @@ fn push_tls_material_source(
     if seen.insert((kind, source.pool_key_component())) {
         sources.push(
             crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
-        );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileFingerprint {
-    cert: GatewaySvidFileStamp,
-    key: GatewaySvidFileStamp,
-    trust_bundle: GatewaySvidFileStamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileStamp {
-    len: u64,
-    modified_nanos: Option<u128>,
-}
-
-fn gateway_svid_file_stamp(path: &Path) -> Result<GatewaySvidFileStamp, anyhow::Error> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("failed to stat {}: {}", path.display(), e))?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    Ok(GatewaySvidFileStamp {
-        len: metadata.len(),
-        modified_nanos,
-    })
-}
-
-fn gateway_svid_file_fingerprint(
-    paths: &GatewaySvidFilePaths,
-) -> Result<GatewaySvidFileFingerprint, anyhow::Error> {
-    Ok(GatewaySvidFileFingerprint {
-        cert: gateway_svid_file_stamp(&paths.cert)?,
-        key: gateway_svid_file_stamp(&paths.key)?,
-        trust_bundle: gateway_svid_file_stamp(&paths.trust_bundle)?,
-    })
-}
-
-async fn run_gateway_svid_file_rotation_loop(
-    state: ProxyState,
-    paths: GatewaySvidFilePaths,
-    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-) {
-    const GATEWAY_SVID_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-    let mut last_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Gateway SVID file watcher could not read startup fingerprint; continuing and will retry"
-            );
-            None
-        }
-    };
-    let mut interval = tokio::time::interval(GATEWAY_SVID_FILE_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-            return;
-        }
-
-        if let Some(shutdown) = shutdown_rx.as_mut() {
-            tokio::select! {
-                _ = interval.tick() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            interval.tick().await;
-        }
-
-        let next_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Gateway SVID file watcher could not inspect SVID files; keeping current backend identity"
-                );
-                continue;
-            }
-        };
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            continue;
-        }
-
-        let bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
-            &paths.cert,
-            &paths.key,
-            &paths.trust_bundle,
-            paths.expected_spiffe_id.as_deref(),
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    cert_path = %paths.cert.display(),
-                    key_path = %paths.key.display(),
-                    trust_bundle_path = %paths.trust_bundle.display(),
-                    "Gateway SVID files changed but reload failed; keeping current backend identity"
-                );
-                // Record the failing fingerprint so we don't re-warn every
-                // poll while the bad state is stable. The next genuine
-                // change (good or different-bad) will compare unequal and
-                // re-attempt the load.
-                last_fingerprint = Some(next_fingerprint);
-                continue;
-            }
-        };
-
-        let spiffe_id = bundle.spiffe_id.to_string();
-        state.install_gateway_file_svid_bundle(bundle);
-        state
-            .backend_svid_rotation_tx
-            .send_modify(|revision| *revision = revision.saturating_add(1));
-        let revision = *state.backend_svid_rotation_tx.borrow();
-        last_fingerprint = Some(next_fingerprint);
-        info!(
-            spiffe_id = %spiffe_id,
-            svid_revision = revision,
-            "Gateway SVID files reloaded; backend SVID rotation published"
         );
     }
 }
@@ -6861,15 +6724,41 @@ impl ProxyState {
         )
     }
 
-    fn start_gateway_svid_file_rotation_task(
+    /// Start the gateway SVID source rotation watcher.
+    ///
+    /// Covers every configured SVID source form: file paths keep the historical
+    /// 1s cadence, provider URIs are re-fetched on
+    /// `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (or their own `?poll=`), and a
+    /// fully inline-PEM triple makes the watcher exit at once. The publish
+    /// closure is the same pipeline `POST /admin/tls/rotate/svid` drives:
+    /// install the validated bundle into the SVID slot (preserving any
+    /// CP-delivered trust override), then bump the backend SVID generation so
+    /// pool keys, pool drains, and health probes observe one coherent update.
+    fn start_gateway_svid_rotation_task(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let paths = gateway_svid_file_paths_from_env(&self.env_config)?;
+        let sources = gateway_svid_source_set_from_env(&self.env_config)?;
         let state = self.clone();
-        Some(tokio::spawn(run_gateway_svid_file_rotation_loop(
-            state,
-            paths,
+        let provider_interval =
+            Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1));
+        let publish: GatewaySvidPublishFn = Box::new(move |bundle| {
+            // Slot first, then the generation bump the backend pools, pool
+            // keys, and health probes key off — never the other way round.
+            state.install_gateway_file_svid_bundle(bundle);
+            state
+                .backend_svid_rotation_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            *state.backend_svid_rotation_tx.borrow()
+        });
+        let config = GatewaySvidWatchConfig {
+            sources,
+            file_interval: GATEWAY_SVID_FILE_POLL_INTERVAL,
+            provider_interval,
+            publish,
+        };
+        Some(tokio::spawn(run_gateway_svid_source_rotation_loop(
+            config,
             shutdown_rx,
         )))
     }
@@ -7535,7 +7424,7 @@ impl ProxyState {
             ),
         };
         if let Some(handle) =
-            state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
+            state.start_gateway_svid_rotation_task(health_check_restart_rx.clone())
         {
             health_check_handles.push(handle);
         }

@@ -118,6 +118,73 @@ async fn proxy_state_loads_gateway_svid_bundle_from_env_config() {
     assert_eq!(bundle.trust_bundles.local.x509_authorities.len(), 1);
 }
 
+/// A validated source change must reach the live SVID slot **and** advance the
+/// backend SVID generation, in that order, so pool keys (`|svidg=<n>`), pool
+/// drains, and health-probe restarts all observe one coherent update (#3625).
+#[tokio::test]
+async fn gateway_svid_source_change_publishes_a_backend_rotation_generation() {
+    let files = generate_gateway_svid();
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path.clone()),
+        gateway_svid_key_path: Some(files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path.clone()),
+        ..Default::default()
+    };
+
+    let (state, _handles) = ProxyState::new(
+        GatewayConfig::default(),
+        test_dns_cache(),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+
+    assert_eq!(*state.backend_svid_rotation_tx.borrow(), 0);
+    let original_leaf = state
+        .gateway_svid_bundle
+        .load_full()
+        .as_ref()
+        .as_ref()
+        .expect("gateway svid loaded")
+        .cert_chain_der
+        .clone();
+
+    // A complete replacement generation written over the configured sources.
+    let rotated = generate_gateway_svid();
+    for (from, to) in [
+        (&rotated.key_path, &files.key_path),
+        (&rotated.cert_path, &files.cert_path),
+        (&rotated.trust_bundle_path, &files.trust_bundle_path),
+    ] {
+        let bytes = std::fs::read(from).expect("read rotated material");
+        std::fs::write(to, bytes).expect("write rotated material");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while *state.backend_svid_rotation_tx.borrow() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    assert_eq!(
+        *state.backend_svid_rotation_tx.borrow(),
+        1,
+        "a validated SVID source change must publish exactly one rotation generation"
+    );
+    let rotated_leaf = state
+        .gateway_svid_bundle
+        .load_full()
+        .as_ref()
+        .as_ref()
+        .expect("gateway svid still loaded")
+        .cert_chain_der
+        .clone();
+    assert_ne!(
+        rotated_leaf, original_leaf,
+        "the live SVID slot must hold the rotated material once the generation advanced"
+    );
+}
+
 #[tokio::test]
 async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
     let files = generate_gateway_svid();
