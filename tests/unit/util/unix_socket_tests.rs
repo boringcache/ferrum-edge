@@ -343,7 +343,6 @@ mod connect_time {
         // The identity really is inode-pinned: re-binding the same path yields a
         // different object even though the owner and mode are identical.
         let metadata = std::fs::symlink_metadata(&socket).expect("stat socket");
-        drop(_listener);
         std::fs::remove_file(&socket).expect("unlink socket");
         let _replacement = bind_socket(&socket);
         let replaced = std::fs::symlink_metadata(&socket).expect("stat replacement");

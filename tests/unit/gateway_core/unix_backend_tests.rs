@@ -145,14 +145,13 @@ async fn a_socket_swapped_after_admission_is_refused_before_any_request_byte() {
     let root = canonical_root(&temp);
     let path = root.join("app.sock");
 
-    let original = std::os::unix::net::UnixListener::bind(&path).expect("bind original socket");
+    let _original = std::os::unix::net::UnixListener::bind(&path).expect("bind original socket");
     let admitted = admit_socket_for_connect(path.to_str().expect("utf-8"), &roots(&root), &[])
         .expect("the original socket is admitted");
 
     // The swap: unlink the admitted socket and bind a different object at the
     // same path. Exactly what an attacker with write access to the directory
     // would do inside the check-to-connect window.
-    drop(original);
     std::fs::remove_file(&path).expect("unlink the admitted socket");
     let substituted = CountingPeer::bind(&path);
 
