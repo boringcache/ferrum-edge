@@ -317,9 +317,6 @@ pub(super) fn collect_backend_lb_policy(
         }
     }
 
-    validate_backend_lb_policy_status_capacity(object, service_targets.len())
-        .map_err(|message| invalid_resource(object, message))?;
-
     if object.spec.get("retryConstraint").is_some() {
         // Unrepresentable retry budgets must not fail open: rejecting the
         // whole policy also withholds sessionPersistence rather than applying
@@ -806,34 +803,12 @@ const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or X
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 /// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
+///
+/// The spec forbids adding another entry when the shared list is full. This
+/// limit is only an output constraint for the status writer; status owned by
+/// other controllers must not influence translation or session-persistence
+/// projection.
 const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
-
-/// Ensure Ferrum can represent every direct-policy attachment without
-/// overwriting another controller's entry in the shared, 16-item ancestor map.
-/// A policy whose complete status cannot be represented is unimplementable and
-/// must not steer traffic.
-fn validate_backend_lb_policy_status_capacity(
-    object: &K8sObject,
-    desired_ancestor_count: usize,
-) -> Result<(), String> {
-    let foreign_count = object
-        .status
-        .get("ancestors")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
-        .count();
-    let available = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
-    if desired_ancestor_count > available {
-        return Err(format!(
-            "status.ancestors has capacity for {available} Ferrum entries after preserving \
-             {foreign_count} entries owned by other controllers, but this policy requires \
-             {desired_ancestor_count}; the policy is not applied"
-        ));
-    }
-    Ok(())
-}
 
 /// Policies that lose at least one Service target under the same GEP-713 None
 /// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
@@ -1202,7 +1177,6 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
             ));
         }
     }
-    validate_backend_lb_policy_status_capacity(object, service_targets.len())?;
     if object.spec.get("retryConstraint").is_some() {
         return Err(
             "spec.retryConstraint is not supported; Ferrum does not enforce \
@@ -13478,6 +13452,9 @@ mod tests {
     /// implementation not to add entries once it is full. Foreign controller
     /// ownership therefore wins the capacity budget over Ferrum's desired
     /// entry; forced SSA must never evict a foreign status just to report ours.
+    ///
+    /// Translation / Accepted semantics for a full foreign map are covered in
+    /// `tests/unit/gateway_core/gateway_backend_lb_policy_tests.rs`.
     #[test]
     fn backend_lb_policy_status_does_not_evict_a_full_foreign_ancestor_map() {
         let mut policy = backend_lb_policy(
@@ -13505,20 +13482,18 @@ mod tests {
 
         let status = super::backend_lb_policy_status(&policy, false);
         let ancestors = status["ancestors"].as_array().expect("ancestors array");
-        assert_eq!(ancestors.len(), super::POLICY_ANCESTOR_MAX_ITEMS);
-        assert!(ancestors.iter().all(|entry| {
-            entry["controllerName"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("example.com/controller-"))
-        }));
-
-        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
-            .expect_err("a policy with no status capacity must not steer traffic");
+        assert_eq!(
+            ancestors.len(),
+            super::POLICY_ANCESTOR_MAX_ITEMS,
+            "Ferrum must never write a seventeenth status ancestor"
+        );
         assert!(
-            err.to_string()
-                .contains("status.ancestors has capacity for 0 Ferrum entries")
-                && err.to_string().contains("policy is not applied"),
-            "got: {err}"
+            ancestors.iter().all(|entry| {
+                entry["controllerName"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("example.com/controller-"))
+            }),
+            "a full foreign ancestor map must leave Ferrum with no status slot"
         );
 
         // Applying a planner-produced document without a fresh live snapshot
