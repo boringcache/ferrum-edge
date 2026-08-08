@@ -453,6 +453,12 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
         return None;
     }
     let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    // RFC 8446 §4.1.2: the vector contains two-byte CipherSuite values and
+    // cannot be empty. An odd or empty vector is not a provable ClientHello;
+    // do not let a trailing byte disappear from the eligibility decision.
+    if cipher_suites_len < 2 || cipher_suites_len % 2 != 0 {
+        return None;
+    }
     let suites_start = pos.checked_add(2)?;
     let suites_end = suites_start.checked_add(cipher_suites_len)?;
     if body.len() < suites_end {
@@ -474,6 +480,10 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
 
     // compression_methods
     let compression_len = *body.get(pos)? as usize;
+    // The legacy compression vector must contain at least the null method.
+    if compression_len == 0 {
+        return None;
+    }
     pos = pos.checked_add(1 + compression_len)?;
     if body.len() < pos {
         return None;
@@ -491,7 +501,9 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
     let extensions_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos = pos.checked_add(2)?;
     let extensions_end = pos.checked_add(extensions_len)?;
-    if body.len() < extensions_end {
+    // The extension vector is the final ClientHello field. Both truncation and
+    // bytes outside its declared boundary are malformed and must be refused.
+    if body.len() != extensions_end {
         return None;
     }
 
@@ -505,31 +517,45 @@ fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts
 /// Returns `None` on a malformed extension list: callers must treat that as
 /// "cannot prove this is TLS 1.2", never as "this is TLS 1.2".
 fn extensions_offer_tls13(mut ext: &[u8]) -> Option<bool> {
-    while ext.len() >= 4 {
+    let mut offered_tls13 = false;
+    let mut saw_supported_versions = false;
+
+    while !ext.is_empty() {
+        if ext.len() < 4 {
+            return None;
+        }
         let ext_type = u16::from_be_bytes([ext[0], ext[1]]);
         let ext_len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
-        if ext.len() < 4 + ext_len {
+        let extension_end = 4usize.checked_add(ext_len)?;
+        if ext.len() < extension_end {
             return None;
         }
         if ext_type == 0x002b {
-            let data = &ext[4..4 + ext_len];
+            if saw_supported_versions {
+                // Duplicate extensions are forbidden by the TLS grammar. In
+                // particular, never let an earlier TLS 1.2-only copy hide a
+                // later TLS 1.3 offer from this pre-handshake gate.
+                return None;
+            }
+            saw_supported_versions = true;
+
+            let data = &ext[4..extension_end];
             // ClientHello form: list_len (1) + versions (2 each).
             let list_len = *data.first()? as usize;
-            if data.len() < 1 + list_len {
+            if list_len < 2 || list_len % 2 != 0 || data.len() != 1 + list_len {
                 return None;
             }
             let mut i = 1usize;
-            while i + 2 <= 1 + list_len {
+            while i < data.len() {
                 if u16::from_be_bytes([data[i], data[i + 1]]) == 0x0304 {
-                    return Some(true);
+                    offered_tls13 = true;
                 }
                 i += 2;
             }
-            return Some(false);
         }
-        ext = &ext[4 + ext_len..];
+        ext = &ext[extension_end..];
     }
-    Some(false)
+    Some(offered_tls13)
 }
 
 /// Concatenate the handshake-layer payloads of consecutive TLS handshake records

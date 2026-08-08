@@ -70,6 +70,40 @@ fn client_hello_for(versions: &[&'static rustls::SupportedProtocolVersion]) -> V
     hello
 }
 
+/// Build a compact TLS 1.2 ClientHello whose vector boundaries can be varied
+/// independently for malformed-input admission tests.
+fn minimal_client_hello(
+    cipher_suites: &[u8],
+    extensions: &[u8],
+    declared_extensions_len: usize,
+    trailing_body: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0; 32]);
+    body.push(0); // session_id
+    body.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(cipher_suites);
+    body.extend_from_slice(&[1, 0]); // one null compression method
+    body.extend_from_slice(&(declared_extensions_len as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+    body.extend_from_slice(trailing_body);
+
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    handshake.extend_from_slice(&[
+        ((body.len() >> 16) & 0xff) as u8,
+        ((body.len() >> 8) & 0xff) as u8,
+        (body.len() & 0xff) as u8,
+    ]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
 /// Every per-cipher kernel probe passing (Linux 5.11+ shape).
 const ALL_CIPHERS: (bool, bool, bool) = (true, true, true);
 
@@ -200,6 +234,56 @@ fn non_handshake_and_empty_inputs_are_refused() {
     // Handshake record whose message type is ServerHello, not ClientHello.
     let server_hello = [0x16u8, 0x03, 0x01, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
     assert!(client_hello_ktls_facts(&server_hello).is_none());
+}
+
+#[test]
+fn malformed_client_hello_vector_boundaries_are_refused() {
+    let aes128_suite = [0xC0, 0x2F];
+    let valid = minimal_client_hello(&aes128_suite, &[], 0, &[]);
+    assert!(
+        client_hello_ktls_facts(&valid).is_some(),
+        "sanity: the compact TLS 1.2 ClientHello must parse"
+    );
+
+    let odd_cipher_suite_vector = minimal_client_hello(&[0xC0, 0x2F, 0x00], &[], 0, &[]);
+    assert!(client_hello_ktls_facts(&odd_cipher_suite_vector).is_none());
+
+    let trailing_extension_fragment = minimal_client_hello(&aes128_suite, &[0x00], 1, &[]);
+    assert!(client_hello_ktls_facts(&trailing_extension_fragment).is_none());
+
+    let bytes_past_extension_vector = minimal_client_hello(&aes128_suite, &[], 0, &[0x00]);
+    assert!(client_hello_ktls_facts(&bytes_past_extension_vector).is_none());
+
+    // supported_versions with an odd version vector cannot be walked as u16s.
+    let odd_versions = [0x00, 0x2B, 0x00, 0x04, 0x03, 0x03, 0x04, 0x03];
+    let odd_versions = minimal_client_hello(
+        &aes128_suite,
+        &odd_versions,
+        odd_versions.len(),
+        &[],
+    );
+    assert!(client_hello_ktls_facts(&odd_versions).is_none());
+
+    // The one-byte vector length must consume the entire extension payload.
+    let versions_with_trailing_byte = [0x00, 0x2B, 0x00, 0x04, 0x02, 0x03, 0x03, 0x00];
+    let versions_with_trailing_byte = minimal_client_hello(
+        &aes128_suite,
+        &versions_with_trailing_byte,
+        versions_with_trailing_byte.len(),
+        &[],
+    );
+    assert!(client_hello_ktls_facts(&versions_with_trailing_byte).is_none());
+
+    let duplicate_supported_versions = [
+        0x00, 0x2B, 0x00, 0x03, 0x02, 0x03, 0x03, 0x00, 0x2B, 0x00, 0x03, 0x02, 0x03, 0x04,
+    ];
+    let duplicate_supported_versions = minimal_client_hello(
+        &aes128_suite,
+        &duplicate_supported_versions,
+        duplicate_supported_versions.len(),
+        &[],
+    );
+    assert!(client_hello_ktls_facts(&duplicate_supported_versions).is_none());
 }
 
 #[test]
