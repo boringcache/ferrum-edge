@@ -657,8 +657,7 @@ fn supported_route_families_retain_service_import_materialization() {
         let translation = translate_k8s_objects(&[route, import.clone()], options())
             .unwrap_or_else(|error| panic!("{kind} ServiceImport should translate: {error}"));
         assert_eq!(
-            translation.config.proxies[0].backend_host,
-            "store.default.svc.clusterset.local",
+            translation.config.proxies[0].backend_host, "store.default.svc.clusterset.local",
             "{kind} should keep ClusterSet DNS"
         );
         assert_eq!(translation.config.proxies[0].backend_port, 8080);
