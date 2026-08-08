@@ -573,6 +573,71 @@ Secret material never leaves `Zeroizing` buffers, is never logged, and the
 immediately (it exists only for TLS 1.3 KeyUpdate and client-side session
 tickets, neither of which applies here).
 
+### Traffic-key confidentiality budget
+
+rustls normally counts the messages each traffic key protects and refuses to
+continue past the negotiated suite's `CipherSuiteCommon::confidentiality_limit`.
+`dangerous_into_kernel_connection` ends that accounting: rustls's own `kernel`
+module states that a `KernelConnection` cannot track it and that aborting before
+the limit becomes the caller's responsibility. In the pinned providers
+(`rustls 0.23.40`, aws-lc-rs and ring alike) the TLS 1.2 AES-GCM suites carry
+`confidentiality_limit: 1 << 24` and ChaCha20-Poly1305 carries `u64::MAX`.
+
+Ferrum therefore enforces the limit itself, per direction, in
+`src/proxy/ktls_confidentiality.rs`:
+
+* **The record counter is the kernel's, not a byte estimate.** A peer chooses
+  its own record sizing, so "plaintext bytes / 2^14" understates the record
+  count by an unbounded factor for a client that emits minimum-size records.
+  The authoritative counter is the TLS ULP's live `rec_seq`, read with
+  `getsockopt(SOL_TLS, TLS_TX | TLS_RX)`. Every read validates the returned
+  option length against the cipher's `tls12_crypto_info_*` layout and checks the
+  echoed version and cipher type; anything else is an error, never a guess. The
+  reply also carries the session key, so the scratch buffer is `Zeroizing` and
+  only `rec_seq` is ever read out of it.
+* **The handshake's own records are already counted.** The budget is seeded from
+  a kernel readback taken immediately after `setsockopt(SOL_TLS, ...)`, which a
+  TLS 1.2 server reaches having already protected at least one `Finished` record
+  in each direction. A readback below the sequence numbers rustls reported fails
+  the connection.
+* **Enforcement adds no per-byte and no per-syscall cost.** Before each relay
+  syscall the guard *reserves* that syscall's worst-case record count out of the
+  remaining budget, and only pays for a `getsockopt` when the window it opened is
+  used up. Because the reservation precedes the syscall, the true sequence number
+  can never pass the threshold between two observations. Transmit is bounded by
+  `ceil(bytes / 2^14) + 1` records per write; receive is bounded by
+  `receive-buffer-ceiling / 29` (the smallest possible TLS 1.2 AEAD record on the
+  wire: 5-byte header + 8-byte explicit nonce + 16-byte tag), with the ceiling
+  taken as the largest of the live `SO_RCVBUF`, the kernel's `tcp_rmem` maximum,
+  and a 16 MiB floor so receive-buffer autotuning during a window cannot
+  invalidate the bound. In practice that is roughly one `getsockopt` per 70
+  splice calls, and none at all on a quiet socket.
+* **A 2^16-record reserve** is held back below the cipher limit, so teardown
+  records (the `close_notify` alert) and any kernel accounting subtlety stay
+  inside the safe bound.
+* **Every uncertainty ends the relay** as an attributed failure — receive-budget
+  failures on the client→backend read side, transmit-budget failures on the
+  backend→client write side. That covers reaching the threshold, a counter that
+  moves backwards, a counter that cannot be read, and a next syscall whose
+  worst case no longer fits in the remaining budget.
+* **Ciphers whose limit cannot be enforced are refused before the handshake is
+  consumed.** The startup per-cipher probe additionally installs both directions
+  on a throwaway loopback kTLS socket with two distinct non-zero sequence
+  numbers and requires the kernel to hand each of them back on its own
+  direction. A cipher with a finite confidentiality limit that fails that probe
+  is dropped from the ClientHello eligibility gate, so the connection falls back
+  to the buffered userspace rustls relay with the socket untouched — it is never
+  handed off and then aborted. On such a kernel, AES-GCM frontends simply do not
+  get kTLS splice acceleration; that is the accurate residual performance
+  limitation.
+* **ChaCha20-Poly1305 keeps its unlimited posture.** rustls reports
+  `u64::MAX` for it, so no guard is built, no counter is read, and the
+  sequence-number probe is not required for its eligibility.
+
+`bidirectional_copy` is not a legal relay for a kTLS client leg (it enforces
+neither the close handshake nor this budget), so the unreachable
+kTLS-client-to-TLS-backend combination now fails closed rather than relaying.
+
 ### Ancillary-message safety
 
 Every `msg_control` buffer in `src/proxy/ktls_record.rs` is an
@@ -607,7 +672,14 @@ every pull request:
 5. a bare TCP FIN with no alert behind it is an attributed client→backend read
    failure; and
 6. a record the kernel cannot authenticate ends the relay with an attributed
-   failure and never with an EOF.
+   failure and never with an EOF; and
+7. the handed-off session carries a real per-direction confidentiality budget —
+   the negotiated suite's rustls `confidentiality_limit` (2^24 for AES-128-GCM)
+   plus kernel-reported record sequence numbers that already account for the
+   records the handshake itself spent.
+
+Case 7 is asserted inside case 1's test rather than as a fourth test, so the
+required live gate's expected pass count stays at three.
 
 The tests are `#[ignore]`d by default and pin their throwaway TLS 1.2 client
 and server to AES-128-GCM, so the kernel gate needs that kTLS family without
@@ -685,7 +757,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. |
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. The startup probe also verifies that the kernel reports per-direction TLS record sequence numbers via `getsockopt(SOL_TLS, TLS_TX/TLS_RX)`; a suite with a finite confidentiality limit (both AES-GCM families) is dropped from handoff eligibility on a kernel that does not, so such kernels keep the userspace relay for AES-GCM while ChaCha20-Poly1305 (rustls limit `u64::MAX`) is unaffected. |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction), but concurrent io_uring relays are capped at 128 — beyond the cap, additional streams transparently fall back to the async libc splice path, so worst-case io_uring blocking-thread usage is 256. Keep `FERRUM_BLOCKING_THREADS` at the 512 default or higher so other `spawn_blocking` work retains headroom. Each blocking thread consumes ~2-4 MB of stack |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |

@@ -45,6 +45,19 @@
 //! consumed) and returns [`KtlsAcceptOutcome::Declined`] with the untouched
 //! stream so the caller runs the ordinary buffered tokio-rustls accept.
 //!
+//! # The traffic keys carry a confidentiality budget across the handoff
+//!
+//! rustls stops counting protected messages the moment
+//! `dangerous_into_kernel_connection` is called, and its `kernel` module makes
+//! aborting before the suite's `CipherSuiteCommon::confidentiality_limit` the
+//! caller's responsibility. This module therefore reads that limit from the
+//! *negotiated* suite, refuses any limited suite whose kernel record sequence
+//! number this kernel cannot report (before the handshake is consumed), and
+//! hands [`crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy`] —
+//! seeded from the kernel's own post-install readback, so the records the
+//! handshake already spent are counted — to the relay, which enforces it per
+//! direction.
+//!
 //! # TLS 1.3 is refused, not silently mishandled
 //!
 //! The kernel holds a static copy of the application traffic secret and this
@@ -70,6 +83,10 @@ use tracing::{debug, warn};
 
 use crate::modes::mesh::node_waypoint_observability::{
     NodeWaypointHboneHandshakePhase, record_hbone_handshake,
+};
+use crate::proxy::ktls_confidentiality::{
+    KtlsConfidentialityPolicy, KtlsDirection, KtlsSessionLimits, current_receive_ceiling,
+    observe_record_seq,
 };
 use crate::socket_opts::ktls;
 
@@ -108,6 +125,9 @@ pub(crate) struct KtlsAccepted {
     pub(crate) sni_hostname: Option<String>,
     /// Verified client certificate chain (leaf first), when mTLS is configured.
     pub(crate) peer_certificates: Option<Vec<Vec<u8>>>,
+    /// Per-direction traffic-key confidentiality budget the relay must enforce
+    /// now that rustls no longer can (issue #3619).
+    pub(crate) confidentiality: KtlsConfidentialityPolicy,
 }
 
 /// Result of attempting the unbuffered kTLS accept.
@@ -190,9 +210,9 @@ pub(crate) async fn try_ktls_accept(
     };
 
     if !facts.ktls_eligible(
-        ktls::is_ktls_aes128gcm_available(),
-        ktls::is_ktls_aes256gcm_available(),
-        ktls::is_ktls_chacha20_poly1305_available(),
+        cipher_handoff_usable(ktls::KtlsCipher::Aes128Gcm),
+        cipher_handoff_usable(ktls::KtlsCipher::Aes256Gcm),
+        cipher_handoff_usable(ktls::KtlsCipher::Chacha20Poly1305),
     ) {
         debug!(
             peer = %peer.ip(),
@@ -256,10 +276,13 @@ pub(crate) async fn try_ktls_accept(
     // `WriteTraffic` proved the handshake completed with nothing buffered in
     // either direction. Re-read the negotiated parameters from the session
     // rather than trusting the pre-handshake ClientHello prediction.
-    let Some(cipher) = conn
-        .negotiated_cipher_suite()
-        .and_then(|suite| ktls_cipher_for(suite.suite()))
-    else {
+    let Some(suite) = conn.negotiated_cipher_suite() else {
+        record_frontend_tls_failure(record_mesh_mtls_metric, "error");
+        return KtlsAcceptOutcome::Failed(io::Error::other(
+            "kTLS: no negotiated cipher suite after the handshake",
+        ));
+    };
+    let Some(cipher) = ktls_cipher_for(suite.suite()) else {
         record_frontend_tls_failure(record_mesh_mtls_metric, "error");
         return KtlsAcceptOutcome::Failed(io::Error::other(
             "kTLS: negotiated cipher suite is not installable in the kernel",
@@ -269,6 +292,24 @@ pub(crate) async fn try_ktls_accept(
         record_frontend_tls_failure(record_mesh_mtls_metric, "error");
         return KtlsAcceptOutcome::Failed(io::Error::other(
             "kTLS: negotiated cipher suite failed the kernel probe",
+        ));
+    }
+    // The suite's own confidentiality limit, read from rustls rather than
+    // hardcoded. Enforcing it is impossible without the kernel's record
+    // sequence number, so a limited suite on a kernel that cannot report one
+    // fails closed here. The pre-handshake eligibility gate above already
+    // refuses that combination while the socket is pristine; this is the
+    // defence-in-depth restatement for a suite rustls picked anyway.
+    let limits = KtlsSessionLimits {
+        cipher,
+        tls_version: TLS_1_2_WIRE_VERSION,
+        confidentiality_limit: suite_confidentiality_limit(suite),
+    };
+    if limits.requires_enforcement() && !ktls::is_ktls_record_seq_observable(cipher) {
+        record_frontend_tls_failure(record_mesh_mtls_metric, "error");
+        return KtlsAcceptOutcome::Failed(io::Error::other(
+            "kTLS: negotiated suite has a confidentiality limit but this kernel does not \
+             report record sequence numbers",
         ));
     }
     if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2) {
@@ -288,6 +329,10 @@ pub(crate) async fn try_ktls_accept(
         // The `KernelConnection` only exists to drive TLS 1.3 KeyUpdate and
         // client-side session tickets, neither of which applies to a TLS 1.2
         // server session. Dropping it releases the remaining key schedule.
+        //
+        // What it does NOT release is the confidentiality budget: rustls stops
+        // counting protected messages here, so `limits` above plus the kernel
+        // readback below take that over for the life of the connection.
         Ok((secrets, _kernel_conn)) => secrets,
         Err(e) => {
             record_frontend_tls_failure(record_mesh_mtls_metric, "error");
@@ -297,6 +342,13 @@ pub(crate) async fn try_ktls_accept(
             )));
         }
     };
+
+    // The sequence numbers the handshake already consumed. A TLS 1.2 server has
+    // encrypted and decrypted at least its `Finished` record before handoff, so
+    // a budget that started at zero would overstate the remaining headroom by
+    // exactly those records.
+    let tx_seq = secrets.tx.0;
+    let rx_seq = secrets.rx.0;
 
     let Some(params) = build_ktls_params(TLS_1_2_WIRE_VERSION, &secrets) else {
         record_frontend_tls_failure(record_mesh_mtls_metric, "error");
@@ -310,6 +362,15 @@ pub(crate) async fn try_ktls_accept(
     match ktls::enable_ktls(fd, &params) {
         Ok(true) => {
             drop(params);
+            let seeded = seed_confidentiality_policy(fd, &limits, tx_seq, rx_seq);
+            let confidentiality = match seeded {
+                Ok(policy) => policy,
+                Err(e) => {
+                    record_frontend_tls_failure(record_mesh_mtls_metric, "error");
+                    warn!("kTLS: confidentiality budget could not be established: {e}");
+                    return KtlsAcceptOutcome::Failed(e);
+                }
+            };
             if record_mesh_mtls_metric {
                 record_hbone_handshake(NodeWaypointHboneHandshakePhase::InboundTls, true);
             }
@@ -321,6 +382,7 @@ pub(crate) async fn try_ktls_accept(
                 stream,
                 sni_hostname,
                 peer_certificates,
+                confidentiality,
             }))
         }
         Ok(false) => {
@@ -598,6 +660,100 @@ fn cipher_kernel_available(cipher: ktls::KtlsCipher) -> bool {
         ktls::KtlsCipher::Aes256Gcm => ktls::is_ktls_aes256gcm_available(),
         ktls::KtlsCipher::Chacha20Poly1305 => ktls::is_ktls_chacha20_poly1305_available(),
     }
+}
+
+/// Whether a cipher may be offered to the handoff at all.
+///
+/// Installability is necessary but not sufficient: a suite with a finite
+/// confidentiality limit also needs the kernel to expose its live record
+/// sequence number, since that counter is the only thing that can enforce the
+/// limit after rustls stops tracking messages. Requiring it *here* — from the
+/// peeked ClientHello, before `UnbufferedServerConnection` reads a byte — is
+/// what makes the refusal a clean fall-back to the buffered rustls relay
+/// rather than a dropped connection.
+///
+/// ChaCha20-Poly1305 carries `confidentiality_limit: u64::MAX` in both pinned
+/// providers, so it is deliberately *not* subject to the sequence-number
+/// requirement: gating it there would disable a cipher that needs no budget.
+fn cipher_handoff_usable(cipher: ktls::KtlsCipher) -> bool {
+    if !cipher_kernel_available(cipher) {
+        return false;
+    }
+    !cipher_has_confidentiality_limit(cipher) || ktls::is_ktls_record_seq_observable(cipher)
+}
+
+/// Whether the TLS 1.2 suites that map to `cipher` carry a finite
+/// confidentiality limit.
+///
+/// Cross-checked against the negotiated suite's real
+/// `CipherSuiteCommon::confidentiality_limit` once the handshake completes
+/// (`KtlsSessionLimits::requires_enforcement`), so this pre-handshake
+/// approximation can only be conservative, never permissive.
+fn cipher_has_confidentiality_limit(cipher: ktls::KtlsCipher) -> bool {
+    match cipher {
+        ktls::KtlsCipher::Aes128Gcm | ktls::KtlsCipher::Aes256Gcm => true,
+        ktls::KtlsCipher::Chacha20Poly1305 => false,
+    }
+}
+
+/// The negotiated suite's confidentiality limit, straight from rustls.
+///
+/// `u64::MAX` is rustls's encoding of "no limit applies". Reading the field
+/// rather than hardcoding 2^24 means a provider or rustls upgrade that changes
+/// the bound changes this enforcement with it.
+fn suite_confidentiality_limit(suite: rustls::SupportedCipherSuite) -> u64 {
+    match suite {
+        rustls::SupportedCipherSuite::Tls12(inner) => inner.common.confidentiality_limit,
+        rustls::SupportedCipherSuite::Tls13(inner) => inner.common.confidentiality_limit,
+    }
+}
+
+/// Establish the per-connection confidentiality budget from the kernel's own
+/// post-install state.
+///
+/// For an unlimited suite this is free. For a limited one it reads both
+/// directions back through `getsockopt(SOL_TLS, ...)` and requires each to be
+/// at least the sequence number rustls said the handshake had reached — a
+/// kernel reporting *less* than what was just installed is not a counter this
+/// budget can be built on, so it fails closed. The observed values (not the
+/// requested ones) seed the policy, so the budget starts from what the kernel
+/// will actually count from.
+fn seed_confidentiality_policy(
+    fd: std::os::unix::io::RawFd,
+    limits: &KtlsSessionLimits,
+    handshake_tx_seq: u64,
+    handshake_rx_seq: u64,
+) -> io::Result<KtlsConfidentialityPolicy> {
+    if !limits.requires_enforcement() {
+        let cipher = limits.cipher;
+        let version = limits.tls_version;
+        return Ok(KtlsConfidentialityPolicy::unlimited(cipher, version));
+    }
+    let tx = observe_record_seq(fd, limits, KtlsDirection::Transmit)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rx = observe_record_seq(fd, limits, KtlsDirection::Receive)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    if tx.record_seq < handshake_tx_seq || rx.record_seq < handshake_rx_seq {
+        return Err(io::Error::other(format!(
+            "kTLS: kernel reports record sequences ({}, {}) below the handshake sequences \
+             ({handshake_tx_seq}, {handshake_rx_seq})",
+            tx.record_seq, rx.record_seq
+        )));
+    }
+    let policy = KtlsConfidentialityPolicy {
+        limits: *limits,
+        initial_transmit_seq: tx.record_seq,
+        initial_receive_seq: rx.record_seq,
+        initial_receive_buffer_ceiling: current_receive_ceiling(fd),
+    };
+    // Reject a session that is already out of budget rather than starting a
+    // relay that would refuse on its first syscall.
+    for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
+        let _guard = policy
+            .guard(direction)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    Ok(policy)
 }
 
 /// Map rustls `ExtractedSecrets` to `KtlsParams` for the kernel TLS ULP.

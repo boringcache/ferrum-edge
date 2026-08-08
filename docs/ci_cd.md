@@ -370,7 +370,13 @@ rustls TLS 1.2 AES-128-GCM client through `try_ktls_accept`, installs kernel TLS
 runner's own kernel with `setsockopt(SOL_TLS, ...)`, relays application bytes
 through `splice(2)`, and asserts the TLS close handshake (authenticated
 `close_notify` → clean EOF, bare FIN → truncation, backend EOF → reciprocal
-alert, unauthenticated record → attributed failure). It lives in `test-unit`
+alert, unauthenticated record → attributed failure) plus the per-direction
+traffic-key confidentiality budget the handoff hands to the relay (the
+negotiated suite's rustls `confidentiality_limit` and kernel-reported record
+sequence numbers that already include the handshake's own records). That last
+assertion is folded into the first test rather than added as a fourth, because
+the step's expected pass count of three is part of the gate. It lives in
+`test-unit`
 because that job is `require_success "Unit and inline lib"` in the required
 `Tests` aggregate, so the live path is blocking today without touching the
 byte-frozen aggregate wiring. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an

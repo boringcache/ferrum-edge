@@ -35,6 +35,10 @@
 //!    client→backend read failure, not a clean relay close.
 //! 6. A record the kernel cannot authenticate ends the relay with an
 //!    attributed failure and never with EOF.
+//! 7. The handed-off session carries a real per-direction confidentiality
+//!    budget: the negotiated suite's rustls `confidentiality_limit`, and
+//!    kernel-reported record sequence numbers that already account for the
+//!    records the handshake itself spent.
 //!
 //! Peer-originated fatal and non-`close_notify` warning alerts are classified
 //! by [`classify_ktls_control_record`](crate::proxy::ktls_record::classify_ktls_control_record),
@@ -68,6 +72,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::plugins::Direction;
 use crate::proxy::ktls_accept::{KtlsAcceptOutcome, KtlsAccepted, try_ktls_accept};
+use crate::proxy::ktls_confidentiality::KtlsDirection;
 use crate::proxy::tcp_proxy::{
     StreamCopyResult, StreamIoSide, bidirectional_splice_ktls_client_for_test,
 };
@@ -199,14 +204,72 @@ async fn accept_ktls(listener: &TcpListener, config: &Arc<ServerConfig>) -> Ktls
 
 /// Run the relay with the client leg marked as kernel-TLS terminated, bounded
 /// so a wedged direction fails the test instead of hanging CI.
-async fn run_ktls_relay(client: TcpStream, backend: TcpStream) -> StreamCopyResult {
+async fn run_ktls_relay(accepted: KtlsAccepted, backend: TcpStream) -> StreamCopyResult {
     let idle = Some(Duration::from_secs(10));
     let half_close = Some(Duration::from_secs(10));
-    let relay =
-        bidirectional_splice_ktls_client_for_test(client, backend, idle, half_close, PIPE_SIZE);
+    let relay = bidirectional_splice_ktls_client_for_test(
+        accepted.stream,
+        backend,
+        idle,
+        half_close,
+        PIPE_SIZE,
+        accepted.confidentiality,
+    );
     tokio::time::timeout(RELAY_BUDGET, relay)
         .await
         .expect("the kTLS splice relay must terminate within its budget")
+}
+
+/// Pin the confidentiality budget the real kernel handed back.
+///
+/// This is the half of the #3619 budget contract that only a live kernel can
+/// answer: that `getsockopt(SOL_TLS, TLS_TX | TLS_RX)` really does report a
+/// per-direction record sequence number, that AES-128-GCM really is a limited
+/// suite (`1 << 24`, straight from the rustls provider), and that the
+/// handshake's own records are already counted — a TLS 1.2 server has
+/// encrypted and decrypted at least its `Finished` record before handoff, so a
+/// budget seeded at zero would be provably wrong.
+fn assert_live_confidentiality_policy(accepted: &KtlsAccepted) {
+    let policy = accepted.confidentiality;
+    assert!(
+        policy.limits.requires_enforcement(),
+        "AES-128-GCM must carry a finite confidentiality limit, got {}",
+        policy.limits.confidentiality_limit
+    );
+    assert_eq!(
+        policy.limits.confidentiality_limit,
+        1 << 24,
+        "the pinned rustls TLS 1.2 AES-GCM providers limit a traffic key to 2^24 records"
+    );
+    assert!(
+        ktls::is_ktls_record_seq_observable(ktls::KtlsCipher::Aes128Gcm),
+        "a limited suite can only be handed off on a kernel that reports record sequences"
+    );
+    assert!(
+        policy.initial_transmit_seq >= 1,
+        "the handshake's own transmitted records must already be counted, got {}",
+        policy.initial_transmit_seq
+    );
+    assert!(
+        policy.initial_receive_seq >= 1,
+        "the handshake's own received records must already be counted, got {}",
+        policy.initial_receive_seq
+    );
+    let threshold = policy.limits.threshold();
+    assert!(
+        policy.initial_transmit_seq < threshold && policy.initial_receive_seq < threshold,
+        "a fresh session must start well inside its budget"
+    );
+    // Both guards must build; an already-exhausted direction would refuse the
+    // relay outright.
+    for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
+        let guard = policy
+            .guard(direction)
+            .unwrap_or_else(|e| panic!("{direction} guard must build on a fresh session: {e}"))
+            .unwrap_or_else(|| panic!("{direction} must be enforced for AES-128-GCM"));
+        assert_eq!(guard.threshold(), threshold);
+        assert!(guard.allowance() > 0, "a fresh window must be open");
+    }
 }
 
 /// Bind a loopback listener and report its address.
@@ -285,10 +348,11 @@ async fn ktls_live_relays_plaintext_and_completes_the_tls_close_handshake() {
             Some(LIVE_SNI),
             "the accept must surface the peeked SNI"
         );
+        assert_live_confidentiality_policy(&accepted);
         let backend = TcpStream::connect(backend_addr)
             .await
             .expect("relay dials the backend");
-        let result = run_ktls_relay(accepted.stream, backend).await;
+        let result = run_ktls_relay(accepted, backend).await;
 
         // An authenticated close_notify is never a relay failure.
         let failure = result.first_failure;
@@ -347,7 +411,7 @@ async fn ktls_live_bare_fin_is_attributed_as_a_tls_truncation() {
         let backend = TcpStream::connect(backend_addr)
             .await
             .expect("relay dials the backend");
-        let result = run_ktls_relay(accepted.stream, backend).await;
+        let result = run_ktls_relay(accepted, backend).await;
 
         let (direction, _class, side, message) = result
             .first_failure
@@ -413,7 +477,7 @@ async fn ktls_live_unauthenticated_record_never_becomes_a_clean_eof() {
         let backend = TcpStream::connect(backend_addr)
             .await
             .expect("relay dials the backend");
-        let result = run_ktls_relay(accepted.stream, backend).await;
+        let result = run_ktls_relay(accepted, backend).await;
 
         let (direction, _class, side, message) = result
             .first_failure

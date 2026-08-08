@@ -738,7 +738,7 @@ pub(crate) async fn bidirectional_splice_for_test(
         None,
         None,
         pipe_size,
-        false,
+        None,
     )
     .await
 }
@@ -765,7 +765,7 @@ pub(crate) async fn bidirectional_splice_for_test_with_timeouts(
         backend_read_timeout,
         backend_write_timeout,
         pipe_size,
-        false,
+        None,
     )
     .await
 }
@@ -786,6 +786,7 @@ pub(crate) async fn bidirectional_splice_ktls_client_for_test(
     idle_timeout: Option<Duration>,
     half_close_cap: Option<Duration>,
     pipe_size: usize,
+    confidentiality: crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy,
 ) -> StreamCopyResult {
     bidirectional_splice(
         client,
@@ -795,7 +796,7 @@ pub(crate) async fn bidirectional_splice_ktls_client_for_test(
         None,
         None,
         pipe_size,
-        true,
+        Some(confidentiality),
     )
     .await
 }
@@ -3290,7 +3291,8 @@ async fn handle_tcp_connection_inner(
                     .await?;
                 }
 
-                break 'frontend_tls ClientRelayStream::Ktls(accepted.stream);
+                let policy = accepted.confidentiality;
+                break 'frontend_tls ClientRelayStream::Ktls(accepted.stream, policy);
             }
         };
 
@@ -3822,12 +3824,12 @@ async fn handle_tcp_connection_inner(
             }
         }
         #[cfg(target_os = "linux")]
-        ClientRelayStream::Ktls(client_stream) => {
+        ClientRelayStream::Ktls(client_stream, ktls_policy) => {
             // The kernel TLS ULP owns this socket's record layer: reads yield
             // decrypted application bytes and writes are encrypted on the way
             // out. That makes the frontend leg indistinguishable from a plain
             // socket to the relay, so `splice(2)` is legal against a plain
-            // backend and the userspace copy stays correct against a TLS one.
+            // backend.
             let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Plain(bs) => {
@@ -3840,24 +3842,32 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
-                        true,
+                        Some(ktls_policy),
                     )
                     .await
                 }
-                BackendStream::Tls(bs) => {
-                    // Not reachable today (`ktls_eligible` requires a plain
-                    // backend), but correct if that gate ever widens.
+                BackendStream::Tls(_bs) => {
+                    // Not reachable today: `ktls_eligible` requires a plain
+                    // backend. If that gate ever widens, fail closed rather
+                    // than relay a kernel-TLS socket through `bidirectional_copy`,
+                    // which enforces neither the TLS close handshake nor the
+                    // traffic-key confidentiality budget.
                     used_splice = false;
-                    bidirectional_copy(
-                        client_stream,
-                        bs,
-                        idle_timeout,
-                        half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
-                        buf_size,
-                    )
-                    .await
+                    let error = anyhow::anyhow!(
+                        "kTLS client leg cannot be relayed to a TLS backend: the userspace \
+                         copy path enforces neither the close handshake nor the traffic-key \
+                         confidentiality limit"
+                    );
+                    StreamCopyResult {
+                        bytes_client_to_backend: 0,
+                        bytes_backend_to_client: 0,
+                        first_failure: Some((
+                            Direction::Unknown,
+                            classify_stream_error(&error),
+                            None,
+                            error.to_string(),
+                        )),
+                    }
                 }
             }
         }
@@ -5439,8 +5449,13 @@ enum ClientRelayStream {
     /// traffic secrets to the kTLS ULP after an unbuffered handshake reached
     /// `WriteTraffic` (issue #3619). The socket now reads decrypted plaintext
     /// and encrypts on write, so `splice(2)` is legal on it.
+    ///
+    /// The policy travels with the socket: rustls no longer counts the records
+    /// each traffic key protects, so the relay enforces the negotiated suite's
+    /// confidentiality limit per direction from the kernel's own sequence
+    /// numbers.
     #[cfg(target_os = "linux")]
-    Ktls(TcpStream),
+    Ktls(TcpStream, crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy),
 }
 
 /// Outcome of the frontend TLS accept for a terminating TCP listener.
@@ -7019,6 +7034,14 @@ async fn sleep_for_cap(half_close_cap: Option<Duration>) {
 ///   not look like a truncated TLS session — and so the client's own
 ///   `close_notify` is reciprocated only after the remaining response bytes
 ///   have drained.
+/// * **Confidentiality budget.** `client_ktls` also carries the negotiated
+///   suite's `confidentiality_limit`. rustls stops counting protected messages
+///   once the keys reach the kernel, so each direction gets its own
+///   `KtlsConfidentialityGuard`, seeded from the kernel's post-install record
+///   sequence numbers, and pre-charges every relay syscall's worst-case record
+///   count against it. Any exhaustion, regression, or unreadable counter ends
+///   the relay as an attributed failure. A suite rustls reports as unlimited
+///   (ChaCha20-Poly1305) produces no guard and pays nothing.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn bidirectional_splice(
@@ -7029,8 +7052,38 @@ async fn bidirectional_splice(
     backend_read_timeout: Option<Duration>,
     backend_write_timeout: Option<Duration>,
     pipe_size: usize,
-    client_is_ktls: bool,
+    client_ktls: Option<crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy>,
 ) -> StreamCopyResult {
+    use crate::proxy::ktls_confidentiality::KtlsDirection;
+
+    let client_is_ktls = client_ktls.is_some();
+    // One guard per direction, each owned outright by its relay future: the
+    // receive budget covers records the kernel decrypts for client→backend,
+    // the transmit budget covers records it encrypts for backend→client.
+    let (receive_guard, transmit_guard) = match client_ktls.as_ref() {
+        Some(policy) => {
+            let rx = policy.guard(KtlsDirection::Receive);
+            let tx = policy.guard(KtlsDirection::Transmit);
+            match (rx, tx) {
+                (Ok(rx), Ok(tx)) => (rx, tx),
+                (Err(e), _) | (_, Err(e)) => {
+                    let error = anyhow::anyhow!("{e}");
+                    return StreamCopyResult {
+                        bytes_client_to_backend: 0,
+                        bytes_backend_to_client: 0,
+                        first_failure: Some((
+                            Direction::Unknown,
+                            classify_stream_error(&error),
+                            None,
+                            error.to_string(),
+                        )),
+                    };
+                }
+            }
+        }
+        None => (None, None),
+    };
+    let ktls_limits = client_ktls.map(|policy| policy.limits);
     // Create two pipes: one for each direction. Guards close fds on drop.
     let (c2b_pipe_r, c2b_pipe_w) = match create_splice_pipe(pipe_size) {
         Ok(p) => p,
@@ -7105,6 +7158,8 @@ async fn bidirectional_splice(
         client_is_ktls,
         // Backend leg is always a plain socket on the kTLS path.
         false,
+        ktls_limits,
+        receive_guard,
     );
     let b2c_fut = splice_one_direction_no_guard(
         &backend,
@@ -7119,6 +7174,8 @@ async fn bidirectional_splice(
         // Backend EOF must reach a kTLS client as a real TLS `close_notify`,
         // not a bare half-close that reads as a truncation attack.
         client_is_ktls,
+        ktls_limits,
+        transmit_guard,
     );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
@@ -7543,7 +7600,7 @@ async fn bidirectional_splice_io_uring_bounded_or_async(
             backend_read_timeout,
             backend_write_timeout,
             pipe_size,
-            false,
+            None,
         )
         .await
     }
@@ -8419,6 +8476,8 @@ async fn splice_one_direction_no_guard(
     write_watermark: Option<Arc<AtomicU64>>,
     src_is_ktls: bool,
     dst_is_ktls: bool,
+    ktls_limits: Option<crate::proxy::ktls_confidentiality::KtlsSessionLimits>,
+    mut confidentiality: Option<crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard>,
 ) -> Result<(), (StreamIoSide, anyhow::Error)> {
     use std::os::unix::io::AsRawFd;
 
@@ -8427,6 +8486,19 @@ async fn splice_one_direction_no_guard(
     let dst_fd = dst.as_raw_fd();
 
     loop {
+        // Every record this read could consume is reserved out of the receive
+        // budget BEFORE the syscall, so the kernel's sequence number cannot
+        // cross the threshold between two observations. The reservation is
+        // pure arithmetic; it only pays for a `getsockopt` when the window it
+        // opened has been used up.
+        if src_is_ktls
+            && let Some(guard) = confidentiality.as_mut()
+            && let Some(limits) = ktls_limits.as_ref()
+            && let Err(e) = charge_ktls_receive(guard, limits, src_fd)
+        {
+            return Err((StreamIoSide::Read, anyhow::anyhow!("{e}")));
+        }
+
         // Phase 1: splice from source fd into write end of pipe
         let n = match splice_when_ready(src, tokio::io::Interest::READABLE, || {
             // Use 128 KB per splice call — large enough to amortize syscall
@@ -8452,6 +8524,8 @@ async fn splice_one_direction_no_guard(
                         bytes.as_ref(),
                         read_watermark.as_deref(),
                         write_watermark.as_deref(),
+                        ktls_limits.as_ref(),
+                        confidentiality.as_mut(),
                     )
                     .await
                     {
@@ -8487,6 +8561,17 @@ async fn splice_one_direction_no_guard(
             // Phase 2: splice from read end of pipe into destination fd
             let mut remaining = n as usize;
             while remaining > 0 {
+                // Same pre-charge discipline on the transmit budget: the
+                // kernel turns at most `ceil(bytes / 2^14) + 1` records out of
+                // this write, and that bound is reserved before the syscall
+                // runs.
+                if dst_is_ktls
+                    && let Some(guard) = confidentiality.as_mut()
+                    && let Some(limits) = ktls_limits.as_ref()
+                    && let Err(e) = charge_ktls_transmit(guard, limits, dst_fd, remaining as u64)
+                {
+                    return Err((StreamIoSide::Write, anyhow::anyhow!("{e}")));
+                }
                 let written = match splice_when_ready(dst, tokio::io::Interest::WRITABLE, || {
                     splice_once(pipe_r, dst_fd, remaining, splice_flags)
                 })
@@ -8531,6 +8616,62 @@ async fn splice_one_direction_no_guard(
             return Ok(());
         }
     }
+}
+
+/// Reserve one receive syscall's worth of records against the kTLS receive
+/// budget, observing the kernel's `TLS_RX` sequence number only when the
+/// current window cannot cover it.
+///
+/// The charge is the guard's cached bound — derived from the socket receive
+/// buffer ceiling, which is what caps how many records a single non-blocking
+/// receive can consume — so the common case is one subtraction and no syscall.
+#[cfg(target_os = "linux")]
+fn charge_ktls_receive(
+    guard: &mut crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard,
+    limits: &crate::proxy::ktls_confidentiality::KtlsSessionLimits,
+    fd: std::os::unix::io::RawFd,
+) -> Result<(), crate::proxy::ktls_confidentiality::KtlsConfidentialityError> {
+    use crate::proxy::ktls_confidentiality::{KtlsDirection, charge_or_observe, observe_record_seq};
+
+    let records = guard.step_records();
+    charge_or_observe(guard, records, || {
+        observe_record_seq(fd, limits, KtlsDirection::Receive)
+    })
+}
+
+/// Reserve exactly one record against the kTLS receive budget.
+///
+/// Used by the out-of-band `recvmsg` teardown path, which consumes one record
+/// per call.
+#[cfg(target_os = "linux")]
+fn charge_or_observe_one_receive_record(
+    guard: &mut crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard,
+    limits: &crate::proxy::ktls_confidentiality::KtlsSessionLimits,
+    fd: std::os::unix::io::RawFd,
+) -> Result<(), crate::proxy::ktls_confidentiality::KtlsConfidentialityError> {
+    use crate::proxy::ktls_confidentiality::{KtlsDirection, charge_or_observe, observe_record_seq};
+
+    charge_or_observe(guard, 1, || {
+        observe_record_seq(fd, limits, KtlsDirection::Receive)
+    })
+}
+
+/// Reserve the records one write of `bytes` plaintext can produce against the
+/// kTLS transmit budget.
+#[cfg(target_os = "linux")]
+fn charge_ktls_transmit(
+    guard: &mut crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard,
+    limits: &crate::proxy::ktls_confidentiality::KtlsSessionLimits,
+    fd: std::os::unix::io::RawFd,
+    bytes: u64,
+) -> Result<(), crate::proxy::ktls_confidentiality::KtlsConfidentialityError> {
+    use crate::proxy::ktls_confidentiality::{
+        KtlsDirection, charge_or_observe, observe_record_seq, transmit_record_bound,
+    };
+
+    charge_or_observe(guard, transmit_record_bound(bytes), || {
+        observe_record_seq(fd, limits, KtlsDirection::Transmit)
+    })
 }
 
 /// The one message used for both bare-EOF truncation paths on a kTLS receive
@@ -8645,6 +8786,7 @@ async fn send_ktls_close_notify_bounded(dst: &TcpStream) -> bool {
 /// control record; because `recvmsg` has already consumed it, it is forwarded
 /// (and accounted) rather than dropped.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn resolve_ktls_splice_einval(
     src: &TcpStream,
     dst: &TcpStream,
@@ -8652,6 +8794,8 @@ async fn resolve_ktls_splice_einval(
     bytes: &AtomicU64,
     read_watermark: Option<&AtomicU64>,
     write_watermark: Option<&AtomicU64>,
+    ktls_limits: Option<&crate::proxy::ktls_confidentiality::KtlsSessionLimits>,
+    confidentiality: Option<&mut crate::proxy::ktls_confidentiality::KtlsConfidentialityGuard>,
 ) -> KtlsSpliceEinval {
     use crate::proxy::ktls_record::{
         KtlsRecvOutcome, MAX_TLS_PLAINTEXT_RECORD_LEN, classify_ktls_control_record,
@@ -8660,6 +8804,16 @@ async fn resolve_ktls_splice_einval(
     use std::os::unix::io::AsRawFd;
 
     let src_fd = src.as_raw_fd();
+
+    // `recv_ktls_record` consumes exactly one record, so one record is charged
+    // to the receive budget before it runs. This path is cold, but a peer that
+    // drives it repeatedly with tiny control records must not be able to walk
+    // the sequence number past the threshold unobserved.
+    if let (Some(guard), Some(limits)) = (confidentiality, ktls_limits)
+        && let Err(e) = charge_or_observe_one_receive_record(guard, limits, src_fd)
+    {
+        return KtlsSpliceEinval::Failed(StreamIoSide::Read, anyhow::anyhow!("{e}"));
+    }
     // One decrypted record. Allocated only on this cold teardown path, never
     // per relayed byte, so the splice hot loop keeps its zero-copy profile.
     let mut buf = vec![0u8; MAX_TLS_PLAINTEXT_RECORD_LEN];

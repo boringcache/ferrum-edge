@@ -535,3 +535,350 @@ async fn an_untouched_budget_still_grants_the_whole_configured_timeout() {
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert_eq!(spent, Duration::from_secs(10));
 }
+
+// ── Traffic-key confidentiality budget ──────────────────────────────────────
+//
+// `dangerous_into_kernel_connection` ends rustls's own message accounting: its
+// `kernel` module states that a `KernelConnection` cannot track how many
+// messages a traffic key has protected and that aborting before the suite's
+// `CipherSuiteCommon::confidentiality_limit` becomes the caller's job. In the
+// pinned providers that limit is `1 << 24` for both TLS 1.2 AES-GCM suites and
+// `u64::MAX` for ChaCha20-Poly1305.
+//
+// These tests pin the enforcement arithmetic and its fail-closed edges without
+// a kernel: the syscall is injected as a closure, so "the counter is
+// unreadable", "the counter went backwards", and "one more syscall cannot be
+// proven safe" are all deterministic here. The live half — that a real kernel
+// actually reports those counters, and that they already include the
+// handshake's own records — is `proxy::ktls_live_kernel_tests`.
+
+mod confidentiality {
+    use ferrum_edge::proxy::ktls_confidentiality::{
+        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KtlsConfidentialityError, KtlsConfidentialityGuard,
+        KtlsConfidentialityPolicy, KtlsDirection, KtlsObservation, KtlsSessionLimits,
+        MAX_TLS_PLAINTEXT_BYTES, MIN_TLS12_AEAD_RECORD_WIRE_BYTES, charge_or_observe,
+        receive_buffer_ceiling, receive_record_bound, transmit_record_bound,
+    };
+    use ferrum_edge::socket_opts::ktls::KtlsCipher;
+
+    /// The AES-GCM confidentiality limit both pinned rustls providers carry.
+    const AES_GCM_LIMIT: u64 = 1 << 24;
+
+    fn aes_limits() -> KtlsSessionLimits {
+        KtlsSessionLimits {
+            cipher: KtlsCipher::Aes128Gcm,
+            tls_version: 0x0303,
+            confidentiality_limit: AES_GCM_LIMIT,
+        }
+    }
+
+    fn aes_policy(tx_seq: u64, rx_seq: u64) -> KtlsConfidentialityPolicy {
+        KtlsConfidentialityPolicy {
+            limits: aes_limits(),
+            initial_transmit_seq: tx_seq,
+            initial_receive_seq: rx_seq,
+            initial_receive_buffer_ceiling: 128 * 1024,
+        }
+    }
+
+    fn guard_for(direction: KtlsDirection, seq: u64) -> KtlsConfidentialityGuard {
+        let threshold = aes_limits().threshold();
+        let guard = KtlsConfidentialityGuard::new(direction, threshold, seq, 1);
+        guard.expect("a fresh session is inside its budget")
+    }
+
+    fn guard_with(threshold: u64, seq: u64, step: u64) -> KtlsConfidentialityGuard {
+        let direction = KtlsDirection::Receive;
+        let guard = KtlsConfidentialityGuard::new(direction, threshold, seq, step);
+        guard.expect("a fresh session is inside its budget")
+    }
+
+    #[test]
+    fn a_transmit_write_is_bounded_by_full_records_plus_one_partial() {
+        // A write cannot produce more records than it has full ones, plus the
+        // record an earlier write may have left partially filled.
+        assert_eq!(transmit_record_bound(0), 1);
+        assert_eq!(transmit_record_bound(1), 2);
+        assert_eq!(transmit_record_bound(MAX_TLS_PLAINTEXT_BYTES), 2);
+        assert_eq!(transmit_record_bound(MAX_TLS_PLAINTEXT_BYTES + 1), 3);
+        assert_eq!(transmit_record_bound(128 * 1024), 9);
+    }
+
+    #[test]
+    fn a_receive_is_bounded_by_the_buffer_ceiling_not_by_plaintext_bytes() {
+        // This is the property plaintext byte counters cannot supply: a peer
+        // choosing minimum-size records still cannot exceed
+        // ceiling / 29 records, because that is all the buffer can hold.
+        let ceiling = 64 * 1024u64;
+        let expected = ceiling.div_ceil(MIN_TLS12_AEAD_RECORD_WIRE_BYTES) + 1;
+        assert_eq!(receive_record_bound(ceiling), expected);
+        assert!(
+            receive_record_bound(ceiling) > ceiling / MAX_TLS_PLAINTEXT_BYTES,
+            "the bound must not assume maximally sized records"
+        );
+        assert_eq!(receive_record_bound(0), 1);
+    }
+
+    #[test]
+    fn the_receive_ceiling_takes_the_largest_candidate() {
+        // Autotuning may grow the buffer after a window is sized, so the
+        // window must be sized against the kernel maximum, never the live
+        // value alone.
+        let big = 64 * 1024 * 1024u64;
+        assert_eq!(receive_buffer_ceiling(1024, Some(big)), big);
+        assert_eq!(receive_buffer_ceiling(big, Some(1024)), big);
+        // With no kernel maximum readable, the conservative floor applies.
+        assert!(receive_buffer_ceiling(1024, None) >= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_handshakes_own_records_are_already_spent() {
+        // A TLS 1.2 server has protected at least its `Finished` record in
+        // each direction before handoff. Seeding the budget at zero would
+        // overstate the headroom by exactly those records.
+        let threshold = aes_limits().threshold();
+        let fresh = guard_for(KtlsDirection::Transmit, 0);
+        let after_handshake = guard_for(KtlsDirection::Transmit, 7);
+        assert_eq!(fresh.allowance(), threshold);
+        assert_eq!(after_handshake.allowance(), threshold - 7);
+        assert_eq!(after_handshake.observed(), 7);
+    }
+
+    #[test]
+    fn the_reserve_stops_the_relay_short_of_the_cipher_limit() {
+        let limits = aes_limits();
+        assert_eq!(
+            limits.threshold(),
+            AES_GCM_LIMIT - KTLS_CONFIDENTIALITY_RESERVE_RECORDS
+        );
+        assert!(limits.requires_enforcement());
+    }
+
+    #[test]
+    fn a_session_already_past_its_budget_never_starts_relaying() {
+        let threshold = aes_limits().threshold();
+        let direction = KtlsDirection::Receive;
+        let guard = KtlsConfidentialityGuard::new(direction, threshold, threshold, 1);
+        let err = guard.expect_err("a session at its threshold must refuse");
+        assert!(matches!(
+            err,
+            KtlsConfidentialityError::LimitReached {
+                direction: KtlsDirection::Receive,
+                ..
+            }
+        ));
+        let spent_tx = aes_policy(threshold, 0);
+        let spent_rx = aes_policy(0, threshold);
+        assert!(spent_tx.guard(KtlsDirection::Transmit).is_err());
+        assert!(spent_rx.guard(KtlsDirection::Receive).is_err());
+    }
+
+    #[test]
+    fn both_directions_get_independent_budgets() {
+        let policy = aes_policy(3, 11);
+        let tx = policy
+            .guard(KtlsDirection::Transmit)
+            .expect("transmit guard builds")
+            .expect("AES-GCM is enforced");
+        let rx = policy
+            .guard(KtlsDirection::Receive)
+            .expect("receive guard builds")
+            .expect("AES-GCM is enforced");
+        assert_eq!(tx.direction(), KtlsDirection::Transmit);
+        assert_eq!(rx.direction(), KtlsDirection::Receive);
+        assert_eq!(tx.observed(), 3);
+        assert_eq!(rx.observed(), 11);
+        assert_ne!(
+            tx.allowance(),
+            rx.allowance(),
+            "the two directions must not share one counter"
+        );
+        // The receive window is sized from the buffer ceiling; the transmit
+        // window is charged per write.
+        assert_eq!(
+            rx.step_records(),
+            receive_record_bound(policy.initial_receive_buffer_ceiling)
+        );
+    }
+
+    #[test]
+    fn an_unlimited_suite_is_not_penalised() {
+        // ChaCha20-Poly1305 carries `confidentiality_limit: u64::MAX` in both
+        // pinned providers. Enforcing nothing there is the correct posture.
+        let cipher = KtlsCipher::Chacha20Poly1305;
+        let policy = KtlsConfidentialityPolicy::unlimited(cipher, 0x0303);
+        assert!(!policy.limits.requires_enforcement());
+        let tx = policy.guard(KtlsDirection::Transmit);
+        let rx = policy.guard(KtlsDirection::Receive);
+        assert!(tx.expect("no error").is_none());
+        assert!(rx.expect("no error").is_none());
+    }
+
+    #[test]
+    fn charges_under_the_window_never_touch_the_kernel() {
+        // The whole point of pre-charging: relaying must not add a syscall per
+        // splice, let alone per byte.
+        let mut guard = guard_for(KtlsDirection::Transmit, 0);
+        let mut observations = 0usize;
+        for _ in 0..10_000 {
+            charge_or_observe(&mut guard, transmit_record_bound(128 * 1024), || {
+                observations += 1;
+                Ok(KtlsObservation {
+                    record_seq: 0,
+                    step_records: None,
+                })
+            })
+            .expect("well inside the budget");
+        }
+        assert_eq!(observations, 0, "no observation should have been needed");
+        assert_eq!(guard.allowance(), guard.threshold() - 10_000 * 9);
+    }
+
+    #[test]
+    fn an_exhausted_window_observes_once_and_reopens() {
+        let threshold = aes_limits().threshold();
+        let mut guard = guard_with(threshold, 0, 4);
+        // Burn the window down to nothing.
+        assert!(guard.charge(threshold));
+        let mut observations = 0usize;
+        charge_or_observe(&mut guard, 4, || {
+            observations += 1;
+            Ok(KtlsObservation {
+                record_seq: 1_000,
+                step_records: Some(4),
+            })
+        })
+        .expect("the kernel counter proves headroom remains");
+        assert_eq!(observations, 1);
+        assert_eq!(guard.observed(), 1_000);
+        assert_eq!(guard.allowance(), threshold - 1_000 - 4);
+    }
+
+    #[test]
+    fn an_unreadable_kernel_counter_fails_closed() {
+        let mut guard = guard_for(KtlsDirection::Receive, 0);
+        assert!(guard.charge(guard.allowance()));
+        let err = charge_or_observe(&mut guard, 1, || {
+            Err(KtlsConfidentialityError::Unobservable {
+                direction: KtlsDirection::Receive,
+                detail: "ENOPROTOOPT".to_string(),
+            })
+        })
+        .expect_err("an unreadable counter must not be treated as headroom");
+        assert!(matches!(
+            err,
+            KtlsConfidentialityError::Unobservable {
+                direction: KtlsDirection::Receive,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("receive"));
+    }
+
+    #[test]
+    fn a_counter_that_moves_backwards_fails_closed() {
+        let mut guard = guard_for(KtlsDirection::Transmit, 5_000);
+        let err = guard
+            .refresh(4_999)
+            .expect_err("a regressing counter cannot bound anything");
+        assert!(matches!(
+            err,
+            KtlsConfidentialityError::NonMonotonic {
+                direction: KtlsDirection::Transmit,
+                previous: 5_000,
+                observed: 4_999,
+            }
+        ));
+        // A counter that stands still is legitimate (an idle direction).
+        guard.refresh(5_000).expect("a static counter is monotonic");
+    }
+
+    #[test]
+    fn reaching_the_threshold_ends_the_relay() {
+        let threshold = aes_limits().threshold();
+        let mut guard = guard_for(KtlsDirection::Transmit, 0);
+        assert!(guard.charge(guard.allowance()));
+        let err = charge_or_observe(&mut guard, 1, || {
+            Ok(KtlsObservation {
+                record_seq: threshold,
+                step_records: None,
+            })
+        })
+        .expect_err("the traffic key must not be used past its bound");
+        let text = err.to_string();
+        assert!(text.contains("transmit"));
+        assert!(
+            text.contains("confidentiality limit"),
+            "the relay failure must name the cause it will be attributed with"
+        );
+        match &err {
+            KtlsConfidentialityError::LimitReached {
+                direction,
+                observed,
+                threshold: reported,
+            } => {
+                assert_eq!(*direction, KtlsDirection::Transmit);
+                assert_eq!(*observed, threshold);
+                assert_eq!(*reported, threshold);
+            }
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_larger_than_the_remaining_budget_fails_closed() {
+        // Near the threshold the next syscall's worst case may no longer fit.
+        // That cannot be relayed "just this once": it is a refusal.
+        let threshold = 1_000u64;
+        let mut guard = guard_with(threshold, 0, 10);
+        assert!(guard.charge(threshold));
+        let err = charge_or_observe(&mut guard, 10, || {
+            Ok(KtlsObservation {
+                record_seq: 995,
+                step_records: Some(10),
+            })
+        })
+        .expect_err("a step that could cross the threshold must be refused");
+        assert!(matches!(
+            err,
+            KtlsConfidentialityError::WindowExceedsBudget {
+                direction: KtlsDirection::Receive,
+                step_records: 10,
+                remaining: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_refreshed_window_never_lowers_the_charge() {
+        // If the receive buffer grew, the retry must be charged at the new,
+        // larger bound — not the stale one the caller computed.
+        let mut guard = guard_for(KtlsDirection::Receive, 0);
+        assert!(guard.charge(guard.allowance()));
+        charge_or_observe(&mut guard, 4, || {
+            Ok(KtlsObservation {
+                record_seq: 10,
+                step_records: Some(4_096),
+            })
+        })
+        .expect("headroom remains");
+        assert_eq!(guard.step_records(), 4_096);
+        assert_eq!(guard.allowance(), guard.threshold() - 10 - 4_096);
+    }
+
+    #[test]
+    fn every_failure_names_the_direction_it_will_be_attributed_to() {
+        // The relay maps a receive-budget failure to the client->backend read
+        // side and a transmit-budget failure to the backend->client write
+        // side, so the direction must survive into the error text.
+        for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
+            let err = KtlsConfidentialityError::LimitReached {
+                direction,
+                observed: 1,
+                threshold: 1,
+            };
+            assert!(err.to_string().contains(direction.as_str()));
+            assert_eq!(direction.is_transmit(), direction == KtlsDirection::Transmit);
+        }
+    }
+}
