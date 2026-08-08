@@ -44,6 +44,11 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+/// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
+/// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
+/// the buffered tokio-rustls accept and the userspace relay.
+#[cfg(target_os = "linux")]
+pub(crate) mod ktls_accept;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;

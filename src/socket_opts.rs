@@ -1722,7 +1722,7 @@ pub mod ktls {
     /// would fail AFTER we have already consumed the TLS stream via
     /// `into_inner()` + `dangerous_extract_secrets()` — at which point
     /// there is no safe way back to userspace TLS, forcing a hard
-    /// connection drop. The per-cipher gate in `try_ktls_splice` prevents
+    /// connection drop. The per-cipher gate in `proxy::ktls_accept` prevents
     /// this by refusing connections for ciphers whose kernel probe failed
     /// BEFORE extracting secrets.
     struct KtlsAvailability {
@@ -1807,7 +1807,7 @@ pub mod ktls {
     }
 
     /// Returns `true` if the kernel accepts AES-128-GCM kTLS key installs.
-    /// Gate `try_ktls_splice` on this before extracting secrets for AES-128-GCM
+    /// Gate the kTLS accept on this before extracting secrets for AES-128-GCM
     /// sessions.
     pub fn is_ktls_aes128gcm_available() -> bool {
         ktls_availability().aes128gcm
@@ -1821,7 +1821,7 @@ pub mod ktls {
     /// Returns `true` if the kernel accepts ChaCha20-Poly1305 kTLS key installs
     /// (Linux 5.11+). Kernels with AES-GCM kTLS but no ChaCha20 kTLS exist in
     /// the wild (4.13+ vs 5.11+), so this MUST be checked independently before
-    /// handing a ChaCha20-Poly1305 connection to `try_ktls_splice`.
+    /// handing a ChaCha20-Poly1305 connection to the kTLS accept path.
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         ktls_availability().chacha20_poly1305
     }
@@ -2906,7 +2906,7 @@ mod ktls_availability_tests {
     fn composite_is_any_of_three() {
         // `is_ktls_available()` must return true iff at least one per-cipher
         // probe returned true. This invariant is what upstream auto-detection
-        // depends on to set `ktls_enabled`, and is what the `try_ktls_splice`
+        // depends on to set `ktls_enabled`, and is what the `ktls_accept`
         // per-cipher gate relies on to safely refuse connections whose
         // specific cipher's probe failed.
         let any_supported = is_ktls_aes128gcm_available()

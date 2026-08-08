@@ -738,6 +738,7 @@ pub(crate) async fn bidirectional_splice_for_test(
         None,
         None,
         pipe_size,
+        false,
     )
     .await
 }
@@ -764,6 +765,7 @@ pub(crate) async fn bidirectional_splice_for_test_with_timeouts(
         backend_read_timeout,
         backend_write_timeout,
         pipe_size,
+        false,
     )
     .await
 }
@@ -3022,6 +3024,7 @@ async fn handle_tcp_connection_inner(
                 backend_read_timeout,
                 backend_write_timeout,
                 buf_size,
+                false,
             )
             .await
         };
@@ -3109,8 +3112,43 @@ async fn handle_tcp_connection_inner(
     // (even when empty) means we read plaintext from the TLS session and must
     // therefore use a userspace relay (kTLS splice is no longer possible).
     let mut client_first_bytes_forward: Option<Vec<u8>> = None;
-    let client_stream = if let Some(tls_config) = frontend_tls_config {
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
+    let client_stream = 'frontend_tls: {
+        let Some(tls_config) = frontend_tls_config else {
+            // Plaintext client: peek (non-destructively) the opening bytes. These are
+            // the application bytes on the wire, so they are fully L7-inspectable and
+            // the relay (including splice) still forwards them unchanged.
+            if scan_first_bytes {
+                stream_ctx.first_bytes =
+                    peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len)
+                        .await;
+                // Preserve the wire kind even when the timed peek observes no bytes:
+                // an enforcing stream WAF must fail closed instead of letting an
+                // idle client send unchecked bytes after the relay starts.
+                stream_ctx.first_bytes_kind = Some(StreamBytesKind::PlaintextWire);
+            }
+            if !plugins.is_empty() {
+                run_tcp_stream_connect_plugins(
+                    plugins.as_ref(),
+                    stream_ctx,
+                    &client_stream,
+                    proxy_id,
+                    remote_addr.ip(),
+                    "TCP",
+                    "(TCP)",
+                )
+                .await?;
+            }
+            break 'frontend_tls ClientRelayStream::Plain(client_stream);
+        };
+        // Linux kTLS handoff eligibility, decided before the handshake starts.
+        // A plain backend is required (splice needs both ends raw), and a
+        // decrypted first-bytes read is disqualifying because those plaintext
+        // bytes have already left the TLS session. Everything else that can
+        // refuse — kernel/cipher probes, TLS 1.3, secret-extraction opt-in —
+        // is decided inside `try_ktls_accept` while the socket is still
+        // pristine, so a refusal costs nothing but a ClientHello peek.
+        let ktls_eligible = ktls_enabled && !is_backend_tls && !scan_first_bytes_decrypted;
+
         // Frontend TLS failures return before any backend dispatch — no backend
         // circuit-breaker, pool, or socket interaction.
         // The typed `StreamSetupError` carries the kind so
@@ -3118,12 +3156,13 @@ async fn handle_tcp_connection_inner(
         // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
         // helper bounds the handshake under the configured timeout so a stalled
         // peer cannot wedge a frontend slot indefinitely.
-        let mut tls_stream = crate::tls::accept_with_optional_timeout(
-            &acceptor,
+        let accepted = accept_frontend_tls(
             client_stream,
+            tls_config,
             frontend_tls_handshake_timeout_seconds,
             &remote_addr,
             record_mesh_mtls_metric,
+            ktls_eligible,
         )
         .await
         .map_err(|e| -> anyhow::Error {
@@ -3134,6 +3173,56 @@ async fn handle_tcp_connection_inner(
             )
             .into()
         })?;
+
+        let mut tls_stream = match accepted {
+            FrontendTlsAccepted::Buffered(tls_stream) => *tls_stream,
+            #[cfg(target_os = "linux")]
+            FrontendTlsAccepted::Ktls(accepted) => {
+                // Kernel-terminated TLS. Peer identity, SNI, and the plugin
+                // lifecycle are populated exactly as on the buffered branch;
+                // the only difference is that the relay socket is plaintext.
+                let mut accepted = *accepted;
+                let peer_chain_der = accepted.peer_certificates.take();
+                let peer_cert_der = peer_chain_der
+                    .as_ref()
+                    .and_then(|certs| certs.first().cloned())
+                    .map(Arc::new);
+                let peer_chain_tail_der = peer_chain_der.and_then(|mut certs| {
+                    if certs.len() <= 1 {
+                        None
+                    } else {
+                        certs.remove(0);
+                        Some(Arc::new(certs))
+                    }
+                });
+                stream_ctx.tls_client_cert_der = peer_cert_der;
+                stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
+                stream_ctx.sni_hostname = accepted.sni_hostname.take();
+
+                // Mark the connection as TLS-terminated for any first-bytes-aware
+                // plugin (see the buffered branch below for the rationale). The
+                // decrypted first-bytes read never reaches this branch — it is
+                // disqualifying for kTLS — so no application byte is consumed.
+                if scan_first_bytes {
+                    stream_ctx.first_bytes_kind = Some(StreamBytesKind::DecryptedApp);
+                }
+
+                if !plugins.is_empty() {
+                    run_tcp_stream_connect_plugins(
+                        plugins.as_ref(),
+                        stream_ctx,
+                        &accepted.stream,
+                        proxy_id,
+                        remote_addr.ip(),
+                        "TCP/TLS",
+                        "(TCP/TLS)",
+                    )
+                    .await?;
+                }
+
+                break 'frontend_tls ClientRelayStream::Ktls(accepted.stream);
+            }
+        };
 
         // Extract peer certificate DER from TLS handshake for plugin use.
         let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
@@ -3203,31 +3292,6 @@ async fn handle_tcp_connection_inner(
         }
 
         ClientRelayStream::Tls(Box::new(tls_stream))
-    } else {
-        // Plaintext client: peek (non-destructively) the opening bytes. These are
-        // the application bytes on the wire, so they are fully L7-inspectable and
-        // the relay (including splice) still forwards them unchanged.
-        if scan_first_bytes {
-            stream_ctx.first_bytes =
-                peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len).await;
-            // Preserve the wire kind even when the timed peek observes no bytes:
-            // an enforcing stream WAF must fail closed instead of letting an
-            // idle client send unchecked bytes after the relay starts.
-            stream_ctx.first_bytes_kind = Some(StreamBytesKind::PlaintextWire);
-        }
-        if !plugins.is_empty() {
-            run_tcp_stream_connect_plugins(
-                plugins.as_ref(),
-                stream_ctx,
-                &client_stream,
-                proxy_id,
-                remote_addr.ip(),
-                "TCP",
-                "(TCP)",
-            )
-            .await?;
-        }
-        ClientRelayStream::Plain(client_stream)
     };
 
     // Helper: record circuit breaker failure for the current target.
@@ -3640,6 +3704,11 @@ async fn handle_tcp_connection_inner(
     let mut used_splice = false;
     let copy_result = match client_stream {
         ClientRelayStream::Tls(tls_stream) => {
+            // Userspace rustls relay. This is the fallback for every kTLS
+            // refusal (non-Linux, TLS 1.3, unsupported/unprobed cipher, kernel
+            // setup failure, decrypted first-bytes inspection) as well as the
+            // only path for TLS backends. Never splice a TLS stream that the
+            // kernel does not own.
             let tls_stream = *tls_stream;
             let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
@@ -3656,100 +3725,56 @@ async fn handle_tcp_connection_inner(
                     .await
                 }
                 BackendStream::Plain(bs) => {
-                    // On Linux with kTLS, attempt to install TLS keys into the kernel
-                    // so splice(2) can handle encrypted traffic without userspace copies.
-                    // backend_{read,write}_timeout are enforced inside the splice loop
-                    // via per-direction watermarks; no eligibility gate required.
-                    // Skip kTLS when first-bytes inspection consumed a decrypted
-                    // prefix: those plaintext bytes have already left the TLS
-                    // session, so the userspace relay must carry the remainder.
-                    //
-                    // Issue #2955: `try_ktls_splice` additionally refuses handoff
-                    // from the buffered tokio-rustls `TlsStream` because the
-                    // public buffered rustls API cannot prove inbound record
-                    // alignment; those connections keep the userspace relay.
-                    #[cfg(target_os = "linux")]
-                    {
-                        if ktls_enabled && client_first_bytes_forward.is_none() {
-                            match try_ktls_splice(
-                                tls_stream,
-                                bs,
-                                idle_timeout,
-                                half_close_cap,
-                                backend_read_timeout,
-                                backend_write_timeout,
-                                buf_size,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    used_splice = true;
-                                    result
-                                }
-                                Err(KtlsError::Unsupported(streams)) => {
-                                    // kTLS not available for this cipher/version — fall back
-                                    // to userspace copy with the TLS stream intact.
-                                    let (tls_stream_back, bs_back) = *streams;
-                                    bidirectional_copy(
-                                        tls_stream_back,
-                                        bs_back,
-                                        idle_timeout,
-                                        half_close_cap,
-                                        backend_read_timeout,
-                                        backend_write_timeout,
-                                        buf_size,
-                                    )
-                                    .await
-                                }
-                                Err(KtlsError::Installed(e)) => {
-                                    // Unrecoverable: TLS stream was consumed via into_inner()
-                                    // + dangerous_extract_secrets(). The raw TcpStream has no
-                                    // TLS layer — bidirectional_copy would forward plaintext.
-                                    // This path only triggers if SOL_TLS key install fails
-                                    // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
-                                    // kernel cipher mismatch or ENOMEM). In practice this is
-                                    // extremely rare since we validate cipher/version before
-                                    // extracting secrets. Attribute the failure at the
-                                    // bidirectional-copy boundary — no bytes were exchanged
-                                    // through the proxy path, so per-direction counts are 0.
-                                    StreamCopyResult {
-                                        bytes_client_to_backend: 0,
-                                        bytes_backend_to_client: 0,
-                                        first_failure: Some((
-                                            Direction::Unknown,
-                                            classify_stream_error(&e),
-                                            None,
-                                            e.to_string(),
-                                        )),
-                                    }
-                                }
-                            }
-                        } else {
-                            bidirectional_copy(
-                                tls_stream,
-                                bs,
-                                idle_timeout,
-                                half_close_cap,
-                                backend_read_timeout,
-                                backend_write_timeout,
-                                buf_size,
-                            )
-                            .await
-                        }
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        bidirectional_copy(
-                            tls_stream,
-                            bs,
-                            idle_timeout,
-                            half_close_cap,
-                            backend_read_timeout,
-                            backend_write_timeout,
-                            buf_size,
-                        )
-                        .await
-                    }
+                    bidirectional_copy(
+                        tls_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                    )
+                    .await
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        ClientRelayStream::Ktls(client_stream) => {
+            // The kernel TLS ULP owns this socket's record layer: reads yield
+            // decrypted application bytes and writes are encrypted on the way
+            // out. That makes the frontend leg indistinguishable from a plain
+            // socket to the relay, so `splice(2)` is legal against a plain
+            // backend and the userspace copy stays correct against a TLS one.
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
+            match backend_stream {
+                BackendStream::Plain(bs) => {
+                    used_splice = true;
+                    bidirectional_splice(
+                        client_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                        true,
+                    )
+                    .await
+                }
+                BackendStream::Tls(bs) => {
+                    // Not reachable today (`ktls_eligible` requires a plain
+                    // backend), but correct if that gate ever widens.
+                    used_splice = false;
+                    bidirectional_copy(
+                        client_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                    )
+                    .await
                 }
             }
         }
@@ -3798,6 +3823,7 @@ async fn handle_tcp_connection_inner(
                                 backend_read_timeout,
                                 backend_write_timeout,
                                 buf_size,
+                                false,
                             )
                             .await
                         }
@@ -5325,6 +5351,72 @@ enum BackendStream {
 enum ClientRelayStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// Frontend TLS terminated by the **kernel**: rustls handed its TLS 1.2
+    /// traffic secrets to the kTLS ULP after an unbuffered handshake reached
+    /// `WriteTraffic` (issue #3619). The socket now reads decrypted plaintext
+    /// and encrypts on write, so `splice(2)` is legal on it.
+    #[cfg(target_os = "linux")]
+    Ktls(TcpStream),
+}
+
+/// Outcome of the frontend TLS accept for a terminating TCP listener.
+enum FrontendTlsAccepted {
+    /// Ordinary buffered tokio-rustls termination; TLS stays in userspace.
+    Buffered(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// Keys installed in the kernel; the returned socket carries plaintext.
+    #[cfg(target_os = "linux")]
+    Ktls(Box<crate::proxy::ktls_accept::KtlsAccepted>),
+}
+
+/// Terminate frontend TLS, preferring the Linux kTLS handoff when the
+/// connection is eligible for it.
+///
+/// The kTLS attempt is strictly additive: it only ever peeks the ClientHello
+/// before deciding, and any refusal returns the socket untouched so the
+/// buffered tokio-rustls accept below runs exactly as it did before. Frontend
+/// admission ordering, the handshake timeout, mTLS peer verification, and the
+/// mesh handshake metrics are identical on both branches.
+async fn accept_frontend_tls(
+    client_stream: TcpStream,
+    tls_config: &Arc<rustls::ServerConfig>,
+    frontend_tls_handshake_timeout_seconds: u64,
+    remote_addr: &SocketAddr,
+    record_mesh_mtls_metric: bool,
+    ktls_eligible: bool,
+) -> std::io::Result<FrontendTlsAccepted> {
+    #[cfg(target_os = "linux")]
+    let client_stream = if ktls_eligible {
+        match crate::proxy::ktls_accept::try_ktls_accept(
+            client_stream,
+            tls_config,
+            frontend_tls_handshake_timeout_seconds,
+            remote_addr,
+            record_mesh_mtls_metric,
+        )
+        .await
+        {
+            crate::proxy::ktls_accept::KtlsAcceptOutcome::Installed(accepted) => {
+                return Ok(FrontendTlsAccepted::Ktls(accepted));
+            }
+            crate::proxy::ktls_accept::KtlsAcceptOutcome::Declined(stream) => stream,
+            crate::proxy::ktls_accept::KtlsAcceptOutcome::Failed(e) => return Err(e),
+        }
+    } else {
+        client_stream
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = ktls_eligible;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        client_stream,
+        frontend_tls_handshake_timeout_seconds,
+        remote_addr,
+        record_mesh_mtls_metric,
+    )
+    .await?;
+    Ok(FrontendTlsAccepted::Buffered(Box::new(tls_stream)))
 }
 
 /// Try to select a different upstream target for retry, excluding the current one.
@@ -6747,6 +6839,13 @@ async fn sleep_for_cap(half_close_cap: Option<Duration>) {
 ///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
+///
+/// `client_is_ktls` marks the client leg as kernel-TLS terminated (issue
+/// #3619). A kTLS receive side returns `EINVAL` from `splice(2)` for any
+/// non-application record, which is how an ordinary rustls `close_notify`
+/// arrives; with the flag set that is treated as a clean EOF instead of a
+/// relay failure, so a graceful TLS close is not attributed as an error or
+/// charged to the backend circuit breaker.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn bidirectional_splice(
@@ -6757,6 +6856,7 @@ async fn bidirectional_splice(
     backend_read_timeout: Option<Duration>,
     backend_write_timeout: Option<Duration>,
     pipe_size: usize,
+    client_is_ktls: bool,
 ) -> StreamCopyResult {
     // Create two pipes: one for each direction. Guards close fds on drop.
     let (c2b_pipe_r, c2b_pipe_w) = match create_splice_pipe(pipe_size) {
@@ -6829,6 +6929,7 @@ async fn bidirectional_splice(
         c2b_bytes_task,
         None,
         c2b_write_watermark.clone(),
+        client_is_ktls,
     );
     let b2c_fut = splice_one_direction_no_guard(
         &backend,
@@ -6839,6 +6940,7 @@ async fn bidirectional_splice(
         b2c_bytes_task,
         b2c_read_watermark.clone(),
         None,
+        false,
     );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
@@ -7263,6 +7365,7 @@ async fn bidirectional_splice_io_uring_bounded_or_async(
             backend_read_timeout,
             backend_write_timeout,
             pipe_size,
+            false,
         )
         .await
     }
@@ -8136,6 +8239,7 @@ async fn splice_one_direction_no_guard(
     bytes: Arc<AtomicU64>,
     read_watermark: Option<Arc<AtomicU64>>,
     write_watermark: Option<Arc<AtomicU64>>,
+    src_is_ktls: bool,
 ) -> Result<(), (StreamIoSide, anyhow::Error)> {
     use std::os::unix::io::AsRawFd;
 
@@ -8154,6 +8258,18 @@ async fn splice_one_direction_no_guard(
         {
             Ok(n) => n,
             Err(err) => {
+                // A kTLS receive side surfaces every NON-application record
+                // (close_notify and any other alert) as `EINVAL` from
+                // `splice(2)` — the kernel will not hand a control record to a
+                // pipe. rustls clients always send `close_notify` before FIN,
+                // so treating that as an error would attribute an ordinary
+                // graceful close as a relay failure and charge the backend
+                // circuit breaker for it. Terminate this direction the same
+                // way a plain EOF does: propagate the half-close and exit Ok.
+                if src_is_ktls && err.raw_os_error() == Some(libc::EINVAL) {
+                    shutdown_write_fd(dst_fd);
+                    return Ok(());
+                }
                 return Err((
                     StreamIoSide::Read,
                     anyhow::anyhow!("splice read readiness error: {}", err),
@@ -8240,552 +8356,6 @@ impl Drop for SplicePipeGuard {
 #[inline]
 fn coarse_now_ms() -> u64 {
     crate::socket_opts::monotonic_now_ms()
-}
-
-// ---------------------------------------------------------------------------
-// kTLS support: install TLS session keys into the kernel so splice(2) works
-// on encrypted TCP connections (Linux 4.13+).
-// ---------------------------------------------------------------------------
-
-/// Error type for the kTLS attempt. Distinguishes between pre-install failures
-/// (where the TLS stream is still usable) and post-install failures (where the
-/// connection is consumed and cannot be recovered).
-#[cfg(target_os = "linux")]
-enum KtlsError {
-    /// kTLS could not be installed (unsupported cipher, wrong TLS version, etc.).
-    /// The original streams are returned so the caller can fall back to userspace copy.
-    Unsupported(Box<(tokio_rustls::server::TlsStream<TcpStream>, TcpStream)>),
-    /// kTLS keys were installed into the kernel but the subsequent splice failed.
-    /// The TLS stream has been consumed (into_inner + dangerous_extract_secrets)
-    /// so there is no way to recover — propagate the error.
-    Installed(anyhow::Error),
-}
-
-/// Return whether a **buffered** rustls `ServerConnection` (as held inside a
-/// tokio-rustls `TlsStream`) may be abandoned for kernel TLS.
-///
-/// Always returns `false`.
-///
-/// ## Why this is fail-closed
-///
-/// `ServerConnection::dangerous_extract_secrets` delegates to
-/// `dangerous_into_kernel_connection`, which refuses handoff only when secret
-/// extraction is disabled, the handshake is incomplete, or **outbound** TLS
-/// records remain in `sendable_tls`. It silently discards:
-/// 1. decrypted-but-unread **received** plaintext, and
-/// 2. any residual **inbound** bytes still sitting in rustls's private
-///    deframer — in particular the head of a partial TLS record.
-///
-/// kTLS resumes decryption straight from the socket at the extracted `rx`
-/// sequence number, so handoff is sound only if the next byte the kernel reads
-/// is the first byte of that record. Case (1) is observable (`wants_read()` is
-/// false while plaintext is staged). Case (2) is **not**: `ConnectionCommon`'s
-/// deframer buffer is private and has no public accessor, so a session that
-/// looks completely idle can still be holding the front of a record the kernel
-/// will never see. Both cases are produced by exactly the client behaviour
-/// that motivated issue #2955 — coalescing application data with the handshake
-/// tail — so on this API there is no narrower predicate that is still sound.
-///
-/// rustls's supported kernel-handoff entry point is the **unbuffered** path:
-/// drive `rustls::server::UnbufferedServerConnection` until
-/// `ConnectionState::WriteTraffic`, then call
-/// `dangerous_into_kernel_connection`. Reaching `WriteTraffic` proves the
-/// caller-owned input buffer is drained at a record boundary. This gateway's
-/// TCP frontend still handshakes through buffered tokio-rustls, so that proof
-/// is unavailable here. Correctness wins over acceleration: keep the
-/// `TlsStream` and relay in userspace.
-///
-/// The session is borrowed **immutably** on purpose. The refusal path must not
-/// be able to consume, drain, or otherwise disturb rustls state: every
-/// application byte already decrypted has to stay readable through the
-/// `TlsStream` the caller falls back to. The logged reason therefore uses the
-/// `&self` observables only (`wants_write`/`wants_read`), which tokio-rustls
-/// has already refreshed via `process_new_packets` while completing `accept()`.
-//
-// Referenced by `try_ktls_splice` (Linux only) and by `crate::_test_support` in
-// the library target. The binary target compiles this module directly and does
-// not include `_test_support`, so non-Linux binaries have no caller.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn ktls_rustls_buffers_safe_for_kernel_handoff(
-    server_conn: &rustls::ServerConnection,
-) -> bool {
-    // Operator-visible evidence that the buffered accept path never hands off.
-    static LOG_ONCE: std::sync::Once = std::sync::Once::new();
-    LOG_ONCE.call_once(|| {
-        info!(
-            "kTLS: kernel handoff from the buffered tokio-rustls TlsStream is disabled - \
-             the public rustls ServerConnection API cannot prove that the inbound deframer \
-             is empty and record-aligned (issue #2955), so frontend-TLS TCP keeps the \
-             userspace relay"
-        );
-    });
-
-    if server_conn.wants_write() {
-        debug!(
-            "kTLS: rustls still holds outbound TLS records; refusing kernel handoff, \
-             retaining userspace TlsStream"
-        );
-    } else if !server_conn.wants_read() {
-        debug!(
-            "kTLS: rustls holds unread decrypted plaintext (or a received close_notify) \
-             after the handshake; refusing kernel handoff, retaining userspace TlsStream"
-        );
-    } else {
-        debug!(
-            "kTLS: buffered rustls ServerConnection cannot prove an empty, record-aligned \
-             inbound deframer; refusing kernel handoff (issue #2955), retaining userspace \
-             TlsStream"
-        );
-    }
-
-    false
-}
-
-/// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
-///
-/// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
-/// 2. Check that the negotiated TLS version is TLS 1.2 (see below).
-/// 3. Refuse handoff from the buffered tokio-rustls `TlsStream` (see
-///    [`ktls_rustls_buffers_safe_for_kernel_handoff`] — always fails closed
-///    until an unbuffered handshake can prove record alignment; issue #2955).
-/// 4. Extract TLS session keys via `dangerous_extract_secrets()`.
-/// 5. Install keys into the kernel via `enable_ktls()`.
-/// 6. Use `bidirectional_splice()` for zero-copy relay.
-///
-/// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
-/// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
-///
-/// **TLS 1.2 ONLY.** TLS 1.3 connections fall back to userspace relay because
-/// this implementation does not handle KeyUpdate — the kernel holds a static
-/// copy of the application traffic secret, and a peer-initiated KeyUpdate
-/// would silently desynchronize decryption mid-stream.
-///
-/// **Buffered handoff disabled.** Steps 4–6 are currently unreachable for
-/// connections accepted via tokio-rustls: the public buffered rustls API
-/// cannot prove the inbound deframer is empty, so step 3 always returns the
-/// streams for userspace relay. Secret extraction is never attempted on that
-/// path.
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-async fn try_ktls_splice(
-    tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
-    backend_stream: TcpStream,
-    idle_timeout: Option<Duration>,
-    half_close_cap: Option<Duration>,
-    backend_read_timeout: Option<Duration>,
-    backend_write_timeout: Option<Duration>,
-    buf_size: usize,
-) -> Result<StreamCopyResult, KtlsError> {
-    use std::os::unix::io::AsRawFd;
-
-    // Check cipher suite compatibility AND per-cipher kernel support before
-    // consuming the TLS stream. Supported ciphers: AES-128-GCM, AES-256-GCM,
-    // and ChaCha20-Poly1305.
-    //
-    // CRITICAL: Each cipher landed in kTLS in a different kernel version
-    // (AES-GCM in 4.13/4.17, ChaCha20-Poly1305 in 5.11+). A blanket
-    // `is_ktls_available()` answer is NOT sufficient: a kernel may accept
-    // the ULP and AES-128 keys while rejecting ChaCha20 keys with
-    // EINVAL/EOPNOTSUPP. If we only checked the cipher suite name and
-    // assumed the kernel supports it, the install would fail AFTER we
-    // have already consumed the TLS stream via `into_inner()` +
-    // `dangerous_extract_secrets()`, forcing a hard connection drop with
-    // no safe fallback to userspace TLS. The per-cipher gate below
-    // prevents this by refusing connections whose kernel probe failed
-    // BEFORE we extract secrets.
-    let cipher_ok = {
-        let (_, server_conn) = tls_stream.get_ref();
-        match server_conn.negotiated_cipher_suite() {
-            Some(suite) => {
-                let name = format!("{:?}", suite.suite());
-                if name.contains("AES_128_GCM") {
-                    crate::socket_opts::ktls::is_ktls_aes128gcm_available()
-                } else if name.contains("AES_256_GCM") {
-                    crate::socket_opts::ktls::is_ktls_aes256gcm_available()
-                } else if name.contains("CHACHA20_POLY1305") {
-                    crate::socket_opts::ktls::is_ktls_chacha20_poly1305_available()
-                } else {
-                    false
-                }
-            }
-            None => false,
-        }
-    };
-
-    if !cipher_ok {
-        debug!(
-            "kTLS: unsupported cipher suite or kernel lacks per-cipher support, \
-             falling back to userspace copy"
-        );
-        return Err(KtlsError::Unsupported(Box::new((
-            tls_stream,
-            backend_stream,
-        ))));
-    }
-
-    // Check TLS version — kTLS is restricted to TLS 1.2 ONLY in this gateway.
-    //
-    // TLS 1.3 is intentionally NOT supported because `dangerous_extract_secrets()`
-    // returns the CURRENT application traffic secret. In TLS 1.3 either peer may
-    // issue a KeyUpdate message at any time (RFC 8446 §4.6.3) to rotate keys.
-    // Because we install keys into the kernel ONCE and then splice the socket
-    // directly (no userspace TLS state machine), a peer-initiated KeyUpdate
-    // would silently desynchronize the kernel from the negotiated peer state
-    // mid-stream, producing decryption failures with no opportunity to rekey
-    // the kernel. For long-lived TCP streams this is a reachable correctness
-    // bug, so we fall back to userspace TLS for TLS 1.3 connections.
-    let tls_version = {
-        let (_, server_conn) = tls_stream.get_ref();
-        server_conn.protocol_version()
-    };
-    let tls_ver_u16 = match tls_version {
-        Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303_u16,
-        Some(rustls::ProtocolVersion::TLSv1_3) => {
-            debug!("kTLS: TLS 1.3 KeyUpdate handling not implemented, falling back to userspace");
-            return Err(KtlsError::Unsupported(Box::new((
-                tls_stream,
-                backend_stream,
-            ))));
-        }
-        _ => {
-            debug!(
-                "kTLS: unsupported TLS version {:?}, falling back",
-                tls_version
-            );
-            return Err(KtlsError::Unsupported(Box::new((
-                tls_stream,
-                backend_stream,
-            ))));
-        }
-    };
-
-    // Fail closed BEFORE TCP_ULP or `into_inner()`. The buffered tokio-rustls
-    // `ServerConnection` cannot prove inbound record alignment (issue #2955),
-    // so `ktls_rustls_buffers_safe_for_kernel_handoff` always returns false and
-    // we keep the `TlsStream` intact — including any plaintext rustls already
-    // decrypted out of the client's handshake-tail segment. The check only
-    // borrows the session immutably, so the refusal path cannot drop a single
-    // application byte, and it runs before the ULP probe because TCP_ULP is
-    // sticky on the fd once installed.
-    {
-        let (_, server_conn) = tls_stream.get_ref();
-        if !ktls_rustls_buffers_safe_for_kernel_handoff(server_conn) {
-            return Err(KtlsError::Unsupported(Box::new((
-                tls_stream,
-                backend_stream,
-            ))));
-        }
-    }
-
-    // Pre-flight: probe TCP_ULP installation on the raw fd BEFORE consuming
-    // the TLS stream. If the kernel doesn't support kTLS (ENOPROTOOPT), we
-    // can still fall back with the TLS stream intact.
-    //
-    // NOTE: Today the buffered-API gate above always refuses, so this block
-    // is only reached if that gate is later relaxed for an unbuffered
-    // `UnbufferedServerConnection` → `WriteTraffic` →
-    // `dangerous_into_kernel_connection` path that can prove alignment.
-    {
-        let (tcp_ref, _) = tls_stream.get_ref();
-        let fd = tcp_ref.as_raw_fd();
-        let ulp_name = b"tls\0";
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_ULP,
-                ulp_name.as_ptr() as *const libc::c_void,
-                ulp_name.len() as libc::socklen_t,
-            )
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            debug!("kTLS: TCP_ULP probe failed ({}), falling back", err);
-            return Err(KtlsError::Unsupported(Box::new((
-                tls_stream,
-                backend_stream,
-            ))));
-        }
-        // TCP_ULP installed successfully — kTLS is available on this socket.
-        // Proceed to extract secrets (point of no return after this block).
-    }
-
-    // Point of no return: consume the TLS stream to extract secrets.
-    // TCP_ULP is already installed on the underlying fd, so kTLS key
-    // installation should succeed. Only reachable if the buffered-API
-    // alignment gate above is later satisfied by a proven-safe handshake.
-    let (tcp_stream, server_conn) = tls_stream.into_inner();
-
-    let secrets = match server_conn.dangerous_extract_secrets() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("kTLS: failed to extract TLS secrets: {}", e);
-            return Err(KtlsError::Installed(anyhow::anyhow!(
-                "kTLS secret extraction failed: {}",
-                e
-            )));
-        }
-    };
-
-    // Map rustls secrets to kTLS parameters.
-    let params = match build_ktls_params(tls_ver_u16, &secrets) {
-        Some(p) => p,
-        None => {
-            warn!("kTLS: cipher not mappable to kTLS params");
-            return Err(KtlsError::Installed(anyhow::anyhow!(
-                "kTLS: unsupported cipher in extracted secrets"
-            )));
-        }
-    };
-
-    // Install kTLS on the raw TCP socket.
-    let fd = tcp_stream.as_raw_fd();
-    match crate::socket_opts::ktls::enable_ktls(fd, &params) {
-        Ok(true) => {
-            debug!("kTLS installed successfully, using splice for TLS connection");
-            Ok(bidirectional_splice(
-                tcp_stream,
-                backend_stream,
-                idle_timeout,
-                half_close_cap,
-                backend_read_timeout,
-                backend_write_timeout,
-                buf_size,
-            )
-            .await)
-        }
-        Ok(false) => {
-            // Kernel doesn't support kTLS (ENOPROTOOPT) — but we already consumed
-            // the TLS stream so we cannot recover.
-            warn!("kTLS: kernel returned ENOPROTOOPT after secret extraction");
-            Err(KtlsError::Installed(anyhow::anyhow!(
-                "kTLS not supported by kernel after secret extraction"
-            )))
-        }
-        Err(e) => {
-            warn!("kTLS: setsockopt failed: {}", e);
-            Err(KtlsError::Installed(anyhow::anyhow!(
-                "kTLS setsockopt failed: {}",
-                e
-            )))
-        }
-    }
-}
-
-/// Map rustls `ExtractedSecrets` to `KtlsParams` for the kernel TLS ULP.
-///
-/// Returns `None` if the cipher suite is not AES-128-GCM, AES-256-GCM, or
-/// ChaCha20-Poly1305.
-///
-/// Secret material is wrapped in `Zeroizing<Vec<u8>>` so the heap backing
-/// is volatile-zeroed on drop. This applies to the intermediate allocations
-/// in this function (they are `Zeroizing` from the moment they are created)
-/// as well as any downstream storage inside `KtlsParams`.
-#[cfg(target_os = "linux")]
-fn build_ktls_params(
-    tls_version: u16,
-    secrets: &rustls::ExtractedSecrets,
-) -> Option<crate::socket_opts::ktls::KtlsParams> {
-    use crate::socket_opts::ktls::{KtlsCipher, KtlsParams};
-    use rustls::ConnectionTrafficSecrets;
-    use zeroize::Zeroizing;
-
-    let (tx_seq, ref tx_secrets) = secrets.tx;
-    let (rx_seq, ref rx_secrets) = secrets.rx;
-
-    let (cipher_suite, tx_key, tx_iv, rx_key, rx_iv) = match (tx_secrets, rx_secrets) {
-        (
-            ConnectionTrafficSecrets::Aes128Gcm { key: tk, iv: tiv },
-            ConnectionTrafficSecrets::Aes128Gcm { key: rk, iv: riv },
-        ) => (
-            KtlsCipher::Aes128Gcm,
-            Zeroizing::new(tk.as_ref().to_vec()),
-            Zeroizing::new(tiv.as_ref().to_vec()),
-            Zeroizing::new(rk.as_ref().to_vec()),
-            Zeroizing::new(riv.as_ref().to_vec()),
-        ),
-        (
-            ConnectionTrafficSecrets::Aes256Gcm { key: tk, iv: tiv },
-            ConnectionTrafficSecrets::Aes256Gcm { key: rk, iv: riv },
-        ) => (
-            KtlsCipher::Aes256Gcm,
-            Zeroizing::new(tk.as_ref().to_vec()),
-            Zeroizing::new(tiv.as_ref().to_vec()),
-            Zeroizing::new(rk.as_ref().to_vec()),
-            Zeroizing::new(riv.as_ref().to_vec()),
-        ),
-        (
-            ConnectionTrafficSecrets::Chacha20Poly1305 { key: tk, iv: tiv },
-            ConnectionTrafficSecrets::Chacha20Poly1305 { key: rk, iv: riv },
-        ) => (
-            KtlsCipher::Chacha20Poly1305,
-            Zeroizing::new(tk.as_ref().to_vec()),
-            Zeroizing::new(tiv.as_ref().to_vec()),
-            Zeroizing::new(rk.as_ref().to_vec()),
-            Zeroizing::new(riv.as_ref().to_vec()),
-        ),
-        _ => return None,
-    };
-
-    Some(KtlsParams {
-        tls_version,
-        cipher_suite,
-        tx_key,
-        tx_iv,
-        tx_seq: tx_seq.to_be_bytes(),
-        rx_key,
-        rx_iv,
-        rx_seq: rx_seq.to_be_bytes(),
-    })
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod ktls_param_tests {
-    //! Tests for `build_ktls_params` — the rustls-ExtractedSecrets to
-    //! KtlsParams mapping. These run inline because `build_ktls_params`
-    //! is a private function and the rustls types it consumes are not
-    //! re-exported from the gateway crate.
-    //!
-    //! We use `AeadKey::from([u8; 32])` (the only stable public constructor)
-    //! which yields a 32-byte key regardless of the cipher's real key length.
-    //! That is harmless for this unit test since we are exercising the match
-    //! arm selection and byte plumbing, not the kernel install path.
-
-    use super::build_ktls_params;
-    use crate::socket_opts::ktls::KtlsCipher;
-    use rustls::ConnectionTrafficSecrets;
-    use rustls::ExtractedSecrets;
-    use rustls::crypto::cipher::{AeadKey, Iv};
-
-    fn aead_key(byte: u8) -> AeadKey {
-        AeadKey::from([byte; 32])
-    }
-
-    fn iv(byte: u8) -> Iv {
-        Iv::from([byte; 12])
-    }
-
-    #[test]
-    fn aes128_gcm_both_sides_maps_to_aes128() {
-        let secrets = ExtractedSecrets {
-            tx: (
-                0x1122_3344_5566_7788,
-                ConnectionTrafficSecrets::Aes128Gcm {
-                    key: aead_key(0x11),
-                    iv: iv(0x22),
-                },
-            ),
-            rx: (
-                0xdead_beef_0000_0001,
-                ConnectionTrafficSecrets::Aes128Gcm {
-                    key: aead_key(0x33),
-                    iv: iv(0x44),
-                },
-            ),
-        };
-        let params = build_ktls_params(0x0303, &secrets).expect("AES-128 pair must map");
-        assert!(matches!(params.cipher_suite, KtlsCipher::Aes128Gcm));
-        assert_eq!(params.tls_version, 0x0303);
-        assert_eq!(params.tx_seq, 0x1122_3344_5566_7788_u64.to_be_bytes());
-        assert_eq!(params.rx_seq, 0xdead_beef_0000_0001_u64.to_be_bytes());
-        assert_eq!(params.tx_iv.len(), 12);
-        assert_eq!(params.rx_iv.len(), 12);
-    }
-
-    #[test]
-    fn aes256_gcm_both_sides_maps_to_aes256() {
-        let secrets = ExtractedSecrets {
-            tx: (
-                1,
-                ConnectionTrafficSecrets::Aes256Gcm {
-                    key: aead_key(0xaa),
-                    iv: iv(0xbb),
-                },
-            ),
-            rx: (
-                2,
-                ConnectionTrafficSecrets::Aes256Gcm {
-                    key: aead_key(0xcc),
-                    iv: iv(0xdd),
-                },
-            ),
-        };
-        let params = build_ktls_params(0x0303, &secrets).expect("AES-256 pair must map");
-        assert!(matches!(params.cipher_suite, KtlsCipher::Aes256Gcm));
-        assert_eq!(params.tx_seq, 1u64.to_be_bytes());
-        assert_eq!(params.rx_seq, 2u64.to_be_bytes());
-    }
-
-    #[test]
-    fn mismatched_cipher_families_return_none() {
-        let secrets = ExtractedSecrets {
-            tx: (
-                0,
-                ConnectionTrafficSecrets::Aes128Gcm {
-                    key: aead_key(0x11),
-                    iv: iv(0x22),
-                },
-            ),
-            rx: (
-                0,
-                ConnectionTrafficSecrets::Aes256Gcm {
-                    key: aead_key(0x33),
-                    iv: iv(0x44),
-                },
-            ),
-        };
-        assert!(build_ktls_params(0x0303, &secrets).is_none());
-    }
-
-    #[test]
-    fn chacha20_poly1305_both_sides_maps_to_chacha20() {
-        let secrets = ExtractedSecrets {
-            tx: (
-                7,
-                ConnectionTrafficSecrets::Chacha20Poly1305 {
-                    key: aead_key(0x11),
-                    iv: iv(0x22),
-                },
-            ),
-            rx: (
-                8,
-                ConnectionTrafficSecrets::Chacha20Poly1305 {
-                    key: aead_key(0x33),
-                    iv: iv(0x44),
-                },
-            ),
-        };
-        let params = build_ktls_params(0x0304, &secrets).expect("ChaCha20-Poly1305 pair must map");
-        assert!(matches!(params.cipher_suite, KtlsCipher::Chacha20Poly1305));
-        assert_eq!(params.tls_version, 0x0304);
-        assert_eq!(params.tx_seq, 7u64.to_be_bytes());
-        assert_eq!(params.rx_seq, 8u64.to_be_bytes());
-        // ChaCha20-Poly1305 uses the full 12-byte IV directly.
-        assert_eq!(params.tx_iv.len(), 12);
-        assert_eq!(params.rx_iv.len(), 12);
-    }
-
-    #[test]
-    fn chacha20_mixed_with_aes_returns_none() {
-        // TX ChaCha20, RX AES-128 — not a supported mixed pairing.
-        let secrets = ExtractedSecrets {
-            tx: (
-                0,
-                ConnectionTrafficSecrets::Chacha20Poly1305 {
-                    key: aead_key(0x11),
-                    iv: iv(0x22),
-                },
-            ),
-            rx: (
-                0,
-                ConnectionTrafficSecrets::Aes128Gcm {
-                    key: aead_key(0x33),
-                    iv: iv(0x44),
-                },
-            ),
-        };
-        assert!(build_ktls_params(0x0303, &secrets).is_none());
-    }
 }
 
 #[cfg(test)]

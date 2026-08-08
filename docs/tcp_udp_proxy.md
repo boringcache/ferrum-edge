@@ -391,7 +391,7 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A watchdog compares the last activity timestamp against the timeout. It ticks every 1 second for sub-30s timeouts and every 5 seconds for 30s+ timeouts, reducing timer churn for production-length connections
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. Frontend-TLS TCP connections currently **retain the userspace rustls relay** even when `FERRUM_KTLS_ENABLED=auto`/`true` and the kernel `tls` module is loaded: the buffered tokio-rustls `TlsStream` cannot prove inbound TLS record alignment before secret extraction (issue #2955 — silent plaintext loss or deframer desync). Kernel kTLS splice will only be re-enabled from an unbuffered rustls handshake that reaches `WriteTraffic` before `dangerous_into_kernel_connection`. Plaintext-to-plaintext splice is unaffected. Stream transaction summaries report `splice=false` for frontend-TLS relays while this gate is in effect.
+- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. Frontend-TLS TCP connections use `splice(2)` too when — and only when — the TLS session can be handed to the kernel TLS ULP; see "Frontend-TLS kTLS splice" below. Every connection that cannot be handed off keeps the userspace rustls relay and reports `splice=false` in its stream transaction summary.
 - TLS userspace relays additionally collapse to `tokio::io::copy_bidirectional_with_sizes` (no per-direction tracking) when the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`); any non-zero bound opts into the direction-tracking copy path
 
 ```yaml
@@ -423,6 +423,103 @@ Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement f
 **Watchdog granularity**: The watchdog ticks every 1 second when the shortest active timeout is below 30 seconds, and every 5 seconds when all active timeouts are 30 seconds or longer. A configured 5,000 ms timeout therefore fires within ~6 s; the default 30,000 ms backend timeouts fire within ~35 s. This keeps short test/dev timeouts responsive while reducing per-connection timer churn for production-length TCP sessions.
 
 **Splice/kTLS paths**: The per-direction inactivity timeouts apply to the Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths too. Each direction carries a watermark refreshed on every successful splice syscall (read or write), and the same watchdog cadence (1 s under 30 s timeouts, 5 s otherwise) checks them. For the io_uring path the watermark is polled inline inside the blocking worker; on timeout the worker returns a sentinel error and the parent issues a `shutdown(SHUT_RDWR)` to unblock the other worker if needed. Successfully delivered bytes are preserved on EOF, idle timeout, per-direction read/write timeout, cancellation, and I/O/setup errors — the io_uring and libc-fallback workers return `bytes_so_far` with the error so metrics and `StreamTransactionSummary` still reflect volume transferred before the ending (issue #2957).
+
+## Frontend-TLS kTLS Splice
+
+`FERRUM_KTLS_ENABLED=auto|true` lets a TLS-terminating TCP proxy hand its
+session keys to the Linux kernel TLS ULP so the relay can use `splice(2)`
+instead of decrypting in userspace. This is a pure optimization: **every**
+connection that cannot be handed off safely keeps the userspace rustls relay
+and is never dropped for it.
+
+### What is supported
+
+| Axis | Supported | Everything else |
+| --- | --- | --- |
+| Platform | Linux with the `tls` kernel module (`modprobe tls`) | userspace relay |
+| TLS version | **TLS 1.2 only** | userspace relay |
+| Cipher | `ECDHE_{RSA,ECDSA}_WITH_AES_128_GCM_SHA256`, `..._AES_256_GCM_SHA384` (Linux 4.13/4.17+), `..._CHACHA20_POLY1305_SHA256` (Linux 5.11+), each gated on its own startup probe | userspace relay |
+| Backend | plain `tcp` backend | userspace relay |
+| Plugins | no plugin requesting decrypted first bytes | userspace relay |
+| Frontend mode | terminating `tcp_tls` (not `passthrough`) | unchanged |
+
+TLS 1.3 is **refused, not approximated**. The kernel holds a static copy of the
+application traffic secret and this gateway does not implement KeyUpdate
+(RFC 8446 §4.6.3) rekeying, so a TLS 1.3 client is declined before any
+handshake work — detected from the `supported_versions` extension in the
+peeked ClientHello — and served by the userspace relay instead.
+
+### Why the handoff is safe (issues #2955, #3619)
+
+`ServerConnection::dangerous_extract_secrets` silently discards
+decrypted-but-unread plaintext and any residual bytes in rustls's private
+inbound deframer. Because kTLS resumes decryption straight off the socket at
+the extracted `rx` sequence number, either would corrupt the stream — and
+neither is observable through the buffered tokio-rustls API, which is why
+issue #2955 pinned that path closed.
+
+The handshake therefore runs on `rustls::server::UnbufferedServerConnection`
+(`src/proxy/ktls_accept.rs`), whose input buffer is owned by the gateway, and
+the gateway reads **one whole TLS record at a time, only while rustls reports
+`BlockedHandshake`**. Reaching `ConnectionState::WriteTraffic` then proves all
+three preconditions at once:
+
+1. no decrypted plaintext is staged (`ReadTraffic`/`ReadEarlyData` would have
+   been emitted first),
+2. no outbound record is pending (`EncodeTlsData`/`TransmitTlsData` would have
+   been emitted first, and `dangerous_into_kernel_connection` re-checks), and
+3. the gateway-owned inbound buffer is empty and the socket is positioned on a
+   record boundary.
+
+A client that coalesces application data behind its handshake tail simply
+leaves that record in the kernel receive queue, where the kTLS record layer
+picks it up — the exact case that motivated #2955.
+
+### Fallback contract
+
+Eligibility is decided from a **peeked** (never consumed) ClientHello, so all
+of the following decline with the socket byte-for-byte intact and the ordinary
+buffered tokio-rustls accept takes over: secret extraction not enabled on the
+listener, no kernel cipher probe passed, no complete ClientHello observable
+before `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, a TLS 1.3 offer, an
+offer set containing any suite this kernel cannot install, or a `TCP_ULP`
+install failure. `TCP_ULP` is installed *before* the handshake precisely so its
+failure is still recoverable; with no keys installed the ULP is the kernel's
+transparent `TLS_BASE` variant, so the userspace relay on the decline path is
+unaffected.
+
+Handshake failures, peer I/O errors, and handshake timeouts terminate the
+connection exactly as they would on the buffered path, with the same
+`StreamSetupKind::FrontendTlsHandshake` attribution and the same mesh mTLS
+handshake metrics. The one residual unrecoverable window is a failing
+`setsockopt(SOL_TLS, TLS_TX/TLS_RX)` *after* the handshake completed and
+rustls's session was consumed — guarded by the startup per-cipher probe (an
+identical install on a real loopback socket) plus the pre-handshake `TCP_ULP`
+install on this socket, leaving ENOMEM-class kernel failure.
+
+### Observability and semantics
+
+A handed-off connection reports `splice=true` in its stream transaction
+summary; a fallback reports `splice=false`. Peer certificate identity (mTLS),
+SNI, `on_stream_connect` plugin ordering, `tcp_idle_timeout_seconds`,
+`tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`,
+`backend_write_timeout_ms`, byte accounting, and first-failure direction
+attribution are identical on both paths — the kTLS socket carries plaintext to
+userspace, so it feeds the same splice loops as a plain-to-plain relay. SNI on
+the kTLS path is parsed from the peeked ClientHello rather than read back from
+a `ServerConnection`.
+
+One kernel-specific detail is handled explicitly: a kTLS receive side returns
+`EINVAL` from `splice(2)` for any non-application record, which is how a
+routine rustls `close_notify` arrives. The client-leg splice loop maps that to
+a clean EOF, so a graceful TLS close is not reported as a relay failure and
+does not charge the backend circuit breaker. The io_uring splice path is not
+used for kTLS connections.
+
+Secret material never leaves `Zeroizing` buffers, is never logged, and the
+`KernelConnection` handle rustls returns alongside the secrets is dropped
+immediately (it exists only for TLS 1.3 KeyUpdate and client-side session
+tickets, neither of which applies here).
 
 ## UDP Session Management
 
@@ -486,7 +583,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe and cipher gating for TCP frontend-TLS paths (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. **Handoff from the buffered tokio-rustls accept path is currently disabled** (issue #2955): rustls's public buffered API cannot prove the inbound deframer is empty, so every frontend-TLS connection keeps the userspace relay. Re-enable only with an unbuffered `UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection` handshake. |
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction), but concurrent io_uring relays are capped at 128 — beyond the cap, additional streams transparently fall back to the async libc splice path, so worst-case io_uring blocking-thread usage is 256. Keep `FERRUM_BLOCKING_THREADS` at the 512 default or higher so other `spawn_blocking` work retains headroom. Each blocking thread consumes ~2-4 MB of stack |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |

@@ -1,289 +1,172 @@
-//! Deterministic coverage for the rustls -> kTLS handoff gate
-//! ([issue #2955](https://github.com/ferrum-edge/ferrum-edge/issues/2955)).
+//! Deterministic coverage for the frontend-TLS kTLS handoff admission gate
+//! ([issue #3619](https://github.com/ferrum-edge/ferrum-edge/issues/3619),
+//! superseding the refuse-closed buffered gate of issue #2955).
 //!
-//! `try_ktls_splice` consumes the tokio-rustls `TlsStream` and resumes
-//! decryption from the raw socket. rustls's `dangerous_into_kernel_connection`
-//! refuses only when *outbound* TLS records are still buffered, so two classes
-//! of inbound state were dropped silently:
+//! The handshake itself now runs on rustls's unbuffered API and only hands off
+//! after reaching `WriteTraffic`, which is what makes the record alignment
+//! provable. What decides *whether* that path is entered at all is
+//! [`ClientHelloKtlsFacts`], computed from a peeked ClientHello while the
+//! socket is still pristine — so every refusal here is a clean fall-back to
+//! the buffered tokio-rustls accept, not a dropped connection.
 //!
-//! 1. plaintext rustls had already decrypted but the gateway had not read, and
-//! 2. residual bytes in rustls's private deframer — the head of a partial TLS
-//!    record — which desynchronize the kernel record layer.
+//! These tests pin the two properties that keep the fallback safe:
 //!
-//! Class (1) is observable through the public buffered API. Class (2) is not:
-//! a session holding a partial inbound record is byte-for-byte
-//! indistinguishable, through every public accessor, from a completely idle
-//! one. These tests pin that the gate therefore refuses unconditionally, and
-//! that refusing never disturbs the session — every application byte stays
-//! readable for the userspace relay that takes over.
+//! 1. A TLS 1.3 offer is refused. The kernel holds a static traffic secret and
+//!    KeyUpdate (RFC 8446 §4.6.3) is not handled, so TLS 1.3 must never reach
+//!    the handoff.
+//! 2. Anything unprovable is refused. Truncated, malformed, or non-TLS input,
+//!    and any offer set containing a suite this kernel cannot install, all
+//!    decline rather than gamble on rustls's suite choice.
 //!
-//! The transport is in memory (`Vec<u8>` pumped between two rustls
-//! connections) so record coalescing is exact and nothing depends on socket or
-//! thread timing.
+//! ClientHello bytes come from real rustls client connections so the parser is
+//! exercised against authentic wire encodings rather than hand-rolled blobs.
 
-use std::io::{Read, Write};
 use std::sync::Arc;
 
+use ferrum_edge::proxy::sni::{ClientHelloKtlsFacts, client_hello_ktls_facts};
 use ferrum_edge::tls::NoVerifier;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
 
-const OPENING: &[u8] = b"OPENING-CMD-2955";
-const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.crt");
-const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.key");
-
-/// Bytes withheld from the final application record in the partial-record test.
-const WITHHELD_TAIL: usize = 8;
-
-/// Ferrum's production handoff gate, reached through the crate test surface.
-fn handoff_allowed(server: &ServerConnection) -> bool {
-    ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(server)
-}
-
-fn test_certs() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let cert_pem = std::fs::read(CERT_PATH).expect("read test certificate");
-    let key_pem = std::fs::read(KEY_PATH).expect("read test private key");
-    let certs = rustls_pemfile::certs(&mut &cert_pem[..])
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse test certificate chain");
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .expect("parse test private key")
-        .expect("test private key present");
-    (certs, key)
-}
-
-/// TLS 1.2 only: that is the sole version `try_ktls_splice` ever hands off, and
-/// its abbreviated handshake is what lets a client coalesce Finished with
-/// application data.
-fn tls12_server_config() -> Arc<ServerConfig> {
-    let (certs, key) = test_certs();
+/// Produce a real ClientHello for a client restricted to `versions`.
+fn client_hello_for(versions: &[&'static rustls::SupportedProtocolVersion]) -> Vec<u8> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS12])
-        .expect("TLS 1.2 is a supported protocol version")
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("test server certificate and key");
-    // Session-ID resumption backs the abbreviated-handshake test below.
-    config.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
-    Arc::new(config)
-}
-
-fn tls12_client_config() -> Arc<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS12])
-        .expect("TLS 1.2 is a supported protocol version")
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .expect("requested protocol versions are supported")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
-    config.resumption = rustls::client::Resumption::in_memory_sessions(32);
-    Arc::new(config)
+    let mut conn = ClientConnection::new(
+        Arc::new(config),
+        ServerName::try_from("ktls.example.com").expect("valid SNI"),
+    )
+    .expect("client connection");
+
+    let mut hello = Vec::new();
+    conn.write_tls(&mut hello)
+        .expect("ClientHello is written to an in-memory buffer");
+    assert!(!hello.is_empty(), "rustls must emit a ClientHello");
+    hello
 }
 
-fn tls12_pair_from(
-    client_config: Arc<ClientConfig>,
-    server_config: Arc<ServerConfig>,
-) -> (ClientConnection, ServerConnection) {
-    let name = ServerName::try_from("localhost").expect("static DNS name");
-    let client = ClientConnection::new(client_config, name).expect("client connection");
-    let server = ServerConnection::new(server_config).expect("server connection");
-    (client, server)
-}
+/// Every per-cipher kernel probe passing (Linux 5.11+ shape).
+const ALL_CIPHERS: (bool, bool, bool) = (true, true, true);
 
-/// Drain every TLS record the client currently wants to send.
-fn take_client_records(client: &mut ClientConnection) -> Vec<u8> {
-    let mut out = Vec::new();
-    while client.wants_write() {
-        client.write_tls(&mut out).expect("client write_tls");
-    }
-    out
-}
-
-/// Drain every TLS record the server currently wants to send.
-fn take_server_records(server: &mut ServerConnection) -> Vec<u8> {
-    let mut out = Vec::new();
-    while server.wants_write() {
-        server.write_tls(&mut out).expect("server write_tls");
-    }
-    out
-}
-
-fn feed_client(client: &mut ClientConnection, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        let read = client.read_tls(&mut bytes).expect("client read_tls");
-        assert!(read > 0, "client read_tls stalled");
-        client.process_new_packets().expect("client packets");
-    }
-}
-
-/// Deliver `bytes` to the server as one logical arrival, then let rustls
-/// process whatever became complete. Passing a concatenated handshake flight
-/// plus application record reproduces the TCP coalescing from issue #2955.
-fn feed_server(server: &mut ServerConnection, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        let read = server.read_tls(&mut bytes).expect("server read_tls");
-        assert!(read > 0, "server read_tls stalled");
-        server.process_new_packets().expect("server packets");
-    }
-}
-
-/// Pump both directions until neither side is handshaking.
-fn drive_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
-    for _ in 0..16 {
-        let to_server = take_client_records(client);
-        if !to_server.is_empty() {
-            feed_server(server, &to_server);
-        }
-        let to_client = take_server_records(server);
-        if !to_client.is_empty() {
-            feed_client(client, &to_client);
-        }
-        if !client.is_handshaking() && !server.is_handshaking() {
-            return;
-        }
-        if to_server.is_empty() && to_client.is_empty() {
-            break;
-        }
-    }
-    panic!("TLS 1.2 handshake did not converge");
-}
-
-/// Buffer application bytes on the client's plaintext writer. Before the
-/// handshake completes rustls stages them and flushes them into the same
-/// outbound record burst as the client Finished.
-fn stage_app_data(client: &mut ClientConnection, data: &[u8]) {
-    let mut writer = client.writer();
-    writer.write_all(data).expect("stage application data");
-}
-
-fn read_plaintext(server: &mut ServerConnection, len: usize) -> Vec<u8> {
-    let mut got = vec![0u8; len];
-    let mut reader = server.reader();
-    reader.read_exact(&mut got).expect("read staged plaintext");
-    got
-}
-
-/// A completed TLS 1.2 handshake with nothing left on either side — the state a
-/// tokio-rustls `accept()` hands to `try_ktls_splice`.
-fn completed_tls12_pair() -> (ClientConnection, ServerConnection) {
-    let client_cfg = tls12_client_config();
-    let server_cfg = tls12_server_config();
-    let (mut client, mut server) = tls12_pair_from(client_cfg, server_cfg);
-    drive_handshake(&mut client, &mut server);
-    (client, server)
+fn eligible(facts: &ClientHelloKtlsFacts, probes: (bool, bool, bool)) -> bool {
+    facts.ktls_eligible(probes.0, probes.1, probes.2)
 }
 
 #[test]
-fn clean_buffered_handshake_is_not_treated_as_kernel_handoff_safe() {
-    let (_client, mut server) = completed_tls12_pair();
+fn tls13_capable_client_is_refused_before_any_handshake_work() {
+    let hello = client_hello_for(&[&rustls::version::TLS13, &rustls::version::TLS12]);
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
-    let io = server.process_new_packets().expect("server packets");
-    assert_eq!(io.plaintext_bytes_to_read(), 0);
-    assert_eq!(io.tls_bytes_to_write(), 0);
-    assert!(server.wants_read());
-    assert!(!server.wants_write());
-    let version = server.protocol_version();
-    assert_eq!(version, Some(rustls::ProtocolVersion::TLSv1_2));
-
-    // A clean IoState is necessary but not sufficient. Nothing observable here
-    // proves rustls's private inbound deframer is empty and record-aligned, so
-    // the gate must still refuse.
-    assert!(!handoff_allowed(&server));
+    assert!(
+        facts.offers_tls13,
+        "a TLS 1.3-capable client must be detected through supported_versions"
+    );
+    assert!(
+        !eligible(&facts, ALL_CIPHERS),
+        "TLS 1.3 must never reach the kernel handoff: KeyUpdate is not handled"
+    );
 }
 
 #[test]
-fn plaintext_buffered_after_handshake_refuses_handoff_and_survives() {
-    let (mut client, mut server) = completed_tls12_pair();
+fn tls13_only_client_is_refused() {
+    let hello = client_hello_for(&[&rustls::version::TLS13]);
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
-    stage_app_data(&mut client, OPENING);
-    let record = take_client_records(&mut client);
-    feed_server(&mut server, &record);
-
-    let io = server.process_new_packets().expect("server packets");
-    assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
-    assert!(!server.wants_read());
-
-    assert!(!handoff_allowed(&server));
-    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+    assert!(facts.offers_tls13);
+    assert!(!eligible(&facts, ALL_CIPHERS));
 }
 
 #[test]
-fn resumed_handshake_coalescing_finished_with_app_data_refuses_handoff() {
-    let client_cfg = tls12_client_config();
-    let server_cfg = tls12_server_config();
+fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
+    let hello = client_hello_for(&[&rustls::version::TLS12]);
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
-    // Warm-up full handshake so both sides cache a resumable TLS 1.2 session.
-    let warm_pair = tls12_pair_from(client_cfg.clone(), server_cfg.clone());
-    let (mut warm_client, mut warm_server) = warm_pair;
-    drive_handshake(&mut warm_client, &mut warm_server);
-
-    // Abbreviated handshake: the server sends CCS+Finished first, so the
-    // client's single reply flight carries CCS, Finished and the opening
-    // application record together — the coalescing described in issue #2955.
-    let (mut client, mut server) = tls12_pair_from(client_cfg, server_cfg);
-    let hello = take_client_records(&mut client);
-    feed_server(&mut server, &hello);
-    let server_flight = take_server_records(&mut server);
-    stage_app_data(&mut client, OPENING);
-    feed_client(&mut client, &server_flight);
-    assert!(!client.is_handshaking());
-    let client_flight = take_client_records(&mut client);
-    feed_server(&mut server, &client_flight);
-
-    let kind = server.handshake_kind();
-    assert_eq!(kind, Some(rustls::HandshakeKind::Resumed));
-    let io = server.process_new_packets().expect("server packets");
-    assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
-
-    // Handing off here is exactly the silent-truncation bug: the kernel would
-    // resume from the socket and these bytes would never reach the backend.
-    assert!(!handoff_allowed(&server));
-    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+    assert!(
+        !facts.offers_tls13,
+        "a TLS 1.2-only rustls client must not advertise TLS 1.3"
+    );
+    assert!(
+        facts.offers_aes128_gcm || facts.offers_aes256_gcm || facts.offers_chacha20_poly1305,
+        "rustls TLS 1.2 always offers at least one AEAD suite"
+    );
+    assert!(
+        eligible(&facts, ALL_CIPHERS),
+        "a TLS 1.2 client whose whole offer set is installable is eligible"
+    );
 }
 
 #[test]
-fn partial_inbound_record_looks_idle_yet_handoff_is_refused() {
-    let (mut client, mut server) = completed_tls12_pair();
+fn a_single_uninstallable_offered_suite_declines_the_whole_connection() {
+    let hello = client_hello_for(&[&rustls::version::TLS12]);
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
+    assert!(
+        facts.offers_chacha20_poly1305,
+        "rustls TLS 1.2 offers ChaCha20-Poly1305"
+    );
 
-    stage_app_data(&mut client, OPENING);
-    let record = take_client_records(&mut client);
-    assert!(record.len() > WITHHELD_TAIL, "expected a full record");
-
-    // Deliver all but the tail of the record. rustls keeps the fragment in its
-    // private deframer, which no public accessor reports.
-    let split = record.len() - WITHHELD_TAIL;
-    feed_server(&mut server, &record[..split]);
-
-    // Observably identical to the clean, idle connection above.
-    let io = server.process_new_packets().expect("server packets");
-    assert_eq!(io.plaintext_bytes_to_read(), 0);
-    assert_eq!(io.tls_bytes_to_write(), 0);
-    assert!(server.wants_read());
-    assert!(!server.wants_write());
-
-    // Handing off would strand the fragment and desynchronize the kernel
-    // record layer, so the gate refuses on this indistinguishable state too.
-    assert!(!handoff_allowed(&server));
-
-    // The refusal left the session intact: the record completes normally.
-    feed_server(&mut server, &record[split..]);
-    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+    // Linux 4.17-5.10 shape: AES-GCM kTLS exists, ChaCha20-Poly1305 does not.
+    // rustls's suite choice is not predicted here, so the connection declines.
+    assert!(
+        !eligible(&facts, (true, true, false)),
+        "an offer set containing a suite the kernel cannot install must decline"
+    );
 }
 
 #[test]
-fn handoff_gate_never_consumes_staged_plaintext() {
-    let (mut client, mut server) = completed_tls12_pair();
+fn no_kernel_cipher_support_declines() {
+    let hello = client_hello_for(&[&rustls::version::TLS12]);
+    let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
-    stage_app_data(&mut client, OPENING);
-    let record = take_client_records(&mut client);
-    feed_server(&mut server, &record);
+    assert!(!eligible(&facts, (false, false, false)));
+}
 
-    for _ in 0..4 {
-        assert!(!handoff_allowed(&server));
-        let io = server.process_new_packets().expect("server packets");
-        assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
+#[test]
+fn a_hello_offering_no_selectable_suite_declines() {
+    // No TLS 1.2 AEAD suite rustls can select: nothing to install, so the
+    // handoff must not be attempted even though TLS 1.3 was not offered.
+    let facts = ClientHelloKtlsFacts::default();
+    assert!(!eligible(&facts, ALL_CIPHERS));
+}
+
+#[test]
+fn truncated_client_hello_is_unprovable_and_refused() {
+    let hello = client_hello_for(&[&rustls::version::TLS13, &rustls::version::TLS12]);
+    assert!(hello.len() > 32, "sanity: hello is longer than its header");
+
+    // A prefix that stops before the extension block could hide
+    // supported_versions and make a TLS 1.3 client look like TLS 1.2. Parsing
+    // must refuse rather than answer from a partial view.
+    for cut in [5usize, 16, 40, hello.len() - 4] {
+        assert!(
+            client_hello_ktls_facts(&hello[..cut]).is_none(),
+            "a ClientHello truncated at {cut} bytes must not yield facts"
+        );
     }
+}
 
-    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+#[test]
+fn non_handshake_and_empty_inputs_are_refused() {
+    assert!(client_hello_ktls_facts(&[]).is_none());
+    assert!(client_hello_ktls_facts(b"GET / HTTP/1.1\r\n").is_none());
+    // Handshake record whose message type is ServerHello, not ClientHello.
+    let server_hello = [0x16u8, 0x03, 0x01, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
+    assert!(client_hello_ktls_facts(&server_hello).is_none());
+}
+
+#[test]
+fn sni_used_for_the_ktls_relay_identity_comes_from_the_same_hello() {
+    // The kTLS branch has no `ServerConnection::server_name()` to read, so it
+    // takes SNI from the peeked ClientHello. Pin that the same bytes that
+    // prove eligibility also yield the hostname.
+    let hello = client_hello_for(&[&rustls::version::TLS12]);
+    assert!(client_hello_ktls_facts(&hello).is_some());
+    assert_eq!(
+        ferrum_edge::proxy::sni::extract_sni_from_client_hello(&hello).as_deref(),
+        Some("ktls.example.com")
+    );
 }
