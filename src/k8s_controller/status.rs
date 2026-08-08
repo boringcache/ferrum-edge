@@ -598,7 +598,11 @@ fn frontend_tls_hostname_losers(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|listener| listener_is_terminating_tls(listener))
+            .filter(|listener| {
+                listener_is_terminating_tls(listener)
+                    && listener_protocol_mode_is_supported(listener)
+                    && validate_gateway_listener_allowed_routes(listener).is_ok()
+            })
         {
             let identities = listener_tls_certificate_ref_identities(gateway, listener, indexes);
             // Only a listener whose references ALL resolve can claim a
@@ -4302,6 +4306,69 @@ mod tests {
             find_condition(loser_conditions, "Programmed")["reason"].as_str(),
             Some("HostnameConflict")
         );
+    }
+
+    #[test]
+    fn unsupported_tls_terminate_listener_cannot_claim_an_https_hostname() {
+        let gateway_class = ferrum_gateway_class();
+        let mut unsupported = object(
+            "Gateway",
+            "edge-unsupported",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 443,
+                    "protocol": "TLS",
+                    "hostname": "shop.example.com",
+                    "tls": {
+                        "mode": "Terminate",
+                        "certificateRefs": [{"name": "certificate-a"}]
+                    }
+                }]
+            }),
+        );
+        unsupported.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut valid = object(
+            "Gateway",
+            "edge-valid",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        valid.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, unsupported, valid, secret_a, secret_b],
+            options(),
+        );
+
+        let unsupported = update_for(&updates, "Gateway", "edge-unsupported");
+        let unsupported_listener = listener_status_by_name(
+            unsupported.status["listeners"].as_array().unwrap(),
+            "tls-terminate",
+        );
+        assert_condition(
+            unsupported_listener["conditions"].as_array().unwrap(),
+            "Accepted",
+            "False",
+        );
+
+        let valid = update_for(&updates, "Gateway", "edge-valid");
+        let valid_listener =
+            listener_status_by_name(valid.status["listeners"].as_array().unwrap(), "https");
+        let conditions = valid_listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Conflicted", "False");
     }
 
     #[test]

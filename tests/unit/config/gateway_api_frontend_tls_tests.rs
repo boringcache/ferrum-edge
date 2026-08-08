@@ -344,6 +344,62 @@ fn hostname_collision_fails_the_younger_listener_closed() {
 }
 
 #[test]
+fn rejected_listener_cannot_win_a_certificate_hostname_collision() {
+    let mut rejected = https_listener(
+        "https",
+        443,
+        Some("shop.example.com"),
+        &["rejected-cert"],
+    );
+    rejected["allowedRoutes"]["namespaces"]["from"] = json!("Invalid");
+    let rejected_gateway = created_at(
+        gateway("ferrum", "edge-rejected", vec![rejected]),
+        "2026-01-01T00:00:00Z",
+    );
+    let valid_gateway = created_at(
+        gateway(
+            "ferrum",
+            "edge-valid",
+            vec![https_listener(
+                "https",
+                8443,
+                Some("shop.example.com"),
+                &["valid-cert"],
+            )],
+        ),
+        "2026-06-01T00:00:00Z",
+    );
+
+    let result = translate(&[
+        rejected_gateway,
+        valid_gateway,
+        tls_secret("rejected-cert", "ferrum"),
+        tls_secret("valid-cert", "ferrum"),
+        route("ferrum", "route-valid", "edge-valid", "https", "/"),
+    ]);
+
+    assert_eq!(result.config.frontend_tls_certificate_sources.len(), 1);
+    assert_eq!(
+        result.config.frontend_tls_certificate_sources[0].gateway,
+        "edge-valid"
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("route-valid")),
+        "a rejected older listener must not evict the valid listener or its routes"
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("already served with a different certificate"))
+    );
+}
+
+#[test]
 fn identical_certificate_on_one_hostname_is_not_a_collision() {
     let result = translate(&[
         gateway(

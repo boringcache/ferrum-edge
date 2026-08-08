@@ -1565,6 +1565,11 @@ fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
         .filter(|listener| listener_requires_frontend_tls(listener))
     {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let key = GatewayApiListenerKey {
+            namespace: object.metadata.namespace.clone(),
+            gateway: object.metadata.name.clone(),
+            listener: listener_name.to_string(),
+        };
         let Some(certificates) = listener_frontend_tls_sources(acc, object, listener) else {
             warnings.push(format!(
                 "Gateway API Gateway {}/{} listener {} field spec.listeners[].tls.certificateRefs has at least one reference that is not an authorized, valid kubernetes.io/tls Secret; leaving this listener's frontend TLS unmaterialized",
@@ -1579,12 +1584,19 @@ fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
             ));
             continue;
         }
+        // Certificate ownership must follow the same listener-admission
+        // decision as route materialization. Otherwise an invalid listener can
+        // consume the snapshot cap or win a hostname collision and evict a
+        // valid listener even though it can never serve its own routes.
+        if !acc
+            .gateway_api_listener_policies
+            .get(&key)
+            .is_some_and(|policy| policy.materializable)
+        {
+            continue;
+        }
         pending.push(PendingFrontendTlsListener {
-            key: GatewayApiListenerKey {
-                namespace: object.metadata.namespace.clone(),
-                gateway: object.metadata.name.clone(),
-                listener: listener_name.to_string(),
-            },
+            key,
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             creation_timestamp: object
                 .metadata
