@@ -416,26 +416,40 @@ when the selected CA backend owns a JWT signing authority. With
 `FetchJWTBundles`, `ValidateJWTSVID`) are implemented — see
 [docs/mesh.md](mesh.md#workload-api-jwt-svid) for the exact contract.
 
-**With `FERRUM_MESH_CA_BACKEND=spire` they all return gRPC `UNIMPLEMENTED`**
-([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)). Two
-distinct reasons, both external to Ferrum:
+**With `FERRUM_MESH_CA_BACKEND=spire`, bundles and validation work; mint does
+not** ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)).
 
-1. **Mint is not delegable.** A SPIRE agent authorizes `FetchJWTSVID` against
-   the *calling process's* attested identity. If Ferrum proxied the RPC, the
-   returned token's `sub` would be Ferrum's own SPIFFE ID, not the downstream
-   workload's — a silent identity substitution. Minting for a delegated
-   subject requires SPIRE's admin / delegated-identity API, which Ferrum is
-   not granted and which is not part of the Workload API surface it consumes.
-2. **Bundles are not currently consumed.** Ferrum's SPIRE backend reads the
-   agent's `FetchX509SVID` / `FetchX509Bundles` streams, which carry X.509
-   authorities only, so it publishes no JWT authorities to validate against.
+`FetchJWTBundles` and `ValidateJWTSVID` are available: Ferrum consumes the SPIRE
+agent's own `FetchJWTBundles` stream, converts each JWKS document into the
+SPKI-PEM form its identity subsystem speaks, and admits it through the same
+bounds a locally published bundle goes through (authority count, trust-domain
+binding, duplicate `kid`, key type/size, total JWKS size). That stream is
+independent of the X.509 SVID readiness gate, and an agent that answers
+`UNIMPLEMENTED` — a SPIRE deployment with no JWT-SVID registration entries — is
+retried on the ordinary reconnect schedule rather than failing startup. A
+malformed bundle is never installed; the last good snapshot is retained. A trust
+domain with no JWT keys yields an empty set, which the Workload API reports as
+`UNIMPLEMENTED`, never as an empty map (SPIFFE Workload API §6.2.2 requires at
+least the local trust-domain JWT bundle, so an empty map would be misread as
+"zero trusted JWT authorities" rather than "unsupported").
 
-Do not deploy workloads that depend on JWT-SVID mint, validate, or JWT
-trust-bundle streaming against Ferrum's Workload API while running the SPIRE
-backend. `FetchJWTBundles` deliberately does **not** stream an empty `bundles`
-map in that posture — SPIFFE Workload API §6.2.2 requires at least the local
-trust-domain JWT bundle, and an empty map would be misread as "zero trusted
-JWT authorities" rather than "unsupported".
+**`FetchJWTSVID` returns gRPC `UNIMPLEMENTED` under `spire`, and this is a
+terminal capability boundary rather than a deferral.** A SPIRE agent authorizes
+`FetchJWTSVID` against the *calling process's* attested identity. If Ferrum
+proxied the ordinary agent Workload API, the returned token's `sub` would be
+Ferrum's own SPIFFE ID, not the downstream workload's — a silent identity
+substitution, which is strictly worse for a relying party than an honest
+`UNIMPLEMENTED`. Minting for a delegated subject requires SPIRE's delegated
+identity / admin API: an explicitly authorized integration outside the Workload
+API surface Ferrum consumes. Ferrum will not substitute its own identity to make
+the RPC appear to work, so delegated minting stays fail-closed until such an
+integration is configured.
+
+Workloads that need JWT-SVID **mint** under a SPIRE deployment should call their
+local SPIRE agent's Workload API directly (that is the socket SPIRE authorizes
+them on), or use `FERRUM_MESH_CA_BACKEND=internal` with configured JWT signing
+material — see [docs/mesh.md](mesh.md#jwt-signing-material-restart-and-ha) for
+the signing-key, restart, and HA contract.
 
 If you also issue JWT-SVIDs to non-Ferrum workloads in the same SPIRE
 deployment, that is unaffected.

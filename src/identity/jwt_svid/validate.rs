@@ -16,10 +16,19 @@
 //!    bytes and is used only to select the candidate bundle — every claim is
 //!    re-validated after signature verification, over the very same bytes the
 //!    signature covers.
-//! 4. **Authority selection** — the `sub` trust domain must have a bundle;
+//! 4. **Authority admission** — *every* trust domain's complete authority set is
+//!    put through
+//!    [`validate_published_authorities`](super::validate_published_authorities)
+//!    before any of it is scanned: count cap, trust-domain binding, duplicate
+//!    `kid`, key-id / PEM / DER / key-type / key-size constraints, and total
+//!    JWKS size. This is the *same* gate `FetchJWTBundles` uses, so validation
+//!    can never accept material publication would have refused, and a malformed
+//!    or oversized externally supplied SPIRE / federated bundle fails closed
+//!    instead of driving an unbounded scan.
+//! 5. **Authority selection** — the `sub` trust domain must have a bundle;
 //!    `kid` must match exactly one authority in it (with no `kid`, the bundle
 //!    must hold exactly one authority, otherwise the token is ambiguous).
-//! 5. **Signature and time** — verified with the algorithm set implied by the
+//! 6. **Signature and time** — verified with the algorithm set implied by the
 //!    *authority's key type*, never the token's own `alg` claim, so `alg`
 //!    substitution and HMAC confusion cannot validate. `exp` validation is
 //!    mandatory; `nbf` is enforced when present; a future-dated `iat` is
@@ -36,9 +45,10 @@ use jsonwebtoken::{Algorithm, Validation};
 use serde_json::{Map, Value};
 
 use super::{
-    JWT_SVID_CLOCK_SKEW_LEEWAY_SECS, JwtSvidError, MAX_JWT_CLAIMS_JSON_BYTES,
-    MAX_JWT_KEY_ID_BYTES, MAX_JWT_SVID_SEGMENT_BYTES, MAX_JWT_SVID_TOKEN_BYTES,
-    decoding_key_for_authority, parse_strict_json_object, validate_audience_value,
+    JWT_SVID_CLOCK_SKEW_LEEWAY_SECS, JwtSvidError, MAX_JWT_BUNDLE_TRUST_DOMAINS,
+    MAX_JWT_CLAIMS_JSON_BYTES, MAX_JWT_KEY_ID_BYTES, MAX_JWT_SVID_SEGMENT_BYTES,
+    MAX_JWT_SVID_TOKEN_BYTES, decoding_key_for_authority, parse_strict_json_object,
+    validate_audience_value, validate_published_authorities,
 };
 use crate::identity::ca::PublishedJwtAuthority;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -73,6 +83,22 @@ pub fn validate_jwt_svid(
         return Err(JwtSvidError::NoJwtAuthority(
             "no JWT authority is available to validate against",
         ));
+    }
+    // Bound the number of trust domains before validating any of them: the
+    // bundle map can come from an external SPIRE / federated source, and the
+    // per-domain admission below is real work.
+    if bundles.len() > MAX_JWT_BUNDLE_TRUST_DOMAINS {
+        return Err(JwtSvidError::InvalidAuthority(
+            "more JWT bundle trust domains than one response may carry",
+        ));
+    }
+    // Hold EVERY domain's authority set to the same bounds `FetchJWTBundles`
+    // enforces, before anything is scanned or used as a key. A malformed
+    // federated bundle must fail the call closed rather than be quietly skipped
+    // while the local domain still validates: an operator who configured that
+    // federation expects it to be honoured or to fail loudly.
+    for (trust_domain, authorities) in bundles {
+        validate_published_authorities(trust_domain, authorities)?;
     }
 
     let (header_segment, claims_segment) = split_token(token)?;

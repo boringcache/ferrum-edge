@@ -48,9 +48,11 @@
 //! stream cancel drops any pending slot immediately so rotation tasks exit
 //! without waiting on backpressure.
 //!
-//! Phase A wires up the gRPC service handlers and a `serve` entry point.
-//! Listener bind / shutdown integration with the rest of the binary lands
-//! in Phase C — Phase A keeps everything additive.
+//! The listener lifecycle — socket path/ownership/mode contract, bind, serve,
+//! and owned-artifact cleanup — lives in [`super::listener`]; mesh mode stands
+//! this service up through it when
+//! `FERRUM_MESH_WORKLOAD_API_ENABLED=true`, and a bind failure is fatal to
+//! startup rather than a silent downgrade to "not listening".
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -160,15 +162,31 @@ impl WorkloadApiService {
         SpiffeWorkloadApiServer::new(self)
     }
 
-    /// Extract `PeerInfo` from a tonic request. Phase A pulls the bearer
-    /// token from the `authorization` metadata header (Bearer scheme); peer
-    /// creds are surfaced by future Phase C wiring on the listener side.
+    /// Extract `PeerInfo` from a tonic request: the bearer token from the
+    /// `authorization` metadata header (Bearer scheme) plus, on a Unix-socket
+    /// transport, the kernel-supplied `SO_PEERCRED` pid/uid/gid.
+    ///
+    /// Peer credentials come from `UdsConnectInfo`, which tonic populates from
+    /// the accepted socket itself — they are kernel-attested and cannot be
+    /// spoofed by the caller, unlike anything in the metadata. Their absence is
+    /// not fatal here: it simply means no `SO_PEERCRED`-based attestor applies,
+    /// and the attestor chain decides.
     fn peer_info_from_request<T>(req: &Request<T>) -> PeerInfo {
         let mut info = PeerInfo::default();
         if let Some(auth) = req.metadata().get("authorization")
             && let Ok(s) = auth.to_str()
         {
             info.bearer_token = parse_authorization_header(s);
+        }
+        #[cfg(unix)]
+        if let Some(connect_info) = req
+            .extensions()
+            .get::<tonic::transport::server::UdsConnectInfo>()
+            && let Some(cred) = connect_info.peer_cred
+        {
+            info.pid = cred.pid();
+            info.uid = Some(cred.uid());
+            info.gid = Some(cred.gid());
         }
         info
     }
@@ -358,9 +376,21 @@ impl WorkloadApiService {
     /// trust domain: the local trust domain plus every configured federated
     /// one that actually publishes authorities.
     ///
-    /// A federated domain the CA does not serve is skipped rather than
-    /// failing the whole call — federation is best-effort and the local
-    /// bundle is the load-bearing one. A local-domain failure is not skipped.
+    /// **Every** domain's complete authority set is admitted through
+    /// [`jwt_svid::validate_published_authorities`] here, before it is returned
+    /// to either RPC. That is the single place the documented authority bounds
+    /// (count cap, trust-domain binding, duplicate `kid`, key-id / PEM / DER /
+    /// key-type / key-size constraints, total JWKS size) are enforced, so
+    /// `ValidateJWTSVID` and `FetchJWTBundles` cannot disagree about what is
+    /// acceptable material and a hostile externally supplied bundle can never
+    /// reach a scan.
+    ///
+    /// A federated domain the CA does not serve is skipped rather than failing
+    /// the whole call — federation is best-effort and the local bundle is the
+    /// load-bearing one. A local-domain failure is not skipped, and neither is
+    /// *malformed* federated material: a bundle the CA did publish but that
+    /// fails admission is a real fault, not an absent peer, so it fails the call
+    /// closed rather than being silently dropped from the trusted set.
     async fn collect_jwt_authorities(
         ca: &Arc<dyn CertificateAuthority>,
         trust_domain: &TrustDomain,
@@ -377,6 +407,7 @@ impl WorkloadApiService {
                 "the active identity backend publishes no JWT authority for this trust domain",
             ));
         }
+        jwt_svid::validate_published_authorities(trust_domain, &local)?;
         bundles.insert(trust_domain.clone(), local);
 
         for federated in federated_trust_domains {
@@ -392,6 +423,7 @@ impl WorkloadApiService {
             }
             match ca.jwt_authorities(federated).await {
                 Ok(authorities) if !authorities.is_empty() => {
+                    jwt_svid::validate_published_authorities(federated, &authorities)?;
                     bundles.insert(federated.clone(), authorities);
                 }
                 // No authorities published for this federation peer — publish
@@ -506,6 +538,13 @@ fn jwt_svid_status(error: JwtSvidError) -> Status {
         JwtSvidError::NoJwtAuthority(_) => Status::unimplemented(message),
         JwtSvidError::InvalidAuthority(_) => {
             warn!(reason = %message, "JWT authority material rejected before publication");
+            Status::internal(message)
+        }
+        // Neither is reachable from an RPC: rotation runs on the background
+        // task and signing material is loaded at startup. Mapped explicitly so
+        // adding a variant cannot silently acquire a wrong status.
+        JwtSvidError::RotationRefused(_) | JwtSvidError::InvalidSigningMaterial(_) => {
+            error!(reason = %message, "JWT-SVID signing/rotation failure surfaced on an RPC path");
             Status::internal(message)
         }
         JwtSvidError::Internal(_) => {

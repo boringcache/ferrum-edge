@@ -34,6 +34,8 @@ use anyhow::Context as _;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::identity::jwt_svid::JwtSvidSigner as _;
+
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
@@ -11261,7 +11263,7 @@ async fn arm_mesh_runtime_startup(
         );
     }
     let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
-    let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
+    let mesh_ca_backend_source = start_mesh_ca_backend_svid_source(
         &proxy_state,
         runtime,
         env_config,
@@ -11270,9 +11272,32 @@ async fn arm_mesh_runtime_startup(
         shutdown_tx.subscribe(),
     )
     .await?;
+    let mesh_ca_svid_slot = mesh_ca_backend_source
+        .as_ref()
+        .map(|source| source.inbound_slot.clone());
     let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
         || gateway_svid_material_configured(env_config))
     .then_some(mesh_runtime_trust_overlay_slot);
+
+    // In-process SPIFFE Workload API surface (issue #3617). Bound to the SAME CA
+    // and rotation signal the runtime SVID path drives, so its X.509 bundles and
+    // its JWT bundles come from one authority and a rotation on that path
+    // republishes onto its open streams. A bind or socket-contract failure is
+    // FATAL when the surface is enabled: a workload that cannot reach the
+    // Workload API has no identity, and silently not listening is the failure
+    // mode this refuses.
+    if env_config.mesh_workload_api_enabled {
+        let source = mesh_ca_backend_source.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires an active FERRUM_MESH_CA_BACKEND \
+                 so the Workload API has an authority to mint SVIDs from (explicit \
+                 FERRUM_GATEWAY_SVID_* file material takes precedence over a CA backend and \
+                 supplies no issuance path)"
+            )
+        })?;
+        let listener = start_mesh_workload_api_server(env_config, source).await?;
+        owner.set_workload_api_listener(listener);
+    }
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
@@ -12479,6 +12504,27 @@ fn configured_mesh_workload_spiffe_id(
     })
 }
 
+/// What mesh startup gets back from the CA-backend SVID source.
+///
+/// The `ca` handle is the same authority the runtime SVID rotation loop drives,
+/// so the Workload API surface (issue #3617) is wired to the *actual* runtime
+/// authority rather than a second, independently constructed one — the JWT key
+/// rotation it publishes and the JWT bundle it serves therefore come from one
+/// source of truth.
+struct MeshCaBackendSource {
+    inbound_slot: tls::SharedBundleSlot,
+    /// `None` when the Workload API surface is disabled and the backend has no
+    /// other reason to hold a `CertificateAuthority` handle. The SPIRE backend in
+    /// particular opens its own agent streams, so it is constructed only when
+    /// something will actually read from it.
+    ca: Option<crate::identity::ca::SharedCa>,
+    workload_spiffe_id: crate::identity::SpiffeId,
+    /// Bumped by the runtime authority path on SVID *and* JWT key rotation. The
+    /// Workload API's long-lived streams subscribe to it, so a rotation
+    /// republishes bundles on already-open streams.
+    rotation_signal: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
 async fn start_mesh_ca_backend_svid_source(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
@@ -12486,7 +12532,7 @@ async fn start_mesh_ca_backend_svid_source(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<Option<tls::SharedBundleSlot>, anyhow::Error> {
+) -> Result<Option<MeshCaBackendSource>, anyhow::Error> {
     let backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
         .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
     if backend == CaBackend::None {
@@ -12505,9 +12551,14 @@ async fn start_mesh_ca_backend_svid_source(
 
     let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
     let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+    // The Workload API's rotation signal IS the existing backend SVID rotation
+    // channel: one revision counter for the whole runtime authority path, so an
+    // X.509 rotation and a JWT key rotation both wake the open streams and no
+    // consumer has to reconcile two clocks.
+    let rotation_signal = Arc::new(proxy_state.backend_svid_rotation_tx.clone());
     match backend {
         CaBackend::SpireAgent => {
-            let slot = start_spire_agent_mesh_svid_source(
+            let (slot, ca) = start_spire_agent_mesh_svid_source(
                 proxy_state,
                 env_config,
                 &workload_spiffe_id,
@@ -12517,20 +12568,31 @@ async fn start_mesh_ca_backend_svid_source(
                 shutdown_rx,
             )
             .await?;
-            Ok(Some(slot))
+            let ca = ca.map(|ca| ca as crate::identity::ca::SharedCa);
+            Ok(Some(MeshCaBackendSource {
+                inbound_slot: slot,
+                ca,
+                workload_spiffe_id,
+                rotation_signal,
+            }))
         }
         CaBackend::Internal => {
-            let slot = start_internal_mesh_svid_source(
+            let (slot, ca) = start_internal_mesh_svid_source(
                 proxy_state,
                 env_config,
-                workload_spiffe_id,
+                workload_spiffe_id.clone(),
                 inbound_slot,
                 trust_overlay_slot,
                 mesh_background_handles,
                 shutdown_rx,
             )
             .await?;
-            Ok(Some(slot))
+            Ok(Some(MeshCaBackendSource {
+                inbound_slot: slot,
+                ca: Some(ca),
+                workload_spiffe_id,
+                rotation_signal,
+            }))
         }
         CaBackend::None => Ok(None),
     }
@@ -12544,7 +12606,13 @@ async fn start_spire_agent_mesh_svid_source(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+) -> Result<
+    (
+        tls::SharedBundleSlot,
+        Option<Arc<crate::identity::ca::spire::SpireAgentCa>>,
+    ),
+    anyhow::Error,
+> {
     let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
         proxy_state.gateway_svid_bundle.clone(),
     )
@@ -12626,7 +12694,28 @@ async fn start_spire_agent_mesh_svid_source(
             }
         }
     }));
-    Ok(inbound_slot)
+    // A `SpireAgentCa` alongside the fetch loop serves the Workload API surface's
+    // trust material (X.509 bundles, plus the agent's JWT bundles once it
+    // publishes them). It opens its OWN agent streams, so it is constructed only
+    // when the surface that reads it is actually enabled — an unconditional
+    // second pair of streams to the agent would be pure waste on every mesh that
+    // does not serve the Workload API. `SpireAgentCa::new` blocks only until its
+    // own initial SVID or a bounded timeout, and its JWT bundle stream is
+    // independent of that readiness.
+    let ca = if env_config.mesh_workload_api_enabled {
+        Some(Arc::new(
+            crate::identity::ca::spire::SpireAgentCa::new(
+                crate::identity::ca::spire::SpireAgentCaConfig {
+                    socket_path: env_config.mesh_spire_agent_socket.clone(),
+                    cert_ttl_secs: env_config.mesh_cert_ttl_seconds,
+                },
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
+    Ok((inbound_slot, ca))
 }
 
 async fn start_internal_mesh_svid_source(
@@ -12637,7 +12726,7 @@ async fn start_internal_mesh_svid_source(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+) -> Result<(tls::SharedBundleSlot, crate::identity::ca::SharedCa), anyhow::Error> {
     let root = crate::identity::ca::bootstrap::bootstrap_dev_root(
         crate::identity::ca::bootstrap::BootstrapConfig::new(spiffe_id.trust_domain().clone()),
     )
@@ -12650,6 +12739,16 @@ async fn start_internal_mesh_svid_source(
             bundle_refresh_hint_secs: None,
             default_svid_ttl_secs: env_config.mesh_cert_ttl_seconds,
             max_svid_ttl_secs: crate::identity::ca::internal::MAX_SVID_TTL_SECS,
+            // JWT signing material is read straight from the environment (the
+            // secret suffixes have already rewritten it) rather than carried on
+            // `EnvConfig`, so a private key never lands on a struct whose values
+            // are re-rendered onto the `validate` report or startup logs.
+            jwt_signing_key_pem: crate::identity::jwt_signing_key_pem(),
+            jwt_retired_key_pems: crate::identity::jwt_previous_signing_key_pem()
+                .into_iter()
+                .collect(),
+            jwt_key_lifetime_secs: env_config.mesh_jwt_key_lifetime_seconds,
+            allow_ephemeral_jwt_key: crate::identity::allow_ephemeral_jwt_key(),
         },
     )?) as crate::identity::ca::SharedCa;
 
@@ -12667,10 +12766,11 @@ async fn start_internal_mesh_svid_source(
     let loop_env = env_config.clone();
     let loop_inbound_slot = inbound_slot.clone();
     let loop_trust_overlay_slot = trust_overlay_slot.clone();
+    let loop_ca = Arc::clone(&ca);
     mesh_background_handles.push(tokio::spawn(async move {
         run_internal_mesh_svid_rotation_loop(
             state,
-            ca,
+            loop_ca,
             spiffe_id,
             loop_env,
             loop_inbound_slot,
@@ -12680,7 +12780,7 @@ async fn start_internal_mesh_svid_source(
         .await;
     }));
 
-    Ok(inbound_slot)
+    Ok((inbound_slot, ca))
 }
 
 async fn run_internal_mesh_svid_rotation_loop(
@@ -12714,6 +12814,28 @@ async fn run_internal_mesh_svid_rotation_loop(
                 }
                 continue;
             }
+        }
+
+        // JWT signing keys rotate on their OWN schedule, independent of the
+        // X.509 SVID's validity window, so this runs before (and regardless of)
+        // the X.509 rotation decision below — the earlier `continue` on
+        // "X.509 not due yet" would otherwise starve it forever, which is
+        // exactly how a JWT rotation loop ends up never running in production.
+        //
+        // The revision bump is what makes it observable: `FetchJWTBundles`
+        // streams subscribe to `backend_svid_rotation_tx`, so publishing here
+        // republishes the JWKS on every already-open stream. Bundle content is
+        // re-read from the CA at that point, so this signal carries no state.
+        if let Some(generation) = rotate_mesh_jwt_authority_if_due(ca.as_ref(), &spiffe_id).await {
+            proxy_state
+                .backend_svid_rotation_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            info!(
+                spiffe_id = %spiffe_id,
+                jwt_generation = generation,
+                svid_revision = *proxy_state.backend_svid_rotation_tx.borrow(),
+                "Mesh internal CA rotated its JWT-SVID signing key"
+            );
         }
 
         let needs_rotation = {
@@ -12759,6 +12881,237 @@ async fn run_internal_mesh_svid_rotation_loop(
                     "internal mesh CA SVID rotation failed; keeping current identity"
                 );
             }
+        }
+    }
+}
+
+/// Stand up Ferrum's own in-process SPIFFE Workload API server on a Unix socket.
+///
+/// Bound to the runtime authority path: the `ca` is the same one the SVID
+/// rotation loop drives, and the `rotation_signal` is the same revision channel
+/// that loop bumps, so an X.509 SVID rotation *and* a JWT signing-key rotation
+/// both republish onto already-open `FetchX509SVID` / `FetchX509Bundles` /
+/// `FetchJWTBundles` streams.
+///
+/// Fail-closed throughout: an empty attestor chain is refused (a Workload API
+/// that attests nothing can only either hand out identities it was not told to
+/// hand out, or reject everything while looking healthy), and any socket
+/// contract or bind failure is returned to startup.
+async fn start_mesh_workload_api_server(
+    env_config: &EnvConfig,
+    source: &MeshCaBackendSource,
+) -> Result<crate::identity::workload_api::WorkloadApiListener, anyhow::Error> {
+    let trust_domain = source.workload_spiffe_id.trust_domain().clone();
+    let ca = source.ca.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_WORKLOAD_API_ENABLED=true but the selected FERRUM_MESH_CA_BACKEND \
+             supplied no certificate authority to mint from"
+        )
+    })?;
+    let attestors = build_mesh_workload_api_attestors(env_config, &trust_domain)?;
+
+    let socket = crate::identity::workload_api::WorkloadApiSocketConfig::from_parts(
+        env_config.mesh_workload_api_socket_path.as_str(),
+        env_config.mesh_workload_api_socket_mode.as_str(),
+    )
+    .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_WORKLOAD_API_* settings: {error}"))?;
+
+    let service = crate::identity::workload_api::WorkloadApiService::with_rotation_signal(
+        attestors,
+        Arc::clone(ca),
+        trust_domain,
+        env_config.mesh_workload_api_svid_ttl_seconds,
+        Arc::clone(&source.rotation_signal),
+    )
+    .with_jwt_svid_ttl_secs(env_config.mesh_jwt_svid_ttl_seconds);
+
+    let listener = crate::identity::workload_api::serve_workload_api(service, socket)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "FERRUM_MESH_WORKLOAD_API_ENABLED=true but the SPIFFE Workload API listener could \
+                 not start: {error}"
+            )
+        })?;
+    info!(
+        socket = %listener.socket_path().display(),
+        jwt_svid_ttl_secs = env_config.mesh_jwt_svid_ttl_seconds,
+        svid_ttl_secs = env_config.mesh_workload_api_svid_ttl_seconds,
+        "Mesh SPIFFE Workload API server started"
+    );
+    Ok(listener)
+}
+
+/// Build the Workload API's attestor chain from configuration.
+///
+/// Two sources, in chain order:
+///
+/// 1. `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` — kernel-attested
+///    `SO_PEERCRED` rules (`uid:<uid>=<spiffe-id>` or
+///    `sha256:<hex>=<spiffe-id>`). This is the production path: the evidence
+///    comes from the accepted socket, not from anything the caller says.
+/// 2. The dev-only [`StaticAttestor`](crate::identity::attestation::static_id::StaticAttestor),
+///    which is itself double-gated on `FERRUM_MESH_ALLOW_STATIC_ID=true` and
+///    refused under `FERRUM_MESH_PRODUCTION_MODE=true`. It is placed *last* so a
+///    real peer-credential rule always wins over it.
+///
+/// An empty chain is an error rather than a permissive default.
+fn build_mesh_workload_api_attestors(
+    env_config: &EnvConfig,
+    trust_domain: &crate::identity::TrustDomain,
+) -> Result<Vec<Arc<dyn crate::identity::attestation::Attestor>>, anyhow::Error> {
+    use crate::identity::attestation::unix::{UnixAttestor, UnixAttestorConfig, UnixIdentityRule};
+
+    let mut attestors: Vec<Arc<dyn crate::identity::attestation::Attestor>> = Vec::new();
+
+    let mut rules: Vec<UnixIdentityRule> = Vec::new();
+    for raw in &env_config.mesh_workload_api_unix_identity_rules {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        rules.push(parse_workload_api_unix_identity_rule(entry, trust_domain)?);
+    }
+    if !rules.is_empty() {
+        let attestor = UnixAttestor::new(UnixAttestorConfig {
+            trust_domain: trust_domain.clone(),
+            rules,
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}")
+        })?;
+        attestors.push(Arc::new(attestor));
+    }
+
+    // Dev-only fallback. `StaticAttestor::new` enforces its own opt-in and the
+    // production refusal, so a failure here is not fatal — it simply means the
+    // shortcut is not available, which is the correct posture in production.
+    match crate::identity::attestation::static_id::StaticAttestor::new(
+        crate::identity::attestation::static_id::StaticAttestorConfig {
+            spiffe_id: crate::identity::SpiffeId::from_parts(
+                trust_domain,
+                "ns/default/sa/ferrum-workload-api-dev",
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("internal: dev static attestor SPIFFE ID rejected: {error}")
+            })?,
+        },
+    ) {
+        Ok(attestor) => attestors.push(Arc::new(attestor)),
+        Err(error) => {
+            debug!(
+                error = %error,
+                "dev static attestor not available for the Workload API (expected in production)"
+            );
+        }
+    }
+
+    if attestors.is_empty() {
+        anyhow::bail!(
+            "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires at least one attestor: set \
+             FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES to map peer credentials \
+             (uid:<uid>=<spiffe-id> or sha256:<hex>=<spiffe-id>) to SPIFFE IDs. Without a rule the \
+             Workload API can only refuse every caller, which looks healthy but serves nothing"
+        );
+    }
+    Ok(attestors)
+}
+
+/// Parse one `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` entry.
+///
+/// Accepted forms, both binding kernel-attested evidence to exactly one SPIFFE
+/// ID in the local trust domain:
+///
+/// - `uid:<uid>=spiffe://<trust-domain>/<path>`
+/// - `sha256:<hex>=spiffe://<trust-domain>/<path>` (SHA-256 of the peer binary)
+///
+/// Anything else is refused. Diagnostics name the *shape* that was expected and
+/// never echo the operator's value, so a rule that accidentally contains a
+/// credential-looking string is not reflected into startup logs.
+fn parse_workload_api_unix_identity_rule(
+    entry: &str,
+    trust_domain: &crate::identity::TrustDomain,
+) -> Result<crate::identity::attestation::unix::UnixIdentityRule, anyhow::Error> {
+    use crate::identity::attestation::unix::UnixIdentityRule;
+
+    let (selector, spiffe_id) = entry.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entries must be \
+             'uid:<uid>=<spiffe-id>' or 'sha256:<hex>=<spiffe-id>'"
+        )
+    })?;
+    let spiffe_id = crate::identity::SpiffeId::new(spiffe_id.trim().to_string()).map_err(|_| {
+        anyhow::anyhow!(
+            "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entry does not name a valid SPIFFE ID"
+        )
+    })?;
+    if spiffe_id.trust_domain() != trust_domain {
+        anyhow::bail!(
+            "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entry names a SPIFFE ID outside the \
+             local trust domain '{trust_domain}'"
+        );
+    }
+
+    let selector = selector.trim();
+    if let Some(uid) = selector.strip_prefix("uid:") {
+        let uid: u32 = uid.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES 'uid:' selector is not a numeric uid"
+            )
+        })?;
+        return Ok(UnixIdentityRule {
+            require_uid: Some(uid),
+            require_binary_sha256: None,
+            spiffe_id,
+        });
+    }
+    if let Some(digest) = selector.strip_prefix("sha256:") {
+        let digest = digest.trim().to_ascii_lowercase();
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES 'sha256:' selector is not a \
+                 64-character hex digest"
+            );
+        }
+        return Ok(UnixIdentityRule {
+            require_uid: None,
+            require_binary_sha256: Some(digest),
+            spiffe_id,
+        });
+    }
+    anyhow::bail!(
+        "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES selector must start with 'uid:' or 'sha256:'"
+    )
+}
+
+/// Ask the CA's JWT signing authority — when it has one — to rotate if its
+/// active key has outlived its configured lifetime, returning the new
+/// generation on a rotation.
+///
+/// A backend with no JWT authority (SPIRE agent, the upstream scaffolds) returns
+/// `None` from `jwt_signer()` and this is a no-op.
+///
+/// Neither failure mode loses anything: a **refused** rotation means the
+/// authority declined to evict a retired key that can still validate a live
+/// token, and a **failed** rotation leaves the previous key active. In both
+/// cases every already-minted JWT-SVID stays verifiable and the next tick
+/// retries, so degrading here is strictly safer than forcing a rotation
+/// through.
+async fn rotate_mesh_jwt_authority_if_due(
+    ca: &dyn CertificateAuthority,
+    spiffe_id: &crate::identity::SpiffeId,
+) -> Option<u64> {
+    let signer = ca.jwt_signer()?;
+    match signer.rotate_if_due().await {
+        Ok(generation) => generation,
+        Err(error) => {
+            warn!(
+                error = %error,
+                spiffe_id = %spiffe_id,
+                "JWT-SVID signing key rotation did not complete; keeping the current key and \
+                 every already-minted token verifiable"
+            );
+            None
         }
     }
 }
@@ -15061,6 +15414,11 @@ struct MeshStartupOwner {
     proxy_state: ProxyState,
     tasks: MeshBackgroundTasks,
     listener_handles: Vec<JoinHandle<()>>,
+    /// In-process SPIFFE Workload API listener, when the surface is enabled.
+    /// Owned here so both the startup-failure rollback and the normal shutdown
+    /// path stop it and unlink its socket artifact — a leftover socket would make
+    /// the next start refuse to bind, or leave workloads dialing a dead endpoint.
+    workload_api_listener: Option<crate::identity::workload_api::WorkloadApiListener>,
     drain_seconds: u64,
     finalize_global_plugins_on_shutdown: bool,
 }
@@ -15085,6 +15443,7 @@ impl MeshStartupOwner {
                 mesh_background_handles,
             },
             listener_handles: Vec::new(),
+            workload_api_listener: None,
             drain_seconds,
             finalize_global_plugins_on_shutdown,
         }
@@ -15122,6 +15481,13 @@ impl MeshStartupOwner {
         self.listener_handles.push(handle);
     }
 
+    fn set_workload_api_listener(
+        &mut self,
+        listener: crate::identity::workload_api::WorkloadApiListener,
+    ) {
+        self.workload_api_listener = Some(listener);
+    }
+
     /// Signal shutdown, drain listeners/tasks with a bound, preserve `err`.
     async fn fail_with(self, err: anyhow::Error) -> anyhow::Error {
         warn!(
@@ -15129,6 +15495,13 @@ impl MeshStartupOwner {
             err
         );
         let _ = self.shutdown_tx.send(true);
+        // Stop the Workload API first so its socket artifact is gone before the
+        // process exits: a rollback that leaves the socket behind makes the
+        // operator's next attempt fail to bind for a different reason than the
+        // one they are debugging.
+        if let Some(listener) = self.workload_api_listener {
+            listener.shutdown().await;
+        }
         // Startup rollback must not wait forever on a stuck listener — bound the
         // join and abort stragglers, then continue background teardown. Normal
         // serve-until-shutdown keeps unbounded await semantics below.
@@ -15156,6 +15529,11 @@ impl MeshStartupOwner {
             "shutdown",
         )
         .await;
+        // Deterministic cleanup: the serve future completes and the socket we
+        // created is unlinked before the process exits.
+        if let Some(listener) = self.workload_api_listener {
+            listener.shutdown().await;
+        }
         shutdown_and_join_mesh(
             self.proxy_state,
             self.tasks,

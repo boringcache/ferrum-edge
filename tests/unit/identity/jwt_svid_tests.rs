@@ -33,11 +33,36 @@ fn workload_id() -> SpiffeId {
     SpiffeId::from_parts(&td(), "ns/test/sa/foo").expect("test SPIFFE ID is valid")
 }
 
+/// A stable, configured signing authority — the production posture. Two calls
+/// with the same PEM publish the same `kid`, which is what the restart /
+/// multi-replica continuity tests assert.
+fn authority_with_key(pem: &str) -> Arc<LocalJwtAuthority> {
+    Arc::new(
+        LocalJwtAuthority::new(LocalJwtAuthorityConfig::new(td()).with_signing_key_pem(pem))
+            .expect("local JWT authority builds from configured material"),
+    )
+}
+
+/// Dev/test posture: an explicitly opted-in ephemeral key. Used where the test
+/// does not care which key signs, only that signing works.
 fn authority() -> Arc<LocalJwtAuthority> {
     Arc::new(
-        LocalJwtAuthority::new(LocalJwtAuthorityConfig::new(td()))
+        LocalJwtAuthority::new(LocalJwtAuthorityConfig::new(td()).allowing_ephemeral_key())
             .expect("local JWT authority builds"),
     )
+}
+
+/// A fresh ES256 (P-256) PKCS#8 private key PEM, the shape
+/// `FERRUM_MESH_JWT_SIGNING_KEY_PEM` accepts.
+fn signing_key_pem() -> String {
+    rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("P-256 key generated")
+        .serialize_pem()
+}
+
+/// A base config with an explicit key and bounds a test can tighten.
+fn config_with_key(pem: &str) -> LocalJwtAuthorityConfig {
+    LocalJwtAuthorityConfig::new(td()).with_signing_key_pem(pem)
 }
 
 fn bundles_of(signer: &Arc<LocalJwtAuthority>) -> BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> {
@@ -909,21 +934,44 @@ async fn rotation_keeps_pre_rotation_tokens_verifiable() {
 }
 
 #[tokio::test]
-async fn rotation_bounds_retained_key_cardinality() {
-    let signer = Arc::new(
-        LocalJwtAuthority::new(LocalJwtAuthorityConfig {
-            trust_domain: td(),
-            default_ttl_secs: 60,
-            max_ttl_secs: 300,
-            key_lifetime_secs: 0,
-            max_retained_keys: 2,
-        })
-        .expect("authority builds"),
-    );
+async fn rapid_rotation_refuses_rather_than_evicting_a_still_live_key() {
+    // Overlap is `max_ttl + 60s` clock-skew leeway = 61s, so every key retired
+    // in this test is still inside its overlap. Time-based rotation is disabled
+    // (`0`) so the cap is not derived up from a cadence and the manual
+    // over-rotation case is reachable at all.
+    let mut config = config_with_key(&signing_key_pem());
+    config.default_ttl_secs = 1;
+    config.max_ttl_secs = 1;
+    config.key_lifetime_secs = 0;
+    config.max_retained_keys = 2;
+    let signer = Arc::new(LocalJwtAuthority::new(config).expect("authority builds"));
 
-    for _ in 0..10 {
-        signer.rotate().await.expect("rotation succeeds");
-    }
+    // A token minted by the ORIGINAL key. It must still validate after every
+    // rotation the authority accepts.
+    let oldest = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 1)
+        .expect("mint succeeds");
+
+    signer.rotate().await.expect("first rotation succeeds");
+    signer.rotate().await.expect("second rotation fills the cap");
+    let generation_at_cap = signer.generation();
+
+    let refused = signer
+        .rotate()
+        .await
+        .expect_err("a third rotation would have to evict a still-live retired key");
+    assert!(
+        matches!(
+            refused,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::RotationRefused(_)
+        ),
+        "expected RotationRefused, got {refused:?}"
+    );
+    assert_eq!(
+        signer.generation(),
+        generation_at_cap,
+        "a refused rotation must not advance the generation"
+    );
 
     let authorities = signer.authorities();
     assert!(
@@ -931,8 +979,57 @@ async fn rotation_bounds_retained_key_cardinality() {
         "active + at most 2 retained keys, got {}",
         authorities.len()
     );
-    // The published set must still be a valid, unambiguous bundle.
+    // The published set must still be a valid, unambiguous bundle...
     jwks_document(&authorities).expect("retained keys still form a valid JWKS");
+    // ...and the oldest still-live token must still validate against it. This is
+    // the guarantee the refusal exists to protect.
+    validate_jwt_svid(&oldest.token, "aud-a", &bundles_of(&signer))
+        .expect("a token inside its permitted lifetime still validates after rotation");
+}
+
+#[tokio::test]
+async fn construction_refuses_a_cadence_shorter_than_the_overlap_permits() {
+    // 1s tokens ⇒ 61s overlap ⇒ ceil(61 / 15 retained slots) = 5s minimum. A 1s
+    // cadence could not retain every still-verifiable key inside the
+    // published-authority cap, so it is refused rather than silently accepted.
+    let mut config = config_with_key(&signing_key_pem());
+    config.max_ttl_secs = 1;
+    config.key_lifetime_secs = 1;
+    let error = LocalJwtAuthority::new(config).expect_err("too-short cadence is refused");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidSigningMaterial(_)
+        ),
+        "expected InvalidSigningMaterial, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_scheduled_cadence_raises_the_retention_cap_so_rotation_never_refuses() {
+    // The cap is DERIVED from the cadence: overlap 61s / 5s lifetime ⇒ 13
+    // required slots, even though 1 was configured. Rotating that many times
+    // must therefore never hit the refusal path.
+    let mut config = config_with_key(&signing_key_pem());
+    config.default_ttl_secs = 1;
+    config.max_ttl_secs = 1;
+    config.key_lifetime_secs = 5;
+    config.max_retained_keys = 1;
+    let signer = Arc::new(LocalJwtAuthority::new(config).expect("authority builds"));
+
+    for index in 0..13 {
+        signer
+            .rotate()
+            .await
+            .unwrap_or_else(|e| panic!("rotation {index} must not be refused: {e}"));
+    }
+    let authorities = signer.authorities();
+    assert!(
+        authorities.len() <= 14,
+        "active + 13 retained slots, got {}",
+        authorities.len()
+    );
+    jwks_document(&authorities).expect("the derived cap still yields a valid JWKS");
 }
 
 #[tokio::test]
@@ -949,23 +1046,42 @@ async fn rotate_if_due_is_a_no_op_while_the_key_is_young() {
 
 #[tokio::test]
 async fn rotate_if_due_rotates_once_the_lifetime_has_elapsed() {
-    let signer = Arc::new(
-        LocalJwtAuthority::new(LocalJwtAuthorityConfig {
-            trust_domain: td(),
-            default_ttl_secs: 60,
-            max_ttl_secs: 300,
-            // Any key is immediately older than a zero-second lifetime... but
-            // `0` disables rotation, so use the smallest enabled lifetime and
-            // rely on `age >= lifetime` being true at age 0 only for `0`.
-            key_lifetime_secs: 1,
-            max_retained_keys: 2,
-        })
-        .expect("authority builds"),
-    );
+    // 5s is the shortest cadence a 1s token ceiling permits (overlap 61s over 15
+    // retained slots), so this is the fastest deterministic rotation available.
+    let mut config = config_with_key(&signing_key_pem());
+    config.default_ttl_secs = 1;
+    config.max_ttl_secs = 1;
+    config.key_lifetime_secs = 5;
+    let signer = Arc::new(LocalJwtAuthority::new(config).expect("authority builds"));
     let before = signer.generation();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
     let rotated = signer.rotate_if_due().await.expect("rotation succeeds");
     assert_eq!(rotated, Some(before + 1));
+
+    // Two concurrent callers that BOTH observed the same due state must produce
+    // exactly ONE rotation: the second re-checks under the rotation gate. Without
+    // that re-check the freshly installed key would be rotated away immediately,
+    // burning a retention slot and halving its effective lifetime.
+    let after_first = signer.generation();
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    let left = Arc::clone(&signer);
+    let right = Arc::clone(&signer);
+    let (a, b) = tokio::join!(
+        tokio::spawn(async move { left.rotate_if_due().await }),
+        tokio::spawn(async move { right.rotate_if_due().await }),
+    );
+    let a = a.expect("task joins").expect("rotation succeeds");
+    let b = b.expect("task joins").expect("rotation succeeds");
+    assert_eq!(
+        [a.is_some(), b.is_some()].iter().filter(|x| **x).count(),
+        1,
+        "exactly one of two concurrent due observations may rotate"
+    );
+    assert_eq!(
+        signer.generation(),
+        after_first + 1,
+        "one due observation must yield exactly one generation bump"
+    );
 }
 
 // ── Workload API RPCs ────────────────────────────────────────────────────
@@ -1261,5 +1377,462 @@ async fn x509_rpcs_are_unaffected_by_the_jwt_surface() {
     assert_eq!(
         bundle.bundles.get(td().as_str()).map(Vec::as_slice),
         Some(b"stub-root".as_slice())
+    );
+}
+
+// ── stable signing material: restart + multi-replica continuity ───────────
+
+#[tokio::test]
+async fn configured_signing_material_publishes_a_stable_key_id() {
+    // Two independently constructed authorities handed the SAME material are the
+    // SAME trust-domain authority. This is what makes a restart and a second
+    // replica indistinguishable to a relying party.
+    let pem = signing_key_pem();
+    let first = authority_with_key(&pem);
+    let second = authority_with_key(&pem);
+
+    let left = first.authorities();
+    let right = second.authorities();
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        left[0].key_id, right[0].key_id,
+        "the same signing material must publish the same kid"
+    );
+    assert_eq!(
+        left[0].public_key_pem, right[0].public_key_pem,
+        "the same signing material must publish the same public key"
+    );
+    assert_eq!(
+        jwks_document(&left).expect("left JWKS"),
+        jwks_document(&right).expect("right JWKS"),
+        "two replicas of one trust domain must publish a byte-identical JWKS"
+    );
+    assert!(!first.uses_ephemeral_key());
+}
+
+#[tokio::test]
+async fn a_token_minted_before_restart_validates_after_restart() {
+    let pem = signing_key_pem();
+    let before_restart = authority_with_key(&pem);
+    let minted = before_restart
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+
+    // "Restart": a brand-new authority, same configured material, no shared
+    // in-memory state at all.
+    drop(before_restart);
+    let after_restart = authority_with_key(&pem);
+    let validated = validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&after_restart))
+        .expect("a token minted before the restart still validates after it");
+    assert_eq!(validated.spiffe_id, workload_id());
+}
+
+#[tokio::test]
+async fn a_second_replica_validates_the_first_replicas_token() {
+    let pem = signing_key_pem();
+    let replica_a = authority_with_key(&pem);
+    let replica_b = authority_with_key(&pem);
+    let minted = replica_a
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+    validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&replica_b))
+        .expect("a peer replica sharing the signing material validates the token");
+}
+
+#[tokio::test]
+async fn an_ephemeral_key_does_not_survive_a_restart() {
+    // The negative counterpart, pinning WHY configured material is required:
+    // with an ephemeral key the same restart loses the token entirely.
+    let before_restart = authority();
+    assert!(before_restart.uses_ephemeral_key());
+    let minted = before_restart
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+    drop(before_restart);
+
+    let after_restart = authority();
+    let error = validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&after_restart))
+        .expect_err("an ephemeral key cannot validate a pre-restart token");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidToken(_)
+        ),
+        "expected InvalidToken, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_previous_key_keeps_pre_rotation_tokens_verifiable() {
+    // The rolling-restart rotation contract: mint with key A, then restart with
+    // B as primary and A retired. A's token must still validate.
+    let key_a = signing_key_pem();
+    let key_b = signing_key_pem();
+    let old = authority_with_key(&key_a);
+    let minted = old
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+    drop(old);
+
+    let rotated = Arc::new(
+        LocalJwtAuthority::new(
+            LocalJwtAuthorityConfig::new(td())
+                .with_signing_key_pem(&key_b)
+                .with_retired_key_pems([key_a.clone()]),
+        )
+        .expect("authority builds with a retired key"),
+    );
+    let authorities = rotated.authorities();
+    assert_eq!(
+        authorities.len(),
+        2,
+        "the new primary and the retired key are both published"
+    );
+    validate_jwt_svid(&minted.token, "aud-a", &bundles_of(&rotated))
+        .expect("a pre-rotation token validates against the retired key");
+    // And the new primary mints validly too.
+    let fresh = rotated
+        .mint(&workload_id(), &["aud-a".to_string()], 300)
+        .expect("mint succeeds");
+    validate_jwt_svid(&fresh.token, "aud-a", &bundles_of(&rotated))
+        .expect("the new primary's token validates");
+}
+
+// ── misconfiguration fails closed ────────────────────────────────────────
+
+#[tokio::test]
+async fn absent_signing_material_without_the_dev_opt_in_fails_closed() {
+    let error = LocalJwtAuthority::new(LocalJwtAuthorityConfig::new(td()))
+        .expect_err("no material and no ephemeral opt-in must fail closed");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidSigningMaterial(_)
+        ),
+        "expected InvalidSigningMaterial, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_p256_signing_key_is_refused() {
+    let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .expect("Ed25519 key generated")
+        .serialize_pem();
+    let error = LocalJwtAuthority::new(config_with_key(&ed25519))
+        .expect_err("a non-P-256 key must be refused rather than mislabelled ES256");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidSigningMaterial(_)
+        ),
+        "expected InvalidSigningMaterial, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn garbage_signing_material_is_refused_without_echoing_it() {
+    let secret_looking = "-----BEGIN PRIVATE KEY-----\nSUPERSECRETVALUE\n-----END PRIVATE KEY-----";
+    let error = LocalJwtAuthority::new(config_with_key(secret_looking))
+        .expect_err("unparseable material must be refused");
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("SUPERSECRETVALUE"),
+        "a signing-material error must not echo the material: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_key_as_both_primary_and_retired_is_refused() {
+    let pem = signing_key_pem();
+    let error = LocalJwtAuthority::new(
+        LocalJwtAuthorityConfig::new(td())
+            .with_signing_key_pem(&pem)
+            .with_retired_key_pems([pem.clone()]),
+    )
+    .expect_err("a duplicate kid across primary and retired must be refused");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidSigningMaterial(_)
+        ),
+        "expected InvalidSigningMaterial, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_authority_debug_rendering_never_carries_key_material() {
+    let pem = signing_key_pem();
+    let signer = authority_with_key(&pem);
+    let rendered = format!("{signer:?}");
+    assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
+    let config = config_with_key(&pem);
+    let rendered = format!("{config:?}");
+    assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
+    assert!(
+        rendered.contains("signing_key_pem: true"),
+        "the config Debug should report presence, not content: {rendered}"
+    );
+}
+
+// ── authority bounds are enforced before publication AND validation ───────
+
+/// Build `n` distinct, individually valid authorities for one trust domain.
+fn distinct_authorities(n: usize) -> Vec<PublishedJwtAuthority> {
+    (0..n)
+        .map(|_| {
+            let key = forge_key();
+            PublishedJwtAuthority {
+                trust_domain: td(),
+                key_id: ferrum_edge::identity::jwt_svid::published_authority_key_id(
+                    &key.public_key_pem,
+                )
+                .expect("key id derives"),
+                public_key_pem: key.public_key_pem,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn validate_rejects_an_over_cap_authority_set_the_bundle_rpc_would_also_reject() {
+    // 17 > MAX_JWT_AUTHORITIES_PER_TRUST_DOMAIN (16). The point is that BOTH
+    // surfaces refuse it: previously `ValidateJWTSVID` scanned the set without a
+    // cap while `FetchJWTBundles` refused it.
+    let over_cap = distinct_authorities(17);
+    let publication = jwks_document(&over_cap)
+        .expect_err("publication must refuse an over-cap authority set");
+    assert!(
+        matches!(
+            publication,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {publication:?}"
+    );
+
+    let signer = authority();
+    let minted = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 60)
+        .expect("mint succeeds");
+    let mut bundles = BTreeMap::new();
+    bundles.insert(td(), over_cap);
+    let validation = validate_jwt_svid(&minted.token, "aud-a", &bundles)
+        .expect_err("validation must refuse the same over-cap set");
+    assert!(
+        matches!(
+            validation,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {validation:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_a_duplicate_key_id_in_the_bundle() {
+    let mut authorities = distinct_authorities(2);
+    let duplicated = authorities[0].key_id.clone();
+    authorities[1].key_id = duplicated;
+
+    let signer = authority();
+    let minted = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 60)
+        .expect("mint succeeds");
+    let mut bundles = BTreeMap::new();
+    bundles.insert(td(), authorities.clone());
+    let error = validate_jwt_svid(&minted.token, "aud-a", &bundles)
+        .expect_err("an ambiguous kid must not resolve to whichever entry came first");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {error:?}"
+    );
+    jwks_document(&authorities).expect_err("publication refuses it too");
+}
+
+#[test]
+fn validate_rejects_an_authority_stamped_with_another_trust_domain() {
+    let mut authorities = distinct_authorities(1);
+    authorities[0].trust_domain = TrustDomain::new("other.test").expect("valid");
+
+    let signer = authority();
+    let minted = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 60)
+        .expect("mint succeeds");
+    let mut bundles = BTreeMap::new();
+    bundles.insert(td(), authorities);
+    let error = validate_jwt_svid(&minted.token, "aud-a", &bundles)
+        .expect_err("a bundle must not carry another trust domain's key");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {error:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_malformed_authority_material_in_any_bundle() {
+    // A malformed FEDERATED bundle fails the call closed rather than validating
+    // against the good local one: an operator who configured that federation
+    // must see it fail, not silently lose it.
+    let signer = authority();
+    let minted = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 60)
+        .expect("mint succeeds");
+    let mut bundles = bundles_of(&signer);
+    bundles.insert(
+        TrustDomain::new("federated.test").expect("valid"),
+        vec![PublishedJwtAuthority {
+            trust_domain: TrustDomain::new("federated.test").expect("valid"),
+            key_id: "kid-federated".to_string(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nnot base64!!\n-----END PUBLIC KEY-----"
+                .to_string(),
+        }],
+    );
+    let error = validate_jwt_svid(&minted.token, "aud-a", &bundles)
+        .expect_err("malformed federated material must fail the call closed");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {error:?}"
+    );
+}
+
+// ── JWKS → authority conversion (SPIRE / federated bundle consumption) ────
+
+#[test]
+fn jwks_round_trips_through_authority_conversion() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    let pem = signing_key_pem();
+    let signer = authority_with_key(&pem);
+    let published = signer.authorities();
+    let document = jwks_document(&published).expect("JWKS builds");
+
+    let recovered = authorities_from_jwks(&td(), &document).expect("JWKS parses back");
+    assert_eq!(recovered.len(), published.len());
+    assert_eq!(recovered[0].key_id, published[0].key_id);
+    assert_eq!(recovered[0].trust_domain, td());
+    // The recovered SPKI must be usable for verification, which is the whole
+    // point of consuming an external bundle.
+    let minted = signer
+        .mint(&workload_id(), &["aud-a".to_string()], 60)
+        .expect("mint succeeds");
+    let mut bundles = BTreeMap::new();
+    bundles.insert(td(), recovered);
+    validate_jwt_svid(&minted.token, "aud-a", &bundles)
+        .expect("a token validates against authorities recovered from JWKS");
+}
+
+#[test]
+fn jwks_conversion_rejects_hostile_and_malformed_documents() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    for (label, document) in [
+        ("empty", "".to_string()),
+        ("not an object", "[]".to_string()),
+        ("no keys array", "{\"foo\":1}".to_string()),
+        ("empty keys", "{\"keys\":[]}".to_string()),
+        (
+            "key without kid",
+            "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}]}".to_string(),
+        ),
+        (
+            "unsupported kty",
+            "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"k\",\"k\":\"AA\"}]}".to_string(),
+        ),
+        (
+            "unsupported curve",
+            "{\"keys\":[{\"kty\":\"EC\",\"kid\":\"k\",\"crv\":\"P-521\",\"x\":\"AA\",\"y\":\"AA\"}]}"
+                .to_string(),
+        ),
+        (
+            "encryption-only use",
+            "{\"keys\":[{\"kty\":\"EC\",\"kid\":\"k\",\"crv\":\"P-256\",\"use\":\"enc\",\
+             \"x\":\"AA\",\"y\":\"AA\"}]}"
+                .to_string(),
+        ),
+        (
+            "duplicate JSON key",
+            "{\"keys\":[],\"keys\":[]}".to_string(),
+        ),
+    ] {
+        assert!(
+            authorities_from_jwks(&td(), document.as_bytes()).is_err(),
+            "{label} JWKS must be refused"
+        );
+    }
+}
+
+#[test]
+fn jwks_conversion_refuses_an_over_cap_key_list_without_scanning_it() {
+    use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
+
+    // 17 syntactically-shaped entries. The cap is checked before per-key work,
+    // so this is refused rather than parsed.
+    let entries: Vec<String> = (0..17)
+        .map(|i| format!("{{\"kty\":\"EC\",\"kid\":\"k{i}\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}}"))
+        .collect();
+    let document = format!("{{\"keys\":[{}]}}", entries.join(","));
+    let error = authorities_from_jwks(&td(), document.as_bytes())
+        .expect_err("an over-cap key list must be refused");
+    assert!(
+        matches!(
+            error,
+            ferrum_edge::identity::jwt_svid::JwtSvidError::InvalidAuthority(_)
+        ),
+        "expected InvalidAuthority, got {error:?}"
+    );
+}
+
+// ── Workload API socket contract ─────────────────────────────────────────
+
+#[test]
+fn workload_api_socket_config_rejects_unsafe_paths_and_modes() {
+    use ferrum_edge::identity::workload_api::WorkloadApiSocketConfig;
+
+    // Relative and traversing paths never resolve somewhere unnamed.
+    assert!(
+        WorkloadApiSocketConfig::from_parts("relative/socket", "0660")
+            .expect("mode parses")
+            .validate()
+            .is_err(),
+        "a relative socket path must be refused"
+    );
+    assert!(
+        WorkloadApiSocketConfig::from_parts("/run/ferrum/../etc/socket", "0660")
+            .expect("mode parses")
+            .validate()
+            .is_err(),
+        "a traversing socket path must be refused"
+    );
+    // A parent directory Ferrum would have to create is refused, not created.
+    assert!(
+        WorkloadApiSocketConfig::from_parts(
+            "/nonexistent-ferrum-workload-api-parent/socket",
+            "0660"
+        )
+        .expect("mode parses")
+        .validate()
+        .is_err(),
+        "a missing parent directory must be refused"
+    );
+    // World-writable and non-octal modes are configuration errors, never
+    // silently replaced by a default.
+    assert!(
+        WorkloadApiSocketConfig::from_parts("/tmp/ferrum-wl-api.sock", "0666").is_err(),
+        "a world-writable socket mode must be refused"
+    );
+    assert!(
+        WorkloadApiSocketConfig::from_parts("/tmp/ferrum-wl-api.sock", "not-octal").is_err(),
+        "a non-octal socket mode must be refused"
+    );
+    assert!(
+        WorkloadApiSocketConfig::from_parts("/tmp/ferrum-wl-api.sock", "0660").is_ok(),
+        "a well-formed path and mode must be accepted"
     );
 }

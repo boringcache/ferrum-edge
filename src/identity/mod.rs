@@ -96,6 +96,75 @@ pub fn allow_no_ca() -> bool {
         .unwrap_or(false)
 }
 
+/// Canonical read of the `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` dev opt-in — the
+/// per-posture sibling to `FERRUM_MESH_CA_BOOTSTRAP_DEV` /
+/// `FERRUM_MESH_ALLOW_STATIC_ID` / `FERRUM_MESH_ALLOW_NO_CA`.
+///
+/// When `true` and no JWT signing material is configured, the internal CA's JWT
+/// authority generates a **process-local** ES256 key. That key is lost on
+/// restart and differs on every replica, so tokens minted moments earlier stop
+/// validating and two instances of one trust domain publish different JWKS —
+/// dev/test only. With this unset and nothing configured, JWT-SVID mint is
+/// refused at startup rather than minting tokens nothing can verify.
+///
+/// Like [`production_mode`] / [`allow_no_ca`] it is read directly from the
+/// environment — intentionally **not** parsed into `EnvConfig`, which would both
+/// let a config-file-only value re-open the posture and put the setting on
+/// surfaces `EnvConfig` values are re-rendered on. It is refused unconditionally
+/// under `FERRUM_MESH_PRODUCTION_MODE=true` (see `.claude/rules/tls-security.md`;
+/// do not collapse the per-posture opt-ins into one flag).
+pub fn allow_ephemeral_jwt_key() -> bool {
+    if production_mode() {
+        return false;
+    }
+    std::env::var("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY")
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        })
+        .unwrap_or(false)
+}
+
+/// The configured JWT signing key PEM for the local trust domain, if any.
+///
+/// Read directly from the environment — **not** through `EnvConfig` — for two
+/// independent reasons: the external-secret suffixes (`_VAULT`, `_AWS`,
+/// `_AZURE`, `_GCP`, `_FILE`) have already rewritten the base variable by the
+/// time this runs, and a private key must not be held on a struct whose values
+/// are re-rendered onto the `validate` report and startup log surfaces. The value
+/// is returned in a [`Zeroizing`] buffer and is never logged, echoed in an error,
+/// or included in a `Debug` rendering.
+///
+/// A blank value is treated as absent, matching `EnvConfig`'s blank-is-unset
+/// convention for optional settings.
+pub fn jwt_signing_key_pem() -> Option<Zeroizing<String>> {
+    env_pem("FERRUM_MESH_JWT_SIGNING_KEY_PEM")
+}
+
+/// The previous JWT signing key PEM, published for **verification only**.
+///
+/// Set this to the outgoing primary across a JWT signing-key rotation so tokens
+/// it signed stay verifiable for their whole permitted lifetime while the new
+/// primary takes over. Same handling rules as [`jwt_signing_key_pem`].
+pub fn jwt_previous_signing_key_pem() -> Option<Zeroizing<String>> {
+    env_pem("FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM")
+}
+
+/// Read a PEM-valued environment variable into a zeroizing buffer.
+///
+/// Uses `var_os` so a non-UTF-8 value is a *rejection* rather than a panic; an
+/// undecodable value is reported as absent here and the startup env-secret
+/// screen already fails closed on a non-Unicode `FERRUM_*` value, so it cannot
+/// silently become "no key configured" without a diagnostic elsewhere.
+fn env_pem(key: &str) -> Option<Zeroizing<String>> {
+    let raw = std::env::var_os(key)?;
+    let value = raw.into_string().ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some(Zeroizing::new(value))
+}
+
 /// A single fetched X.509-SVID with its surrounding trust material.
 ///
 /// Hot-swapped by [`workload_api::fetch_loop`] / [`rotation`] via `ArcSwap`

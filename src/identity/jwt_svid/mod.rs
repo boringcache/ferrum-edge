@@ -4,15 +4,19 @@
 //! JWT RPCs (`FetchJWTSVID`, `FetchJWTBundles`, `ValidateJWTSVID`) while
 //! staying independent of the gRPC layer so it can be unit-tested directly:
 //!
-//! - [`authority`] — [`LocalJwtAuthority`], the process-local JWT signing
-//!   authority used by CA backends that actually own signing material
-//!   (today: [`crate::identity::ca::internal::InternalCa`]). It generates an
-//!   ES256 key at construction, signs bounded short-lived JWT-SVIDs, and
-//!   rotates with a documented verification overlap.
+//! - [`authority`] — [`LocalJwtAuthority`], the JWT signing authority used by
+//!   CA backends that actually own signing material (today:
+//!   [`crate::identity::ca::internal::InternalCa`]). It loads **operator-
+//!   configured** ES256 signing material (so the trust domain's JWT authority
+//!   survives a restart and is identical across replicas sharing that
+//!   material), signs bounded short-lived JWT-SVIDs, and rotates with a
+//!   documented, provable verification overlap.
 //! - [`jwks`] — conversion between the CA-published
 //!   [`PublishedJwtAuthority`](crate::identity::ca::PublishedJwtAuthority)
 //!   (SPKI PEM + key id) and both a JWKS document and a `jsonwebtoken`
-//!   [`DecodingKey`](jsonwebtoken::DecodingKey).
+//!   [`DecodingKey`](jsonwebtoken::DecodingKey), plus the reverse direction
+//!   (JWKS → SPKI PEM) used to consume an external SPIRE / federated JWT
+//!   bundle.
 //! - [`validate`] — fail-closed JWT-SVID validation.
 //!
 //! ## Security posture
@@ -34,6 +38,13 @@
 //!   size, claim-document size, authority count, key-id size, PEM size, and
 //!   the JWKS document itself all have hard caps checked before any parse or
 //!   publication.
+//! - **The same authority bounds gate publication *and* validation.** Every
+//!   trust domain's complete authority set goes through
+//!   [`validate_published_authorities`] before it is published in a JWT bundle
+//!   *and* before it is scanned to select a verification key, so
+//!   `ValidateJWTSVID` can never accept material `FetchJWTBundles` would have
+//!   refused, and a hostile/oversized externally supplied bundle can never
+//!   drive an unbounded scan.
 
 pub mod authority;
 pub mod jwks;
@@ -43,7 +54,10 @@ pub mod validate;
 pub use authority::{
     JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, MintedJwtSvid, SharedJwtSvidSigner,
 };
-pub use jwks::{decoding_key_for_authority, jwks_document, published_authority_key_id};
+pub use jwks::{
+    authorities_from_jwks, decoding_key_for_authority, jwks_document, published_authority_key_id,
+    validate_published_authorities,
+};
 pub use validate::{ValidatedJwtSvid, validate_jwt_svid};
 
 pub(crate) use strict_json::parse_strict_json_object;
@@ -83,6 +97,51 @@ pub const JWT_SVID_CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 /// Default lifetime of a local JWT signing key before it is rotated out.
 pub const DEFAULT_JWT_KEY_LIFETIME_SECS: u64 = 24 * 3600;
 
+/// The rotation verification overlap: how long a retired signing key stays
+/// published after it is replaced.
+///
+/// Every minted token's lifetime is clamped to `max_ttl_secs`, so a token
+/// minted one instant before a rotation is still within its permitted lifetime
+/// for at most `max_ttl_secs + JWT_SVID_CLOCK_SKEW_LEEWAY_SECS`. A retired key
+/// must therefore remain published for exactly that long, and **must not be
+/// evicted earlier to satisfy a retention cap**.
+pub fn rotation_overlap_secs(max_ttl_secs: u64) -> u64 {
+    max_ttl_secs.saturating_add(JWT_SVID_CLOCK_SKEW_LEEWAY_SECS)
+}
+
+/// Number of retired-but-still-verifiable keys a scheduled rotation cadence can
+/// produce, i.e. the retention cap a `key_lifetime_secs` schedule *requires*.
+///
+/// With rotations at `0, L, 2L, …` a key retired at `T - kL` is still inside its
+/// overlap while `kL < overlap`, so at most `ceil(overlap / L)` retired keys are
+/// simultaneously live. `0` for `key_lifetime_secs == 0` (time-based rotation
+/// disabled — nothing is scheduled, so nothing accumulates).
+///
+/// This is the relationship that makes the overlap guarantee *provable*: as long
+/// as `max_retained_keys >= required_retained_keys(...)`, a scheduled rotation
+/// never needs to evict a key that could still validate a live token.
+pub fn required_retained_keys(max_ttl_secs: u64, key_lifetime_secs: u64) -> u64 {
+    if key_lifetime_secs == 0 {
+        return 0;
+    }
+    rotation_overlap_secs(max_ttl_secs).div_ceil(key_lifetime_secs)
+}
+
+/// Shortest `key_lifetime_secs` whose required retention still fits inside
+/// [`MAX_JWT_AUTHORITIES_PER_TRUST_DOMAIN`] (the active key occupies one slot,
+/// leaving `MAX - 1` for retired ones).
+///
+/// A shorter lifetime cannot be honoured without either exceeding the published
+/// authority cap or evicting a key that can still validate a live token, so it
+/// is refused at construction rather than silently accepted.
+pub fn min_key_lifetime_secs(max_ttl_secs: u64) -> u64 {
+    let retained_slots = MAX_JWT_AUTHORITIES_PER_TRUST_DOMAIN.saturating_sub(1) as u64;
+    if retained_slots == 0 {
+        return u64::MAX;
+    }
+    rotation_overlap_secs(max_ttl_secs).div_ceil(retained_slots)
+}
+
 /// Errors raised by the JWT-SVID mint / validate / bundle paths.
 ///
 /// Every variant except [`JwtSvidError::Internal`] carries a fixed
@@ -112,6 +171,16 @@ pub enum JwtSvidError {
     /// not be republished. Maps to gRPC `INTERNAL`.
     #[error("JWT authority material rejected: {0}")]
     InvalidAuthority(&'static str),
+    /// A rotation was refused because completing it would have evicted a
+    /// retired key that can still validate a token inside its permitted
+    /// lifetime. The current key stays active and every already-minted token
+    /// stays verifiable, so refusing is strictly safer than rotating.
+    #[error("JWT-SVID rotation refused: {0}")]
+    RotationRefused(&'static str),
+    /// The configured JWT signing material is unusable or absent where it is
+    /// mandatory. Startup-only; never reachable from an RPC path.
+    #[error("JWT-SVID signing material rejected: {0}")]
+    InvalidSigningMaterial(&'static str),
     /// Ferrum-side failure. Maps to gRPC `INTERNAL`.
     #[error("JWT-SVID internal error: {0}")]
     Internal(String),
