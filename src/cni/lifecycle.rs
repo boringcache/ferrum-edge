@@ -346,6 +346,15 @@ impl CleanupWaitReport {
     pub fn scheduled_nowhere(&self) -> bool {
         self.desired == 0
     }
+
+    /// Whether deleting the release is safe based on this completion report.
+    ///
+    /// At least one cleanup pod must have been scheduled and every scheduled
+    /// pod must be Ready. A controller-observed `0/0` is useful diagnostic
+    /// evidence, but never proof that no node still has the chained CNI file.
+    pub fn release_deletion_is_safe(&self) -> bool {
+        self.desired > 0 && self.ready >= self.desired
+    }
 }
 
 /// Run the whole Helm `pre-delete` completion boundary: block until every
@@ -376,6 +385,15 @@ pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWait
     let api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
 
     let report = await_cleanup_daemonset(&api, config).await?;
+    if !report.release_deletion_is_safe() {
+        return Err(
+            "the cleanup DaemonSet scheduled onto no node, so no node was cleaned. The release \
+             will be retained because deleting the node-agent could strand a chained CNI \
+             configuration. If the cluster has no schedulable nodes, clean them with the manual \
+             steps in docs/node_agent.md before retrying."
+                .to_string(),
+        );
+    }
     // The cleanup DaemonSet is a `pre-delete` hook that deliberately carries
     // NO `hook-succeeded` deletion policy, so Helm leaves it alone. Removing
     // it is this Job's job, and it happens only after every node reported

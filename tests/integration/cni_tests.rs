@@ -1430,14 +1430,33 @@ mod install_lifecycle {
         CniUninstallReport, FERRUM_MANAGED_BY, OWNERSHIP_MANIFEST_FILE_NAME, install, uninstall,
     };
     use ferrum_edge::cni::lifecycle::{
-        RollbackWatchConfig, RollbackWatchOutcome, clear_stale_ready_marker, ready_marker_present,
-        run_rollback_watch, write_ready_marker,
+        CleanupWaitReport, RollbackWatchConfig, RollbackWatchOutcome, clear_stale_ready_marker,
+        ready_marker_present, run_rollback_watch, write_ready_marker,
     };
     use serde_json::Value;
 
     const OWNER: &str = "ferrum/mesh";
     const PRIMARY_CONF: &str = "10-calico.conflist";
     const GENERATED_CONF: &str = "00-ferrum.conflist";
+
+    /// A controller-observed all-zero DaemonSet is diagnostic evidence, not
+    /// permission to delete the node-agent: no cleanup pod proved that any
+    /// host's chained CNI configuration was removed.
+    #[test]
+    fn zero_scheduled_cleanup_nodes_never_make_release_deletion_safe() {
+        let nowhere = CleanupWaitReport {
+            desired: 0,
+            ready: 0,
+        };
+        assert!(nowhere.scheduled_nowhere());
+        assert!(!nowhere.release_deletion_is_safe());
+
+        let complete = CleanupWaitReport {
+            desired: 2,
+            ready: 2,
+        };
+        assert!(complete.release_deletion_is_safe());
+    }
 
     struct Node {
         _root: tempfile::TempDir,

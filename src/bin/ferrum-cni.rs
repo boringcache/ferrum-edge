@@ -277,14 +277,6 @@ mod cni_main {
             }
         };
         match runtime.block_on(lifecycle::run_cleanup_phase(&config)) {
-            Ok(report) if report.scheduled_nowhere() => {
-                eprintln!(
-                    "ferrum-cni: the cleanup DaemonSet scheduled onto no node, so no node was \
-                     cleaned. If nodes exist but are cordoned or tainted, clean them with the \
-                     manual steps in docs/node_agent.md before deleting the release."
-                );
-                ExitCode::SUCCESS
-            }
             Ok(report) => {
                 eprintln!(
                     "ferrum-cni: CNI cleanup completed on {} of {} scheduled nodes",
