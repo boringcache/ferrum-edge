@@ -360,8 +360,7 @@ where
 /// full timer, so a stalled peer could hold a frontend slot for twice the
 /// configured seconds).
 pub fn frontend_tls_handshake_deadline(timeout_secs: u64) -> Option<tokio::time::Instant> {
-    (timeout_secs > 0)
-        .then(|| tokio::time::Instant::now() + Duration::from_secs(timeout_secs))
+    (timeout_secs > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(timeout_secs))
 }
 
 /// Accept a frontend TLS stream bounded by an already-established deadline.

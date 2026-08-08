@@ -42,7 +42,9 @@ use ferrum_edge::proxy::ktls_record::{
     TLS_RECORD_TYPE_HANDSHAKE, classify_ktls_control_record,
 };
 use ferrum_edge::proxy::sni::{ClientHelloKtlsFacts, client_hello_ktls_facts};
-use ferrum_edge::tls::{NoVerifier, accept_with_optional_deadline, frontend_tls_handshake_deadline};
+use ferrum_edge::tls::{
+    NoVerifier, accept_with_optional_deadline, frontend_tls_handshake_deadline,
+};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 
@@ -236,7 +238,11 @@ fn other_alerts_of_either_severity_are_errors() {
         (TLS_ALERT_LEVEL_WARNING, 90u8),
     ] {
         let record = classify_ktls_control_record(TLS_RECORD_TYPE_ALERT, &[level, description]);
-        let KtlsControlRecord::Alert { level: l, description: d } = record else {
+        let KtlsControlRecord::Alert {
+            level: l,
+            description: d,
+        } = record
+        else {
             panic!("alert {level}/{description} must classify as Alert, got {record}");
         };
         assert_eq!((l, d), (level, description));
@@ -271,11 +277,18 @@ fn non_alert_control_records_are_errors() {
 fn malformed_alert_bodies_fail_closed() {
     // A TLS 1.2 alert is exactly two bytes. Anything else is a malformed peer;
     // guessing at a truncated or padded body is how a close gets forged.
-    let three = [TLS_ALERT_LEVEL_WARNING, TLS_ALERT_DESCRIPTION_CLOSE_NOTIFY, 0];
+    let three = [
+        TLS_ALERT_LEVEL_WARNING,
+        TLS_ALERT_DESCRIPTION_CLOSE_NOTIFY,
+        0,
+    ];
     for body in [&[][..], &[TLS_ALERT_LEVEL_WARNING][..], &three[..]] {
         let record = classify_ktls_control_record(TLS_RECORD_TYPE_ALERT, body);
         let KtlsControlRecord::MalformedAlert { len } = record else {
-            panic!("a {}-byte alert body must fail closed, got {record}", body.len());
+            panic!(
+                "a {}-byte alert body must fail closed, got {record}",
+                body.len()
+            );
         };
         assert_eq!(len, body.len());
         assert!(!record.is_clean_eof());
@@ -328,8 +341,7 @@ fn close_notify_control_message_sets_the_alert_record_type() {
     assert_eq!(level, SOL_TLS, "record type is set at the SOL_TLS level");
     assert_eq!(kind, TLS_SET_RECORD_TYPE);
     assert_eq!(
-        record_type,
-        TLS_RECORD_TYPE_ALERT,
+        record_type, TLS_RECORD_TYPE_ALERT,
         "an absent or wrong record type would emit the alert as application data"
     );
 }

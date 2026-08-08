@@ -548,7 +548,9 @@ async fn read_one_tls_record(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::R
     }
     let header_at = buf.len();
     buf.resize(header_at + 5, 0);
-    stream.read_exact(&mut buf[header_at..header_at + 5]).await?;
+    stream
+        .read_exact(&mut buf[header_at..header_at + 5])
+        .await?;
 
     let record_len = u16::from_be_bytes([buf[header_at + 3], buf[header_at + 4]]) as usize;
     if record_len > MAX_TLS_RECORD_LEN {
