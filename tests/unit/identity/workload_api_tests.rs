@@ -1745,12 +1745,15 @@ mod socket_boundary {
 
     /// A private per-test directory whose ancestors are all trusted, so a test
     /// can introduce exactly one untrusted component.
-    struct Sandbox {
-        root: PathBuf,
+    ///
+    /// Shared with the publication tests below, which need the same "a real path
+    /// Ferrum would accept" starting point.
+    pub(crate) struct Sandbox {
+        pub(crate) root: PathBuf,
     }
 
     impl Sandbox {
-        fn new(label: &str) -> Option<Self> {
+        pub(crate) fn new(label: &str) -> Option<Self> {
             // Canonicalized: on macOS `std::env::temp_dir()` sits under `/var`,
             // which is itself a symlink — the very thing the walk refuses. The
             // canonical form is what an operator would configure.
@@ -1991,7 +1994,7 @@ mod socket_policy {
     #[test]
     fn a_parent_with_no_room_for_the_staging_directory_is_refused() {
         // The socket is bound inside a private staging directory beneath the
-        // parent and only then renamed into place, so it is the STAGING path
+        // parent and only then published from there, so it is the STAGING path
         // that has to fit `sockaddr_un.sun_path`. A parent that leaves no
         // headroom is a configuration error, not a bare EINVAL from `bind`.
         let parent = format!("/{}", "d".repeat(90));
@@ -2074,6 +2077,233 @@ mod socket_policy {
         assert!(
             !matches_bound_socket_identity(true, EUID, (8, 42), EUID, bound),
             "the device is part of the identity too"
+        );
+    }
+
+    #[test]
+    fn the_liveness_probe_carries_a_bound_and_a_timeout_is_not_an_answer() {
+        use ferrum_edge::identity::workload_api::listener::SOCKET_LIVENESS_PROBE_TIMEOUT;
+
+        // A local Unix connect either completes or fails at once; the deadline
+        // exists for the peer that does neither — one that is listening but has
+        // stopped draining its accept queue. Without a bound, that peer holds
+        // startup open indefinitely, which is neither of the two refusals the
+        // contract documents.
+        assert!(
+            SOCKET_LIVENESS_PROBE_TIMEOUT > std::time::Duration::ZERO
+                && SOCKET_LIVENESS_PROBE_TIMEOUT <= std::time::Duration::from_secs(10),
+            "the probe must be bounded, and briefly: a slow local connect is already evidence"
+        );
+        // Expiry is folded back through the ordinary classification rather than
+        // short-circuiting it, so it lands on the same fail-closed verdict as
+        // every other answer the kernel did not give.
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::TimedOut))),
+            SocketLiveness::Undetermined
+        );
+    }
+}
+
+// ── Publication and the liveness probe against real sockets ───────────────
+//
+// The two startup steps that decide whether Ferrum may own the path workloads
+// dial for their identity. Both are exercised on a real filesystem here: the
+// pure predicates above say what the policy is, these say what the code does
+// with it.
+
+#[cfg(unix)]
+mod socket_publication {
+    use super::socket_boundary::Sandbox;
+    use ferrum_edge::identity::workload_api::listener::{
+        SocketLiveness, bind_and_publish_socket, probe_socket_liveness,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    fn entries(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("the parent directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn publication_never_replaces_an_artifact_that_is_already_at_the_destination() {
+        // The race the publication step exists to lose safely. The liveness
+        // probe runs before the socket is even bound, so a peer can bind the
+        // path in between; `rename(2)` would have silently unlinked that live
+        // listener and taken over the endpoint workloads dial for their
+        // identity. The destination is created up front here, which is the same
+        // state that window produces and needs no timing to reach.
+        let Some(sandbox) = Sandbox::new("pub") else {
+            return;
+        };
+        let path = sandbox.root.join("api.sock");
+        let competitor = std::os::unix::net::UnixListener::bind(&path)
+            .expect("a competing process can bind the path first");
+        let before = std::fs::symlink_metadata(&path).expect("the competitor's socket exists");
+
+        let error = bind_and_publish_socket(&path, 0o660)
+            .expect_err("publication must refuse a destination that is already occupied");
+        assert!(
+            error.to_string().contains("another process"),
+            "unexpected refusal reason: {error}"
+        );
+
+        let after = std::fs::symlink_metadata(&path).expect("the competitor's socket survives");
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "a refused publication must never replace the artifact it lost to"
+        );
+        std::os::unix::net::UnixStream::connect(&path)
+            .expect("the competing listener is still serving on its own socket");
+        assert_eq!(
+            entries(&sandbox.root),
+            vec!["api.sock".to_string()],
+            "a refused publication must leave nothing of ours behind, staging included"
+        );
+
+        drop(competitor);
+    }
+
+    #[tokio::test]
+    async fn a_published_socket_is_the_staged_inode_and_reachable_through_its_new_name() {
+        // The other half: refusing to clobber must not have cost publication its
+        // meaning. The listener is bound in staging and never rebound, so this
+        // pins that the published NAME reaches that same listener — a Unix
+        // socket is resolved to its inode, which is what makes linking a valid
+        // publication rather than a copy.
+        let Some(sandbox) = Sandbox::new("ok") else {
+            return;
+        };
+        let path = sandbox.root.join("api.sock");
+        let (listener, identity) =
+            bind_and_publish_socket(&path, 0o660).expect("an empty destination is published");
+
+        let metadata = std::fs::symlink_metadata(&path).expect("the published socket exists");
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            identity,
+            "the published name is the inode that was bound and permissioned in staging"
+        );
+        assert_eq!(metadata.mode() & 0o777, 0o660, "the configured mode survives");
+        assert_eq!(
+            metadata.nlink(),
+            1,
+            "only the published name survives; the staging alias is unlinked"
+        );
+        assert_eq!(
+            entries(&sandbox.root),
+            vec!["api.sock".to_string()],
+            "publication leaves no staging directory behind"
+        );
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("the published name reaches the listener bound in staging");
+        listener
+            .accept()
+            .await
+            .expect("the listener accepts a connection made through the published name");
+        drop(client);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_probe_reads_live_leftover_and_missing_sockets_correctly() {
+        let Some(sandbox) = Sandbox::new("probe") else {
+            return;
+        };
+
+        let path = sandbox.root.join("live.sock");
+        let live = tokio::net::UnixListener::bind(&path).expect("bind a live listener");
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::Live,
+            "a listener that is serving must be seen as live and never unlinked"
+        );
+
+        // Closing the listener leaves the name on disk with nothing bound to it:
+        // exactly what a crashed predecessor leaves behind, and the only shape
+        // that admits an unlink.
+        drop(live);
+        assert!(path.exists(), "the leftover socket file remains on disk");
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::NotListening
+        );
+
+        assert_eq!(
+            probe_socket_liveness(&sandbox.root.join("missing.sock")).await,
+            SocketLiveness::NotListening
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_socket_we_cannot_reach_is_undetermined_rather_than_stale() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // "Ambiguous fails closed", against a real socket rather than a
+        // synthesized error kind. A live listener whose file denies us write
+        // permission answers `connect(2)` with `EACCES`, and that is not
+        // evidence that nobody is there — reading it as stale would unlink a
+        // serving endpoint. Root bypasses the permission check, so there is
+        // nothing to observe as that user.
+        //
+        // SAFETY: `geteuid` is a pure read of this process's credentials.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let Some(sandbox) = Sandbox::new("eacces") else {
+            return;
+        };
+        let path = sandbox.root.join("closed.sock");
+        let live = tokio::net::UnixListener::bind(&path).expect("bind a live listener");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("test can chmod a socket it owns");
+
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::Undetermined,
+            "an unreachable socket is an answer we did not get, not an absent listener"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_listener_publishes_and_probes_without_the_primitives_that_caused_this() {
+        // Two structural regressions this module cannot observe behaviourally,
+        // both of which reintroduce a silent failure rather than a visible one:
+        // an overwrite-capable `rename` as the publication step, and a blocking
+        // `connect(2)` issued from the async startup path.
+        let listener = include_str!("../../../src/identity/workload_api/listener.rs");
+        assert!(
+            !listener.contains("fs::rename"),
+            "publication must not go back to an overwrite-capable rename"
+        );
+        assert!(
+            listener.contains("fs::hard_link"),
+            "publication must use a primitive that fails when the destination exists"
+        );
+        assert!(
+            !listener.contains("std::os::unix::net::UnixStream::connect"),
+            "the liveness probe must not block the startup runtime on a peer that never answers"
+        );
+        assert!(
+            listener.contains("tokio::net::UnixStream::connect")
+                && listener.contains("tokio::time::timeout("),
+            "the liveness probe must stay asynchronous and bounded"
         );
     }
 }

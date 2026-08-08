@@ -640,7 +640,7 @@ async fn the_bound_socket_carries_the_configured_mode_and_is_owned_by_this_proce
     // process, at exactly the configured mode.
     //
     // Ferrum never touches the process umask — it binds inside a private 0700
-    // staging directory, sets and verifies the mode there, and renames the inode
+    // staging directory, sets and verifies the mode there, and publishes the inode
     // into place — so a permissive ambient umask must neither widen the endpoint
     // nor be observable in the published artifact. The umask is set to 0o000
     // here to prove exactly that: it is the state that WOULD have leaked through
@@ -830,9 +830,10 @@ async fn a_stale_socket_with_no_listener_is_still_cleared() {
 
 #[tokio::test]
 async fn publication_leaves_no_staging_artifact_behind() {
-    // The socket is bound inside a private 0700 staging directory and renamed
-    // into place, so the parent directory must hold exactly the published socket
-    // afterwards — no `.fw-*` directory, no half-published inode.
+    // The socket is bound inside a private 0700 staging directory and published
+    // from there with a no-clobber primitive, so the parent directory must hold
+    // exactly the published socket afterwards — no `.fw-*` directory, no staged
+    // alias, no half-published inode.
     let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

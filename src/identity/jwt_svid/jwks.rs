@@ -52,8 +52,11 @@
 //! to build a `DecodingKey`:
 //!
 //! - an **RSA modulus** is bounded by its *significant* bit length,
-//!   `2048..=8192`. A byte-count floor is not the same test: 256 bytes with a
-//!   small top byte is a 2041-bit key, and leading zero octets add nothing.
+//!   `2048..=8192`, and must be **odd**. A byte-count floor is not the same
+//!   test: 256 bytes with a small top byte is a 2041-bit key, and leading zero
+//!   octets add nothing. Parity is not a size question at all: a modulus is a
+//!   product of odd primes, so an even value — however well-sized and
+//!   canonically encoded — is not an RSA modulus.
 //! - an **RSA public exponent** must be odd and at least 3, within a bounded
 //!   encoding. `0` and `1` are not exponents and an even value cannot be coprime
 //!   with φ(n); real keys are 65537.
@@ -926,14 +929,21 @@ fn significant_bit_length(unsigned_be: &[u8]) -> u32 {
     }
 }
 
-/// Admit an RSA modulus only inside the documented `2048..=8192` significant-bit
-/// range.
+/// Admit an RSA modulus only when it is odd and inside the documented
+/// `2048..=8192` significant-bit range.
 ///
 /// A byte-length floor is not equivalent: 256 bytes whose top byte is `0x01`
 /// carries 2041 significant bits, which is weaker than the module claims to
 /// accept, and leading zero bytes contribute nothing at all. The upper bound is
 /// enforced for the same reason it is documented — an unbounded modulus makes
 /// every verification against that authority arbitrarily expensive.
+///
+/// Size is not the only structural fact available for free. An RSA modulus is a
+/// product of odd primes, so it is **odd**; an even value is not an RSA modulus
+/// at all, however well-sized and canonically encoded it is. Refusing it here
+/// costs one bit test and keeps a malformed or hostile authority from being
+/// republished in `FetchJWTBundles` or turned into a `DecodingKey`. The exponent
+/// has always been parity-checked; the modulus not being was the asymmetry.
 fn check_rsa_modulus(modulus: &[u8]) -> Result<(), JwtSvidError> {
     let bits = significant_bit_length(modulus);
     if bits < MIN_RSA_MODULUS_BITS {
@@ -944,6 +954,16 @@ fn check_rsa_modulus(modulus: &[u8]) -> Result<(), JwtSvidError> {
     if bits > MAX_RSA_MODULUS_BITS {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority RSA public key is larger than the 8192-bit ceiling",
+        ));
+    }
+    // The bit-length floor above guarantees a nonempty significant slice, so a
+    // missing least-significant byte cannot silently pass as odd.
+    if strip_leading_zeros(modulus)
+        .last()
+        .is_none_or(|byte| byte % 2 == 0)
+    {
+        return Err(JwtSvidError::InvalidAuthority(
+            "JWT authority RSA public key modulus is even; a modulus is a product of odd primes",
         ));
     }
     Ok(())

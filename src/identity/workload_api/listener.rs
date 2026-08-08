@@ -56,7 +56,7 @@
 //! unlink the first one's **live** Workload API socket and take over the path
 //! workloads dial for their identity. So before any unlink, the existing socket
 //! is probed with a real Unix-domain `connect(2)`
-//! ([`probe_existing_socket`]) and
+//! ([`probe_socket_liveness`]) and
 //!
 //! - a **successful connection means live**: startup is refused and nothing is
 //!   unlinked;
@@ -65,6 +65,14 @@
 //! - **anything ambiguous fails closed** — `EACCES`, `EAGAIN` (a listener whose
 //!   backlog is full), a timeout, or any other error. "We could not tell" is
 //!   never treated as "nobody is there".
+//!
+//! The probe is **asynchronous and bounded**. A blocking `connect(2)` issued
+//! from the startup future would hand a peer that is listening but not draining
+//! its backlog the ability to hang startup for as long as it liked, which is a
+//! different failure from the fail-closed refusal documented above and would
+//! contradict it. It runs on `tokio::net::UnixStream::connect` under a
+//! [`SOCKET_LIVENESS_PROBE_TIMEOUT`] deadline, and expiring the deadline is
+//! simply one more answer we did not get: `Undetermined`, therefore fatal.
 //!
 //! Immediately before the unlink the artifact's `(device, inode, type, owner)`
 //! is re-checked against what was probed, so a replacement that raced in
@@ -86,17 +94,30 @@
 //!    verified there. Whatever mode `bind(2)` happened to create it with is
 //!    unreachable to anyone else for the whole of that window, so there is never
 //!    a permissive temporary endpoint;
-//! 3. the socket inode is **renamed** onto the final path — same parent, so the
-//!    same filesystem, so the publication is atomic — and re-verified
-//!    afterwards: still a socket, still owned by this process, still exactly the
-//!    configured mode, and still the same `(device, inode)`. That pair is
-//!    recorded as the **bound identity**.
+//! 3. the socket is **published onto the final path with a no-clobber
+//!    primitive** (`publish_socket_exclusively`) and re-verified afterwards:
+//!    still a socket, still owned by this process, still exactly the configured
+//!    mode, and still the same `(device, inode)`. That pair is recorded as the
+//!    **bound identity**.
+//!
+//! `rename(2)` is deliberately **not** the publication step. POSIX rename
+//! silently replaces whatever is at the destination, and the destination is
+//! probed for liveness *earlier* — so a peer that binds the path in between
+//! would have had its live listener clobbered by the very code that refuses to
+//! unlink it. Publication therefore uses a primitive that fails atomically when
+//! the destination exists: `link(2)`, which leaves the listener bound to an
+//! inode that simply gains a second name (a Unix-socket connection resolves to
+//! the *inode*, so the published name reaches the same listener), after which
+//! only the staging alias is unlinked. On Apple platforms, whose filesystems
+//! refuse a hard link to anything but a regular file, `renamex_np(RENAME_EXCL)`
+//! plays the same role. An **occupied destination fails startup**, and the
+//! competing artifact is never removed.
 //!
 //! If the bound identity cannot be established at any point, startup **fails**
 //! and every artifact (staged socket, staging directory, and a published socket
-//! that failed its post-rename check) is cleaned up identity-checked. Ferrum
-//! does not serve a credential endpoint whose on-disk identity it could not
-//! confirm.
+//! that failed its post-publication check) is cleaned up identity-checked.
+//! Ferrum does not serve a credential endpoint whose on-disk identity it could
+//! not confirm.
 //!
 //! The staging directory needs room inside `sockaddr_un.sun_path`, so
 //! [`WorkloadApiSocketConfig::validate`] additionally requires the socket's
@@ -137,6 +158,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -163,11 +185,23 @@ const MAX_SOCKET_PATH_BYTES: usize = 100;
 /// Headroom the private staging directory needs inside `sun_path`, beyond the
 /// socket's parent directory: `/` + `.fw-<pid>-<seq>` + `/s`.
 ///
-/// The socket is bound at `<parent>/.fw-<pid>-<seq>/s` before it is renamed onto
-/// its configured path, and *that* path is what `bind(2)` has to fit into
+/// The socket is bound at `<parent>/.fw-<pid>-<seq>/s` before it is published
+/// onto its configured path, and *that* path is what `bind(2)` has to fit into
 /// `sockaddr_un`. `pid` is at most 10 decimal digits and `seq` at most 8 hex
 /// digits, so the worst case is `1 + 4 + 10 + 1 + 8 + 2`.
 pub const MAX_STAGING_SUFFIX_BYTES: usize = 26;
+
+/// How long a liveness `connect(2)` probe may take before the answer is treated
+/// as one we did not get.
+///
+/// A local Unix-domain connect either completes or fails immediately; the
+/// deadline exists for the case that does neither — a peer that is listening but
+/// has stopped draining its accept queue. Without it, that peer would hold
+/// startup open indefinitely, which is neither the "live, refuse" nor the
+/// "ambiguous, refuse" outcome the contract documents. Kept short because a
+/// slow local connect is already evidence enough: expiry is `Undetermined`, and
+/// `Undetermined` is fatal.
+pub const SOCKET_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Attempts to find an unused staging-directory name before giving up. A
 /// collision needs another process with our pid, so one retry would do; a small
@@ -201,7 +235,7 @@ pub struct WorkloadApiSocketConfig {
     /// Absolute filesystem path to bind.
     pub socket_path: PathBuf,
     /// Permission bits the published socket carries. Set and verified inside a
-    /// private staging directory, then published by rename.
+    /// private staging directory, then published with a no-clobber primitive.
     pub socket_mode: u32,
 }
 
@@ -314,7 +348,7 @@ impl WorkloadApiSocketConfig {
             ))
         })?;
         // The socket is bound inside a private staging directory under this
-        // parent and only then renamed into place, so it is the *staging* path
+        // parent and only then published from there, so it is the *staging* path
         // that has to fit `sockaddr_un.sun_path`.
         let max_parent = MAX_SOCKET_PATH_BYTES.saturating_sub(MAX_STAGING_SUFFIX_BYTES);
         if parent.as_os_str().len() > max_parent {
@@ -447,7 +481,7 @@ pub async fn serve_workload_api(
 
     config.validate()?;
     let path = config.socket_path.clone();
-    refuse_live_or_clear_stale_socket(&path)?;
+    refuse_live_or_clear_stale_socket(&path).await?;
 
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
 
@@ -618,8 +652,8 @@ impl StagingDir {
 #[cfg(unix)]
 impl Drop for StagingDir {
     /// Best-effort teardown on every path, success or failure. After a
-    /// successful publication the staged socket has already been renamed away,
-    /// so only the empty directory remains.
+    /// successful publication the staged alias has already been unlinked, so
+    /// only the empty directory remains.
     fn drop(&mut self) {
         remove_self_owned_socket_best_effort(&self.socket_path());
         let _ = std::fs::remove_dir(&self.path);
@@ -627,14 +661,19 @@ impl Drop for StagingDir {
 }
 
 /// Bind the socket inside a private staging directory, permission it there, and
-/// publish it onto `path` by rename.
+/// publish it onto `path` without ever replacing an entry already there.
 ///
 /// Returns the listener together with the published `(device, inode)` identity.
 /// Every failure leaves no artifact behind: the staging directory's `Drop`
 /// removes the staged socket, and a post-publication verification failure
-/// removes the published one identity-checked.
+/// removes the published one identity-checked. A destination that is already
+/// occupied is refused with the competing artifact left untouched.
+///
+/// Public so the publication step — the security-relevant half of startup — can
+/// be exercised directly against a destination that already exists, which the
+/// full [`serve_workload_api`] path refuses earlier for a different reason.
 #[cfg(unix)]
-fn bind_and_publish_socket(
+pub fn bind_and_publish_socket(
     path: &Path,
     socket_mode: u32,
 ) -> Result<(tokio::net::UnixListener, (u64, u64)), WorkloadApiListenerError> {
@@ -664,15 +703,10 @@ fn bind_and_publish_socket(
     )?;
     let staged_identity = confirm_socket_identity(&staged_path, socket_mode, "in staging")?;
 
-    // Publication. Same parent directory, therefore the same filesystem, so the
-    // rename is atomic: a workload either sees no socket or sees the finished,
-    // correctly permissioned one.
-    std::fs::rename(&staged_path, path).map_err(|error| {
-        WorkloadApiListenerError::Io(format!(
-            "publishing the Workload API socket at '{}' failed: {error}",
-            path.display()
-        ))
-    })?;
+    // Publication. Atomic and no-clobber: a workload either sees no socket or
+    // sees the finished, correctly permissioned one, and a peer that bound the
+    // path since the liveness probe is never displaced.
+    publish_socket_exclusively(&staged_path, path)?;
 
     match confirm_socket_identity(path, socket_mode, "after publication") {
         Ok(published_identity) if published_identity == staged_identity => {
@@ -693,6 +727,158 @@ fn bind_and_publish_socket(
             Err(error)
         }
     }
+}
+
+/// Publish the staged socket at `path` **without ever replacing** an entry that
+/// is already there.
+///
+/// `rename(2)` cannot be used for this. POSIX rename overwrites its destination,
+/// and the destination is probed for liveness *before* the socket is even bound,
+/// so an entry that appears in between — another same-uid Ferrum process
+/// publishing its own endpoint — would be silently clobbered by the same startup
+/// that refuses to unlink a live socket. The primitives here fail atomically
+/// instead:
+///
+/// - `link(2)`, the POSIX one. It creates the published name for the inode the
+///   listener is already bound to; a Unix-domain connection resolves the path to
+///   an *inode* and finds the socket attached to it, so the new name reaches the
+///   same listener. Only the staging alias is unlinked afterwards, so the
+///   published name is what survives.
+/// - `renamex_np(..., RENAME_EXCL)` on Apple platforms, whose filesystems refuse
+///   a hard link to anything but a regular file, so `link(2)` cannot be the
+///   publication primitive there.
+///
+/// An occupied destination is fatal and the competing artifact is left exactly
+/// as it was. If neither primitive is available, publication fails rather than
+/// falling back to an overwriting rename.
+#[cfg(unix)]
+fn publish_socket_exclusively(
+    staged_path: &Path,
+    path: &Path,
+) -> Result<(), WorkloadApiListenerError> {
+    match std::fs::hard_link(staged_path, path) {
+        Ok(()) => {
+            // The inode carries two names for as long as it takes to drop the
+            // staging alias, and that alias lives inside our private `0700`
+            // directory, so the extra name is never reachable by anyone else.
+            // Only it is removed — the published name is not ours to reconsider.
+            remove_self_owned_socket_best_effort(staged_path);
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(destination_already_published(path));
+        }
+        Err(error) if !link_unsupported_for_socket(&error) => {
+            return Err(WorkloadApiListenerError::Io(format!(
+                "publishing the Workload API socket at '{}' failed: {error}",
+                path.display()
+            )));
+        }
+        // The filesystem refuses a hard link to a socket at all; fall through to
+        // the exclusive-rename primitive rather than to an overwriting one.
+        Err(_) => {}
+    }
+    rename_exclusively(staged_path, path)
+}
+
+/// The socket path was taken between the liveness probe and publication.
+///
+/// Fatal, and deliberately non-destructive: whatever is there now belongs to
+/// whoever won the race, and unlinking it is exactly the take-over the whole
+/// contract exists to prevent.
+#[cfg(unix)]
+fn destination_already_published(path: &Path) -> WorkloadApiListenerError {
+    WorkloadApiListenerError::Socket(format!(
+        "'{}' was created by another process while this one was preparing its socket; refusing to \
+         replace it and take over the endpoint workloads dial for their identity. Stop that \
+         process or configure a different FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+        path.display()
+    ))
+}
+
+/// Whether `link(2)` failed because the filesystem will not hard-link this kind
+/// of file, rather than because of the destination or a permission problem.
+///
+/// Apple's HFS+/APFS answer `EPERM` for a link to anything but a regular file;
+/// other filesystems use `EOPNOTSUPP`/`ENOTSUP`. `EXDEV` and `EMLINK` cannot
+/// arise for a same-directory link to a freshly created inode, but they belong
+/// to the same "this primitive does not apply here" class. Every other error —
+/// including `EEXIST`, which the caller handles first — is a real failure.
+#[cfg(unix)]
+fn link_unsupported_for_socket(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    // Compared rather than matched: `ENOTSUP` and `EOPNOTSUPP` are the same
+    // value on Linux, and two equal constants in one match are an unreachable
+    // pattern.
+    code == libc::EPERM
+        || code == libc::EOPNOTSUPP
+        || code == libc::ENOTSUP
+        || code == libc::EXDEV
+        || code == libc::EMLINK
+}
+
+/// Apple's exclusive rename: atomic, and `EEXIST` rather than a replacement when
+/// the destination exists — the `renameat2`/`RENAME_NOREPLACE` semantics under
+/// their own name.
+#[cfg(all(unix, target_vendor = "apple"))]
+fn rename_exclusively(staged_path: &Path, path: &Path) -> Result<(), WorkloadApiListenerError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // `RENAME_EXCL` from `<stdio.h>`, declared here (with `renamex_np` itself)
+    // so the publication primitive does not depend on which libc release
+    // exposes it.
+    const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
+    }
+
+    let to_c_string = |value: &Path| {
+        CString::new(value.as_os_str().as_bytes()).map_err(|_| {
+            WorkloadApiListenerError::Io(format!(
+                "the Workload API socket path '{}' cannot be passed to the kernel",
+                value.display()
+            ))
+        })
+    };
+    let from = to_c_string(staged_path)?;
+    let to = to_c_string(path)?;
+
+    // SAFETY: both pointers are NUL-terminated C strings that outlive the call,
+    // and `RENAME_EXCL` is the documented exclusive-rename flag. The call has no
+    // other effect on this process.
+    let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        return Err(destination_already_published(path));
+    }
+    Err(WorkloadApiListenerError::Io(format!(
+        "publishing the Workload API socket at '{}' failed: {error}",
+        path.display()
+    )))
+}
+
+/// No exclusive-rename primitive is reachable portably outside Apple, so a
+/// filesystem that also refuses `link(2)` on a socket leaves publication with no
+/// safe move. That fails startup; it never falls back to `rename(2)`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn rename_exclusively(_staged_path: &Path, path: &Path) -> Result<(), WorkloadApiListenerError> {
+    Err(WorkloadApiListenerError::Io(format!(
+        "the filesystem holding '{}' supports no publication that refuses an existing \
+         destination; refusing to publish the Workload API socket with an overwriting rename, \
+         which could replace another process's live endpoint",
+        path.display()
+    )))
 }
 
 /// Confirm the artifact at `path` is a socket owned by this process carrying
@@ -864,13 +1050,28 @@ pub fn classify_connect_result(result: &io::Result<()>) -> SocketLiveness {
     }
 }
 
-/// Attempt a Unix-domain connection to `path` and classify the outcome.
+/// Attempt a Unix-domain connection to `path`, bounded, and classify the
+/// outcome.
+///
+/// Asynchronous and time-bounded on purpose. A blocking `connect(2)` from the
+/// startup future parks the runtime thread, and a peer that is listening but has
+/// stopped draining its accept queue can then hold startup open for as long as
+/// it likes — an outcome the fail-closed contract does not have a verdict for
+/// and does not describe. Expiring [`SOCKET_LIVENESS_PROBE_TIMEOUT`] is folded
+/// back into the ordinary classification as a timed-out I/O result, so it lands
+/// on `Undetermined` through the same policy every other inconclusive answer
+/// goes through, and `Undetermined` refuses startup.
+///
+/// Public so the probe can be exercised against real sockets — live, leftover,
+/// and unreachable — rather than only through its pure classifier.
 #[cfg(unix)]
-fn probe_existing_socket(path: &Path) -> SocketLiveness {
-    let result = std::os::unix::net::UnixStream::connect(path).map(|stream| {
+pub async fn probe_socket_liveness(path: &Path) -> SocketLiveness {
+    let connect = tokio::net::UnixStream::connect(path);
+    let result = match tokio::time::timeout(SOCKET_LIVENESS_PROBE_TIMEOUT, connect).await {
         // Close immediately: the probe is the connection, not anything on it.
-        drop(stream);
-    });
+        Ok(result) => result.map(drop),
+        Err(_elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+    };
     classify_connect_result(&result)
 }
 
@@ -885,8 +1086,11 @@ fn probe_existing_socket(path: &Path) -> SocketLiveness {
 ///
 /// A regular file, a directory, a symlink, or another user's socket is refused
 /// outright rather than deleted.
+///
+/// `async` because the probe is: it is bounded rather than blocking, so a peer
+/// that never answers costs a deadline instead of the whole startup.
 #[cfg(unix)]
-fn refuse_live_or_clear_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError> {
+async fn refuse_live_or_clear_stale_socket(path: &Path) -> Result<(), WorkloadApiListenerError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let metadata = match std::fs::symlink_metadata(path) {
@@ -922,7 +1126,7 @@ fn refuse_live_or_clear_stale_socket(path: &Path) -> Result<(), WorkloadApiListe
         )));
     }
 
-    match probe_existing_socket(path) {
+    match probe_socket_liveness(path).await {
         SocketLiveness::Live => {
             return Err(WorkloadApiListenerError::Socket(format!(
                 "'{}' is a SPIFFE Workload API socket that is currently LIVE — another process is \
@@ -980,7 +1184,7 @@ fn refuse_live_or_clear_stale_socket(path: &Path) -> Result<(), WorkloadApiListe
 }
 
 #[cfg(not(unix))]
-fn refuse_live_or_clear_stale_socket(_path: &Path) -> Result<(), WorkloadApiListenerError> {
+async fn refuse_live_or_clear_stale_socket(_path: &Path) -> Result<(), WorkloadApiListenerError> {
     Err(WorkloadApiListenerError::Unsupported)
 }
 

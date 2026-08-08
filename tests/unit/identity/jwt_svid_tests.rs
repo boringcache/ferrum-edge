@@ -2310,6 +2310,60 @@ fn rsa_admission_is_by_significant_bit_length_not_byte_count() {
 }
 
 #[test]
+fn an_even_rsa_modulus_is_refused_on_both_the_jwk_and_the_spki_path() {
+    use ferrum_edge::identity::jwt_svid::{authorities_from_jwks, decoding_key_for_authority};
+
+    // An RSA modulus is a product of odd primes, so it is odd. Size and
+    // canonical encoding say nothing about that: the value below is a genuine
+    // 2048-bit modulus with a single bit cleared, so it passes every bit-length
+    // and canonical-form check and is still not an RSA modulus.
+    let (modulus, exponent) = rsa_jwk_members();
+    assert_eq!(exponent, vec![0x01, 0x00, 0x01], "the fixture uses 65537");
+    let mut even = modulus.clone();
+    let last = even.len() - 1;
+    assert_eq!(even[last] % 2, 1, "a real modulus is odd to begin with");
+    even[last] &= 0xfe;
+    assert_eq!(even.len(), 256, "clearing a bit does not change the size");
+    assert_ne!(even[0], 0x00, "the value stays canonical big-endian");
+
+    let error = authorities_from_jwks(&td(), rsa_jwks(&even, &exponent).as_bytes())
+        .expect_err("an even modulus must not be admitted from a JWKS");
+    assert!(
+        error.to_string().contains("even"),
+        "an even modulus must be refused for its parity, not incidentally: {error}"
+    );
+    // The baseline differs from it by exactly that one bit, so the refusal above
+    // is about the parity rather than about the fixture.
+    authorities_from_jwks(&td(), rsa_jwks(&modulus, &exponent).as_bytes())
+        .expect("the untouched 2048-bit modulus is admitted");
+
+    // The SPKI path reaches the same admission gate, so an authority whose PEM
+    // carries an even modulus never becomes a verification key either. The
+    // RSAPublicKey tail is `INTEGER 65537`, so the modulus's least significant
+    // byte sits five bytes before it.
+    let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("RSA key generated")
+        .public_key_pem();
+    decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "rsa-1", pem.as_str()))
+        .expect("the untampered RSA authority is usable");
+    let mut der = spki_der_from_pem(&pem);
+    let tail = der.len() - 5;
+    assert_eq!(
+        &der[tail..],
+        [0x02u8, 0x03, 0x01, 0x00, 0x01].as_slice(),
+        "the fixture's DER ends in INTEGER 65537"
+    );
+    der[tail - 1] &= 0xfe;
+    let tampered = spki_pem_from_der(&der);
+    let error = decoding_key_for_authority(&PublishedJwtAuthority::new(td(), "rsa-1", tampered.as_str()))
+        .expect_err("an even modulus must not become a verification key");
+    assert!(
+        error.to_string().contains("even"),
+        "the SPKI path must refuse the same way the JWK path does: {error}"
+    );
+}
+
+#[test]
 fn rsa_public_exponents_must_be_odd_and_at_least_three() {
     use ferrum_edge::identity::jwt_svid::authorities_from_jwks;
 
