@@ -13,9 +13,6 @@ use ferrum_edge::plugins::utils::metadata_redaction::{
     strip_internal_only_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
-use ferrum_edge::plugins::mesh::prometheus_helpers::{
-    MESH_METRICS_DISABLED_METADATA, MESH_REQUEST_COUNT_OVERRIDES_METADATA,
-};
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -56,10 +53,13 @@ const NON_SECRET_COUNTERS: &[&str] = &[
     "routing_key",
 ];
 
+const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str = "mesh.metrics.request_count.tag_overrides";
+
 const MESH_METRICS_COORDINATION_KEYS: &[&str] = &[
-    "mesh.metrics.disabled",
+    MESH_METRICS_DISABLED_METADATA,
     "mesh.metrics.prometheus_metrics_observed",
-    "mesh.metrics.request_count.tag_overrides",
+    MESH_REQUEST_COUNT_OVERRIDES_METADATA,
     "Mesh.Metrics.Request_Duration.Tag_Overrides",
 ];
 
