@@ -2393,6 +2393,7 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
         config.consumers.len(),
         config.plugin_configs.len(),
         config.upstreams.len(),
+        config.http_tls_listen_ports.len(),
     );
     config.proxies.retain(|p| p.namespace == namespace);
     config.consumers.retain(|c| c.namespace == namespace);
@@ -2410,6 +2411,7 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
         + (pre.1 - config.consumers.len())
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
+        + (pre.4 - config.http_tls_listen_ports.len())
         + usize::from(frontend_tls_filtered)
 }
 
@@ -2824,7 +2826,11 @@ mod tests {
             k8s_mesh_overlay: Default::default(),
         };
 
-        filter_config_to_namespace(&mut cfg, "production");
+        assert_eq!(
+            filter_config_to_namespace(&mut cfg, "production"),
+            1,
+            "the removed foreign listener classification must trigger the DP warning count"
+        );
 
         assert_eq!(
             cfg.http_tls_listen_ports,
