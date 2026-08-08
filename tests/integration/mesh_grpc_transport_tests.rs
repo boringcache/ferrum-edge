@@ -974,6 +974,65 @@ async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeo
 }
 
 #[tokio::test]
+async fn grpc_over_ambient_hbone_classifies_a_rejected_inner_handshake_as_h2c() {
+    let ids = mesh_identities();
+    // The outer SVID-mTLS/HBONE handshake succeeds, but the destination app
+    // rejects the nested cleartext HTTP/2 preface. That is an h2c protocol
+    // failure, not evidence of a TLS failure on the already-established outer
+    // mesh hop.
+    let app_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind rejecting app");
+    let app_addr = app_listener.local_addr().expect("rejecting app addr");
+    tokio::spawn(async move {
+        let (mut tcp, _) = app_listener.accept().await.expect("accept rejecting app");
+        tcp.write_all(b"not-an-http2-server")
+            .await
+            .expect("write rejecting preface");
+        let _ = tcp.shutdown().await;
+    });
+    let (relay_addr, _connect_observed_rx) = start_hbone_grpc_relay(ids.server_slot).await;
+
+    let grpc_pool = GrpcConnectionPool::default();
+    let mesh_pool = mesh_mtls_pool(Arc::clone(&ids.gateway_slot));
+    let ambient_pool = hbone_pool(ids.gateway_slot);
+    let proxy = grpc_proxy_for_test();
+    let target = hbone_target(app_addr.port(), relay_addr.port(), ids.peer_id.as_str());
+    let transport =
+        GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, &ambient_pool, Some(&target))
+            .expect("mesh.hbone target must resolve the Ambient HBONE transport");
+
+    let (headers, proxy_headers) = grpc_request_headers();
+    let dns = DnsCache::new(DnsConfig::default());
+    let result = proxy_grpc_request_from_bytes(
+        hyper::Method::POST,
+        headers,
+        grpc_message(b"ping"),
+        None,
+        &proxy,
+        &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
+        &transport,
+        &dns,
+        &proxy_headers,
+        false,
+        0,
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(GrpcProxyError::BackendUnavailable {
+                kind: ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::H2cHandshake,
+                ..
+            })
+        ),
+        "a rejected nested cleartext handshake must classify as H2cHandshake"
+    );
+}
+
+#[tokio::test]
 async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_gateway() {
     let ids = mesh_identities();
     let expected_body = grpc_message(b"pong");

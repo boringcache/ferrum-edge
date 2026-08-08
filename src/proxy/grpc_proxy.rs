@@ -2934,9 +2934,7 @@ impl<'a> GrpcDispatchTransport<'a> {
                 )
                 .await
                 {
-                    Ok(result) => result
-                        .map(GrpcDispatchSender::H2)
-                        .map_err(hbone_pool_error_to_grpc),
+                    Ok(result) => result.map(GrpcDispatchSender::H2),
                     Err(_) => Err(GrpcProxyError::BackendTimeout {
                         kind: GrpcTimeoutKind::Connect,
                         message: format!("Ambient HBONE connect timeout after {timeout_ms}ms"),
@@ -3096,7 +3094,7 @@ fn hbone_dispatch_authority<'a>(
 async fn open_hbone_grpc_sender(
     hbone: &HboneGrpcTransport<'_>,
     proxy: &Proxy,
-) -> Result<http2::SendRequest<GrpcBody>, HbonePoolError> {
+) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
     let plan = &hbone.plan;
     let tunnel = hbone
         .pool
@@ -3112,7 +3110,8 @@ async fn open_hbone_grpc_sender(
             plan.sni_override,
             None,
         )
-        .await?;
+        .await
+        .map_err(hbone_pool_error_to_grpc)?;
 
     let pool_config = hbone.pool.pool_config_for(proxy);
     let mut builder = http2::Builder::new(TokioExecutor::new());
@@ -3126,16 +3125,22 @@ async fn open_hbone_grpc_sender(
         builder.max_concurrent_streams(max_streams);
     }
 
-    let (sender, connection) =
-        builder
-            .handshake(TokioIo::new(tunnel))
-            .await
-            .map_err(|e| HbonePoolError::H2Handshake {
-                host: plan.app_host.to_string(),
-                message: format!(
-                    "nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {e}"
-                ),
-            })?;
+    let (sender, connection) = builder
+        .handshake(TokioIo::new(tunnel))
+        .await
+        .map_err(|error| {
+            let message =
+                format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {error}");
+            // The secured OUTER HBONE session is already established here;
+            // this is the cleartext h2c handshake with the destination app.
+            // Keep it distinct from an outer TLS/H2 handshake so retry and
+            // backend-health accounting classify the failure accurately.
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                message,
+                error,
+            )
+        })?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);

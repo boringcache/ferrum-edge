@@ -2250,13 +2250,13 @@ fn grpc_mesh_dispatch_same_cluster_mtls_routes_over_mesh_mtls() {
 }
 
 #[test]
-fn grpc_mesh_dispatch_same_cluster_hbone_is_out_of_scope_and_fails_closed() {
+fn grpc_mesh_dispatch_same_cluster_hbone_classifies_for_transport_materialization() {
     use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
     let target = target_with_tags(&[(ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&target),
         GrpcMeshDispatch::Hbone,
-        "Ambient native gRPC over HBONE is out of scope: the inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
+        "Ambient HBONE must resolve through the nested-HTTP/2 transport, never the direct pool"
     );
 }
 
@@ -2293,10 +2293,10 @@ fn grpc_mesh_dispatch_cross_cluster_sidecar_mtls_wellformed_routes_over_mesh_mtl
 }
 
 #[test]
-fn grpc_mesh_dispatch_cross_cluster_ambient_hbone_fails_closed() {
+fn grpc_mesh_dispatch_cross_cluster_ambient_hbone_classifies_for_east_west_transport() {
     use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
-    // Ambient HBONE cross-cluster gRPC stays fail-closed: the HBONE inner
-    // protocol is HTTP/1.1 and cannot carry gRPC trailers, cross-cluster or not.
+    // Cross-cluster Ambient HBONE uses the same nested h2c application
+    // transport over the east-west CONNECT dial as its same-cluster sibling.
     let hbone_xc = target_with_tags(&[
         (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
         (
@@ -2307,7 +2307,7 @@ fn grpc_mesh_dispatch_cross_cluster_ambient_hbone_fails_closed() {
     assert_eq!(
         classify_grpc_mesh_dispatch(&hbone_xc),
         GrpcMeshDispatch::HboneCrossCluster,
-        "cross-cluster Ambient HBONE gRPC must fail closed (HBONE has no trailer path)"
+        "cross-cluster Ambient HBONE must resolve through its east-west nested-HTTP/2 transport"
     );
 }
 
