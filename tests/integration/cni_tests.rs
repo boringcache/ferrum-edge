@@ -2352,13 +2352,7 @@ mod install_lifecycle {
         let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
             .expect_err("unmarked target must be refused");
         expect_unsafe_install_target(err);
-        assert_shared_artifacts_unchanged(
-            &node,
-            Some(&foreign),
-            None,
-            None,
-            &primary_before,
-        );
+        assert_shared_artifacts_unchanged(&node, Some(&foreign), None, None, &primary_before);
     }
 
     #[test]
@@ -2400,13 +2394,7 @@ mod install_lifecycle {
         let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
             .expect_err("malformed target must be refused");
         expect_unsafe_install_target(err);
-        assert_shared_artifacts_unchanged(
-            &node,
-            Some(malformed),
-            None,
-            None,
-            &primary_before,
-        );
+        assert_shared_artifacts_unchanged(&node, Some(malformed), None, None, &primary_before);
     }
 
     #[cfg(unix)]
@@ -2495,12 +2483,6 @@ mod install_lifecycle {
         let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
             .expect_err("oversized target must be refused");
         expect_unsafe_install_target(err);
-        assert_shared_artifacts_unchanged(
-            &node,
-            Some(&bytes),
-            None,
-            None,
-            &primary_before,
-        );
+        assert_shared_artifacts_unchanged(&node, Some(&bytes), None, None, &primary_before);
     }
 }

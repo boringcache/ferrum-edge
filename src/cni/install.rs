@@ -133,8 +133,7 @@ const REASON_TOO_LARGE: &str = "file is larger than any artifact this installer 
 const REASON_SWAPPED: &str =
     "the file was replaced between the ownership check and removal; nothing was deleted";
 /// Existing target conflist has no usable Ferrum ownership marker.
-const REASON_TARGET_UNOWNED: &str =
-    "existing configuration carries no Ferrum ownership marker; it was not written by this installer";
+const REASON_TARGET_UNOWNED: &str = "existing configuration carries no Ferrum ownership marker; it was not written by this installer";
 /// Existing target has a Ferrum-shaped marker, but its required ownership
 /// tokens are absent or outside the installer's bounded alphabet.
 const REASON_TARGET_INVALID_MARKER: &str =
@@ -399,10 +398,7 @@ pub enum CniInstallError {
     )]
     UnsafeReadyMarker { path: String },
     #[error("refusing to overwrite {path}: {reason}")]
-    UnsafeInstallTarget {
-        path: String,
-        reason: &'static str,
-    },
+    UnsafeInstallTarget { path: String, reason: &'static str },
 }
 
 pub fn install_from_env() -> Result<PathBuf, CniInstallError> {
@@ -776,12 +772,10 @@ fn assert_install_target_reusable(
                 path: path.display().to_string(),
                 reason: REASON_TARGET_UNOWNED,
             }),
-            Some(found) if found.validate().is_err() => {
-                Err(CniInstallError::UnsafeInstallTarget {
-                    path: path.display().to_string(),
-                    reason: REASON_TARGET_INVALID_MARKER,
-                })
-            }
+            Some(found) if found.validate().is_err() => Err(CniInstallError::UnsafeInstallTarget {
+                path: path.display().to_string(),
+                reason: REASON_TARGET_INVALID_MARKER,
+            }),
             Some(found) if found.owner == ownership.owner => Ok(()),
             Some(_) => Err(CniInstallError::UnsafeInstallTarget {
                 path: path.display().to_string(),
