@@ -3374,8 +3374,6 @@ async fn handle_h3_request(
     {
         crate::proxy::run_final_backend_header_policy_hooks(&plugins, &ctx, &mut proxy_headers);
     }
-    let effective_query_string =
-        crate::proxy::effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -3402,7 +3400,9 @@ async fn handle_h3_request(
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
     // Preserve the private override for finalized-egress plugins. The shared
     // helper also keeps H3 path selection in lockstep with H1/H2.
-    let path = crate::proxy::rebase_route_override_path(&mut ctx, path);
+    // `path` stays mutable so a RemainingDeferred provider claim can rebase it
+    // before query capture / dial (H1/H2 parity).
+    let mut path = crate::proxy::rebase_route_override_path(&mut ctx, path);
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
@@ -3488,8 +3488,13 @@ async fn handle_h3_request(
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
     // frontend never carries a captured original destination. A Passthrough
     // upstream therefore round-robins here (with the existing warn).
-    let routing_proxy = Arc::clone(&proxy);
-    let selection = crate::proxy::backend_dispatch::select_upstream_target(
+    //
+    // `routing_proxy` / `selection` / targets stay mutable so a RemainingDeferred
+    // provider claim can rebind them against the route-override base (not the
+    // DestinationRule-effective `proxy`) before query capture / dial. Keep the
+    // gated rebind below in sync with `handle_proxy_request_inner`.
+    let mut routing_proxy = Arc::clone(&proxy);
+    let mut selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -3497,12 +3502,16 @@ async fn handle_h3_request(
         &proxy_headers,
         None,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
-        request_host.as_deref(),
-    );
-    let upstream_balancer = selection.balancer;
+    // Fields are moved out with `Option::take` so the deferred-override rebind
+    // can replace the whole selection (balancer / sticky) rather than only the
+    // target text.
+    let mut lb_hash_key = selection.lb_hash_key.take();
+    let mut upstream_target =
+        crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+            selection.target.take(),
+            request_host.as_deref(),
+        );
+    let mut upstream_balancer = selection.balancer.take();
     // Mirror H1/H2 selected-target policy: retain the original route retry
     // ceiling, then build an effective proxy carrying per-target
     // DestinationRule-derived connectionPool/TLS overrides for the FIRST
@@ -3515,9 +3524,9 @@ async fn handle_h3_request(
     // `retry_attempt_allowed_for_target` against the original route ceiling, so
     // a later target does not inherit the first target's port-level TLS/SNI/H1
     // policy or get blocked by a permanently lowered initial-port retry cap.
-    let route_retry_ceiling =
+    let mut route_retry_ceiling =
         crate::proxy::route_retry_ceiling(routing_proxy.as_ref()).unwrap_or(0);
-    let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+    let mut selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
         Arc::clone(&routing_proxy),
         upstream_target.as_deref(),
     );
@@ -3530,7 +3539,7 @@ async fn handle_h3_request(
         &selected_base_proxy,
         upstream_target.as_deref(),
     );
-    let proxy = match effective_proxy {
+    let mut proxy = match effective_proxy {
         std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
@@ -3743,7 +3752,105 @@ async fn handle_h3_request(
                 return Ok(());
             }
         }
+
+        // A remaining deferred hook may commit a destination only after the
+        // original backend-effective path has passed policy (for example, an
+        // AI federation streaming claim). Rebind every dispatch input before
+        // credentials installed by that hook can reach a backend. Otherwise
+        // the headers can describe the claimed provider while `proxy`, `path`,
+        // and `upstream_target` still point at the pre-claim destination.
+        //
+        // Rebind against `routing_proxy` (the route-override base), never the
+        // DestinationRule-effective `proxy`: applying overrides onto a
+        // first-target DR overlay would leak that overlay onto the provider
+        // destination. Keep the movement gate and whole-selection replace in
+        // sync with `handle_proxy_request_inner`.
+        //
+        // Each rebind is gated on that input actually moving. Re-running
+        // load-balancer selection unconditionally would advance round-robin,
+        // re-read the health snapshot, and re-derive the hash key for every
+        // policy-bound request that never had a deferred override at all,
+        // perturbing target choice, retry rotation, and least-connections
+        // accounting well beyond the destinations this rebind exists to honor.
+        let previous_routing_proxy = Arc::clone(&routing_proxy);
+        routing_proxy = ctx
+            .apply_route_overrides_with_upstreams(routing_proxy, epoch.load_balancer.upstreams());
+        // `apply_route_overrides_with_upstreams` is idempotent: it hands back
+        // the SAME `Arc` when the already-baked proxy reflects every override,
+        // so pointer identity against the retained pre-pass `Arc` is an exact,
+        // allocation-free "a deferred hook committed a new destination" test.
+        let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);
+        // A deferred hook can also rewrite only the backend path (the Istio
+        // `rewrite.uri` shape) without moving the destination. `path` and
+        // `ctx.path` already carry the rewrite bound before the deferred
+        // passes, so a divergence from the current override is exactly the
+        // case where re-basing changes what is dispatched.
+        let path_rebase_pending = ctx
+            .route_override_path
+            .as_deref()
+            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+        if path_rebase_pending {
+            path = crate::proxy::rebase_route_override_path(&mut ctx, path);
+        }
+        if destination_rebound {
+            // Replace the whole selection rather than only the target:
+            // `balancer` and `sticky_cookie_needed` are read after this point,
+            // so same-generation load-balancer accounting and sticky-cookie
+            // issuance must describe the target that is actually dialed.
+            selection = crate::proxy::backend_dispatch::select_upstream_target(
+                &routing_proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                &proxy_headers,
+                None,
+            );
+            lb_hash_key = selection.lb_hash_key.take();
+            upstream_target =
+                crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+                    selection.target.take(),
+                    request_host.as_deref(),
+                );
+            upstream_balancer = selection.balancer.take();
+            // Re-cap and re-resolve DestinationRule overlays for the NEW
+            // destination so TLS/DNS/timeouts/pool keys cannot keep describing
+            // the pre-claim target while credentials describe the provider.
+            route_retry_ceiling =
+                crate::proxy::route_retry_ceiling(routing_proxy.as_ref()).unwrap_or(0);
+            selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+                Arc::clone(&routing_proxy),
+                upstream_target.as_deref(),
+            );
+            debug_assert_eq!(
+                crate::proxy::route_retry_ceiling(routing_proxy.as_ref()),
+                crate::proxy::route_retry_ceiling(selected_base_proxy.as_ref()),
+                "cap_proxy_retry_for_target must retain the original route retry ceiling"
+            );
+            let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                &selected_base_proxy,
+                upstream_target.as_deref(),
+            );
+            proxy = match effective_proxy {
+                std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
+                std::borrow::Cow::Owned(owned) => Arc::new(owned),
+            };
+            ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
+            ctx.proxy_lifecycle_generation = epoch.plugin_cache.proxy_lifecycle_generation(
+                &selected_base_proxy.namespace,
+                &selected_base_proxy.id,
+            );
+        }
     }
+
+    // Capture the backend-visible query only after every deferred before_proxy
+    // pass and the gated destination rebinding above. A remaining deferred hook
+    // (for example `ai_federation` streaming) can commit an empty provider-owned
+    // query boundary while the client wire query still carries normal-backend
+    // material; capturing earlier would leak that stale query into backend URL
+    // construction, retry replay, and cache partitions. Keep in sync with
+    // `handle_proxy_request_inner`.
+    let effective_query_string =
+        crate::proxy::effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Terminal final-body hooks may perform provider egress. Run them only
     // after the selected backend-effective path has been authorized and all
