@@ -620,6 +620,39 @@ fn test_deferred_destination_override_is_rebound_before_dispatch() {
     assert!(gate > rebase);
 }
 
+/// A remaining deferred provider claim can commit an empty appendable query while
+/// the client wire query still carries normal-backend material. The dispatch
+/// ladder must capture the canonical backend-visible query only after that
+/// commit and the gated destination rebind, never before.
+#[test]
+fn test_deferred_provider_claim_recomputes_effective_query_before_dispatch() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .split_once("async fn handle_proxy_request_inner(")
+        .map(|(_, handler)| handler)
+        .expect("H1/H2 request handler must remain present");
+    let remaining_deferred = handler
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred pass must remain present");
+    let before_deferred = &handler[..remaining_deferred];
+    assert!(
+        !before_deferred.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+        "effective query must not be captured before the remaining deferred pass"
+    );
+
+    let after_deferred = &handler[remaining_deferred..];
+    let query_capture = after_deferred
+        .find("effective_backend_query_string_with_raw(&ctx, &query_string)")
+        .expect("backend query must be captured after the remaining deferred pass");
+    let reselect = after_deferred
+        .find("upstream_target = backend_dispatch::concretize_wildcard_target_for_request(")
+        .expect("deferred destination overrides must replace the pinned target");
+    assert!(
+        query_capture > reselect,
+        "effective query must be recomputed after deferred override rebind"
+    );
+}
+
 /// The rebind above must leave the load-balancer bookkeeping describing the
 /// target that is actually dialed: `balancer`, `is_fallback`, and
 /// `sticky_cookie_needed` are read long after the deferred pass, so the gated

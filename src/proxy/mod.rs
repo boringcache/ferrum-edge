@@ -25898,7 +25898,6 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -26195,6 +26194,14 @@ async fn handle_proxy_request_inner(
             );
         }
     }
+
+    // Capture the backend-visible query only after every deferred before_proxy
+    // pass and the gated destination rebinding above. A remaining deferred hook
+    // (for example `ai_federation` streaming) can commit an empty provider-owned
+    // query boundary while the client wire query still carries normal-backend
+    // material; capturing earlier would leak that stale query into backend URL
+    // construction, retry replay, and cache partitions.
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has

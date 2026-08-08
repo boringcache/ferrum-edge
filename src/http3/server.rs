@@ -3374,8 +3374,6 @@ async fn handle_h3_request(
     {
         crate::proxy::run_final_backend_header_policy_hooks(&plugins, &ctx, &mut proxy_headers);
     }
-    let effective_query_string =
-        crate::proxy::effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -3744,6 +3742,15 @@ async fn handle_h3_request(
             }
         }
     }
+
+    // Capture the backend-visible query only after every deferred before_proxy
+    // pass. A remaining deferred hook (for example `ai_federation` streaming)
+    // can commit an empty provider-owned query boundary while the client wire
+    // query still carries normal-backend material; capturing earlier would leak
+    // that stale query into backend URL construction, retry replay, and cache
+    // partitions. Keep in sync with `handle_proxy_request_inner`.
+    let effective_query_string =
+        crate::proxy::effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Terminal final-body hooks may perform provider egress. Run them only
     // after the selected backend-effective path has been authorized and all

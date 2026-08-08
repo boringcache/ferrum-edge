@@ -5724,6 +5724,37 @@ async fn final_query_preserves_a_safe_unchanged_client_query() {
 }
 
 #[tokio::test]
+async fn pre_deferred_query_capture_would_leak_client_material_after_empty_commit() {
+    let plugins = router_config_then_transformer(
+        azure_final_query_config(),
+        json!([{"operation": "add", "target": "query", "key": "backend_token",
+                "value": "INTERNAL-BACKEND-SECRET"}]),
+    );
+    let raw = "client_secret=leaked";
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx_with_query(&body, raw);
+    let mut headers = json_headers();
+
+    let stale = captured_backend_query(&ctx, raw);
+    assert_eq!(
+        stale, raw,
+        "before claim the client wire query is still visible"
+    );
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let fresh = captured_backend_query(&ctx, raw);
+    assert_eq!(fresh, "");
+    assert_ne!(
+        stale, fresh,
+        "dispatch must recompute after deferred claim, not reuse a pre-claim capture"
+    );
+}
+
+#[tokio::test]
 async fn final_query_is_empty_when_an_endpoint_query_is_folded_into_the_path() {
     let plugins = router_config_then_transformer(
         azure_final_query_config(),
@@ -6370,6 +6401,32 @@ fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
         h3.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
         "the native HTTP/3 ladder must capture its backend query through the shared funnel"
     );
+
+    for (label, ladder, deferred_needle) in [
+        (
+            "H1/H2",
+            h1h2.as_str(),
+            "BackendPathBeforeProxyPass::RemainingDeferred",
+        ),
+        (
+            "native HTTP/3",
+            h3.as_str(),
+            "BackendPathBeforeProxyPass::RemainingDeferred",
+        ),
+    ] {
+        let deferred = ladder
+            .find(deferred_needle)
+            .unwrap_or_else(|| panic!("{label} remaining deferred pass must remain present"));
+        let before_deferred = &ladder[..deferred];
+        assert!(
+            !before_deferred.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            "{label} must not capture backend query before the remaining deferred pass"
+        );
+        assert!(
+            ladder[deferred..].contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            "{label} must capture backend query after the remaining deferred pass"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
