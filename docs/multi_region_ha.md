@@ -20,7 +20,7 @@ rejected with `FAILED_PRECONDITION`, not treated as a usable fallback.
                     │                                     │
                     │  ┌─────────┐ ┌─────────┐ ┌───────┐ │
                     │  │ US East │ │ US West │ │US Cent│ │
-                    │  │ (R/W)   │ │ (R/W)   │ │ (R/W) │ │
+                    │  │  node   │ │  node   │ │ node  │ │
                     │  └────┬────┘ └────┬────┘ └───┬───┘ │
                     └───────┼───────────┼──────────┼─────┘
                             │           │          │
@@ -35,6 +35,10 @@ rejected with `FAILED_PRECONDITION`, not treated as a usable fallback.
               │  ns: us-east  │  │  ns: us-west│ │ ns: us-cent  │
               └───────────────┘  └─────────────┘ └──────────────┘
 ```
+
+The database boxes represent members, not three independent writers. Writer,
+replica, and quorum roles follow the selected database topology; do not turn an
+asynchronous standby into a writable Ferrum failover target.
 
 Each region runs:
 
@@ -116,7 +120,7 @@ trust-bundle format, and migration steps.
 | Single CP goes down | DPs in that region use cached config; failover works only if another listed CP serves the same namespace | Automatic via `FERRUM_DP_CP_GRPC_URLS` when scopes match |
 | CP + its DPs go down (full region) | Other regions continue serving their own namespaces. Admin writes to the down region's namespace persist in the DB but DPs there do not receive updates until a CP serving that namespace is back | Restore regional CP or hot-standby CP with matching scope |
 | Database node goes down | DB cluster handles failover internally. CPs continue with cached config during brief failover. **Admin mutations fail closed** while Ferrum is on a `FERRUM_DB_FAILOVER_URLS` entry unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` | Prefer a writer/virtual-IP endpoint for `FERRUM_DB_URL` so promotion stays transparent; see below |
-| Network partition between regions | Each region continues operating independently with local DB connectivity. Writes converge when the partition heals | Automatic via DB cluster replication |
+| Network partition between regions | DPs keep serving cached config. CP reads/writes depend on database writer and quorum reachability; a single-primary or minority partition is not independently writable, and Ferrum must not manufacture multi-primary behavior with failover-write opt-in | Restore writer/quorum connectivity. Do not enable failover writes on asynchronous standbys |
 
 ### What This Gives You vs. Single CP
 
@@ -298,13 +302,20 @@ FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/fe
 This example uses **one namespace per region** and **same-namespace CP failover
 only** — the recommended starting point.
 
-**Shared JWT secrets** — all CPs and DPs in a namespace share the same secrets
-(single-namespace CPs may use the fleet-wide secret; multi-namespace CPs require
-a trust bundle instead):
+**Namespace-specific DP signing secrets** — CPs and DPs serving the same
+namespace share one legacy secret. Use a different value for each namespace: a
+DP holding a legacy HS256 secret is a signing authority, so distributing one
+value across regional namespaces defeats their credential isolation.
+Multi-namespace CPs require a trust bundle instead. The admin secret below is
+shown shared only because this example intentionally permits cross-region admin
+management:
 
 ```bash
-# Generate once, distribute to all nodes
-export GRPC_JWT_SECRET=$(openssl rand -base64 32)
+# Generate one DP signing secret per namespace; distribute each only to that
+# namespace's CPs/DPs (including same-namespace hot standbys).
+export GRPC_JWT_SECRET_US_EAST=$(openssl rand -base64 32)
+export GRPC_JWT_SECRET_US_WEST=$(openssl rand -base64 32)
+export GRPC_JWT_SECRET_US_CENTRAL=$(openssl rand -base64 32)
 export ADMIN_JWT_SECRET=$(openssl rand -base64 32)
 ```
 
@@ -318,7 +329,7 @@ FERRUM_DB_URL=postgres://user:pass@pg-writer-vip:5432/ferrum
 FERRUM_DB_FAILOVER_URLS=postgres://user:pass@pg-west:5432/ferrum,postgres://user:pass@pg-central:5432/ferrum
 FERRUM_DB_READ_REPLICA_URL=postgres://user:pass@pg-east-replica:5432/ferrum
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem
 FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem
@@ -335,7 +346,7 @@ FERRUM_NAMESPACE=us-east
 # Only CPs that serve us-east — NOT cp-west/cp-central unless they also scope us-east
 FERRUM_DP_CP_GRPC_URLS=https://cp-east:50051,https://cp-east-standby:50051
 FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem
 ```
@@ -350,7 +361,7 @@ FERRUM_DB_URL=postgres://user:pass@pg-writer-vip:5432/ferrum
 FERRUM_DB_FAILOVER_URLS=postgres://user:pass@pg-west:5432/ferrum,postgres://user:pass@pg-central:5432/ferrum
 FERRUM_DB_READ_REPLICA_URL=postgres://user:pass@pg-west-replica:5432/ferrum
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_WEST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem
 FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem
@@ -363,13 +374,13 @@ FERRUM_MODE=dp
 FERRUM_NAMESPACE=us-west
 FERRUM_DP_CP_GRPC_URLS=https://cp-west:50051,https://cp-west-standby:50051
 FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_WEST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem
 ```
 
 Repeat for `us-central` with `FERRUM_NAMESPACE=us-central` and
-same-namespace CP URLs only.
+same-namespace CP URLs only, using `$GRPC_JWT_SECRET_US_CENTRAL`.
 
 ### Cross-Region Namespace Management
 
@@ -404,7 +415,7 @@ FERRUM_NAMESPACE=us-east   # or us-west, us-central per region
 FERRUM_DB_TYPE=mongodb
 FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/ferrum?replicaSet=rs0
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 ```
 
@@ -414,7 +425,7 @@ FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 FERRUM_MODE=dp
 FERRUM_NAMESPACE=us-east
 FERRUM_DP_CP_GRPC_URLS=https://cp-east:50051,https://cp-east-standby:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
 ```
 
