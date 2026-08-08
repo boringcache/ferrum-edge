@@ -7118,6 +7118,13 @@ pub struct StreamConnectionContext {
     /// When PROXY protocol is disabled or the peer is not trusted, this equals
     /// `direct_client_ip` (the raw socket peer).
     pub client_ip: String,
+    /// Client TCP port paired with [`Self::client_ip`].
+    ///
+    /// When inbound PROXY protocol supplies a forwarded source address this is
+    /// the port from that header; otherwise it is the accept-time socket peer
+    /// port. Used when emitting outbound PROXY v2 headers so backends see the
+    /// same client 4-tuple Ferrum resolved for stream plugins.
+    pub client_port: u16,
     /// Immediate socket-peer IP captured at accept(), before any PROXY-protocol
     /// header is applied. For stream proxies without inbound PROXY protocol
     /// this is always equal to `client_ip`. For proxies behind a trusted L4
@@ -7211,10 +7218,17 @@ pub struct StreamConnectionContext {
     /// record that the transport was terminated even when no application bytes
     /// were read.
     pub first_bytes_kind: Option<StreamBytesKind>,
-    /// Original destination IP from `SO_ORIGINAL_DST` / capture metadata when
-    /// available. Used by VirtualService L4 `destinationSubnets` matching.
-    /// Never inferred from client-controlled headers.
+    /// Original destination IP from a trusted inbound PROXY tuple,
+    /// `SO_ORIGINAL_DST`, or capture metadata when available. Used by
+    /// VirtualService L4 `destinationSubnets` matching. Never inferred from an
+    /// untrusted direct client's application data.
     pub destination_ip: Option<std::net::IpAddr>,
+    /// TCP port paired with [`Self::destination_ip`]. For a trusted inbound
+    /// PROXY header this is the forwarded destination port; otherwise it comes
+    /// from `SO_ORIGINAL_DST` / node-waypoint capture metadata. Kept separate
+    /// from `listen_port` because transparent capture listeners commonly bind
+    /// a fixed interception port that is not the connection's original port.
+    pub destination_port: Option<u16>,
     /// Listener-configured gateway binding for VirtualService L4 `gateways`
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
@@ -7263,7 +7277,11 @@ impl StreamConnectionContext {
             first_bytes: None,
             first_bytes_kind: None,
             destination_ip: None,
+            destination_port: None,
             trusted_gateway_ref: None,
+            // Callers that know the peer/forwarded port (TCP accept path) set
+            // this after construction; UDP/DTLS leave it at 0.
+            client_port: 0,
         }
     }
 
