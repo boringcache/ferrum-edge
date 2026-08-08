@@ -708,6 +708,11 @@ fn namespaces_for_broadcast(
 /// still publish. Unversioned publication (no sequence established yet) is
 /// unchanged bootstrap behavior.
 ///
+/// A retention also raises
+/// [`K8sConfigRevisionTracker::request_evidence_refresh`] on `revision_tracker`
+/// (when one is supplied), so the withheld mesh is released after one relist
+/// round trip instead of after a whole idle-relist window.
+///
 /// The overlay slot is still written BEFORE the CAS. Holding the gate means
 /// there is no losing CAS writer in practice, but the ordering is preserved so
 /// the CAS retry loops stay correct on their own terms: a writer that did lose
@@ -726,14 +731,29 @@ pub fn publish_k8s_reconcile(
     mesh_update_tx: &broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: &MeshNodeRegistry,
     mesh_revision: Option<&MeshConfigRevision>,
+    revision_tracker: Option<&K8sConfigRevisionTracker>,
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
         let previous = overlay_slot.load_full();
-        let (effective_translation, effective_revision) = bind_k8s_mesh_revision_publication(
+        let binding = bind_k8s_mesh_revision_publication(
             previous.as_ref().as_ref(),
             translation,
             mesh_revision,
         );
+        if binding.retained_mesh {
+            // Retention is the fail-closed answer, but it means the data plane
+            // is serving mesh content older than the cluster's. The aggregate
+            // watermark is a MINIMUM, so a quiet scope pins it until its next
+            // generation adopts a fresh boundary: ask for that generation now
+            // instead of waiting out `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`. This
+            // asks for PROOF; it never fabricates a watermark, so nothing about
+            // the ordering or content-identity contract relaxes (issue #3611).
+            if let Some(tracker) = revision_tracker {
+                tracker.request_evidence_refresh();
+            }
+        }
+        let effective_translation = binding.translation;
+        let effective_revision = binding.revision;
 
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin
@@ -797,6 +817,35 @@ pub fn publish_k8s_reconcile(
     })
 }
 
+/// Outcome of [`bind_k8s_mesh_revision_publication`]: the effective translation
+/// (candidate non-mesh fields, possibly retained mesh), the revision that must
+/// stamp it, and whether mesh content was actually withheld.
+struct K8sMeshRevisionBinding {
+    translation: GatewayConfig,
+    revision: Option<MeshConfigRevision>,
+    /// The candidate mesh could not be published under the sequence available
+    /// for it, so the last accepted mesh is serving instead.
+    ///
+    /// Retention is CORRECT but must be BRIEF: the data plane is running older
+    /// mesh content than the cluster describes for as long as it lasts. The
+    /// caller turns this into a
+    /// [`K8sConfigRevisionTracker::request_evidence_refresh`], which is the only
+    /// way a quiet scope's watermark — and therefore the aggregate minimum —
+    /// can move before the idle relist window elapses.
+    retained_mesh: bool,
+}
+
+impl K8sMeshRevisionBinding {
+    /// Publish the candidate as-is under `revision`.
+    fn released(translation: GatewayConfig, revision: Option<MeshConfigRevision>) -> Self {
+        Self {
+            translation,
+            revision,
+            retained_mesh: false,
+        }
+    }
+}
+
 /// Bind the mesh snapshot that may leave this CP to the authoritative
 /// Kubernetes config revision (issue #3611).
 ///
@@ -805,23 +854,22 @@ pub fn publish_k8s_reconcile(
 /// evidence, or a complete aggregate MIN pinned by a quiet scope). Broadcasting
 /// that divergent mesh under the old scalar is exactly what
 /// `MeshRevisionGate` must reject as `divergent_content`. The producer therefore
-/// keeps the last accepted mesh until the sequence advances.
+/// keeps the last accepted mesh until the sequence advances, and reports the
+/// retention so the caller can request the evidence that would let it advance.
 ///
-/// Returns the effective translation (candidate non-mesh fields, possibly
-/// retained mesh) and the revision that must stamp it. Decision happens only at
-/// the publication boundary; callers must invoke this inside
-/// [`CpPublicationGate`].
+/// Decision happens only at the publication boundary; callers must invoke this
+/// inside [`CpPublicationGate`].
 fn bind_k8s_mesh_revision_publication(
     previous: Option<&AcceptedK8sOverlay>,
     translation: &GatewayConfig,
     mesh_revision: Option<&MeshConfigRevision>,
-) -> (GatewayConfig, Option<MeshConfigRevision>) {
+) -> K8sMeshRevisionBinding {
     let mut effective = translation.clone();
     let Some(previous) = previous else {
         // Unversioned bootstrap / disabled authority: no prior scalar exists
         // to bind. A present malformed value is retained for the existing
         // downstream validation boundary to reject rather than normalized.
-        return (effective, mesh_revision.cloned());
+        return K8sMeshRevisionBinding::released(effective, mesh_revision.cloned());
     };
     let Some(previous_revision) = previous
         .mesh_revision
@@ -829,8 +877,11 @@ fn bind_k8s_mesh_revision_publication(
         .filter(|revision| revision.is_well_formed())
     else {
         // First established sequence after unversioned publication.
-        return (effective, mesh_revision.cloned());
+        return K8sMeshRevisionBinding::released(effective, mesh_revision.cloned());
     };
+    // Every arm below that cannot authorize the candidate mesh retains the last
+    // accepted one AND reports it, so the caller can ask for the fresh
+    // convergence evidence that would let the sequence advance.
     let Some(candidate_revision) = mesh_revision.filter(|revision| revision.is_well_formed())
     else {
         // Once a usable sequence is established, an absent or malformed claim
@@ -838,41 +889,58 @@ fn bind_k8s_mesh_revision_publication(
         // retain its floor, but this publication boundary must fail closed if
         // that invariant is ever violated.
         retain_previously_accepted_k8s_mesh(&mut effective, previous);
-        return (effective, Some(previous_revision.clone()));
+        return K8sMeshRevisionBinding {
+            translation: effective,
+            revision: Some(previous_revision.clone()),
+            retained_mesh: true,
+        };
     };
 
     match MeshConfigRevision::compare(Some(previous_revision), Some(candidate_revision)) {
         MeshRevisionOrder::Newer | MeshRevisionOrder::Incomparable => {
             // Sequence advanced (or a new ordering domain): release the newest
             // mesh, including authoritative withdrawals.
-            (effective, Some(candidate_revision.clone()))
+            K8sMeshRevisionBinding::released(effective, Some(candidate_revision.clone()))
         }
         MeshRevisionOrder::Same => {
             if k8s_published_mesh_content_matches(&previous.translation, &effective) {
                 // Idempotent equal-revision republish.
-                (effective, Some(candidate_revision.clone()))
+                K8sMeshRevisionBinding::released(effective, Some(candidate_revision.clone()))
             } else {
                 warn!(
                     retained_sequence = previous_revision.sequence,
                     "Kubernetes mesh content changed under an unchanged authoritative revision; \
-                     retaining the last accepted mesh snapshot until the sequence advances"
+                     retaining the last accepted mesh snapshot and requesting fresh convergence \
+                     evidence so the sequence can advance"
                 );
                 retain_previously_accepted_k8s_mesh(&mut effective, previous);
-                (effective, Some(previous_revision.clone()))
+                K8sMeshRevisionBinding {
+                    translation: effective,
+                    revision: Some(previous_revision.clone()),
+                    retained_mesh: true,
+                }
             }
         }
         MeshRevisionOrder::Older => {
             // A non-advancing claim cannot authorize different mesh content.
             // The tracker floor normally prevents Older; fail closed anyway.
             retain_previously_accepted_k8s_mesh(&mut effective, previous);
-            (effective, Some(previous_revision.clone()))
+            K8sMeshRevisionBinding {
+                translation: effective,
+                revision: Some(previous_revision.clone()),
+                retained_mesh: true,
+            }
         }
         MeshRevisionOrder::Unversioned | MeshRevisionOrder::Bootstrap => {
             // Both inputs above are known well formed, so these outcomes would
             // violate `MeshConfigRevision::compare`'s contract. Fail closed if
             // that contract changes instead of treating this as bootstrap.
             retain_previously_accepted_k8s_mesh(&mut effective, previous);
-            (effective, Some(previous_revision.clone()))
+            K8sMeshRevisionBinding {
+                translation: effective,
+                revision: Some(previous_revision.clone()),
+                retained_mesh: true,
+            }
         }
     }
 }
@@ -1072,6 +1140,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &ctx.mesh_update_tx,
         &ctx.mesh_registry,
         mesh_revision.as_ref(),
+        Some(ctx.revision.as_ref()),
     );
     let Some(new_config) = published else {
         debug!("No config changes detected, skipping swap");

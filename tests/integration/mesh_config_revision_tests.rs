@@ -2684,3 +2684,72 @@ async fn a_failed_boundary_read_understates_but_never_overstates() {
     let _ = shutdown_tx.send(true);
     let _ = watcher.await;
 }
+
+/// The aggregate sequence is a MINIMUM over scopes, so a quiet scope pins it
+/// until its next generation adopts a fresh boundary. Left to the idle relist
+/// alone, a change in one busy scope therefore cannot advance the sequence and
+/// the publication boundary withholds the changed mesh for up to a whole
+/// `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window — a mesh config outage on a
+/// single, healthy control-plane replica (the NodeWaypoint eBPF live suite saw
+/// ~350 s of ambient proxies serving a pre-workload slice).
+///
+/// A withheld publication therefore REQUESTS convergence evidence, and a
+/// requested refresh must start a new generation promptly — well inside the
+/// idle window — while still proving the same thing the idle relist proves:
+/// the boundary is read before the list and adopted only at `InitDone`.
+#[tokio::test(start_paused = true)]
+async fn a_withheld_publication_can_refresh_evidence_without_waiting_for_the_idle_window() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (harness, task) = k8s_scope(2, vec![Some(1_000), Some(7_000)], shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let settle = Duration::from_millis(50);
+
+    harness.emit(0, Event::Init);
+    let edge = harness.object_at("alpha", "edge", "900");
+    harness.emit(0, Event::InitApply(edge));
+    harness.emit(0, Event::InitDone);
+    tokio::time::sleep(settle).await;
+    assert_eq!(harness.revision_watermark().await, Some(1_000));
+
+    // Script the replacement generation up front. It cannot be consumed until a
+    // new generation actually starts, so it doubles as the observable for
+    // whether one did.
+    harness.emit(1, Event::Init);
+    let relisted = harness.object_at("alpha", "relisted", "6500");
+    harness.emit(1, Event::InitApply(relisted));
+    harness.emit(1, Event::InitDone);
+
+    // Far short of the idle window: with no request, nothing relists and the
+    // quiet scope keeps pinning the watermark.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(1_000),
+        "no relist without a request — this is the stall the repair addresses"
+    );
+    assert_eq!(harness.visible_names().await, vec!["edge".to_string()]);
+
+    harness.request_evidence_refresh();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(7_000),
+        "the requested generation read a fresh boundary and adopted it at InitDone"
+    );
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["relisted".to_string()],
+        "still make-before-break: the replacement store is swapped in whole"
+    );
+    assert_eq!(
+        harness.publish_revision().await,
+        Some(MeshConfigRevision::new("k8s", 7_000)),
+        "the sequence can now advance, so the withheld mesh is released"
+    );
+    assert_eq!(harness.revision_stats().evidence_refresh_requests, 1);
+    assert_eq!(harness.revision_stats().unparsable_resource_versions, 0);
+
+    let _ = shutdown_tx.send(true);
+    let _ = watcher.await;
+}

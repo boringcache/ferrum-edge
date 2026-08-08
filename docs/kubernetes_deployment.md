@@ -686,9 +686,20 @@ behaviour is:
   entirely, on either shape. Data planes then apply no cross-CP ordering — only
   do this deliberately.
 
+- **A replica holding back its own mesh recovers on its own.** The sequence is
+  a minimum over scopes, so a change in one busy scope while the rest are quiet
+  cannot advance it, and the control plane keeps serving the last accepted mesh
+  rather than stamping new content with the old sequence. It does not wait out
+  the relist window to get unstuck: it asks every watch scope for a fresh
+  authoritative boundary immediately (spaced by a 5 s per-scope floor), so the
+  withheld mesh is released after one relist round trip. Nothing is assumed —
+  a scope that cannot relist still contributes no evidence and the sequence
+  still refuses to advance.
+
 The Kubernetes control plane costs one extra one-item list request per watch
-scope per relist window for this (the authoritative boundary read); it adds no
-request-path work and no per-object state. See
+scope per relist window for this (the authoritative boundary read), plus a
+relist sweep — at most one per 5 s — while a reconcile is actively withholding
+mesh content; it adds no request-path work and no per-object state. See
 [`docs/mesh.md`](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection)
 for the full contract.
 

@@ -571,6 +571,21 @@ const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// yields no boundary, which only *understates* that generation's convergence.
 const BOUNDARY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum spacing between demand-driven evidence refreshes of ONE scope
+/// (issue #3611).
+///
+/// The reconciler publication boundary asks for a refresh whenever it had to
+/// withhold changed mesh content under a sequence it could not advance
+/// ([`super::revision::K8sConfigRevisionTracker::request_evidence_refresh`]).
+/// Honouring every request immediately would let a churning cluster relist
+/// every scope on every change, so each scope serves at most one refresh per
+/// this interval, measured from the start of its current generation. Five
+/// seconds keeps mesh propagation prompt (the alternative was waiting out a
+/// whole `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window, which is 300 s by default)
+/// while capping the extra API-server load at one relist sweep per interval,
+/// and only while mesh content is actually being withheld.
+const REVISION_EVIDENCE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Reads the authoritative `resourceVersion` boundary for one watch scope.
 ///
 /// Invoked once per watcher generation, immediately BEFORE the generation's own
@@ -740,6 +755,11 @@ pub(crate) async fn run_watcher_generations<S, F>(
     );
     let scope_key: K8sWatchScopeKey =
         super::revision::watch_scope_key(&target.api_version, &target.kind, &target.scope);
+    // Demand-driven evidence refresh (issue #3611). Mark the current value seen
+    // so only requests raised from now on trigger a generation: the first one
+    // this watcher will ever start already takes a fresh boundary read.
+    let mut refresh_requests = revision.subscribe_evidence_refresh();
+    refresh_requests.mark_unchanged();
     let mut initial_writer = Some(initial_writer);
 
     loop {
@@ -790,13 +810,25 @@ pub(crate) async fn run_watcher_generations<S, F>(
 
         let generation_start = tokio::time::Instant::now();
         let mut last_event = generation_start;
+        let mut refresh_requested = false;
 
         loop {
-            let deadline = match pending.as_ref() {
+            let idle_deadline = match pending.as_ref() {
                 Some(_) => Some(generation_start + policy.readiness_timeout),
                 None => policy
                     .idle_window
                     .map(|window| last_event + window + jitter),
+            };
+            // A refresh request is satisfied by any COMPLETED generation, so a
+            // replacement already listing needs no second trigger — it will
+            // adopt a boundary read taken after the request was raised.
+            let refresh_deadline = (refresh_requested && pending.is_none())
+                .then(|| generation_start + REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+            let deadline = match (idle_deadline, refresh_deadline) {
+                (Some(idle), Some(refresh)) => Some(idle.min(refresh)),
+                (Some(idle), None) => Some(idle),
+                (None, Some(refresh)) => Some(refresh),
+                (None, None) => None,
             };
 
             tokio::select! {
@@ -825,6 +857,16 @@ pub(crate) async fn run_watcher_generations<S, F>(
                              retrying (the previous store keeps serving meanwhile)",
                             target.watcher_label
                         );
+                    } else if refresh_requested {
+                        debug!(
+                            kind = %target.kind,
+                            api_version = %target.api_version,
+                            scope = %target.scope,
+                            "{} rebuilding its reflector from an authoritative list because \
+                             mesh config publication is withholding content under a revision \
+                             this scope cannot advance",
+                            target.watcher_label
+                        );
                     } else {
                         debug!(
                             kind = %target.kind,
@@ -836,6 +878,15 @@ pub(crate) async fn run_watcher_generations<S, F>(
                         );
                     }
                     break;
+                }
+                // The reconciler is withholding changed mesh content because
+                // the authoritative sequence cannot advance (issue #3611).
+                // Arm a bounded relist rather than acting immediately, so a
+                // churning cluster cannot turn per-change requests into a
+                // per-change list storm. Disabled once armed: further requests
+                // coalesce into the generation this one already schedules.
+                _ = refresh_requests.changed(), if !refresh_requested => {
+                    refresh_requested = true;
                 }
                 item = stream.try_next() => {
                     match item {

@@ -508,6 +508,7 @@ impl PublicationHarness {
             &self.mesh_tx,
             self.mesh_registry.as_ref(),
             None,
+            None,
         );
     }
 }

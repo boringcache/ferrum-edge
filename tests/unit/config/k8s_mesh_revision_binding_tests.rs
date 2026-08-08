@@ -20,6 +20,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshConfigBroadcast;
+use ferrum_edge::k8s_controller::revision::K8sConfigRevisionTracker;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
 use ferrum_edge::modes::mesh::revision::MeshConfigRevision;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -161,6 +162,7 @@ struct Harness {
     mesh_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
     managed: BTreeSet<String>,
+    revision_tracker: Arc<K8sConfigRevisionTracker>,
 }
 
 impl Harness {
@@ -176,6 +178,7 @@ impl Harness {
             mesh_tx,
             mesh_registry: Arc::new(MeshNodeRegistry::new()),
             managed: BTreeSet::from(["ferrum".to_string()]),
+            revision_tracker: Arc::new(K8sConfigRevisionTracker::new(Some("k8s".to_string()))),
         }
     }
 
@@ -197,7 +200,14 @@ impl Harness {
             &self.mesh_tx,
             self.mesh_registry.as_ref(),
             mesh_revision,
+            Some(self.revision_tracker.as_ref()),
         )
+    }
+
+    /// Demand-driven evidence refreshes this harness's publication boundary has
+    /// asked its watch scopes for.
+    fn evidence_refresh_requests(&self) -> u64 {
+        self.revision_tracker.stats().evidence_refresh_requests
     }
 
     fn overlay_mesh_service_names(&self) -> Vec<String> {
@@ -457,4 +467,78 @@ fn missing_revision_after_versioned_publication_retains_prior_mesh() {
     assert_eq!(harness.live_mesh_service_names(), vec!["svc-a".to_string()]);
     assert_eq!(harness.overlay_revision(), Some(revision(100)));
     assert_eq!(harness.config_arc.load().mesh_revision, Some(revision(100)));
+}
+
+/// Retention is correct but must be BRIEF, and the ONLY way a quiet watch
+/// scope's watermark — and therefore the aggregate minimum the sequence comes
+/// from — can move before the idle relist window elapses is a fresh watcher
+/// generation. So a withheld mesh must ASK for one.
+///
+/// Without this the producer waits out `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+/// (300 s by default) before it can publish a change made in one busy scope
+/// while every other scope is quiet, which is a mesh config outage on a
+/// perfectly healthy single-replica control plane: the NodeWaypoint eBPF live
+/// suite reproduced it as ~350 s of ambient proxies serving a pre-workload
+/// slice and answering `HBONE dispatch required for this backend target`.
+#[test]
+fn retained_equal_revision_mesh_requests_fresh_convergence_evidence() {
+    let harness = Harness::new();
+    let first = authoritative_translation("gwapi-route-a", "svc-a");
+    assert!(harness.publish(&first, Some(&revision(664))).is_some());
+    assert_eq!(
+        harness.evidence_refresh_requests(),
+        0,
+        "a released publication needs no refresh"
+    );
+
+    let divergent = authoritative_translation("gwapi-route-a", "svc-b");
+    assert!(harness.publish(&divergent, Some(&revision(664))).is_none());
+    assert_eq!(
+        harness.live_mesh_service_names(),
+        vec!["svc-a".to_string()],
+        "the withheld mesh is still retained — the request does not relax that"
+    );
+    assert_eq!(
+        harness.evidence_refresh_requests(),
+        1,
+        "withholding mesh must ask the watch scopes for a newer boundary"
+    );
+
+    // Still withheld on the next reconcile: keep asking until the sequence can
+    // actually advance. The watchers, not this boundary, space the relists.
+    assert!(harness.publish(&divergent, Some(&revision(664))).is_none());
+    assert_eq!(harness.evidence_refresh_requests(), 2);
+
+    // Evidence arrived, the sequence advanced, the mesh is released — and no
+    // further refresh is requested.
+    assert!(harness.publish(&divergent, Some(&revision(665))).is_some());
+    assert_eq!(harness.live_mesh_service_names(), vec!["svc-b".to_string()]);
+    assert_eq!(harness.evidence_refresh_requests(), 2);
+}
+
+/// An equal-revision replay of IDENTICAL content is an ordinary reconnect-shaped
+/// publication, not a withheld one, so it must not drive relist traffic.
+#[test]
+fn idempotent_equal_revision_replay_requests_no_evidence_refresh() {
+    let harness = Harness::new();
+    let first = authoritative_translation("gwapi-route-a", "svc-a");
+    assert!(harness.publish(&first, Some(&revision(100))).is_some());
+
+    let replay = authoritative_translation("gwapi-route-a", "svc-a");
+    assert!(harness.publish(&replay, Some(&revision(100))).is_none());
+    assert_eq!(harness.evidence_refresh_requests(), 0);
+}
+
+/// An absent claim after a versioned publication also cannot authorize the
+/// candidate mesh, so it retains AND asks for evidence.
+#[test]
+fn missing_revision_retention_requests_fresh_convergence_evidence() {
+    let harness = Harness::new();
+    let first = authoritative_translation("gwapi-route-a", "svc-a");
+    assert!(harness.publish(&first, Some(&revision(100))).is_some());
+
+    let divergent = authoritative_translation("gwapi-route-a", "svc-withheld");
+    assert!(harness.publish(&divergent, None).is_none());
+    assert_eq!(harness.live_mesh_service_names(), vec!["svc-a".to_string()]);
+    assert_eq!(harness.evidence_refresh_requests(), 1);
 }

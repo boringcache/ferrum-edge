@@ -86,6 +86,31 @@
 //!   either an identical equal-revision replay or no mesh change at all — never
 //!   a new snapshot stamped with the old scalar.
 //!
+//! # Refreshing evidence on demand
+//!
+//! The aggregate is a MINIMUM, so it is pinned by the QUIETEST scope, and a
+//! quiet scope's watermark only moves when its watcher generation adopts a new
+//! boundary — i.e. on a relist. Left to the idle relist alone
+//! (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`, default 300 s), a change in ONE busy
+//! scope therefore cannot advance the sequence, the publication boundary
+//! retains the last accepted mesh, and mesh config propagation stalls for up to
+//! a whole idle window on a perfectly healthy single-replica control plane.
+//! That is not a theoretical bound: it reproduced as a ~350 s live-datapath
+//! outage in the NodeWaypoint eBPF suite, where workloads created seconds after
+//! startup did not reach any ambient proxy until the first idle relist.
+//!
+//! Nothing may be *assumed* about a quiet scope — the whole point of the
+//! pre-list boundary is that convergence is proven, not optimistic — so the
+//! repair is to ACQUIRE the missing proof instead of waiting for the timer:
+//! [`K8sConfigRevisionTracker::request_evidence_refresh`] asks every watch scope
+//! to start a fresh generation, which takes a new boundary read and adopts it at
+//! `InitDone` exactly as the idle relist does. The publication boundary raises
+//! the request only when it actually had to withhold changed mesh content, and
+//! each scope's watcher spaces its refreshes with its own floor interval, so a
+//! churning cluster cannot turn this into an unbounded list storm: the extra
+//! cost is at most one relist sweep per floor interval, and only while mesh
+//! content is being withheld — a state that is otherwise a config outage.
+//!
 //! # Monotonicity
 //!
 //! Per scope the watermark is a running maximum, so it never falls. The
@@ -193,6 +218,12 @@ pub struct K8sRevisionStats {
     /// revision. A non-zero value means this cluster's version space is not the
     /// numeric etcd one and ordering is unavailable by design.
     pub unparsable_resource_versions: u64,
+    /// Demand-driven evidence refreshes requested because the publication
+    /// boundary had to withhold changed mesh content under a sequence it could
+    /// not advance. Each one asks the watch scopes for a fresh generation; the
+    /// watchers apply their own spacing floor, so this counts REQUESTS, not
+    /// relists.
+    pub evidence_refresh_requests: u64,
 }
 
 /// Per-scope Kubernetes convergence evidence and the sequence published from it.
@@ -219,6 +250,12 @@ pub struct K8sConfigRevisionTracker {
     withheld_advances: AtomicU64,
     unsequenced_publications: AtomicU64,
     unparsable_resource_versions: AtomicU64,
+    evidence_refresh_requests: AtomicU64,
+    /// Monotonic counter every watch scope subscribes to. A bump asks each
+    /// scope to start a fresh generation so it can adopt a new authoritative
+    /// boundary; `watch` (rather than `Notify`) so a request raised while a
+    /// watcher is busy is still observed on its next poll instead of being lost.
+    refresh_requests: tokio::sync::watch::Sender<u64>,
 }
 
 impl K8sConfigRevisionTracker {
@@ -234,7 +271,37 @@ impl K8sConfigRevisionTracker {
             withheld_advances: AtomicU64::new(0),
             unsequenced_publications: AtomicU64::new(0),
             unparsable_resource_versions: AtomicU64::new(0),
+            evidence_refresh_requests: AtomicU64::new(0),
+            refresh_requests: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Subscribe a watch scope to demand-driven evidence refresh requests.
+    ///
+    /// The receiver observes a bump for every
+    /// [`Self::request_evidence_refresh`] raised after it last marked the value
+    /// seen. Requests coalesce, which is what the caller wants: one fresh
+    /// generation satisfies any number of pending requests.
+    pub fn subscribe_evidence_refresh(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.refresh_requests.subscribe()
+    }
+
+    /// Ask every watch scope for a fresh authoritative boundary.
+    ///
+    /// Raised by the reconciler publication boundary when it had to RETAIN mesh
+    /// content because the sequence could not advance — the aggregate minimum
+    /// is pinned by a quiet scope whose only path to a newer watermark is a new
+    /// generation. This requests proof; it never manufactures any. A scope that
+    /// cannot relist, or whose boundary read fails, still contributes no
+    /// evidence and the sequence still refuses to advance.
+    ///
+    /// Non-blocking and safe to call from inside the publication gate: `watch`
+    /// stores one value and wakes subscribers without allocating or awaiting.
+    pub fn request_evidence_refresh(&self) {
+        self.evidence_refresh_requests.fetch_add(1, Ordering::Relaxed);
+        self.refresh_requests.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
 
     /// Whether this tracker publishes revisions at all.
@@ -348,7 +415,9 @@ impl K8sConfigRevisionTracker {
     ///   retains the last accepted mesh when the candidate mesh differs under
     ///   that equal scalar, so a withheld advance cannot authorize divergent
     ///   content. Identical mesh at the retained sequence remains an ordinary
-    ///   idempotent republish.
+    ///   idempotent republish. A retention raises
+    ///   [`Self::request_evidence_refresh`], so the wait for a usable sequence
+    ///   is bounded by one relist round trip rather than by the idle window.
     /// * `None` with nothing established — publish no revision. Data planes
     ///   bootstrap unversioned, exactly as they did before this feature; the
     ///   first established sequence then bootstraps the gate.
@@ -398,6 +467,7 @@ impl K8sConfigRevisionTracker {
             withheld_advances: load(&self.withheld_advances),
             unsequenced_publications: load(&self.unsequenced_publications),
             unparsable_resource_versions: load(&self.unparsable_resource_versions),
+            evidence_refresh_requests: load(&self.evidence_refresh_requests),
         }
     }
 

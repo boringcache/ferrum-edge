@@ -7651,6 +7651,14 @@ pub mod _test_support {
         pub fn revision_stats(&self) -> crate::k8s_controller::revision::K8sRevisionStats {
             self.revision.stats()
         }
+
+        /// Raise the demand-driven evidence refresh the reconciler publication
+        /// boundary raises when it has to withhold mesh content under a
+        /// sequence it cannot advance (issue #3611). Every subscribed watch
+        /// scope starts a fresh generation, spaced by its own floor interval.
+        pub fn request_evidence_refresh(&self) {
+            self.revision.request_evidence_refresh();
+        }
         /// A `DynamicObject` in this scope's namespace, shaped like one the
         /// reflector would receive.
         pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
