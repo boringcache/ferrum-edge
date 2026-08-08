@@ -16,7 +16,12 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
+use ferrum_edge::modes::mesh::config::{MeshConfig, MeshEgressUdpDestination};
+use ferrum_edge::proxy::{
+    ProxyState, start_proxy_listener_with_bound_listener,
+    start_proxy_listener_with_bound_listener_and_mesh_direction,
+};
 
 fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
@@ -732,5 +737,348 @@ async fn hbone_connect_closes_idle_tunnel() {
 
     shutdown_tx.send(true).expect("shutdown gateway");
     backend_handle.await.expect("backend task");
+    conn_task.abort();
+}
+
+// ── EgressGateway external UDP ServiceEntry egress (issue #3263) ──────────
+
+/// Mesh config for an EgressGateway that admits exactly one external UDP
+/// destination.
+///
+/// `workloads` is deliberately EMPTY so the byte-stream open-relay guard
+/// (`inbound_hbone_relay_destination_allowed`) denies every authority — a
+/// loopback authority is admitted only when some workload declares that port.
+/// Whatever the relay admits here therefore came from the external UDP
+/// allowlist and nothing else.
+fn egress_udp_mesh_config(host: &str, port: u16, dial_port: u16) -> MeshConfig {
+    MeshConfig {
+        egress_udp_destinations: vec![MeshEgressUdpDestination {
+            host: host.to_string(),
+            port,
+            dial_port,
+            service_entry: "external-udp".to_string(),
+            namespace: "default".to_string(),
+        }],
+        ..MeshConfig::default()
+    }
+}
+
+fn spiffe_identity_global_plugin_config() -> PluginConfig {
+    PluginConfig {
+        id: "spiffe-identity-global".to_string(),
+        plugin_name: "spiffe_identity".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Build an inbound-direction mesh gateway with a static mTLS `ServerConfig`
+/// and the supplied mesh block, so `udp`-marked CONNECTs reach the relay
+/// synthesis path.
+fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
+    let spiffe_plugin = spiffe_identity_global_plugin_config();
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        // One unrelated HTTP route keeps the config shaped like a real gateway.
+        // It can never serve these CONNECTs: a `udp`-marked CONNECT is forced to
+        // a route miss so it always takes the guarded relay-synthesis path.
+        proxies: vec![create_mesh_proxy(1)],
+        consumers: vec![],
+        plugin_configs: vec![spiffe_plugin],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
+        frontend_tls_namespace_sources: Vec::new(),
+        trust_bundles: None,
+        mesh: Some(Box::new(mesh)),
+        mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
+    };
+    let env_config = EnvConfig {
+        mode: OperatingMode::Mesh,
+        log_level: "error".to_string(),
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        shutdown_drain_seconds: 0,
+        max_connections: 0,
+        ..EnvConfig::default()
+    };
+    ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0
+}
+
+async fn start_egress_udp_gateway(
+    state: ProxyState,
+    server_config: Arc<rustls::ServerConfig>,
+) -> (std::net::SocketAddr, watch::Sender<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let addr = listener.local_addr().expect("gateway local addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            state,
+            shutdown_rx,
+            Some(server_config),
+            Some(MeshTrafficDirection::Inbound),
+        )
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, shutdown_tx)
+}
+
+/// A stand-in "external" UDP service: echoes `pong:<payload>` back to whoever
+/// sent the datagram.
+async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind external udp echo");
+    let addr = socket.local_addr().expect("external udp echo addr");
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0_u8; 2048];
+        loop {
+            let Ok((read, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let mut reply = b"pong:".to_vec();
+            reply.extend_from_slice(&buf[..read]);
+            if socket.send_to(&reply, peer).await.is_err() {
+                return;
+            }
+        }
+    });
+    (addr, handle)
+}
+
+/// `[u16 big-endian length][payload]` — the datagram-over-mesh wire framing.
+fn frame_datagram(payload: &[u8]) -> Bytes {
+    let mut framed = Vec::with_capacity(2 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    framed.extend_from_slice(payload);
+    Bytes::from(framed)
+}
+
+/// Read framed bytes off the tunnel until one whole datagram is decoded.
+async fn read_framed_datagram(body: &mut h2::RecvStream) -> Vec<u8> {
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        if buffered.len() >= 2 {
+            let len = u16::from_be_bytes([buffered[0], buffered[1]]) as usize;
+            if buffered.len() >= 2 + len {
+                return buffered[2..2 + len].to_vec();
+            }
+        }
+        let chunk = body
+            .data()
+            .await
+            .expect("tunnel closed before a full datagram")
+            .expect("tunnel datagram chunk");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buffered.extend_from_slice(&chunk);
+    }
+}
+
+fn udp_connect_request(authority: &str) -> Request<()> {
+    Request::builder()
+        .method(Method::CONNECT)
+        .uri(authority)
+        .header("x-ferrum-mesh-protocol", "udp")
+        .body(())
+        .expect("udp connect request")
+}
+
+/// Live request AND response over an EgressGateway external UDP destination:
+/// an authenticated `udp`-marked mesh CONNECT naming an admitted external
+/// `host:port` relays the framed datagram to that destination and frames the
+/// reply back over the same tunnel.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_service_entry_destination_relays_request_and_response() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        external_addr.port(),
+        external_addr.port(),
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, mut request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    request_body
+        .send_data(frame_datagram(b"ping"), false)
+        .expect("send framed datagram");
+
+    let mut response_body = resp.into_body();
+    let echoed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_framed_datagram(&mut response_body),
+    )
+    .await
+    .expect("external udp reply");
+    assert_eq!(echoed, b"pong:ping".to_vec());
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    external_handle.abort();
+    conn_task.abort();
+}
+
+/// Fail-closed: a `udp`-marked CONNECT naming a destination the ServiceEntry
+/// allowlist does not admit is refused before any socket is opened. The
+/// admitted destination in this config is a DIFFERENT port on the same host, so
+/// nothing but the exact `(host, port)` match can be what admits traffic.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_unadmitted_destination_is_refused() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let admitted_port = external_addr.port().wrapping_add(1).max(1);
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        admitted_port,
+        admitted_port,
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, _request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "an unadmitted external UDP destination must never open a relay socket"
+    );
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    external_handle.abort();
+    conn_task.abort();
+}
+
+/// Fail-closed: an EMPTY allowlist — what every non-EgressGateway topology and
+/// every reload that withdrew the ServiceEntry produces — admits nothing, even
+/// for a destination that was previously reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_empty_allowlist_admits_nothing() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(MeshConfig::default());
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, _request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    external_handle.abort();
+    conn_task.abort();
+}
+
+/// The relay is authenticated: a `udp`-marked CONNECT to an ADMITTED external
+/// destination over a plaintext (non-mTLS) listener carries no peer SPIFFE
+/// identity and is rejected 403 before any socket is opened. Admission by the
+/// ServiceEntry allowlist never substitutes for peer authentication.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_admitted_destination_still_requires_authenticated_peer() {
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        external_addr.port(),
+        external_addr.port(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let gateway_addr = listener.local_addr().expect("gateway local addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            Some(MeshTrafficDirection::Inbound),
+        )
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let (response_fut, _request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    external_handle.abort();
     conn_task.abort();
 }

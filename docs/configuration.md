@@ -808,7 +808,7 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | No | `300` | Default TCP idle timeout; `0` disables |
 | `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` | No | `300` | Hard cap for TCP half-close drain; the userspace `copy_bidirectional` fast path requires this, `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` all set to `0`. Linux splice paths enforce these bounds inline and do not require disabling them. |
-| `FERRUM_UDP_MAX_SESSIONS` | No | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_MAX_SESSIONS` | No | `10000` | Maximum concurrent UDP sessions per proxy. Also the process-wide ceiling on concurrent EgressGateway external-UDP relay sessions (`udp`-marked mesh CONNECTs to a `ServiceEntry`-admitted external destination); over-cap CONNECTs are rejected with `503` |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | No | `10` | UDP session cleanup interval |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | No | `64` | Linux `recvmmsg` receive batch size; clamped 1..1024 |
 | `FERRUM_DTLS_CERT_PATH` | No | — | Leaf-first PEM certificate bundle for frontend DTLS termination. The ECDSA P-256/P-384 leaf must match `FERRUM_DTLS_KEY_PATH`; the complete chain is transmitted in configured order. Refused while `FERRUM_FIPS_MODE=enforce` — see [FIPS mode](fips.md#dtls-why-the-whole-transport-is-refused) |

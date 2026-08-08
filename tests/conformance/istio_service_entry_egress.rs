@@ -507,3 +507,170 @@ fn sidecar_unrepresentable_outbound_traffic_policy_fails_closed() {
         );
     }
 }
+
+/// UDP ServiceEntry → EgressGateway datagram-over-mesh egress (issue #3263).
+/// A `protocol: UDP` external port materializes a destination ADMISSION rather
+/// than a listener or upstream: `MeshConfig.egress_udp_destinations` is what the
+/// gateway's authenticated mesh CONNECT terminator consults.
+#[test]
+fn se_udp_egress_materializes_relay_destination_not_listener() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP ServiceEntry → EgressGateway datagram-over-mesh destination (#3263)",
+        status = Status::Supported,
+        notes = "#3263: UDP external ports materialize `mesh.egress_udp_destinations`; no UDP/DTLS listener and no upstream, by design.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        !prepared.proxies.iter().any(|p| p.listen_port == Some(53)),
+        "UDP ServiceEntry must not bind an egress listener"
+    );
+    let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+    assert_eq!(
+        mesh.egress_udp_destinations
+            .iter()
+            .map(|destination| (
+                destination.host.as_str(),
+                destination.port,
+                destination.dial_port
+            ))
+            .collect::<Vec<_>>(),
+        vec![("dns.external.com", 53, 53)],
+    );
+}
+
+/// Reload/update/delete: the admission set is REBUILT and reassigned on every
+/// apply, so withdrawing the ServiceEntry withdraws the admission and does not
+/// leave a stale destination behind.
+#[test]
+fn se_udp_egress_destinations_are_withdrawn_on_reload() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destination allowlist is rebuilt per apply (#3263)",
+        status = Status::Supported,
+        notes = "#3263: an update that changes the port re-keys the admission; a delete clears it; a non-EgressGateway topology never admits.",
+    );
+    let initial = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(initial.config, &egress_runtime()).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .len(),
+        1
+    );
+
+    // Update: the operator moves the port. The old (host, 53) admission must
+    // not survive alongside the new one.
+    let updated = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 5353, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(updated.config, &egress_runtime()).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .iter()
+            .map(|destination| destination.port)
+            .collect::<Vec<_>>(),
+        vec![5353]
+    );
+
+    // Delete: no ServiceEntry at all leaves an EMPTY allowlist, which denies.
+    let deleted = translate_k8s_objects(
+        &[external_se("kafka", vec!["kafka.external.com"], 9092, "TCP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(deleted.config, &egress_runtime()).expect("mesh apply");
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty(),
+        "a withdrawn UDP ServiceEntry must withdraw its admission"
+    );
+}
+
+/// Fail-closed by topology: the same UDP ServiceEntry admits nothing when the
+/// process is not an EgressGateway.
+#[test]
+fn se_udp_egress_destinations_are_empty_off_egress_gateway() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destinations are EgressGateway-only (#3263)",
+        status = Status::Supported,
+        notes = "#3263: a Sidecar/Ambient process never publishes external UDP admissions, so its CONNECT terminator cannot relay to external hosts.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(
+        translation.config,
+        &sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny),
+    )
+    .expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty()
+    );
+}
+
+/// Fail-closed by opt-in: with `FERRUM_MESH_EGRESS_STREAM_ENABLED=false` the UDP
+/// ServiceEntry admits nothing — there is no plaintext-UDP fallback.
+#[test]
+fn se_udp_egress_destinations_require_stream_egress_opt_in() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destinations require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
+        status = Status::Supported,
+        notes = "#3263: the datagram relay rides the same operator opt-in the TCP stream listeners do; off means denied, never plaintext.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let mut runtime = egress_runtime();
+    runtime.egress_stream_enabled = false;
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty()
+    );
+}

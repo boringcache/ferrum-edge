@@ -53,11 +53,12 @@ use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_c
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
     AppProtocol, DestinationRuleLookupTier, EastWestGateway, MeshConfig, MeshDestinationRule,
-    MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
-    MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
-    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
-    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
+    MeshEgressUdpDestination, MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer,
+    MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication,
+    MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode,
+    PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
+    destination_rule_exported_to_namespace, destination_rule_lookup_tier, resolve_target_port,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -8809,6 +8810,16 @@ fn materialize_egress_gateway_proxies(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
+    // The external-UDP relay allowlist is rebuilt from scratch on EVERY mesh
+    // apply and is cleared on every path that materializes nothing (issue
+    // #3263). Assignment is unconditional rather than merged so an update that
+    // drops a UDP ServiceEntry — or a topology flip away from `EgressGateway` —
+    // can never leave a stale admission behind that would keep the gateway
+    // relaying datagrams to a destination the operator withdrew.
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.egress_udp_destinations.clear();
+    }
+
     if runtime.topology != MeshTopology::EgressGateway {
         return;
     }
@@ -8829,13 +8840,35 @@ fn materialize_egress_gateway_proxies(
     let mut mesh_reserved_ports = std::collections::HashSet::new();
     mesh_reserved_ports.insert(runtime.egress_listen_addr.port());
 
-    let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+    let (proxies, upstreams, udp_destinations) = build_egress_proxies_and_upstreams(
         service_entries,
         &runtime.namespace,
         &mesh_reserved_ports,
         runtime.egress_stream_enabled,
         runtime.egress_stream_allow_plaintext,
     );
+
+    // Publish the allowlist BEFORE the `proxies.is_empty()` early return: a
+    // slice whose only external ports are UDP materializes no proxy or upstream
+    // (datagram egress rides the authenticated mesh CONNECT terminator, not a
+    // listener) but must still admit its destinations.
+    if !udp_destinations.is_empty() {
+        info!(
+            egress_udp_destinations = udp_destinations.len(),
+            "Materializing external UDP egress destinations from ServiceEntries"
+        );
+        if let Some(mesh) = config.mesh.as_deref_mut() {
+            mesh.egress_udp_destinations = udp_destinations;
+        } else {
+            // No mesh block means nothing on the request path can consult the
+            // allowlist, so the relay stays denied. Say so instead of silently
+            // dropping admissions.
+            warn!(
+                "External UDP egress destinations were materialized but the prepared config \
+                 carries no mesh block; datagram-over-mesh egress stays denied"
+            );
+        }
+    }
 
     if proxies.is_empty() {
         debug!("no external service entries produced egress proxies");
@@ -8873,19 +8906,18 @@ fn materialize_egress_gateway_proxies(
     }
 }
 
-/// One-time guard so the "UDP egress materialization deferred" warning fires at
-/// most once per process instead of on every slice apply that carries a UDP
-/// ServiceEntry. Reset is intentionally not provided — F3 §3.3 stage 1 is inert
-/// for UDP and the later datapath stage removes the skip entirely.
-static UDP_EGRESS_DEFERRED_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Build proxy + upstream pairs from external `ServiceEntry` resources.
+/// Build proxy + upstream pairs from external `ServiceEntry` resources, plus the
+/// external-UDP relay allowlist (issue #3263).
 ///
-/// UDP ServiceEntry ports (`AppProtocol::Udp`) are classified but NOT
-/// materialized in this F3 §3.3 stage (schema-only / inert) — they are skipped
-/// with a one-time deferred warning so no premature UDP listener is emitted (no
-/// port-only TCP/UDP dedup collision, no unseeded-DTLS deferral). UDP egress
-/// materialization arrives in a later stage.
+/// UDP ServiceEntry ports (`AppProtocol::Udp`) materialize NO listener and no
+/// upstream: datagram-over-mesh egress rides the gateway's existing
+/// authenticated mesh CONNECT terminator (SVID-mTLS `:15006` / HBONE `:15008`)
+/// and the shared datagram codec, so there is no plaintext UDP listener to bind,
+/// no port-only TCP/UDP dedup collision with a sibling TCP port on the same
+/// number (DNS `53/TCP` + `53/UDP` coexist), and no DTLS material to seed. What
+/// they produce instead is a [`MeshEgressUdpDestination`] admission: the exact
+/// `(authority host, service port)` pairs a `udp`-marked CONNECT may name, with
+/// the resolved `targetPort` the gateway's local socket dials.
 ///
 /// Only entries with `location == MeshExternal` are materialized. For each
 /// qualifying entry, one upstream per port is created (keyed by host + port
@@ -8920,9 +8952,14 @@ fn build_egress_proxies_and_upstreams(
     mesh_reserved_ports: &std::collections::HashSet<u16>,
     egress_stream_enabled: bool,
     egress_stream_allow_plaintext: bool,
-) -> (Vec<Proxy>, Vec<Upstream>) {
+) -> (Vec<Proxy>, Vec<Upstream>, Vec<MeshEgressUdpDestination>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
+    // External UDP relay admissions (issue #3263). Keyed by `(host, port)` so a
+    // second ServiceEntry claiming an already-admitted pair is refused rather
+    // than silently shadowing the first entry's dial port.
+    let mut udp_destinations: Vec<MeshEgressUdpDestination> = Vec::new();
+    let mut materialized_udp_destinations = std::collections::HashSet::new();
     // HTTP-family materialization is host-keyed because the egress listener
     // shares one port (15090) with host-based routing.
     let mut materialized_http_hosts = std::collections::HashSet::new();
@@ -8946,28 +8983,22 @@ fn build_egress_proxies_and_upstreams(
         }
 
         for port_spec in &entry.ports {
-            // F3 §3.3 stage 1 is schema-only and INERT for UDP: a `protocol: UDP`
-            // ServiceEntry port classifies as `AppProtocol::Udp` (so it is no
-            // longer mis-routed as HTTP-family) but must NOT yet materialize an
-            // egress listener. Materializing it now would (a) collide with a
-            // sibling TCP port on the same number under the port-only stream
-            // dedup (e.g. DNS TCP/53 + UDP/53) and (b) build a `frontend_tls`
-            // listener that mesh never seeds DTLS material for, deferring it
-            // indefinitely. UDP egress materialization (with protocol-aware
-            // dedup + DTLS seeding) belongs to a later F3 §3.3 stage; skip it
-            // here so Stage 1 stays inert. Warn once per process to flag the
-            // deferral without log spam across repeated slice applies.
+            // A `protocol: UDP` ServiceEntry port takes the datagram-over-mesh
+            // branch (issue #3263): no listener, no upstream — just the exact
+            // set of `(authority host, port)` pairs the gateway's authenticated
+            // mesh CONNECT terminator may relay to. This deliberately does NOT
+            // share the stream-family path: binding a UDP listener on the
+            // ServiceEntry port would collide with a sibling TCP port on the
+            // same number under the port-only stream dedup (DNS `53/TCP` +
+            // `53/UDP`) and would need DTLS material mesh never seeds.
             if matches!(port_spec.protocol, AppProtocol::Udp) {
-                if !UDP_EGRESS_DEFERRED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    warn!(
-                        service_entry = %entry.name,
-                        namespace = %entry.namespace,
-                        port = port_spec.port,
-                        "UDP egress materialization deferred to a later F3 §3.3 stage: \
-                         UDP ServiceEntry ports are classified but not yet materialized \
-                         as egress listeners (no UDP capture/egress datapath in this stage)."
-                    );
-                }
+                build_udp_egress_destinations_for_entry(
+                    entry,
+                    port_spec,
+                    egress_stream_enabled,
+                    &mut materialized_udp_destinations,
+                    &mut udp_destinations,
+                );
                 continue;
             }
 
@@ -9027,7 +9058,184 @@ fn build_egress_proxies_and_upstreams(
         }
     }
 
-    (proxies, upstreams)
+    (proxies, upstreams, udp_destinations)
+}
+
+/// Datagram-over-mesh egress materialization branch for a `protocol: UDP`
+/// external `ServiceEntry` port (issue #3263).
+///
+/// Emits zero or more [`MeshEgressUdpDestination`] admissions — one per exact
+/// authority host the entry declares — and nothing else. Every rejection is
+/// field-specific and fails CLOSED (the destination simply stays inadmissible);
+/// nothing is ever guessed, widened, or fallen back to a direct unauthenticated
+/// UDP path.
+///
+/// Refusals, all warned with the offending field:
+/// - stream-family egress not enabled (`FERRUM_MESH_EGRESS_STREAM_ENABLED`);
+/// - `port: 0` (a CONNECT authority can never name it);
+/// - a wildcard host (`*.example.com`) — admission is exact-match only, so a
+///   prefix pattern would have to be resolved by guessing;
+/// - an empty/whitespace host;
+/// - a `STATIC` endpoint address that is not a bare IP literal;
+/// - a `(host, port)` pair another ServiceEntry already admitted.
+fn build_udp_egress_destinations_for_entry(
+    entry: &ServiceEntry,
+    port_spec: &crate::modes::mesh::config::ServicePort,
+    egress_stream_enabled: bool,
+    materialized_udp_destinations: &mut std::collections::HashSet<(String, u16)>,
+    destinations: &mut Vec<MeshEgressUdpDestination>,
+) {
+    if !egress_stream_enabled {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            "Skipping UDP egress ServiceEntry port: stream-family egress is disabled. Set \
+             FERRUM_MESH_EGRESS_STREAM_ENABLED=true to admit datagram-over-mesh egress \
+             destinations (relayed over the gateway's authenticated mesh CONNECT terminator, \
+             never as plaintext UDP)."
+        );
+        return;
+    }
+
+    if port_spec.port == 0 {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            field = "ports[].number",
+            "Skipping UDP egress ServiceEntry port 0: a CONNECT authority cannot name port 0"
+        );
+        return;
+    }
+
+    // A numeric `targetPort` moves the port the gateway's local socket DIALS
+    // without moving the port the CONNECT authority names. A named targetPort
+    // has no workload port table to resolve against on an external entry, so it
+    // resolves to `None` and the service port is dialed.
+    let dial_port =
+        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
+
+    let mut admitted_for_port = 0usize;
+    for host in &entry.hosts {
+        let host = host.trim();
+        if host.is_empty() {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "hosts[]",
+                port = port_spec.port,
+                "Skipping empty UDP egress ServiceEntry host"
+            );
+            continue;
+        }
+        if host.contains('*') {
+            warn!(
+                service_entry = %entry.name,
+                namespace = %entry.namespace,
+                field = "hosts[]",
+                host = %host,
+                port = port_spec.port,
+                "Skipping wildcard UDP egress ServiceEntry host: datagram-over-mesh egress \
+                 admits exact authority hosts only, so a wildcard cannot be honored without \
+                 guessing the destination"
+            );
+            continue;
+        }
+        if push_udp_egress_destination(
+            entry,
+            host,
+            port_spec.port,
+            dial_port,
+            materialized_udp_destinations,
+            destinations,
+        ) {
+            admitted_for_port += 1;
+        }
+    }
+
+    // STATIC resolution names concrete endpoint addresses; a workload may dial
+    // one of those directly instead of the ServiceEntry host, so admit them too
+    // — but only when they are bare IP literals. A named endpoint port (when the
+    // service port carries a name and no numeric targetPort) moves that
+    // endpoint's dial port the same way a numeric targetPort does.
+    if entry.resolution == Resolution::Static {
+        for endpoint in &entry.endpoints {
+            let address = endpoint.address.trim();
+            if address.parse::<std::net::IpAddr>().is_err() {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    field = "endpoints[].address",
+                    address = %address,
+                    port = port_spec.port,
+                    "Skipping UDP egress ServiceEntry endpoint whose address is not an IP literal"
+                );
+                continue;
+            }
+            let endpoint_dial_port = match (
+                resolve_target_port(port_spec.target_port.as_ref(), &[]),
+                port_spec.name.as_deref(),
+            ) {
+                (Some(numeric), _) => numeric,
+                (None, Some(name)) => endpoint.ports.get(name).copied().unwrap_or(port_spec.port),
+                (None, None) => port_spec.port,
+            };
+            if push_udp_egress_destination(
+                entry,
+                address,
+                port_spec.port,
+                endpoint_dial_port,
+                materialized_udp_destinations,
+                destinations,
+            ) {
+                admitted_for_port += 1;
+            }
+        }
+    }
+
+    if admitted_for_port == 0 {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            "UDP egress ServiceEntry port admitted no destination; datagram-over-mesh egress \
+             stays denied for it"
+        );
+    }
+}
+
+/// Insert one `(host, port)` admission, refusing a duplicate another
+/// ServiceEntry already claimed. Returns `true` when the admission was added.
+fn push_udp_egress_destination(
+    entry: &ServiceEntry,
+    host: &str,
+    port: u16,
+    dial_port: u16,
+    materialized_udp_destinations: &mut std::collections::HashSet<(String, u16)>,
+    destinations: &mut Vec<MeshEgressUdpDestination>,
+) -> bool {
+    // Authority hosts are compared ASCII-case-insensitively on the request path,
+    // so normalize once here instead of per CONNECT.
+    let host = host.to_ascii_lowercase();
+    if !materialized_udp_destinations.insert((host.clone(), port)) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            host = %host,
+            port,
+            "Skipping UDP egress ServiceEntry destination: another ServiceEntry already \
+             admitted this host and port"
+        );
+        return false;
+    }
+    destinations.push(MeshEgressUdpDestination {
+        host,
+        port,
+        dial_port,
+        service_entry: entry.name.clone(),
+        namespace: entry.namespace.clone(),
+    });
+    true
 }
 
 /// HTTP-family egress materialization branch. One proxy per host, host-routed
@@ -30695,7 +30903,7 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30758,7 +30966,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30794,7 +31002,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30816,7 +31024,7 @@ mod tests {
         );
         service_entry.namespace = "payments".to_string();
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &[service_entry.clone()],
             "default",
             &std::collections::HashSet::new(),
@@ -30827,7 +31035,7 @@ mod tests {
         assert!(upstreams.is_empty());
 
         service_entry.export_to = vec!["*".to_string()];
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &[service_entry],
             "default",
             &std::collections::HashSet::new(),
@@ -30860,7 +31068,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30890,13 +31098,12 @@ mod tests {
     }
 
     #[test]
-    fn egress_does_not_materialize_udp_service_entry_in_stage_1() {
-        // F3 §3.3 stage 1 is INERT for UDP: a `protocol: UDP` ServiceEntry port
-        // is classified `AppProtocol::Udp` but must NOT materialize an egress
-        // listener yet (no premature UDP listener → no port-only TCP/UDP dedup
-        // collision, no unseeded-DTLS deferral). UDP egress arrives in a later
-        // stage. Even with stream egress ENABLED, a UDP-only ServiceEntry yields
-        // zero proxies and zero upstreams.
+    fn egress_materializes_udp_service_entry_as_relay_destination_not_listener() {
+        // Issue #3263: a `protocol: UDP` external ServiceEntry port materializes
+        // a datagram-over-mesh relay ADMISSION, never a listener or upstream —
+        // so there is still no premature UDP listener (no port-only TCP/UDP
+        // dedup collision, no unseeded-DTLS material). The admission is what the
+        // gateway's authenticated mesh CONNECT terminator consults.
         let service_entries = vec![ServiceEntry {
             name: "dns".to_string(),
             namespace: "default".to_string(),
@@ -30914,7 +31121,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30924,22 +31131,228 @@ mod tests {
 
         assert!(
             proxies.is_empty(),
-            "UDP ServiceEntry must materialize NO egress proxy in stage 1 (inert), got {proxies:?}"
+            "UDP ServiceEntry must materialize NO egress proxy, got {proxies:?}"
         );
         assert!(
             upstreams.is_empty(),
-            "UDP ServiceEntry must materialize NO egress upstream in stage 1 (inert)"
+            "UDP ServiceEntry must materialize NO egress upstream"
+        );
+        assert_eq!(
+            udp_destinations,
+            vec![MeshEgressUdpDestination {
+                host: "dns.external.com".to_string(),
+                port: 53,
+                dial_port: 53,
+                service_entry: "dns".to_string(),
+                namespace: "default".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn egress_materializes_tcp_but_not_udp_for_dual_protocol_service() {
+    fn egress_udp_service_entry_is_denied_when_stream_egress_is_disabled() {
+        // The datagram relay rides the same operator opt-in the stream-family
+        // egress listeners do. With it off the destination is NOT admitted, so
+        // the terminator keeps denying the CONNECT — never a plaintext fallback.
+        let service_entries = vec![ServiceEntry {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["dns.external.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams, udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            false, // egress_stream_enabled
+            false,
+        );
+
+        assert!(proxies.is_empty());
+        assert!(upstreams.is_empty());
+        assert!(
+            udp_destinations.is_empty(),
+            "UDP egress must stay denied while stream-family egress is disabled"
+        );
+    }
+
+    #[test]
+    fn egress_udp_service_entry_refuses_invalid_variants() {
+        // Every refusal is fail-closed and field-specific: port 0 can never be a
+        // CONNECT authority port, a wildcard host cannot be exact-matched, a
+        // non-IP STATIC endpoint address is not a dialable literal, and a
+        // duplicate (host, port) claimed by a second entry must not shadow the
+        // first entry's dial port.
+        let service_entries = vec![
+            ServiceEntry {
+                name: "zero-port".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["zero.external.com".to_string()],
+                endpoints: Vec::new(),
+                resolution: Resolution::Dns,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 0,
+                    protocol: AppProtocol::Udp,
+                    name: None,
+                    target_port: None,
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            },
+            ServiceEntry {
+                name: "wildcard".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["*.external.com".to_string(), "".to_string()],
+                endpoints: Vec::new(),
+                resolution: Resolution::Dns,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 5353,
+                    protocol: AppProtocol::Udp,
+                    name: None,
+                    target_port: None,
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            },
+            ServiceEntry {
+                name: "static-hostname-endpoint".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["static.external.com".to_string()],
+                endpoints: vec![MeshEndpoint {
+                    address: "not-an-ip.example".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 161,
+                    protocol: AppProtocol::Udp,
+                    name: None,
+                    target_port: None,
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            },
+            ServiceEntry {
+                name: "duplicate".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["STATIC.external.com".to_string()],
+                endpoints: Vec::new(),
+                resolution: Resolution::Dns,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 161,
+                    protocol: AppProtocol::Udp,
+                    name: None,
+                    target_port: Some(ServiceTargetPort::Number(9999)),
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            },
+        ];
+
+        let (_, _, udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        // Only `static.external.com:161` survives: the port-0 entry, the
+        // wildcard/empty hosts, and the non-IP endpoint are all refused, and the
+        // duplicate `(static.external.com, 161)` claim cannot overwrite the
+        // first entry's dial port with 9999.
+        assert_eq!(
+            udp_destinations,
+            vec![MeshEgressUdpDestination {
+                host: "static.external.com".to_string(),
+                port: 161,
+                dial_port: 161,
+                service_entry: "static-hostname-endpoint".to_string(),
+                namespace: "default".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn egress_udp_service_entry_honors_numeric_target_port_and_static_endpoints() {
+        let service_entries = vec![ServiceEntry {
+            name: "syslog".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["Syslog.External.COM".to_string()],
+            endpoints: vec![MeshEndpoint {
+                address: "203.0.113.7".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 514,
+                protocol: AppProtocol::Udp,
+                name: Some("syslog".to_string()),
+                target_port: Some(ServiceTargetPort::Number(1514)),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_, _, udp_destinations) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        // Host admission is lowercased for the case-insensitive authority match,
+        // the CONNECT authority still names the SERVICE port, and the gateway's
+        // local socket dials the numeric `targetPort`.
+        assert_eq!(
+            udp_destinations,
+            vec![
+                MeshEgressUdpDestination {
+                    host: "syslog.external.com".to_string(),
+                    port: 514,
+                    dial_port: 1514,
+                    service_entry: "syslog".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "203.0.113.7".to_string(),
+                    port: 514,
+                    dial_port: 1514,
+                    service_entry: "syslog".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_materializes_tcp_listener_and_udp_relay_for_dual_protocol_service() {
         // A DNS-like service exposing BOTH TCP/53 and UDP/53: the TCP/53 stream
-        // listener still materializes, while UDP/53 is skipped (deferred). This
-        // pins that the inert UDP skip does NOT also drop the coexisting TCP port
-        // and that no UDP listener is emitted on the same number (the port-only
-        // dedup collision codex flagged never arises because UDP never enters
-        // the stream materializer).
+        // listener materializes, and UDP/53 materializes a relay ADMISSION on
+        // the same port number. This pins that the two lanes coexist — the
+        // port-only stream dedup collision never arises because UDP still never
+        // enters the stream materializer.
         let service_entries = vec![ServiceEntry {
             name: "dns".to_string(),
             namespace: "default".to_string(),
@@ -30965,7 +31378,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -30973,17 +31386,27 @@ mod tests {
             false,
         );
 
-        // Exactly one stream proxy (the TCP/53 listener); the UDP/53 port is
-        // skipped, so it neither adds a second listener nor collides with TCP.
+        // Exactly one stream proxy (the TCP/53 listener); the UDP/53 port adds
+        // no second listener and cannot collide with the TCP one.
         assert_eq!(
             proxies.len(),
             1,
-            "only the TCP/53 stream listener must materialize (UDP/53 deferred)"
+            "only the TCP/53 stream listener must materialize"
         );
         assert_eq!(proxies[0].listen_port, Some(53));
         assert_eq!(proxies[0].backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(upstreams.len(), 1);
         assert_eq!(upstreams[0].targets[0].port, 53);
+        assert_eq!(
+            udp_destinations,
+            vec![MeshEgressUdpDestination {
+                host: "dns.external.com".to_string(),
+                port: 53,
+                dial_port: 53,
+                service_entry: "dns".to_string(),
+                namespace: "default".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -30995,7 +31418,7 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31131,7 +31554,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31194,7 +31617,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31228,7 +31651,7 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(
+        let (_, upstreams, _) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31266,7 +31689,7 @@ mod tests {
         );
         entry.ports[0].target_port = Some(ServiceTargetPort::Number(8443));
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(
+        let (_, upstreams, _) = build_egress_proxies_and_upstreams(
             &[entry],
             "default",
             &std::collections::HashSet::new(),
@@ -31297,7 +31720,7 @@ mod tests {
         );
         entry.ports[0].target_port = Some(ServiceTargetPort::Number(8443));
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(
+        let (_, upstreams, _) = build_egress_proxies_and_upstreams(
             &[entry.clone()],
             "default",
             &std::collections::HashSet::new(),
@@ -31364,7 +31787,7 @@ mod tests {
 
     #[test]
     fn egress_empty_service_entries_produces_no_proxies() {
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &[],
             "default",
             &std::collections::HashSet::new(),
@@ -31557,7 +31980,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31604,7 +32027,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31643,7 +32066,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31775,7 +32198,7 @@ mod tests {
             AppProtocol::Tcp,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31821,7 +32244,7 @@ mod tests {
         )];
 
         // Default (allow_plaintext = false): terminate SVID-mTLS.
-        let (mtls_proxies, _) = build_egress_proxies_and_upstreams(
+        let (mtls_proxies, _, _) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31835,7 +32258,7 @@ mod tests {
         );
 
         // Explicit opt-out (allow_plaintext = true): legacy plaintext listener.
-        let (plaintext_proxies, _) = build_egress_proxies_and_upstreams(
+        let (plaintext_proxies, _, _) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31858,7 +32281,7 @@ mod tests {
             AppProtocol::Mongo,
         )];
 
-        let (proxies, _) = build_egress_proxies_and_upstreams(
+        let (proxies, _, _) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31913,7 +32336,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31953,7 +32376,7 @@ mod tests {
             ),
         ];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -31989,7 +32412,7 @@ mod tests {
             ),
         ];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -32052,7 +32475,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -32090,7 +32513,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -32152,7 +32575,7 @@ mod tests {
             workload_selector: None,
         };
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(
+        let (_, upstreams, _) = build_egress_proxies_and_upstreams(
             std::slice::from_ref(&entry),
             "default",
             &std::collections::HashSet::new(),
@@ -32259,7 +32682,7 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (_proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (_proxies, upstreams, _) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
@@ -32561,7 +32984,7 @@ mod tests {
             AppProtocol::Tcp,
         )];
 
-        let (proxies, upstreams) =
+        let (proxies, upstreams, _) =
             build_egress_proxies_and_upstreams(&service_entries, "default", &reserved, true, false);
 
         assert!(
@@ -32587,7 +33010,7 @@ mod tests {
             AppProtocol::Tcp,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        let (proxies, upstreams, _udp_destinations) = build_egress_proxies_and_upstreams(
             &service_entries,
             "default",
             &std::collections::HashSet::new(),

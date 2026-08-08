@@ -2965,6 +2965,56 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_inbound_tcp_routes: Vec<MeshInboundTcpRoute>,
+    /// Runtime-only allowlist of external UDP destinations this **EgressGateway**
+    /// may relay datagram-over-mesh traffic to (issue #3263). Materialized by
+    /// `materialize_egress_gateway_proxies` from `MESH_EXTERNAL` `ServiceEntry`
+    /// ports whose protocol is `UDP`, and consumed on the request path by
+    /// `crate::proxy::mesh_egress_udp_destination_dial_port` /
+    /// `crate::proxy::mesh_egress_udp_destination_allowed` to admit a
+    /// `udp`-marked mesh CONNECT whose `:authority` names an external host.
+    ///
+    /// **Fail closed by construction.** The vector is assigned UNCONDITIONALLY on
+    /// every mesh apply — empty for every non-`EgressGateway` topology, when
+    /// stream-family egress is disabled, and when the slice carries no admissible
+    /// UDP ServiceEntry port — so an empty list denies every external UDP relay
+    /// and a removed/edited ServiceEntry cannot leave a stale admission behind.
+    ///
+    /// `serde(skip)`: never operator-settable and never on the `config_json`
+    /// wire. Widening this by hand would turn the gateway's authenticated mesh
+    /// CONNECT terminator into an open UDP relay.
+    #[serde(skip)]
+    pub egress_udp_destinations: Vec<MeshEgressUdpDestination>,
+}
+
+/// One admitted external UDP egress destination materialized from a
+/// `MESH_EXTERNAL` `ServiceEntry` UDP port under `EgressGateway` topology
+/// (issue #3263).
+///
+/// The gateway terminates the sidecar's authenticated mesh transport (SVID-mTLS
+/// on `:15006` / HBONE on `:15008`), unframes the `udp`-marked CONNECT body with
+/// the shared datagram codec (`crate::proxy::mesh_udp_frame`), and relays each
+/// datagram over a `connect()`ed local `UdpSocket` — so the reply peer is pinned
+/// by the kernel to the exact destination that was admitted here. There is no
+/// plaintext UDP listener and no DTLS material to seed.
+///
+/// `host` is the exact authority host an admitted CONNECT may name: a
+/// ServiceEntry host, a bare `addresses[]` IP literal, or a `STATIC` endpoint
+/// address. Matching is exact and ASCII-case-insensitive — wildcard ServiceEntry
+/// hosts (`*.example.com`) and CIDR `addresses[]` are refused at materialization
+/// so no admission is ever decided by a prefix/subnet guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MeshEgressUdpDestination {
+    /// Exact authority host admitted for a `udp` CONNECT (lowercased).
+    pub host: String,
+    /// Service port the CONNECT `:authority` carries.
+    pub port: u16,
+    /// Port the gateway's local `UdpSocket` dials — the ServiceEntry's numeric
+    /// `targetPort` when declared, otherwise identical to [`Self::port`].
+    pub dial_port: u16,
+    /// Owning ServiceEntry name, for diagnostics only.
+    pub service_entry: String,
+    /// Owning ServiceEntry namespace, for diagnostics only.
+    pub namespace: String,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -3002,6 +3052,7 @@ impl Default for MeshConfig {
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
+            egress_udp_destinations: Vec::new(),
         }
     }
 }

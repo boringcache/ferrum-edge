@@ -2281,6 +2281,64 @@ fn inbound_hbone_relay_destination_allowed(
     })
 }
 
+/// Resolve the local UDP port an EgressGateway may dial for a `udp`-marked mesh
+/// CONNECT naming external `host:port` (issue #3263), or `None` when the pair is
+/// not an admitted external UDP egress destination.
+///
+/// The allowlist is materialized ONLY under `EgressGateway` topology, ONLY from
+/// `MESH_EXTERNAL` `ServiceEntry` ports whose protocol is `UDP`, and ONLY when
+/// stream-family egress is enabled — so on every other proxy this is an empty
+/// vector and the lookup denies. Matching is EXACT on the host (ASCII
+/// case-insensitive; the stored host is already lowercased) and exact on the
+/// service port: wildcard ServiceEntry hosts are refused at materialization, so
+/// no admission is ever decided by a prefix or subnet guess.
+///
+/// This deliberately does NOT widen [`inbound_hbone_relay_destination_allowed`]:
+/// the byte-stream HBONE relay stays bounded to loopback / slice-known workload
+/// targets. Only the datagram handler consults this second, egress-specific
+/// allowlist.
+fn mesh_egress_udp_destination_dial_port(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<u16> {
+    let mesh = mesh?;
+    if mesh.egress_udp_destinations.is_empty() {
+        return None;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.egress_udp_destinations
+        .iter()
+        .find(|dest| dest.port == port && dest.host.eq_ignore_ascii_case(host))
+        .map(|dest| dest.dial_port)
+}
+
+/// Whether `host:port` is an admitted external UDP egress destination, matching
+/// EITHER the ServiceEntry service port (the CONNECT authority port) or the
+/// resolved `targetPort` the gateway's socket dials.
+///
+/// The dial-port arm exists because `handle_hbone_udp_request` re-runs this
+/// guard on the EFFECTIVE destination AFTER route overrides, by which point the
+/// synthesized relay proxy already carries the `targetPort`. Both ports are
+/// operator-declared on the same ServiceEntry, so accepting either never admits
+/// a destination the operator did not name.
+fn mesh_egress_udp_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let Some(mesh) = mesh else {
+        return false;
+    };
+    if mesh.egress_udp_destinations.is_empty() {
+        return false;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.egress_udp_destinations.iter().any(|dest| {
+        (dest.port == port || dest.dial_port == port) && dest.host.eq_ignore_ascii_case(host)
+    })
+}
+
 fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     let Some(inner) = host
         .strip_prefix('[')
@@ -2300,9 +2358,18 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
 /// terminator where no inbound route is materialized. Returns `None` (caller
 /// 404s) when the authority is missing/portless or is not a safe local relay
 /// target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` selects the SECOND, narrower admission source used only by
+/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
+/// naming an external destination the EgressGateway's `ServiceEntry`-derived
+/// allowlist admits relays to that external host over a local `UdpSocket`, with
+/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
+/// relay never consults it, so a bare CONNECT stays bounded to loopback /
+/// slice-known workload targets exactly as before.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    is_udp_connect: bool,
 ) -> Option<Arc<Proxy>> {
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
@@ -2310,12 +2377,19 @@ fn build_inbound_hbone_relay_proxy(
     if host.is_empty() || port == 0 {
         return None;
     }
-    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return None;
+    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+        ));
     }
-    Some(Arc::new(
-        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-    ))
+    if is_udp_connect
+        && let Some(dial_port) = mesh_egress_udp_destination_dial_port(host, port, mesh)
+    {
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, dial_port),
+        ));
+    }
+    None
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -15878,6 +15952,29 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_bound_listener_and_mesh_direction(
+        listener, state, shutdown, tls_config, None,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_bound_listener`] with an explicit mesh traffic
+/// direction stamped on every accepted connection.
+///
+/// Mesh listeners are normally bound by `modes::mesh`, which owns the direction
+/// per listener descriptor. This variant exists so an out-of-process-free test
+/// harness can drive the direction-gated inbound paths — the transparent HBONE
+/// relay synthesis and the datagram-over-mesh UDP relay — over a pre-bound
+/// socket with a static mTLS `ServerConfig`, instead of standing up a full mesh
+/// runtime. It adds no behavior of its own: `None` is exactly the existing
+/// entry point.
+pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> Result<(), anyhow::Error> {
     let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
@@ -15906,7 +16003,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         },
         conn_semaphore,
         shutdown,
-        None,
+        mesh_direction,
         0,
         SourceIpOverride::none(),
         None,
@@ -24623,10 +24720,17 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
+            // A UDP CONNECT additionally consults the EgressGateway's
+            // ServiceEntry-derived external-destination allowlist (issue #3263),
+            // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+                build_inbound_hbone_relay_proxy(
+                    req.uri().authority(),
+                    epoch.config.mesh.as_deref(),
+                    is_udp_hbone_connect,
+                )
             } else {
                 None
             };
@@ -50036,7 +50140,7 @@ mod tests {
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .rfind("build_inbound_hbone_relay_proxy(")
             .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
         assert!(
             relay_pos < gate_pos,
@@ -51919,7 +52023,7 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
             .expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.backend_host, "fd00:10:244:1::4");
