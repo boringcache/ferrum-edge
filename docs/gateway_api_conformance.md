@@ -81,7 +81,8 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace. `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. |
-| Invalid backend references | Yes | Missing Services, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
+| Invalid backend references | Yes | Missing Services/ServiceImports, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
+| MCS `ServiceImport` backendRefs | Partial (Ferrum translation/status; not an upstream conformance feature claim) | GEP-1748 Extended: `group: multicluster.x-k8s.io` / `kind: ServiceImport` resolves through the same typed backend-kind adapter as core `Service`, including ReferenceGrant authorization, port existence checks, ClusterSet DNS (`*.svc.clusterset.local`), and optional MCS-labeled EndpointSlice expansion when pod discovery is enabled. The MCS CRD is watched when present and skipped cleanly when absent. Upstream profiles/features remain unchanged — this is not advertised as a Gateway API conformance claim. |
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
@@ -292,10 +293,17 @@ and specified field-by-field in [`docs/configuration.md`](configuration.md)
 are summarized here because they are common conformance questions. These are
 single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 
-- **Invalid / unresolved backendRef** (missing Service, unsupported backend
+- **Invalid / unresolved backendRef** (missing Service or ServiceImport, unsupported backend
   kind, or an unpermitted cross-namespace ref) materializes a fail-closed route
   that returns **HTTP 500**, matching the Gateway API expectation. The
   black-box lab asserts the `/invalid` route returns `500`.
+- **MCS `ServiceImport` backendRefs** (`group: multicluster.x-k8s.io`) resolve
+  through the shared backend-kind adapter to ClusterSet DNS
+  (`{name}.{namespace}.svc.clusterset.local`) or ready EndpointSlice addresses
+  labeled `multicluster.kubernetes.io/service-name`. Cross-namespace imports
+  require a ReferenceGrant whose `to` names that group/kind. Missing imports and
+  unknown kinds stay fail-closed with `ResolvedRefs=False`
+  (`BackendNotFound` / `InvalidKind`).
 - **Zero-weight-only rule** (every `backendRef` in a matched rule has
   `weight: 0`) is *not* dropped. Ferrum keeps the route materialized and applies
   the same synthesized 100% fault-abort used for wholly invalid/unresolved

@@ -235,6 +235,15 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "xbackendtrafficpolicies",
         namespaced: true,
     },
+    // GEP-1748 Extended: MCS ServiceImport as a Gateway API backendRef target.
+    // Discovery skips cleanly when the MCS CRD is not installed.
+    CrdSpec {
+        group: "multicluster.x-k8s.io",
+        version: "v1alpha1",
+        kind: "ServiceImport",
+        plural: "serviceimports",
+        namespaced: true,
+    },
 ];
 
 pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
@@ -1498,6 +1507,13 @@ mod tests {
             resource.kind == "XBackendTrafficPolicy"
                 && resource.group == "gateway.networking.x-k8s.io"
                 && resource.version == "v1alpha1"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "ServiceImport"
+                && resource.group == "multicluster.x-k8s.io"
+                && resource.version == "v1alpha1"
+                && resource.plural == "serviceimports"
                 && resource.namespaced
         }));
     }

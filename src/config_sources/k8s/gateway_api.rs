@@ -5283,7 +5283,7 @@ fn backend_ref_fault_value_with_percentage(
 ) -> Value {
     let body = match reason {
         BackendRefFaultReason::InvalidKind => "Gateway API backendRef kind is unsupported",
-        BackendRefFaultReason::BackendNotFound => "Gateway API backendRef Service was not found",
+        BackendRefFaultReason::BackendNotFound => "Gateway API backendRef target was not found",
         BackendRefFaultReason::RefNotPermitted => {
             "Gateway API backendRef is not permitted by ReferenceGrant"
         }
@@ -5470,9 +5470,9 @@ fn route_backends(
         }
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
+        let (backend_kind, backend_namespace) =
             match checked_backend_namespace(object, backend_ref, acc, object.kind.as_str()) {
-                Ok(namespace) => namespace,
+                Ok(resolved) => resolved,
                 Err(error) if error_is_backend_ref_resolution(&error) => {
                     fault_reason.get_or_insert(backend_ref_resolution_reason(&error));
                     invalid_weight = invalid_weight.saturating_add(weight);
@@ -5488,44 +5488,33 @@ fn route_backends(
                     80
                 },
             );
-        if acc.has_observed_services()
-            && (!acc.service_exists(&backend_namespace, backend_name)
-                || !acc.service_port_exists(&backend_namespace, backend_name, backend_port))
-        {
+        if super::backend_ref::backend_target_missing(
+            acc,
+            backend_kind,
+            &backend_namespace,
+            backend_name,
+            backend_port,
+        ) {
             fault_reason.get_or_insert(BackendRefFaultReason::BackendNotFound);
             invalid_weight = invalid_weight.saturating_add(weight);
             continue;
         }
         valid_weight = valid_weight.saturating_add(weight);
-        let endpoint_backends = acc.endpoint_route_backends_for_service(
+        let endpoint_backends = super::backend_ref::materialize_backend(
+            acc,
+            backend_kind,
             &backend_namespace,
             backend_name,
             backend_port,
             weight,
         );
-        if !endpoint_backends.is_empty() {
-            backend_groups.push(RouteBackendGroup {
-                total_weight: weight,
-                expanded_endpoints: endpoint_backends.len() > 1,
-                backends: endpoint_backends,
-            });
-            continue;
-        }
+        // Match historical Service semantics: only multi-address EndpointSlice
+        // expansion triggers weight redistribution across targets.
+        let expanded_endpoints = endpoint_backends.len() > 1;
         backend_groups.push(RouteBackendGroup {
             total_weight: weight,
-            expanded_endpoints: false,
-            backends: vec![RouteBackend {
-                host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
-                port: backend_port,
-                weight,
-                service_namespace: Some(backend_namespace.clone()),
-                service_name: Some(backend_name.to_string()),
-                service_port: Some(backend_port),
-            }],
+            expanded_endpoints,
+            backends: endpoint_backends,
         });
     }
     let backends = flatten_route_backend_groups(backend_groups);
@@ -5639,7 +5628,8 @@ fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
 fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
-            message.contains("ReferenceGrant") || message.contains("only core Service")
+            message.contains("ReferenceGrant")
+                || super::backend_ref::message_is_unsupported_backend_kind(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -5648,7 +5638,7 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
 fn backend_ref_resolution_reason(error: &K8sTranslateError) -> BackendRefFaultReason {
     match error {
         K8sTranslateError::InvalidResource { message, .. }
-            if message.contains("only core Service") =>
+            if super::backend_ref::message_is_unsupported_backend_kind(message) =>
         {
             BackendRefFaultReason::InvalidKind
         }
@@ -5699,7 +5689,7 @@ fn l4_route_proxies(
         };
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
+        let (backend_kind, backend_namespace) =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
         let raw_backend_port =
             backend_ref
@@ -5713,11 +5703,56 @@ fn l4_route_proxies(
             raw_backend_port,
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
+        if matches!(
+            backend_kind,
+            super::backend_ref::BackendKind::ServiceImport
+        ) && super::backend_ref::backend_target_missing(
+            acc,
+            backend_kind,
+            &backend_namespace,
+            backend_name,
+            backend_port,
+        ) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "backendRef ServiceImport '{backend_namespace}/{backend_name}' port {backend_port} was not found"
+                ),
+            ));
+        }
 
         let listen_bindings = if materialized_listener_bindings.is_empty() {
             vec![(backend_port, string_array(&object.spec, "hostnames"))]
         } else {
             materialized_listener_bindings.clone()
+        };
+        // L4 Service backends keep historical cluster-local DNS materialization
+        // (no EndpointSlice expansion). ServiceImport uses the shared adapter
+        // (ClusterSet DNS or MCS-labeled EndpointSlice addresses).
+        let (backend_host, resolved_port) = match backend_kind {
+            super::backend_ref::BackendKind::Service => (
+                super::backend_ref::backend_dns_name(
+                    backend_kind,
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                backend_port,
+            ),
+            super::backend_ref::BackendKind::ServiceImport => {
+                let backends = super::backend_ref::materialize_backend(
+                    acc,
+                    backend_kind,
+                    &backend_namespace,
+                    backend_name,
+                    backend_port,
+                    1,
+                );
+                let Some(primary) = backends.first() else {
+                    continue;
+                };
+                (primary.host.clone(), primary.port)
+            }
         };
         for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
             let suffix = if listen_bindings.len() == 1 {
@@ -5737,12 +5772,8 @@ fn l4_route_proxies(
                 listen_path: None,
                 strip_listen_path: false,
                 preserve_host_header: false,
-                backend_host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
-                backend_port,
+                backend_host: backend_host.clone(),
+                backend_port: resolved_port,
                 upstream_id: None,
                 backend_scheme: scheme,
                 listen_port: Some(*listen_port),
@@ -5785,63 +5816,8 @@ fn checked_backend_namespace(
     backend_ref: &Value,
     acc: &K8sAccumulator,
     from_kind: &str,
-) -> Result<String, K8sTranslateError> {
-    let backend_namespace =
-        string_field(backend_ref, "namespace").unwrap_or(&object.metadata.namespace);
-    let to_group = string_field(backend_ref, "group").unwrap_or_default();
-    let to_kind = string_field(backend_ref, "kind").unwrap_or("Service");
-    validate_supported_backend_ref(object, to_group, to_kind)?;
-
-    if backend_namespace == object.metadata.namespace {
-        return Ok(backend_namespace.to_string());
-    }
-
-    if acc.reference_grant_allows(
-        &object.metadata.namespace,
-        api_group(&object.api_version),
-        from_kind,
-        backend_namespace,
-        to_group,
-        to_kind,
-        string_field(backend_ref, "name"),
-    ) {
-        Ok(backend_namespace.to_string())
-    } else {
-        Err(invalid_resource(
-            object,
-            format!(
-                "{} backendRef to {} in namespace '{}' requires a matching ReferenceGrant",
-                from_kind, to_kind, backend_namespace
-            ),
-        ))
-    }
-}
-
-fn validate_supported_backend_ref(
-    object: &K8sObject,
-    to_group: &str,
-    to_kind: &str,
-) -> Result<(), K8sTranslateError> {
-    if to_group.is_empty() && to_kind == "Service" {
-        return Ok(());
-    }
-
-    Err(invalid_resource(
-        object,
-        format!(
-            "unsupported backendRef target group '{}' kind '{}'; only core Service backendRefs are supported",
-            to_group, to_kind
-        ),
-    ))
-}
-
-fn api_group(api_version: &str) -> &str {
-    // Core Kubernetes API versions such as "v1" have no slash; Gateway API
-    // represents that core group as the empty string in ReferenceGrant fields.
-    api_version
-        .split_once('/')
-        .map(|(group, _version)| group)
-        .unwrap_or_default()
+) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
+    super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind)
 }
 
 fn first_backend_ref<'a>(
@@ -11700,7 +11676,7 @@ mod tests {
         let result = translate_k8s_objects(&[service, route], options())
             .expect("missing Service port should translate to invalid backend behavior");
 
-        assert_invalid_backend_fault_route(&result, "Gateway API backendRef Service was not found");
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef target was not found");
     }
 
     #[test]

@@ -19,6 +19,11 @@ rules:
       - referencegrants
       - backendtlspolicies
     verbs: ["get", "list", "watch"]
+  # GEP-1748: MCS ServiceImport backendRef targets (skipped when CRD absent).
+  - apiGroups: ["multicluster.x-k8s.io"]
+    resources:
+      - serviceimports
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
       - namespaces
