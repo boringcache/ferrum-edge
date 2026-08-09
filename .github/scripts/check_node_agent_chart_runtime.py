@@ -94,6 +94,10 @@ FULL_LINE_HASH_COMMENT_RE = re.compile(r"(?m)^\s*#.*$")
 TRAILING_HASH_COMMENT_RE = re.compile(
     r"(?m)^(?P<code>(?:[^#'\"\n]|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")*?)\s+#.*$"
 )
+YAML_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+YAML_JSON_CODEPOINT_ESCAPE_RE = re.compile(
+    r"\\(?:x(?P<x>[0-9a-fA-F]{2})|u(?P<u>[0-9a-fA-F]{4})|U(?P<U>[0-9a-fA-F]{8}))"
+)
 
 # Reject a privileged field unless its value is a literal false. This catches
 # hard-coded true, inline YAML/JSON, and Helm expressions such as
@@ -136,6 +140,30 @@ def strip_chart_comments(text: str) -> str:
     return TRAILING_HASH_COMMENT_RE.sub(r"\g<code>", without_full)
 
 
+def normalize_interpreted_escapes(text: str) -> str:
+    """Expose YAML/JSON escapes before applying security regexes.
+
+    Kubernetes parses rendered YAML/JSON before it consumes fields such as
+    `hostPath.path` and `securityContext.privileged`. A raw-text scan must
+    therefore not let `dock\\u0065r.sock`, an escaped `privile\\u0067ed` key,
+    or a YAML double-quoted line continuation hide the value Kubernetes will
+    see. Decoding outside a quoted scalar can only create a conservative false
+    positive; it cannot make the gate more permissive.
+    """
+
+    joined = YAML_LINE_CONTINUATION_RE.sub("", text)
+
+    def decode(match: re.Match[str]) -> str:
+        raw = match.group("x") or match.group("u") or match.group("U")
+        assert raw is not None
+        value = int(raw, 16)
+        if value > 0x10FFFF:
+            return match.group(0)
+        return chr(value)
+
+    return YAML_JSON_CODEPOINT_ESCAPE_RE.sub(decode, joined).replace(r"\/", "/")
+
+
 def iter_scan_paths(root: Path) -> list[Path]:
     paths: set[Path] = set()
     missing: list[str] = []
@@ -163,7 +191,7 @@ def iter_scan_paths(root: Path) -> list[Path]:
 
 
 def scan_text(relative: str, text: str) -> list[str]:
-    content = strip_chart_comments(text)
+    content = normalize_interpreted_escapes(strip_chart_comments(text))
     findings: list[str] = []
     for match in PRIVILEGED_ASSIGNMENT_RE.finditer(content):
         value = match.group("value").strip().lower()
@@ -450,6 +478,15 @@ def run_self_test() -> list[str]:
         failures.append(
             "rendered Helm privileged assignment did not expose privileged: true"
         )
+    encoded_render = r'path: "\u002fvar\u002frun\u002fdock\u0065r\u002esock"'
+    if not scan_text("encoded-render", encoded_render):
+        failures.append("YAML/JSON codepoint escapes hid a prohibited socket path")
+    continued_render = 'path: "/var/run/dock\\\n  er.sock"'
+    if not scan_text("continued-render", continued_render):
+        failures.append("YAML line continuation hid a prohibited socket path")
+    encoded_privileged = r'"privile\u0067ed": true'
+    if not scan_text("encoded-privileged", encoded_privileged):
+        failures.append("escaped privileged key was not rejected")
 
     with tempfile.TemporaryDirectory(prefix="ferrum-chart-runtime-lint-") as tmp:
         good_root = Path(tmp) / "good"

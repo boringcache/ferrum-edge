@@ -43,10 +43,12 @@ import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
 
-# `git archive` records these as the only two blob modes a Git tree can carry
-# for a regular file. Anything else (symlink 120000, gitlink 160000) is not a
-# file this verifier is willing to execute.
-TRUSTED_FILE_MODES = frozenset((0o644, 0o755))
+# Git tracks only the executable bit for regular blobs (100644 / 100755), while
+# its default tar writer represents those as 0664 / 0775. Accept both canonical
+# filesystem and archive spellings, but no other permission shape; executable
+# parity with the checkout is still checked below. Anything else (including a
+# symlink 120000 or gitlink 160000) is not an input this verifier will execute.
+TRUSTED_FILE_MODES = frozenset((0o644, 0o664, 0o755, 0o775))
 # Bound a hostile archive so a crafted manifest cannot exhaust the runner.
 MAX_ARCHIVE_MEMBERS = 4096
 MAX_MEMBER_BYTES = 8 * 1024 * 1024
@@ -59,34 +61,50 @@ class TrustedActionError(Exception):
 def normalize_action_path(action_path: str) -> PurePosixPath:
     """Reject an action path that is absolute, empty, or contains `..`."""
 
-    text = action_path.strip().replace("\\", "/").strip("/")
+    raw = action_path.strip().replace("\\", "/")
+    if not raw:
+        raise TrustedActionError("action path must not be empty")
+    if raw.startswith("/") or (
+        len(raw) >= 3 and raw[1] == ":" and raw[2] == "/"
+    ):
+        raise TrustedActionError(f"action path must be relative: {action_path}")
+    text = raw.rstrip("/")
     if not text:
         raise TrustedActionError("action path must not be empty")
+    if any(part in ("", "..", ".") for part in text.split("/")):
+        raise TrustedActionError(
+            f"action path must not contain empty, '..', or '.' components: "
+            f"{action_path}"
+        )
     candidate = PurePosixPath(text)
     if candidate.is_absolute():
         raise TrustedActionError(f"action path must be relative: {action_path}")
-    for part in candidate.parts:
-        if part in ("..", "."):
-            raise TrustedActionError(
-                f"action path must not contain '..' or '.': {action_path}"
-            )
     return candidate
 
 
 def member_path(member_name: str) -> PurePosixPath:
     """Validate one archive member name as a relative, traversal-free path."""
 
-    text = member_name.replace("\\", "/").strip("/")
+    raw = member_name.replace("\\", "/")
+    if not raw:
+        raise TrustedActionError("trusted archive contains an unnamed member")
+    if raw.startswith("/") or (
+        len(raw) >= 3 and raw[1] == ":" and raw[2] == "/"
+    ):
+        raise TrustedActionError(
+            f"trusted archive member is absolute: {member_name}"
+        )
+    text = raw.rstrip("/")
     if not text:
         raise TrustedActionError("trusted archive contains an unnamed member")
+    if any(part in ("", "..", ".") for part in text.split("/")):
+        raise TrustedActionError(
+            f"trusted archive member contains an empty, '..', or '.' component: "
+            f"{member_name}"
+        )
     candidate = PurePosixPath(text)
     if candidate.is_absolute():
         raise TrustedActionError(f"trusted archive member is absolute: {member_name}")
-    for part in candidate.parts:
-        if part in ("..", "."):
-            raise TrustedActionError(
-                f"trusted archive member must not contain '..' or '.': {member_name}"
-            )
     return candidate
 
 
@@ -318,8 +336,9 @@ def run_self_test() -> list[str]:
     failures: list[str] = []
     action_dir = normalize_action_path(_ACTION_DIR)
     entries = [
-        ("action.yml", _ACTION_YML, 0o644),
-        ("bin/helper.sh", _HELPER_SH, 0o755),
+        # `git archive`'s default tar modes for tracked 100644 / 100755 blobs.
+        ("action.yml", _ACTION_YML, 0o664),
+        ("bin/helper.sh", _HELPER_SH, 0o775),
     ]
     manifest = _manifest_from_bytes(_archive_bytes(_ACTION_DIR, entries), action_dir)
     if set(manifest) != {"action.yml", "bin/helper.sh"}:
@@ -329,7 +348,10 @@ def run_self_test() -> list[str]:
 
     for label, path in (
         ("absolute", "/etc/passwd"),
+        ("Windows absolute", "C:\\Windows\\System32"),
         ("parent traversal", ".github/../../etc"),
+        ("dot component", ".github/./actions"),
+        ("empty component", ".github//actions"),
         ("empty", "   "),
     ):
         try:
@@ -346,6 +368,10 @@ def run_self_test() -> list[str]:
     escaping_member.size = 0
     sibling_member = tarfile.TarInfo(name=".github/actions/other-action/action.yml")
     sibling_member.size = 0
+    absolute_member = tarfile.TarInfo(name=f"/{_ACTION_DIR}/absolute.yml")
+    absolute_member.size = 0
+    dotted_member = tarfile.TarInfo(name=f"{_ACTION_DIR}/./dotted.yml")
+    dotted_member.size = 0
     escaping_directory = tarfile.TarInfo(name=".github/workflows")
     escaping_directory.type = tarfile.DIRTYPE
     escaping_directory.mode = 0o755
@@ -358,6 +384,12 @@ def run_self_test() -> list[str]:
         ),
         "sibling action member": _archive_bytes(
             _ACTION_DIR, entries, extra=[sibling_member]
+        ),
+        "absolute trusted member": _archive_bytes(
+            _ACTION_DIR, entries, extra=[absolute_member]
+        ),
+        "dotted trusted member": _archive_bytes(
+            _ACTION_DIR, entries, extra=[dotted_member]
         ),
         "escaping trusted directory": _archive_bytes(
             _ACTION_DIR, entries, extra=[escaping_directory]
