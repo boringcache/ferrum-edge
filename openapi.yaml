@@ -16483,12 +16483,22 @@ components:
         nested claim leaf paths, `request.headers[...]`, and
         `experimental.envoy.filters.<filter>[<key>]`.
         Values follow Istio's string-matcher grammar (`*` presence,
-        `<prefix>*`, `*<suffix>`, otherwise exact). Keys outside the documented
-        set — and malformed keys/values, non-numeric `destination.port` values,
-        malformed IP CIDRs, and collections over 64 `when[]` entries per rule or
-        256 values per list — are rejected during translation/config validation
-        with a field-specific diagnostic, so DENY conditions cannot silently
-        fail open.
+        `<prefix>*`, `*<suffix>`, otherwise exact — a mid-string `*` is literal
+        text) for every key EXCEPT the ones Istio compiles differently:
+        `source.ip`/`remote.ip`/`destination.ip` are CIDR blocks;
+        `source.serviceAccount` is an exact match over
+        `<namespace>/<service-account>` where a bare `<service-account>` is
+        resolved against the declaring policy's namespace and a `*` is rejected;
+        and `source.namespace` treats every `*` as an arbitrary substring at any
+        position, including mid-string and repeated stars. Keys outside the
+        documented set — and malformed keys/values, non-numeric
+        `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
+        with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
+        repeated/mid-string `*`, and collections over 64 `when[]` entries per
+        rule or 256 values per list (16 values of at most 320 bytes for
+        `source.serviceAccount`) — are rejected during translation/config
+        validation with a field-specific diagnostic, on both `values` and
+        `notValues`, so DENY conditions cannot silently fail open.
         An attribute the path CAN source but that this request lacks follows
         ordinary Istio semantics (a `values` check fails; a `notValues`-only
         check passes). An attribute the path can NEVER source — an HTTP-only key

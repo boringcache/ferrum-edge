@@ -950,18 +950,27 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
     );
 }
 
-/// Istio's `StringMatcherWithPrefix` grammar, verbatim: `*` is presence, a
-/// trailing `*` is a prefix match, a leading `*` is a suffix match, and a
-/// mid-string `*` is an exact match on the literal text.
+/// Istio's `StringMatcherWithPrefix` grammar, verbatim, for the keys that
+/// actually compile to it: `*` is presence, a trailing `*` is a prefix match, a
+/// leading `*` is a suffix match, and a mid-string `*` is an exact match on the
+/// literal text.
+///
+/// This is NOT the grammar for every condition key — `source.serviceAccount` and
+/// `source.namespace` compile to their own Istio matchers, covered by
+/// [`authz_source_service_account_condition_is_exact_and_namespace_relative`] and
+/// [`authz_source_namespace_condition_treats_every_star_as_a_wildcard`].
 #[test]
 fn authz_condition_values_follow_istio_string_matcher_grammar() {
     register_feature!(
         category = CATEGORY,
         feature = "when-condition value grammar (presence / prefix / suffix / exact)",
         status = Status::Supported,
-        notes = "Matches Istio's matcher.StringMatcherWithPrefix: '*' presence, '<prefix>*' \
-                 prefix, '*<suffix>' suffix, anything else exact — including a mid-string '*', \
-                 which Istio also treats as a literal exact match.",
+        notes = "Matches Istio's matcher.StringMatcherWithPrefix for the keys that compile to \
+                 it: '*' presence, '<prefix>*' prefix, '*<suffix>' suffix, anything else exact — \
+                 including a mid-string '*', which Istio also treats as a literal exact match. \
+                 source.serviceAccount (exact, namespace-relative) and source.namespace (every \
+                 '*' is an arbitrary substring) have their own Istio grammars and are covered \
+                 separately.",
     );
 
     let deny_prefix = condition_policy(
@@ -1059,4 +1068,232 @@ fn header_request(name: &str, value: &str) -> MeshAuthzRequest {
         protocol: MeshAuthzProtocol::Http,
         ..MeshAuthzRequest::default()
     }
+}
+
+fn source_attribute_request(key: &str, value: &str) -> MeshAuthzRequest {
+    let mut attributes = std::collections::BTreeMap::new();
+    let attribute = MeshAuthzAttribute::Scalar(value.to_string());
+    attributes.insert(key.to_string(), attribute);
+    MeshAuthzRequest {
+        attributes,
+        protocol: MeshAuthzProtocol::Http,
+        ..MeshAuthzRequest::default()
+    }
+}
+
+fn deny_condition(key: &str, values: Value) -> MeshPolicy {
+    condition_policy("DENY", key, values, Value::Null)
+}
+
+fn denied() -> MeshAuthzDecision {
+    MeshAuthzDecision::Deny {
+        policy: "authz-under-test".to_string(),
+    }
+}
+
+/// Istio compiles `source.serviceAccount` to an EXACT matcher over
+/// `<namespace>/<service-account>` (`serviceAccountRegex` in
+/// `pilot/pkg/security/authz/model/generator.go`), and a bare
+/// `<service-account>` is resolved against the namespace of the
+/// `AuthorizationPolicy` that declared it — so the same policy text means
+/// different things in different namespaces.
+#[test]
+fn authz_source_service_account_condition_is_exact_and_namespace_relative() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when: source.serviceAccount (exact, namespace-relative)",
+        status = Status::Supported,
+        notes = "A bare '<service-account>' resolves against the declaring AuthorizationPolicy's \
+                 namespace, matching Istio's serviceAccountRegex; the explicit \
+                 '<namespace>/<service-account>' form is namespace-independent. The key is \
+                 matched exactly — the generic string matcher is NOT used, and wildcards are \
+                 rejected at translation rather than installed as conditions that can never \
+                 fire.",
+    );
+
+    let bare = deny_condition("source.serviceAccount", json!(["checkout"]));
+    assert_eq!(bare.namespace, "default");
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&bare),
+            &source_attribute_request("source.serviceAccount", "default/checkout")
+        ),
+        denied(),
+        "a bare service account must resolve against the policy's own namespace"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&bare),
+            &source_attribute_request("source.serviceAccount", "payments/checkout")
+        ),
+        MeshAuthzDecision::Allow,
+        "the same bare value must not match an identically named account in another namespace"
+    );
+
+    // The identical policy text, owned by another namespace, follows it.
+    let mut relocated = bare.clone();
+    relocated.namespace = "payments".to_string();
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&relocated),
+            &source_attribute_request("source.serviceAccount", "payments/checkout")
+        ),
+        denied(),
+        "a bare service account is relative to the OWNING policy namespace"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&relocated),
+            &source_attribute_request("source.serviceAccount", "default/checkout")
+        ),
+        MeshAuthzDecision::Allow
+    );
+
+    // The explicit form is namespace-independent and still exact.
+    let explicit = deny_condition("source.serviceAccount", json!(["payments/checkout"]));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&explicit),
+            &source_attribute_request("source.serviceAccount", "payments/checkout")
+        ),
+        denied()
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&explicit),
+            &source_attribute_request("source.serviceAccount", "payments/checkout-canary")
+        ),
+        MeshAuthzDecision::Allow,
+        "source.serviceAccount is exact — it must not behave as a prefix match"
+    );
+}
+
+/// Istio's `srcNamespaceGenerator` rewrites EVERY `*` in a `source.namespace`
+/// value to `.*`, so a mid-string or repeated star is a real wildcard here even
+/// though it is literal text for the generic string matcher.
+#[test]
+fn authz_source_namespace_condition_treats_every_star_as_a_wildcard() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when: source.namespace (arbitrary-position wildcard)",
+        status = Status::Supported,
+        notes = "srcNamespaceGenerator replaces every '*' with '.*', so leading, trailing, \
+                 mid-string, and repeated stars all behave as arbitrary substrings. This \
+                 deliberately differs from matcher.StringMatcherWithPrefix, where a mid-string \
+                 '*' is literal text.",
+    );
+
+    let middle = deny_condition("source.namespace", json!(["pr*d"]));
+    for namespace in ["prod", "pr-team-d"] {
+        assert_eq!(
+            evaluate_mesh_authorization_policies(
+                std::slice::from_ref(&middle),
+                &source_attribute_request("source.namespace", namespace)
+            ),
+            denied(),
+            "a mid-string '*' is an arbitrary substring for source.namespace ({namespace})"
+        );
+    }
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&middle),
+            &source_attribute_request("source.namespace", "staging")
+        ),
+        MeshAuthzDecision::Allow
+    );
+
+    let repeated = deny_condition("source.namespace", json!(["*pay*ments*"]));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&repeated),
+            &source_attribute_request("source.namespace", "eu-pay-core-ments-1")
+        ),
+        denied(),
+        "repeated stars are each an arbitrary substring"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&repeated),
+            &source_attribute_request("source.namespace", "eu-ments-core-pay-1")
+        ),
+        MeshAuthzDecision::Allow,
+        "the literal segments must still appear in order"
+    );
+
+    // A star-free value stays exact.
+    let exact = deny_condition("source.namespace", json!(["prod"]));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&exact),
+            &source_attribute_request("source.namespace", "production")
+        ),
+        MeshAuthzDecision::Allow
+    );
+}
+
+/// `source.trustDomain` keeps the presence / prefix / suffix matcher, which is
+/// only correct because Istio's restricted `CheckTrustDomainValues` grammar is
+/// enforced at admission on both value directions.
+#[test]
+fn authz_source_service_account_and_trust_domain_grammars_fail_closed_at_translation() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when: source.serviceAccount / source.trustDomain value grammars",
+        status = Status::Supported,
+        notes = "CheckServiceAccount (exact '<namespace>/<service-account>' or bare \
+                 '<service-account>', no '*', at most one '/') and CheckTrustDomainValues \
+                 (exact, presence '*', one leading or one trailing '*', no '/') are enforced on \
+                 both values and notValues. A value that would silently never match is \
+                 fail-OPEN for a DENY, so it is rejected instead.",
+    );
+
+    let rejected: &[(&str, &str, &str)] = &[
+        ("source.serviceAccount", "*", "must not contain '*'"),
+        ("source.serviceAccount", "payments/*", "must not contain '*'"),
+        ("source.serviceAccount", "a/b/c", "at most one '/'"),
+        ("source.serviceAccount", "/checkout", "non-empty namespace"),
+        ("source.trustDomain", "clus*er.local", "leading or trailing wildcard"),
+        ("source.trustDomain", "*a*b*", "at most one '*'"),
+        ("source.trustDomain", "cluster.local/ns", "must not contain '/'"),
+    ];
+
+    for (key, value, reason) in rejected {
+        let values_message = condition_translation_error(key, json!([value]));
+        assert!(
+            values_message.contains(reason) && values_message.contains("values[0]"),
+            "'{key}' values '{value}' must fail closed with '{reason}': {values_message}"
+        );
+
+        let not_values_message = translate_k8s_objects(
+            &[authz_policy(json!({
+                "action": "DENY",
+                "rules": [{"when": [{"key": key, "notValues": [value]}]}]
+            }))],
+            options(),
+        )
+        .expect_err("a malformed notValues entry must fail closed")
+        .to_string();
+        assert!(
+            not_values_message.contains(reason) && not_values_message.contains("notValues[0]"),
+            "'{key}' notValues '{value}' must fail closed with '{reason}': {not_values_message}"
+        );
+    }
+
+    // The admitted trust-domain shapes still evaluate through the presence /
+    // prefix / suffix matcher.
+    let suffix = deny_condition("source.trustDomain", json!(["*.local"]));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&suffix),
+            &source_attribute_request("source.trustDomain", "cluster.local")
+        ),
+        denied()
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&suffix),
+            &source_attribute_request("source.trustDomain", "cluster.remote")
+        ),
+        MeshAuthzDecision::Allow
+    );
 }

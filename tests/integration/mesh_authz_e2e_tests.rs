@@ -510,6 +510,119 @@ async fn condition_source_service_account_and_trust_domain_use_verified_spiffe_i
     }
 }
 
+/// Istio resolves a bare `when: source.serviceAccount` value against the
+/// namespace of the `AuthorizationPolicy` that declared it, so the plugin path
+/// must carry the owning policy's namespace into condition evaluation. The
+/// explicit `<namespace>/<service-account>` form stays namespace-independent,
+/// and both forms are matched EXACTLY (never as a prefix).
+#[tokio::test]
+async fn condition_bare_source_service_account_resolves_against_the_policy_namespace() {
+    // CLIENT_SPIFFE is `.../ns/default/sa/client`, i.e. attribute
+    // `default/client`.
+    let own_namespace = condition_policy(
+        "deny-bare-service-account",
+        PolicyAction::Deny,
+        "source.serviceAccount",
+        vec!["client"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![own_namespace.clone()]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    let decision = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(decision, PluginResult::Reject { .. }),
+        "a bare service account must match within the policy's own namespace"
+    );
+
+    let mut foreign_namespace = own_namespace.clone();
+    foreign_namespace.namespace = "payments".to_string();
+    let plugin = build_mesh_authz_for_workload(&[], vec![foreign_namespace]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    let decision = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(decision, PluginResult::Continue),
+        "the same bare value owned by another namespace must resolve to payments/client"
+    );
+
+    let mut explicit = condition_policy(
+        "deny-explicit-service-account",
+        PolicyAction::Deny,
+        "source.serviceAccount",
+        vec!["default/client"],
+        Vec::new(),
+    );
+    explicit.namespace = "payments".to_string();
+    let plugin = build_mesh_authz_for_workload(&[], vec![explicit]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    let decision = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(decision, PluginResult::Reject { .. }),
+        "the explicit form is namespace-independent"
+    );
+
+    let prefix_shaped = condition_policy(
+        "deny-prefix-shaped-service-account",
+        PolicyAction::Deny,
+        "source.serviceAccount",
+        vec!["default/cli"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![prefix_shaped]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    let decision = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(decision, PluginResult::Continue),
+        "source.serviceAccount is exact — it must never behave as a prefix match"
+    );
+}
+
+/// Istio's `srcNamespaceGenerator` turns every `*` in a `source.namespace` value
+/// into an arbitrary substring, including mid-string and repeated stars. The
+/// generic string matcher would treat those as literal text and silently never
+/// match, which is fail-OPEN for a DENY.
+#[tokio::test]
+async fn condition_source_namespace_supports_arbitrary_star_placement() {
+    for pattern in ["d*t", "*efaul*", "def*"] {
+        let deny = condition_policy(
+            "deny-source-namespace-glob",
+            PolicyAction::Deny,
+            "source.namespace",
+            vec![pattern],
+            Vec::new(),
+        );
+        let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+        let mut http = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+        let decision = plugin.authorize(&mut http).await;
+        assert!(
+            matches!(decision, PluginResult::Reject { .. }),
+            "'{pattern}' must match the peer namespace 'default' on the request path"
+        );
+
+        let mut stream = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+        let decision = plugin.on_stream_connect(&mut stream).await;
+        assert!(
+            matches!(decision, PluginResult::Reject { .. }),
+            "'{pattern}' must match the peer namespace 'default' on the stream path"
+        );
+    }
+
+    let unrelated = condition_policy(
+        "deny-unrelated-namespace",
+        PolicyAction::Deny,
+        "source.namespace",
+        vec!["p*ments"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![unrelated]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    let decision = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(decision, PluginResult::Continue),
+        "a wildcard whose literal segments are absent must not match"
+    );
+}
+
 #[tokio::test]
 async fn condition_match_on_jwt_list_claim_preserves_item_boundaries() {
     let allow_with_claim = MeshPolicy {

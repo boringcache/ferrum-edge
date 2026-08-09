@@ -3133,6 +3133,205 @@ fn mesh_policy_admits_experimental_envoy_filter_key_and_rejects_the_bare_form() 
     );
 }
 
+/// Istio compiles `source.serviceAccount` to an EXACT matcher
+/// (`pkg/config/security/security.go::CheckServiceAccount` +
+/// `serviceAccountRegex`), so a wildcard or multi-slash value would install a
+/// condition that can never fire — fail-OPEN for a DENY. Both `values` and
+/// `notValues` are checked; a bound on only one direction leaves the other open.
+#[test]
+fn mesh_policy_enforces_istio_source_service_account_value_grammar() {
+    for accepted in ["checkout", "payments/checkout"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.serviceAccount".into(),
+            values: vec![accepted.into()],
+            not_values: vec![accepted.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "'{accepted}' is a valid Istio source.serviceAccount value"
+        );
+    }
+
+    // Every rejected value embeds a distinctive token so the assertions can
+    // prove the diagnostic never echoes operator-supplied text.
+    let rejected: Vec<(String, &str)> = vec![
+        ("*".to_string(), "must not contain '*'"),
+        (format!("{ECHO_PROBE}*"), "must not contain '*'"),
+        (format!("ns/{ECHO_PROBE}/extra"), "at most one '/'"),
+        (format!("/{ECHO_PROBE}"), "non-empty namespace"),
+        (format!("{ECHO_PROBE}/"), "non-empty namespace"),
+    ];
+    for (value, reason) in &rejected {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("source.serviceAccount", direction, value);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]")) && e.contains(reason)
+                }),
+                "expected a '{reason}' diagnostic on {direction} for '{value}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a source.serviceAccount diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+}
+
+/// Distinctive token embedded in hostile condition values so a diagnostic that
+/// echoed operator-supplied text would be caught.
+const ECHO_PROBE: &str = "zzprobezz";
+
+fn errors_for_condition(key: &str, direction: &str, value: &str) -> Vec<String> {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    let entries = vec![value.to_string()];
+    policy.rules[0].when.push(ConditionMatch {
+        key: key.into(),
+        values: if direction == "values" {
+            entries.clone()
+        } else {
+            Vec::new()
+        },
+        not_values: if direction == "values" {
+            Vec::new()
+        } else {
+            entries
+        },
+    });
+    validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None)
+}
+
+/// Istio's stricter `CheckServiceAccount` bounds (16 entries, 320 bytes) apply
+/// on top of the common condition caps, on both value directions.
+#[test]
+fn mesh_policy_applies_istio_service_account_condition_bounds() {
+    let mut too_many = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_many.rules[0].when.push(ConditionMatch {
+        key: "source.serviceAccount".into(),
+        values: Vec::new(),
+        not_values: (0..20).map(|index| format!("sa{index}")).collect(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[too_many], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].not_values") && e.contains("at most 16 entries")
+        }),
+        "source.serviceAccount notValues must carry Istio's 16-entry bound, got: {errors:?}"
+    );
+
+    let mut too_long = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_long.rules[0].when.push(ConditionMatch {
+        key: "source.serviceAccount".into(),
+        values: vec!["a".repeat(400)],
+        not_values: Vec::new(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[too_long], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]") && e.contains("at most 320 UTF-8 bytes")
+        }),
+        "source.serviceAccount values must carry Istio's 320-byte bound, got: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains(&"a".repeat(400))),
+        "an oversized service-account value must never be echoed, got: {errors:?}"
+    );
+
+    // The common 512-byte / 256-entry caps still govern every other key.
+    let mut generic = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    generic.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: vec!["a".repeat(400)],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[generic], &[], &[], &[], None).is_empty(),
+        "the stricter service-account bound must not leak onto other condition keys"
+    );
+}
+
+/// Istio's `CheckTrustDomainValues` allows an exact value, presence `*`, one
+/// leading `*`, or one trailing `*`. A mid-string / repeated `*` would degrade
+/// to a literal exact match at runtime and a `/` is not a trust domain at all —
+/// both silently never match, which is fail-OPEN for a DENY.
+#[test]
+fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
+    for accepted in ["cluster.local", "*", "*.local", "cluster.*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.trustDomain".into(),
+            values: vec![accepted.into()],
+            not_values: vec![accepted.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "'{accepted}' is a valid Istio source.trustDomain value"
+        );
+    }
+
+    let rejected: Vec<(String, &str)> = vec![
+        (format!("{ECHO_PROBE}*local"), "leading or trailing wildcard"),
+        (format!("*{ECHO_PROBE}*"), "at most one '*'"),
+        (format!("{ECHO_PROBE}/ns"), "must not contain '/'"),
+    ];
+    for (value, reason) in &rejected {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("source.trustDomain", direction, value);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]")) && e.contains(reason)
+                }),
+                "expected a '{reason}' diagnostic on {direction} for '{value}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a source.trustDomain diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+}
+
+/// `source.namespace` keeps Istio's `srcNamespaceGenerator` grammar, where every
+/// `*` is an arbitrary substring. A mid-string or repeated star is therefore
+/// valid input and must not be rejected as it is for `source.trustDomain`.
+#[test]
+fn mesh_policy_admits_arbitrary_star_placement_in_source_namespace_conditions() {
+    for value in ["prod", "*", "pr*d", "*pay*ments*", "team-*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.namespace".into(),
+            values: vec![value.into()],
+            not_values: vec![value.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "Istio accepts '{value}' as a source.namespace condition value"
+        );
+    }
+}
+
 /// Hostile / unbounded condition input is rejected with field-specific
 /// diagnostics, and an oversized key is never echoed back into logs or
 /// Kubernetes status.

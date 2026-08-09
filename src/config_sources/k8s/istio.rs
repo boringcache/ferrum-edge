@@ -874,7 +874,7 @@ fn condition_match(
     // purpose: rejecting the resource drops the whole AuthorizationPolicy,
     // which is fail-OPEN for a DENY. The evaluator applies Istio's explicit
     // unsourceable-attribute semantics instead — see
-    // `crate::modes::mesh::policy::condition_key_is_sourceable`.
+    // `crate::modes::mesh::policy::condition_kind_is_sourceable`.
     if let Err(issues) = validate_mesh_condition(&condition)
         && let Some(issue) = issues.first()
     {

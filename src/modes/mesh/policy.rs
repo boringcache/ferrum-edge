@@ -140,7 +140,7 @@ where
 
     for policy in policies {
         for rule in &policy.rules {
-            if !rule_matches(rule, request, normalized_host.as_ref()) {
+            if !rule_matches(rule, request, normalized_host.as_ref(), &policy.namespace) {
                 continue;
             }
             match rule.action {
@@ -178,10 +178,15 @@ where
     MeshAuthzDecision::Allow
 }
 
+/// `policy_namespace` is the namespace of the owning [`MeshPolicy`] (the
+/// `AuthorizationPolicy`'s own namespace on the Kubernetes path). Istio resolves
+/// a bare `when: source.serviceAccount` value against it, so it has to reach
+/// condition evaluation.
 fn rule_matches(
     rule: &MeshRule,
     request: &MeshAuthzRequest,
     normalized_host: Option<&NormalizedHost>,
+    policy_namespace: &str,
 ) -> bool {
     if rule.never_matches {
         return false;
@@ -191,7 +196,7 @@ fn rule_matches(
         && matches_not_request_principals(&rule.not_request_principals, request)
         && matches_source_negation(&rule.source_negation, request)
         && matches_requests(&rule.to, request, rule.action, normalized_host)
-        && matches_conditions(&rule.when, request, rule.action)
+        && matches_conditions(&rule.when, request, rule.action, policy_namespace)
 }
 
 /// Enforce the conjunctive source-negative / IP-block matchers for one rule.
@@ -610,15 +615,40 @@ fn is_valid_authority_port(port: &str) -> bool {
     !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
+/// The per-condition facts value matching needs beyond the candidate and the
+/// attribute: the classified key kind and the namespace of the owning
+/// [`MeshPolicy`], which Istio resolves a bare `source.serviceAccount` value
+/// against.
+///
+/// `Copy` and borrow-only, built once per `when[]` entry — nothing is allocated
+/// or cloned per candidate on the request path.
+#[derive(Debug, Clone, Copy)]
+struct ConditionMatchContext<'a> {
+    kind: MeshConditionKeyKind,
+    policy_namespace: &'a str,
+}
+
 fn matches_conditions(
     matches: &[ConditionMatch],
     request: &MeshAuthzRequest,
     action: PolicyAction,
+    policy_namespace: &str,
 ) -> bool {
     matches.iter().all(|match_| {
         if match_.values.is_empty() && match_.not_values.is_empty() {
             return false;
         }
+        // Classify once per condition, not once per candidate: the key kind
+        // decides both the sourceability gate below and the value grammar the
+        // candidate loops use.
+        //
+        // An unclassifiable key is treated as unsourceable — config validation
+        // and Kubernetes translation both reject those before they can reach a
+        // live policy, so this is a defence-in-depth default, not a path
+        // operators can reach.
+        let Some(kind) = classify_mesh_condition_key(&match_.key) else {
+            return action == PolicyAction::Deny;
+        };
         // Istio semantics for an attribute this path can never observe (an
         // HTTP-only key on a TCP/UDP port, or a documented key Ferrum has no
         // input for at all). Both directions are fail-closed:
@@ -631,16 +661,20 @@ fn matches_conditions(
         // absent on a path that can source it (e.g. a header the client did
         // not send), which follows the ordinary values / notValues rules
         // below exactly as Istio compiles them.
-        if !condition_key_is_sourceable(&match_.key, request) {
+        if !condition_kind_is_sourceable(kind, request) {
             return action == PolicyAction::Deny;
         }
+        let context = ConditionMatchContext {
+            kind,
+            policy_namespace,
+        };
         let value = request.attributes.get(&match_.key);
         if !match_.values.is_empty()
             && !value.is_some_and(|value| {
                 match_
                     .values
                     .iter()
-                    .any(|candidate| condition_value_matches(&match_.key, candidate, value))
+                    .any(|candidate| condition_value_matches(context, candidate, value))
             })
         {
             return false;
@@ -650,7 +684,7 @@ fn matches_conditions(
                 match_
                     .not_values
                     .iter()
-                    .any(|candidate| condition_value_matches(&match_.key, candidate, value))
+                    .any(|candidate| condition_value_matches(context, candidate, value))
             })
         {
             return false;
@@ -659,39 +693,91 @@ fn matches_conditions(
     })
 }
 
-fn condition_value_matches(key: &str, candidate: &str, value: &MeshAuthzAttribute) -> bool {
+fn condition_value_matches(
+    context: ConditionMatchContext<'_>,
+    candidate: &str,
+    value: &MeshAuthzAttribute,
+) -> bool {
     match value {
-        MeshAuthzAttribute::Scalar(value) => condition_scalar_value_matches(key, candidate, value),
+        MeshAuthzAttribute::Scalar(value) => {
+            condition_scalar_value_matches(context, candidate, value)
+        }
         MeshAuthzAttribute::StringList(values) => values
             .iter()
-            .any(|value| condition_scalar_value_matches(key, candidate, value)),
+            .any(|value| condition_scalar_value_matches(context, candidate, value)),
     }
 }
 
-fn condition_scalar_value_matches(key: &str, candidate: &str, value: &str) -> bool {
-    if condition_key_is_ip(key) {
+/// Per-key `when[]` value grammar.
+///
+/// Most Istio condition keys compile to `matcher.StringMatcherWithPrefix`, but
+/// three deliberately do not, and each divergence is load-bearing:
+///
+/// * IP-valued keys (`source.ip` / `remote.ip` / `destination.ip`) are CIDR
+///   containment, not string matching.
+/// * `source.serviceAccount` is an EXACT match over
+///   `<namespace>/<service-account>`, with a bare `<service-account>` resolved
+///   against the owning policy's namespace (`serviceAccountRegex` in
+///   `pilot/pkg/security/authz/model/generator.go`). Shared validation rejects
+///   any `*` here, so there is no wildcard case to consider.
+/// * `source.namespace` compiles to a regex with EVERY `*` replaced by `.*`
+///   (`srcNamespaceGenerator`), i.e. an arbitrary-substring wildcard at any
+///   position — including mid-string and repeated stars, which the generic
+///   matcher would silently treat as literal text.
+///
+/// `source.trustDomain` keeps the generic matcher on purpose: shared validation
+/// already guarantees Istio's restricted `CheckTrustDomainValues` grammar
+/// (exact, presence `*`, one leading `*`, or one trailing `*`), which the
+/// presence / prefix / suffix matcher implements exactly.
+fn condition_scalar_value_matches(
+    context: ConditionMatchContext<'_>,
+    candidate: &str,
+    value: &str,
+) -> bool {
+    if context.kind.is_ip_valued() {
         return value
             .parse::<IpAddr>()
             .is_ok_and(|ip| cidr_contains(candidate, ip));
     }
-    istio_condition_string_match(candidate, value)
+    match context.kind {
+        MeshConditionKeyKind::SourceServiceAccount => {
+            istio_service_account_match(candidate, value, context.policy_namespace)
+        }
+        MeshConditionKeyKind::SourceNamespace => wildcard_match(candidate, value),
+        _ => istio_condition_string_match(candidate, value),
+    }
 }
 
-fn condition_key_is_ip(key: &str) -> bool {
-    classify_mesh_condition_key(key).is_some_and(MeshConditionKeyKind::is_ip_valued)
-}
-
-/// Can this evaluation context observe the attribute named by `key`?
+/// Istio's namespace-relative `source.serviceAccount` comparison.
 ///
-/// Separate from "is the attribute present": see the fail-closed branch in
-/// [`matches_conditions`]. An unclassifiable key is treated as unsourceable —
-/// config validation and Kubernetes translation both reject those before they
-/// can reach a live policy, so this is a defence-in-depth default, not a path
-/// operators can reach.
-fn condition_key_is_sourceable(key: &str, request: &MeshAuthzRequest) -> bool {
-    let Some(kind) = classify_mesh_condition_key(key) else {
+/// `value` is the materialized attribute, always `<namespace>/<service-account>`
+/// derived from the verified peer SPIFFE identity. `candidate` is the policy's
+/// configured value: either the same explicit form (compared verbatim) or a bare
+/// `<service-account>`, which Istio resolves against the namespace of the
+/// `AuthorizationPolicy` that declared it.
+///
+/// Allocation-free on the request path: the bare form compares the two halves of
+/// the attribute in place rather than building `<policy-namespace>/<candidate>`
+/// per candidate.
+///
+/// Fail-closed on degenerate input — a malformed attribute with no `/`, or a
+/// policy carrying an empty namespace, simply never satisfies the bare form.
+fn istio_service_account_match(candidate: &str, value: &str, policy_namespace: &str) -> bool {
+    if candidate.contains('/') {
+        return candidate == value;
+    }
+    let Some((namespace, service_account)) = value.split_once('/') else {
         return false;
     };
+    namespace == policy_namespace && service_account == candidate
+}
+
+/// Can this evaluation context observe the attribute of kind `kind`?
+///
+/// Separate from "is the attribute present": see the fail-closed branch in
+/// [`matches_conditions`], which also resolves an unclassifiable key as
+/// unsourceable before reaching this gate.
+fn condition_kind_is_sourceable(kind: MeshConditionKeyKind, request: &MeshAuthzRequest) -> bool {
     match kind {
         // No Envoy filter chain exists in Ferrum, so the dynamic metadata
         // Istio matches here is never populated on any protocol.
@@ -718,10 +804,14 @@ fn condition_key_is_sourceable(key: &str, request: &MeshAuthzRequest) -> bool {
     }
 }
 
-/// Istio's `when[]` value grammar, matching `matcher.StringMatcherWithPrefix`:
-/// `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is
-/// a suffix match, and everything else — including a mid-string `*` — is an
-/// exact match on the literal text.
+/// Istio's GENERIC `when[]` value grammar, matching
+/// `matcher.StringMatcherWithPrefix`: `*` is a presence check, a trailing `*` is
+/// a prefix match, a leading `*` is a suffix match, and everything else —
+/// including a mid-string `*` — is an exact match on the literal text.
+///
+/// This is not the grammar for every key. `source.serviceAccount` and
+/// `source.namespace` have their own Istio matchers; see
+/// [`condition_scalar_value_matches`] for the exceptions and why they exist.
 fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return !value.is_empty();
@@ -2577,6 +2667,12 @@ mod tests {
     /// Istio's `StringMatcherWithPrefix` only treats a leading or trailing `*`
     /// as a wildcard; a mid-string `*` is an exact match on the literal text.
     /// `pr*d` therefore does not match `prod`.
+    ///
+    /// This holds for the keys that compile to that matcher — `source.namespace`
+    /// does NOT (Istio's `srcNamespaceGenerator` rewrites every `*` to `.*`), so
+    /// the key here is deliberately a `request.headers[...]` one. The
+    /// `source.namespace` behaviour is covered by the conformance and
+    /// `mesh_authz` e2e suites.
     #[test]
     fn condition_values_treat_middle_globs_as_literal_text() {
         let slice = MeshSlice {

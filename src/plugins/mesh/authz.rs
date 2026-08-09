@@ -212,7 +212,7 @@ struct HttpConditionNetworkAttrs {
 // "This path can never source the attribute" is a different fact and is NOT
 // expressed by omission — it is carried on `MeshAuthzRequest` as
 // `protocol` / typed transport IP evidence and resolved by
-// `crate::modes::mesh::policy::condition_key_is_sourceable`, which fails closed
+// `crate::modes::mesh::policy::condition_kind_is_sourceable`, which fails closed
 // (an ALLOW/AUDIT rule cannot match; a DENY rule ignores the field and still
 // matches). Encoding it as a missing attribute instead would let an
 // `experimental.envoy.filters.*` or HTTP-only `notValues` condition satisfy an
@@ -427,9 +427,15 @@ impl ConditionAttributeKeys {
                 } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
                     self.claim_keys.insert(key.to_string());
                 }
-                // Other keys (unsourced or unknown) are deliberately not
-                // tracked; the evaluator treats them as absent (see note on
-                // `ConditionAttributeKeys`).
+                // Anything left is an `experimental.envoy.filters.*` key or a
+                // key config validation rejects. Neither has an attribute to
+                // materialize, and the evaluator resolves BOTH as
+                // UNSOURCEABLE via
+                // `crate::modes::mesh::policy::condition_kind_is_sourceable`
+                // (DENY still matches, ALLOW/AUDIT never matches) — not as a
+                // merely absent attribute. Do not "fix" a miss here by adding
+                // an omission-means-absent branch; see the note above
+                // `ATTR_SOURCE_PRINCIPAL`.
             }
         }
     }

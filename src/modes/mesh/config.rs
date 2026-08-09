@@ -735,6 +735,14 @@ pub const MAX_MESH_CONDITION_VALUES: usize = 256;
 /// Upper bound on `when[]` entries in a single rule. Conditions are conjunctive
 /// and walked in order on every matching request.
 pub const MAX_MESH_RULE_CONDITIONS: usize = 64;
+/// Istio's own `source.serviceAccount` list bound
+/// (`pkg/config/security/security.go::CheckServiceAccount`). Stricter than the
+/// common [`MAX_MESH_CONDITION_VALUES`], so it applies on top of it for that one
+/// key rather than replacing the shared cap for everything else.
+pub const MAX_MESH_SERVICE_ACCOUNT_CONDITION_VALUES: usize = 16;
+/// Istio's own `source.serviceAccount` per-value byte bound, from the same
+/// `CheckServiceAccount` check. Stricter than [`MAX_MESH_CONDITION_VALUE_LEN`].
+pub const MAX_MESH_SERVICE_ACCOUNT_CONDITION_VALUE_LEN: usize = 320;
 
 /// Typed classification of an Istio `AuthorizationPolicy` `when[].key`.
 ///
@@ -751,11 +759,16 @@ pub enum MeshConditionKeyKind {
     /// `source.principal` — peer SPIFFE identity in Istio's scheme-less form.
     SourcePrincipal,
     /// `source.namespace` — namespace segment of the peer SPIFFE identity.
+    /// Istio's `srcNamespaceGenerator` rewrites every `*` to `.*`, so this key
+    /// takes an arbitrary-position wildcard, NOT the generic string matcher.
     SourceNamespace,
     /// `source.serviceAccount` — `<namespace>/<service-account>` derived from
-    /// the peer SPIFFE identity.
+    /// the peer SPIFFE identity. Matched EXACTLY, with a bare
+    /// `<service-account>` resolved against the owning policy's namespace.
     SourceServiceAccount,
-    /// `source.trustDomain` — trust domain of the peer SPIFFE identity.
+    /// `source.trustDomain` — trust domain of the peer SPIFFE identity. Keeps
+    /// the presence / prefix / suffix matcher, under Istio's restricted
+    /// `CheckTrustDomainValues` grammar enforced at admission.
     SourceTrustDomain,
     /// `source.ip` — immediate downstream socket peer. CIDR-valued.
     SourceIp,
@@ -983,27 +996,39 @@ pub fn validate_mesh_condition(
         issues.push(MeshConditionIssue::key("must set values or notValues"));
     }
 
+    // Istio bounds `source.serviceAccount` more tightly than the generic
+    // string-matcher keys. Both directions (`values` and `notValues`) get the
+    // same treatment: a bound that applied to only one of them would leave the
+    // other as an unbounded per-request walk.
+    let (max_values, max_value_len) = match kind {
+        MeshConditionKeyKind::SourceServiceAccount => (
+            MAX_MESH_SERVICE_ACCOUNT_CONDITION_VALUES,
+            MAX_MESH_SERVICE_ACCOUNT_CONDITION_VALUE_LEN,
+        ),
+        _ => (MAX_MESH_CONDITION_VALUES, MAX_MESH_CONDITION_VALUE_LEN),
+    };
+
     for (field, values) in [
         (MeshConditionField::Values, &condition.values),
         (MeshConditionField::NotValues, &condition.not_values),
     ] {
-        if values.len() > MAX_MESH_CONDITION_VALUES {
+        if values.len() > max_values {
             issues.push(MeshConditionIssue {
                 field,
                 index: None,
-                reason: format!("must have at most {MAX_MESH_CONDITION_VALUES} entries"),
+                reason: format!("must have at most {max_values} entries"),
             });
         }
-        for (index, value) in values.iter().take(MAX_MESH_CONDITION_VALUES).enumerate() {
+        for (index, value) in values.iter().take(max_values).enumerate() {
             if value.is_empty() {
                 issues.push(MeshConditionIssue::value(field, index, "must not be empty"));
                 continue;
             }
-            if value.len() > MAX_MESH_CONDITION_VALUE_LEN {
+            if value.len() > max_value_len {
                 issues.push(MeshConditionIssue::value(
                     field,
                     index,
-                    format!("must be at most {MAX_MESH_CONDITION_VALUE_LEN} UTF-8 bytes"),
+                    format!("must be at most {max_value_len} UTF-8 bytes"),
                 ));
                 continue;
             }
@@ -1033,12 +1058,31 @@ pub fn validate_mesh_condition(
                         "must be a numeric port in 0..=65535",
                     ));
                 }
+                // Istio gives `source.serviceAccount` and `source.trustDomain`
+                // their own value grammars instead of the generic string
+                // matcher. Enforcing them here is what lets the evaluator use
+                // an exact matcher for the first and keep the presence /
+                // leading / trailing matcher for the second.
+                MeshConditionKeyKind::SourceServiceAccount => {
+                    if let Err(reason) = validate_mesh_condition_service_account(value) {
+                        issues.push(MeshConditionIssue::value(field, index, reason));
+                    }
+                }
+                MeshConditionKeyKind::SourceTrustDomain => {
+                    if let Err(reason) = validate_mesh_condition_trust_domain(value) {
+                        issues.push(MeshConditionIssue::value(field, index, reason));
+                    }
+                }
                 _ => {
-                    // Istio string-match values are exact / `*` (presence) /
-                    // `<prefix>*` / `*<suffix>`; anything else — including a
-                    // mid-string `*` — is an exact match on the literal text.
-                    // The evaluator implements that grammar verbatim, so there
-                    // is nothing further to reject here.
+                    // The remaining string-match keys follow Istio's
+                    // `matcher.StringMatcherWithPrefix` grammar: exact / `*`
+                    // (presence) / `<prefix>*` / `*<suffix>`; anything else —
+                    // including a mid-string `*` — is an exact match on the
+                    // literal text. `source.namespace` is deliberately in this
+                    // arm as well: Istio's `srcNamespaceGenerator` accepts a
+                    // `*` at ANY position (each one becomes an arbitrary
+                    // substring), so there is nothing to reject there either.
+                    // The evaluator implements both grammars verbatim.
                 }
             }
         }
@@ -1048,6 +1092,69 @@ pub fn validate_mesh_condition(
         Ok(kind)
     } else {
         Err(issues)
+    }
+}
+
+/// Istio's `source.serviceAccount` value grammar
+/// (`pkg/config/security/security.go::CheckServiceAccount`): either an explicit
+/// `<namespace>/<service-account>` or a bare `<service-account>` that is
+/// resolved against the namespace of the `AuthorizationPolicy` that declared it.
+///
+/// Wildcards are rejected outright. Istio compiles this key to an EXACT matcher
+/// (`serviceAccountRegex` in `pilot/pkg/security/authz/model/generator.go`), so
+/// admitting a `*` would install a condition that can never match — silently
+/// fail-OPEN for a DENY. Diagnostics never echo the operator-supplied value.
+fn validate_mesh_condition_service_account(value: &str) -> Result<(), &'static str> {
+    if value.contains('*') {
+        return Err(
+            "must not contain '*' (source.serviceAccount is matched exactly; use \
+             '<namespace>/<service-account>' or a bare '<service-account>' relative to \
+             the policy namespace)",
+        );
+    }
+    let mut segments = value.split('/');
+    let namespace = segments.next().unwrap_or_default();
+    let Some(service_account) = segments.next() else {
+        // Bare `<service-account>`, resolved against the policy namespace.
+        return if namespace.is_empty() {
+            Err("must not be empty")
+        } else {
+            Ok(())
+        };
+    };
+    if segments.next().is_some() {
+        return Err(
+            "must be '<namespace>/<service-account>' or a bare '<service-account>' \
+             (at most one '/')",
+        );
+    }
+    if namespace.is_empty() || service_account.is_empty() {
+        return Err(
+            "must be '<namespace>/<service-account>' with a non-empty namespace and \
+             service account",
+        );
+    }
+    Ok(())
+}
+
+/// Istio's `source.trustDomain` value grammar
+/// (`pkg/config/security/security.go::CheckTrustDomainValues`): an exact trust
+/// domain, the presence wildcard `*`, one LEADING wildcard, or one TRAILING
+/// wildcard. Multiple or mid-string wildcards, and any `/`, are rejected.
+///
+/// Guaranteeing this shape at admission is what lets the evaluator keep the
+/// presence / prefix / suffix matcher for this key: a mid-string `*` would
+/// otherwise degrade to a literal exact match that can never fire, which is
+/// fail-OPEN for a DENY. Diagnostics never echo the operator-supplied value.
+fn validate_mesh_condition_trust_domain(value: &str) -> Result<(), &'static str> {
+    if value.contains('/') {
+        return Err("must not contain '/' (a trust domain is a single segment)");
+    }
+    match value.matches('*').count() {
+        0 => Ok(()),
+        1 if value.starts_with('*') || value.ends_with('*') => Ok(()),
+        1 => Err("supports '*' only as a leading or trailing wildcard"),
+        _ => Err("supports at most one '*', as a leading or trailing wildcard"),
     }
 }
 
