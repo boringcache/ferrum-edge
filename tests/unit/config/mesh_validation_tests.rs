@@ -3125,16 +3125,7 @@ fn mesh_policy_admits_experimental_envoy_filter_key_and_rejects_the_bare_form() 
         not_values: Vec::new(),
     });
     assert!(
-        validate_mesh_config(
-            &[],
-            &[],
-            &[admitted_with_bracket],
-            &[],
-            &[],
-            &[],
-            None
-        )
-        .is_empty(),
+        validate_mesh_config(&[], &[], &[admitted_with_bracket], &[], &[], &[], None).is_empty(),
         "Istio treats the first '[' and final ']' as delimiters, so an interior bracket remains part of the metadata key"
     );
 
