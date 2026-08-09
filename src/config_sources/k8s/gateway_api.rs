@@ -5542,36 +5542,57 @@ fn route_host_scopes_for_path(inputs: RouteHostScopeInputs<'_>) -> Vec<RouteHost
             continue;
         }
 
+        // Group by the RESOLVED LISTENER, not by parentRef. The materialized
+        // proxy id is keyed by `(hostname, listener)`, so two parentRef
+        // selectors that name the *same* listener — `{name: edge}` beside
+        // `{name: edge, sectionName: http}`, or a `sectionName` and a `port`
+        // reference to one listener — would otherwise emit two scopes carrying
+        // an identical id. The duplicate re-enters `merge_http_route_proxy`
+        // with no plugins of its own (the first copy already claimed them),
+        // which clears `reject_unmatched` on the surviving dispatch plugin and
+        // serves every non-matching request on that host+path to the default
+        // backend — a fail-open on header/method/query match predicates.
+        //
+        // One scope per listener carrying every parentRef that resolved it is
+        // both the correct claim and the correct attachment record. Cross-kind
+        // arbitration decides losses per `(route, listener)`, so every parentRef
+        // in one group always agrees about a loss on that listener.
+        let mut by_listener: BTreeMap<GatewayApiListenerKey, Vec<String>> = BTreeMap::new();
         for (parent_ref, listener_keys) in resolved {
             for listener_key in listener_keys {
-                let parent_refs = vec![parent_ref.clone()];
-                let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
-                    !descriptor_conflicts_for_host(
-                        &parent_refs,
-                        route_family,
-                        hostname,
-                        descriptor,
-                        Some(&listener_key),
-                        losing_conflict_keys,
-                    )
-                });
-                if !has_surviving_match {
-                    continue;
-                }
-                // The suffix carries the listener identity, not just its port:
-                // two Gateways can expose same-named hostnames on one port, and
-                // a port-only suffix would collide their proxy IDs.
-                let listener_suffix = listener_id_suffix(&listener_key);
-                scopes.push(RouteHostScope {
-                    proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
-                    conflict_hostname: hostname.clone(),
-                    parent_refs,
-                    listen_port: listener_policy_port(acc, &listener_key),
-                    requires_tls: listener_policy_requires_tls(acc, &listener_key),
-                    listener: Some(listener_key),
-                    suffix: Some(format!("host{host_index}-{listener_suffix}")),
-                });
+                by_listener
+                    .entry(listener_key)
+                    .or_default()
+                    .push(parent_ref.clone());
             }
+        }
+        for (listener_key, parent_refs) in by_listener {
+            let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
+                !descriptor_conflicts_for_host(
+                    &parent_refs,
+                    route_family,
+                    hostname,
+                    descriptor,
+                    Some(&listener_key),
+                    losing_conflict_keys,
+                )
+            });
+            if !has_surviving_match {
+                continue;
+            }
+            // The suffix carries the listener identity, not just its port:
+            // two Gateways can expose same-named hostnames on one port, and
+            // a port-only suffix would collide their proxy IDs.
+            let listener_suffix = listener_id_suffix(&listener_key);
+            scopes.push(RouteHostScope {
+                proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
+                conflict_hostname: hostname.clone(),
+                parent_refs,
+                listen_port: listener_policy_port(acc, &listener_key),
+                requires_tls: listener_policy_requires_tls(acc, &listener_key),
+                listener: Some(listener_key),
+                suffix: Some(format!("host{host_index}-{listener_suffix}")),
+            });
         }
     }
 

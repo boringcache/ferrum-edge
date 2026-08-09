@@ -173,11 +173,15 @@ impl GatewayListenerPlan {
                 }
                 continue;
             }
+            // `reserved_gateway_ports()` covers the admin and CP gRPC
+            // listeners, the mesh UDP capture socket, and the process-global
+            // proxy ports this gateway did not adopt as a same-class frontend
+            // above — name the set rather than guessing which member it was.
             if reserved.contains(&port) {
                 refused.entry(port).or_insert_with(|| {
                     format!(
-                        "port {port} is already owned by an admin/control-plane listener; the \
-                         Gateway listener is not bound"
+                        "port {port} is reserved by another Ferrum listener \
+                         (proxy/admin/control-plane/capture); the Gateway listener is not bound"
                     )
                 });
                 continue;

@@ -537,3 +537,59 @@ fn a_resolved_grpcroute_listener_still_stamps_the_port_on_the_claim() {
         "a resolved GRPCRoute listener must record a materialized parent"
     );
 }
+
+/// Two parentRef selectors can name the SAME Gateway listener — `{name: edge}`
+/// beside `{name: edge, sectionName: http}`, or a `sectionName` and a `port`
+/// reference to one listener. The materialized proxy id is keyed by
+/// `(hostname, listener)`, so both claims must collapse into ONE scope that
+/// carries both parentRefs.
+///
+/// Emitting one scope per parentRef produced two proxies with an identical id.
+/// The duplicate then re-entered the same-listener merge carrying no plugins of
+/// its own (the first copy had already claimed them), which cleared
+/// `reject_unmatched` on the surviving dispatch plugin — serving every request
+/// that does not satisfy the route's header predicate to the default backend.
+#[test]
+fn two_parent_refs_naming_one_listener_collapse_into_a_single_claim() {
+    let route = object(
+        "HTTPRoute",
+        "sample",
+        json!({
+            "parentRefs": [{"name": "edge"}, {"name": "edge", "sectionName": "http"}],
+            "hostnames": ["api.example.com"],
+            "rules": [{
+                "matches": [{
+                    "path": {"type": "PathPrefix", "value": "/api"},
+                    "headers": [{"type": "Exact", "name": "x-env", "value": "prod"}]
+                }],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }]
+        }),
+    );
+    let objects = [gateway_class(), http_gateway("edge", 8084), route];
+    let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert_eq!(
+        result.config.proxies.len(),
+        1,
+        "two parentRefs onto one listener must materialize exactly one proxy: {:?}",
+        result.config.proxies
+    );
+    let dispatch: Vec<_> = result
+        .config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .collect();
+    assert_eq!(
+        dispatch.len(),
+        1,
+        "one collapsed claim owns exactly one dispatch plugin: {dispatch:?}"
+    );
+    let dispatch_config = &dispatch[0].config;
+    assert_eq!(
+        dispatch_config["reject_unmatched"],
+        json!(true),
+        "a header-gated route must keep rejecting unmatched requests: {dispatch_config:?}"
+    );
+}
