@@ -137,7 +137,7 @@ fn full_db_reload_reapplies_k8s_overlay_and_mesh() {
         .push(make_proxy("gwapi-route-httpbin", "ferrum"));
     k8s.mesh = Some(mesh_with_service("overlay-svc"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
-    store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed);
+    store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed, None);
 
     let mut db_reload = GatewayConfig::default();
     db_reload.proxies.push(make_proxy("db-proxy", "ferrum"));
@@ -187,13 +187,13 @@ fn overlay_slot_preserves_mesh_when_later_translate_omits_it() {
         .proxies
         .push(make_proxy("gwapi-route-httpbin", "ferrum"));
     with_mesh.mesh = Some(mesh_with_service("overlay-svc"));
-    store_accepted_k8s_overlay(&overlay_slot, with_mesh, managed.clone());
+    store_accepted_k8s_overlay(&overlay_slot, with_mesh, managed.clone(), None);
 
     let mut without_mesh = GatewayConfig::default();
     without_mesh
         .proxies
         .push(make_proxy("gwapi-route-httpbin", "ferrum"));
-    store_accepted_k8s_overlay(&overlay_slot, without_mesh, managed);
+    store_accepted_k8s_overlay(&overlay_slot, without_mesh, managed, None);
 
     let mut db_reload = GatewayConfig::default();
     db_reload.proxies.push(make_proxy("db-proxy", "ferrum"));
@@ -317,7 +317,7 @@ fn concurrent_poll_and_reconcile_cas_preserves_both_sources() {
     k8s.proxies
         .push(make_proxy("gwapi-route-overlay", "ferrum"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
-    store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed.clone());
+    store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed.clone(), None);
 
     let writer = {
         let config_arc = Arc::clone(&config_arc);
@@ -325,7 +325,7 @@ fn concurrent_poll_and_reconcile_cas_preserves_both_sources() {
         let managed = managed.clone();
         thread::spawn(move || {
             for _ in 0..200 {
-                let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed);
+                let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed, None);
                 thread::sleep(Duration::from_micros(50));
             }
         })
@@ -371,7 +371,7 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
     k8s.proxies
         .push(make_proxy("gwapi-route-overlay", "ferrum"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
-    let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed);
+    let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed, None);
 
     let writer = {
         let config_arc = Arc::clone(&config_arc);
@@ -379,7 +379,7 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
         let managed = managed.clone();
         thread::spawn(move || {
             for _ in 0..100 {
-                let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed);
+                let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed, None);
                 thread::sleep(Duration::from_micros(50));
             }
         })
@@ -507,6 +507,8 @@ impl PublicationHarness {
             &self.cp_scope,
             &self.mesh_tx,
             self.mesh_registry.as_ref(),
+            None,
+            None,
         );
     }
 }

@@ -810,7 +810,19 @@ The optional CNI-style install closes that window. A small `ferrum-cni` binary, 
                             └──────────────────────────────────────────────┘
 ```
 
-The CNI plugin and the kube-rs watcher feed the same enrollment path. They are deliberately not mutually exclusive: even with the CNI plugin installed, the watcher continues to run and reconcile, so the CNI hook is an **optimization** rather than a hard dependency. STATUS reports whether that node-agent + Kubernetes API dependency is ready for ADD. GC is complementary: it recovers Ferrum capture/enrollment state after missed DEL calls, node crashes, or sandbox metadata loss without relying on watcher timing alone.
+The CNI plugin and the kube-rs watcher feed the same enrollment path, and the watcher keeps running and reconciling once the plugin is installed. For *enrollment* the CNI hook is therefore an optimization: it closes the kubelet-vs-watcher race, and the watcher would eventually enroll the pod anyway.
+
+> **Availability is a different question, and the answer is a hard dependency.** Installing the chained conflist puts `ferrum-cni` in the ADD path of **every** pod on the node. `ferrum-cni` fails **closed** when it cannot reach the node-agent: a missing socket, a crash-looping or absent node-agent, or an IPC error makes ADD return a CNI error, and kubelet leaves the pod in `ContainerCreating`. So while `nodeAgent.cni.enabled=true`, node-agent availability is a **node-wide pod-creation dependency**, not an optimization. This is the deliberate capture-race posture — passing ADD through unenrolled would silently start a pod outside the mesh — but it must be operated as a dependency.
+>
+> Three mechanisms bound the blast radius, and none of them is optional reading before you enable this:
+>
+> - **CNI 1.1 STATUS** lets a 1.1.0 runtime observe that Ferrum cannot service ADD before it tries (see below). It is informational: per spec it does not stop ADD.
+> - **Automatic rollback** (`nodeAgent.cni.rollback`, on by default) removes this pod's own CNI artifacts if the node-agent never reaches CNI readiness, so a broken install degrades to watcher-only enrollment instead of a node-wide outage.
+> - **Uninstall** (`nodeAgent.cni.uninstall`, on by default) removes the chain from every node during `helm uninstall`, before the socket disappears.
+>
+> A node-agent that crash-loops *after* it was once ready is **not** rolled back automatically — see "Recovering a node" for the manual path.
+
+STATUS reports whether that node-agent + Kubernetes API dependency is ready for ADD. GC is complementary: it recovers Ferrum capture/enrollment state after missed DEL calls, node crashes, or sandbox metadata loss without relying on watcher timing alone.
 
 ### CNI 1.1 STATUS semantics
 
@@ -831,12 +843,156 @@ The CNI plugin and the kube-rs watcher feed the same enrollment path. They are d
 
 The Helm chart at `charts/ferrum-mesh/` ships an opt-in CNI installer init container, gated by `nodeAgent.cni.enabled`. When enabled:
 
-1. The DaemonSet pod's init container runs `/app/ferrum-cni install`, which copies the binary into the host's `/opt/cni/bin/` (host-path mount).
-2. The installer reads the existing primary CNI config matching `nodeAgent.cni.chainedWith`, preserves its plugin fields/IPAM, appends Ferrum as a meta-plugin, and writes the generated `*-ferrum.conflist` into `/etc/cni/net.d/`.
-3. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
-4. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
+1. The DaemonSet pod starts the rollback watcher as a **native sidecar** (an init container with `restartPolicy: Always`; Kubernetes 1.29+), ordered before the installer so it is already running while the chain is written.
+2. The next init container runs `/app/ferrum-cni install`, which copies the binary into the host's `/opt/cni/bin/` (host-path mount).
+3. Under the install lock the installer fail-closes if the configured target conflist already exists and is not a same-owner Ferrum-marked regular file, then records an ownership manifest, reads the existing primary CNI config matching `nodeAgent.cni.chainedWith`, preserves its plugin fields/IPAM, appends Ferrum as a meta-plugin, and writes the generated `*-ferrum.conflist` into `/etc/cni/net.d/`.
+4. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
+5. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
 
-Manual install (no Helm): copy `ferrum-cni` to `/opt/cni/bin/` on every node, write a chained `.conflist` in `/etc/cni/net.d/` that preserves the primary CNI plugin/IPAM and appends Ferrum, ensure `/var/run/ferrum/` is writable, set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock`; any `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` override must be absolute.
+Manual install (no Helm): run `ferrum-cni install` on every node with `HOST_BIN_DIR`, `HOST_CONF_DIR`, `HOST_SOCKET_DIR`, `CONF_FILE_NAME`, `CHAINED_WITH`, `SOCKET_PATH`, `OWNER_ID`, and `INSTALL_GENERATION` set, or hand-write the equivalent chained `.conflist` (see "Ownership markers" for what `ferrum-cni uninstall` will and will not remove). Ensure `/var/run/ferrum/` is writable and set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock`; any `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` override must be absolute.
+
+### Ownership markers
+
+Everything the installer writes is stamped so it can be removed again without guessing. `/etc/cni/net.d/` is shared with the cluster's primary CNI and any other meta-plugin, so "delete the file we would have written" is not good enough.
+
+Two pieces of evidence, both written at install time:
+
+- The generated conflist's own `ferrum-cni` plugin entry carries `managedBy: ferrum-edge`, an `owner`, and a `generation`. This lives in the object the CNI spec reserves for this plugin, so no neighbouring plugin can be confused by it, and `FerrumCniOptions` ignores the extra keys on the request path.
+- A sibling `/etc/cni/net.d/.ferrum-cni-owned.marker` manifest repeats the ownership, names the exact artifacts it speaks for (`confFileName`, `binaryFileName`), and records the SHA-256 of the binary that was installed. The name has no CNI extension, so no runtime treats it as a network configuration and the installer's own primary-config scan skips it. A manifest that names a different conflist or a different binary is evidence about *those* files and authorizes nothing here.
+
+`previousBinarySha256` is the one field that carries an *older* digest forward, and it is an attestation rather than an observation. Hashing whatever regular file happens to occupy `/opt/cni/bin/ferrum-cni` proves nothing about who owns it — on a first install that file may belong to an operator or another product entirely — so recording that digest would hand cleanup permission to delete a binary Ferrum never owned. The installer therefore writes the field only when the manifest already on disk (a) parses at the current schema, (b) names these exact artifact names, (c) carries this same owner, and (d) already recorded the digest now on disk as one of its own. That is precisely the repeat-upgrade case the field exists for: a crash between the manifest write and the binary rename leaves whichever of the two attested digests is on disk provably Ferrum's. Every other case writes `null`, the pre-existing binary is retained, and — because an unreferenced binary is inert — chain cleanup still succeeds.
+
+`binaryOwned` applies that same evidence rule to the current digest. It is true only when this install publishes the staged inode or a prior same-owner manifest already attested the reused inode. Byte-identical contents alone never transfer ownership: an operator-provided binary may be reused, but it remains in place after the chain is removed.
+
+A third file, `/etc/cni/net.d/.ferrum-cni-install.lock`, is the node's lifecycle lock (see "Ordering, locking, and what the swap checks do not claim" below). It holds no state, carries no CNI extension, and is deliberately left behind by cleanup.
+
+The Helm chart sets `owner` to `<release namespace>/<release name>` — stable across upgrades — and `generation` to the node-agent pod UID.
+
+`ferrum-cni uninstall` removes an artifact only when that evidence is present **and** matches the scope it was given:
+
+| Situation | Conflist | Binary | Exit |
+|---|---|---|---|
+| Ferrum-owned, owner matches | removed | removed after its digest matches the manifest | 0 |
+| Already cleaned | absent | absent | 0 |
+| Owned by a different release / generation | retained | retained | 0 |
+| Present but carries no Ferrum marker | retained | retained (still referenced) | **1** |
+| Symlink, hard link, non-regular file, or oversized | retained | retained | **1** for the conflist |
+| Manifest lost or corrupt | removed (the in-file marker is sufficient) | retained (provenance unproven) | 0 |
+| Binary replaced out of band | — | retained | 0 |
+| Another CNI config on the node still names `ferrum-cni` | removed | retained (shared, still referenced) | 0 |
+| The configuration directory could not be fully scanned | removed | retained (references unprovable) | 0 |
+| Manifest names a different conflist or binary | removed | retained (evidence not bound to these files) | 0 |
+
+Removal order is always conflist first, then binary: the reverse would leave a chain pointing at a missing plugin, which fails every ADD.
+
+`/opt/cni/bin/ferrum-cni` is a **shared** executable. Another Ferrum release, or an operator-authored configuration, can chain to the same file, so clearing this release's conflist says nothing on its own. Before the binary is removed, cleanup rescans `/etc/cni/net.d/` and retains it if any remaining `.conf` / `.conflist` / `.json` still names the `ferrum-cni` plugin type — and also if that scan could not be completed (an unreadable or unparseable neighbour could be such a configuration). Retention costs a stale, inert file; deletion could break a live release, so the unprovable case keeps the binary.
+
+The primary CNI configuration is never read for modification, rewritten, or deleted in any of these paths.
+
+Note that an unreferenced `/opt/cni/bin/ferrum-cni` is inert. A retained binary is reported but does not fail cleanup; a retained **conflist** does, because that is the file that holds the node hostage. A conflist that belongs to a *different* Ferrum release is not a failure — it is not this release's to lift — and `ferrum-cni uninstall` says so explicitly rather than implying the node is clean.
+
+### Ordering, locking, and what the swap checks do not claim
+
+Install publishes in a fixed order, and each step exists to make the *next* failure recoverable:
+
+0. Under the install lock, **preflight the configured target conflist** before any staging, manifest, binary, or target-config write. Absent → proceed. Present → proceed only when it is a bounded regular single-link file opened `O_NOFOLLOW` whose Ferrum ownership marker names **this same owner** (same-owner upgrades across generations are allowed). An unmarked, malformed, oversized, symlinked, non-regular, hard-linked, or differently-owned file is refused with a fixed error and **no** shared side effects. The exact marker and the exact device/inode/length observed here are remembered for step 6.
+1. **Find the primary CNI config, build the chained conflist, and serialize it — all before anything shared is touched.** Every one of those steps can fail on input the installer does not control (no primary matching `chainedWith`, a primary that is not an object, an empty plugin list), so none of them may run after the shared manifest or the shared binary has been written.
+2. Stage the new binary in `/opt/cni/bin/` under an unguessable `O_EXCL | O_NOFOLLOW` temporary name, hashing the bytes as they are written. The staging sibling is removed on every exit, so nothing shared has changed yet.
+3. **Apply the shared-binary rule.** `/opt/cni/bin/ferrum-cni` is shared, and cleanup already refuses to delete it while another `.conf` / `.conflist` / `.json` on the node names `ferrum-cni`; install owes that reference the mirror guarantee and will not swap the bytes out from under it. Republishing byte-identical bytes is not a replacement and is always allowed. Otherwise, if any other configuration still references the plugin — or if the installed object cannot be classified, or the directory cannot be fully scanned — the install is refused with a fixed error and the shared binary and manifest are left byte-identical. (A directory that cannot be scanned therefore blocks a *binary-changing* upgrade; a same-image reinstall is unaffected.)
+4. Write the ownership manifest — **before** the shared binary is published — recording the staged digest, plus an *attested* previous digest where one exists (see "Ownership markers" above). From here on, every artifact this install can leave behind, including after a crash at any later step, is provably Ferrum's and therefore removable.
+5. Publish the binary with an atomic same-directory `rename`.
+6. Write the chained conflist **last**, atomically. The moment that file lands, every pod ADD on the node traverses `ferrum-cni`, so nothing that can fail may still be pending — its bytes were already built in step 1.
+
+**If any step after the preflight fails and the preflight found this owner's previous chain, the installer lifts that chain before returning the error.** This is an availability rule, not tidiness. On a same-owner upgrade the node is already carrying generation N-1 while the replacement pod's rollback watcher is scoped to generation N; an install that dies before publishing N leaves every pod ADD traversing a socket no node-agent will serve, and the watcher correctly reports `never published` and removes nothing. The recovery runs under the same lock and re-proves the chain first: it removes the file only when it is still the exact object the preflight classified — same device/inode/length **and** a marker naming the same owner *and* the same generation. A different owner, or a generation that overtook the run, is retained untouched and logged; so is a chain the recovery could not remove, which is reported as an error because the node is still dependent. The failure itself is always surfaced; the recovery never masks it.
+
+Every mutating step — the whole of `install`, and the whole of `uninstall` — holds an exclusive `flock` on `/etc/cni/net.d/.ferrum-cni-install.lock` first. That is what makes rollback ownership provable rather than probable: a watcher whose budget expired cannot delete anything while an installer still holds the lock, and it re-reads every ownership marker under that lock before deciding.
+
+Within a run, artifacts are opened `O_NOFOLLOW`, classified against the open handle (regular file, single link, plausible size), read with a hard byte cap that does not trust the pre-read length, and hashed through that same handle — so the digest that authorizes a removal is the digest of the object being removed. Removal re-opens the path `O_NOFOLLOW` and refuses unless the device/inode still matches the object the evidence came from.
+
+What this does **not** claim: the final `unlink` is still by pathname. The lock removes that race between Ferrum's own processes, and the identity re-check refuses every swap that lands before it, but against a third party with write access to a root-owned host CNI directory the window is narrowed rather than closed. Anyone with write access there can already replace the primary CNI configuration outright.
+
+### Automatic rollback when the node-agent never becomes ready
+
+`nodeAgent.cni.rollback.enabled` (default `true`) adds the `ferrum-cni rollback-watch` native sidecar to the node-agent pod. The run has two phases, and the split is load-bearing.
+
+**Phase 1 — publication.** The watcher is a native sidecar, so it starts *before* the installer init container. A readiness budget that started at container start could therefore expire while the installer was still working, delete this generation's state, and then watch the installer publish a conflist that nothing was left to remove — manufacturing exactly the stranded chain the watcher exists to prevent. So the watcher first polls until the generated conflist is on disk carrying **this** owner and generation. That file is written last and atomically, so its presence is the only observable proof that the install completed and the node now depends on the node-agent.
+
+If that never happens within `publishTimeoutSeconds` (default 300), the watcher reports `never published`, removes nothing, and exits non-zero. An installer that never published a chain never created a node-wide dependency *of its own*, so there is nothing for this watcher to roll back — the visible failure belongs to the installer container. The previous generation's chain is not left to this watcher either: a failed same-owner upgrade lifts the chain it found on the installer's own error path, under the same lock (see "Ordering, locking, and what the swap checks do not claim" above). Without that, a generation-N watcher would sit out its publish budget and report `never published` while generation N-1's chain still routed every pod ADD through a socket nothing was going to answer.
+
+Nothing but publication can end phase 1. In particular CNI STATUS is **not** probed before the conflist appears: the socket path is node-scoped and outlives any one install, so a still-running previous node-agent generation can answer `Ok` for a chain this generation has not written yet. Reading that as readiness would return `Ready`, park the watcher for the lifetime of the pod, and leave the rollback permanently disarmed while the installer went on to publish — the exact failure the two-phase split exists to prevent. (Regression pin: `a_status_probe_before_publication_can_never_disarm_the_rollback` in `tests/integration/cni_tests.rs`.)
+
+**Phase 2 — readiness.** Only now does `readyTimeoutSeconds` (default 300) start, and only now is CNI STATUS probed at all, every `pollIntervalSeconds` (default 5).
+
+- **STATUS answers `Ok` at least once** → artifacts are retained for the lifetime of the pod and the watcher parks. A node-agent that fails *later* is deliberately not unchained: it was proven usable, so the pods that depend on its capture are expected to stay enrolled.
+- **STATUS never answers `Ok`** → the watcher runs the generation-scoped cleanup and exits non-zero. The container then shows `CrashLoopBackOff`, the pod stays not-Ready, and the failure is visible in `kubectl describe` and the container log.
+
+The outcome it reports is the outcome that actually happened, not a blanket "rolled back":
+
+| Outcome | What is true afterwards | Exit |
+|---|---|---|
+| `Ready` | STATUS answered; the chain stays for this pod's lifetime | parks |
+| never published | this generation never chained the node; nothing removed | **1** |
+| rolled back | the chained conflist is gone; pod creation no longer depends on the node-agent | **1** |
+| superseded | a newer generation owns the artifacts; **nothing was removed** and the chain is still in place | **1** |
+| incomplete | cleanup ran and the chained conflist is **still there**; the node is still dependent | **1** |
+
+Only the "rolled back" line claims the dependency was lifted. A superseded run and an incomplete run both say so plainly instead.
+
+Time decides only *when* to act. *What* may be removed is decided by the markers: the watcher pins both the owner and its own pod UID as the generation, so an install that was overtaken by a newer rollout reports `retained-other-generation` and deletes nothing. Cleanup additionally takes the node lifecycle lock for its whole run, so it cannot interleave with a still-running installer at all.
+
+After a rollback the chain is **not** reinstalled by a container restart — init containers do not re-run. Recreate the node-agent pod (`kubectl delete pod`, or roll the DaemonSet) once the underlying failure is fixed.
+
+Set `nodeAgent.cni.rollback.enabled=false` on clusters older than Kubernetes 1.29 (no native sidecar support) or where you would rather keep a broken install for inspection. The uninstall path is unaffected by this setting.
+
+### Uninstall (`helm uninstall`)
+
+`nodeAgent.cni.uninstall.enabled` (default `true`) renders two `pre-delete` hooks plus the release-owned identity they run as:
+
+| Resource | Kind of resource | Deletion policy | Role |
+|---|---|---|---|
+| `ferrum-mesh-cni-cleanup` (ServiceAccount) | ordinary release resource | removed by the normal uninstall sweep | No Role, no binding, token not mounted. |
+| `ferrum-mesh-cni-cleanup-wait` (ServiceAccount + Role + RoleBinding) | ordinary release resources | removed by the normal uninstall sweep | `get` + `delete` on exactly one DaemonSet, by name, in the release namespace, and `get` on its status. Nothing else. |
+| `ferrum-mesh-cni-cleanup` (DaemonSet) | `pre-delete` hook, weight 0 | `before-hook-creation` **only** | Runs `ferrum-cni uninstall` on every node. Deleted by the wait Job, not by Helm. |
+| `ferrum-mesh-cni-cleanup-wait` (Job) | `pre-delete` hook, weight 10 | `before-hook-creation,hook-succeeded` | Runs `ferrum-cni await-cleanup`: blocks until every cleanup pod is Ready, then deletes the cleanup DaemonSet and confirms it is gone. |
+
+**Why identity and RBAC are not hook resources.** Helm runs a phase's hooks in weight order, and on **Helm 3.19+ and Helm v4** a later hook's failure also deletes the earlier ones that carry `hook-delete-policy: hook-succeeded` — `deleteHooksByPolicy(executingHooks[0:i], HookSucceeded, ...)` on the failure path of `execHook` in `pkg/action/hooks.go`. (Helm 3.18 and older do not: `execHook` there deletes only the *failing* hook, by its `hook-failed` policy, and reaches the `hook-succeeded` sweep only once every hook in the phase succeeded. The rule below is written for the stricter, newer behaviour so the chart is correct on both.) Held as hook resources, the cleanup ServiceAccounts and RBAC would therefore be destroyed by exactly the failure that makes a retry necessary: the failed DaemonSet's pods would be running against a ServiceAccount that no longer existed, and the next `helm uninstall` would have to recreate the identity before any cleanup pod could be admitted. As ordinary release resources they are created at install time and removed only by the normal uninstall sweep, which runs *after* the pre-delete phase has succeeded — so they are present for the first attempt, still present after a failed one, and gone once the release is really deleted.
+
+**Why the DaemonSet deletes itself through the wait Job.** Helm's hook wait only watches `Job` and `Pod` kinds, so a hook DaemonSet is "succeeded" the instant it is created. A `hook-succeeded` policy on it would therefore delete it immediately — before its pods had cleaned anything — and would additionally delete it on the failure path above, taking the pods and their logs with it. Instead the DaemonSet carries `before-hook-creation` only, and the wait Job removes it once every node has reported success, using foreground propagation and refusing to report success until the API server no longer serves the object. That is a stronger guarantee than the policy would have given: it proves no cleanup pod is still running anywhere before `helm uninstall` is allowed to delete the node-agent.
+
+- **A DaemonSet, not a Job**, because cleanup must happen on every node that ever ran the installer. A Job runs on one node and would silently strand the rest of a multi-node cluster. Each cleanup pod becomes Ready only after `ferrum-cni uninstall` succeeded on *its* node: the container publishes a readiness marker that its `exec` readiness probe (`ferrum-cni uninstall-status`) reads, then holds.
+- **Readiness belongs to the current run.** The marker lives in an `emptyDir`, which survives a container restart, so a marker left by an earlier failed start would make the probe pass for work the current invocation has not done. Every `ferrum-cni uninstall` therefore retracts any pre-existing marker *before* touching the node, and publishes a new one only after its own cleanup succeeded. Retraction never follows a symlink and never deletes anything that is not a plain regular file: a symlink, a directory, or any other object at the marker path is refused, and the container exits non-zero rather than publishing readiness through a file it does not own. The publish itself is an atomic `O_EXCL | O_NOFOLLOW` write-and-rename, and the probe accepts only a regular file, so a planted link is never readiness.
+- **Plus a wait Job**, because Helm's hook wait only watches `Job` and `Pod` kinds. A hook DaemonSet on its own is created and then left behind — the release, including the node-agent and its socket, could be deleted while cleanup pods were still starting. The Job polls the DaemonSet's ready count and fails after `nodeAgent.cni.uninstall.timeoutSeconds` (default 240) with an "N of M nodes" diagnostic. That value is one shared end-to-end budget for both the readiness wait and the foreground DaemonSet deletion that follows it; it is not restarted between phases. Keep it inside `helm uninstall --timeout` (default 5m) or Helm gives up first and you lose the diagnostic.
+- **`pre-delete` only.** `helm upgrade` and `helm rollback` do not fire pre-delete hooks, so a normal rolling pod replacement never removes CNI state that is still required. Upgrades re-run the installer, which is idempotent and rewrites the chain in place.
+- **Narrow privileges.** The cleanup pods do pure host-filesystem work, so they get no API access at all (`automountServiceAccountToken: false`), run with `readOnlyRootFilesystem: true` and all capabilities dropped, and mount only the two host CNI directories plus a scratch `emptyDir`. Only the wait Job talks to the API, and it runs as non-root with the named-object Role above: `get` and `delete` on the one DaemonSet it manages, `get` on that DaemonSet's status, and nothing else. There is no `list` and no `watch` — neither can be restricted by `resourceNames` — and no create, update or patch anywhere.
+- **`hostNetwork: true` on both.** This is correctness, not tuning. Cleanup runs precisely when a chained `ferrum-cni` is on the node and its socket is about to disappear — and a chained ADD fails closed. A cleanup pod that needed its own CNI sandbox would be stuck in `ContainerCreating` behind the very chain it exists to remove, so the hook would deadlock on every node where it matters. Pods with `hostNetwork: true` skip CNI ADD entirely, exactly like the node-agent DaemonSet they clean up after. The wait Job reaches the API server through `KUBERNETES_SERVICE_HOST` (an IP), so it needs no cluster DNS and keeps `dnsPolicy: Default`.
+- **Completion is controller-observed and non-vacuous.** The wait Job treats the DaemonSet as finished only once `status.observedGeneration` has caught up with `metadata.generation`; a status carrying no observed generation counts as *unobserved*, never as observed-and-idle. An all-zero `0/0` status additionally has to persist for 15 s before it is classified as "this DaemonSet scheduled onto no node", so a freshly created DaemonSet's initial snapshot can never be mistaken for completion. A genuine zero is still a **failure**, not vacuous success: the Job retains the DaemonSet and blocks release deletion because no cleanup pod proved that any node's chained CNI configuration was removed.
+- **Scoped removal.** The hook passes `EXPECTED_OWNER` (this release) and no generation, so whichever revision is on the node is removed; another release's artifacts are left alone and reported as such.
+
+Failure is loud on purpose, and recoverable by construction. A cleanup container that cannot finish exits non-zero, its pod never goes Ready, the wait Job times out, and `helm uninstall` fails. What survives that failure is chosen deliberately, not assumed: the cleanup DaemonSet carries no `hook-succeeded` policy, so Helm's failure path leaves it, its pods and its logs alone (`kubectl -n <ns> logs daemonset/ferrum-mesh-cni-cleanup`), and the ServiceAccounts, Role and RoleBinding are release resources that a failed pre-delete phase never reaches. Recovery is therefore just `helm uninstall` again: `before-hook-creation` replaces the DaemonSet and the failed wait Job, the surviving identity admits the new pods immediately, and the same wait runs against the same budget. Do not add `hook-succeeded` to the DaemonSet — it would delete the evidence and the retry path at the same time.
+
+The hook tolerates all taints by default (`nodeAgent.cni.uninstall.tolerations`) so it reaches every node the node-agent could run on. A node that is cordoned, `NotReady`, or otherwise unschedulable cannot be cleaned by the hook — the uninstall will time out and report failure. That is intentional: the alternative is declaring success while a live node keeps a chained conflist pointing at a socket that is about to disappear. Clean such nodes with the manual steps below, then re-run the uninstall (or set `nodeAgent.cni.uninstall.enabled=false` to skip the hook entirely and accept manual cleanup).
+
+### Recovering a node
+
+Symptom: pods on a node stick in `ContainerCreating` with a CNI error mentioning `ferrum-cni`.
+
+1. Confirm the chain is Ferrum's and see who owns it:
+   ```bash
+   cat /etc/cni/net.d/00-ferrum.conflist
+   cat /etc/cni/net.d/.ferrum-cni-owned.marker
+   ```
+2. Remove the chain. Preferred, because it validates ownership before touching anything:
+   ```bash
+   HOST_CONF_DIR=/etc/cni/net.d HOST_BIN_DIR=/opt/cni/bin \
+   CONF_FILE_NAME=00-ferrum.conflist \
+   ferrum-cni uninstall
+   ```
+   If the binary is not usable, delete **only** the generated conflist by hand:
+   ```bash
+   rm /etc/cni/net.d/00-ferrum.conflist
+   ```
+   The primary CNI configuration it chained behind was never modified, so nothing else needs repairing; kubelet picks the primary config up again on the next ADD.
+3. Fix the node-agent (see the diagnostics table above and `ferrum_node_agent_cni_socket_lifecycle_total`), then recreate the node-agent pod to reinstall the chain.
 
 The listener holds a sibling `<socket>.lock` advisory lock for its complete
 lifetime. A second live node-agent generation refuses to replace the active
@@ -852,8 +1008,8 @@ replacement.
 ### Fallback semantics
 
 - **Default disabled.** `nodeAgent.cni.enabled=false` (chart) / `FERRUM_NODE_AGENT_CNI_ENABLED=false` (env) keeps the kube-rs watcher as the sole enrollment path. Existing operators upgrade with zero behavior change.
-- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host will then fail every kubelet invocation with `IpcFailed`, and kubelet will eventually mark the pod creation as failed — at which point the operator must either fix the UDS or roll back the chained CNI config. The watcher path will still enroll already-scheduled pods.
-- **CNI plugin installed but node-agent not running.** Same effect as above: kubelet sees a CNI error and may delay sandbox setup. The watcher path is irrelevant here because the node-agent process is absent.
+- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host then fails **every** kubelet ADD on that node with `IpcFailed`, so new pods stick in `ContainerCreating` — the watcher path still reconciles pods that already have a sandbox, but it cannot create one. If this happens during initial pod startup the rollback watcher removes the chain once its readiness budget expires; if it happens after the node-agent was once ready, recovery is manual ("Recovering a node").
+- **CNI plugin installed but node-agent not running.** Same effect as above, and the watcher path is irrelevant because the node-agent process is absent. If the pod never became ready in the first place, the rollback watcher unchains the node automatically.
 - **CNI plugin enabled, node-agent running, watcher disabled.** Not a supported configuration. The watcher is the source of truth for enrollment; the CNI hook only acknowledges sandbox-setup events to close the race window.
 
 ### Chained CNI compatibility
@@ -868,10 +1024,17 @@ $ cat /etc/cni/net.d/00-ferrum.conflist
   "plugins": [
     { "type": "calico", ... },
     { "type": "ferrum-cni",
-      "ferrum": { "socketPath": "/var/run/ferrum/node-agent-cni.sock" } }
+      "ferrum": {
+        "socketPath": "/var/run/ferrum/node-agent-cni.sock",
+        "managedBy": "ferrum-edge",
+        "owner": "ferrum/ferrum-mesh",
+        "generation": "8f1c1a0e-...-pod-uid"
+      } }
   ]
 }
 ```
+
+The `managedBy` / `owner` / `generation` keys are the ownership markers described below; the plugin itself ignores them on the request path.
 
 The generated `name` is preserved from the matched primary CNI config, so it will usually be the primary network name rather than a Ferrum-specific constant.
 
@@ -889,9 +1052,29 @@ Socket lifecycle failures use
 `reason`; an ownership conflict is an explicit startup refusal, not stale-file
 recovery.
 
-### Deferred follow-ups (not in scope for this PR)
+### Lifecycle coverage and remaining gaps
 
-- Install verification (probe to confirm `/opt/cni/bin/ferrum-cni` is present after upgrade).
-- CNI upgrade dance (in-place binary swap without disrupting in-flight kubelet calls).
-- Rollback (auto-remove the conflist + binary if the node-agent never comes up).
-- Admission-time validation of pod CNI metadata.
+Delivered (issue #3609):
+
+- **Uninstall.** `ferrum-cni uninstall`, plus the `pre-delete` hook DaemonSet that runs it on every node before the socket disappears.
+- **Rollback.** `ferrum-cni rollback-watch` removes an install that never reached CNI readiness, scoped by ownership and generation, with the readiness budget gated on this generation's own publication.
+- **Install verification.** The rollback watcher's STATUS poll *is* the post-install probe: an install whose plugin never answers is undone rather than left in place. The ownership manifest additionally records the digest of the binary that was installed, so an out-of-band replacement is detectable (and blocks removal of that binary). Install also fail-closes under the lifecycle lock before overwriting an existing target conflist unless that file's Ferrum marker names this same owner.
+- **In-place upgrade.** See below.
+- **Hosted evidence.** External Rust integration coverage in `tests/integration/cni_tests.rs` (`install_lifecycle`) plus the existing CI Helm render/static contract assertions. There is no privileged live CNI lifecycle workflow.
+
+**In-place upgrade.** A re-run of the installer is an upgrade, and the semantics are now explicit rather than incidental:
+
+- The new binary is staged in the destination directory and published by an atomic same-directory `rename`. The installed file is never truncated or written through, so an already-exec'd `ferrum-cni` keeps a valid inode and finishes its RPC forward against the binary it started with — there is no torn-binary or `ETXTBSY` window.
+- When the staged bytes are byte-identical to what is already installed — the routine `helm upgrade` with an unchanged image — the rename is **skipped entirely**. The common upgrade therefore performs no binary swap at all, so no in-flight plugin can straddle one.
+- The manifest is rewritten before the swap and records both the digest being published and the digest being replaced, so a crash between those two steps still leaves whichever binary is on disk provably removable.
+- The conflist is re-stamped with the new generation last, so kubelet's next ADD resolves the new inode through a fresh `exec`.
+
+What remains true, and is a property of POSIX rather than a gap Ferrum can close: a plugin process already `exec`'d from the previous inode runs the previous code until it exits. Because the RPC contract is forward-compatible within a release and the forward is a single sub-second call, that is a coordination *cost* rather than an upgrade barrier — and the skip-if-identical rule removes it from the common case. There is no cross-process handshake that would make an already-running plugin adopt new code, so none is claimed.
+
+**Hosted evidence (not a live cluster gate).** This change is gated by the Rust integration suite and the normal CI Helm rendering/static contract assertions. It does **not** claim a live kind / multi-node recovery job or a full-chart `helm install` / `helm uninstall` lifecycle gate.
+
+Still deferred / unclaimed operational gaps:
+
+- **Admission-time validation of pod CNI metadata.**
+- **Rollback for a node-agent that fails after it was once ready.** By design (see above); recovery is the manual path in "Recovering a node".
+- **Live full-chart lifecycle.** A privileged live CNI lifecycle workflow is not present; full `helm install` / `helm uninstall` round-trip against a cluster with kernel prerequisites remains an operational gap. Chart hook policies and wiring are pinned statically by the `helm-chart` CI job instead.

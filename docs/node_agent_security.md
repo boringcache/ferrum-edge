@@ -24,9 +24,10 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
 6. [AppArmor profile](#apparmor-profile)
 7. [Pod Security Standards compatibility](#pod-security-standards-compatibility)
 8. [Network exposure and NetworkPolicy](#network-exposure-and-networkpolicy)
-9. [Audit and logging](#audit-and-logging)
-10. [Compromise containment](#compromise-containment)
-11. [Threat-by-threat checklist](#threat-by-threat-checklist)
+9. [CNI install lifecycle](#cni-install-lifecycle)
+10. [Audit and logging](#audit-and-logging)
+11. [Compromise containment](#compromise-containment)
+12. [Threat-by-threat checklist](#threat-by-threat-checklist)
 
 ## Threat model
 
@@ -189,6 +190,16 @@ The node agent does **not** need, and the chart does **not** mount:
 - `/etc` (host configuration), `/var/log` (host logs), `/dev` (raw devices),
   `/lib/modules` (kernel modules).
 - Any pod's filesystem or volume.
+
+One documented exception, and only when you opt in with
+`nodeAgent.cni.enabled=true`: the CNI install lifecycle mounts
+`/opt/cni/bin`, `/etc/cni/net.d`, and the socket directory
+(`/var/run/ferrum`) read-write. This is a narrow, named carve-out from the
+"no `/etc`" rule above — `/etc/cni/net.d` only, never `/etc` itself — and it
+is what the installer, the rollback watcher, and the uninstall hook use to
+write and remove Ferrum's own plugin binary and chained conflist. See
+[CNI install lifecycle](#cni-install-lifecycle) for the ownership rules that
+bound what those mounts are allowed to touch.
 
 If you see a fork or downstream chart that adds any of these mounts to
 the node-agent DaemonSet, treat it as a red flag and confirm the use
@@ -515,6 +526,115 @@ CNI does not see their traffic. Operators relying on per-pod
 NetworkPolicy for compliance must use a node-level firewall (iptables /
 nftables / cilium hostFirewall) to enforce egress from the node-agent.
 
+## CNI install lifecycle
+
+Opting in to `nodeAgent.cni.enabled=true` gives three short-lived workloads
+write access to two shared host directories, `/opt/cni/bin` and
+`/etc/cni/net.d`. Those directories belong to the cluster's primary CNI, so
+the security question is not "can Ferrum write there" — it must — but "what
+bounds what Ferrum writes and deletes there".
+
+**Availability is part of the threat model here.** While the chain is
+installed, `ferrum-cni` is in the ADD path of every pod on the node and fails
+closed when the node-agent is unreachable, so an unremovable or stranded
+conflist is a node-wide denial of pod creation. That is why removal exists,
+why it is automatic on `helm uninstall`, and why a cleanup that cannot
+complete reports failure instead of success (see
+[docs/node_agent.md](node_agent.md) → "CNI plugin install").
+
+| Workload | Runs | Access | Bound |
+|---|---|---|---|
+| `ferrum-cni-installer` (init container) | at pod start | rw on both host dirs + socket dir | Durable artifacts: `<hostBinDir>/ferrum-cni`, the configured conflist name, `/etc/cni/net.d/.ferrum-cni-owned.marker` (ownership manifest), and `/etc/cni/net.d/.ferrum-cni-install.lock` (lifecycle lock; created/updated and left behind by design). Same-directory `O_EXCL \| O_NOFOLLOW` staging siblings are used for binary, conflist, and manifest publishes and are removed on success or failure. Under the lock, install refuses to overwrite an existing target conflist unless that file is a bounded regular single-link object whose Ferrum marker names this same owner, and refuses to replace the shared plugin binary with different bytes while any other configuration still references it. Reads neighbouring configs only to copy the primary's plugin list; never modifies one. On a failure after the preflight it removes the same-owner chain it had classified — re-proved by owner, generation, and device/inode — so a failed upgrade cannot leave the node depending on a node-agent that never starts. |
+| `ferrum-cni-rollback` (native sidecar) | from this generation's publication until readiness or the deadline | rw on both host dirs, read on the socket | May remove only artifacts carrying this release's owner **and** this pod's generation. Neither its readiness budget nor its STATUS probe starts until this generation's own conflist is observed on disk — the socket is node-scoped, so an answer from an earlier node-agent generation must not be able to disarm this one's rollback — and cleanup holds the node lifecycle lock, so it cannot act against an install that is still running. |
+| `ferrum-mesh-cni-cleanup` (pre-delete hook DaemonSet) | during `helm uninstall` | rw on both host dirs | May remove only artifacts carrying this release's owner. No ServiceAccount token, no RBAC, no Kubernetes API access. Runs `hostNetwork: true`, because a pod needing its own CNI sandbox could not start on a node whose chain is broken. Its readiness marker is retracted at process start and republished only by the run that actually completed cleanup; a symlink or any other non-regular file at the marker path is refused, never followed and never deleted. |
+| `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role names one object: `get` + `delete` on `daemonsets` and `get` on `daemonsets/status`, both with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace — no list, no watch, no writes of any other kind. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup; `delete` is what lets it retire that DaemonSet itself instead of relying on a Helm deletion policy that would also fire on failure. |
+| `ferrum-mesh-cni-cleanup` / `-wait` identity (ServiceAccounts, Role, RoleBinding) | for the lifetime of the release | none of their own | Ordinary release resources, deliberately not hook resources: on Helm 3.19+ and v4, a later hook's failure also deletes the earlier `hook-succeeded` hooks in that phase, so identity held that way would disappear exactly when a retry needs it. Grants are unchanged by this; the cleanup ServiceAccount still has no Role at all. |
+
+Removal is gated on evidence written at install time, never on a path guess:
+
+- The conflist must carry `managedBy: ferrum-edge` inside its own `ferrum-cni`
+  plugin entry, and its `owner`/`generation` must match the run's scope.
+- `<hostBinDir>/ferrum-cni` is a **shared** executable, so it is removed only
+  when all of the following hold: this run's chain is gone, no remaining
+  `.conf`/`.conflist`/`.json` in the directory still names the `ferrum-cni`
+  plugin type, the sibling ownership manifest names *these exact* artifacts
+  (`confFileName` / `binaryFileName`), and the manifest's recorded SHA-256
+  matches the bytes on disk. A directory that could not be fully scanned, or
+  manifest evidence bound to different file names, keeps the binary. Retaining
+  an unreferenced executable is inert; deleting one another release still
+  chains to is not.
+- A manifest's `previousBinarySha256` is an **attestation, not an
+  observation**. Hashing whatever already occupies the shared plugin path
+  proves nothing about who owns it, so the installer records that digest only
+  when the manifest already on disk carries this same owner, names these exact
+  artifact names, and had itself already recorded that digest. Every other
+  case records `null`: a pre-existing operator or third-party binary can never
+  be made removable merely because the installer read it. Because an
+  unreferenced binary is inert, retaining it never fails chain cleanup.
+- The manifest's `binaryOwned` bit applies the same proof to its current
+  digest. Publishing the staged inode sets it; reusing an inode sets it only
+  when prior same-owner evidence already attested that inode's digest.
+  Byte-identical operator-provided contents alone never transfer ownership.
+- Install applies the shared-binary rule in the other direction too: while any
+  remaining `.conf`/`.conflist`/`.json` still names `ferrum-cni`, the shared
+  executable is not replaced with different bytes. Byte-identical
+  republication is not a replacement and stays allowed; an installed object
+  that cannot be classified, or a directory that cannot be fully scanned,
+  fails safe by refusing the replacement with a fixed error and leaving the
+  shared binary and manifest byte-identical.
+- A failed install does not get to strand a chain. Everything that can fail on
+  uncontrolled input — locating the primary config, building the chain,
+  serializing it, staging and gating the binary — runs before any shared
+  write, and if a later step still fails the installer removes the same-owner
+  chain its preflight had classified, re-proving owner, generation, and
+  device/inode under the same lock first. A different owner, or a generation
+  that overtook the run, is retained and logged; the original failure is
+  always surfaced.
+- The configured file name is validated as a single path component, so `..`
+  or an embedded separator can never redirect a delete out of the directory.
+- Artifacts are opened with `O_NOFOLLOW` and classified against the **open
+  handle** (regular file, single link, plausible size). Reads are capped in
+  bytes independently of the pre-read length, and the binary is hashed through
+  the same handle it was classified on, so the digest that authorizes a
+  removal is the digest of the object being removed. Removal re-opens the path
+  `O_NOFOLLOW` and refuses unless the device/inode still matches. Symlinks,
+  hard-linked files, non-regular files, and oversized files are refused rather
+  than removed.
+- Temporary files are created `O_EXCL | O_NOFOLLOW` at mode `0600` under an
+  unpredictable name in the destination directory, so a pre-planted symlink or
+  file at a guessable path cannot be followed or truncated by a root process.
+- Every mutating run — install and cleanup alike — holds an exclusive `flock`
+  on `/etc/cni/net.d/.ferrum-cni-install.lock` for its whole duration, so two
+  Ferrum lifecycle steps on one node can never interleave.
+- Install fail-closes under that lock before any staging, manifest, binary, or
+  target-config write: an existing configured conflist is overwritten only when
+  it classifies as a bounded regular single-link file and its Ferrum ownership
+  marker names this same owner. Unmarked, malformed, oversized, symlinked,
+  non-regular, hard-linked, or differently-owned targets are refused with a
+  fixed error and leave those shared artifacts byte-identical.
+- Ownership tokens are bounded to 128 bytes of `[A-Za-z0-9._:/@#-]`, so
+  nothing operator-supplied reaches the filesystem or a log line unchecked.
+  Cleanup diagnostics report fixed reason strings and operator-configured
+  paths only; file contents are never echoed.
+
+**What this does not claim.** The final `unlink` is still by pathname. The
+lock removes that race between Ferrum's own processes, and the identity
+re-check refuses every swap that lands before it, but against a third party
+with write access to a root-owned host CNI directory the window is narrowed,
+not closed — and such a party can already replace the primary CNI
+configuration outright. The bound that matters is the evidence gate above:
+anything Ferrum cannot prove it owns is retained and reported, never removed.
+
+Everything else in the directory — the primary CNI's config, another
+meta-plugin's config, another Ferrum release's chain — is retained and
+reported, not deleted.
+
+The rollback watcher and cleanup hook run with all capabilities dropped,
+`allowPrivilegeEscalation: false`, and `readOnlyRootFilesystem: true`. They
+run as UID 0 because `/etc/cni/net.d` and `/opt/cni/bin` are root-owned on
+every supported distribution; they hold no Linux capability that would let
+them do anything beyond file I/O in the two mounted directories.
+
 ## Audit and logging
 
 ### Kernel auditd
@@ -589,7 +709,7 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 |---|---|---|
 | BPF program from compromised image | Sign agent images, pin digests, scan for unexpected BPF program types | Operator |
 | Capability creep in chart fork | This document + chart fields use `nodeAgent.security.*` toggles, default to least privilege | Gateway |
-| Runtime socket mount (escape vector) | Not present in upstream chart; trusted chart runtime lint in the required `Helm Chart` job (`.github/scripts/check_node_agent_chart_runtime.py`, base-extracted on PRs) recursively rejects any chart template, values/example input, or chart file fragment that adds Docker/containerd/CRI-O sockets or host storage, common `runtime.sock` spellings, or a true/dynamic `privileged` assignment | Operator + Gateway |
+| Runtime socket mount (escape vector) | Not present in upstream chart; trusted chart runtime lint in the required `Helm Chart` job (`.github/scripts/check_node_agent_chart_runtime.py`, base-extracted on PRs; the local Helm installer must match the trusted base before that scan) recursively rejects any chart template, values/example input, or chart file fragment that adds Docker/containerd/CRI-O sockets or host storage, common `runtime.sock` spellings, or a true/dynamic `privileged` assignment, and repeats these checks on Helm-rendered default, node-agent/ambient-enabled, and example-values manifests | Operator + Gateway |
 | Read-write `/sys/fs/cgroup` (host modification) | Chart mounts `readOnly: true`; verify in your own values overlays | Operator |
 | Privileged: true (defeats seccomp) | Chart sets `privileged: false` on the node-agent container; the trusted chart-runtime lint requires every chart `privileged` assignment to remain literal false and rejects true or dynamic Helm-controlled values | Operator + Gateway |
 | Unauthenticated /metrics on cluster network | Loopback-only default (see [`docs/node_agent.md`](node_agent.md)); explicit opt-in to broaden | Gateway |

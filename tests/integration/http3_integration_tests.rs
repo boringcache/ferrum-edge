@@ -408,7 +408,10 @@ async fn test_http3_proxy_state_creation() {
                 ),
             )
         },
-        alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        alt_svc_header: Some(std::sync::Arc::from("h3=\":8443\"; ma=86400")),
+        gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,
@@ -438,6 +441,7 @@ async fn test_http3_proxy_state_creation() {
         per_ip_request_counts: None,
         max_concurrent_requests_per_ip: 0,
         stream_listener_manager: slm,
+        config_revision: ferrum_edge::proxy::ConfigRevisionNotifier::default(),
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
@@ -708,7 +712,10 @@ async fn test_http3_full_integration() {
                 ),
             )
         },
-        alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        alt_svc_header: Some(std::sync::Arc::from("h3=\":8443\"; ma=86400")),
+        gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,
@@ -738,6 +745,7 @@ async fn test_http3_full_integration() {
         per_ip_request_counts: None,
         max_concurrent_requests_per_ip: 0,
         stream_listener_manager: slm,
+        config_revision: ferrum_edge::proxy::ConfigRevisionNotifier::default(),
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
