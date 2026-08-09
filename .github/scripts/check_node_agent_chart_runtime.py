@@ -13,9 +13,8 @@ The job is deliberately separate from `ci-plan`: the trusted ARM64 Cross build
 policy freezes the per-job digest of every Cross-sensitive `ci.yml` job, and
 `ci-plan` is one of them.
 
-The scanner reasons about chart workload/value content after stripping Helm and
-YAML comments, so prose such as the existing RuntimeDefault/containerd seccomp
-comment does not false-positive.
+The scanner checks both chart sources (after stripping comments) and manifests
+rendered by Helm, so helpers and expressions cannot conceal dangerous output.
 
 Usage:
   python3 -I .github/scripts/check_node_agent_chart_runtime.py --self-test
@@ -27,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -180,13 +181,54 @@ def scan_file(root: Path, path: Path) -> list[str]:
     return scan_text(relative, text)
 
 
-def check_repository(root: Path | None = None) -> list[str]:
+def render_mesh_manifests(root: Path) -> list[tuple[str, str]]:
+    """Render the security-sensitive workloads with their supported inputs."""
+
+    helm = shutil.which("helm")
+    if helm is None:
+        raise FileNotFoundError("helm is required to inspect rendered chart manifests")
+    chart = root / "charts/ferrum-mesh"
+    renders: list[tuple[str, list[str]]] = [
+        ("defaults", []),
+        (
+            "node-agent-and-ambient",
+            ["--set", "nodeAgent.enabled=true", "--set", "ambient.enabled=true"],
+        ),
+    ]
+    for values in sorted((chart / "examples").glob("*.y*ml")):
+        renders.append((f"values:{values.name}", ["--values", str(values)]))
+
+    manifests: list[tuple[str, str]] = []
+    for label, extra_args in renders:
+        command = [helm, "template", "ferrum-runtime-lint", str(chart), *extra_args]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"helm render {label} timed out") from exc
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise OSError(f"helm render {label} failed: {detail}")
+        manifests.append((label, result.stdout))
+    return manifests
+
+
+def check_repository(root: Path | None = None, *, render: bool = False) -> list[str]:
     base = default_repo_root() if root is None else root
     if not base.is_dir():
         raise NotADirectoryError(f"chart check root is not a directory: {base}")
     findings: list[str] = []
     for path in iter_scan_paths(base):
         findings.extend(scan_file(base, path))
+    if render:
+        for label, manifest in render_mesh_manifests(base):
+            findings.extend(scan_text(f"helm-render:{label}", manifest))
     return findings
 
 
@@ -270,6 +312,15 @@ def run_self_test() -> list[str]:
     """Synthetic fixtures: prohibited examples fail; legitimate chart content passes."""
 
     failures: list[str] = []
+
+    constructed_source = (
+        'path: {{ printf "/%s/%s/%s.%s" "var" "run" "docker" "sock" }}'
+    )
+    if scan_text("constructed-source", constructed_source):
+        failures.append("constructed Helm source unexpectedly matched a literal path")
+    constructed_render = "path: /var/run/docker.sock"
+    if not scan_text("constructed-render", constructed_render):
+        failures.append("rendered Helm expression did not expose its prohibited path")
 
     with tempfile.TemporaryDirectory(prefix="ferrum-chart-runtime-lint-") as tmp:
         good_root = Path(tmp) / "good"
@@ -529,12 +580,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(
             "node-agent/ambient chart runtime lint self-test passed "
-            "(required surfaces plus recursive chart templates/values/examples)"
+            "(recursive chart sources and rendered-expression regression)"
         )
         return 0
 
     try:
-        findings = check_repository(args.root)
+        findings = check_repository(args.root, render=True)
     except (OSError, ValueError, NotADirectoryError, FileNotFoundError) as exc:
         print(f"::error::chart runtime lint failed closed: {exc}", file=sys.stderr)
         return 1
@@ -545,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         "node-agent/ambient chart runtime lint passed "
-        "(required surfaces plus recursive chart templates/values/examples)"
+        "(recursive chart sources plus Helm-rendered manifests)"
     )
     return 0
 

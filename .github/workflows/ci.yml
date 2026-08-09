@@ -2010,6 +2010,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
       # Trusted-base chart runtime lint: reject container-runtime socket mounts /
       # host storage and privileged: true on node-agent/ambient chart surfaces.
       # Extract the checker from the base branch on pull_request / merge_group so
@@ -2050,9 +2053,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Install Prometheus rule validator
         run: |

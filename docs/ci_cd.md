@@ -228,7 +228,8 @@ runner allocations.
 
 The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
 runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
-as its first step. On pull requests and merge groups the checker is extracted
+immediately after installing its pinned Helm binary. On pull requests and merge
+groups the checker is extracted
 from the base revision when one exists, then self-tested and executed against
 the proposed chart tree. That prevents the step from executing a checker
 replaced by the same pull request; the workflow wiring remains a reviewed pull
@@ -236,7 +237,10 @@ request surface and the required aggregate checks its expected shape. The
 checker rejects Docker/containerd/CRI-O socket mounts, a `runtime.sock` host
 path, or a true/dynamic `privileged` assignment. The scan walks every regular,
 non-symlink chart template, values file, example values file, and chart fragment
-rather than trusting a fixed pair of workload filenames.
+rather than trusting a fixed pair of workload filenames. It also invokes Helm
+and scans the default, node-agent/ambient-enabled, and example-values rendered
+manifests, so helper expansion or a path assembled by a Helm expression cannot
+hide dangerous workload output from the gate.
 
 It lives in `Helm Chart` rather than in `CI Plan` or a new standalone job for
 two reasons. First, `Trusted Cross Build Policy` freezes the per-job digest of
