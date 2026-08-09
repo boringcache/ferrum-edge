@@ -1532,7 +1532,7 @@ impl RequestEpochStore {
         })
     }
 
-    /// Republish a config snapshot into an existing store.
+    /// Republish a config snapshot into an existing store for an integration test.
     ///
     /// Harnesses that drive [`crate::proxy::stream_listener::StreamListenerManager`]
     /// without a full [`crate::proxy::ProxyState`] reload must call this before
@@ -1546,7 +1546,8 @@ impl RequestEpochStore {
     /// Production reloads must keep using [`Self::update_config`] through
     /// `ProxyState::update_config`, which publishes the epoch and mirrors it
     /// into the shared config slot under the writer lock.
-    pub fn republish_from_runtime_parts(
+    #[doc(hidden)]
+    pub fn republish_from_runtime_parts_for_test(
         &self,
         config: GatewayConfig,
         plugin_cache: &PluginCache,
@@ -1575,9 +1576,7 @@ impl RequestEpochStore {
             |_| {},
         )? {
             Some(_) => Ok(()),
-            None => Err(
-                "request epoch harness republish produced no epoch".to_string(),
-            ),
+            None => Err("request epoch harness republish produced no epoch".to_string()),
         }
     }
 

@@ -758,7 +758,7 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
     // deleted catch-all in its captured candidate list.
     let updated = build(second_port, false);
     assert!(updated.validate_stream_proxies().is_ok());
-    runtime.request_epoch.republish_from_runtime_parts(
+    runtime.request_epoch.republish_from_runtime_parts_for_test(
         updated.clone(),
         &runtime.plugin_cache,
         &runtime.consumer_index,
