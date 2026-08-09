@@ -3,9 +3,9 @@
 //!
 //! Covers: absent-trigger parity, request/stream gating, decide-once
 //! memoization, phase safety at the authentication boundary, no-work and
-//! no-buffering on skip, global/proxy scopes, multiple instances, priority and
-//! ordering preservation, reload/publication, and the fail-closed composition
-//! refusals.
+//! no-buffering on skip, global/proxy/proxy-group scopes, multiple instances,
+//! priority and ordering preservation, reload/publication, and the fail-closed
+//! composition refusals.
 //!
 //! The pure schema/compilation layer lives in
 //! `tests/unit/config/plugin_trigger_tests.rs`.
@@ -13,12 +13,12 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     attach_stream_trigger_decisions_for_test, final_request_body_requirements_for_test,
-    set_request_wire_protocol_for_test,
+    set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig,
-    PluginScope, Proxy,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, HttpWireTransport,
+    PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::{
@@ -250,23 +250,62 @@ async fn header_query_and_cookie_predicates_read_the_live_request() {
 }
 
 #[tokio::test]
-async fn protocol_predicates_read_the_frontend_stamped_wire_transport() {
+async fn protocol_predicates_read_frontend_transport_and_http_flavor() {
+    let trigger_specs = [
+        ("h1", "http1", "x-h1"),
+        ("h2", "http2", "x-h2"),
+        ("h3", "http3", "x-h3"),
+        ("grpc", "grpc", "x-grpc"),
+        ("grpc-web", "grpc_web", "x-grpc-web"),
+        ("websocket", "websocket", "x-websocket"),
+    ];
     let plugins = published(
         &config(
-            vec![make_proxy("api", "/api", vec!["stamp"])],
-            vec![with_trigger(
-                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
-                json!({"when": {"match": {"protocol": ["http3"]}}}),
+            vec![make_proxy(
+                "api",
+                "/api",
+                trigger_specs.iter().map(|(id, _, _)| *id).collect(),
             )],
+            trigger_specs
+                .iter()
+                .map(|(id, protocol, header)| {
+                    with_trigger(
+                        header_stamper(id, PluginScope::Proxy, Some("api"), header),
+                        json!({"when": {"match": {"protocol": [protocol]}}}),
+                    )
+                })
+                .collect(),
         ),
         "api",
     );
 
-    let mut h2 = request_from("GET", "/api", "10.1.2.3", HttpWireTransport::Http2);
-    assert!(run_request(&plugins, &mut h2).await.is_empty());
+    let h1 = request_from("GET", "/api", "10.1.2.3", HttpWireTransport::Http1);
 
-    let mut h3 = request_from("GET", "/api", "10.1.2.3", HttpWireTransport::Http3);
-    assert!(!run_request(&plugins, &mut h3).await.is_empty());
+    let mut native_grpc =
+        request_from("POST", "/api", "10.1.2.3", HttpWireTransport::Http2);
+    set_request_http_flavor_for_test(&mut native_grpc, HttpFlavor::Grpc);
+
+    let mut grpc_web = request_from("POST", "/api", "10.1.2.3", HttpWireTransport::Http3);
+    set_request_wire_protocol_for_test(&mut grpc_web, HttpWireTransport::Http3, true);
+
+    let mut websocket = request_from("GET", "/api", "10.1.2.3", HttpWireTransport::Http1);
+    set_request_http_flavor_for_test(&mut websocket, HttpFlavor::WebSocket);
+
+    for (mut ctx, expected) in [
+        (h1, &["x-h1"][..]),
+        (native_grpc, &["x-h2", "x-grpc"][..]),
+        (grpc_web, &["x-h3", "x-grpc-web"][..]),
+        (websocket, &["x-h1", "x-websocket"][..]),
+    ] {
+        let headers = run_request(&plugins, &mut ctx).await;
+        for (_, _, header) in trigger_specs {
+            assert_eq!(
+                headers.contains_key(header),
+                expected.contains(&header),
+                "unexpected protocol-trigger result for {header}: {headers:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1027,6 +1066,46 @@ async fn a_global_scoped_trigger_applies_per_proxy_without_changing_scope_merge(
             headers.contains_key("x-global"),
             expected,
             "proxy {proxy_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_proxy_group_trigger_is_shared_only_by_associated_proxies() {
+    let group = with_trigger(
+        header_stamper("group", PluginScope::ProxyGroup, None, "x-group"),
+        json!({"when": {"match": {"proxy_id": ["alpha"]}}}),
+    );
+    let cfg = config(
+        vec![
+            make_proxy("alpha", "/alpha", vec!["group"]),
+            make_proxy("beta", "/beta", vec!["group"]),
+            make_proxy("unassociated", "/unassociated", vec![]),
+        ],
+        vec![group],
+    );
+    let cache = PluginCache::new(&cfg).expect("proxy-group trigger publishes");
+    let alpha_plugins = cache.get_plugins(NS, "alpha").as_ref().clone();
+    let beta_plugins = cache.get_plugins(NS, "beta").as_ref().clone();
+    assert_eq!(alpha_plugins.len(), 1);
+    assert_eq!(beta_plugins.len(), 1);
+    assert!(
+        Arc::ptr_eq(&alpha_plugins[0], &beta_plugins[0]),
+        "one proxy-group instance must remain shared across its associations"
+    );
+    assert!(cache.get_plugins(NS, "unassociated").is_empty());
+
+    for (proxy_id, plugins, expected) in [
+        ("alpha", &alpha_plugins, true),
+        ("beta", &beta_plugins, false),
+    ] {
+        let mut ctx = request("GET", &format!("/{proxy_id}"));
+        ctx.matched_proxy = Some(Arc::new(make_proxy(proxy_id, "/x", vec!["group"])));
+        let headers = run_request(plugins, &mut ctx).await;
+        assert_eq!(
+            headers.contains_key("x-group"),
+            expected,
+            "proxy-group trigger result for {proxy_id}"
         );
     }
 }
