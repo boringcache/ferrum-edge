@@ -341,13 +341,7 @@ fn malformed_cidrs_methods_field_names_and_ports_are_rejected() {
 fn field_names_are_not_trimmed_and_padded_names_are_rejected() {
     for field in ["header", "query", "cookie"] {
         for name in [
-            " x-tier",
-            "x-tier ",
-            " x-tier ",
-            "\tx-tier",
-            "x-tier\n",
-            "x tier",
-            " ",
+            " x-tier", "x-tier ", " x-tier ", "\tx-tier", "x-tier\n", "x tier", " ",
         ] {
             let error = compile_error(serde_json::json!({
                 "when": {"match": {field: {"name": name}}}

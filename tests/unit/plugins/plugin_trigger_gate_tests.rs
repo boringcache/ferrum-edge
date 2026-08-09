@@ -339,7 +339,11 @@ async fn an_unrepresentable_query_pair_fails_closed_to_running_under_not() {
         !run_request(&plugins, &mut invalid).await.is_empty(),
         "an unrepresentable pair must not be able to switch an instance off"
     );
-    assert!(!invalid.metadata.contains_key("plugin_trigger.stamp.skipped"));
+    assert!(
+        !invalid
+            .metadata
+            .contains_key("plugin_trigger.stamp.skipped")
+    );
 }
 
 #[tokio::test]
@@ -571,7 +575,11 @@ async fn a_skipped_instance_contributes_no_response_body_release_decision() {
     // and skipped runs, which is what makes the gate observable.
     let mut running = request("GET", "/api/orders/42");
     plugin.on_request_received(&mut running).await;
-    assert!(!running.metadata.contains_key("plugin_trigger.compress.skipped"));
+    assert!(
+        !running
+            .metadata
+            .contains_key("plugin_trigger.compress.skipped")
+    );
     assert_eq!(
         release_votes(plugin, &running, &headers),
         [false, false, true, false, true],
@@ -650,7 +658,11 @@ async fn a_priority_only_wrapper_still_runs_the_final_response_header_phase() {
         "api",
     );
     let plugin = plugins.first().expect("one published instance");
-    assert_eq!(plugin.priority(), 3501, "the wrapper is the priority-only one");
+    assert_eq!(
+        plugin.priority(),
+        3501,
+        "the wrapper is the priority-only one"
+    );
 
     let headers = html_response_headers();
     let mut ctx = request("GET", "/api/orders/42");
