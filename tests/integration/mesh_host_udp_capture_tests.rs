@@ -298,7 +298,7 @@ fn planner_orders_rules_deterministically_and_detects_attribution_changes() {
     // authorization stops new traffic, but a session admitted earlier still
     // holds the removed pod's identity and its transparent reply socket, so a
     // one-way return stream could keep reaching a removed (or recycled) address.
-    let removed = plan_host_udp_bindings(&[a.clone()], &resolved);
+    let removed = plan_host_udp_bindings(std::slice::from_ref(&a), &resolved);
     assert!(
         removed.requires_listener_restart_from(&state),
         "removing a captured pod must cancel the sessions admitted under its evidence"

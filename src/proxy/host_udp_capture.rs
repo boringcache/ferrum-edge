@@ -619,11 +619,6 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         self
     }
 
-    /// The shared per-datagram evidence index (handed to the capture loop).
-    pub fn index(&self) -> Arc<HostUdpIdentityIndex> {
-        self.index.clone()
-    }
-
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         // Reap any state a previous generation of this process left behind
         // BEFORE the first apply. Running it unconditionally is what makes a
