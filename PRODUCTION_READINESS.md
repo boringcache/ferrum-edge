@@ -97,10 +97,10 @@ issue body alone.
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 | Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
-| CNI ferrum-cni chaining uninstall/rollback | #3609 | Node-agent becomes node-wide pod-creation dependency |
+| CNI chained-install live lifecycle evidence | #3609 | Ownership-scoped install, readiness rollback, `helm uninstall` cleanup hook and honest dependency docs shipped; no live full-chart `helm install`/`helm uninstall` gate, and a node-agent that fails *after* it was once ready is not auto-rolled back |
 | Cross-region CP failover topology | #3610 | `multi_region_ha.md` vs CP rejection/failover fence |
 | CP/K8s authoritative mesh config revision | #3611 | DP stale-fallback gate inert in flagship K8s topology |
-| Gateway API port-aware route representation | #3612 | Per-listener routes collide at validation |
+| Gateway API port-aware route representation | #3612 | Done — per-listener identity, real listener binding, per-listener retention |
 | OIDC RP pending login state (HA) | #3613 | Process-local state breaks non-sticky multi-replica login |
 | `ai_stream_router` Anthropic multimodal content | #3616 | Silent drop vs Gemini fail-closed path |
 | TCP outbound PROXY protocol v2 | #3618 | Inbound only today |

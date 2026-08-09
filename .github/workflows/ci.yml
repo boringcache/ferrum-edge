@@ -739,7 +739,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 107 test-file filters visible to the grep-based coverage
+    # below keeps every test-file filter visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -795,6 +795,7 @@ jobs:
               integration::ai_transcript_audit_grpc_reload_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
+              integration::gateway_api_backend_ref_kinds_tests
               integration::gateway_api_backend_tls_policy_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
@@ -866,6 +867,7 @@ jobs:
               integration::gateway_svid_identity_tests
               integration::workload_api_jwt_svid_tests
               integration::graceful_shutdown_tests
+              integration::port_aware_route_traffic_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_mutation_decode_fail_closed_tests
@@ -1112,7 +1114,9 @@ jobs:
               functional_credential_rotation_test
               functional_file_mode_test
               functional_gateway_backend_tls_policy_test
+              functional_gateway_service_import_test
               functional_host_only_routing_test
+              functional_port_aware_routes_test
               functional_migrate_mode_test
               functional_protocol_validation_test
               functional_regex_routing_test
@@ -2162,6 +2166,153 @@ jobs:
             echo "::error title=Disabled Ambient UDP capture was armed in iptables mode::lifecycle wiring must not render the producer enable flag"
             exit 1
           fi
+          # CNI install lifecycle (#3609): the chained conflist makes the
+          # node-agent a node-wide pod-creation dependency, so the chart must
+          # render an ownership-stamped install, an in-pod rollback watcher,
+          # and a per-node pre-delete cleanup hook — and must NOT render the
+          # cleanup on upgrade/rollback.
+          cni_out="$RUNNER_TEMP/ferrum-helm-results/cni-lifecycle-rendered.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.cni.enabled=true \
+            > "$cni_out"
+          for needle in 'name: ferrum-cni-rollback' 'name: ferrum-mesh-cni-cleanup' \
+            'name: ferrum-mesh-cni-cleanup-wait' 'name: OWNER_ID' \
+            'name: INSTALL_GENERATION' 'name: EXPECTED_OWNER' \
+            'name: READY_MARKER_PATH' 'restartPolicy: Always' \
+            'name: PUBLISH_TIMEOUT_SECS' \
+            'automountServiceAccountToken: false' \
+            'resourceNames: ["ferrum-mesh-cni-cleanup"]' \
+            '- await-cleanup'; do
+            if ! grep -Fq -- "$needle" "$cni_out"; then
+              echo "::error title=CNI lifecycle wiring missing::expected ${needle} in the rendered CNI install lifecycle (#3609)"
+              exit 1
+            fi
+          done
+          # Cleanup must be a DaemonSet (one pod per node), pre-delete only.
+          if ! grep -Fq '"helm.sh/hook": pre-delete' "$cni_out"; then
+            echo "::error title=CNI cleanup hook is not pre-delete::cleanup must complete before the node-agent socket is deleted"
+            exit 1
+          fi
+          if grep -E '"helm\.sh/hook": (pre|post)-(upgrade|rollback|install)' "$cni_out"; then
+            echo "::error title=CNI cleanup hook fires outside uninstall::a rolling replacement must never remove still-required CNI state"
+            exit 1
+          fi
+          if ! grep -A3 '^kind: DaemonSet' "$cni_out" | grep -Fq 'name: ferrum-mesh-cni-cleanup'; then
+            echo "::error title=CNI cleanup hook is not a DaemonSet::a Job cleans one node and strands a multi-node cluster"
+            exit 1
+          fi
+          # Helm's hook wait only watches Job/Pod kinds, so the per-node
+          # DaemonSet needs a later-weighted Job to give the phase a real
+          # completion boundary.
+          if ! grep -A3 '^kind: Job' "$cni_out" | grep -Fq 'name: ferrum-mesh-cni-cleanup-wait'; then
+            echo "::error title=CNI cleanup has no wait Job::a hook DaemonSet alone is fire-and-forget; the release could be deleted mid-cleanup"
+            exit 1
+          fi
+          # Both cleanup pods must be hostNetwork: a pod that needed its own
+          # CNI sandbox could never start on a node whose chain is broken, so
+          # the hook would deadlock exactly where it is needed most.
+          cni_hook_out="$RUNNER_TEMP/ferrum-helm-results/cni-uninstall-hook.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --show-only templates/cni-uninstall-hook.yaml > "$cni_hook_out"
+          if [ "$(grep -c 'hostNetwork: true' "$cni_hook_out")" -lt 2 ]; then
+            echo "::error title=CNI cleanup pods are not hostNetwork::cleanup would deadlock behind the chain it removes"
+            exit 1
+          fi
+          # Hook deletion policies are asymmetric and load-bearing. Helm 3.19+
+          # and v4 delete every earlier `hook-succeeded` hook when a later hook
+          # in the same phase fails (deleteHooksByPolicy in
+          # pkg/action/hooks.go; 3.18 and older delete only the failing hook),
+          # so the cleanup DaemonSet must NOT carry that policy: the wait Job
+          # deletes it explicitly, and a failed wait has to leave it for the
+          # retry.
+          if [ "$(grep -c '"helm.sh/hook-delete-policy": before-hook-creation$' "$cni_hook_out")" -ne 1 ]; then
+            echo "::error title=CNI cleanup DaemonSet deletion policy changed::the cleanup DaemonSet must carry before-hook-creation only, so a failed wait leaves it for the retry"
+            exit 1
+          fi
+          if [ "$(grep -c '"helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded$' "$cni_hook_out")" -ne 1 ]; then
+            echo "::error title=CNI cleanup wait Job deletion policy changed::exactly the wait Job may be deleted on success"
+            exit 1
+          fi
+          # Identity and RBAC must be ORDINARY release resources. As hook
+          # resources they would be deleted by the failure path above, exactly
+          # when a retry needs them.
+          cni_rbac_out="$RUNNER_TEMP/ferrum-helm-results/cni-cleanup-rbac.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --show-only templates/cni-cleanup-rbac.yaml > "$cni_rbac_out"
+          if grep -Fq 'helm.sh/hook' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup identity is a hook resource::Helm deletes succeeded hooks when a later hook fails; the cleanup SA/Role/RoleBinding must be ordinary release resources"
+            exit 1
+          fi
+          for needle in 'kind: ServiceAccount' 'kind: Role' 'kind: RoleBinding' \
+            'automountServiceAccountToken: false' \
+            'resourceNames: ["ferrum-mesh-cni-cleanup"]'; do
+            if ! grep -Fq "$needle" "$cni_rbac_out"; then
+              echo "::error title=CNI cleanup identity missing::expected ${needle} in the release-owned cleanup RBAC (#3609)"
+              exit 1
+            fi
+          done
+          # The wait Job's RBAC must stay the two named-object verbs it needs
+          # (read the status, then retire the DaemonSet) and nothing more.
+          if ! grep -Fq 'verbs: ["get", "delete"]' "$cni_rbac_out" \
+            || ! grep -Fq 'verbs: ["get"]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC verbs changed::the wait Job needs exactly get+delete on the named DaemonSet and get on its status"
+            exit 1
+          fi
+          if grep -E 'verbs: \[.*(list|watch|create|update|patch|"\*").*\]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC widened::no list/watch/write access may be granted to the cleanup wait identity"
+            exit 1
+          fi
+          if grep -Fq 'resources: ["daemonsets", "daemonsets/status"]' "$cni_rbac_out"; then
+            echo "::error title=CNI cleanup RBAC collapsed::daemonsets and daemonsets/status must stay separate rules so delete is not granted on the status subresource"
+            exit 1
+          fi
+          # The rollback watcher must be ordered BEFORE the installer, or it
+          # cannot undo a half-finished install.
+          rollback_line="$(grep -n 'name: ferrum-cni-rollback' "$cni_out" | head -n1 | cut -d: -f1)"
+          installer_line="$(grep -n 'name: ferrum-cni-installer' "$cni_out" | head -n1 | cut -d: -f1)"
+          if [ -z "$rollback_line" ] || [ -z "$installer_line" ] || [ "$rollback_line" -ge "$installer_line" ]; then
+            echo "::error title=Rollback watcher ordered after the installer::the native sidecar must start before the chained conflist is written"
+            exit 1
+          fi
+          # Default render (CNI opt-out) must carry none of it.
+          for needle in 'ferrum-cni-rollback' 'ferrum-mesh-cni-cleanup'; do
+            if grep -Fq "$needle" "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
+              echo "::error title=CNI lifecycle rendered while CNI is disabled::${needle} must be gated on nodeAgent.cni.enabled"
+              exit 1
+            fi
+          done
+          # Each half is independently disableable.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --set nodeAgent.cni.rollback.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/cni-no-rollback.yaml"
+          if grep -Fq 'ferrum-cni-rollback' "$RUNNER_TEMP/ferrum-helm-results/cni-no-rollback.yaml"; then
+            echo "::error title=Rollback watcher rendered while disabled::nodeAgent.cni.rollback.enabled=false must drop the sidecar"
+            exit 1
+          fi
+          grep -Fq 'ferrum-mesh-cni-cleanup' "$RUNNER_TEMP/ferrum-helm-results/cni-no-rollback.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --set nodeAgent.cni.uninstall.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/cni-no-uninstall.yaml"
+          if grep -Fq 'ferrum-mesh-cni-cleanup' "$RUNNER_TEMP/ferrum-helm-results/cni-no-uninstall.yaml"; then
+            echo "::error title=Cleanup hook rendered while disabled::nodeAgent.cni.uninstall.enabled=false must drop the hook"
+            exit 1
+          fi
+          # A rollback budget that cannot fit one probe must fail render.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true --set nodeAgent.cni.enabled=true \
+            --set nodeAgent.cni.rollback.readyTimeoutSeconds=5 \
+            --set nodeAgent.cni.rollback.pollIntervalSeconds=5 \
+            > "$RUNNER_TEMP/ferrum-helm-results/cni-bad-rollback.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/cni-bad-rollback.err"; then
+            echo "::error title=Degenerate rollback budget rendered successfully::readyTimeoutSeconds must exceed pollIntervalSeconds"
+            exit 1
+          fi
+          grep -F 'must be greater than' "$RUNNER_TEMP/ferrum-helm-results/cni-bad-rollback.err"
           if grep -q 'ferrum-mesh-control-plane' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
             echo "::error title=Default chart rendered a control plane::controlPlane.enabled must default to false until required values are supplied"
             exit 1

@@ -17,6 +17,11 @@
 //!   distinct keeps the CNI parser independent of the node-agent surface
 //!   so we can evolve either side without churning the other.
 //!
+//! Two more modules cover the host-side install lifecycle rather than the
+//! wire: [`install`] writes and provably removes the Ferrum-owned binary and
+//! chained conflist, and [`lifecycle`] rolls that install back when the
+//! node-agent never reaches CNI readiness.
+//!
 //! Why both? The CNI spec defines the byte-for-byte JSON the kubelet hands
 //! us; the node-agent RPC is internal and intentionally minimal (no
 //! interface/IP allocation responsibilities — Ferrum chains behind the
@@ -31,6 +36,7 @@
 
 pub mod client;
 pub mod install;
+pub mod lifecycle;
 pub mod ownership;
 pub mod rpc;
 pub mod spec;
