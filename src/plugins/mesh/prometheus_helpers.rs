@@ -13,8 +13,8 @@ use dashmap::mapref::entry::Entry;
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::metric_tag_cel::{
-    MetricTagCelAttr, MetricTagCelContext, MetricTagCelExpr, evaluate_metric_tag_cel,
-    metadata_destination_port, metadata_request_host, metadata_request_method,
+    MetricTagCelAttr, MetricTagCelContext, metadata_destination_port, metadata_request_host,
+    metadata_request_method, sanitize_metric_tag_value,
 };
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
@@ -1566,9 +1566,6 @@ fn apply_metric_override_plan(
                 let Some(rest) = rest.strip_prefix(';') else {
                     return;
                 };
-                let Some(expr) = decode_metric_tag_cel_expr(body) else {
-                    return;
-                };
                 let value = {
                     let live_ctx = MetricTagCelContext {
                         source_workload: key.source_workload.as_ref(),
@@ -1595,7 +1592,10 @@ fn apply_metric_override_plan(
                             .then_some(key.response_code)),
                         destination_port: extras.destination_port,
                     };
-                    evaluate_metric_tag_cel(&expr, live_ctx)
+                    let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {
+                        return;
+                    };
+                    value
                 };
                 set_metric_label_value(key, label, intern_label(&value));
                 key.removed_labels &= !(1u16 << label.index());
@@ -1606,37 +1606,92 @@ fn apply_metric_override_plan(
     }
 }
 
-fn decode_metric_tag_cel_expr(mut body: &str) -> Option<MetricTagCelExpr> {
-    let expr = decode_metric_tag_cel_expr_prefix(&mut body)?;
-    if !body.is_empty() {
+/// Validate and evaluate the reload-time compact CEL plan without rebuilding
+/// its owned AST on every metric emission. The first bounded walk validates
+/// the complete plan (including the unselected ternary branch); the second
+/// evaluates only the selected branch and allocates only the final sanitized
+/// label value.
+fn evaluate_compact_metric_tag_cel(
+    body: &str,
+    ctx: MetricTagCelContext<'_>,
+) -> Option<String> {
+    if !compact_metric_tag_cel_is_valid(body) {
         return None;
     }
-    Some(expr)
+    let mut remaining = body;
+    let value = evaluate_compact_metric_tag_cel_prefix(&mut remaining, ctx)?;
+    remaining.is_empty().then_some(value)
 }
 
-fn decode_metric_tag_cel_expr_prefix(body: &mut &str) -> Option<MetricTagCelExpr> {
+fn compact_metric_tag_cel_is_valid(body: &str) -> bool {
+    let mut remaining = body;
+    skip_compact_metric_tag_cel_prefix(&mut remaining).is_some() && remaining.is_empty()
+}
+
+fn skip_compact_metric_tag_cel_prefix(body: &mut &str) -> Option<()> {
     let op = body.as_bytes().first().copied()?;
     *body = &body[1..];
     match op {
         b'L' => {
             let (length, rest) = take_number_until(body, b':')?;
-            let value = rest.get(..length)?.to_string();
+            rest.get(..length)?;
             *body = rest.get(length..)?;
-            Some(MetricTagCelExpr::Literal { value })
+            Some(())
+        }
+        b'A' | b'I' => {
+            let (id, rest) = take_number_end(body)?;
+            MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            *body = rest;
+            Some(())
+        }
+        b'H' => {
+            let (id, after_id) = take_number_until(body, b',')?;
+            MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            let (then_len, after_then_len) = take_number_until(after_id, b':')?;
+            let then_body = after_then_len.get(..then_len)?;
+            let after_then = after_then_len.get(then_len..)?;
+            let (else_len, after_else_len) = take_number_until(after_then, b':')?;
+            let else_body = after_else_len.get(..else_len)?;
+            let after_else = after_else_len.get(else_len..)?;
+            *body = after_else;
+            compact_metric_tag_cel_is_valid(then_body)
+                .then_some(())
+                .filter(|()| compact_metric_tag_cel_is_valid(else_body))
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_compact_metric_tag_cel_prefix(
+    body: &mut &str,
+    ctx: MetricTagCelContext<'_>,
+) -> Option<String> {
+    let op = body.as_bytes().first().copied()?;
+    *body = &body[1..];
+    match op {
+        b'L' => {
+            let (length, rest) = take_number_until(body, b':')?;
+            let value = sanitize_metric_tag_value(rest.get(..length)?);
+            *body = rest.get(length..)?;
+            Some(value)
         }
         b'A' => {
             let (id, rest) = take_number_end(body)?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
             *body = rest;
-            Some(MetricTagCelExpr::Attribute {
-                name: MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?,
-            })
+            Some(sanitize_metric_tag_value(
+                ctx.string_attr(attribute).unwrap_or(""),
+            ))
         }
         b'I' => {
             let (id, rest) = take_number_end(body)?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
             *body = rest;
-            Some(MetricTagCelExpr::StringOfInt {
-                attribute: MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?,
-            })
+            Some(
+                ctx.int_attr(attribute)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            )
         }
         b'H' => {
             let (id, after_id) = take_number_until(body, b',')?;
@@ -1646,15 +1701,14 @@ fn decode_metric_tag_cel_expr_prefix(body: &mut &str) -> Option<MetricTagCelExpr
             let after_then = after_then_len.get(then_len..)?;
             let (else_len, after_else_len) = take_number_until(after_then, b':')?;
             let else_body = after_else_len.get(..else_len)?;
-            let after_else = after_else_len.get(else_len..)?;
-            *body = after_else;
-            let then_expr = decode_metric_tag_cel_expr(then_body)?;
-            let else_expr = decode_metric_tag_cel_expr(else_body)?;
-            Some(MetricTagCelExpr::HasThenElse {
-                attribute,
-                then_expr: Box::new(then_expr),
-                else_expr: Box::new(else_expr),
-            })
+            *body = after_else_len.get(else_len..)?;
+            let mut selected = if ctx.string_attr(attribute).is_some() {
+                then_body
+            } else {
+                else_body
+            };
+            let value = evaluate_compact_metric_tag_cel_prefix(&mut selected, ctx)?;
+            selected.is_empty().then_some(value)
         }
         _ => None,
     }
