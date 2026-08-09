@@ -889,7 +889,12 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
                 .contains(&K8sResourceKey::from_object(object));
             backend_lb_policy_status(object, conflicted)
         }
-        "ListenerSet" => listenerset_status(object, ctx.indexes, ctx.translation_result, ctx.status_context),
+        "ListenerSet" => listenerset_status(
+            object,
+            ctx.indexes,
+            ctx.translation_result,
+            ctx.status_context,
+        ),
         _ => Value::Object(Default::default()),
     }
 }
@@ -1465,33 +1470,38 @@ fn listenerset_status(
             .find(|status| status.resource.matches_object(object))
     });
 
-    let (accepted, accepted_reason, accepted_message, programmed_base, programmed_reason, programmed_message) =
-        match outcome {
-            Some(status) => (
-                status.accepted,
-                status.accepted_reason.as_str(),
-                status.accepted_message.as_str(),
-                status.programmed,
-                status.programmed_reason.as_str(),
-                status.programmed_message.as_str(),
-            ),
-            None => (
-                false,
-                "Pending",
-                "Ferrum has not evaluated this ListenerSet yet",
-                false,
-                "Pending",
-                "Ferrum has not evaluated this ListenerSet yet",
-            ),
-        };
+    let (
+        accepted,
+        accepted_reason,
+        accepted_message,
+        programmed_base,
+        programmed_reason,
+        programmed_message,
+    ) = match outcome {
+        Some(status) => (
+            status.accepted,
+            status.accepted_reason.as_str(),
+            status.accepted_message.as_str(),
+            status.programmed,
+            status.programmed_reason.as_str(),
+            status.programmed_message.as_str(),
+        ),
+        None => (
+            false,
+            "Pending",
+            "Ferrum has not evaluated this ListenerSet yet",
+            false,
+            "Pending",
+            "Ferrum has not evaluated this ListenerSet yet",
+        ),
+    };
 
     // Align Programmed with live mesh materialization when translation ran.
     let programmed_from_config = result.ok().is_some_and(|translation| {
         listenerset_has_materialized_listener(object, &translation.config)
     });
-    let programmed = accepted
-        && (programmed_base || programmed_from_config)
-        && status_context.data_plane_ready;
+    let programmed =
+        accepted && (programmed_base || programmed_from_config) && status_context.data_plane_ready;
     let (programmed_reason, programmed_message) = if programmed {
         ("Programmed", "Ferrum programmed this ListenerSet")
     } else if accepted && (programmed_base || programmed_from_config) {
@@ -1500,10 +1510,7 @@ fn listenerset_status(
             "Ferrum accepted this ListenerSet, but the serving Ferrum data plane is not ready",
         )
     } else if accepted {
-        (
-            programmed_reason,
-            programmed_message,
-        )
+        (programmed_reason, programmed_message)
     } else {
         (accepted_reason, accepted_message)
     };
@@ -1566,29 +1573,29 @@ fn has_ferrum_condition_status(status: &Value) -> bool {
         .any(|condition| {
             // ListenerSet has no controllerName on conditions; presence of our
             // reasons after a prior write is enough to keep reconciling.
-            condition.get("reason").and_then(Value::as_str).is_some_and(|reason| {
-                matches!(
-                    reason,
-                    "Accepted"
-                        | "Programmed"
-                        | "NotAllowed"
-                        | "ParentNotAccepted"
-                        | "ParentNotProgrammed"
-                        | "ListenersNotValid"
-                        | "Invalid"
-                        | "HostnameConflict"
-                        | "ProtocolConflict"
-                        | "DataPlaneNotReady"
-                        | "Pending"
-                )
-            })
+            condition
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    matches!(
+                        reason,
+                        "Accepted"
+                            | "Programmed"
+                            | "NotAllowed"
+                            | "ParentNotAccepted"
+                            | "ParentNotProgrammed"
+                            | "ListenersNotValid"
+                            | "Invalid"
+                            | "HostnameConflict"
+                            | "ProtocolConflict"
+                            | "DataPlaneNotReady"
+                            | "Pending"
+                    )
+                })
         })
 }
 
-fn listenerset_has_materialized_listener(
-    object: &K8sObject,
-    config: &GatewayConfig,
-) -> bool {
+fn listenerset_has_materialized_listener(object: &K8sObject, config: &GatewayConfig) -> bool {
     let Some(mesh) = config.mesh.as_ref() else {
         return false;
     };
@@ -1604,9 +1611,9 @@ fn listenerset_has_materialized_listener(
                 .and_then(Value::as_str)
                 .unwrap_or("listener");
             let expected = format!("{}-{listener_name}", object.metadata.name);
-            mesh.services
-                .iter()
-                .any(|service| service.namespace == object.metadata.namespace && service.name == expected)
+            mesh.services.iter().any(|service| {
+                service.namespace == object.metadata.namespace && service.name == expected
+            })
         })
 }
 

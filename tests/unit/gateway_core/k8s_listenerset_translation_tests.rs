@@ -232,7 +232,8 @@ fn listenerset_attaches_and_materializes_http_route() {
         "accepted ListenerSet listener must materialize a mesh service"
     );
 
-    let updates = plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
     let gateway_update = updates
         .iter()
         .find(|update| update.kind == "Gateway" && update.name == "edge")
@@ -375,13 +376,17 @@ fn listenerset_hostname_conflict_marks_loser_not_materialized() {
     );
     assert!(
         !translation.config.proxies.iter().any(|proxy| {
-            proxy.hosts.iter().any(|host| host == "conflict.example.com")
+            proxy
+                .hosts
+                .iter()
+                .any(|host| host == "conflict.example.com")
                 && proxy.listen_path.contains("newer")
         }),
         "conflicted ListenerSet must not materialize route traffic"
     );
 
-    let updates = plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
     let newer_update = updates
         .iter()
         .find(|update| update.kind == "ListenerSet" && update.name == "newer")
@@ -539,9 +544,13 @@ fn listenerset_update_and_delete_withdraw_materialization() {
         ),
     ];
     let first = translate_k8s_objects(&base, options()).expect("first translate");
-    assert!(first.config.proxies.iter().any(|proxy| {
-        proxy.hosts.iter().any(|host| host == "extra.example.com")
-    }));
+    assert!(
+        first
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "extra.example.com") })
+    );
 
     // Tighten allowedListeners to None and retranslate — ListenerSet withdraws.
     let mut tightened = base.clone();
@@ -554,9 +563,11 @@ fn listenerset_update_and_delete_withdraw_materialization() {
             .any(|status| status.resource.name == "extra" && !status.accepted)
     );
     assert!(
-        !second.config.proxies.iter().any(|proxy| {
-            proxy.hosts.iter().any(|host| host == "extra.example.com")
-        }),
+        !second
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "extra.example.com") }),
         "tightening allowedListeners must withdraw ListenerSet traffic"
     );
 
@@ -568,9 +579,11 @@ fn listenerset_update_and_delete_withdraw_materialization() {
     let third = translate_k8s_objects(&deleted, options()).expect("third translate");
     assert!(third.listenerset_statuses.is_empty());
     assert!(
-        !third.config.proxies.iter().any(|proxy| {
-            proxy.hosts.iter().any(|host| host == "extra.example.com")
-        }),
+        !third
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "extra.example.com") }),
         "deleting ListenerSet must withdraw materialization"
     );
 }

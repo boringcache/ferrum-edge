@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use super::gateway_api::{
     allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
-    listener_is_materializable, listener_protocol_mode_is_supported, listener_requires_frontend_tls,
-    namespace_selector_matches, normalize_gateway_hostname,
+    listener_is_materializable, listener_protocol_mode_is_supported,
+    listener_requires_frontend_tls, namespace_selector_matches, normalize_gateway_hostname,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
@@ -87,16 +87,7 @@ fn collect_one_listenerset(
         Ok(parent) => parent,
         Err(message) => {
             record_listenerset_status(
-                acc,
-                resource,
-                None,
-                false,
-                false,
-                "Invalid",
-                &message,
-                false,
-                "Invalid",
-                &message,
+                acc, resource, None, false, false, "Invalid", &message, false, "Invalid", &message,
             );
             return Ok(());
         }
@@ -276,14 +267,17 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                     .unwrap_or(u64::MAX / 2)
             }
         };
-        by_gateway.entry(gateway).or_default().push(ConflictCandidate {
-            key: key.clone(),
-            precedence,
-            port,
-            protocol: protocol.to_ascii_uppercase(),
-            hostname: policy.hostname.clone(),
-            eligible: policy.materializable && policy.conflict_reason.is_none(),
-        });
+        by_gateway
+            .entry(gateway)
+            .or_default()
+            .push(ConflictCandidate {
+                key: key.clone(),
+                precedence,
+                port,
+                protocol: protocol.to_ascii_uppercase(),
+                hostname: policy.hostname.clone(),
+                eligible: policy.materializable && policy.conflict_reason.is_none(),
+            });
     }
 
     let mut conflicted: HashMap<GatewayApiListenerKey, &'static str> = HashMap::new();
@@ -416,8 +410,9 @@ pub(crate) fn mark_listenerset_programmed_from_config(
             if status.accepted && !status.programmed {
                 status.programmed = false;
                 status.programmed_reason = "ListenersNotValid".to_string();
-                status.programmed_message = "Ferrum accepted this ListenerSet but found no materialized listeners"
-                    .to_string();
+                status.programmed_message =
+                    "Ferrum accepted this ListenerSet but found no materialized listeners"
+                        .to_string();
             }
         }
         return;

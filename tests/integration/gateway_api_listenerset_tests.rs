@@ -128,15 +128,22 @@ fn listenerset_attachment_status_and_withdrawal_round_trip() {
         route(),
     ];
     let translation = translate_k8s_objects(&with_set, options()).expect("translate");
-    assert!(translation
-        .listenerset_statuses
-        .iter()
-        .any(|status| status.attached && status.accepted));
-    assert!(translation.config.proxies.iter().any(|proxy| {
-        proxy.hosts.iter().any(|host| host == "set.example.com")
-    }));
+    assert!(
+        translation
+            .listenerset_statuses
+            .iter()
+            .any(|status| status.attached && status.accepted)
+    );
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "set.example.com") })
+    );
 
-    let updates = plan_gateway_api_status_updates(&with_set, options(), &translation.route_conflicts);
+    let updates =
+        plan_gateway_api_status_updates(&with_set, options(), &translation.route_conflicts);
     assert!(updates.iter().any(|update| {
         update.kind == "Gateway"
             && update.name == "edge"
@@ -149,9 +156,7 @@ fn listenerset_attachment_status_and_withdrawal_round_trip() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|condition| {
-                    condition["type"] == "Accepted" && condition["status"] == "True"
-                })
+                .any(|condition| condition["type"] == "Accepted" && condition["status"] == "True")
     }));
 
     let without_set: Vec<_> = with_set
