@@ -929,23 +929,22 @@ impl MeshMtlsConnectionPool {
         expected_peer: Option<&SpiffeId>,
         expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
+        source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         // Fail closed when no gateway SVID is loaded — never dial a mesh peer
         // identity-less (parity with `open_connect_tunnel` and `get_sender`).
         // This also drives the rotation/retired-fingerprint bookkeeping.
         let _ = self.current_svid_fingerprint_cached()?;
-        // The datagram path (unlike the byte-stream / WS mesh-mTLS paths) carries
-        // the W3C source-identity baggage, so read the source SPIFFE id from the
-        // current SVID bundle. `current_svid_fingerprint_cached` above already
-        // proved a bundle is present, but the slot can rotate to empty between the
-        // two loads, so this re-checks and fails closed rather than dialing
-        // identity-less. The `MeshMtlsConnectionPool` identity cache stores only
-        // the fingerprint (no SPIFFE id — the other transports need none), so the
-        // id is read directly off the bundle here.
-        let source_identity = {
+        // Ambient capture supplies workload + pod evidence. Sidecar capture has
+        // no asserted workload override, so its own SVID remains the source.
+        // The authenticated peer at the destination still validates either
+        // assertion before using it for authorization.
+        let baggage = if let Some(source) = source_identity {
+            crate::modes::mesh::hbone::baggage_header_for_udp_source(source)
+        } else {
             let snapshot = self.gateway_svid.load_full();
             let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
-            bundle.spiffe_id.clone()
+            crate::modes::mesh::hbone::baggage_header_for_source(&bundle.spiffe_id)
         };
         let pool_config = self.pool_config.for_proxy(proxy);
         // Per-port DestinationRule overrides are resolved for the destination's
@@ -982,7 +981,6 @@ impl MeshMtlsConnectionPool {
             conn_admission.as_ref(),
         )
         .await?;
-        let baggage = crate::modes::mesh::hbone::baggage_header_for_source(&source_identity);
         tokio::time::timeout(
             connect_timeout,
             open_h2_connect_stream(
@@ -1897,6 +1895,7 @@ mod tests {
                 53,
                 ISTIO_SIDECAR_INBOUND_PORT,
                 Some(&peer),
+                None,
                 None,
                 None,
             )
