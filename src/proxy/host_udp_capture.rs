@@ -846,7 +846,14 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                     "Host UDP capture: partial capture cleanup failed; guard retained"
                 );
             }
-            // The previously applied ruleset is gone, so do not keep claiming it.
+            // The previously applied ruleset is gone, so do not keep claiming it
+            // or leave sessions from that now-untracked generation alive. If the
+            // listener survived while `applied` became `None`, a later removal
+            // could not detect that it must restart the listener, and an admitted
+            // session could keep its stale identity / transparent reply socket.
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
+            }
             self.applied = None;
             self.index.clear();
             return;
@@ -909,6 +916,14 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                     error = %cleanup_error,
                     "Host UDP capture: capture cleanup after guard-release failure did not complete"
                 );
+            }
+            // Keep the listener generation and `applied` generation coupled on
+            // every failure path. The guard remains fail-closed and the capture
+            // rules are gone, so preserving live sessions provides no availability
+            // benefit and would make their evidence impossible to compare during
+            // the next withdrawal.
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
             }
             self.index.clear();
             self.applied = None;

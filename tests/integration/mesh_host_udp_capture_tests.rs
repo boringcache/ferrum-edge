@@ -351,6 +351,7 @@ struct FakeBackendState {
     /// own, standing in for a socket error or a panicked task.
     listener_exits: bool,
     listeners: usize,
+    listener_stops: usize,
 }
 
 #[derive(Clone, Default)]
@@ -381,6 +382,10 @@ impl FakeBackend {
 
     fn listeners(&self) -> usize {
         self.inner.lock().unwrap().listeners
+    }
+
+    fn listener_stops(&self) -> usize {
+        self.inner.lock().unwrap().listener_stops
     }
 
     fn set_listener_exits(&self, exits: bool) {
@@ -441,6 +446,7 @@ impl HostUdpCaptureBackend for FakeBackend {
             state.listener_exits
         };
         let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let inner = Arc::clone(&self.inner);
         // A real capture loop runs until it is stopped, so the fake spawns a
         // task that does the same — otherwise the manager could never tell a
         // live loop from one that died.
@@ -449,6 +455,7 @@ impl HostUdpCaptureBackend for FakeBackend {
                 return;
             }
             let _ = rx.changed().await;
+            inner.lock().unwrap().listener_stops += 1;
         });
         Ok(HostUdpListenerHandle::new(tx, task))
     }
@@ -552,6 +559,11 @@ async fn guard_release_failure_removes_capture_rather_than_capturing_behind_a_dr
         Some("teardown_capture"),
         "dropping is a correct posture; capturing behind a live DROP is not: {calls:?}"
     );
+    assert_eq!(
+        backend.listener_stops(),
+        1,
+        "a failed generation must not leave its now-untracked sessions alive"
+    );
 
     // The retained guard makes the next poll re-apply rather than short-circuit.
     backend.reset_calls();
@@ -561,6 +573,44 @@ async fn guard_release_failure_removes_capture_rather_than_capturing_behind_a_dr
         backend.calls().contains(&"release_guard".to_string()),
         "a retained guard must be retried, not left dropping forever: {:?}",
         backend.calls()
+    );
+    assert_eq!(backend.listeners(), 2, "the retry must create a fresh listener");
+}
+
+#[tokio::test]
+async fn capture_rebuild_failure_stops_the_previously_applied_listener_generation() {
+    let source = Arc::new(FakeSource::default());
+    let a = target(POD_A_UID, "a", Some("10.244.1.5"));
+    let b = target(POD_B_UID, "b", Some("10.244.1.6"));
+    source.set(vec![a.clone()]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    backend.set_interface(POD_B_UID, "vethb", 12);
+    let mut manager = manager(source.clone(), backend.clone(), None);
+    manager.reconcile_once().await;
+    assert_eq!(backend.listeners(), 1);
+
+    // A pure addition would normally preserve the listener. Once the rebuild
+    // fails and clears `applied`, however, retaining it would also erase the
+    // generation needed to detect a later withdrawal and restart stale sessions.
+    source.set(vec![a, b]);
+    backend.inner.lock().unwrap().fail_install_capture = true;
+    backend.reset_calls();
+    manager.reconcile_once().await;
+
+    assert_eq!(
+        backend.listener_stops(),
+        1,
+        "the listener must stop whenever its applied generation is discarded"
+    );
+    assert_eq!(
+        backend.calls(),
+        vec![
+            "guard:vetha,vethb".to_string(),
+            "capture:vetha,vethb".to_string(),
+            "teardown_capture".to_string(),
+        ],
+        "the failed rebuild remains guarded and never releases plaintext egress"
     );
 }
 
