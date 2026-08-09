@@ -71,8 +71,10 @@ use percent_encoding::percent_decode_str;
 use crate::config::plugin_trigger::{
     CompiledPluginTrigger, FieldVisitor, PluginTrigger, PluginTriggerProtocol, TriggerFacts,
 };
-use crate::config::types::{BackendScheme, HttpFlavor, HttpWireTransport};
-use crate::plugins::{RequestContext, StreamConnectionContext, StreamTransactionSummary};
+use crate::config::types::{HttpFlavor, HttpWireTransport};
+use crate::plugins::{
+    RequestContext, StreamConnectionContext, StreamFrontendTransport, StreamTransactionSummary,
+};
 
 /// Process-local token generator. Tokens are opaque and never persisted; they
 /// only have to be unique among the instances a single request can observe.
@@ -430,10 +432,10 @@ pub struct StreamTriggerFacts<'a> {
 
 impl<'a> StreamTriggerFacts<'a> {
     pub fn new(ctx: &'a StreamConnectionContext) -> Self {
-        let protocol = match ctx.backend_scheme {
-            BackendScheme::Udp => PluginTriggerProtocol::Udp,
-            BackendScheme::Dtls => PluginTriggerProtocol::Dtls,
-            _ => PluginTriggerProtocol::Tcp,
+        let protocol = match ctx.frontend_transport {
+            StreamFrontendTransport::Tcp => PluginTriggerProtocol::Tcp,
+            StreamFrontendTransport::Udp => PluginTriggerProtocol::Udp,
+            StreamFrontendTransport::Dtls => PluginTriggerProtocol::Dtls,
         };
         Self {
             ctx,

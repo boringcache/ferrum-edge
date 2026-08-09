@@ -1233,6 +1233,9 @@ Available `match` predicates:
   instance off.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
+  Stream identities are likewise client-facing: `udp` versus `dtls` comes from
+  the accepting frontend, independently of whether the selected backend uses
+  plain UDP or DTLS.
 
 ### Decide-once and phase safety
 
@@ -1354,7 +1357,19 @@ is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such 
 trigger could only read another mechanism's committed identity and would make the
 effective auth chain order-dependent. That composition is rejected at
 publication, as is an identity predicate on a **stream-only** plugin (see
-"Decide-once and phase safety" above).
+"Decide-once and phase safety" above). A non-identity trigger on an auth plugin
+is supported: a false decision removes that instance from the effective auth
+chain for the request. If every auth instance is skipped, the excluded request
+is intentionally unauthenticated; if another instance applies, that instance's
+ordinary credential requirement and `WWW-Authenticate` challenge remain in
+force.
+
+`response_caching` has one configuration-specific restriction: its default
+`add_cache_status_header: true` publishes named response-trailer ownership, a
+contextless generation-wide capability, so that form cannot carry a trigger.
+Set `add_cache_status_header: false` when a triggered cache instance is needed;
+cache lookup, storage, invalidation, and the remaining response hooks stay gated
+normally, but `X-Cache-Status` is then deliberately absent.
 
 ### Validation and bounds
 

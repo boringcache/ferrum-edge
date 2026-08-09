@@ -1859,6 +1859,9 @@ impl Plugin for PluginInstanceWrapper {
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
     }
+    fn authentication_applies(&self, ctx: &RequestContext) -> bool {
+        self.runs_cached(ctx) && self.inner.authentication_applies(ctx)
+    }
     fn authentication_challenge(&self) -> Option<&'static str> {
         self.inner.authentication_challenge()
     }
@@ -4005,15 +4008,48 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
+        let has_trigger = plugin_config.trigger.is_some();
         if !plugin_config.enabled
-            || !is_security_composition_candidate_plugin(
-                plugin_config.plugin_name.as_str(),
-                &custom_plugin_names,
-            )
+            || (!has_trigger
+                && !is_security_composition_candidate_plugin(
+                    plugin_config.plugin_name.as_str(),
+                    &custom_plugin_names,
+                ))
         {
             continue;
         }
-        let created = if plugin_config.plugin_name == "serverless_function" {
+        // A trigger's composition safety depends on the concrete plugin's
+        // contextless hooks and generation-folded capabilities. Construct every
+        // triggered instance through the production factory even when ordinary
+        // cross-plugin admission can use a cheap capability stand-in; otherwise
+        // an admin write can accept a row that runtime publication rejects and
+        // wedge every subsequent reload behind it.
+        let created = if has_trigger && plugin_config.plugin_name == "geo_restriction" {
+            // GeoRestriction's constructor opens a node-local MMDB. Its plugin
+            // capabilities are trigger-neutral (all protocols, no contextless
+            // hooks, limits, trailer policy, or auth role), so candidate
+            // admission can validate the exact trigger and policy shape without
+            // turning CP/admin validation into a data-plane file dependency.
+            plugin_config.trigger.as_ref().map_or(Ok(None), |trigger| {
+                trigger.validate().and_then(|()| {
+                    crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                        &plugin_config.config,
+                    )
+                })
+                .map(|()| None)
+            })
+        } else if has_trigger {
+            try_create_plugin(
+                plugin_config,
+                config,
+                http_client,
+                &country_mmdb_load_session,
+                &current_adaptive_states,
+                &mut staged_adaptive_states,
+                &current_tcp_throttle_states,
+                &mut staged_tcp_throttle_states,
+            )
+        } else if plugin_config.plugin_name == "serverless_function" {
             crate::plugins::serverless_function::security_composition_capabilities(
                 &plugin_config.config,
             )
@@ -4143,11 +4179,12 @@ fn remove_shadowed_global_plugin(
 }
 
 /// Cross-plugin composition candidate validation. The security composition
-/// candidate walker constructs every composition-relevant plugin once — using a
-/// pure capability view for environment-bound `serverless_function` and for
-/// expensive final request-body policy plugins — and runs both the
-/// security-sensitive ordering/body-view invariants and the correlation-header
-/// invariants. This remains the single admission entrypoint for both concerns.
+/// candidate walker constructs every composition-relevant plugin once, plus
+/// every instance carrying a trigger — using a pure capability view only for
+/// untriggered environment-bound `serverless_function` and expensive final
+/// request-body policy plugins — and runs both the security-sensitive
+/// ordering/body-view invariants and the correlation-header invariants. This
+/// remains the single admission entrypoint for both concerns.
 pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,

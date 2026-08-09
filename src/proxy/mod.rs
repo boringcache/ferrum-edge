@@ -4048,6 +4048,15 @@ pub(crate) fn final_request_body_requirements(
                 needs_final_context |= plugin.needs_final_request_body_context();
             }
         }
+        // A trigger-skipped body plugin correctly contributes no buffering of
+        // its own, but another instance may still buffer the same request. In
+        // that mixed chain the skipped wrapper's context-free compatibility
+        // hooks are still visited by the final transform/policy passes. Force
+        // those passes onto the context-aware dispatch whenever any published
+        // instance requires it and a body will actually be buffered; otherwise
+        // the skipped instance cannot evaluate its trigger and may rewrite or
+        // reject a path it does not govern.
+        needs_final_context |= has_contextual_final_body_hook && requires_buffering;
         // An egress plugin must observe the exact backend-visible request, and
         // the ordinary ladder finalizes the body *inside* `proxy_to_backend`
         // — while the backend request is already being built. Pull the
@@ -23269,6 +23278,7 @@ const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required
 
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
 ) -> (u16, Bytes, HashMap<String, String>) {
     let mut headers = HashMap::new();
     // Challenge selection follows configured priority order: mechanisms that
@@ -23276,6 +23286,7 @@ fn missing_authentication_reject(
     // challenge wins.
     let challenge = auth_plugins
         .iter()
+        .filter(|plugin| plugin.authentication_applies(ctx))
         .find_map(|plugin| plugin.authentication_challenge())
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
@@ -23867,6 +23878,10 @@ pub async fn run_authentication_phase(
     for auth_plugin in auth_plugins {
         auth_plugin.mark_query_credentials_for_redaction(ctx);
     }
+    let applicable_auth_plugin_count = auth_plugins
+        .iter()
+        .filter(|plugin| plugin.authentication_applies(ctx))
+        .count();
 
     match auth_mode {
         AuthMode::Multi => {
@@ -23876,6 +23891,9 @@ pub async fn run_authentication_phase(
             let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
+                if !auth_plugin.authentication_applies(ctx) {
+                    continue;
+                }
                 let deadline = ctx.grpc_deadline_at();
                 let auth_result = match crate::plugins::await_grpc_deadline(
                     deadline,
@@ -23919,13 +23937,14 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+            let mesh_permissive_only_auth_plugin = applicable_auth_plugin_count == 1
                 && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
                     .is_some_and(|v| v == "true");
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
+                || applicable_auth_plugin_count == 0
                 || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
                 ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -23933,13 +23952,16 @@ pub async fn run_authentication_phase(
             } else {
                 let mut reject = server_reject
                     .or(last_reject)
-                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins));
+                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                 Some(reject)
             }
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                if !auth_plugin.authentication_applies(ctx) {
+                    continue;
+                }
                 if request_is_authenticated(ctx) {
                     return None;
                 }
@@ -23966,7 +23988,7 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+            let mesh_permissive_only_auth_plugin = applicable_auth_plugin_count == 1
                 && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
@@ -23974,11 +23996,12 @@ pub async fn run_authentication_phase(
             ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
+                || applicable_auth_plugin_count == 0
                 || mesh_permissive_only_auth_plugin
             {
                 None
             } else {
-                Some(missing_authentication_reject(auth_plugins))
+                Some(missing_authentication_reject(auth_plugins, ctx))
             }
         }
     }

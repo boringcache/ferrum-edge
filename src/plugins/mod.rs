@@ -201,6 +201,19 @@ pub enum ProxyProtocol {
     Udp,
 }
 
+/// Client-facing transport that accepted a stream connection.
+///
+/// This is deliberately independent of [`BackendScheme`]: a DTLS frontend may
+/// forward to a plain UDP backend, and a plain UDP frontend may originate DTLS
+/// to its backend. Request triggers match this frontend fact, never the selected
+/// backend transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamFrontendTransport {
+    Tcp,
+    Udp,
+    Dtls,
+}
+
 /// All protocol variants, for plugins that support every protocol.
 pub const ALL_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Http,
@@ -7242,6 +7255,10 @@ pub struct StreamConnectionContext {
     #[doc(hidden)]
     pub proxy_lifecycle_generation: Option<u64>,
     pub listen_port: u16,
+    /// Authoritative client-facing stream transport stamped by the listener.
+    /// Independent of [`Self::backend_scheme`], which describes the outbound
+    /// backend connection.
+    pub frontend_transport: StreamFrontendTransport,
     /// Wire-level scheme the proxy uses to talk to its backend.
     /// Always one of the stream variants (`Tcp`, `Tcps`, `Udp`, `Dtls`) —
     /// validation guarantees stream proxies have a scheme set before any
@@ -7348,6 +7365,14 @@ impl StreamConnectionContext {
             proxy_name,
             proxy_lifecycle_generation: None,
             listen_port,
+            // Preserve the natural direct mapping for ordinary constructors;
+            // a UDP listener whose frontend and backend transports differ
+            // overwrites this from its listener-owned fact before hooks run.
+            frontend_transport: match backend_scheme {
+                BackendScheme::Dtls => StreamFrontendTransport::Dtls,
+                BackendScheme::Udp => StreamFrontendTransport::Udp,
+                _ => StreamFrontendTransport::Tcp,
+            },
             backend_scheme,
             consumer_index,
             identified_consumer: None,
@@ -9702,6 +9727,17 @@ pub trait Plugin: Send + Sync {
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
+    }
+
+    /// Whether this authentication instance applies to the current request.
+    ///
+    /// Ordinary authentication plugins are always applicable. Instance
+    /// wrappers use this request-time predicate to remove a trigger-skipped
+    /// mechanism from the effective authentication chain, so an intentionally
+    /// public path is not rejected merely because the configured chain contains
+    /// an auth instance that does not govern that path.
+    fn authentication_applies(&self, _ctx: &RequestContext) -> bool {
+        self.is_auth_plugin()
     }
 
     /// Returns the challenge advertised when the full authentication chain

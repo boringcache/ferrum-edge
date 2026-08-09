@@ -720,6 +720,27 @@ pub mod _test_support {
         crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
     }
 
+    /// Resolve the production final request-body dispatch requirements for a
+    /// synthetic plugin chain. This exposes the mixed-chain decision boundary
+    /// without widening the runtime helper's public API.
+    pub fn final_request_body_requirements_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        request_may_need_buffering: bool,
+        has_terminal_body_dispatch: bool,
+        has_contextual_final_body_hook: bool,
+        has_finalized_request_egress: bool,
+    ) -> (bool, bool, bool) {
+        crate::proxy::final_request_body_requirements(
+            plugins,
+            ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
+    }
+
     /// Exercise the mesh RTDS generation reconciliation boundary without
     /// widening its runtime API beyond the crate.
     pub fn reconcile_runtime_overlay_plugin_generations_for_test(

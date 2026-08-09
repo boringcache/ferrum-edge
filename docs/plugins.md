@@ -187,7 +187,12 @@ phase is where stream authentication itself runs — so on a plugin that serves
 both families it governs the HTTP half only. A triggered response-presentation
 transform makes finalized response-cache/dedup replay provenance unprovable;
 those replay consumers fail closed rather than reuse bytes across two trigger
-decisions.
+decisions. Non-identity triggers on auth plugins remove skipped mechanisms from
+that request's effective auth chain; if all are skipped, the excluded path is
+intentionally public. For `response_caching`, the default
+`add_cache_status_header: true` publishes contextless trailer ownership and is
+therefore incompatible with a trigger; set it to `false` for a triggered cache
+instance.
 
 See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
 for the full predicate table, the deterministic absent/multi-value/case rules,
@@ -4731,7 +4736,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `cache_key_include_query` | bool | `true` | Legacy keyspace toggle. The backend-effective query is now always bound because an origin may vary on it; this flag remains in the digest so changing it rotates the keyspace but can no longer authorize cross-query replay |
 | `cache_key_include_consumer` | bool | `false` | Legacy key-partition toggle. Caller isolation no longer depends on it: every key binds a mandatory caller-authorization partition (see below). The flag is still bound into the key digest so flipping it yields a disjoint keyspace. It does not authorize storage of a response to an `Authorization`-bearing request; the response still requires `public`, `must-revalidate`, or `s-maxage`. |
 | `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address (which the origin observes through Ferrum's regenerated `X-Forwarded-For`); a request whose canonical address cannot be parsed bypasses the cache rather than being keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route — it re-opens cross-caller replay for address-sensitive origins and must only be set when that is known-safe. It does not apply to authenticated callers, which always bind their canonical address. |
-| `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
+| `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses. Must be `false` when this PluginConfig carries a per-instance `trigger`, because the enabled form declares contextless response-trailer ownership |
 | `invalidate_on_unsafe_methods` | bool | `true` | After a non-error origin response (status below 400) to an unsafe method (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension/custom method, which fails closed as unsafe), invalidate cached entries for the same matched proxy, normalized/transformed Host/authority partition, and path prefix (including descendants). Method safety is classified independently of `cacheable_methods`: an unsafe method listed there still invalidates after an origin MISS and non-error response, while a served cache HIT that never contacted the origin does not. Safe methods that are not in `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics that never receive a non-error origin status do not invalidate. Invalidation uses private origin-status provenance recorded before `after_proxy` hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation |
 
 Behavior:

@@ -12,16 +12,20 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    attach_stream_trigger_decisions_for_test, set_request_wire_protocol_for_test,
+    attach_stream_trigger_decisions_for_test, final_request_body_requirements_for_test,
+    set_request_wire_protocol_for_test,
+    validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
 use ferrum_edge::config::types::{
-    BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig, PluginScope, Proxy,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig,
+    PluginScope, Proxy,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
-    StreamTransactionSummary,
+    StreamFrontendTransport, StreamTransactionSummary,
 };
+use ferrum_edge::proxy::run_authentication_phase;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::collections::HashMap;
@@ -589,6 +593,57 @@ async fn a_trigger_forces_context_aware_dispatch_for_contextless_request_body_ho
     );
 }
 
+#[tokio::test]
+async fn another_body_plugin_cannot_strand_a_skipped_trigger_on_contextless_dispatch() {
+    let decompress = make_plugin_config_with_json(
+        "decompress",
+        "compression",
+        json!({"decompress_request": true}),
+        PluginScope::Proxy,
+        Some("api"),
+    );
+    let rewrite = with_trigger(
+        make_plugin_config_with_json(
+            "rewrite",
+            "request_transformer",
+            json!({"rules": [{
+                "operation": "add", "target": "body", "key": "gated", "value": "yes"
+            }]}),
+            PluginScope::Proxy,
+            Some("api"),
+        ),
+        json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
+    );
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["decompress", "rewrite"])],
+        vec![decompress, rewrite],
+    );
+    let cache = PluginCache::new(&cfg).expect("mixed body chain publishes");
+    let plugins = cache.get_plugins_for_protocol(NS, "api", ProxyProtocol::Http);
+    let mut skipped = request("POST", "/api/public");
+    skipped
+        .headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    for plugin in plugins.iter() {
+        plugin.on_request_received(&mut skipped).await;
+    }
+
+    let capabilities = cache.get_capabilities(NS, "api", ProxyProtocol::Http);
+    let requirements = final_request_body_requirements_for_test(
+        plugins.as_ref(),
+        &skipped,
+        true,
+        false,
+        capabilities.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
+        false,
+    );
+    assert!(requirements.0, "compression must still require buffering");
+    assert!(
+        requirements.2,
+        "a buffered mixed chain must keep RequestContext so the skipped transform remains gated"
+    );
+}
+
 #[test]
 fn a_triggered_response_presentation_policy_disables_finalized_replay() {
     let a2a = make_plugin_config_with_json(
@@ -978,6 +1033,59 @@ async fn stream_triggers_gate_on_network_facts() {
     );
 }
 
+#[tokio::test]
+async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_scheme() {
+    let gated = with_trigger(
+        make_plugin_config_with_json(
+            "fault",
+            "fault_injection",
+            json!({
+                "abort": {"status_code": 503, "percentage": 100.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+            PluginScope::Proxy,
+            Some("udp"),
+        ),
+        json!({"when": {"match": {"protocol": ["dtls"]}}}),
+    );
+    let plugins = published(
+        &config(
+            vec![stream_proxy("udp", BackendScheme::Udp, 19_316, vec!["fault"])],
+            vec![gated],
+        ),
+        "udp",
+    );
+    let plugin = plugins.first().expect("one published instance");
+
+    let mut dtls_frontend = stream_ctx("203.0.113.5");
+    dtls_frontend.backend_scheme = BackendScheme::Udp;
+    dtls_frontend.frontend_transport = StreamFrontendTransport::Dtls;
+    assert!(
+        !matches!(
+            plugin.on_stream_connect(&mut dtls_frontend).await,
+            PluginResult::Continue
+        ),
+        "DTLS accepted at the frontend must match even when the backend is plain UDP"
+    );
+
+    let mut udp_frontend = stream_ctx("203.0.113.6");
+    udp_frontend.backend_scheme = BackendScheme::Dtls;
+    udp_frontend.frontend_transport = StreamFrontendTransport::Udp;
+    assert!(matches!(
+        plugin.on_stream_connect(&mut udp_frontend).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        udp_frontend
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("plugin_trigger.fault.skipped"))
+            .map(String::as_str),
+        Some("true"),
+        "plain UDP must not be mislabeled DTLS by its encrypted backend"
+    );
+}
+
 fn stream_summary(client_ip: &str) -> StreamTransactionSummary {
     StreamTransactionSummary {
         plugin_trigger_decisions: Default::default(),
@@ -1165,6 +1273,11 @@ fn publication_error(cfg: &GatewayConfig) -> String {
     }
 }
 
+fn candidate_error(cfg: &GatewayConfig) -> String {
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(cfg, None)
+        .expect_err("candidate admission should have refused this trigger")
+}
+
 #[test]
 fn an_invalid_trigger_is_refused_at_plugin_cache_publication() {
     let cfg = config(
@@ -1194,6 +1307,8 @@ fn a_trigger_on_a_websocket_frame_plugin_is_refused_rather_than_half_applied() {
         "{error}"
     );
     assert!(error.contains("WebSocket"), "{error}");
+    let candidate = candidate_error(&cfg);
+    assert!(candidate.contains("WebSocket"), "{candidate}");
 }
 
 #[test]
@@ -1216,6 +1331,8 @@ fn a_trigger_on_a_udp_datagram_plugin_is_refused() {
         "{error}"
     );
     assert!(error.contains("UDP datagram"), "{error}");
+    let candidate = candidate_error(&cfg);
+    assert!(candidate.contains("UDP datagram"), "{candidate}");
 }
 
 #[test]
@@ -1253,6 +1370,11 @@ fn a_trigger_on_an_initial_response_header_policy_plugin_is_refused() {
         "{error}"
     );
     assert!(error.contains("initial response-header policy"), "{error}");
+    let candidate = candidate_error(&cfg);
+    assert!(
+        candidate.contains("initial response-header policy"),
+        "admin candidate admission must match runtime publication: {candidate}"
+    );
 }
 
 #[test]
@@ -1274,6 +1396,11 @@ fn a_trigger_on_a_fixed_core_body_ceiling_is_refused() {
             error.contains("fixed per-proxy") && error.contains("body ceiling"),
             "{plugin_name}: {error}"
         );
+        let candidate = candidate_error(&cfg);
+        assert!(
+            candidate.contains("fixed per-proxy") && candidate.contains("body ceiling"),
+            "admin candidate admission must match runtime for {plugin_name}: {candidate}"
+        );
     }
 }
 
@@ -1292,6 +1419,11 @@ fn a_trigger_on_a_contextless_response_trailer_policy_is_refused() {
         "{error}"
     );
     assert!(error.contains("response-trailer ownership"), "{error}");
+    let candidate = candidate_error(&cfg);
+    assert!(
+        candidate.contains("response-trailer ownership"),
+        "{candidate}"
+    );
 }
 
 /// A stream-only plugin can never reach the HTTP pipeline, and an identity
@@ -1420,8 +1552,8 @@ async fn an_identity_predicate_never_gates_a_stream_connection() {
     assert!(String::from_utf8_lossy(&buffer[..len]).contains("203.0.113.5"));
 }
 
-#[test]
-fn a_non_identity_trigger_on_an_authentication_plugin_is_accepted() {
+#[tokio::test]
+async fn a_non_identity_trigger_removes_an_auth_plugin_from_the_effective_request_chain() {
     let cfg = config(
         vec![make_proxy("api", "/api", vec!["auth"])],
         vec![with_trigger(
@@ -1429,5 +1561,65 @@ fn a_non_identity_trigger_on_an_authentication_plugin_is_accepted() {
             json!({"when": {"not": {"match": {"path": {"prefix": ["/api/public"]}}}}}),
         )],
     );
-    PluginCache::new(&cfg).expect("a path-scoped auth trigger is a supported composition");
+    let plugins = published(&cfg, "api");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut public = request("GET", "/api/public");
+    for plugin in &plugins {
+        plugin.on_request_received(&mut public).await;
+    }
+    assert!(
+        run_authentication_phase(AuthMode::Single, &plugins, &mut public, &consumer_index)
+            .await
+            .is_none(),
+        "when every auth instance is trigger-skipped, the excluded path is intentionally public"
+    );
+
+    let mut private = request("GET", "/api/private");
+    for plugin in &plugins {
+        plugin.on_request_received(&mut private).await;
+    }
+    let rejection = run_authentication_phase(
+        AuthMode::Single,
+        &plugins,
+        &mut private,
+        &consumer_index,
+    )
+    .await
+    .expect("the same auth instance still governs its matching path");
+    assert_eq!(rejection.0, 401);
+}
+
+#[tokio::test]
+async fn a_skipped_auth_instance_cannot_supply_an_inapplicable_challenge() {
+    let mut skipped_basic = with_trigger(
+        builtin("basic", "basic_auth", "api"),
+        json!({"when": {"match": {"path": {"prefix": ["/api/private"]}}}}),
+    );
+    skipped_basic.priority_override = Some(1_000);
+    let mut bearer = builtin("bearer", "oauth2_introspection", "api");
+    bearer.priority_override = Some(1_100);
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["basic", "bearer"])],
+        vec![skipped_basic, bearer],
+    );
+    let plugins = published(&cfg, "api");
+    let mut public = request("GET", "/api/public");
+    for plugin in &plugins {
+        plugin.on_request_received(&mut public).await;
+    }
+    let rejection = run_authentication_phase(
+        AuthMode::Single,
+        &plugins,
+        &mut public,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("the applicable bearer mechanism still requires authentication");
+    assert_eq!(rejection.0, 401);
+    assert_eq!(
+        rejection.2.get("WWW-Authenticate").map(String::as_str),
+        Some("Bearer"),
+        "challenge selection must ignore the trigger-skipped Basic mechanism"
+    );
 }

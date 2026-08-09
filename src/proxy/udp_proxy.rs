@@ -3184,6 +3184,8 @@ async fn start_dtls_frontend_listener(
                         backend_scheme,
                         consumer_index,
                     );
+                    stream_ctx.frontend_transport =
+                        crate::plugins::StreamFrontendTransport::Dtls;
                     stream_ctx.proxy_namespace = proxy_namespace.clone();
                     stream_ctx.proxy_lifecycle_generation = epoch
                         .plugin_cache
@@ -3999,6 +4001,7 @@ async fn admit_plain_udp_stream(
         view.proxy.effective_scheme(),
         Arc::clone(&view.consumer_index),
     );
+    stream_ctx.frontend_transport = crate::plugins::StreamFrontendTransport::Udp;
     stream_ctx.proxy_namespace = view.proxy.namespace.clone();
     stream_ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
