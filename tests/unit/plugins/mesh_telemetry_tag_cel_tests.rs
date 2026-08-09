@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use ferrum_edge::modes::mesh::metric_tag_cel::{
-    MAX_METRIC_TAG_CEL_EXPR_LEN, parse_metric_tag_cel_expression, sanitize_metric_tag_value,
+    MAX_METRIC_TAG_CEL_EXPR_LEN, MetricTagCelAttr, MetricTagCelContext, MetricTagCelExpr,
+    evaluate_metric_tag_cel, parse_metric_tag_cel_expression, sanitize_metric_tag_value,
     validate_metric_tag_cel_for_families,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
@@ -246,6 +247,53 @@ fn rejects_unsupported_malformed_and_costly_cel() {
     let expr = parse_metric_tag_cel_expression("request.host").unwrap();
     assert!(validate_metric_tag_cel_for_families(&expr, true).is_err());
     assert!(sanitize_metric_tag_value("a\nb\"c").contains('_'));
+}
+
+#[test]
+fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
+    let host = parse_metric_tag_cel_expression("request.host").expect("request.host");
+    assert_eq!(
+        host,
+        MetricTagCelExpr::Attribute {
+            name: MetricTagCelAttr::RequestHost
+        }
+    );
+    let port = parse_metric_tag_cel_expression("string(destination.port)")
+        .expect("string destination port");
+    assert_eq!(
+        port,
+        MetricTagCelExpr::StringOfInt {
+            attribute: MetricTagCelAttr::DestinationPort
+        }
+    );
+    let fallback =
+        parse_metric_tag_cel_expression(r#"has(request.host) ? request.host : "unknown""#)
+            .expect("bounded ternary");
+    assert!(matches!(fallback, MetricTagCelExpr::HasThenElse { .. }));
+
+    let ctx = MetricTagCelContext {
+        source_workload: "frontend",
+        source_namespace: "default",
+        source_principal: "spiffe://cluster.local/ns/default/sa/frontend",
+        source_app: "frontend",
+        source_service: "frontend",
+        destination_workload: "backend",
+        destination_namespace: "default",
+        destination_principal: "spiffe://cluster.local/ns/default/sa/backend",
+        destination_app: "backend",
+        destination_service: "backend",
+        request_protocol: "http",
+        response_flags: "-",
+        connection_security_policy: "mutual_tls",
+        request_method: Some("GET"),
+        request_host: None,
+        response_code: Some(200),
+        destination_port: Some(8080),
+    };
+    assert_eq!(evaluate_metric_tag_cel(&host, ctx), "");
+    assert_eq!(evaluate_metric_tag_cel(&port, ctx), "8080");
+    assert_eq!(evaluate_metric_tag_cel(&fallback, ctx), "unknown");
+    assert_eq!(sanitize_metric_tag_value("a\nb\"c"), "a_b_c");
 }
 
 #[tokio::test]
