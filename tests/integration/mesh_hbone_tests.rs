@@ -1349,6 +1349,7 @@ async fn open_source_side_datagram_tunnel(
         dial_plan.expected_peer.as_ref(),
         dial_plan.expected_trust_domain.as_ref(),
         dial_plan.sni_override,
+        None,
     )
     .await
     .map_err(|e| e.to_string())

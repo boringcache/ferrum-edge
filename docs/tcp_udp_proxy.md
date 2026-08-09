@@ -574,6 +574,9 @@ than being accepted as a completed shutdown. The send is non-blocking and
 bounded (250 ms): a peer that stopped reading cannot wedge teardown. The raw
 half-close still follows even when the alert could not be delivered, while the
 transaction remains observably failed instead of reporting a clean TLS close.
+Because this write targets the client socket, the failure is neutral for the
+backend circuit breaker; a client that resets or stops accepting the final
+alert cannot make a healthy backend accumulate connection failures.
 Half-close semantics are
 preserved in both directions — receiving the client's `close_notify` half-closes
 only the client→backend direction, so the backend's remaining response bytes
