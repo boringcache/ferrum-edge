@@ -687,12 +687,8 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(
-                    &mut rx,
-                    &tx,
-                    &mut service_shutdown,
-                )
-                .await
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx, &mut service_shutdown)
+                    .await
                 {
                     return;
                 }
@@ -769,12 +765,8 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(
-                    &mut rx,
-                    &tx,
-                    &mut service_shutdown,
-                )
-                .await
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx, &mut service_shutdown)
+                    .await
                 {
                     return;
                 }
@@ -892,12 +884,8 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(
-                    &mut rx,
-                    &tx,
-                    &mut service_shutdown,
-                )
-                .await
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx, &mut service_shutdown)
+                    .await
                 {
                     return;
                 }

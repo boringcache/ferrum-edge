@@ -98,9 +98,7 @@ impl Attestor for UnixAttestor {
                     tokio::task::spawn_blocking(move || binary_fingerprint_linux(p))
                         .await
                         .map_err(|error| {
-                            AttestError::Io(format!(
-                                "binary fingerprint worker failed: {error}"
-                            ))
+                            AttestError::Io(format!("binary fingerprint worker failed: {error}"))
                         })??
                 }
                 _ => None,
