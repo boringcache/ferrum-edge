@@ -332,9 +332,10 @@ impl WorkloadApiService {
             }
             Err(e) => {
                 warn!(error = %e, "workload attestation failed");
-                Err(Status::permission_denied(format!(
-                    "workload attestation failed: {e}"
-                )))
+                // Attestors may carry local filesystem or provider diagnostics.
+                // Keep those in the structured server log and expose only the
+                // fixed entitlement result to the untrusted caller.
+                Err(Status::permission_denied("workload attestation failed"))
             }
         }
     }

@@ -78,6 +78,16 @@
 //! is re-checked against what was probed, so a replacement that raced in
 //! between is never the thing deleted.
 //!
+//! The check and pathname unlink cannot themselves be made one atomic POSIX
+//! operation. Ferrum therefore holds a per-socket advisory startup lock across
+//! stale cleanup **and** no-clobber publication. Concurrent same-uid Ferrum
+//! processes serialize at that boundary: after the winner publishes, the next
+//! process probes the winner's live socket and refuses it instead of reaching a
+//! stale-unlink race. The lock lives in a private `0600` sidecar file under the
+//! already-validated parent, is acquired with a bounded non-blocking loop, and
+//! is deliberately retained across runs so no waiter can ever lock an unlinked
+//! inode while a newcomer locks a replacement inode.
+//!
 //! **Permissions are established before publication, never through the process
 //! umask.** The umask is process-global state; mesh mode has already started
 //! admin and background tasks by the time this runs, so narrowing it here would
@@ -203,6 +213,17 @@ pub const MAX_STAGING_SUFFIX_BYTES: usize = 26;
 /// `Undetermined` is fatal.
 pub const SOCKET_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time one Workload API startup waits for another startup using the
+/// same socket path to finish its stale-cleanup/publication critical section.
+///
+/// A live listener does not retain this lock; only startup holds it. Expiry is
+/// nevertheless fail-closed because proceeding without serialization would
+/// re-open the same-uid stale-unlink race the lock exists to prevent.
+pub const SOCKET_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+const SOCKET_STARTUP_LOCK_RETRY: Duration = Duration::from_millis(10);
+
 /// Attempts to find an unused staging-directory name before giving up. A
 /// collision needs another process with our pid, so one retry would do; a small
 /// bound keeps it deterministic without ever looping.
@@ -212,6 +233,125 @@ const MAX_STAGING_DIR_ATTEMPTS: u32 = 8;
 /// Serial number distinguishing concurrent staging directories in one process.
 #[cfg(unix)]
 static STAGING_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Per-socket cross-process startup lock.
+///
+/// The sidecar file is never deleted. Unlinking a flock file while waiters may
+/// already hold descriptors to its inode permits a newcomer to create and lock
+/// a second inode at the same path, splitting the critical section in two.
+#[cfg(unix)]
+struct SocketStartupLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl SocketStartupLock {
+    async fn acquire(socket_path: &Path) -> Result<Self, WorkloadApiListenerError> {
+        use std::ffi::OsString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let parent = socket_path.parent().ok_or_else(|| {
+            WorkloadApiListenerError::Socket(format!(
+                "path '{}' has no parent directory for its startup lock",
+                socket_path.display()
+            ))
+        })?;
+        let file_name = socket_path.file_name().ok_or_else(|| {
+            WorkloadApiListenerError::Socket(format!(
+                "path '{}' names no socket file for its startup lock",
+                socket_path.display()
+            ))
+        })?;
+        let mut lock_name = OsString::from(".");
+        lock_name.push(file_name);
+        lock_name.push(".startup.lock");
+        let lock_path = parent.join(lock_name);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| {
+                WorkloadApiListenerError::Socket(format!(
+                    "cannot open the Workload API startup lock '{}': {error}",
+                    lock_path.display()
+                ))
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            WorkloadApiListenerError::Socket(format!(
+                "cannot inspect the Workload API startup lock '{}': {error}",
+                lock_path.display()
+            ))
+        })?;
+        let effective_uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_file() || metadata.uid() != effective_uid {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "the Workload API startup lock '{}' is not a regular file owned by this process; \
+                 refusing to trust it",
+                lock_path.display()
+            )));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(WorkloadApiListenerError::Socket(format!(
+                "the Workload API startup lock '{}' is accessible to group or other users; \
+                 refusing to use a replaceable coordination boundary",
+                lock_path.display()
+            )));
+        }
+
+        let deadline = tokio::time::Instant::now() + SOCKET_STARTUP_LOCK_TIMEOUT;
+        loop {
+            // SAFETY: `file` owns a live descriptor for a regular file. flock
+            // does not dereference userspace memory, and LOCK_NB keeps this
+            // async startup path from blocking a runtime thread.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self {
+                    file,
+                    path: lock_path,
+                });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(WorkloadApiListenerError::Socket(format!(
+                    "cannot lock the Workload API startup boundary '{}': {error}",
+                    lock_path.display()
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(WorkloadApiListenerError::Socket(format!(
+                    "another Workload API startup still holds '{}'; refusing to continue without \
+                     serialized stale-socket cleanup",
+                    lock_path.display()
+                )));
+            }
+            tokio::time::sleep(SOCKET_STARTUP_LOCK_RETRY).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketStartupLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the descriptor remains owned by `self.file` for this entire
+        // call. Closing the file would also release the lock; the explicit
+        // unlock lets an unexpected kernel error be visible before close.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            warn!(
+                error = %io::Error::last_os_error(),
+                lock = %self.path.display(),
+                "failed to release the Workload API startup lock"
+            );
+        }
+    }
+}
 
 /// Errors raised while establishing or tearing down the Workload API listener.
 #[derive(Debug, thiserror::Error)]
@@ -481,11 +621,17 @@ pub async fn serve_workload_api(
 
     config.validate()?;
     let path = config.socket_path.clone();
+    // Hold this across both the pathname unlink and exclusive publication.
+    // Without the shared critical section, another same-uid startup can publish
+    // after our inode recheck but before our pathname unlink, causing us to
+    // delete its live socket despite both individual checks being correct.
+    let startup_lock = SocketStartupLock::acquire(&path).await?;
     refuse_live_or_clear_stale_socket(&path).await?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let service = service.with_service_shutdown(shutdown_tx.subscribe());
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
+    drop(startup_lock);
 
     let (terminated_tx, terminated_rx) = watch::channel(false);
     // Built here rather than inside the spawned task so the receiver is moved

@@ -831,11 +831,68 @@ async fn a_stale_socket_with_no_listener_is_still_cleared() {
 }
 
 #[tokio::test]
+async fn concurrent_stale_cleanup_publishes_one_listener_without_unlinking_the_winner() {
+    // Both startups can positively probe the same leftover inode before either
+    // removes it. An inode recheck alone is insufficient: one can then publish
+    // between the other's recheck and pathname unlink. The per-socket startup
+    // lock must serialize cleanup through publication, leaving exactly one
+    // serving winner and making the loser observe that winner as LIVE.
+    let path = socket_path("stale-race");
+    let leftover =
+        std::os::unix::net::UnixListener::bind(&path).expect("test can bind a leftover socket");
+    drop(leftover);
+
+    let make_service = || {
+        let ca = internal_ca_with_jwt_key(&signing_key_pem());
+        WorkloadApiService::new(
+            vec![Arc::new(FixedAttestor) as Arc<dyn Attestor>],
+            ca as Arc<dyn CertificateAuthority>,
+            trust_domain(),
+            600,
+        )
+    };
+    let first_config =
+        WorkloadApiSocketConfig::from_parts(path.clone(), "0660").expect("mode parses");
+    let second_config =
+        WorkloadApiSocketConfig::from_parts(path.clone(), "0660").expect("mode parses");
+
+    let (first, second) = tokio::join!(
+        serve_workload_api(make_service(), first_config),
+        serve_workload_api(make_service(), second_config),
+    );
+    let (winner, loser) = match (first, second) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+        (Ok(first), Ok(second)) => {
+            first.shutdown().await;
+            second.shutdown().await;
+            panic!("both concurrent startups published the same socket path");
+        }
+        (Err(first), Err(second)) => {
+            panic!("both concurrent startups failed: first={first}; second={second}");
+        }
+    };
+    assert!(
+        loser.to_string().contains("LIVE"),
+        "the serialized loser must probe the winner as live, got: {loser}"
+    );
+
+    let mut client = connect(&path).await;
+    client
+        .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+        .await
+        .expect("the winning listener remains reachable after the loser refuses");
+    drop(client);
+    winner.shutdown().await;
+}
+
+#[tokio::test]
 async fn publication_leaves_no_staging_artifact_behind() {
     // The socket is bound inside a private 0700 staging directory and published
     // from there with a no-clobber primitive, so the parent directory must hold
-    // exactly the published socket afterwards — no `.fw-*` directory, no staged
-    // alias, no half-published inode.
+    // exactly the published socket and its persistent startup-lock sidecar
+    // afterwards — no `.fw-*` directory, no staged alias, no half-published
+    // inode. The lock is intentionally retained so blocked flock waiters and a
+    // newcomer can never coordinate through different inodes at one pathname.
     let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -872,10 +929,12 @@ async fn publication_leaves_no_staging_artifact_behind() {
                 .into_owned()
         })
         .collect();
-    assert_eq!(
-        entries,
-        vec!["api.sock".to_string()],
-        "publication must leave only the socket behind, no staging directory"
+    assert_eq!(entries.len(), 2, "only the socket and startup lock remain");
+    assert!(entries.iter().any(|entry| entry == "api.sock"));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry == ".api.sock.startup.lock")
     );
 
     listener.shutdown().await;
