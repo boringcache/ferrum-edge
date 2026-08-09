@@ -807,7 +807,7 @@ const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 pub(crate) const FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KiB
 pub(crate) const FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
 pub(crate) const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 default)
-const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "gateway_workload_metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
     "source.",
@@ -10930,7 +10930,7 @@ impl ProxyState {
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
     /// identity or credential state triggers one of them — most visibly a DP
-    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// with a gateway SVID, where the injected `gateway_workload_metrics`
     /// plugin config exists only on the applied side.
     ///
     /// The ConfigSync older-cross-source identical-payload exception

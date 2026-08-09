@@ -147,7 +147,7 @@ async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
     let plugin = loaded_config
         .plugin_configs
         .iter()
-        .find(|plugin| plugin.id == "__gateway_workload_metrics")
+        .find(|plugin| plugin.id == "gateway_workload_metrics")
         .expect("gateway workload metrics plugin should be auto-injected");
     assert_eq!(plugin.plugin_name, "workload_metrics");
     assert_eq!(plugin.scope, PluginScope::Global);
