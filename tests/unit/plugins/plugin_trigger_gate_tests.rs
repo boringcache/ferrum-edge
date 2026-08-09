@@ -1228,7 +1228,7 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
                 "udp",
                 BackendScheme::Udp,
                 19_316,
-                vec!["throttle"],
+                vec!["protocol-gate"],
             )],
             vec![gated],
         ),
