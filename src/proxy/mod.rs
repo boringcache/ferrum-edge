@@ -40359,10 +40359,7 @@ async fn proxy_to_backend_unix(
             );
         }
     };
-    let backend_authority = uri
-        .authority()
-        .map(|a| a.as_str())
-        .unwrap_or("localhost");
+    let backend_authority = uri.authority().map(|a| a.as_str()).unwrap_or("localhost");
     let path_and_query = uri
         .path_and_query()
         .cloned()
