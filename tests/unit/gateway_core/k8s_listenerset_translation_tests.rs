@@ -5,8 +5,10 @@
 //! parity (`Accepted`/`Programmed`/`Conflicted`, Gateway `attachedListenerSets`),
 //! and update/delete withdrawal — not only first-start construction.
 
+use base64::Engine as _;
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::reconciler::merge_k8s_translation;
@@ -52,6 +54,25 @@ fn gateway_class() -> K8sObject {
         "ferrum",
         json!({ "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME }),
     )
+}
+
+fn tls_secret(name: &str, namespace: &str) -> K8sObject {
+    let mut secret = object(
+        "Secret",
+        name,
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {
+                "tls.crt": base64::engine::general_purpose::STANDARD
+                    .encode(include_bytes!("../../certs/server.crt")),
+                "tls.key": base64::engine::general_purpose::STANDARD
+                    .encode(include_bytes!("../../certs/server.key"))
+            }
+        }),
+    );
+    secret.api_version = "v1".to_string();
+    secret.metadata.namespace = namespace.to_string();
+    secret
 }
 
 fn http_gateway(name: &str, allowed_from: Option<&str>) -> K8sObject {
@@ -543,18 +564,7 @@ fn listenerset_protocol_conflict_with_gateway_listener() {
 /// the hostname listener reports Accepted=True/NoRules with no materialization.
 #[test]
 fn gateway_https_catch_all_and_hostname_siblings_stay_materializable() {
-    let mut secret = object(
-        "Secret",
-        "edge-cert",
-        json!({
-            "type": "kubernetes.io/tls",
-            "data": {
-                "tls.crt": "Y2VydA==",
-                "tls.key": "a2V5"
-            }
-        }),
-    );
-    secret.api_version = "v1".to_string();
+    let secret = tls_secret("edge-cert", "default");
 
     let gateway = object(
         "Gateway",
@@ -716,7 +726,16 @@ fn listenerset_section_name_and_allowed_routes_gates() {
             "/missing",
         ),
     ];
-    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translate");
+    assert!(
+        skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("bad-section")
+                && error.contains("does not match any known ListenerSet listener")
+        }),
+        "the invalid sibling route must be reported as skipped: {skipped:?}"
+    );
     assert!(translation.config.proxies.iter().any(|proxy| {
         proxy.hosts.iter().any(|host| host == "a.example.com")
             && proxy
@@ -866,24 +885,8 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
     );
     set.metadata.uid = "uid-listenerset-shared".to_string();
 
-    let mut gateway_secret = object(
-        "Secret",
-        "gateway-cert",
-        json!({
-            "type": "kubernetes.io/tls",
-            "data": {"tls.crt": "Y2VydA==", "tls.key": "a2V5"}
-        }),
-    );
-    gateway_secret.api_version = "v1".to_string();
-    let mut set_secret = object(
-        "Secret",
-        "set-cert",
-        json!({
-            "type": "kubernetes.io/tls",
-            "data": {"tls.crt": "c2V0LWNlcnQ=", "tls.key": "c2V0LWtleQ=="}
-        }),
-    );
-    set_secret.api_version = "v1".to_string();
+    let gateway_secret = tls_secret("gateway-cert", "default");
+    let set_secret = tls_secret("set-cert", "default");
 
     let translation = translate_k8s_objects(
         &[gateway_class(), gateway, set, gateway_secret, set_secret],
@@ -977,19 +980,7 @@ fn listenerset_service_cannot_program_same_named_gateway() {
 
 #[test]
 fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
-    let mut secret = object(
-        "Secret",
-        "cert",
-        json!({
-            "type": "kubernetes.io/tls",
-            "data": {
-                "tls.crt": "Y2VydA==",
-                "tls.key": "a2V5"
-            }
-        }),
-    );
-    secret.api_version = "v1".to_string();
-    secret.metadata.namespace = "certs".to_string();
+    let secret = tls_secret("cert", "certs");
 
     let without_grant = vec![
         gateway_class(),
@@ -1017,19 +1008,40 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
     let translation = translate_k8s_objects(&without_grant, options()).expect("translate");
     // Without a ListenerSet-scoped ReferenceGrant the HTTPS listener is not
     // materializable.
-    assert!(
-        translation
-            .listenerset_statuses
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
+        !mesh
+            .services
             .iter()
-            .any(|status| status.resource.name == "tls-set" && !status.accepted)
-            || translation.warnings.iter().any(|warning| {
-                warning.contains("tls-set") && warning.contains("unresolved TLS")
-            })
-            || translation.config.mesh.as_ref().is_none_or(|mesh| {
-                !mesh
-                    .services
-                    .iter()
-                    .any(|service| service.name == "tls-set-https")
-            })
+            .any(|service| service.name == "listenerset-tls-set-https")
+    }));
+
+    let mut grant = object(
+        "ReferenceGrant",
+        "allow-listenerset-cert",
+        json!({
+            "from": [{
+                "namespace": "default",
+                "group": "gateway.networking.k8s.io",
+                "kind": "ListenerSet"
+            }],
+            "to": [{
+                "group": "",
+                "kind": "Secret",
+                "name": "cert"
+            }]
+        }),
+    );
+    grant.api_version = "gateway.networking.k8s.io/v1beta1".to_string();
+    grant.metadata.namespace = "certs".to_string();
+    let mut with_grant = without_grant;
+    with_grant.push(grant);
+    let translation = translate_k8s_objects(&with_grant, options()).expect("translate with grant");
+    assert!(
+        translation.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
+                .iter()
+                .any(|service| service.name == "listenerset-tls-set-https")
+        }),
+        "a ListenerSet-scoped ReferenceGrant must authorize the valid cross-namespace TLS Secret"
     );
 }

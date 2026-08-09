@@ -1901,8 +1901,8 @@ fn same_slot_listener_ambiguity_reports_both_routes_conflicted_in_status() {
         assert_eq!(
             refused,
             vec![
-                "route-a on default/edge-a#http".to_string(),
-                "route-b on default/edge-b#http".to_string(),
+                "route-a on Gateway/default/edge-a#http".to_string(),
+                "route-b on Gateway/default/edge-b#http".to_string(),
             ],
             "both claims must be refused, each named by its exact listener"
         );
