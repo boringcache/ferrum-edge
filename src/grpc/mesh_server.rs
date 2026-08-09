@@ -502,8 +502,15 @@ impl MeshGrpcServer {
         // cursor before the slice is built (issue #2473). `max` guards a peer
         // that sent no cursor (0): the per-stream base must never move
         // backwards, or a subscriber would quarantine its own CP's frames.
+        //
+        // A Kubernetes-domain revision is refused outright (issue #3611): its
+        // sequence is a `resourceVersion` convergence watermark, and a database
+        // change cursor is not a value in that space. Deltas on such a CP carry
+        // no mesh content anyway — the mesh block is authored wholly by the K8s
+        // overlay — so the per-stream base keeps the revision the snapshot was
+        // stamped with.
         if let Some(revision) = candidate.mesh_revision.as_mut() {
-            revision.sequence = revision.sequence.max(delta.sequence_cursor);
+            revision.advance_change_log_sequence(delta.sequence_cursor);
         }
         apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate = Self::filter_config_for_request_and_scope(

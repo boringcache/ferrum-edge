@@ -39,6 +39,7 @@ pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
+pub mod gateway_listener;
 pub mod grpc_proxy;
 pub mod hbone_pool;
 mod hbone_proxy;
@@ -5690,6 +5691,53 @@ pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
     delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
+/// Config-publication notification handle carried by [`ProxyState`].
+///
+/// This is a deliberately one-way seam. Subscribing is public so watchers that
+/// own sockets — notably
+/// [`crate::proxy::gateway_listener::GatewayListenerManager`], which cannot be
+/// constructed before the state it serves — can react to a config swap without
+/// polling the `ArcSwap`. *Advancing* the revision is crate-private, so only
+/// [`ProxyState::bump_config_revision`], reached from a committed config
+/// publication, can signal one. Exposing the raw `watch::Sender` would let any
+/// holder fake a publication and drive listener bind / withdrawal for a config
+/// generation that was never installed.
+///
+/// Construction stays public (`new` / `Default`) so external test crates can
+/// still build a `ProxyState` without that write capability.
+#[derive(Clone)]
+pub struct ConfigRevisionNotifier {
+    tx: Arc<watch::Sender<u64>>,
+}
+
+impl ConfigRevisionNotifier {
+    /// A notifier whose revision starts at `0` and has no watchers.
+    pub fn new() -> Self {
+        Self {
+            tx: Arc::new(watch::channel(0u64).0),
+        }
+    }
+
+    /// Watch for config publications. The value is meaningless; only the
+    /// change notification matters.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
+
+    /// Signal that a new config generation is live.
+    fn bump(&self) {
+        self.tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+}
+
+impl Default for ConfigRevisionNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -5733,9 +5781,16 @@ pub struct ProxyState {
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
     pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
-    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
-    /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
-    pub alt_svc_header: Option<String>,
+    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement on the
+    /// process-global proxy ports. `None` when HTTP/3 is disabled; avoids a
+    /// `format!()` allocation per response.
+    pub alt_svc_header: Option<Arc<str>>,
+    /// Pre-computed Alt-Svc values for dynamically bound Gateway API listener
+    /// ports that really have a QUIC socket, published by
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] on each
+    /// reconcile. Read lock-free; a port that is absent advertises nothing,
+    /// so a client is never steered to a port with no HTTP/3 listener.
+    pub gateway_h3_alt_svc: Arc<ArcSwap<HashMap<u16, Arc<str>>>>,
     /// Pre-computed Via header values per protocol version (RFC 9110 §7.6.3).
     /// `None` when `FERRUM_ADD_VIA_HEADER=false` (default). Keyed by protocol version string.
     pub via_header_http11: Option<String>,
@@ -5785,6 +5840,19 @@ pub struct ProxyState {
     pub max_concurrent_requests_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
+    /// Monotonic counter bumped once per successful config publication.
+    ///
+    /// Watchers that must react to a config swap but do not live inside
+    /// `ProxyState` — notably
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`], which owns
+    /// sockets and therefore cannot be constructed before the state it serves
+    /// — subscribe here instead of polling the `ArcSwap`. The value itself is
+    /// meaningless; only the change notification matters, and `watch`
+    /// coalesces bursts so a rapid reload sequence costs one reconcile.
+    ///
+    /// The field is public but the write capability is not: see
+    /// [`ConfigRevisionNotifier`].
+    pub config_revision: ConfigRevisionNotifier,
     /// Windowed per-second rate metrics computed by a background task.
     /// Read by the admin `/status` endpoint; written by `metrics::start_metrics_monitor`.
     pub windowed_metrics: Arc<crate::metrics::WindowedMetrics>,
@@ -7073,8 +7141,11 @@ impl ProxyState {
             ));
         }
 
-        let alt_svc_header = if env_config.enable_http3 {
-            Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
+        let alt_svc_header: Option<Arc<str>> = if env_config.enable_http3 {
+            Some(Arc::from(format!(
+                "h3=\":{}\"; ma=86400",
+                env_config.proxy_https_port
+            )))
         } else {
             None
         };
@@ -7566,6 +7637,7 @@ impl ProxyState {
             backend_capabilities,
             backend_capabilities_refresh,
             alt_svc_header,
+            gateway_h3_alt_svc: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             via_header_http11,
             via_header_http2,
             via_header_http3,
@@ -7601,6 +7673,7 @@ impl ProxyState {
             },
             max_concurrent_requests_per_ip,
             stream_listener_manager,
+            config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
@@ -7701,6 +7774,54 @@ impl ProxyState {
             ));
         }
         Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
+    /// Subscribe to config-publication notifications.
+    ///
+    /// Used by [`crate::proxy::gateway_listener::GatewayListenerManager`] to
+    /// reconcile Gateway API listener sockets on reload / update / delete /
+    /// withdrawal without polling.
+    pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
+        self.config_revision.subscribe()
+    }
+
+    /// The Alt-Svc value to advertise for the frontend port a request arrived
+    /// on, or `None` when HTTP/3 is not reachable there.
+    ///
+    /// HTTP/3 lives on a UDP socket, so it is only advertisable where one
+    /// exists. The process-global proxy ports keep the precomputed value; a
+    /// Gateway API listener port advertises itself only while
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] has a QUIC
+    /// listener bound on it. Advertising the global HTTPS port from a
+    /// port-scoped listener would steer the client to a socket whose route
+    /// table cannot match the port-scoped route. One `ArcSwap` load and one
+    /// small-map lookup; no allocation and no lock.
+    pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
+        let global = self.alt_svc_header.as_ref()?;
+        match frontend_port {
+            Some(port)
+                if port != self.env_config.proxy_https_port
+                    && port != self.env_config.proxy_http_port =>
+            {
+                self.gateway_h3_alt_svc.load().get(&port).cloned()
+            }
+            _ => Some(Arc::clone(global)),
+        }
+    }
+
+    /// Publish the Gateway API listener ports that currently have a live QUIC
+    /// listener, with their precomputed Alt-Svc values.
+    pub fn publish_gateway_h3_alt_svc(&self, ports: &[u16]) {
+        let map: HashMap<u16, Arc<str>> = ports
+            .iter()
+            .map(|port| (*port, Arc::from(format!("h3=\":{port}\"; ma=86400"))))
+            .collect();
+        self.gateway_h3_alt_svc.store(Arc::new(map));
+    }
+
+    /// Notify config watchers that a new config generation is live.
+    fn bump_config_revision(&self) {
+        self.config_revision.bump();
     }
 
     fn collect_backend_capability_targets(
@@ -9312,6 +9433,15 @@ impl ProxyState {
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
+        // Listener TLS class is route-table input resolved onto
+        // `PortScopedProxy` at build time, but it lives on GatewayConfig rather
+        // than the Proxy and therefore never appears in ConfigDelta. A pure
+        // HTTP<->HTTPS class flip must rebuild the table even when every proxy
+        // object and timestamp is byte-identical.
+        if old_config.http_tls_listen_ports != new_config.http_tls_listen_ports {
+            return true;
+        }
+
         // Keyed by `(namespace, id)`: a bare-id index would let one tenant's
         // same-id proxy stand in for another's, masking a real projected
         // route-content change (or inventing one that never happened).
@@ -10097,6 +10227,11 @@ impl ProxyState {
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
             self.spawn_backend_capability_refresh();
 
+            // Wake external config watchers (Gateway API listener lifecycle).
+            // Published AFTER the epoch swap, so a woken reconciler always
+            // reads the config it is reacting to — never a half-applied one.
+            self.bump_config_revision();
+
             // Reconcile stream proxy listeners (TCP/UDP)
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -10163,9 +10298,10 @@ impl ProxyState {
                     let mesh_changed = current.config.mesh != new_config.mesh;
                     // DestinationRule-derived projections
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
-                    // `resolved_tls`, stream-relay dispatch maps) are
-                    // `#[serde(skip)]` and invisible to ConfigDelta's
-                    // `updated_at` comparison. A DR-only edit that left every
+                    // `resolved_tls`, stream-relay dispatch maps) and the
+                    // Gateway-level `http_tls_listen_ports` classification are
+                    // invisible to ConfigDelta's `updated_at` comparison. A
+                    // DR-only edit or listener-class flip that left every
                     // resource timestamp unchanged must still republish the
                     // route table (and LB, which also consumes DR-derived
                     // upstream policy) before any status/revision ACK — otherwise
@@ -10283,6 +10419,11 @@ impl ProxyState {
             &published.plugin_cache,
             &published.config,
         );
+
+        // Wake external config watchers (Gateway API listener lifecycle) on the
+        // incremental path too — an add/update/delete of a port-scoped route
+        // arrives here, not through the full-rebuild branch.
+        self.bump_config_revision();
 
         // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
         // there is no resource delta to drive pruning, DNS warmup, listener
@@ -10757,21 +10898,36 @@ impl ProxyState {
                     // disappear after its off-thread MMDB generation was
                     // accepted. Claim and publish that handoff rather than
                     // leaving it unowned or retaining stale geo readers.
-                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                    let plugin_cache = self.plugin_cache.build_country_mmdb_reload_inner(
                         &current.plugin_cache,
                         &new_config,
                         false,
-                    )?
-                    else {
+                    )?;
+                    // Gateway listener TLS classification and other projected
+                    // route-table inputs live outside ConfigDelta. An
+                    // incremental snapshot can therefore carry a real class
+                    // flip while every resource identity/timestamp remains
+                    // unchanged; publish the new table before waking the
+                    // listener manager.
+                    let rebuild_routes =
+                        Self::projected_route_proxy_content_changed(&current.config, &new_config)
+                            || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                    if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
-                    };
+                    }
+                    route_changed.set(rebuild_routes);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: Arc::clone(&current.route_table),
-                        plugin_cache,
+                        route_table: if rebuild_routes {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: false,
+                        route_changed: rebuild_routes,
                         lb_changed: false,
                     }));
                 }
@@ -10804,8 +10960,14 @@ impl ProxyState {
             &published.config,
         );
 
+        // `apply_incremental` is a distinct publication path used by database
+        // and CP/DP deltas. Wake socket reconciliation here as well as in the
+        // full-snapshot path; otherwise a newly added/removed listener waits for
+        // the slow supervision tick despite its config already being live.
+        self.bump_config_revision();
+
         let Some(delta) = applied_delta else {
-            debug!("Incremental config: accepted MMDB-only generation republished");
+            debug!("Incremental config: accepted projected route/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
 
@@ -24511,6 +24673,8 @@ async fn handle_proxy_request_inner(
             epoch.route_generation,
             request_host.as_deref(),
             &path,
+            ctx.frontend_listen_port,
+            is_tls,
         ),
     };
 
@@ -24532,6 +24696,8 @@ async fn handle_proxy_request_inner(
                 request_host.as_deref(),
                 &path,
                 ctx.mesh_direction,
+                ctx.frontend_listen_port,
+                is_tls,
             )
         }
         other => other,
@@ -24758,6 +24924,21 @@ async fn handle_proxy_request_inner(
             };
             match hbone_relay {
                 Some(relay_proxy) => {
+                    // Preserve the CONNECT authority port for mesh
+                    // authorization on every synthesized HBONE relay. UDP
+                    // EgressGateway may dial a ServiceEntry targetPort that
+                    // differs from this authority port; TCP relays dial the
+                    // authority port directly. Either way AuthorizationPolicy
+                    // `destination.port` must see the authority port, and the
+                    // synthesized proxy's backend_port remains the socket dial
+                    // port. Stamp unconditionally (not only for UDP) so a
+                    // missing stamp can fail closed in `mesh_inbound_app_port`
+                    // without breaking TCP HBONE, which previously relied on
+                    // falling through to backend_port.
+                    ctx.mesh_inbound_listener_authz_port = req
+                        .uri()
+                        .authority()
+                        .and_then(|authority| authority.port_u16());
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
@@ -32611,9 +32792,10 @@ async fn handle_proxy_request_inner(
         resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
     }
 
-    // Advertise HTTP/3 availability via pre-computed Alt-Svc header
-    if let Some(ref alt_svc) = state.alt_svc_header {
-        resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
+    // Advertise HTTP/3 availability via pre-computed Alt-Svc header, for the
+    // frontend port this request actually arrived on.
+    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
+        resp_builder = resp_builder.header("alt-svc", alt_svc.as_ref());
     }
 
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
@@ -32717,7 +32899,7 @@ async fn handle_proxy_request_inner(
             gateway_owned_headers
                 .insert(headers_mod::GatewayOwnedResponseHeader::GatewayUpstreamStatus);
         }
-        if let Some(alt_svc) = state.alt_svc_header.as_ref() {
+        if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
             final_headers.insert("alt-svc".into(), alt_svc.to_string());
             gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::AltSvc);
         }
@@ -52443,6 +52625,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }

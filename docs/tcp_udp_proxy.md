@@ -648,6 +648,9 @@ than being accepted as a completed shutdown. The send is non-blocking and
 bounded (250 ms): a peer that stopped reading cannot wedge teardown. The raw
 half-close still follows even when the alert could not be delivered, while the
 transaction remains observably failed instead of reporting a clean TLS close.
+Because this write targets the client socket, the failure is neutral for the
+backend circuit breaker; a client that resets or stops accepting the final
+alert cannot make a healthy backend accumulate connection failures.
 Half-close semantics are
 preserved in both directions — receiving the client's `close_notify` half-closes
 only the client→backend direction, so the backend's remaining response bytes
@@ -1062,9 +1065,9 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 ## Validation Rules
 
 - `listen_port` is required for stream proxies (1024-65535)
-- `listen_port` must be unique across all stream proxies (checked via database in DB/CP mode, in-memory in file mode)
+- `listen_port` must be unique across stream proxies unless every sharer forms one opaque-TLS SNI listener (homogeneous passthrough or ordinary opaque TCP) or one L4 `stream_match` group
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
-- HTTP proxies must not set `listen_port`
+- `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)

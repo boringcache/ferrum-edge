@@ -1716,11 +1716,8 @@ async fn validate_bundle(
                 Some(0) => proxy_errors.push("listen_port 0 must be >= 1".to_string()),
                 Some(_) => {}
             }
-        } else if proxy.listen_port.is_some() {
-            proxy_errors.push(format!(
-                "HTTP proxy (scheme {}) must not set listen_port",
-                proxy.scheme_display()
-            ));
+        } else if proxy.listen_port == Some(0) {
+            proxy_errors.push("listen_port 0 must be >= 1".to_string());
         }
 
         if !proxy_errors.is_empty() {

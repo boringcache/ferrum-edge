@@ -81,7 +81,8 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace (`HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `TLSRoute`). `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. ReferenceGrant is not used for parentRefs. |
-| Invalid backend references | Yes | Missing Services, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
+| Invalid backend references | Yes | Missing Services/ServiceImports, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
+| MCS `ServiceImport` backendRefs | Partial (Ferrum translation/status; not an upstream conformance feature claim) | GEP-1748 Extended: `group: multicluster.x-k8s.io` / `kind: ServiceImport` resolves through the same typed backend-kind adapter as core `Service`, including ReferenceGrant authorization, port existence checks, ClusterSet DNS (`*.svc.clusterset.local`), and optional MCS-labeled EndpointSlice expansion when pod discovery is enabled. The MCS CRD is watched when present and skipped cleanly when absent. Upstream profiles/features remain unchanged — this is not advertised as a Gateway API conformance claim. |
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
@@ -253,19 +254,19 @@ materializes anything:
   and a GRPCRoute method predicate on the same host are a conflict even though
   their predicates are disjoint.
 - The losing Route produces no proxy, no upstream, no plugin, and no
-  materialized-parent record for **any** of its `(parentRef, hostname)` claims,
-  so it cannot route traffic through a different parent after losing elsewhere.
-  It is reported `Accepted=False` with `reason: Conflicted` and a message naming
-  the winner, and the translator emits a matching warning.
-- Overlap is detected per listener and per hostname intersection, but the
-  resulting acceptance decision is whole-Route: a loss on any listener
-  withdraws every parentRef and hostname claim authored by that Route. Splitting
-  independently admissible claims into separate Route objects is the only way
-  to retain one after another loses.
+  materialized-parent record for the overlapping `(parentRef, listener)`
+  claims. Sibling claims on other listeners are retained once port-aware
+  representation applies. The overlapping claim is reported `Accepted=False`
+  with `reason: Conflicted` (when every claim under that parentRef lost) or the
+  parent stays `Accepted=True` when at least one listener claim survives, with
+  a message naming the winner on the conflicting listener.
+- Overlap is detected per listener and per hostname intersection. The resulting
+  acceptance decision is per-`(parentRef, listener)`: a loss on one listener
+  does not withdraw healthy sibling claims.
 - Rejection does not cascade: Routes are considered once in the total Gateway
-  API order, and a Route withdrawn after a loss is never admitted as a winner
-  on another listener. A later Route is therefore unaffected when it overlaps
-  only that already-rejected Route.
+  API order, and a Route withdrawn after a loss on one listener is never
+  admitted as a winner on that same listener. A later Route is therefore
+  unaffected when it overlaps only that already-rejected claim.
 
 "The same listener" means the **resolved** listener, not the literal
 `parentRefs[]` entry. A parentRef is a selector, so the two are not
@@ -276,37 +277,158 @@ interchangeable:
   contend, even though their selector shapes differ.
 - Two wildcard references on one Gateway that `allowedRoutes.kinds` sends to
   *different* listeners never share one, so neither is rejected.
-- ParentRefs are not independent acceptance compartments inside one Route.
-  Ferrum's route representation is port-agnostic (see the known limitation
-  below), so retaining a second parentRef after a loss would retain that Route's
-  proxy on the listener where it lost. The Route is therefore
-  **conservatively withdrawn across every parentRef and hostname after a loss
-  on any listener**. Availability on a non-conflicting listener does not take
-  priority over not serving cross-kind traffic on the conflicting one.
-
-Route status is still reported against the parentRef the operator wrote —
-listener resolution is an internal arbitration detail and never rewrites the
-`parentRef` echoed in `status.parents[]`.
+- ParentRefs are not independent acceptance compartments inside one Route for
+  *unresolved* selectors, but once Ferrum can stamp a listener port onto the
+  materialized proxy, a cross-kind loss is confined to the overlapping
+  `(parentRef, listener)` claim. Surviving claims on other listeners keep their
+  proxies and remain `Accepted` when at least one claim is programmed. Route
+  status still echoes each parentRef the operator wrote — listener resolution
+  is an internal arbitration detail.
 
 Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
-`(hostname, listen path)` still collapse into one ordered dispatch-rule list,
-and only claim-for-claim collisions are resolved as conflicts.
+`(hostname, listen path, listen_port)` still collapse into one ordered
+dispatch-rule list, and only claim-for-claim collisions are resolved as
+conflicts.
 
-**Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
-port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
-not distinguishable in the route table. Two consequences follow:
+**Port-aware route representation.** Ferrum materializes Gateway API HTTP-family
+routes with the admitting listener's identity, so listeners of one Gateway are
+distinguishable both in the route table and on the wire:
 
-- Two routes that legitimately survive on different listeners but claim the same
-  `(hostname, listen path)` collide at config validation
-  (`Overlapping host+listen_path`) rather than being served per listener port.
-  This fail-closed behavior prevents either route from becoming reachable on a
-  listener that admitted only the other kind. Give such routes distinct listen
-  paths, distinct hostnames, or distinct Gateways.
-- One Route cannot retain a second `(parentRef, hostname)` claim after a
-  cross-kind loss elsewhere; the entire Route is withdrawn (above). Claims that
-  need independent acceptance must be expressed as separate Route objects,
-  each scoped to its own listener (`sectionName` or `port`) and non-intersecting
-  hostname as appropriate.
+- The admitting listener's port is stamped on `Proxy.listen_port`, and its TLS
+  class on the namespace-qualified `GatewayConfig.http_tls_listen_ports`
+  (`(namespace, port)`). Both are read from **that listener's own policy** — a
+  sibling listener sharing a port number never reclassifies another's routes.
+- A declared Gateway `parentRef` that resolves no concrete, materializable
+  listener — an absent Gateway, a hostname / sectionName / port / policy gate
+  that clears no listener — materializes **nothing** for that parent (no proxy,
+  upstream, plugin, or materialized-parent record) and contributes **no**
+  HTTPRoute/GRPCRoute conflict key or cross-kind arbitration claim. Status stays
+  `Accepted=False` with `NoMatchingParent` / `NotAllowedByListeners` /
+  `NoMatchingListenerHostname` rather than `Programmed` or `Conflicted`. The
+  listener-less, port-agnostic claim (and its cross-kind arbitration) survives
+  only for the deliberately parentless legacy shape (`spec.parentRefs` absent).
+- `GatewayListenerManager` (`src/proxy/gateway_listener.rs`) binds a real
+  socket for every declared listener port in `file`, `database`, and `dp` mode,
+  alongside the global `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`
+  sockets. Two same-protocol listeners such as `:80` and `:8080` therefore both
+  serve, and each request matches only the route attached to the listener it
+  arrived on.
+- Two routes that share `(hostname, listen path)` on **different** listeners
+  validate and serve independently. Overlapping host+path on the **same**
+  listener still fails closed at config validation
+  (`Overlapping host+listen_path`) with field-specific Gateway API status
+  diagnostics.
+- A Route that loses cross-kind arbitration on one listener retains healthy
+  sibling claims on other listeners. The arbitration domain is the resolved
+  `GatewayApiListenerKey`, not the numeric port, so sibling listeners that
+  merely share a port are independent.
+- Same-kind route merging keys on the **exact admitting listener**, never on the
+  numeric port. Two Gateways (or two sibling listeners) sharing a port never
+  have their dispatch rules or default backends combined, because Gateway API
+  attached each Route to only one of them. If two different listeners would
+  materialize the *same* `(namespace, hosts, listen path, listen port)` slot,
+  that claim is physically ambiguous — one socket, one route-table slot, two
+  contracts — so **both** sides are refused with a translator warning rather
+  than letting observation order decide. Same-port listeners with disjoint
+  hostnames are unaffected and keep serving independently.
+- **That refusal is carried into Route status, not only into the data plane.**
+  Every refused claim marks its `status.parents[]` entry `Conflicted=True` with
+  a message naming the refused listener by identity. When the parentRef has no
+  surviving claim left — no other listener, no other rule or path — it also
+  reports `Accepted=False` and `Programmed=False` with `reason: Conflicted`, so
+  a Route can never advertise a materialized Ferrum parent for a slot the
+  translator withdrew. A parentRef that still serves through a sibling listener
+  or a sibling claim stays `Accepted=True` / `Programmed=True` and reports only
+  the conflict; other parentRefs of the same Route, and `status.parents[]`
+  entries owned by other controllers, are untouched. Both colliding Routes are
+  reported identically regardless of the order the objects are observed in.
+- A numeric port claimed by two listeners with incompatible physical shapes is
+  refused at admission, and **every physically competing effective claim fails
+  closed** (matching the Gateway API `Conflicted` condition) rather than one
+  silently winning the socket. Exactly two shapes qualify:
+  - **plaintext vs an effective TLS-serving claim on one port**
+    (`ProtocolConflict`). A socket is one or the other. Unresolved or
+    multi-certificate Gateways that cannot occupy a namespace serving slot do
+    not count as effective TLS claims and cannot poison a healthy plaintext
+    slot.
+  - **effective TLS serving slots from more than one Gateway namespace that
+    resolve to different credentials** (`HostnameConflict`). Ferrum resolves
+    one frontend TLS serving slot per Gateway *namespace* with a shared
+    deterministic planner used by both translation and Gateway status, so
+    raw same-namespace siblings that lose that slot never manufacture a
+    cross-namespace conflict; across namespaces there is no further
+    arbitration and disagreeing effective slots would make one socket present
+    a foreign Gateway's certificate.
+
+  Differing `tls.certificateRefs` on their own are deliberately **not** a
+  conflict. Gateway API v1.5.1 defines HTTP-family listener distinctness on
+  `(port, hostname)` and states that "the `tls` field is not used for
+  determining if a listener is distinct", so sibling HTTPS listeners on one port
+  with disjoint hostnames and different `certificateRefs` stay `Accepted`.
+  Within a namespace the listener whose `certificateRef` does not win that
+  namespace's single serving slot stays `Accepted`, but materializes no routes
+  and reports `Programmed=False` with `reason: NoListeners`. Until Ferrum can
+  select a certificate per SNI hostname, this prevents the listener from
+  advertising or serving traffic under another listener's certificate.
+
+**Listener lifecycle and its bounds.** The listener set is reconciled on every
+config publication, so reload / update / delete / withdrawal reach the sockets
+without a restart. Two bounds are deliberate and tested:
+
+- **Withdrawal is fail-closed but not instantaneous at the socket.** Routes are
+  withdrawn by the atomic config swap that *precedes* the listener reconcile, so
+  a withdrawn listener's port answers `404` from that instant — it can never
+  stale-route. The socket itself stops accepting as soon as the accept loop
+  observes its per-listener shutdown signal and then drains in-flight requests
+  under the normal graceful-shutdown budget.
+- **A listener port that cannot be bound is reported, not fatal.** A same-class
+  process-global proxy frontend on the exact requested port already satisfies
+  the Gateway listener: the router sees that accepted port, so the dynamic
+  manager binds no duplicate socket and reports no failure. A wrong-class
+  global proxy frontend, an admin / control-plane listener, or a TCP/UDP stream
+  proxy on the port is refused; a port the process lacks permission to bind
+  (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
+  way the failure is logged and surfaced on
+  `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
+  refused listener stay unreachable rather than being served somewhere else.
+- **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
+  accept-loop task is awaited before the replacement binds, so with
+  `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
+  never coexist on one port. Already accepted connections keep draining.
+- **A listener that stops serving is rebound.** A started listener whose accept
+  loop later ends — cleanly, with an error, or by panic — is reaped on the next
+  reconcile, surfaced as a bind failure, and rebound; finished drains are reaped
+  too, so completed handles never accumulate for the life of the process.
+
+**Listener status for a refused port.** The same-port incompatible-shape
+refusal is reported on the Gateway's own `status.listeners[]` entry, not only as
+a translator warning: every refused effective claim reports `Conflicted=True`
+(`ProtocolConflict` for plaintext-vs-effective-TLS, `HostnameConflict` for
+cross-namespace effective TLS slots that resolve to different credentials),
+`Accepted=False` with `PortUnavailable`, and `Programmed=False`. `ResolvedRefs`
+still describes that listener's own references, which the port conflict does not
+invalidate. A listener that is merely a same-namespace TLS sibling with a
+different `certificateRef` is not refused for that reason alone and keeps its
+ordinary status while materializing no routes.
+
+**HTTP/3 on Gateway listener ports.** When `FERRUM_ENABLE_HTTP3=true` and
+frontend TLS is configured, every TLS-class Gateway listener port also gets its
+own QUIC socket, added, withdrawn and class-flipped with its TCP listener. Two
+TLS listener ports are therefore reachable over HTTP/3 as well as HTTP/1.1 and
+HTTP/2. `Alt-Svc` is advertised per frontend port and only where a QUIC socket
+really exists, so a client is never steered from a port-scoped listener to the
+global HTTPS port whose route table cannot match the port-scoped route. A port
+whose QUIC bind fails keeps serving H1/H2, reports the failure on
+`GatewayListenerManager::bind_failures`, advertises no HTTP/3, and is retried.
+
+**Single-listener protocol remap.** When the whole route table declares exactly
+one listener port of a protocol class, a request arriving on the global process
+bind of that class is also served by it. This exists for the Service-fronted
+topology, where a `Service` maps the Gateway listener port (`:80`) onto the
+pod's `FERRUM_PROXY_HTTP_PORT` (`:8000`) and the listener port is never bound
+inside the pod. With two or more same-class listener ports the remap is off and
+only an exact listener match serves, because the request would otherwise be
+ambiguous.
 
 ### Fail-closed match shapes
 
@@ -363,10 +485,17 @@ and specified field-by-field in [`docs/configuration.md`](configuration.md)
 are summarized here because they are common conformance questions. These are
 single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 
-- **Invalid / unresolved backendRef** (missing Service, unsupported backend
+- **Invalid / unresolved backendRef** (missing Service or ServiceImport, unsupported backend
   kind, or an unpermitted cross-namespace ref) materializes a fail-closed route
   that returns **HTTP 500**, matching the Gateway API expectation. The
   black-box lab asserts the `/invalid` route returns `500`.
+- **MCS `ServiceImport` backendRefs** (`group: multicluster.x-k8s.io`) resolve
+  through the shared backend-kind adapter to ClusterSet DNS
+  (`{name}.{namespace}.svc.clusterset.local`) or ready EndpointSlice addresses
+  labeled `multicluster.kubernetes.io/service-name`. Cross-namespace imports
+  require a ReferenceGrant whose `to` names that group/kind. Missing imports and
+  unknown kinds stay fail-closed with `ResolvedRefs=False`
+  (`BackendNotFound` / `InvalidKind`).
 - **Zero-weight-only rule** (every `backendRef` in a matched rule has
   `weight: 0`) is *not* dropped. Ferrum keeps the route materialized and applies
   the same synthesized 100% fault-abort used for wholly invalid/unresolved
