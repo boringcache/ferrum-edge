@@ -373,8 +373,9 @@ fn stock_profile_never_ingests_control_plane_key_material() {
         status = Status::Supported,
         notes = "The stock profile does not subscribe to SDS. Workload identity and trust \
                  anchors come from Ferrum's own SPIFFE/SVID configuration. An unsolicited \
-                 SDS push is NACKed and every key-bearing variant is refused by field name \
-                 without being decoded, stored, or logged.",
+                 SDS push closes the stream without emitting an SDS request, and every \
+                 key-bearing variant is refused by field name without being decoded, stored, \
+                 or logged.",
     );
     assert!(!STOCK_XDS_TYPE_URLS.contains(&SDS_TYPE_URL));
     let secret = sp::Secret {

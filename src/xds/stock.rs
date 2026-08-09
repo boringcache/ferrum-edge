@@ -434,8 +434,9 @@ impl StockXdsAccumulator {
         }
     }
 
-    /// Apply one state-of-the-world response, replacing everything previously
-    /// known for that type URL.
+    /// Apply one state-of-the-world response. CDS/LDS replace their complete
+    /// type state; by-name EDS/RDS resources merge and are pruned when their
+    /// complete-state parent stops subscribing to them.
     ///
     /// `Err` is a NACK-worthy structural error; the caller must roll back to a
     /// pre-call clone so a rejected response never partially lands.

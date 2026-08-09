@@ -508,9 +508,11 @@ delivery channel could enter is refused:
 - Any `ConfigSource` that is not `ads`.
 - Every SDS `Secret`. The profile does not subscribe to SDS at all — workload
   identity and trust anchors come from Ferrum's own SPIFFE/SVID configuration —
-  and an unsolicited push is NACKed with each key-bearing variant refused **by
-  field name without being decoded**, so control-plane-delivered private key
-  material is never parsed, stored, or logged.
+  and an unsolicited push closes the ADS stream without sending an SDS request
+  (a NACK for an unrequested type would itself subscribe under SotW semantics).
+  Each key-bearing variant is refused **by field name without being decoded**,
+  so control-plane-delivered private key material is never parsed, stored, or
+  logged.
 
 **Bounds.** `FERRUM_MESH_STOCK_XDS_MAX_RESOURCES` (per response, default 10000),
 `FERRUM_MESH_STOCK_XDS_MAX_RESOURCE_BYTES` (per resource, default 1 MiB), and

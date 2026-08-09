@@ -808,16 +808,18 @@ async fn handle_stock_response(
 ) -> Result<StockResponseOutcome, anyhow::Error> {
     let type_url = response.type_url.clone();
 
-    // Unsubscribed / unsupported types fail closed and explicitly. SDS gets a
-    // dedicated diagnostic because a stock CP volunteering key material is a
-    // security-relevant event, and Ferrum refuses it WITHOUT decoding the key
-    // fields or logging any payload.
+    // Unsubscribed / unsupported types fail closed by terminating the stream.
+    // Sending a NACK DiscoveryRequest for a type the client never requested
+    // would itself create a wildcard subscription to that type under SotW
+    // semantics. SDS gets a dedicated diagnostic because a stock CP
+    // volunteering key material is a security-relevant event, and Ferrum
+    // refuses it WITHOUT decoding the key fields or logging any payload.
     if !is_stock_type_url(&type_url) {
         // `type_url` is a control-plane-supplied string bounded only by the
         // gRPC message size, and it lands in both a log line and the
         // `error_detail` echoed back, so it is rendered before either use.
         let safe_url = diagnostic_value(&type_url);
-        let message = if type_url == SDS_TYPE_URL {
+        let reason = if type_url == SDS_TYPE_URL {
             // Bounded exactly like `log_refusals`: one volunteered SDS response
             // must not be able to amplify into an unbounded burst of log lines.
             for resource in response.resources.iter().take(STOCK_REFUSAL_LOG_LIMIT) {
@@ -846,17 +848,15 @@ async fn handle_stock_response(
         } else {
             format!("type_url '{safe_url}' is not subscribed by the Ferrum stock xDS profile")
         };
-        let mut nack = stream_state
-            .subscriptions
-            .build_request(&type_url, config, Some(message));
-        nack.response_nonce = response.nonce.clone();
-        send_request(tx, nack).await?;
         warn!(
             node_id = %config.node_id,
             type_url = %safe_url,
-            "NACKed an unsupported xDS type on the stock profile"
+            reason = %reason,
+            "Closing stock xDS stream after an unsolicited unsupported resource type"
         );
-        return Ok(StockResponseOutcome::Nacked);
+        return Err(anyhow::anyhow!(
+            "stock xDS control plane sent unsolicited unsupported type_url '{safe_url}'; +             closing the stream without subscribing to that type"
+        ));
     }
 
     debug!(

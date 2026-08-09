@@ -46,7 +46,7 @@ use ferrum_edge::xds::proto::{
 };
 use ferrum_edge::xds::stock::StockXdsLimits;
 use ferrum_edge::xds::stock_proto as sp;
-use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL};
+use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL, SDS_TYPE_URL};
 
 const REVIEWS_CLUSTER: &str = "outbound|9080||reviews.default.svc.cluster.local";
 const RATINGS_CLUSTER: &str = "outbound|9080||ratings.default.svc.cluster.local";
@@ -672,6 +672,49 @@ async fn stock_reconnect_after_a_nack_reasserts_the_accepted_version_with_no_non
         "the re-subscription asserts the last ACCEPTED version, never the NACKed one"
     );
     assert!(resubscribe.error_detail.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_unsolicited_sds_closes_the_stream_without_subscribing_to_sds() {
+    let mut script = HashMap::new();
+    script.insert(
+        CDS_TYPE_URL.to_string(),
+        vec![ScriptedResponse {
+            // The server violates the subscription by replying to the initial
+            // CDS request with SDS. Ferrum must close this stream without
+            // emitting a DiscoveryRequest for SDS: in SotW, even a NACK with
+            // empty resource_names would create a wildcard SDS subscription.
+            type_url: SDS_TYPE_URL.to_string(),
+            version: "sds-v1".to_string(),
+            nonce: "sds-n1".to_string(),
+            resources: vec![Any {
+                type_url: SDS_TYPE_URL.to_string(),
+                value: vec![0x0a, 0x07, b'd', b'e', b'f', b'a', b'u', b'l', b't'],
+            }],
+        }],
+    );
+    let harness = StockHarness::start(script).await;
+
+    let mut reconnected = false;
+    for _ in 0..250 {
+        if harness.recorder.for_type(CDS_TYPE_URL).len() >= 2 {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reconnected,
+        "an unsolicited unsupported type must terminate the stream and reconnect"
+    );
+    assert!(
+        harness
+            .recorder
+            .snapshot()
+            .iter()
+            .all(|request| request.type_url != SDS_TYPE_URL),
+        "Ferrum must never turn an unsolicited SDS push into an SDS subscription"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
