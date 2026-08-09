@@ -126,6 +126,14 @@ pub const MAX_TLS_PLAINTEXT_BYTES: u64 = 16_384;
 /// choose the payload size, but it cannot make a record cheaper than this on
 /// the wire, and the kernel cannot hold more unread wire bytes than the socket
 /// receive buffer allows.
+///
+/// It is an **AES-GCM** figure, and deliberately so: AES-GCM is the only family
+/// with a finite confidentiality limit, and only a finite-limit suite ever
+/// consults a receive-record bound. ChaCha20-Poly1305 carries no explicit
+/// nonce, so its minimum record is 21 wire bytes — using this constant for it
+/// would under-count records. That is safe today only because an unlimited
+/// suite builds no guard at all; a future finite-limit non-AES suite must bring
+/// its own per-cipher minimum rather than reuse this one.
 pub const MIN_TLS12_AEAD_RECORD_WIRE_BYTES: u64 = 29;
 
 /// Receive-buffer size requested when pinning a kTLS socket.

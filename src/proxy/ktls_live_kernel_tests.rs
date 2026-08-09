@@ -58,6 +58,16 @@
 //! `FERRUM_KTLS_LIVE_REQUIRED=1`, which turns an unavailable capability into a
 //! failure. The hosted gate sets that variable, so the required CI signal is
 //! "the live path ran", never "the live path was quietly unavailable".
+//!
+//! That capability answer is only as good as the request the probe makes. The
+//! TLS ULP compares `optlen` against its own `tls12_crypto_info_*` size for
+//! exact equality, so a struct that is the wrong length is refused with
+//! `EINVAL` and reads back as a missing kernel capability. ChaCha20-Poly1305's
+//! UAPI salt is zero-length (56-byte struct), and
+//! [`crate::socket_opts::ktls`] pins all three layouts to `libc`'s definitions
+//! at compile time; the failure message here reports each cipher's probe
+//! `errno` so a future capability red is self-explaining rather than
+//! ambiguous.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -105,20 +115,25 @@ fn live_required() -> bool {
 /// live path, so a required check can never report success for a run that
 /// silently exercised nothing.
 fn kernel_supports_live_ktls() -> bool {
-    let aes128 = ktls::is_ktls_aes128gcm_available();
-    let aes256 = ktls::is_ktls_aes256gcm_available();
-    let chacha = ktls::is_ktls_chacha20_poly1305_available();
-    // Production hands off only ChaCha20-Poly1305. Keep the AES probes in the
-    // diagnostic so a red hosted gate still explains the runner's full kTLS
-    // posture.
-    if chacha {
+    // Production hands off only ChaCha20-Poly1305, so that is the capability
+    // this gate requires. The diagnostic carries every cipher's probe verdict
+    // *and its errno*, because "chacha20=false" alone cannot distinguish a
+    // kernel without the capability from the gateway offering the wrong
+    // `tls12_crypto_info` layout — the exact failure that made this gate
+    // unpassable while the runner's kernel supported the cipher all along.
+    if ktls::is_ktls_chacha20_poly1305_available() {
         return true;
     }
-    let probes = format!("aes128={aes128} aes256={aes256} chacha20={chacha}");
+    let probes = ktls::ktls_availability_diagnostic();
     if live_required() {
-        panic!("FERRUM_KTLS_LIVE_REQUIRED=1 but the kernel TLS ULP is unusable: {probes}");
+        panic!(
+            "FERRUM_KTLS_LIVE_REQUIRED=1 but ChaCha20-Poly1305 kTLS is unusable on this kernel: \
+             {probes}"
+        );
     }
-    println!("SKIP: kernel TLS ULP is unusable ({probes}); needs Linux 5.11+ with `tls` loaded");
+    println!(
+        "SKIP: ChaCha20-Poly1305 kTLS is unusable ({probes}); needs Linux 5.11+ with `tls` loaded"
+    );
     false
 }
 

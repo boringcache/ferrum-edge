@@ -677,6 +677,21 @@ ChaCha20-Poly1305 capability into a failure rather than a skip, and the CI step
 also fails on any `SKIP:` line or on a pass count other than three — so a green
 required check cannot mean "the live path did not run".
 
+Because that gate stands entirely on the per-cipher capability probe, the probe
+has to be asking the kernel the right question. `setsockopt(SOL_TLS, TLS_TX)`
+is accepted only when `optlen` is **exactly** the cipher's
+`tls12_crypto_info_*` size, and ChaCha20-Poly1305's `salt` member is
+zero-length (`TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE == 0`), making that struct
+56 bytes rather than the 60 an AES-shaped 4-byte salt would produce. A struct
+of the wrong length is refused with `EINVAL` on every kernel and reads back
+indistinguishably from "this kernel has no ChaCha20-Poly1305 kTLS". Two things
+keep that from recurring silently: `socket_opts::ktls` pins all three struct
+sizes and `rec_seq` offsets to `libc`'s UAPI definitions with compile-time
+assertions, so a layout regression fails the build; and the availability probe
+records each cipher's install `errno`, which
+`ktls::ktls_availability_diagnostic()` reports in the live gate's failure
+message instead of a bare `chacha20=false`.
+
 Residual, covered only by the deterministic unit suite: peer-originated fatal
 alerts and non-`close_notify` warning alerts are classified by
 `classify_ktls_control_record`, because rustls exposes no API for emitting an

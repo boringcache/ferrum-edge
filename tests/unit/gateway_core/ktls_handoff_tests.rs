@@ -1136,3 +1136,52 @@ mod confidentiality {
         }
     }
 }
+
+/// The kernel-UAPI capability probe must be able to explain itself.
+///
+/// The TLS ULP accepts a cipher install only when `optlen` exactly matches its
+/// own `tls12_crypto_info_*` size, so a gateway-side layout mistake is
+/// indistinguishable from a missing kernel capability if the probe reports
+/// nothing but a boolean. That is not hypothetical: a ChaCha20-Poly1305
+/// crypto-info carrying a 4-byte salt (the UAPI salt is zero-length, making the
+/// struct 56 bytes) is refused with `EINVAL` on every kernel and reads back as
+/// "this kernel has no ChaCha20-Poly1305 kTLS".
+///
+/// The layouts themselves are pinned to `libc`'s definitions by `const`
+/// assertions in `socket_opts::ktls`, so a regression there fails the build
+/// rather than any test. What is asserted here is the other half: the probe
+/// verdict is reported per cipher, with a reason, and can never disagree with
+/// the boolean accessor the admission gate actually reads.
+mod probe_diagnostics {
+    use ferrum_edge::socket_opts::ktls;
+
+    #[test]
+    fn diagnostic_names_every_cipher_and_agrees_with_the_accessors() {
+        let diagnostic = ktls::ktls_availability_diagnostic();
+        for cipher in ["aes128", "aes256", "chacha20"] {
+            assert!(
+                diagnostic.contains(cipher),
+                "the kTLS probe diagnostic must name {cipher}: {diagnostic}"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                diagnostic.contains("install:"),
+                "each cipher must report why its install probe failed: {diagnostic}"
+            );
+            for (name, available) in [
+                ("aes128", ktls::is_ktls_aes128gcm_available()),
+                ("aes256", ktls::is_ktls_aes256gcm_available()),
+                ("chacha20", ktls::is_ktls_chacha20_poly1305_available()),
+            ] {
+                assert!(
+                    diagnostic.contains(&format!("{name}={available}")),
+                    "the diagnostic must not disagree with the {name} accessor \
+                     the admission gate reads: {diagnostic}"
+                );
+            }
+        }
+    }
+}

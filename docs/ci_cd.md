@@ -407,7 +407,10 @@ because that job is `require_success "Unit and inline lib"` in the required
 byte-frozen aggregate wiring. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
 unavailable ChaCha20-Poly1305 kernel capability into a failure rather than a
 skip, and the step additionally fails on any `SKIP:` line or on a pass count
-other than three, so a green check cannot mean "the live path did not run". See
+other than three, so a green check cannot mean "the live path did not run". A
+capability failure prints every cipher's probe verdict *with its install
+`errno`*, because a bare `chacha20=false` cannot distinguish a kernel without
+the cipher from a gateway-side `tls12_crypto_info` layout error. See
 [tcp_udp_proxy.md](tcp_udp_proxy.md#hosted-live-kernel-coverage).
 
 The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
