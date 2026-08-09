@@ -206,7 +206,11 @@ pub fn resolve_unix_socket_target<'a>(
     let Some(path) = target.tags.get(MESH_UNIX_SOCKET_TAG).map(String::as_str) else {
         return Some(Err(UnixSocketPathRejection::MissingSocketPathTag));
     };
-    match target.tags.get(MESH_UNIX_SOCKET_H2C_TAG).map(String::as_str) {
+    match target
+        .tags
+        .get(MESH_UNIX_SOCKET_H2C_TAG)
+        .map(String::as_str)
+    {
         Some("true" | "false") => {}
         Some(_) => return Some(Err(UnixSocketPathRejection::InvalidWireProtocolTag)),
         None => return Some(Err(UnixSocketPathRejection::MissingWireProtocolTag)),
