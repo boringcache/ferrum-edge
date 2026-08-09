@@ -1402,19 +1402,64 @@ pub mod ktls {
     /// `struct tls12_crypto_info_chacha20_poly1305` from Linux 5.11+
     /// `include/uapi/linux/tls.h`).
     ///
-    /// Layout: `version`, `cipher_type`, `iv[12]`, `key[32]`, `salt[4]`
-    /// (present but unused by the kernel — ChaCha20-Poly1305 uses the full
-    /// 12-byte IV directly with no salt/explicit-nonce split like AES-GCM),
+    /// Layout: `version`, `cipher_type`, `iv[12]`, `key[32]`, `salt[0]`,
     /// `rec_seq[8]`.
+    ///
+    /// `TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE` is **0**, not 4: ChaCha20-Poly1305
+    /// uses the full 12-byte IV directly with no salt/explicit-nonce split like
+    /// AES-GCM, so the UAPI struct keeps the member for shape parity at length
+    /// zero. The whole struct is therefore 56 bytes, and `do_tls_setsockopt_conf`
+    /// compares `optlen` against that size for **exact** equality — a struct
+    /// with a 4-byte salt is 60 bytes and is rejected with `EINVAL` on every
+    /// kernel, which presents as "this kernel has no ChaCha20-Poly1305 kTLS"
+    /// rather than as a layout bug. The `const` block below pins all three
+    /// layouts to `libc`'s own `tls12_crypto_info_*` definitions so that
+    /// mistake cannot recur silently.
     #[repr(C)]
     struct TlsCryptoInfoChaCha20Poly1305 {
         version: u16,
         cipher_type: u16,
         iv: [u8; 12],
         key: [u8; 32],
-        salt: [u8; 4],
+        salt: [u8; 0],
         rec_seq: [u8; 8],
     }
+
+    /// Compile-time parity between the structs above and the kernel UAPI.
+    ///
+    /// The TLS ULP rejects any `setsockopt(SOL_TLS, TLS_TX|TLS_RX)` whose
+    /// `optlen` is not exactly the cipher's `tls12_crypto_info_*` size, and the
+    /// `getsockopt` readback in [`read_ktls_record_seq`] locates `rec_seq` by
+    /// offset. A silent divergence in either therefore disables a cipher
+    /// (install `EINVAL`) or misreads its record counter, so both are asserted
+    /// against `libc`'s definitions at build time rather than discovered from a
+    /// capability probe that reports `false`.
+    const _: () = {
+        assert!(
+            std::mem::size_of::<TlsCryptoInfoAes128Gcm>()
+                == std::mem::size_of::<libc::tls12_crypto_info_aes_gcm_128>()
+        );
+        assert!(
+            std::mem::offset_of!(TlsCryptoInfoAes128Gcm, rec_seq)
+                == std::mem::offset_of!(libc::tls12_crypto_info_aes_gcm_128, rec_seq)
+        );
+        assert!(
+            std::mem::size_of::<TlsCryptoInfoAes256Gcm>()
+                == std::mem::size_of::<libc::tls12_crypto_info_aes_gcm_256>()
+        );
+        assert!(
+            std::mem::offset_of!(TlsCryptoInfoAes256Gcm, rec_seq)
+                == std::mem::offset_of!(libc::tls12_crypto_info_aes_gcm_256, rec_seq)
+        );
+        assert!(
+            std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>()
+                == std::mem::size_of::<libc::tls12_crypto_info_chacha20_poly1305>()
+        );
+        assert!(
+            std::mem::offset_of!(TlsCryptoInfoChaCha20Poly1305, rec_seq)
+                == std::mem::offset_of!(libc::tls12_crypto_info_chacha20_poly1305, rec_seq)
+        );
+    };
 
     impl Drop for TlsCryptoInfoChaCha20Poly1305 {
         fn drop(&mut self) {
@@ -1917,9 +1962,10 @@ pub mod ktls {
             cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
             iv: [0u8; 12],
             key: [0u8; 32],
-            // `salt` is present in the struct for layout parity with AES-GCM
-            // but is unused by the kernel for ChaCha20-Poly1305.
-            salt: [0u8; 4],
+            // `TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE` is 0: the member exists
+            // for shape parity with the other UAPI structs and carries no
+            // bytes, because the full 12-byte IV is used directly.
+            salt: [],
             rec_seq: *seq,
         };
         info.key.copy_from_slice(key);
@@ -1976,7 +2022,23 @@ pub mod ktls {
         aes128gcm_record_seq: bool,
         aes256gcm_record_seq: bool,
         chacha20_poly1305_record_seq: bool,
+        /// Raw `errno` from each cipher's one-shot install probe: `0` when the
+        /// kernel took the keys, [`PROBE_SETUP_FAILED`] when the throwaway
+        /// loopback socket or the `TCP_ULP` install failed before the cipher
+        /// was ever offered, otherwise the `setsockopt` error.
+        ///
+        /// Kept so an unavailable cipher can say *why*. A bare `false` is
+        /// ambiguous between "this kernel lacks the cipher" and "the gateway
+        /// asked for it wrongly" — exactly the ambiguity that let a 60-byte
+        /// ChaCha20-Poly1305 `tls12_crypto_info` (the UAPI struct is 56) read
+        /// as a missing kernel capability.
+        aes128gcm_probe_errno: i32,
+        aes256gcm_probe_errno: i32,
+        chacha20_poly1305_probe_errno: i32,
     }
+
+    /// Sentinel for "the probe never reached the cipher install".
+    const PROBE_SETUP_FAILED: i32 = -1;
 
     static KTLS_AVAILABILITY: std::sync::OnceLock<KtlsAvailability> = std::sync::OnceLock::new();
 
@@ -1987,7 +2049,7 @@ pub mod ktls {
             // kernel refuses further TLS_TX installs on a socket that already
             // has keys installed. Three separate probes cost ~3ms at startup
             // (one-time), which is acceptable for one-shot auto-detection.
-            let aes128gcm = unsafe {
+            let aes128gcm_probe_errno = unsafe {
                 let info = TlsCryptoInfoAes128Gcm {
                     version: TLS_1_2_VERSION,
                     cipher_type: TLS_CIPHER_AES_GCM_128,
@@ -2001,7 +2063,7 @@ pub mod ktls {
                     std::mem::size_of::<TlsCryptoInfoAes128Gcm>() as libc::socklen_t,
                 )
             };
-            let aes256gcm = unsafe {
+            let aes256gcm_probe_errno = unsafe {
                 let info = TlsCryptoInfoAes256Gcm {
                     version: TLS_1_2_VERSION,
                     cipher_type: TLS_CIPHER_AES_GCM_256,
@@ -2015,13 +2077,13 @@ pub mod ktls {
                     std::mem::size_of::<TlsCryptoInfoAes256Gcm>() as libc::socklen_t,
                 )
             };
-            let chacha20_poly1305 = unsafe {
+            let chacha20_poly1305_probe_errno = unsafe {
                 let info = TlsCryptoInfoChaCha20Poly1305 {
                     version: TLS_1_2_VERSION,
                     cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
                     iv: [0u8; 12],
                     key: [0u8; 32],
-                    salt: [0u8; 4],
+                    salt: [],
                     rec_seq: [0u8; 8],
                 };
                 probe_cipher(
@@ -2029,6 +2091,9 @@ pub mod ktls {
                     std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>() as libc::socklen_t,
                 )
             };
+            let aes128gcm = aes128gcm_probe_errno == 0;
+            let aes256gcm = aes256gcm_probe_errno == 0;
+            let chacha20_poly1305 = chacha20_poly1305_probe_errno == 0;
             // Sequence-number observability is probed only for ciphers that
             // installed: an unusable cipher has nothing to report.
             let aes128gcm_record_seq =
@@ -2044,8 +2109,47 @@ pub mod ktls {
                 aes128gcm_record_seq,
                 aes256gcm_record_seq,
                 chacha20_poly1305_record_seq,
+                aes128gcm_probe_errno,
+                aes256gcm_probe_errno,
+                chacha20_poly1305_probe_errno,
             }
         })
+    }
+
+    /// Human-readable, secret-free summary of this kernel's kTLS posture.
+    ///
+    /// Every cipher is named with its install verdict *and the reason it
+    /// failed*, plus its record-sequence observability. Only probe outcomes are
+    /// reported: the probes install all-zero throwaway key material on a
+    /// loopback socket that never carries traffic, so nothing here derives from
+    /// a session secret.
+    ///
+    /// Used by the hosted live-kernel gate's failure message, where "the cipher
+    /// is unavailable" without an `errno` is not enough to tell a kernel
+    /// without the capability from a gateway-side layout or argument error.
+    pub fn ktls_availability_diagnostic() -> String {
+        fn install_reason(errno: i32) -> String {
+            match errno {
+                0 => "ok".to_string(),
+                PROBE_SETUP_FAILED => "no TLS ULP (probe setup failed)".to_string(),
+                other => std::io::Error::from_raw_os_error(other).to_string(),
+            }
+        }
+        let a = ktls_availability();
+        format!(
+            "aes128={} (install: {}, record_seq={}) \
+             aes256={} (install: {}, record_seq={}) \
+             chacha20={} (install: {}, record_seq={})",
+            a.aes128gcm,
+            install_reason(a.aes128gcm_probe_errno),
+            a.aes128gcm_record_seq,
+            a.aes256gcm,
+            install_reason(a.aes256gcm_probe_errno),
+            a.aes256gcm_record_seq,
+            a.chacha20_poly1305,
+            install_reason(a.chacha20_poly1305_probe_errno),
+            a.chacha20_poly1305_record_seq,
+        )
     }
 
     /// Whether this kernel exposes a usable live record sequence number for
@@ -2190,8 +2294,10 @@ pub mod ktls {
     }
 
     /// Set up a real TCP loopback connection and run the kTLS setsockopt sequence
-    /// on the accepted server-side socket. Returns `true` iff BOTH the TCP_ULP
-    /// install AND the dummy cipher TX key install returned 0.
+    /// on the accepted server-side socket. Returns `0` iff BOTH the TCP_ULP
+    /// install AND the dummy cipher TX key install returned 0; otherwise the
+    /// `setsockopt` `errno`, or [`PROBE_SETUP_FAILED`] when the probe never got
+    /// as far as offering the cipher.
     ///
     /// The `info_ptr` / `info_len` describe the cipher-specific
     /// `TlsCryptoInfo*` struct to install via `setsockopt(SOL_TLS, TLS_TX)`.
@@ -2205,10 +2311,10 @@ pub mod ktls {
     /// fully support kTLS. Using socketpair(AF_UNIX, ...) would make this
     /// probe silently return false forever and defeat kTLS auto-detection.
     #[allow(clippy::cast_possible_truncation)]
-    unsafe fn probe_cipher(info_ptr: *const libc::c_void, info_len: libc::socklen_t) -> bool {
+    unsafe fn probe_cipher(info_ptr: *const libc::c_void, info_len: libc::socklen_t) -> i32 {
         unsafe {
             let Some((server_fd, client_fd)) = probe_socket_pair() else {
-                return false;
+                return PROBE_SETUP_FAILED;
             };
 
             // Install `TCP_ULP` "tls" on the server-side TCP socket.
@@ -2223,17 +2329,27 @@ pub mod ktls {
             if ulp_ret != 0 {
                 libc::close(server_fd);
                 libc::close(client_fd);
-                return false;
+                return PROBE_SETUP_FAILED;
             }
 
             // Install a dummy TX key for the cipher under test. A value of 0
             // for tx_ret means the kernel accepted the cipher install and the
-            // full kTLS path works for this cipher.
+            // full kTLS path works for this cipher. Capture `errno` before the
+            // closes, which would otherwise overwrite it.
             let tx_ret = libc::setsockopt(server_fd, SOL_TLS, TLS_TX, info_ptr, info_len);
+            let install_errno = if tx_ret == 0 {
+                0
+            } else {
+                // A zero `errno` must never masquerade as a successful install.
+                match *libc::__errno_location() {
+                    0 => libc::EINVAL,
+                    raw => raw,
+                }
+            };
 
             libc::close(server_fd);
             libc::close(client_fd);
-            tx_ret == 0
+            install_errno
         }
     }
 
@@ -2385,6 +2501,13 @@ pub mod ktls {
     #[allow(dead_code)]
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         false
+    }
+
+    /// Same shape as the Linux accessor so callers (notably the live-kernel
+    /// gate's failure message) need no `cfg`.
+    #[allow(dead_code)]
+    pub fn ktls_availability_diagnostic() -> String {
+        "kTLS is Linux-only: aes128=false aes256=false chacha20=false".to_string()
     }
 
     /// No kernel TLS ULP exists off Linux, so no record sequence number can be

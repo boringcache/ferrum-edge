@@ -115,6 +115,7 @@ fn create_mesh_proxy_state_with_config(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
@@ -820,6 +821,7 @@ fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
@@ -1241,6 +1243,7 @@ fn materialize_source_side_external_udp(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
@@ -1354,6 +1357,7 @@ async fn open_source_side_datagram_tunnel(
         dial_plan.expected_peer.as_ref(),
         dial_plan.expected_trust_domain.as_ref(),
         dial_plan.sni_override,
+        None,
     )
     .await
     .map_err(|e| e.to_string())
