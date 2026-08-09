@@ -4703,6 +4703,33 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
 }
 
 #[test]
+fn test_unique_listen_paths_allows_same_host_path_on_distinct_listen_ports() {
+    let mut plain = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
+    plain.listen_port = Some(80);
+    let mut tls = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
+    tls.listen_port = Some(443);
+    let mut config = empty_config();
+    config.proxies = vec![plain, tls];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "port-scoped siblings must not collide"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_allows_port_agnostic_alongside_port_scoped() {
+    let agnostic = make_proxy_with_hosts("fallback", "/api", vec!["api.example.com"]);
+    let mut scoped = make_proxy_with_hosts("scoped", "/api", vec!["api.example.com"]);
+    scoped.listen_port = Some(8080);
+    let mut config = empty_config();
+    config.proxies = vec![agnostic, scoped];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "port-agnostic and port-scoped routes coexist; scoped wins at request time"
+    );
+}
+
+#[test]
 fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
     let mut tenant_a = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
     tenant_a.namespace = "tenant-a".to_string();
@@ -5370,13 +5397,22 @@ fn test_stream_proxy_shared_port_validation_keeps_same_id_namespaces_distinct() 
 }
 
 #[test]
-fn test_http_proxy_must_not_set_listen_port() {
+fn test_http_proxy_may_set_listen_port_for_port_scoped_routing() {
     let mut proxy = make_proxy("p1", "/api");
     proxy.listen_port = Some(8080);
     let mut config = empty_config();
     config.proxies = vec![proxy];
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_http_proxy_rejects_listen_port_zero() {
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.listen_port = Some(0);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
     let err = config.validate_stream_proxies().unwrap_err();
-    assert!(err[0].contains("must not set listen_port"));
+    assert!(err[0].contains("invalid listen_port"));
 }
 
 // ---- Restore pre-deletion validation tests ----

@@ -742,6 +742,12 @@ spec:
               value: "true"
             - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
               value: "true"
+            # The revision scalar is the minimum convergence evidence across
+            # watch scopes. Keep this live fixture's authoritative idle relist
+            # comfortably inside its 60s route-convergence assertion so quiet
+            # scopes advance without weakening the equal-revision content gate.
+            - name: FERRUM_K8S_WATCH_IDLE_RELIST_SECS
+              value: "2"
             # No Istio/Gateway-API CRDs in this kind cluster and no
             # istio-system namespace: disable those watches so the namespaced
             # Role above is sufficient and reconcile startup never waits on a

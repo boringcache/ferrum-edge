@@ -96,8 +96,16 @@ struct CorePod {
 #[derive(Debug)]
 struct CoreEndpointSlice {
     service_key: K8sServiceKey,
+    /// Whether this slice backs a core Service or an MCS ServiceImport.
+    backend_kind: EndpointSliceBackendKind,
     ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSliceBackendKind {
+    Service,
+    ServiceImport,
 }
 
 #[derive(Debug)]
@@ -174,6 +182,9 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
 
     let mut endpoint_slice_indices_by_service: HashMap<K8sServiceKey, Vec<usize>> = HashMap::new();
     for (index, slice) in acc.core.endpoint_slices.iter().enumerate() {
+        if slice.backend_kind != EndpointSliceBackendKind::Service {
+            continue;
+        }
         endpoint_slice_indices_by_service
             .entry(slice.service_key.clone())
             .or_default()
@@ -375,13 +386,26 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
 }
 
 fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
-    let service_name = object
+    // Prefer the MCS ServiceImport label when both are present so an import's
+    // derived slices are never mistaken for a same-named local Service.
+    let (service_name, backend_kind) = if let Some(name) = object
+        .metadata
+        .labels
+        .get("multicluster.kubernetes.io/service-name")
+        .cloned()
+        .filter(|name| !name.is_empty())
+    {
+        (name, EndpointSliceBackendKind::ServiceImport)
+    } else if let Some(name) = object
         .metadata
         .labels
         .get("kubernetes.io/service-name")
         .cloned()
-        .or_else(|| string_field(&object.spec, "serviceName").map(ToOwned::to_owned));
-    let Some(service_name) = service_name else {
+        .or_else(|| string_field(&object.spec, "serviceName").map(ToOwned::to_owned))
+        .filter(|name| !name.is_empty())
+    {
+        (name, EndpointSliceBackendKind::Service)
+    } else {
         return;
     };
     let Some(service_key) = K8sServiceKey::new(object.metadata.namespace.clone(), service_name)
@@ -438,6 +462,7 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
 
     acc.core.endpoint_slices.push(CoreEndpointSlice {
         service_key,
+        backend_kind,
         ports,
         endpoints,
     });
@@ -675,12 +700,9 @@ pub(super) fn endpoint_route_backends_for_service(
         .find(|candidate| candidate.port == service_port);
     let mut seen = BTreeSet::new();
     let mut backends = Vec::new();
-    for slice in acc
-        .core
-        .endpoint_slices
-        .iter()
-        .filter(|slice| slice.service_key == service_key)
-    {
+    for slice in acc.core.endpoint_slices.iter().filter(|slice| {
+        slice.service_key == service_key && slice.backend_kind == EndpointSliceBackendKind::Service
+    }) {
         let Some(target_port) = endpoint_backend_port(service_port_spec, service_port, slice)
         else {
             continue;
@@ -704,6 +726,90 @@ pub(super) fn endpoint_route_backends_for_service(
         }
     }
     backends
+}
+
+/// Expand an MCS `ServiceImport` onto ready EndpointSlice addresses.
+///
+/// Slices are selected by `multicluster.kubernetes.io/service-name`. Unlike
+/// Service expansion, there is no selector/ClusterIP short-circuit — Imports
+/// are ClusterSet-scoped and always endpoint-oriented when slices exist.
+pub(super) fn endpoint_route_backends_for_service_import(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    import_name: &str,
+    service_port: u16,
+    weight: u32,
+) -> Vec<RouteBackend> {
+    if !acc.options.pod_discovery_enabled {
+        return Vec::new();
+    }
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), import_name.to_string())
+    else {
+        return Vec::new();
+    };
+    // MCS-derived EndpointSlices mirror the exporting cluster's slices, so
+    // `ports[].port` is the backing container port and `ports[].name` is the
+    // ClusterSet port's name. `ServiceImport` carries no `targetPort`, so the
+    // name is the only mapping available — see `service_import_endpoint_port`.
+    let import_port_name = acc
+        .service_import_port_index(namespace, import_name)
+        .and_then(|ports| ports.get(&service_port))
+        .and_then(|entry| entry.name.as_deref());
+
+    let mut seen = BTreeSet::new();
+    let mut backends = Vec::new();
+    for slice in acc.core.endpoint_slices.iter().filter(|slice| {
+        slice.service_key == service_key
+            && slice.backend_kind == EndpointSliceBackendKind::ServiceImport
+    }) {
+        let Some(target_port) = service_import_endpoint_port(import_port_name, slice) else {
+            continue;
+        };
+        for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
+            for address in &endpoint.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                if seen.insert((address.clone(), target_port)) {
+                    backends.push(RouteBackend {
+                        host: address.clone(),
+                        port: target_port,
+                        weight,
+                        service_namespace: None,
+                        service_name: None,
+                        service_port: None,
+                    });
+                }
+            }
+        }
+    }
+    backends
+}
+
+/// Backing container port for one MCS-derived EndpointSlice.
+///
+/// A `ServiceImport` has no `targetPort`, so a *named* ClusterSet port resolves
+/// against the slice's like-named port exactly as a core Service resolves a
+/// named `targetPort`. An unnamed port is single-port by Kubernetes rules, so
+/// the slice's sole port is unambiguous. Anything else returns `None` and the
+/// slice is skipped: with no slice left the backend falls back to the stable
+/// ClusterSet DNS name, which is correct, rather than dialing the ClusterSet
+/// port number directly on a pod IP that may not serve it.
+fn service_import_endpoint_port(
+    import_port_name: Option<&str>,
+    slice: &CoreEndpointSlice,
+) -> Option<u16> {
+    if let Some(name) = import_port_name {
+        return slice
+            .ports
+            .iter()
+            .find(|port| port.name.as_deref() == Some(name))
+            .and_then(|port| port.port);
+    }
+    match slice.ports.as_slice() {
+        [only] => only.port,
+        _ => None,
+    }
 }
 
 fn endpoint_backend_port(
