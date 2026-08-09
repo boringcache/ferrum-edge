@@ -2281,6 +2281,101 @@ fn inbound_hbone_relay_destination_allowed(
     })
 }
 
+/// Round-robin cursor over an admitted external UDP destination's precomputed
+/// dial endpoints (issue #3263).
+///
+/// One relaxed `fetch_add` per admitted CONNECT — no lock, no allocation, and no
+/// per-destination state that a reload would have to migrate: the endpoint set
+/// itself lives in the `ArcSwap`ped config snapshot, so an apply that changes the
+/// set changes what the very next CONNECT selects, while this cursor only
+/// spreads sessions across whatever set is current.
+static MESH_EGRESS_UDP_ENDPOINT_CURSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve the destination an EgressGateway may dial for a `udp`-marked mesh
+/// CONNECT naming external `host:port` (issue #3263), or `None` when the pair is
+/// not an admitted external UDP egress destination.
+///
+/// The allowlist is materialized ONLY under `EgressGateway` topology, ONLY from
+/// `MESH_EXTERNAL` `ServiceEntry` ports whose protocol is `UDP`, and ONLY when
+/// stream-family egress is enabled — so on every other proxy this is an empty
+/// vector and the lookup denies. Matching is EXACT on the AUTHORITY host (ASCII
+/// case-insensitive; the stored host is already lowercased) and exact on the
+/// service port: wildcard ServiceEntry hosts are refused at materialization, so
+/// no admission is ever decided by a prefix or subnet guess.
+///
+/// The returned `(host, port)` is a DIAL endpoint, which is not the authority: a
+/// `STATIC` ServiceEntry's host resolves to one of its operator-declared
+/// `endpoints[]`, so the gateway never DNS-resolves a STATIC authority. The set
+/// is precomputed and bounded at materialization; selection is a modulo index
+/// over it.
+///
+/// This deliberately does NOT widen [`inbound_hbone_relay_destination_allowed`]:
+/// the byte-stream HBONE relay stays bounded to loopback / slice-known workload
+/// targets. Only the datagram handler consults this second, egress-specific
+/// allowlist.
+fn mesh_egress_udp_destination_dial_endpoint(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<(String, u16)> {
+    let mesh = mesh?;
+    if mesh.egress_udp_destinations.is_empty() {
+        return None;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    let dest = mesh
+        .egress_udp_destinations
+        .iter()
+        .find(|dest| dest.port == port && dest.host.eq_ignore_ascii_case(host))?;
+    if dest.dial_endpoints.is_empty() {
+        // Materialization refuses an endpoint-less admission, so this is
+        // unreachable in practice; fail closed rather than inventing a fallback
+        // that would dial the authority itself.
+        return None;
+    }
+    let index = MESH_EGRESS_UDP_ENDPOINT_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        as usize
+        % dest.dial_endpoints.len();
+    let endpoint = &dest.dial_endpoints[index];
+    Some((endpoint.host.clone(), endpoint.port))
+}
+
+/// Whether `host:port` is a precomputed dial endpoint of an admitted external
+/// UDP egress destination.
+///
+/// This is the live post-route-override guard in `handle_hbone_udp_request`.
+/// Route-miss synthesis already selected an admitted dial endpoint from the
+/// CONNECT authority via [`mesh_egress_udp_destination_dial_endpoint`], but the
+/// synthesized relay proxy inherits the global plugin chain and a `before_proxy`
+/// route-override can rewrite `app_host` / `app_port` before any socket opens.
+/// Re-checking here is therefore necessary and nonredundant — and it MUST match
+/// dial endpoints only, never authority hosts: a `STATIC` ServiceEntry host is
+/// a valid CONNECT authority, but admitting it as an effective socket target
+/// would let `resolve_local_udp_dest` DNS-resolve that hostname and bypass the
+/// operator-declared `endpoints[]` set. Under `DNS`/`NONE` the dial endpoint
+/// *is* the authority host, so those destinations stay usable; a `STATIC`
+/// endpoint-IP authority is usable because that IP is itself a dial endpoint.
+/// The original-authority lookup used at CONNECT synthesis is unchanged.
+fn mesh_egress_udp_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let Some(mesh) = mesh else {
+        return false;
+    };
+    if mesh.egress_udp_destinations.is_empty() {
+        return false;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.egress_udp_destinations.iter().any(|dest| {
+        dest.dial_endpoints
+            .iter()
+            .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
+    })
+}
+
 fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     let Some(inner) = host
         .strip_prefix('[')
@@ -2300,9 +2395,18 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
 /// terminator where no inbound route is materialized. Returns `None` (caller
 /// 404s) when the authority is missing/portless or is not a safe local relay
 /// target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` selects the SECOND, narrower admission source used only by
+/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
+/// naming an external destination the EgressGateway's `ServiceEntry`-derived
+/// allowlist admits relays to that external host over a local `UdpSocket`, with
+/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
+/// relay never consults it, so a bare CONNECT stays bounded to loopback /
+/// slice-known workload targets exactly as before.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    is_udp_connect: bool,
 ) -> Option<Arc<Proxy>> {
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
@@ -2310,12 +2414,22 @@ fn build_inbound_hbone_relay_proxy(
     if host.is_empty() || port == 0 {
         return None;
     }
-    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return None;
+    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+        ));
     }
-    Some(Arc::new(
-        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-    ))
+    if is_udp_connect
+        && let Some((dial_host, dial_port)) =
+            mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
+    {
+        // The relay dials the SELECTED ENDPOINT, not the authority: a STATIC
+        // ServiceEntry host must never be DNS-resolved here.
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(&dial_host, dial_port),
+        ));
+    }
+    None
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -4014,7 +4128,9 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
-    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
+    // `mesh.metrics.*` coordination keys stay on the in-process summary until
+    // built-in observers consume them and external serialization omits them.
+    crate::plugins::utils::metadata_redaction::strip_dedup_internal_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -15878,6 +15994,29 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_bound_listener_and_mesh_direction(
+        listener, state, shutdown, tls_config, None,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_bound_listener`] with an explicit mesh traffic
+/// direction stamped on every accepted connection.
+///
+/// Mesh listeners are normally bound by `modes::mesh`, which owns the direction
+/// per listener descriptor. This variant exists so an out-of-process-free test
+/// harness can drive the direction-gated inbound paths — the transparent HBONE
+/// relay synthesis and the datagram-over-mesh UDP relay — over a pre-bound
+/// socket with a static mTLS `ServerConfig`, instead of standing up a full mesh
+/// runtime. It adds no behavior of its own: `None` is exactly the existing
+/// entry point.
+pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> Result<(), anyhow::Error> {
     let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
@@ -15906,7 +16045,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         },
         conn_semaphore,
         shutdown,
-        None,
+        mesh_direction,
         0,
         SourceIpOverride::none(),
         None,
@@ -24623,10 +24762,17 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
+            // A UDP CONNECT additionally consults the EgressGateway's
+            // ServiceEntry-derived external-destination allowlist (issue #3263),
+            // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+                build_inbound_hbone_relay_proxy(
+                    req.uri().authority(),
+                    epoch.config.mesh.as_deref(),
+                    is_udp_hbone_connect,
+                )
             } else {
                 None
             };
@@ -50118,7 +50264,7 @@ mod tests {
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .rfind("build_inbound_hbone_relay_proxy(")
             .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
         assert!(
             relay_pos < gate_pos,
@@ -52001,11 +52147,116 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
             .expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.backend_host, "fd00:10:244:1::4");
         assert_eq!(relay.backend_port, 8080);
+    }
+
+    #[test]
+    fn mesh_egress_udp_post_override_allows_only_dial_endpoints() {
+        use crate::modes::mesh::config::{
+            MeshConfig, MeshEgressUdpDestination, MeshEgressUdpDialEndpoint,
+        };
+
+        // STATIC host authority + declared endpoint: CONNECT may name the
+        // hostname, but the effective socket target after synthesis/override
+        // must be a dial endpoint. Admitting the hostname here would let
+        // resolve_local_udp_dest DNS-bypass endpoints[].
+        let mesh = MeshConfig {
+            egress_udp_destinations: vec![
+                MeshEgressUdpDestination {
+                    host: "static.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "198.51.100.9".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "dns.external.com".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "dns".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Original-authority lookup is unchanged: STATIC hostname still
+        // selects a declared dial endpoint.
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("static.external.com", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("STATIC.EXTERNAL.COM", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+
+        // Post-override guard: STATIC hostname is NOT a dialable socket target.
+        assert!(
+            !mesh_egress_udp_destination_allowed("static.external.com", 53, Some(&mesh)),
+            "STATIC hostname must not pass the post-override dial-endpoint guard"
+        );
+        // Declared STATIC endpoint IP and DNS/NONE dial targets still pass.
+        assert!(mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "dns.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "DNS.EXTERNAL.COM",
+            53,
+            Some(&mesh)
+        ));
+        // Unrelated host stays denied; empty mesh denies.
+        assert!(!mesh_egress_udp_destination_allowed(
+            "other.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(!mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            None
+        ));
+
+        // Synthesis converts a STATIC authority CONNECT into the dial endpoint
+        // backend — the unmodified happy path that the post-override guard must
+        // still accept.
+        let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+            .expect("STATIC authority must synthesize a dial-endpoint relay");
+        assert_eq!(relay.backend_host, "198.51.100.9");
+        assert_eq!(relay.backend_port, 53);
+        assert!(mesh_egress_udp_destination_allowed(
+            &relay.backend_host,
+            relay.backend_port,
+            Some(&mesh)
+        ));
     }
 
     #[test]
