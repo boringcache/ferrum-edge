@@ -1586,13 +1586,13 @@ fn apply_metric_override_plan(
                         connection_security_policy: key.connection_security_policy.as_ref(),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
-                        response_code: extras.response_code.or(
-                            (key.response_code_override.is_none()
-                                && key.removed_labels
-                                    & (1u16 << MeshMetricLabel::ResponseCode.index())
-                                    == 0)
-                                .then_some(key.response_code),
-                        ),
+                        response_code: extras.response_code.or((key
+                            .response_code_override
+                            .is_none()
+                            && key.removed_labels
+                                & (1u16 << MeshMetricLabel::ResponseCode.index())
+                                == 0)
+                            .then_some(key.response_code)),
                         destination_port: extras.destination_port,
                     };
                     evaluate_metric_tag_cel(&expr, live_ctx)
