@@ -721,11 +721,14 @@ fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return !value.is_empty();
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return value.starts_with(prefix);
-    }
+    // Istio checks a leading wildcard before a trailing one. This ordering is
+    // observable for `*value*`: it is a suffix match for the literal `value*`,
+    // not a contains match and not a prefix match for the literal `*value`.
     if let Some(suffix) = pattern.strip_prefix('*') {
         return value.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
     }
     pattern == value
 }

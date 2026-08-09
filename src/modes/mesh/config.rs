@@ -802,11 +802,9 @@ pub fn classify_mesh_condition_key(key: &str) -> Option<MeshConditionKeyKind> {
         CONDITION_REQUEST_AUTH_PRESENTER => Some(MeshConditionKeyKind::RequestAuthPresenter),
         CONDITION_REQUEST_AUTH_AUDIENCES => Some(MeshConditionKeyKind::RequestAuthAudiences),
         _ => {
-            if bracketed_mesh_condition_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some() {
+            if bracketed_mesh_header_name(key).is_some() {
                 Some(MeshConditionKeyKind::RequestHeader)
-            } else if bracketed_mesh_condition_name(key, CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)
-                .is_some()
-            {
+            } else if bracketed_mesh_claim_path(key).is_some() {
                 Some(MeshConditionKeyKind::RequestAuthClaim)
             } else if experimental_envoy_filter_metadata_key(key).is_some() {
                 Some(MeshConditionKeyKind::ExperimentalEnvoyFilter)
@@ -825,7 +823,13 @@ fn experimental_envoy_filter_metadata_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix(CONDITION_EXPERIMENTAL_ENVOY_FILTER_PREFIX)?;
     let (filter, metadata) = rest.split_once('[')?;
     let metadata = metadata.strip_suffix(']')?;
-    if filter.is_empty() || metadata.is_empty() || metadata.contains('[') {
+    if filter.is_empty()
+        || metadata.is_empty()
+        || filter.contains('[')
+        || filter.contains(']')
+        || metadata.contains('[')
+        || metadata.contains(']')
+    {
         return None;
     }
     Some((filter, metadata))
@@ -1078,9 +1082,30 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
     }
 }
 
-fn bracketed_mesh_condition_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    let name = key.strip_prefix(prefix)?.strip_suffix(']')?;
-    (!name.is_empty()).then_some(name)
+fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
+    let name = key
+        .strip_prefix(CONDITION_REQUEST_HEADERS_PREFIX)?
+        .strip_suffix(']')?;
+    // Header conditions have exactly one bracket pair. Accepting nested or
+    // unmatched brackets would admit a key no HTTP request can materialize,
+    // which can silently disarm a DENY condition.
+    (!name.is_empty() && !name.contains('[') && !name.contains(']')).then_some(name)
+}
+
+fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
+    let path = key
+        .strip_prefix(CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)?
+        .strip_suffix(']')?;
+    // Nested JWT claims use Istio's exact `a][b` encoding. Each segment must be
+    // non-empty and bracket-free so malformed shapes cannot masquerade as a
+    // documented condition key that the validated-claim store can never source.
+    (!path.is_empty()
+        && path
+            .split("][")
+            .all(|segment| {
+                !segment.is_empty() && !segment.contains('[') && !segment.contains(']')
+            }))
+    .then_some(path)
 }
 
 /// Abstraction over per-workload label maps.

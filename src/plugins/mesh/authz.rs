@@ -1533,7 +1533,10 @@ impl MeshAuthz {
         if keys.destination_port {
             attributes.insert(
                 ATTR_DESTINATION_PORT.to_string(),
-                ctx.listen_port.to_string().into(),
+                ctx.destination_port
+                    .unwrap_or(ctx.listen_port)
+                    .to_string()
+                    .into(),
             );
         }
         if keys.connection_sni
@@ -2515,6 +2518,11 @@ impl Plugin for MeshAuthz {
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
         let destination_ip = mesh_authz_destination_ip(None, ctx.destination_ip);
+        // Transparent stream listeners bind a fixed interception port while the
+        // trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
+        // destination. Both operation `ports` and `when: destination.port` must
+        // judge that original port or a port-scoped DENY can fail open.
+        let destination_port = ctx.destination_port.unwrap_or(ctx.listen_port);
         let attributes = self.build_stream_condition_attributes(
             ctx,
             source_principal.as_ref(),
@@ -2524,7 +2532,7 @@ impl Plugin for MeshAuthz {
         );
         let request = MeshAuthzRequest {
             source_principal,
-            port: Some(ctx.listen_port),
+            port: Some(destination_port),
             attributes,
             source_ip,
             remote_ip,

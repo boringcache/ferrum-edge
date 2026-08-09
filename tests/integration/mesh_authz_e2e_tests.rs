@@ -1568,6 +1568,41 @@ async fn stream_port_scoped_deny_rejects_inbound_raw_tcp_on_app_port() {
 }
 
 #[tokio::test]
+async fn stream_authz_prefers_trusted_original_destination_port_over_capture_listener() {
+    // A transparent listener commonly accepts on :15006 while the trusted
+    // capture tuple says the client addressed :6379. Both the ordinary Istio
+    // operation-port matcher and `when: destination.port` must use :6379;
+    // authorizing on :15006 would silently disarm either DENY.
+    let operation_deny = deny_any_source_on_port("deny-original-operation-port", 6379);
+    let operation_plugin = build_mesh_authz_for_workload(&[], vec![operation_deny]);
+    let mut operation_ctx = inbound_stream_ctx(15006, CLIENT_SPIFFE);
+    operation_ctx.destination_port = Some(6379);
+    assert!(matches!(
+        operation_plugin
+            .on_stream_connect(&mut operation_ctx)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let condition_deny = condition_policy(
+        "deny-original-condition-port",
+        PolicyAction::Deny,
+        "destination.port",
+        vec!["6379"],
+        Vec::new(),
+    );
+    let condition_plugin = build_mesh_authz_for_workload(&[], vec![condition_deny]);
+    let mut condition_ctx = inbound_stream_ctx(15006, CLIENT_SPIFFE);
+    condition_ctx.destination_port = Some(6379);
+    assert!(matches!(
+        condition_plugin
+            .on_stream_connect(&mut condition_ctx)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
 async fn stream_port_scoped_deny_ignores_non_matching_port_and_admits_relay() {
     // The DENY is scoped to a DIFFERENT port than the captured app port, so it
     // must NOT fire — the legitimate stream-only-port relay case proceeds. This

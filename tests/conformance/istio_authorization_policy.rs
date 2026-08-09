@@ -908,6 +908,19 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "a whitespace-bearing condition key must fail closed: {whitespace}"
     );
 
+    for malformed_key in [
+        "request.headers[x-team][nested]",
+        "request.auth.claims[realm_access[roles]",
+        "request.auth.claims[realm_access][]",
+        "experimental.envoy.filters.network.mysql_proxy[db]table]",
+    ] {
+        let message = condition_translation_error(malformed_key, json!(["x"]));
+        assert!(
+            message.contains("rules[].when[0].key") && message.contains("unsupported"),
+            "a structurally malformed condition key must fail closed: {message}"
+        );
+    }
+
     let too_many_values: Vec<String> = (0..300).map(|index| format!("v{index}")).collect();
     let values_message = condition_translation_error("connection.sni", json!(too_many_values));
     assert!(
@@ -962,6 +975,32 @@ fn authz_condition_values_follow_istio_string_matcher_grammar() {
         MeshAuthzDecision::Deny {
             policy: "authz-under-test".to_string()
         }
+    );
+
+    // Istio checks the leading wildcard before the trailing wildcard. Thus a
+    // double-ended pattern is a suffix match for the literal trailing `*`, not
+    // an undocumented contains matcher.
+    let deny_double_ended = condition_policy(
+        "DENY",
+        "request.headers[x-env]",
+        json!(["*prod*"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_double_ended),
+            &header_request("x-env", "release-prod*")
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_double_ended),
+            &header_request("x-env", "release-prod-canary")
+        ),
+        MeshAuthzDecision::Allow
     );
 
     let deny_suffix = condition_policy(
