@@ -894,9 +894,9 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_succeeds_on_clienthello() {
 
 /// Regression for issue #2962 on the NO-DEADLINE path: an oversized (>4 KiB)
 /// ClientHello whose SNI is serialized after fat extensions must still yield
-/// SNI when `handshake_timeout` is `None`. Sizing the single peek at the 4 KiB
-/// lazy floor would truncate the parse and silently misroute the connection to
-/// the catch-all proxy whenever
+/// SNI when `handshake_timeout` is `None`. Sizing that path's peek buffer at the
+/// 4 KiB lazy floor would truncate the parse and silently misroute the
+/// connection to the catch-all proxy whenever
 /// `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`.
 #[tokio::test]
 async fn test_extract_sni_from_tcp_stream_no_timeout_recovers_oversized_clienthello() {
@@ -922,8 +922,11 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_recovers_oversized_clienthe
 
     let accept_task = tokio::spawn(async move {
         let (server_stream, _) = listener.accept().await.expect("accept");
-        // Let the whole hello land in the receive buffer: the no-deadline path
-        // peeks the wire exactly once and never loops for more bytes.
+        // Let the whole hello land in the receive buffer before the first peek.
+        // The no-deadline path does re-peek, but only on a small fixed budget
+        // (one initial peek plus at most `MAX_PEEK_READINESS_RETRIES` more, a
+        // few milliseconds apart), so this test does not lean on that budget:
+        // the hostname must be readable from the very first peek.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         extract_sni_from_tcp_stream(&server_stream, None).await
     });
@@ -973,14 +976,15 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_waits_on_readiness_when_pee
     );
 }
 
-/// Sizing seam for the no-deadline path: its single peek uses the full hard
-/// cap, not the lazy-growth floor that the deadline-driven loop starts from.
+/// Sizing seam for the no-deadline path: every one of its bounded peeks uses the
+/// full hard cap, not the lazy-growth floor that the deadline-driven loop starts
+/// from.
 #[test]
 fn no_deadline_peek_uses_hard_cap_not_lazy_floor() {
     assert_eq!(
         no_deadline_peek_capacity(),
         16 * 1024,
-        "the no-deadline single peek must be able to inspect a standards-valid \
+        "each no-deadline peek must be able to inspect a standards-valid \
          oversized ClientHello up to the hard cap"
     );
     assert!(
@@ -1611,6 +1615,119 @@ fn classify_rejects_duplicate_host_names_inside_one_server_name_extension() {
         classify_client_hello(&hello),
         ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
         "RFC 6066 permits at most one host_name in a ServerNameList"
+    );
+}
+
+/// One complete extension of an arbitrary type carrying an empty body.
+fn empty_extension_block(ext_type: u16) -> Vec<u8> {
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&ext_type.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    ext
+}
+
+/// One `server_name` extension whose `ServerNameList` carries the given
+/// `(name_type, name_length)` entries, each filled with placeholder bytes.
+fn server_name_extension_with_name_types(entries: &[(u8, usize)]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for &(name_type, name_len) in entries {
+        list.push(name_type);
+        let encoded_len = u16::try_from(name_len).expect("test name length fits in u16");
+        list.extend_from_slice(&encoded_len.to_be_bytes());
+        list.extend(std::iter::repeat_n(b'x', name_len));
+    }
+    let server_name_list_len =
+        u16::try_from(list.len()).expect("test ServerNameList length fits in u16");
+    let extension_len = server_name_list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&extension_len.to_be_bytes());
+    ext.extend_from_slice(&server_name_list_len.to_be_bytes());
+    ext.extend_from_slice(&list);
+    ext
+}
+
+/// RFC 8446 §4.2 forbids repeating ANY extension type, not only the two the
+/// strict whole-hello scan interprets. The lenient extractor returns from the
+/// FIRST `server_name` it sees, so without a general duplicate check a hello
+/// with a valid early SNI followed by a duplicated generic extension would still
+/// be admitted and select a tenant route off a structure the TLS grammar
+/// forbids.
+#[test]
+fn classify_rejects_a_duplicate_generic_extension_after_a_valid_early_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    // `status_request` (0x0005), twice. Neither copy is `server_name` nor
+    // `supported_versions`, and each is individually well formed.
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early.example.com".to_string()),
+        "the lenient extractor still reads the early SNI — which is exactly why \
+         classification has to validate the entire declared ClientHello"
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "a duplicate extension of ANY type makes the hello malformed, even when \
+         an earlier valid server_name is readable"
+    );
+}
+
+/// Control for the general duplicate check: distinct extension types after the
+/// SNI are ordinary and must still classify as a routable hostname.
+#[test]
+fn classify_accepts_distinct_generic_extensions_after_a_valid_early_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    extensions.extend_from_slice(&empty_extension_block(0x0017));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Sni("early.example.com".to_string()),
+        "distinct extension types are not duplicates and must not be refused"
+    );
+}
+
+/// RFC 6066 §3: "The ServerNameList MUST NOT contain more than one name of the
+/// same name_type." That is not a `host_name`-only rule — a list repeating an
+/// unknown future type is malformed too.
+#[test]
+fn classify_rejects_duplicate_unknown_server_name_types() {
+    let extensions = server_name_extension_with_name_types(&[(0x7f, 4), (0x7f, 4)]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "two ServerName entries sharing a name_type are malformed for every \
+         name_type, not just host_name"
+    );
+}
+
+/// The conservative classifier contract for unknown future name types, pinned
+/// exactly: DISTINCT unknown types stay structurally valid, so the hello is NOT
+/// `Malformed`. It is still refused, because a `server_name` extension is
+/// present yet yields no representable `host_name` — `UnrepresentableName` is
+/// the fail-closed answer an SNI-routing listener needs, and it must not decay
+/// into `NoSni` (which would silently take the catch-all route).
+#[test]
+fn classify_treats_distinct_unknown_server_name_types_as_unrepresentable_not_malformed() {
+    let extensions = server_name_extension_with_name_types(&[(0x7f, 4), (0x80, 4)]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(extract_sni_from_client_hello(&hello), None);
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName),
+        "distinct unknown name types are structurally accepted; the present but \
+         unreadable server_name is what fails the hello closed"
     );
 }
 

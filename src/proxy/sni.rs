@@ -228,16 +228,18 @@ pub fn initial_peek_capacity() -> usize {
     INITIAL_CLIENT_HELLO_PEEK_LEN
 }
 
-/// Capacity of the buffer used by the no-deadline (single-peek) path.
+/// Capacity of the buffer used by the no-deadline path.
 ///
-/// The no-deadline path cannot loop on the wire, so its one peek must be able
-/// to see a standards-valid oversized ClientHello in full — it sizes straight
-/// to the hard cap rather than the lazy floor. Lazy growth exists to bound
-/// memory held ACROSS the deadline-driven peek loop while a slow peer dribbles
-/// bytes; it does not apply to a buffer that is allocated only after the socket
-/// is already readable and dropped before the next await. Capping this at the
-/// 4 KiB floor would silently truncate SNI extraction whenever the frontend
-/// handshake timeout is disabled (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`),
+/// That path has no handshake clock to loop against, so it re-peeks only on a
+/// small fixed budget ([`MAX_PEEK_READINESS_RETRIES`]) and every one of those
+/// peeks must be able to see a standards-valid oversized ClientHello in full —
+/// it sizes straight to the hard cap rather than the lazy floor. Lazy growth
+/// exists to bound memory held ACROSS the deadline-driven peek loop while a slow
+/// peer dribbles bytes; it does not apply to a buffer that is allocated only
+/// after the socket is already readable and dropped before the next await.
+/// Capping this at the 4 KiB floor would silently truncate SNI extraction
+/// whenever the frontend handshake timeout is disabled
+/// (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`),
 /// which is the oversized-ClientHello misrouting of issue #2962.
 ///
 /// Pure sizing seam so external tests can lock this without observing live
@@ -277,20 +279,21 @@ async fn poll_peek_once(
     std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_peek(cx, buf))).await
 }
 
-/// Single bounded ClientHello peek for callers that pass no handshake deadline.
+/// Bounded ClientHello peek for callers that pass no handshake deadline.
 ///
-/// Takes one peek of the wire and never loops on it, so a stalled peer cannot
-/// park the task waiting for a record that never completes. Two invariants have
-/// to hold at once, so readiness and the buffer are deliberately separated:
+/// One initial peek plus at most [`MAX_PEEK_READINESS_RETRIES`] further peeks —
+/// a fixed budget rather than a clock — so a stalled peer cannot park the task
+/// waiting for a record that never completes. Two invariants have to hold at
+/// once, so readiness and the buffer are deliberately separated:
 ///
 /// 1. A silent peer must not pin a hard-cap allocation. `readable()` carries no
 ///    buffer, so an idle connection suspends here holding nothing.
-/// 2. Once bytes are actually available, the single peek must still be able to
+/// 2. Once bytes are actually available, each peek must still be able to
 ///    inspect a standards-valid ClientHello up to [`MAX_CLIENT_HELLO_LEN`]
 ///    (issue #2962) — so the buffer is allocated only *after* readiness, at the
-///    full cap.
+///    full cap, and dropped again before the next suspension.
 ///
-/// The peek itself is one non-blocking `poll_peek` wrapped in an always-`Ready`
+/// Each peek is one non-blocking `poll_peek` wrapped in an always-`Ready`
 /// future: it cannot suspend, so the hard-cap buffer is never live across an
 /// await. A spurious readiness signal yields `Pending`; the buffer is dropped
 /// and a fresh readiness event awaited, bounded by
@@ -361,15 +364,19 @@ async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> ClientHell
 /// stream can be forwarded to the backend with the ClientHello intact.
 ///
 /// `handshake_timeout` bounds how long the peek can wait for the ClientHello
-/// before giving up. A `None` value preserves the single-peek behavior used by
-/// internal callers that have already enforced a deadline elsewhere; passthrough
-/// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
-/// so a peer that opens a TCP connection and sends nothing cannot park a
-/// connection-handler task indefinitely. The no-deadline path awaits socket
-/// readiness with no buffer allocated, then takes one non-blocking peek into a
-/// full [`no_deadline_peek_capacity`] buffer that is dropped before any further
-/// await — so an idle peer pins nothing, while a readable peer's oversized
-/// ClientHello is still inspected up to the hard cap.
+/// before giving up. A `None` value is for internal callers that have already
+/// enforced a deadline elsewhere; passthrough listeners pass `Some(d)` (mapped
+/// from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`) so a peer that opens a
+/// TCP connection and sends nothing cannot park a connection-handler task
+/// indefinitely. With no deadline there is no clock to loop against, so the
+/// path is bounded by a fixed retry budget instead: it awaits socket readiness
+/// with no buffer allocated, then takes a non-blocking peek into a full
+/// [`no_deadline_peek_capacity`] buffer that is dropped before any further
+/// await, repeating at most `MAX_PEEK_READINESS_RETRIES` more times (one
+/// `SNI_PEEK_RETRY_INTERVAL` tick apart) while the hello is still incomplete
+/// or readiness proves spurious. So an idle peer pins nothing, a fragmented
+/// hello is not misreported as truncated on its first segment, and a readable
+/// peer's oversized ClientHello is still inspected up to the hard cap.
 ///
 /// When a deadline is set, the peek LOOPS until the full ClientHello handshake
 /// (`5 + record_len` bytes across records, capped at [`MAX_CLIENT_HELLO_LEN`])
@@ -864,6 +871,49 @@ struct ScannedExtensions {
     offers_server_name: bool,
 }
 
+/// Fixed-capacity "have I already seen this code point" bitset for the bounded
+/// TLS enumerations this parser has to de-duplicate (extension types,
+/// `ServerNameList` name types).
+///
+/// Both vectors are attacker-controlled up to [`MAX_CLIENT_HELLO_LEN`], so a
+/// hostile peer can pack thousands of entries into one hello. Rescanning the
+/// already-seen values for each entry would therefore be quadratic in a count
+/// the client chooses. A bitset covering the *whole* code-point space makes
+/// each test O(1) against a fixed, input-independent amount of stack — 8 KiB
+/// for the 2^16 extension types, 32 bytes for the 2^8 name types — with no
+/// allocation and no growth with input size.
+struct SeenCodePoints<const WORDS: usize> {
+    words: [u64; WORDS],
+}
+
+impl<const WORDS: usize> SeenCodePoints<WORDS> {
+    fn empty() -> Self {
+        Self {
+            words: [0u64; WORDS],
+        }
+    }
+
+    /// Record `code_point` and report whether it had already been recorded.
+    ///
+    /// A code point outside the sized space reports `true` (fail closed, so the
+    /// caller refuses the hello) rather than indexing out of bounds; callers
+    /// only pass `u16`/`u8` values that fit their chosen `WORDS`.
+    fn insert_is_duplicate(&mut self, code_point: usize) -> bool {
+        let Some(word) = self.words.get_mut(code_point / 64) else {
+            return true;
+        };
+        let bit = 1u64 << (code_point % 64);
+        let already_seen = *word & bit != 0;
+        *word |= bit;
+        already_seen
+    }
+}
+
+/// Number of `u64` words needed to cover every 16-bit TLS extension type.
+const EXTENSION_TYPE_BITSET_WORDS: usize = (u16::MAX as usize + 1) / 64;
+/// Number of `u64` words needed to cover every 8-bit `ServerNameList` name type.
+const NAME_TYPE_BITSET_WORDS: usize = (u8::MAX as usize + 1) / 64;
+
 /// Walk the extension list for `supported_versions` (0x002b) and `server_name`
 /// (0x0000), reporting whether TLS 1.3 was offered and whether the hello
 /// carried an SNI extension at all.
@@ -872,8 +922,18 @@ struct ScannedExtensions {
 /// "cannot prove this is TLS 1.2", never as "this is TLS 1.2".
 fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
     let mut scanned = ScannedExtensions::default();
-    let mut saw_supported_versions = false;
-    let mut saw_server_name = false;
+    // RFC 8446 §4.2 (and RFC 5246 §7.4.1.4 before it): "There MUST NOT be more
+    // than one extension of the same type in a given extension block." That
+    // holds for EVERY extension type, not only the two this scan interprets —
+    // so the whole-hello gate rejects a repeated arbitrary type as malformed.
+    // Two reasons this has to be general:
+    //   * the lenient hostname extractor returns from the FIRST `server_name`
+    //     it sees, so a hello with a valid early SNI followed by any duplicate
+    //     extension would otherwise still be admitted and select a tenant
+    //     route off a structure the TLS grammar forbids, and
+    //   * for `supported_versions` specifically, an earlier TLS 1.2-only copy
+    //     must never hide a later TLS 1.3 offer from this pre-handshake gate.
+    let mut seen_extension_types = SeenCodePoints::<EXTENSION_TYPE_BITSET_WORDS>::empty();
 
     while !ext.is_empty() {
         if ext.len() < 4 {
@@ -885,15 +945,10 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
         if ext.len() < extension_end {
             return None;
         }
+        if seen_extension_types.insert_is_duplicate(ext_type as usize) {
+            return None;
+        }
         if ext_type == 0x0000 {
-            // Duplicate extensions are forbidden by the TLS grammar. The
-            // lenient hostname extractor returns from the first SNI extension,
-            // so this strict pass must prevent a later duplicate from turning
-            // a malformed hello into a routable tenant selection.
-            if saw_server_name {
-                return None;
-            }
-            saw_server_name = true;
             if !server_name_extension_is_well_formed(&ext[4..extension_end]) {
                 return None;
             }
@@ -903,14 +958,6 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
             scanned.offers_server_name = true;
         }
         if ext_type == 0x002b {
-            if saw_supported_versions {
-                // Duplicate extensions are forbidden by the TLS grammar. In
-                // particular, never let an earlier TLS 1.2-only copy hide a
-                // later TLS 1.3 offer from this pre-handshake gate.
-                return None;
-            }
-            saw_supported_versions = true;
-
             let data = &ext[4..extension_end];
             // ClientHello form: list_len (1) + versions (2 each).
             let list_len = *data.first()? as usize;
@@ -932,10 +979,12 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
 
 /// Validate the RFC 6066 `ServerNameList` shape without interpreting DNS bytes.
 ///
-/// Unknown future name types remain structurally valid, but `host_name` may
-/// appear at most once and must be non-empty. Representability is deliberately
-/// left to [`parse_sni_hostname`] so the typed classifier can distinguish an
-/// unreadable name from a malformed extension.
+/// Unknown future name types remain structurally valid (no length constraint is
+/// imposed on them), but RFC 6066 §3 forbids more than one name of the *same*
+/// `name_type` — for every one of the 256 types, not just `host_name` — and a
+/// `host_name` entry must additionally be non-empty. Representability is
+/// deliberately left to [`parse_sni_hostname`] so the typed classifier can
+/// distinguish an unreadable name from a malformed extension.
 fn server_name_extension_is_well_formed(data: &[u8]) -> bool {
     if data.len() < 2 {
         return false;
@@ -947,7 +996,12 @@ fn server_name_extension_is_well_formed(data: &[u8]) -> bool {
     }
 
     let mut pos = 0usize;
-    let mut saw_host_name = false;
+    // RFC 6066 §3: "The ServerNameList MUST NOT contain more than one name of
+    // the same name_type." Tracked across the whole 8-bit name-type space with
+    // the same bounded, non-quadratic detector the extension scan uses, so a
+    // list that repeats an unknown future type is refused just like a repeated
+    // `host_name`.
+    let mut seen_name_types = SeenCodePoints::<NAME_TYPE_BITSET_WORDS>::empty();
     while pos < names.len() {
         let Some(header_end) = pos.checked_add(3) else {
             return false;
@@ -964,11 +1018,13 @@ fn server_name_extension_is_well_formed(data: &[u8]) -> bool {
         if next > names.len() {
             return false;
         }
-        if name_type == 0x00 {
-            if name_len == 0 || saw_host_name {
-                return false;
-            }
-            saw_host_name = true;
+        if seen_name_types.insert_is_duplicate(name_type as usize) {
+            return false;
+        }
+        // `host_name` additionally may not be empty; unknown future types carry
+        // no length contract here and stay structurally valid.
+        if name_type == 0x00 && name_len == 0 {
+            return false;
         }
         pos = next;
     }
