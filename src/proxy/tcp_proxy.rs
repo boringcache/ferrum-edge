@@ -3058,13 +3058,31 @@ async fn handle_tcp_connection_inner(
         // Outbound PROXY v2 must precede every relayed byte — including the
         // client's encrypted ClientHello on the splice/kTLS-free passthrough
         // fast path — so write it before handing the sockets to the kernel.
-        if let Some(header) = resolve_outbound_proxy_v2_header(
-            params.backend_proxy_protocol,
-            stream_ctx,
-            client_local_addr,
-        )? {
-            write_outbound_proxy_v2_header(&mut backend_stream, &header).await?;
+        async {
+            if let Some(header) = resolve_outbound_proxy_v2_header(
+                params.backend_proxy_protocol,
+                stream_ctx,
+                client_local_addr,
+            )? {
+                write_outbound_proxy_v2_header(&mut backend_stream, &header).await?;
+            }
+            Ok::<(), anyhow::Error>(())
         }
+        .await
+        .inspect_err(|_| {
+            // Header construction and I/O happen after breaker admission. Record
+            // either failure so an admitted HALF_OPEN probe always releases its
+            // in-flight slot instead of wedging the breaker at probe capacity.
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        })?;
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
         let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
