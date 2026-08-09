@@ -1511,9 +1511,10 @@ pub struct EnvConfig {
     /// operator-authored config, and an unconstrained path would let it point
     /// the (often privileged) Ferrum process at any local socket, e.g.
     /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
-    /// bare `/`; the socket must be a STRICT descendant. Enforced at
-    /// translation and re-enforced at dial (where symlink resolution must land
-    /// inside a root too) — see `crate::util::unix_socket`.
+    /// bare `/`; the socket must be a STRICT descendant. Pure path syntax is
+    /// checked at translation; the data-plane-only containment policy is
+    /// enforced at materialization and again at dial (where symlink resolution
+    /// must land inside a root too) — see `crate::util::unix_socket`.
     pub mesh_unix_socket_allowed_roots: Vec<String>,
     /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
     /// (the default) admits ONLY the Ferrum process's own effective uid, so a

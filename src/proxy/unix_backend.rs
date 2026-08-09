@@ -84,8 +84,9 @@ pub const DEFAULT_UNIX_CONNECT_TIMEOUT_MS: u64 = 5_000;
 /// Why a `mesh.unix_socket`-tagged target could not be dialed.
 #[derive(Debug)]
 pub enum UnixBackendError {
-    /// The tagged path failed the same admission rules translation applies.
-    /// Fail-closed: a hostile or corrupted carrier never reaches `connect`.
+    /// The tagged path failed data-plane admission (syntax or configured
+    /// containment). Fail-closed: a hostile or corrupted carrier never reaches
+    /// `connect`; CP-side translation intentionally checks syntax only.
     InadmissiblePath(UnixSocketPathRejection),
     /// `UnixStream::connect` failed — socket missing, not a socket, permission
     /// denied, listen backlog full, or the peer is gone.
@@ -346,9 +347,10 @@ const UNIX_H2C_MAX_CONCURRENT_RESET_STREAMS: usize = 1024;
 ///   the process that called `listen(2)`, which is exactly the fact needed
 ///   here: it names the peer that will read the request, and the peer cannot
 ///   change it after the fact by setuid-ing.
-/// * **Apple / FreeBSD / DragonFly** — `getpeereid(3)`; **NetBSD** —
-///   `LOCAL_PEERCRED`; **illumos / Solaris** — `getpeerucred(3)`. All report the
-///   same connect-time effective uid of the listening peer.
+/// * **Apple / FreeBSD / DragonFly** — `getpeereid(3)`; **OpenBSD** —
+///   `SO_PEERCRED`/`sockpeercred`; **NetBSD** — `LOCAL_PEERCRED`;
+///   **illumos / Solaris** — `getpeerucred(3)`. All report the same connect-time
+///   effective uid of the listening peer.
 ///
 /// Any other Unix target has no equivalently strong guarantee, so it refuses
 /// Unix backends outright (`PlatformUnsupported`) rather than weakening the
@@ -454,11 +456,11 @@ pub async fn connect_admitted(
 /// Admit `path` at the TOCTOU boundary and dial the resulting checked identity,
 /// bounded by `connect_timeout_ms`.
 ///
-/// The admission re-run here is the SECOND half of the containment contract:
-/// the value reached this process over a CP/DP, file, or xDS boundary, and the
-/// filesystem may have changed since translation admitted it. It checks
-/// containment, symlink-resolved containment, the full parent-to-root directory
-/// chain, socket file type, owner uid, and mode — see
+/// This is the dial-time half of the containment contract:
+/// the value reached this process over a CP/DP, file, or xDS boundary, and only
+/// this data plane has the local containment policy and filesystem facts. It
+/// checks containment, symlink-resolved containment, the full parent-to-root
+/// directory chain, socket file type, owner uid, and mode — see
 /// [`crate::util::unix_socket::admit_socket_for_connect`] — and hands
 /// [`connect_admitted`] the identity to bind the connection to.
 #[cfg(unix)]

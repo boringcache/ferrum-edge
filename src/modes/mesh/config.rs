@@ -1956,16 +1956,20 @@ pub struct ResolvedIngressListener {
 /// The typed, routable backend one [`ResolvedIngressListener`] forwards to.
 ///
 /// Constructed only by [`MeshSidecarIngress::resolve`] and
-/// [`ResolvedIngressListener::backend`], both of which apply the full
-/// fail-closed admission rules first, so holding one of these is evidence the
-/// endpoint passed admission.
+/// [`ResolvedIngressListener::backend`]. The former applies the shape and
+/// syntax rules available to a control plane; the latter additionally applies
+/// the data plane's configured containment roots. Callers at a materialization
+/// or dial boundary must use `backend(allowed_roots)`, not treat a carried enum
+/// or listener as evidence of local containment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshIngressBackend {
     /// A co-located loopback TCP backend (`127.0.0.1`/`::1` + nonzero port).
     Loopback { host: String, port: u16 },
-    /// A co-located Unix-domain STREAM socket at an admitted, CONTAINED
-    /// absolute path. `h2c` selects the client handshake performed on the
-    /// socket: prior-knowledge HTTP/2 when true, HTTP/1.1 when false.
+    /// A co-located Unix-domain STREAM socket at a syntactically admitted
+    /// absolute path. Values returned by `backend(allowed_roots)` are also
+    /// contained by the supplied data-plane roots; CP-side `resolve()` cannot
+    /// make that filesystem-local decision. `h2c` selects the client handshake:
+    /// prior-knowledge HTTP/2 when true, HTTP/1.1 when false.
     Unix { path: String, h2c: bool },
 }
 
@@ -2125,8 +2129,9 @@ pub(crate) fn unix_backend_wire_protocol(protocol: AppProtocol) -> Option<bool> 
 impl MeshSidecarIngress {
     /// Resolve this ingress entry into a routable [`ResolvedIngressListener`],
     /// or the reason it cannot be modeled. Fail-closed: anything that does not
-    /// map cleanly onto a loopback host:port HTTP route or an admitted
-    /// Unix-stream socket path is rejected, never guessed.
+    /// map cleanly onto a loopback host:port HTTP route or a syntactically
+    /// admitted Unix-stream socket path is rejected, never guessed. Unix
+    /// containment is deliberately enforced later by the data plane.
     pub fn resolve(&self) -> Result<ResolvedIngressListener, IngressListenerUnsupported> {
         if !is_http_family_app_protocol(self.protocol) {
             return Err(IngressListenerUnsupported::NonHttpProtocol);

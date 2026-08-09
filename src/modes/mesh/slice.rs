@@ -386,10 +386,12 @@ pub struct MeshSlice {
     /// per-service-port inbound materialization for the workload: the inbound
     /// materializer emits one loopback route per entry (listener port → the
     /// entry's `defaultEndpoint`) instead of the service-port defaults. Only
-    /// resolvable entries land here; unsupported shapes (Unix-socket /
-    /// non-loopback `defaultEndpoint`, non-HTTP-family protocol) are dropped at
-    /// resolution and reported as deferred. Empty when no Sidecar applies, the
-    /// Sidecar declares no ingress, or no entry resolved.
+    /// resolvable entries land here; unsupported shapes (non-loopback
+    /// `defaultEndpoint`, an inadmissible Unix-socket path, or a non-HTTP-family
+    /// protocol) are dropped at resolution and reported as deferred. Admissible
+    /// Unix-socket listeners remain subject to the data plane's containment
+    /// allowlist at materialization and dial time. Empty when no Sidecar applies,
+    /// the Sidecar declares no ingress, or no entry resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
     /// Fail-closed marker: the local workload's applicable `Sidecar` declared a
@@ -1257,11 +1259,14 @@ impl MeshSlice {
         };
 
         // Resolve the local workload's custom inbound listeners from the selected
-        // Sidecar's `ingress[]`, keeping only the routable entries (loopback
-        // host:port HTTP listeners); unsupported shapes are dropped here and
-        // reported as deferred by the K8s status writer. Carried on the slice so
-        // the DP materializer never re-resolves raw `MeshSidecar` records (they
-        // do not ride the slice), mirroring the `local_inbound_services` pattern.
+        // Sidecar's `ingress[]`, keeping only the syntactically routable entries
+        // (loopback host:port or admissible Unix-socket HTTP listeners).
+        // Unsupported shapes are dropped here and reported as deferred by the
+        // K8s status writer. Unix containment is intentionally deferred to the
+        // data-plane materializer because a control plane does not share the
+        // workload filesystem. Carried on the slice so the DP materializer never
+        // re-resolves raw `MeshSidecar` records (they do not ride the slice),
+        // mirroring the `local_inbound_services` pattern.
         let (
             mut local_ingress_listeners,
             sidecar_ingress_declared,
@@ -3516,9 +3521,10 @@ fn resolve_applicable_sidecar_outbound_policy(
 /// tier precedence under the identical enforcement gate. `None` (no applicable
 /// Sidecar, or the gate is off) resolves to "no custom listeners declared".
 ///
-/// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
-/// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
-/// the entries that resolve to a loopback host:port HTTP route are returned.
+/// Unsupported entries (an inadmissible Unix-socket path, non-loopback
+/// `defaultEndpoint`, non-HTTP-family protocol, or zero port) are dropped
+/// fail-closed and warned; entries that resolve to either a loopback host:port
+/// HTTP route or an admissible Unix-stream backend are returned.
 ///
 /// `ingress_declared` is `true` when the applicable Sidecar DECLARED an
 /// `ingress` block — a non-empty `ingress[]` OR an explicit empty `ingress: []`

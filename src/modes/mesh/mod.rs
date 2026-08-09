@@ -440,7 +440,7 @@ pub struct MeshRuntimeConfig {
     /// Containment roots admitted for a `Sidecar` ingress `defaultEndpoint:
     /// unix://…` socket (issue #3261). Sourced from
     /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`; **empty means the feature is
-    /// OFF** and every `unix://` endpoint is deferred fail-closed. There is no
+    /// OFF** and every `unix://` endpoint is refused fail-closed. There is no
     /// built-in allowance — see `crate::util::unix_socket`.
     pub unix_socket_allowed_roots: Vec<String>,
     /// Owner uids admitted for such a socket. Empty admits only the Ferrum
@@ -4520,18 +4520,19 @@ fn materialize_sidecar_inbound_proxies(
 }
 
 /// Materialize the workload's Sidecar `ingress[]` custom inbound listeners as
-/// loopback routes (F6 §6.2). Called only when the slice resolved at least one
-/// listener; per Istio these REPLACE the default per-service-port inbound
-/// routes, so the caller returns without running the service-port path.
+/// co-located loopback-TCP or Unix-stream routes (F6 §6.2). Per Istio these
+/// REPLACE the default per-service-port inbound routes, so the caller returns
+/// without running the service-port path even when every declared listener is
+/// refused.
 ///
 /// Each listener becomes one route: hosts = the union of its owning local
 /// service's FQDN variants (the owner identity the slice builder stamped from
 /// the resolved local-inbound view — Istio only configures ingress "if and only
 /// if the workload is associated with a service"); backend = the entry's
-/// resolved loopback `defaultEndpoint`; listen path `/`. The listener port
-/// disambiguates per-port siblings exactly like the default inbound path, but
-/// the captured original destination matches the LISTENER port (the dialed
-/// port) rather than the backend port — see
+/// resolved loopback or Unix-stream `defaultEndpoint`; listen path `/`. The
+/// listener port disambiguates per-port siblings exactly like the default
+/// inbound path, but the captured original destination matches the LISTENER
+/// port rather than the TCP backend port (a Unix backend has none) — see
 /// `HostRouteTable::select_mesh_inbound_port_route` and the router's ingress
 /// grouping. Operator-proxy yield mirrors the default inbound path.
 fn materialize_sidecar_ingress_listener_proxies(
@@ -4548,8 +4549,9 @@ fn materialize_sidecar_ingress_listener_proxies(
     // untrusted wire JSON. Drop a listener that fails EITHER guard, fail-closed:
     //
     //   1. Backend endpoint: must pass the same loopback/instance-IP +
-    //      nonzero-port allowlist `MeshSidecarIngress::resolve` enforces, so the
-    //      carrier path can never dial somewhere resolution would have refused.
+    //      nonzero-port rules `MeshSidecarIngress::resolve` enforces, or the
+    //      Unix shape/syntax rules PLUS this DP's containment roots, so the
+    //      carrier path can never dial somewhere either boundary would refuse.
     //   2. Owner anchor: must carry a non-empty `owner_namespace`/`owner_service`
     //      (the slice builder stamps these from the resolved local service; it
     //      clears ALL listeners when no local service anchors them). An owner-less

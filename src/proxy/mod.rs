@@ -35853,7 +35853,7 @@ async fn proxy_to_backend(
             unix_target,
             &state.env_config.mesh_unix_socket_allowed_roots,
         ) {
-            Some(Ok(path)) => path.to_string(),
+            Some(Ok(path)) => path,
             // The tag is present but its path failed re-admission at dial time.
             // Refuse: the carrier may have crossed a CP/DP or file boundary
             // since translation admitted it, and the containment allowlist is a
@@ -35995,14 +35995,14 @@ async fn proxy_to_backend(
                 ctx_bytes_sent_observed,
                 route_request_body_limit,
                 route_response_body_limit,
-                Some(socket_path.as_str()),
+                Some(socket_path),
             )
             .await
         } else {
             proxy_to_backend_unix(
                 state,
                 proxy,
-                &socket_path,
+                socket_path,
                 backend_url,
                 method,
                 headers,
@@ -40193,6 +40193,7 @@ fn unix_backend_dispatch_unavailable_response(
     proxy: &Proxy,
     stage: &'static str,
 ) -> retry::BackendResponse {
+    let error_class = retry::ErrorClass::DispatchPolicyRejected;
     warn!(
         proxy_id = %proxy.id,
         stage,
@@ -40205,9 +40206,9 @@ fn unix_backend_dispatch_unavailable_response(
             br#"{"error":"Unix backend dispatch unavailable"}"#,
         )),
         headers: HashMap::new(),
-        connection_error: true,
+        connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: None,
-        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        error_class: Some(error_class),
     }
 }
 
@@ -40360,8 +40361,8 @@ async fn proxy_to_backend_unix(
     };
     let backend_authority = uri
         .authority()
-        .map(|a| a.as_str().to_string())
-        .unwrap_or_else(|| "localhost".to_string());
+        .map(|a| a.as_str())
+        .unwrap_or("localhost");
     let path_and_query = uri
         .path_and_query()
         .cloned()
@@ -40452,7 +40453,7 @@ async fn proxy_to_backend_unix(
             "unix",
             "backend_host",
             "host",
-            &backend_authority,
+            backend_authority,
         );
     }
 

@@ -1039,12 +1039,13 @@ fn sidecar(
     }
 
     // `spec.ingress[]` — custom inbound listeners. Each entry MUST declare a
-    // `port.number` and a `defaultEndpoint`; everything else is optional. We
+    // `port.number`; `defaultEndpoint` and everything else are optional. We
     // translate the entry shape here (parse + validate the required fields) and
-    // defer the routable/unsupported decision (Unix sockets, non-HTTP-family,
-    // arbitrary IPs) to `MeshSidecarIngress::resolve` at slice build, so the
-    // status writer can keep unsupported entries in `deferred_fields` while
-    // accepting the resource.
+    // defer the routable/unsupported decision (admissible vs. inadmissible Unix
+    // paths, non-HTTP-family protocols, arbitrary IPs, or an omitted endpoint)
+    // to `MeshSidecarIngress::resolve` at slice build, so the status writer can
+    // keep unsupported entries in `deferred_fields` while accepting the
+    // resource.
     let mut ingress = Vec::new();
     // Istio distinguishes an OMITTED `ingress` block (keep automatic
     // per-service-port inbound defaults) from a DECLARED one — including an
@@ -20728,7 +20729,9 @@ extensionProviders:
         assert_eq!(sc.ingress[0].name.as_deref(), Some("https"));
         assert_eq!(sc.ingress[0].bind.as_deref(), Some("127.0.0.1"));
         assert_eq!(sc.ingress[0].default_endpoint, "127.0.0.1:8080");
-        // The unix-socket entry is parsed (deferred later), not rejected.
+        // The unix-socket entry is parsed for later Sidecar resolution; an
+        // admissible path is materialized when the data plane enables an
+        // allowed containment root, while an inadmissible path is deferred.
         assert_eq!(sc.ingress[1].port, 9000);
         assert_eq!(sc.ingress[1].default_endpoint, "unix:///var/run/grpc.sock");
     }

@@ -8,17 +8,19 @@
 //! `unix:///var/run/docker.sock` would hand every request-path client the
 //! container runtime's API.
 //!
-//! Admission is a TWO-STAGE, fail-closed gate:
+//! Admission is a layered, fail-closed gate:
 //!
 //! 1. [`validate_unix_socket_path`] — pure syntax. Absolute, normalized,
 //!    printable, and short enough for `sockaddr_un` on every supported
-//!    platform.
+//!    platform. This is the portion a control plane can apply while translating
+//!    an Istio resource.
 //! 2. [`admit_configured_path`] — syntax PLUS **containment** inside an
 //!    operator-configured allowlist of roots
 //!    (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`). The allowlist has **no
 //!    default**: with none configured, every `unix://` endpoint is refused, so
 //!    the feature is opt-in per deployment and there is no blanket `/run` or
-//!    `/var/run` permission to inherit.
+//!    `/var/run` permission to inherit. This policy is data-plane-local: a
+//!    control plane does not share the workload's configured roots.
 //!
 //! At DIAL time [`admit_socket_for_connect`] re-runs both stages and adds the
 //! filesystem facts that only exist at connect, returning an explicit
@@ -372,11 +374,12 @@ fn path_is_contained(path: &str, allowed_roots: &[String]) -> Result<(), UnixSoc
 /// Admit an operator-configured `unix://` backend path: full syntax rules PLUS
 /// containment inside `allowed_roots`.
 ///
-/// This is the TRANSLATION-time gate (Istio `Sidecar` resolution, the status
-/// writer's `deferred_fields` classification, and carrier re-validation of an
-/// already-resolved listener). It performs NO filesystem I/O, so it is safe to
-/// run on a control plane that does not share the workload's filesystem; the
-/// filesystem facts are checked at dial time by [`admit_socket_for_connect`].
+/// This is the DATA-PLANE config gate used for materialization, dispatch, and
+/// carrier re-validation. It performs no filesystem I/O; the filesystem facts
+/// are checked at dial time by [`admit_socket_for_connect`]. CP-side Sidecar
+/// resolution and status classification deliberately use
+/// [`validate_unix_socket_path`] alone because a control plane neither shares
+/// these configured roots nor knows the workload filesystem.
 pub fn admit_configured_path(
     path: &str,
     allowed_roots: &[String],
@@ -586,7 +589,7 @@ fn admit_directory_chain(
 /// that only exist at connect, and return the CHECKED IDENTITY to dial.
 ///
 /// Runs the full [`admit_configured_path`] gate again (the value may have
-/// crossed a CP/DP or file boundary since translation admitted it), then:
+/// crossed a CP/DP or file boundary since syntax-only translation), then:
 ///
 /// * `canonicalize`s the path — which fully resolves symlinks, `..`, and mount
 ///   points — and requires the RESOLVED path to be syntactically dialable in

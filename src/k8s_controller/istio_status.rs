@@ -29,9 +29,10 @@
 //! - `RequestAuthentication` — status reports the resolved scope and the
 //!   number of JWT rules (permissive-by-default semantics).
 //! - `Sidecar` — status reports the egress scope and the modeled `ingress[]`
-//!   listener count. Only ingress entries Ferrum cannot model (Unix-socket /
-//!   non-loopback `defaultEndpoint`, non-HTTP-family protocol) remain in
-//!   `deferred_fields`; resolvable listeners are materialized.
+//!   listener count. Only ingress entries Ferrum cannot model (an inadmissible
+//!   Unix-socket path, non-loopback `defaultEndpoint`, or non-HTTP-family
+//!   protocol) remain in `deferred_fields`; resolvable listeners are
+//!   materialized.
 //! - `Telemetry` — status reports which sections (tracing / metrics /
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
@@ -1397,9 +1398,10 @@ fn workload_entry_status(
 /// Status for `Sidecar`. Ferrum models the egress scope AND (F6 §6.2) the
 /// `ingress[]` custom inbound listeners. Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
-/// Ingress entries that Ferrum cannot represent (Unix-socket / non-loopback
-/// `defaultEndpoint`, non-HTTP-family protocol) stay in `deferred_fields`;
-/// resolvable listeners are materialized and reported via `ingress_modeled`.
+/// Ingress entries that Ferrum cannot represent (an inadmissible Unix-socket
+/// path, non-loopback `defaultEndpoint`, or non-HTTP-family protocol) stay in
+/// `deferred_fields`; resolvable listeners are materialized and reported via
+/// `ingress_modeled`.
 ///
 /// `ingress_enforced` is the EFFECTIVE ingress materialization gate
 /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`),
@@ -1582,11 +1584,12 @@ fn sidecar_outbound_policy_label(classified: &SidecarOutboundPolicy) -> &'static
 /// materialized and which it left deferred. Mirrors
 /// `MeshSidecarIngress::resolve` and the slice resolver's fail-closed semantics
 /// on the raw spec so the translator predicate and the status writer stay in
-/// lock-step: an entry is modeled iff its protocol is HTTP-family AND its
-/// `defaultEndpoint` is a loopback / instance-IP `host:port` AND its listener
-/// port has not already been claimed by an earlier modeled entry. Unix-socket
-/// and non-loopback endpoints, non-HTTP-family protocols, unparseable shapes,
-/// and DUPLICATE listener ports are deferred (the translator still accepts the
+/// lock-step: an entry is modeled iff its protocol is HTTP-family, its
+/// `defaultEndpoint` is either a loopback / instance-IP `host:port` or a
+/// syntactically admissible `unix://` path, and its listener port has not
+/// already been claimed by an earlier modeled entry. Inadmissible Unix paths,
+/// non-loopback endpoints, non-HTTP-family protocols, unparseable shapes, and
+/// DUPLICATE listener ports are deferred (the translator still accepts the
 /// resource; only the unmodeled entries surface here).
 ///
 /// The duplicate-port dedup mirrors `resolve_selected_sidecar_ingress` in
