@@ -429,6 +429,32 @@ fn l4_route_delete_withdraws_materialized_stream_proxy() {
 }
 
 #[test]
+fn non_gateway_l4_parent_ref_does_not_open_backend_port_listener() {
+    for kind in ["TCPRoute", "TLSRoute"] {
+        let route = object(
+            kind,
+            "db",
+            "apps",
+            json!({
+                "parentRefs": [{
+                    "group": "",
+                    "kind": "Service",
+                    "name": "db"
+                }],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[route], options())
+            .unwrap_or_else(|error| panic!("{kind} translation failed: {error}"));
+        assert!(
+            result.config.proxies.is_empty(),
+            "{kind} with only a non-Gateway parentRef must not bind the backend port"
+        );
+    }
+}
+
+#[test]
 fn tcp_route_status_reports_not_allowed_by_listeners_for_cross_namespace_parent_ref() {
     let route = object(
         "TCPRoute",
