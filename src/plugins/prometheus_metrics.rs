@@ -1781,6 +1781,7 @@ impl MetricsRegistry {
 
     /// Lower the per-family mesh series budget for focused cardinality tests.
     #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn set_mesh_series_budget_per_family_for_test(&self, budget: usize) {
         self.mesh_series_budget_per_family
             .store(budget.max(1), Ordering::Release);
@@ -1788,6 +1789,7 @@ impl MetricsRegistry {
 
     /// Live admitted series for one mesh family (exact reservation count).
     #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_live_for_test(&self, family: &str) -> Option<usize> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
@@ -1798,6 +1800,7 @@ impl MetricsRegistry {
 
     /// Overflow drops for one mesh family.
     #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_overflow_for_test(&self, family: &str) -> Option<u64> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
