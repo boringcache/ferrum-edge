@@ -2325,9 +2325,11 @@ expect_allowed() {
   local url="$3"
   local expected_body="$4"
   local family="${5:-}"
+  local retry_route_not_found="${6:-false}"
+  local max_attempts="${7:-8}"
   local output="" code="" body="" status=1 err
   err="$(mktemp)"
-  for attempt in $(seq 1 8); do
+  for attempt in $(seq 1 "$max_attempts"); do
     set +e
     output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
     status=$?
@@ -2346,8 +2348,19 @@ expect_allowed() {
       break
     fi
     if [[ "$status" -eq 0 ]]; then
+      if [[ "$retry_route_not_found" == "true" ]] &&
+        [[ "$code" == "404" ]] &&
+        [[ "$body" == '{"error":"Not Found"}' ]]; then
+        sleep 1
+        continue
+      fi
       break
     fi
+    # A rolling NodeWaypoint restart becomes Kubernetes-Ready before the CP's
+    # updated waypoint inventory has necessarily rematerialized every outbound
+    # route. Only callers that opt into this bounded convergence mode retry the
+    # exact route-missing response above; authorization failures and other HTTP
+    # errors still fail immediately so policy regressions cannot be hidden.
     sleep 1
   done
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
@@ -2916,7 +2929,9 @@ run_forged_assertion_rejection_check() {
       "restored trusted HBONE assertors" \
       "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
       "ok-a" \
-      4; then
+      4 \
+      true \
+      30; then
       recovery_ok=0
     else
       recovery_ok=$?

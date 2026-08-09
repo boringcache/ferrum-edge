@@ -51,6 +51,16 @@ pub struct RequestEpoch {
 }
 
 impl RequestEpoch {
+    /// Read-only access to the configuration published with this request epoch.
+    ///
+    /// Callers that need to compare request-facing state with another runtime
+    /// projection must read it through the epoch so the configuration and its
+    /// derived caches cannot come from different reload generations.
+    #[inline]
+    pub fn config(&self) -> &GatewayConfig {
+        self.config.as_ref()
+    }
+
     /// Namespace-qualified proxy lookup.
     ///
     /// This is the only proxy-by-identity accessor: every runtime caller must

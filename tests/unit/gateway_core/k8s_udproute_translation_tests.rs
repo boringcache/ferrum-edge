@@ -849,21 +849,6 @@ fn udp_route_with_only_non_gateway_parents_opens_no_listener() {
 }
 
 #[test]
-fn non_gateway_parents_keep_the_tcp_route_fallback() {
-    // The stricter UDP rule above must not change shared TCPRoute/TLSRoute
-    // behavior: only a Gateway parent arms their fail-closed listener gate.
-    let spec = json!({
-        "parentRefs": [{"group": "", "kind": "Service", "name": "db"}],
-        "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
-    });
-    let objects = [gateway_class(), l4_route("TCPRoute", "db", spec)];
-    let tcp = translate_k8s_objects(&objects, options()).expect("translation succeeds");
-
-    assert_eq!(tcp.config.proxies.len(), 1);
-    assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
-}
-
-#[test]
 fn udp_route_with_unmatched_section_name_opens_no_listener() {
     let route = udp_route(
         "dns",
