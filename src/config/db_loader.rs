@@ -10490,11 +10490,13 @@ fn row_to_plugin_config_inner(
         )
     })?;
 
-    let trigger = row
-        .try_get::<Option<String>, _>("trigger_json")
-        .ok()
-        .flatten()
-        .filter(|raw| !raw.trim().is_empty());
+    let trigger = optional_utf8_text_column(row, "trigger_json").map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to read trigger_json column: {}",
+            id_preview,
+            e
+        )
+    })?;
     let trigger = match trigger {
         // A stored trigger that no longer parses is a fail-closed error, not a
         // silently untriggered instance: dropping it would run a plugin the

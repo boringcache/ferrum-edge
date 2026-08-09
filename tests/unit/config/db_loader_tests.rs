@@ -1982,6 +1982,36 @@ async fn proxy_plugin_query_wrapper_preserves_typed_sqlx_source() {
     );
 }
 
+#[tokio::test]
+async fn whitespace_trigger_json_is_rejected_instead_of_disabling_trigger() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("whitespace_trigger_json.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO plugin_configs (id, namespace, plugin_name, trigger_json) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind("whitespace-trigger")
+    .bind("ferrum")
+    .bind("rate_limiting")
+    .bind("   \t")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let error = store.load_full_config("ferrum").await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("failed to parse trigger JSON"),
+        "a non-NULL malformed trigger must reject the row, never broaden it into an untriggered instance: {rendered}"
+    );
+}
+
 #[test]
 fn non_transient_load_error_message_preserves_driver_cause() {
     // main logs fatal errors with `{}` (outermost anyhow context only), so the
