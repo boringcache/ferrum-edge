@@ -504,41 +504,84 @@ struct StreamListenerKeyCandidate {
     has_stream_match: bool,
 }
 
-/// Returns `(sni_group_ports, l4_group_ports)` using the same grouping rules
-/// as `reconcile`'s `passthrough_groups` / `l4_match_groups` construction.
+/// Whether a stream proxy belongs to the **opaque-TLS SNI routing plane**: it
+/// never terminates or re-originates TLS, so a client's ClientHello reaches the
+/// backend verbatim and `server_name` is a usable route predicate.
+///
+/// Mirrors `Proxy::joins_opaque_tls_sni_plane` on the config type; both must
+/// stay in step or a listener would be grouped one way and validated another.
+#[inline]
+fn joins_sni_plane(passthrough: bool, scheme: BackendScheme, frontend_tls: bool) -> bool {
+    passthrough || (!frontend_tls && matches!(scheme, BackendScheme::Tcp))
+}
+
+/// Whether a candidate is a member of its port's `__sni_{port}` group.
+///
+/// A port that carries ANY passthrough candidate keeps the historical
+/// membership — the passthrough set alone — so a config that mixes shapes on
+/// one port number (which validation rejects, but a CP-pushed DP snapshot is
+/// not revalidated for) groups exactly as it always did. Only a port with no
+/// passthrough candidate at all forms the new opaque-`tcp` SNI group.
+#[inline]
+fn sni_group_member(
+    port_has_passthrough: bool,
+    passthrough: bool,
+    scheme: BackendScheme,
+    frontend_tls: bool,
+) -> bool {
+    if port_has_passthrough {
+        passthrough
+    } else {
+        joins_sni_plane(passthrough, scheme, frontend_tls)
+    }
+}
+
+/// Returns `(sni_group_ports, l4_group_ports)` using the same grouping rules as
+/// `reconcile`'s `sni_groups` / `l4_match_groups` construction. Each SNI port
+/// maps to whether it carries a passthrough candidate, which is what
+/// [`sni_group_member`] needs.
 fn stream_listener_group_ports(
     candidates: &[StreamListenerKeyCandidate],
 ) -> (
-    std::collections::HashSet<u16>,
+    std::collections::HashMap<u16, bool>,
     std::collections::HashSet<u16>,
 ) {
-    let mut passthrough_by_port: std::collections::HashMap<u16, (usize, bool)> =
+    // `.0` counts passthrough candidates only (the historical "two passthrough
+    // proxies share a port" trigger); `.1` records whether ANY SNI-plane
+    // candidate on the port declares `hosts`, which is what promotes an
+    // ordinary opaque `tcp` listener onto the SNI routing plane.
+    let mut sni_signal_by_port: std::collections::HashMap<u16, (usize, bool)> =
         std::collections::HashMap::new();
     let mut l4_by_port: std::collections::HashMap<u16, (usize, bool)> =
         std::collections::HashMap::new();
 
     for candidate in candidates {
         if candidate.passthrough {
-            let entry = passthrough_by_port.entry(candidate.port).or_default();
+            let entry = sni_signal_by_port.entry(candidate.port).or_default();
             entry.0 += 1;
             entry.1 |= candidate.has_hosts;
         } else if matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps) {
+            if candidate.has_hosts
+                && joins_sni_plane(false, candidate.scheme, candidate.frontend_tls)
+            {
+                sni_signal_by_port.entry(candidate.port).or_default().1 = true;
+            }
             let entry = l4_by_port.entry(candidate.port).or_default();
             entry.0 += 1;
             entry.1 |= candidate.has_stream_match;
         }
     }
 
-    let sni_ports: std::collections::HashSet<u16> = passthrough_by_port
+    let sni_ports: std::collections::HashMap<u16, bool> = sni_signal_by_port
         .into_iter()
-        .filter(|(_, (count, has_hosts))| *count > 1 || *has_hosts)
-        .map(|(port, _)| port)
+        .filter(|(_, (passthrough_count, has_hosts))| *passthrough_count > 1 || *has_hosts)
+        .map(|(port, (passthrough_count, _))| (port, passthrough_count > 0))
         .collect();
 
     let l4_ports: std::collections::HashSet<u16> = l4_by_port
         .into_iter()
         .filter(|(port, (count, has_constrained))| {
-            *count > 1 && *has_constrained && !sni_ports.contains(port)
+            *count > 1 && *has_constrained && !sni_ports.contains_key(port)
         })
         .map(|(port, _)| port)
         .collect();
@@ -548,10 +591,20 @@ fn stream_listener_group_ports(
 
 fn stream_listener_runtime_key(
     candidate: &StreamListenerKeyCandidate,
-    sni_ports: &std::collections::HashSet<u16>,
+    sni_ports: &std::collections::HashMap<u16, bool>,
     l4_ports: &std::collections::HashSet<u16>,
 ) -> String {
-    if candidate.passthrough && sni_ports.contains(&candidate.port) {
+    if sni_ports
+        .get(&candidate.port)
+        .is_some_and(|port_has_passthrough| {
+            sni_group_member(
+                *port_has_passthrough,
+                candidate.passthrough,
+                candidate.scheme,
+                candidate.frontend_tls,
+            )
+        })
+    {
         format!("__sni_{}", candidate.port)
     } else if !candidate.passthrough
         && matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
@@ -641,6 +694,25 @@ struct DesiredStreamProxy {
     /// non-passthrough ports with stream_match form an L4 match group.
     has_stream_match: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
+}
+
+impl DesiredStreamProxy {
+    /// See [`joins_sni_plane`].
+    #[inline]
+    fn joins_sni_plane(&self) -> bool {
+        joins_sni_plane(self.passthrough, self.scheme, self.frontend_tls)
+    }
+
+    /// See [`sni_group_member`].
+    #[inline]
+    fn is_sni_group_member(&self, port_has_passthrough: bool) -> bool {
+        sni_group_member(
+            port_has_passthrough,
+            self.passthrough,
+            self.scheme,
+            self.frontend_tls,
+        )
+    }
 }
 
 /// One listener the reconcile pass wants running: either an individual proxy
@@ -761,6 +833,17 @@ pub struct StreamListenerManager {
     io_uring_splice_enabled: bool,
     /// Whether frontend TCP TLS handshake failures should increment mesh mTLS metrics.
     record_mesh_mtls_metric: bool,
+    /// `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK`: whether an opaque-TLS SNI
+    /// listener may route provably non-TLS opening bytes to its catch-all
+    /// instead of closing the connection.
+    ///
+    /// Stored as an atomic rather than a constructor argument because the
+    /// production `EnvConfig` is available only at
+    /// [`Self::set_stream_sni_plaintext_fallback`] time, and because the value
+    /// is read once per listener spawn (never on the per-connection hot path).
+    /// Defaults to fail-closed, so a manager built without the setter — every
+    /// test harness — behaves like a gateway that never authorized a fallback.
+    stream_sni_plaintext_fallback: AtomicBool,
     /// SO_BUSY_POLL duration in microseconds for UDP sockets.
     so_busy_poll_us: u32,
     /// Enable UDP GRO on frontend sockets.
@@ -1065,7 +1148,19 @@ impl StreamListenerManager {
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
             backend_conn_limit: std::sync::OnceLock::new(),
+            stream_sni_plaintext_fallback: AtomicBool::new(false),
         }
+    }
+
+    /// Publish `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK`.
+    ///
+    /// Call after [`Self::new`] and BEFORE the first `reconcile()`: each TCP
+    /// listener snapshots the value at spawn, so a listener started earlier
+    /// keeps the fail-closed default until it is rebound. Not calling it at all
+    /// leaves every SNI listener fail-closed, which is the secure default.
+    pub fn set_stream_sni_plaintext_fallback(&self, enabled: bool) {
+        self.stream_sni_plaintext_fallback
+            .store(enabled, Ordering::Release);
     }
 
     /// Install the ONE gateway-wide `connectionPool.tcp.maxConnections` counter
@@ -1394,43 +1489,64 @@ impl StreamListenerManager {
         let mut incompatible_shared_ids: std::collections::HashSet<NamespacedResourceId> =
             std::collections::HashSet::new();
 
-        // Detect passthrough port groups that must be resolved by SNI.
-        // Multiple passthrough proxies sharing a port need one shared listener keyed by
-        // "__sni_{port}". A single passthrough proxy with configured hosts also needs
-        // SNI resolution so those host predicates are enforced instead of becoming a
-        // port-wide catch-all.
+        // Detect port groups that must be resolved by opaque-TLS SNI, keyed by
+        // "__sni_{port}". Two triggers, matching `stream_listener_group_ports`:
+        //
+        //   * more than one `passthrough` proxy shares the port (historical), or
+        //   * any SNI-plane candidate on the port declares `hosts` — including a
+        //     lone one, so its host predicates are enforced instead of becoming
+        //     a port-wide catch-all, and including an ordinary opaque `tcp`
+        //     listener, which relays the ClientHello verbatim and can therefore
+        //     be SNI-routed without terminating TLS (issue #3264).
         //
         // Grouping is by port because the OS port is the shared resource: a port
-        // may legitimately be shared by passthrough proxies from different
-        // namespaces (per-namespace uniqueness allows it). Candidates therefore
-        // stay namespace-qualified so SNI resolution selects the right tenant.
-        let mut passthrough_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
+        // may legitimately be shared by proxies from different namespaces
+        // (per-namespace uniqueness allows it). Candidates therefore stay
+        // namespace-qualified so SNI resolution selects the right tenant.
+        let mut sni_signal_by_port: std::collections::HashMap<u16, (usize, bool)> =
+            std::collections::HashMap::new();
+        for entry in desired.values() {
+            if entry.passthrough {
+                let signal = sni_signal_by_port.entry(entry.port).or_default();
+                signal.0 += 1;
+                signal.1 |= entry.has_hosts;
+            } else if entry.has_hosts && entry.joins_sni_plane() {
+                sni_signal_by_port.entry(entry.port).or_default().1 = true;
+            }
+        }
+        let sni_ports: std::collections::HashMap<u16, bool> = sni_signal_by_port
+            .into_iter()
+            .filter(|(_, (passthrough_count, has_hosts))| *passthrough_count > 1 || *has_hosts)
+            .map(|(port, (passthrough_count, _))| (port, passthrough_count > 0))
+            .collect();
+        // Every member candidate on an SNI port joins the shared listener,
+        // hosts or not: a hostless candidate is the group's catch-all, and
+        // leaving it outside would give it its own listener on an already-bound
+        // port. Validation guarantees at most one such catch-all.
+        let mut sni_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
             std::collections::HashMap::new();
         for (identity, entry) in &desired {
-            if entry.passthrough {
-                passthrough_groups
+            if sni_ports
+                .get(&entry.port)
+                .is_some_and(|port_has_passthrough| entry.is_sni_group_member(*port_has_passthrough))
+            {
+                sni_groups
                     .entry(entry.port)
                     .or_default()
                     .push(identity.clone());
             }
         }
-        for ids in passthrough_groups.values() {
+        for ids in sni_groups.values() {
             if ids.len() > 1 && !listener_candidates_compatible(ids) {
                 incompatible_shared_ids.extend(ids.iter().cloned());
             }
         }
-        passthrough_groups.retain(|_, ids| {
-            listener_candidates_compatible(ids)
-                && (ids.len() > 1
-                    || ids
-                        .iter()
-                        .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts)))
-        });
+        sni_groups.retain(|_, ids| listener_candidates_compatible(ids));
         // Preserve config/translator declaration order for semantic
         // first-match-wins resolution. Identity is only a deterministic tie
         // breaker for synthetic/hand-authored inputs that somehow share a
         // declaration priority.
-        for ids in passthrough_groups.values_mut() {
+        for ids in sni_groups.values_mut() {
             ids.sort_by(|a, b| {
                 let a_entry = desired.get(a);
                 let b_entry = desired.get(b);
@@ -1471,7 +1587,7 @@ impl StreamListenerManager {
                     .iter()
                     .any(|id| desired.get(id).is_some_and(|entry| entry.has_stream_match))
                 && listener_candidates_compatible(ids)
-                && !passthrough_groups.contains_key(port)
+                && !sni_groups.contains_key(port)
         });
         for ids in l4_match_groups.values_mut() {
             ids.sort_by(|a, b| {
@@ -1492,7 +1608,7 @@ impl StreamListenerManager {
         // Build the effective desired map: individual proxies + SNI/L4 group entries.
         // Proxies in a group are replaced by a single shared-port entry.
         let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> =
-            passthrough_groups
+            sni_groups
                 .values()
                 .chain(l4_match_groups.values())
                 .flatten()
@@ -1530,7 +1646,7 @@ impl StreamListenerManager {
                 },
             );
         }
-        for (port, ids) in &passthrough_groups {
+        for (port, ids) in &sni_groups {
             let key = format!("__sni_{}", port);
             // Use the first semantic-priority candidate as the listener's
             // representative; the accept path re-resolves the concrete tenant
@@ -1568,8 +1684,14 @@ impl StreamListenerManager {
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
-                        // Reuse the candidate-id channel; tcp_proxy distinguishes
-                        // L4 match groups from SNI groups via passthrough=false.
+                        // Reuse the candidate-id channel. `tcp_proxy`
+                        // distinguishes an L4 match group from an SNI group by
+                        // inspecting the candidates themselves: an L4 group is
+                        // reachable only when the port carries no passthrough
+                        // candidate and no candidate declares `hosts` (either
+                        // would have promoted the port to `__sni_{port}` above),
+                        // so "any candidate is passthrough or declares hosts"
+                        // is exactly the SNI-group predicate.
                         sni_ids: Some(ids.clone()),
                     },
                 );
@@ -2075,6 +2197,8 @@ impl StreamListenerManager {
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
                 let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
+                let stream_sni_plaintext_fallback =
+                    self.stream_sni_plaintext_fallback.load(Ordering::Acquire);
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
                 let stream_gateway_ref = self.stream_gateway_ref.clone();
@@ -2128,6 +2252,7 @@ impl StreamListenerManager {
                         ktls_enabled,
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
+                        stream_sni_plaintext_fallback,
                         mesh_outbound_enforcement,
                         stream_gateway_ref,
                         node_waypoint_identity_resolver,

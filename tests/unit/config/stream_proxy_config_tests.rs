@@ -789,6 +789,11 @@ fn test_passthrough_shared_listener_rejects_mixed_scheme() {
     );
 }
 
+/// Issue #3264: an empty-`hosts` candidate is the group's DEFAULT route, not a
+/// competing claim on every hostname. The runtime tier ladder puts it strictly
+/// behind every exact and wildcard host, and `catch_all_count` already caps it
+/// at one — so treating it as an "overlap" made both the documented third tier
+/// and that cap unreachable in validated shared config.
 #[test]
 fn test_passthrough_port_sharing_with_catchall() {
     let mut p1 = make_stream_proxy("pt-specific", BackendScheme::Tcp, 8444);
@@ -797,14 +802,14 @@ fn test_passthrough_port_sharing_with_catchall() {
 
     let mut p2 = make_stream_proxy("pt-catchall", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
-    p2.hosts = vec![]; // catch-all
+    p2.hosts = vec![]; // catch-all / default route
 
     let config = test_config(vec![p1, p2]);
-    // Catch-all overlaps with everything — rejected
-    let result = config.validate_stream_proxies();
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
-    assert!(errors.iter().any(|e| e.contains("overlapping hosts")));
+    assert!(
+        config.validate_stream_proxies().is_ok(),
+        "exactly one default route may coexist with named SNI routes: {:?}",
+        config.validate_stream_proxies()
+    );
 }
 
 #[test]
@@ -823,7 +828,7 @@ fn test_passthrough_port_sharing_rejected_for_non_passthrough() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("all proxies sharing a port must have passthrough: true"))
+            .any(|e| e.contains("mixes passthrough and non-passthrough proxies"))
     );
 }
 
@@ -929,4 +934,232 @@ fn test_passthrough_port_sharing_two_catchalls_rejected() {
     assert!(result.is_err());
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.contains("at most one catch-all")));
+}
+
+// ── Issue #3264: general opaque-TLS SNI routing outside passthrough ──────────
+
+/// Two ordinary `tcp` listeners distinguished only by SNI now form one shared
+/// SNI-routed listener. Before #3264 this was rejected outright ("all proxies
+/// sharing a port must have passthrough: true"), so a plain opaque TLS fanout
+/// could not be expressed at all.
+#[test]
+fn opaque_tcp_listeners_may_share_a_port_when_distinguished_by_sni() {
+    let mut a = make_stream_proxy("tenant-a", BackendScheme::Tcp, 8443);
+    a.hosts = vec!["tenant-a.example.com".to_string()];
+    let mut b = make_stream_proxy("tenant-b", BackendScheme::Tcp, 8443);
+    b.hosts = vec!["tenant-b.example.com".to_string()];
+
+    let config = test_config(vec![a, b]);
+    assert!(
+        config.validate_stream_proxies().is_ok(),
+        "SNI-distinguished opaque tcp listeners must share a port: {:?}",
+        config.validate_stream_proxies()
+    );
+}
+
+/// The SNI group's uniqueness rules apply to ordinary `tcp` listeners exactly
+/// as they do to passthrough ones: one hostname, one owner.
+#[test]
+fn opaque_tcp_sni_group_rejects_overlapping_hosts() {
+    let mut a = make_stream_proxy("tenant-a", BackendScheme::Tcp, 8443);
+    a.hosts = vec!["shared.example.com".to_string()];
+    let mut b = make_stream_proxy("tenant-b", BackendScheme::Tcp, 8443);
+    b.hosts = vec!["shared.example.com".to_string()];
+
+    let errors = test_config(vec![a, b])
+        .validate_stream_proxies()
+        .expect_err("one hostname must not have two owners");
+    assert!(errors.iter().any(|e| e.contains("overlapping hosts")));
+}
+
+/// A wildcard route and an exact route below it are NOT a conflict — the tier
+/// ladder resolves them deterministically (exact beats wildcard).
+#[test]
+fn opaque_tcp_sni_group_allows_wildcard_plus_exact_and_one_catch_all() {
+    let mut wild = make_stream_proxy("wild", BackendScheme::Tcp, 8443);
+    wild.hosts = vec!["*.example.com".to_string()];
+    let mut catch_all = make_stream_proxy("catch-all", BackendScheme::Tcp, 8443);
+    catch_all.hosts = vec![];
+    let mut other = make_stream_proxy("other", BackendScheme::Tcp, 8443);
+    other.hosts = vec!["other.org".to_string()];
+
+    let config = test_config(vec![wild, catch_all, other]);
+    assert!(
+        config.validate_stream_proxies().is_ok(),
+        "{:?}",
+        config.validate_stream_proxies()
+    );
+}
+
+#[test]
+fn opaque_tcp_sni_group_rejects_two_catch_alls() {
+    let mut named = make_stream_proxy("named", BackendScheme::Tcp, 8443);
+    named.hosts = vec!["a.example.com".to_string()];
+    let first = make_stream_proxy("catch-all-1", BackendScheme::Tcp, 8443);
+    let second = make_stream_proxy("catch-all-2", BackendScheme::Tcp, 8443);
+
+    let errors = test_config(vec![named, first, second])
+        .validate_stream_proxies()
+        .expect_err("a port must not have two default routes");
+    assert!(errors.iter().any(|e| e.contains("at most one catch-all")));
+}
+
+/// A shared listener socket is built from one representative before any route
+/// is selected, so passthrough must be homogeneous on the port.
+#[test]
+fn shared_sni_port_rejects_mixed_passthrough() {
+    let mut pt = make_stream_proxy("pt", BackendScheme::Tcp, 8443);
+    pt.passthrough = true;
+    pt.hosts = vec!["a.example.com".to_string()];
+    let mut plain = make_stream_proxy("plain", BackendScheme::Tcp, 8443);
+    plain.hosts = vec!["b.example.com".to_string()];
+
+    let errors = test_config(vec![pt, plain])
+        .validate_stream_proxies()
+        .expect_err("mixed passthrough on one port must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("mixes passthrough and non-passthrough proxies"))
+    );
+}
+
+/// `hosts` is a TLS `server_name` predicate. On a listener that terminates or
+/// re-originates crypto it can never be read, and silently ignoring it made an
+/// operator believe the listener admitted one hostname when it admitted every
+/// connection on the port. It is now a field-specific rejection.
+#[test]
+fn hosts_on_a_terminating_stream_listener_is_rejected_not_ignored() {
+    let mut terminating = make_stream_proxy("tls-term", BackendScheme::Tcp, 8443);
+    terminating.frontend_tls = true;
+    terminating.hosts = vec!["a.example.com".to_string()];
+
+    let errors = test_config(vec![terminating])
+        .validate_stream_proxies()
+        .expect_err("inert hosts must not be silently accepted");
+    assert!(
+        errors.iter().any(|e| e.contains("cannot route by SNI")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn hosts_on_a_backend_tls_originating_stream_listener_is_rejected() {
+    let mut originating = make_stream_proxy("tcps", BackendScheme::Tcps, 8443);
+    originating.hosts = vec!["a.example.com".to_string()];
+
+    let errors = test_config(vec![originating])
+        .validate_stream_proxies()
+        .expect_err("tcps re-originates TLS, so hosts is not a route predicate");
+    assert!(
+        errors.iter().any(|e| e.contains("cannot route by SNI")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn hosts_on_a_non_passthrough_udp_listener_is_rejected() {
+    let mut udp = make_stream_proxy("udp", BackendScheme::Udp, 8443);
+    udp.hosts = vec!["a.example.com".to_string()];
+
+    let errors = test_config(vec![udp])
+        .validate_stream_proxies()
+        .expect_err("a non-passthrough UDP listener has no ClientHello to peek");
+    assert!(
+        errors.iter().any(|e| e.contains("cannot route by SNI")),
+        "{errors:?}"
+    );
+}
+
+/// DTLS passthrough keeps using `hosts` for SNI routing (it peeks the DTLS
+/// ClientHello), so the new rejection must not catch it.
+#[test]
+fn hosts_on_a_dtls_passthrough_listener_stays_valid() {
+    let mut a = make_stream_proxy("dtls-a", BackendScheme::Dtls, 8443);
+    a.passthrough = true;
+    a.hosts = vec!["a.example.com".to_string()];
+    let mut b = make_stream_proxy("dtls-b", BackendScheme::Dtls, 8443);
+    b.passthrough = true;
+    b.hosts = vec!["b.example.com".to_string()];
+
+    let config = test_config(vec![a, b]);
+    assert!(
+        config.validate_stream_proxies().is_ok(),
+        "{:?}",
+        config.validate_stream_proxies()
+    );
+}
+
+/// Two plain `tcp` listeners with neither hosts nor stream_match remain a plain
+/// duplicate-port error: nothing distinguishes them.
+#[test]
+fn opaque_tcp_listeners_without_hosts_or_stream_match_still_conflict() {
+    let errors = test_config(vec![
+        make_stream_proxy("a", BackendScheme::Tcp, 8443),
+        make_stream_proxy("b", BackendScheme::Tcp, 8443),
+    ])
+    .validate_stream_proxies()
+    .expect_err("indistinguishable listeners must not share a port");
+    assert!(errors.iter().any(|e| e.contains("Duplicate listen_port")));
+}
+
+/// `joins_opaque_tls_sni_plane` is the single predicate shared by validation and
+/// listener grouping. Lock its truth table so the two cannot drift apart.
+#[test]
+fn opaque_tls_sni_plane_membership_truth_table() {
+    let plain = make_stream_proxy("plain", BackendScheme::Tcp, 8443);
+    assert!(plain.joins_opaque_tls_sni_plane());
+
+    let mut terminating = make_stream_proxy("term", BackendScheme::Tcp, 8443);
+    terminating.frontend_tls = true;
+    assert!(!terminating.joins_opaque_tls_sni_plane());
+
+    let originating = make_stream_proxy("tcps", BackendScheme::Tcps, 8443);
+    assert!(!originating.joins_opaque_tls_sni_plane());
+
+    let udp = make_stream_proxy("udp", BackendScheme::Udp, 8443);
+    assert!(!udp.joins_opaque_tls_sni_plane());
+
+    let mut udp_passthrough = make_stream_proxy("udp-pt", BackendScheme::Dtls, 8443);
+    udp_passthrough.passthrough = true;
+    assert!(
+        udp_passthrough.joins_opaque_tls_sni_plane(),
+        "DTLS passthrough peeks its own ClientHello and stays on the plane"
+    );
+}
+
+/// The SNI conflict rule is tier-aware: only a tie INSIDE one tier is
+/// ambiguous. Cross-tier pairs (exact under a wildcard, anything above the
+/// catch-all) are resolved deterministically by the runtime ladder, so
+/// rejecting them made the wildcard and default tiers unconfigurable.
+#[test]
+fn sni_conflict_rejection_is_tier_aware() {
+    let case = |a: Vec<&str>, b: Vec<&str>| {
+        let mut first = make_stream_proxy("first", BackendScheme::Tcp, 8443);
+        first.hosts = a.into_iter().map(String::from).collect();
+        let mut second = make_stream_proxy("second", BackendScheme::Tcp, 8443);
+        second.hosts = b.into_iter().map(String::from).collect();
+        test_config(vec![first, second])
+            .validate_stream_proxies()
+            .err()
+            .map(|errors| errors.iter().any(|e| e.contains("overlapping hosts")))
+            .unwrap_or(false)
+    };
+
+    // Same tier, same claim → ambiguous.
+    assert!(case(vec!["a.example.com"], vec!["a.example.com"]));
+    assert!(case(vec!["*.example.com"], vec!["*.example.com"]));
+    // Nested wildcards can both match `x.a.example.com`.
+    assert!(case(vec!["*.example.com"], vec!["*.a.example.com"]));
+    assert!(case(vec!["*.a.example.com"], vec!["*.example.com"]));
+
+    // Different tiers → deterministic, so allowed.
+    assert!(!case(vec!["api.example.com"], vec!["*.example.com"]));
+    assert!(!case(vec!["*.example.com"], vec!["api.example.com"]));
+    assert!(!case(vec!["api.example.com"], vec![]));
+    assert!(!case(vec![], vec!["api.example.com"]));
+
+    // Unrelated names never conflict.
+    assert!(!case(vec!["a.example.com"], vec!["b.example.com"]));
+    assert!(!case(vec!["*.foo.com"], vec!["*.bar.com"]));
 }

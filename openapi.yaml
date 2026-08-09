@@ -7293,6 +7293,20 @@ components:
             For HTTP-family proxies, either `hosts` or `listen_path` must be
             set (both may be set together). A host-only proxy (hosts set, no
             listen_path) matches any path under the configured hosts.
+
+
+            For stream-family proxies (`tcp`, `tcps`, `udp`, `dtls`), `hosts` is
+            the TLS/DTLS `server_name` (SNI) route predicate. It is accepted
+            only on an opaque listener that terminates nothing — `passthrough:
+            true`, or `backend_scheme: tcp` with `frontend_tls: false` — because
+            only such a listener can read a ClientHello. Setting it on a
+            terminating (`frontend_tls: true`), backend-TLS-originating
+            (`tcps`), or non-passthrough `udp`/`dtls` proxy is rejected with a
+            field-specific 400 rather than silently ignored. Proxies sharing one
+            `listen_port` resolve in a fixed tier order (exact host, wildcard,
+            then the single empty-`hosts` catch-all); admission rejects a tie
+            inside one tier, more than one catch-all, and mixed `passthrough`
+            on a port.
           examples:
             - ["api.example.com", "*.internal.example.com"]
         backend_scheme:
@@ -7536,8 +7550,11 @@ components:
           description: |
             Port for this TCP/UDP proxy to listen on (must be >= 1). Required when
             backend_scheme is tcp, tcps, udp, or dtls. Must NOT be set for HTTP
-            proxies. Each stream proxy binds its own dedicated port; duplicate ports
-            across stream proxies are rejected. In database mode, the Admin API also
+            proxies. A stream proxy normally binds its own dedicated port; proxies
+            may share one port only by forming a single shared listener — an
+            opaque-TLS SNI group (all `passthrough: true`, or all opaque `tcp`
+            listeners with at least one declaring `hosts`) or an L4 `stream_match`
+            group. Any other duplicate port is rejected. In database mode, the Admin API also
             rejects ports that conflict with gateway reserved ports (proxy/admin/gRPC
             listeners) or are already bound on the host. In CP mode, local port
             checks are skipped since stream proxies run on remote DP nodes.
@@ -7558,6 +7575,13 @@ components:
             ClientHello to extract SNI for logging but does not decrypt traffic.
             Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
             Mutually exclusive with frontend_tls.
+
+            SNI-based routing is not exclusive to this flag: an ordinary
+            `backend_scheme: tcp` listener with `frontend_tls: false` is equally
+            opaque and routes by `hosts` on the same plane. Every candidate
+            sharing one `listen_port` must agree on `passthrough`, because the
+            shared listener socket is built from one representative before any
+            route is selected.
         tcp_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64

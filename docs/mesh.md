@@ -3067,6 +3067,8 @@ VirtualService L4 routing is materialized into Ferrum stream proxies, reusing th
 - **`spec.tls[]`** → a **passthrough TCP** proxy keyed by SNI: `match[].sniHosts` become the proxy's `hosts`, `match[].port` (or the destination port) the listen port, and the proxy forwards the **encrypted** bytes to the destination without terminating TLS. Multiple `tls[]` matches sharing a port are SNI-routed (`resolve_proxy_by_sni`), then filtered by any compiled L4 `stream_match`.
 - **`spec.tcp[]`** → a plain **TCP** proxy keyed by `listen_port` (`match[].port`, or the destination port), forwarding to the destination. Multiple matches sharing a port with L4 predicates share one listener and resolve by first-match `stream_match` evaluation.
 
+SNI routing is not exclusive to `passthrough: true`: the same plane admits any stream listener that terminates nothing, including an ordinary `tcp` listener with `frontend_tls: false` that declares `hosts` (issue #3264). The peek, precedence ladder, normalization rules, and fail-closed admission for indeterminate ClientHellos are documented once in [TCP/UDP stream proxy → Opaque TLS SNI routing](tcp_udp_proxy.md#opaque-tls-sni-routing) and apply identically to mesh-materialized `tls[]` proxies, Gateway API `TLSRoute`, east-west passthrough, and hand-authored stream proxies.
+
 Optional L4 match predicates compile onto `Proxy.stream_match` (AND within one match arm; OR across match candidates) and are evaluated from trustworthy evidence before the stream route is selected:
 
 | Predicate | Evidence | Deny-by-absence |
