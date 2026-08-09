@@ -241,9 +241,12 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
         options(),
     )
     .expect("translate strict allowedListeners selectors");
-    assert!(translation.listenerset_statuses.iter().any(|status| {
-        status.resource.name == "selected-set" && status.accepted
-    }));
+    assert!(
+        translation
+            .listenerset_statuses
+            .iter()
+            .any(|status| { status.resource.name == "selected-set" && status.accepted })
+    );
     assert!(translation.listenerset_statuses.iter().any(|status| {
         status.resource.name == "malformed-set"
             && !status.accepted
@@ -883,13 +886,7 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
     set_secret.api_version = "v1".to_string();
 
     let translation = translate_k8s_objects(
-        &[
-            gateway_class(),
-            gateway,
-            set,
-            gateway_secret,
-            set_secret,
-        ],
+        &[gateway_class(), gateway, set, gateway_secret, set_secret],
         options(),
     )
     .expect("translate same-named Gateway and ListenerSet");
@@ -914,7 +911,10 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         .iter()
         .find(|status| status.resource.kind == "ListenerSet" && status.resource.name == "shared")
         .expect("ListenerSet translation status");
-    assert!(status.accepted, "the non-conflicting ListenerSet stays accepted");
+    assert!(
+        status.accepted,
+        "the non-conflicting ListenerSet stays accepted"
+    );
     assert!(
         !status.programmed && status.programmed_listeners.is_empty(),
         "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"

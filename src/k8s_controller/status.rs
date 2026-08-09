@@ -6309,8 +6309,7 @@ mod tests {
             patch_gateway_addresses: false,
             patch_gateway_listeners: false,
         };
-        let listenerset_patch =
-            gateway_status_apply_patch_for_update(&listenerset_update, None);
+        let listenerset_patch = gateway_status_apply_patch_for_update(&listenerset_update, None);
         assert_eq!(
             listenerset_patch["status"]["conditions"]
                 .as_array()

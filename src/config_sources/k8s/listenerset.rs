@@ -19,8 +19,8 @@ use serde_json::Value;
 use super::gateway_api::{
     allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
     listener_is_materializable, listener_protocol_mode_is_supported,
-    listener_requires_frontend_tls, listener_selected_frontend_tls_source,
-    namespace_selector, namespace_selector_matches, normalize_gateway_hostname,
+    listener_requires_frontend_tls, listener_selected_frontend_tls_source, namespace_selector,
+    namespace_selector_matches, normalize_gateway_hostname,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
@@ -609,18 +609,12 @@ fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, Str
         })
         .collect();
     entries.sort_by(|left, right| {
-        (
-            left.1.is_none(),
-            left.1.as_ref(),
-            left.2,
-            left.3,
-        )
-            .cmp(&(
-                right.1.is_none(),
-                right.1.as_ref(),
-                right.2,
-                right.3,
-            ))
+        (left.1.is_none(), left.1.as_ref(), left.2, left.3).cmp(&(
+            right.1.is_none(),
+            right.1.as_ref(),
+            right.2,
+            right.3,
+        ))
     });
     entries
         .into_iter()
