@@ -704,11 +704,13 @@ fn condition_key_is_sourceable(key: &str, request: &MeshAuthzRequest) -> bool {
         // missing evidence rather than a genuinely absent attribute (a UDP or
         // DTLS session with no captured original destination, for example).
         MeshConditionKeyKind::DestinationIp => request.destination_ip.is_some(),
+        MeshConditionKeyKind::DestinationPort => request.port.is_some(),
         MeshConditionKeyKind::SourcePrincipal
         | MeshConditionKeyKind::SourceNamespace
+        | MeshConditionKeyKind::SourceServiceAccount
+        | MeshConditionKeyKind::SourceTrustDomain
         | MeshConditionKeyKind::SourceIp
         | MeshConditionKeyKind::RemoteIp
-        | MeshConditionKeyKind::DestinationPort
         | MeshConditionKeyKind::ConnectionSni => true,
     }
 }

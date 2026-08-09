@@ -614,6 +614,8 @@ fn authz_translates_the_complete_documented_condition_key_set() {
             json!(["cluster.local/ns/default/sa/web"]),
         ),
         ("source.namespace", json!(["default"])),
+        ("source.serviceAccount", json!(["default/web"])),
+        ("source.trustDomain", json!(["cluster.local"])),
         ("source.ip", json!(["10.1.2.3", "10.2.0.0/16"])),
         ("remote.ip", json!(["203.0.113.0/24"])),
         ("destination.ip", json!(["10.96.0.0/12"])),
@@ -910,6 +912,7 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
 
     for malformed_key in [
         "request.headers[x-team][nested]",
+        "request.headers[x:invalid]",
         "request.auth.claims[realm_access[roles]",
         "request.auth.claims[realm_access][]",
         "experimental.envoy.filters.network.mysql_proxy[db]table]",

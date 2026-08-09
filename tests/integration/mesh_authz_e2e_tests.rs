@@ -476,6 +476,41 @@ async fn condition_match_on_source_principal_uses_istio_format() {
 }
 
 #[tokio::test]
+async fn condition_source_service_account_and_trust_domain_use_verified_spiffe_identity() {
+    for (key, value) in [
+        ("source.serviceAccount", "default/client"),
+        ("source.trustDomain", "cluster.local"),
+    ] {
+        let deny = condition_policy(
+            "deny-source-component",
+            PolicyAction::Deny,
+            key,
+            vec![value],
+            Vec::new(),
+        );
+        let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+        let mut http = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+        assert!(
+            matches!(
+                plugin.authorize(&mut http).await,
+                PluginResult::Reject { .. }
+            ),
+            "{key} must be materialized from the verified HTTP peer SPIFFE identity"
+        );
+
+        let mut stream = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+        assert!(
+            matches!(
+                plugin.on_stream_connect(&mut stream).await,
+                PluginResult::Reject { .. }
+            ),
+            "{key} must be materialized from the verified stream peer SPIFFE identity"
+        );
+    }
+}
+
+#[tokio::test]
 async fn condition_match_on_jwt_list_claim_preserves_item_boundaries() {
     let allow_with_claim = MeshPolicy {
         name: "allow-ops-group".to_string(),

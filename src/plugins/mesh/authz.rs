@@ -175,6 +175,8 @@ struct ConditionAttributeKeys {
     any: bool,
     source_principal: bool,
     source_namespace: bool,
+    source_service_account: bool,
+    source_trust_domain: bool,
     source_ip: bool,
     remote_ip: bool,
     destination_ip: bool,
@@ -219,6 +221,8 @@ struct HttpConditionNetworkAttrs {
 // ── Istio `when:` attribute key constants ────────────────────────────────
 const ATTR_SOURCE_PRINCIPAL: &str = "source.principal";
 const ATTR_SOURCE_NAMESPACE: &str = "source.namespace";
+const ATTR_SOURCE_SERVICE_ACCOUNT: &str = "source.serviceAccount";
+const ATTR_SOURCE_TRUST_DOMAIN: &str = "source.trustDomain";
 const ATTR_SOURCE_IP: &str = "source.ip";
 const ATTR_REMOTE_IP: &str = "remote.ip";
 const ATTR_DESTINATION_IP: &str = "destination.ip";
@@ -407,6 +411,8 @@ impl ConditionAttributeKeys {
         match key {
             ATTR_SOURCE_PRINCIPAL => self.source_principal = true,
             ATTR_SOURCE_NAMESPACE => self.source_namespace = true,
+            ATTR_SOURCE_SERVICE_ACCOUNT => self.source_service_account = true,
+            ATTR_SOURCE_TRUST_DOMAIN => self.source_trust_domain = true,
             ATTR_SOURCE_IP => self.source_ip = true,
             ATTR_REMOTE_IP => self.remote_ip = true,
             ATTR_DESTINATION_IP => self.destination_ip = true,
@@ -1424,6 +1430,26 @@ impl MeshAuthz {
                 namespace.to_string().into(),
             );
         }
+        if keys.source_service_account
+            && let (Some(namespace), Some(service_account)) = (
+                source_principal.and_then(|principal| principal.namespace()),
+                source_principal.and_then(|principal| principal.service_account()),
+            )
+        {
+            let mut value = String::with_capacity(namespace.len() + service_account.len() + 1);
+            value.push_str(namespace);
+            value.push('/');
+            value.push_str(service_account);
+            attributes.insert(ATTR_SOURCE_SERVICE_ACCOUNT.to_string(), value.into());
+        }
+        if keys.source_trust_domain
+            && let Some(trust_domain) = source_principal.map(|principal| principal.trust_domain())
+        {
+            attributes.insert(
+                ATTR_SOURCE_TRUST_DOMAIN.to_string(),
+                trust_domain.as_str().to_string().into(),
+            );
+        }
         if keys.request_auth_principal
             && let Some(principal) = ctx.metadata.get("mesh.request_principal")
         {
@@ -1528,6 +1554,26 @@ impl MeshAuthz {
             attributes.insert(
                 ATTR_SOURCE_NAMESPACE.to_string(),
                 namespace.to_string().into(),
+            );
+        }
+        if keys.source_service_account
+            && let (Some(namespace), Some(service_account)) = (
+                source_principal.and_then(|principal| principal.namespace()),
+                source_principal.and_then(|principal| principal.service_account()),
+            )
+        {
+            let mut value = String::with_capacity(namespace.len() + service_account.len() + 1);
+            value.push_str(namespace);
+            value.push('/');
+            value.push_str(service_account);
+            attributes.insert(ATTR_SOURCE_SERVICE_ACCOUNT.to_string(), value.into());
+        }
+        if keys.source_trust_domain
+            && let Some(trust_domain) = source_principal.map(|principal| principal.trust_domain())
+        {
+            attributes.insert(
+                ATTR_SOURCE_TRUST_DOMAIN.to_string(),
+                trust_domain.as_str().to_string().into(),
             );
         }
         if keys.destination_port {

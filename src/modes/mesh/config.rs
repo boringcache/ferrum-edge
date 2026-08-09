@@ -704,6 +704,8 @@ pub struct ConditionMatch {
 // fail-closed semantics instead of silently dropping the whole policy.
 const CONDITION_SOURCE_PRINCIPAL: &str = "source.principal";
 const CONDITION_SOURCE_NAMESPACE: &str = "source.namespace";
+const CONDITION_SOURCE_SERVICE_ACCOUNT: &str = "source.serviceAccount";
+const CONDITION_SOURCE_TRUST_DOMAIN: &str = "source.trustDomain";
 const CONDITION_SOURCE_IP: &str = "source.ip";
 const CONDITION_REMOTE_IP: &str = "remote.ip";
 const CONDITION_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
@@ -750,6 +752,11 @@ pub enum MeshConditionKeyKind {
     SourcePrincipal,
     /// `source.namespace` — namespace segment of the peer SPIFFE identity.
     SourceNamespace,
+    /// `source.serviceAccount` — `<namespace>/<service-account>` derived from
+    /// the peer SPIFFE identity.
+    SourceServiceAccount,
+    /// `source.trustDomain` — trust domain of the peer SPIFFE identity.
+    SourceTrustDomain,
     /// `source.ip` — immediate downstream socket peer. CIDR-valued.
     SourceIp,
     /// `remote.ip` — forwarded/original client IP. CIDR-valued.
@@ -793,6 +800,8 @@ pub fn classify_mesh_condition_key(key: &str) -> Option<MeshConditionKeyKind> {
     match key {
         CONDITION_SOURCE_PRINCIPAL => Some(MeshConditionKeyKind::SourcePrincipal),
         CONDITION_SOURCE_NAMESPACE => Some(MeshConditionKeyKind::SourceNamespace),
+        CONDITION_SOURCE_SERVICE_ACCOUNT => Some(MeshConditionKeyKind::SourceServiceAccount),
+        CONDITION_SOURCE_TRUST_DOMAIN => Some(MeshConditionKeyKind::SourceTrustDomain),
         CONDITION_SOURCE_IP => Some(MeshConditionKeyKind::SourceIp),
         CONDITION_REMOTE_IP => Some(MeshConditionKeyKind::RemoteIp),
         CONDITION_DESTINATION_IP => Some(MeshConditionKeyKind::DestinationIp),
@@ -961,7 +970,8 @@ pub fn validate_mesh_condition(
         // and operators cannot fix the policy without seeing which key failed.
         return Err(vec![MeshConditionIssue::key(format!(
             "'{}' is unsupported (expected one of source.principal, source.namespace, \
-             source.ip, remote.ip, destination.ip, destination.port, connection.sni, \
+             source.serviceAccount, source.trustDomain, source.ip, remote.ip, destination.ip, \
+             destination.port, connection.sni, \
              request.auth.principal, request.auth.presenter, request.auth.audiences, \
              request.auth.claims[<name>], request.headers[<name>], or \
              experimental.envoy.filters.<filter>[<key>])",
@@ -1089,7 +1099,11 @@ fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
     // Header conditions have exactly one bracket pair. Accepting nested or
     // unmatched brackets would admit a key no HTTP request can materialize,
     // which can silently disarm a DENY condition.
-    (!name.is_empty() && !name.contains('[') && !name.contains(']')).then_some(name)
+    (!name.is_empty()
+        && !name.contains('[')
+        && !name.contains(']')
+        && http::header::HeaderName::from_bytes(name.as_bytes()).is_ok())
+    .then_some(name)
 }
 
 fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
