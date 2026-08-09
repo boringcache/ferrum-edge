@@ -51,12 +51,11 @@ pub const MESH_UNIX_SOCKET_TAG: &str = "mesh.unix_socket";
 /// Reserved `UpstreamTarget.tags` key marking the socket's wire protocol as
 /// **h2c prior-knowledge HTTP/2** rather than HTTP/1.1.
 ///
-/// Present (value `"true"`) only for a listener whose declared `port.protocol`
-/// is `http2` / `https` / `grpc`. Resolved once at translation from that
-/// declared protocol and never inferred at dispatch: an ABSENT tag means
-/// HTTP/1.1, which is exactly what an `http` listener declared, so a stripped
-/// tag degrades to the weaker-but-declared protocol instead of a guessed h2c
-/// handshake the application would reject.
+/// Value `"true"` for a listener whose declared `port.protocol` is `http2` /
+/// `https` / `grpc`; value `"false"` for `http`. Resolved once at translation
+/// from that declared protocol and never inferred at dispatch: an absent or
+/// malformed tag is refused, so a stripped carrier cannot silently downgrade
+/// h2c to HTTP/1.1.
 pub const MESH_UNIX_SOCKET_H2C_TAG: &str = "mesh.unix_socket_h2c";
 
 /// Fallback connect timeout when the proxy configures none (`0` = unset).
@@ -103,6 +102,11 @@ pub enum UnixBackendError {
     /// a reason to silently retry as HTTP/1.1 (that would deliver a request the
     /// declared protocol says the app cannot parse).
     H2Handshake(hyper::Error),
+    /// The socket accepted the connection but did not complete the h2c client
+    /// handshake inside the effective connect budget. Without this bound an
+    /// allowed local peer could withhold SETTINGS and pin a request task
+    /// indefinitely when the client supplied no gRPC deadline.
+    H2HandshakeTimeout { timeout_ms: u64 },
     /// The build target has no Unix-domain sockets (Windows). Sidecar mesh
     /// deployments are Linux-only, so this is unreachable in practice; it
     /// exists so the non-Unix build refuses the dispatch rather than silently
@@ -136,6 +140,10 @@ impl std::fmt::Display for UnixBackendError {
             Self::H2Handshake(err) => {
                 write!(f, "unix backend h2c handshake failed: {err}")
             }
+            Self::H2HandshakeTimeout { timeout_ms } => write!(
+                f,
+                "unix backend h2c handshake timed out after {timeout_ms}ms"
+            ),
             Self::PlatformUnsupported => {
                 write!(f, "unix backends are not supported on this platform")
             }
@@ -177,6 +185,7 @@ impl UnixBackendError {
             // (it is not speaking the protocol its listener declared) — the same
             // posture the pooled transports give a failed connection setup.
             Self::H2Handshake(_) => crate::retry::ErrorClass::ConnectionPoolError,
+            Self::H2HandshakeTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
         }
     }
 }
@@ -456,10 +465,17 @@ pub async fn dial_unix_h2c_sender(
         .max_frame_size(UNIX_H2C_MAX_FRAME_SIZE)
         .max_concurrent_reset_streams(UNIX_H2C_MAX_CONCURRENT_RESET_STREAMS);
 
-    let (sender, connection) = builder
-        .handshake(TokioIo::new(stream))
-        .await
-        .map_err(UnixBackendError::H2Handshake)?;
+    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
+    let (sender, connection) = match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        builder.handshake(TokioIo::new(stream)),
+    )
+    .await
+    {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(err)) => return Err(UnixBackendError::H2Handshake(err)),
+        Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
+    };
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("unix_backend: h2c connection closed: {}", e);

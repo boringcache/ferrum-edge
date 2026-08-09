@@ -20,7 +20,7 @@ use std::time::Duration;
 use ferrum_edge::config::types::UpstreamTarget;
 use ferrum_edge::proxy::unix_backend::{
     MESH_UNIX_SOCKET_H2C_TAG, MESH_UNIX_SOCKET_TAG, UnixBackendError, connect_admitted,
-    resolve_unix_socket_target, target_is_unix_backend,
+    dial_unix_h2c_sender, resolve_unix_socket_target, target_is_unix_backend,
 };
 use ferrum_edge::util::unix_socket::{UnixSocketPathRejection, admit_socket_for_connect};
 
@@ -239,4 +239,35 @@ async fn an_unlinked_socket_is_refused_rather_than_dialed_blind() {
         matches!(outcome, Err(UnixBackendError::Connect(_))),
         "an absent socket must fail closed at connect, got {outcome:?}"
     );
+}
+
+/// An admitted peer may accept the Unix connection and then never speak h2c.
+/// The transport must bound the HTTP/2 SETTINGS handshake even when the client
+/// supplied no gRPC deadline, otherwise that peer can pin the request task
+/// indefinitely before normal sender-readiness timeouts are installed.
+#[tokio::test]
+async fn a_stalled_h2c_handshake_is_bounded_by_the_connect_budget() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = canonical_root(&temp);
+    let path = root.join("stalled-h2c.sock");
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind h2c socket");
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept h2c connection");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(stream);
+    });
+
+    let outcome = dial_unix_h2c_sender(
+        path.to_str().expect("utf-8 socket path"),
+        50,
+        &roots(&root),
+        &[],
+    )
+    .await;
+    match outcome {
+        Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }) => assert_eq!(timeout_ms, 50),
+        Err(other) => panic!("expected a bounded h2c handshake timeout, got {other:?}"),
+        Ok(_) => panic!("a peer that withholds SETTINGS must not complete the h2c handshake"),
+    }
+    peer.abort();
 }
