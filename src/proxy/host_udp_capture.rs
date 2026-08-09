@@ -1198,7 +1198,6 @@ pub struct ProxyHostUdpBackend {
     state: Arc<super::ProxyState>,
     capture_config: crate::capture::CaptureConfig,
     capture_port: u16,
-    include_v6: bool,
     max_sessions: usize,
     cleanup_interval_seconds: u64,
     recvmmsg_batch_size: usize,
@@ -1217,12 +1216,10 @@ impl ProxyHostUdpBackend {
         recvmmsg_batch_size: usize,
         session_shard_amount: usize,
     ) -> Self {
-        let include_v6 = capture_config.ip6tables_mode != crate::capture::Ip6TablesMode::Disabled;
         Self {
             state,
             capture_config,
             capture_port,
-            include_v6,
             max_sessions,
             cleanup_interval_seconds,
             recvmmsg_batch_size,
@@ -1294,7 +1291,7 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
     }
 
     fn teardown_capture_rules(&self) -> Result<(), String> {
-        let script = IptablesPlan::host_udp_capture_rules_teardown_script(self.include_v6);
+        let script = IptablesPlan::host_udp_capture_rules_teardown_script();
         run_host_script(&script)
     }
 
@@ -1303,7 +1300,7 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
     }
 
     fn teardown_all(&self) -> Result<(), String> {
-        let script = IptablesPlan::host_udp_teardown_script(self.include_v6);
+        let script = IptablesPlan::host_udp_teardown_script();
         run_host_script(&script)
     }
 
@@ -1407,11 +1404,11 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
 ///
 /// Every command targets an exact Ferrum-owned object and is best-effort, so it
 /// is a no-op when no host state exists.
-pub fn reap_stale_host_udp_state(include_v6: bool) {
+pub fn reap_stale_host_udp_state() {
     if !cfg!(target_os = "linux") {
         return;
     }
-    let script = IptablesPlan::host_udp_teardown_script(include_v6);
+    let script = IptablesPlan::host_udp_teardown_script();
     if let Err(error) = run_host_script(&script) {
         debug!(
             %error,

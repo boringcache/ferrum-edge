@@ -3004,12 +3004,14 @@ attested SPIFFE identity, no published address, an unresolvable interface, or a
 name this path will not place in an `iptables -i` argument (notably a `+` suffix,
 which would be a prefix wildcard).
 
-**Privileges.** `NET_ADMIN` plus `iproute2`/`iptables` in the image — but **not**
-`hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no namespace is entered. The
-chart narrows those capabilities automatically when this placement is selected.
-The registry hostPath and read-only host cgroup mount stay (the enrolled-pod set
-and interface resolution use them); interface resolution falls back to the host
-route table keyed on the registry-published pod IP when `/proc` is not shared.
+**Privileges.** The host UDP path needs `NET_ADMIN` plus `iproute2`/`iptables` in
+the image — but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no
+namespace is entered. The chart narrows those capabilities automatically when
+this placement is selected while retaining the ambient container's baseline
+`NET_RAW`. The registry hostPath and read-only host cgroup mount stay (the
+enrolled-pod set and interface resolution use them); interface resolution falls
+back to the host route table keyed on the registry-published pod IP when `/proc`
+is not shared.
 
 **Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
 guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`

@@ -380,14 +380,15 @@ not attributable to exactly one enrolled pod is dropped rather than relayed unde
 an absent or neighbouring identity, and two pods resolving to one interface are
 both refused.
 
-This placement enters no namespace, so it needs `NET_ADMIN` and the capture tools
-but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart narrows the ambient
-DaemonSet's capabilities accordingly. It keeps the registry hostPath and the
-read-only host cgroup mount (the enrolled-pod set and interface resolution use
-them), and falls back to the host route table keyed on the registry-published pod
-IP when host `/proc` is not shared. It requires a CNI that gives each pod its own
-host-side interface. Full behaviour, ownership, and the placement-migration
-constraint are in [`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
+This placement enters no namespace, so the host UDP path needs `NET_ADMIN` and
+the capture tools but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart
+narrows the ambient DaemonSet's capabilities accordingly while retaining its
+baseline `NET_RAW`. It keeps the registry hostPath and the read-only host cgroup
+mount (the enrolled-pod set and interface resolution use them), and falls back to
+the host route table keyed on the registry-published pod IP when host `/proc` is
+not shared. It requires a CNI that gives each pod its own host-side interface.
+Full behaviour, ownership, and the placement-migration constraint are in
+[`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

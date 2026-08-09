@@ -266,11 +266,12 @@ fn host_udp_guard_is_empty_when_there_is_nothing_to_guard() {
 
 #[test]
 fn host_udp_teardown_reaps_only_host_owned_objects() {
-    let script = IptablesPlan::host_udp_teardown_script(true);
+    let script = IptablesPlan::host_udp_teardown_script();
 
     for expected in [
         "-D PREROUTING -p udp -j FERRUM_MESH_UDP_HOST",
         "-X FERRUM_MESH_UDP_HOST",
+        "ip6tables -t mangle",
         "rule del priority 101 lookup 33135",
         "route del local 0.0.0.0/0 dev lo table 33135",
         "route del local ::/0 dev lo table 33135",
@@ -300,7 +301,7 @@ fn host_udp_teardown_reaps_only_host_owned_objects() {
 
 #[test]
 fn host_udp_capture_rules_teardown_leaves_the_guard_in_place() {
-    let script = IptablesPlan::host_udp_capture_rules_teardown_script(true);
+    let script = IptablesPlan::host_udp_capture_rules_teardown_script();
     assert!(script.contains("-X FERRUM_MESH_UDP_HOST"), "{script}");
     assert!(
         !script.contains("FERRUM_MESH_UDP_HOST_GUARD_A"),

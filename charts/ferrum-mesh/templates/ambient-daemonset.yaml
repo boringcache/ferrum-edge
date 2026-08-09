@@ -198,9 +198,9 @@ spec:
                 {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
                        shared by the NodeWaypoint TCP path and the per-pod-netns
                        Ambient UDP producer. The host-network UDP placement enters
-                       no other namespace and so is deliberately excluded — it runs
-                       on NET_ADMIN alone. BPF/PERFMON stay NodeWaypoint-only (no
-                       eBPF here). */}}
+                       no other namespace and so is deliberately excluded — the
+                       rendered container retains its baseline NET_ADMIN/NET_RAW
+                       pair. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */}}
                 - SYS_ADMIN
                 - SYS_PTRACE
                 {{- end }}

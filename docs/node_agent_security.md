@@ -155,8 +155,8 @@ privilege footprints:
 
 | Placement | `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED` | Proxy capabilities | Host access |
 |---|---|---|---|
-| Per-pod-netns producer (default) | `false` | `NET_ADMIN`, `SYS_ADMIN`, `SYS_PTRACE` | `hostNetwork`, `hostPID`, host cgroup (ro), registry hostPath |
-| Host-network capture | `true` | `NET_ADMIN` only | `hostNetwork`, host cgroup (ro), registry hostPath |
+| Per-pod-netns producer (default) | `false` | `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE` | `hostNetwork`, `hostPID`, host cgroup (ro), registry hostPath |
+| Host-network capture | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath |
 
 The host placement installs its `mangle` rules and binds its transparent socket
 in the proxy's own namespace, so it calls no `setns(CLONE_NEWNET)` and never opens
@@ -169,8 +169,10 @@ than adding to them.
 
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds
-`IP_TRANSPARENT` sockets. Treat a compromised proxy in this placement as able to
-rewrite host netfilter state, exactly as in the default placement.
+`IP_TRANSPARENT` sockets. The chart also retains the ambient container's existing
+`CAP_NET_RAW`; the host UDP implementation itself adds no raw-socket operation.
+Treat a compromised proxy in this placement as able to rewrite host netfilter
+state, exactly as in the default placement.
 
 Two properties bound the blast radius of the rules it installs. It emits **no
 `mangle OUTPUT` chain**, so the node's own traffic (kubelet, CNI, DNS, every

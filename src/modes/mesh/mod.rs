@@ -11833,7 +11833,7 @@ async fn arm_mesh_runtime_startup(
         // chain no socket serves — captured egress diverted into a black hole with
         // no remaining code path to clean it up.
         if !settings.udp_host_netns_enabled {
-            crate::proxy::host_udp_capture::reap_stale_host_udp_state(true);
+            crate::proxy::host_udp_capture::reap_stale_host_udp_state();
         }
         if settings.udp_capture_enabled {
             if !cfg!(target_os = "linux") {

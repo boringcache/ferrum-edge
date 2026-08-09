@@ -1322,20 +1322,21 @@ impl IptablesPlan {
     /// fail-closed guard intact. Used before rebuilding and on setup failure, so
     /// a retry never reopens plaintext egress.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn host_udp_capture_rules_teardown_script(include_v6: bool) -> String {
+    pub fn host_udp_capture_rules_teardown_script() -> String {
         let v4 = host_udp_capture_teardown_for("iptables");
         let mut chunks = Vec::new();
         chunks.extend(v4.iptables);
         chunks.extend(v4.ip_routing);
-        if include_v6 {
-            let v6 = host_udp_capture_teardown_for("ip6tables");
-            chunks.extend(
-                v6.iptables
-                    .iter()
-                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
-            );
-            chunks.extend(v6.ip_routing);
-        }
+        // Always probe for stale IPv6 state, even when IPv6 capture is disabled
+        // in the current generation. A prior enabled generation may have left a
+        // jump, chain, fwmark rule, or local route behind.
+        let v6 = host_udp_capture_teardown_for("ip6tables");
+        chunks.extend(
+            v6.iptables
+                .iter()
+                .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+        );
+        chunks.extend(v6.ip_routing);
         chunks.join("\n")
     }
 
@@ -1344,28 +1345,21 @@ impl IptablesPlan {
     /// so a prior crashed generation's state is reaped even when the current
     /// configuration would emit nothing.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn host_udp_teardown_script(include_v6: bool) -> String {
+    pub fn host_udp_teardown_script() -> String {
         let v4 = host_udp_teardown_for("iptables");
         let mut chunks: Vec<String> = Vec::new();
         chunks.extend(v4.iptables);
         chunks.extend(v4.ip_routing);
-        if include_v6 {
-            let v6 = host_udp_teardown_for("ip6tables");
-            chunks.extend(
-                v6.iptables
-                    .iter()
-                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
-            );
-            chunks.extend(v6.ip_routing);
-        } else {
-            // Current IPv6 disablement must not orphan a guard installed by an
-            // earlier enabled generation.
-            chunks.extend(
-                host_udp_guard_teardown_for("ip6tables")
-                    .iter()
-                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
-            );
-        }
+        // Complete teardown is generation-independent: always probe IPv6 table
+        // state and always remove the raw IPv6 routing objects. This matters when
+        // a node restarts with IPv6 capture disabled after an enabled generation.
+        let v6 = host_udp_teardown_for("ip6tables");
+        chunks.extend(
+            v6.iptables
+                .iter()
+                .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+        );
+        chunks.extend(v6.ip_routing);
         chunks.join("\n")
     }
 

@@ -181,14 +181,18 @@ pub struct MeshUdpCaptureConfig {
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-/// Session key: a captured flow is identified by the client's source address
-/// and the datagram's original (pre-TPROXY) destination. Two pods dialing the
-/// same upstream, or one pod dialing two upstreams, are distinct sessions.
+/// Session key: a captured flow is identified by the client's source address,
+/// the datagram's original (pre-TPROXY) destination, and the kernel-reported
+/// ingress interface when the shared host-network capture socket is used. The
+/// interface is required because two network tenants may use the same source
+/// IP:port tuple; collapsing them into one session would relay the second pod's
+/// datagrams under the first pod's identity. Fixed-evidence placements use `0`.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CaptureSessionKey {
     pub client: SocketAddr,
     pub orig_dst: SocketAddr,
+    pub ingress_ifindex: u32,
 }
 
 /// Whether `e` indicates IPv6 is unavailable on this host (so the dual-stack
@@ -927,7 +931,14 @@ fn handle_captured_datagram(
     // `key.orig_dst`), so `send_to(client)` never trips a family mismatch.
     let orig_dst = canonicalize_socket_addr(orig_dst);
 
-    let key = CaptureSessionKey { client, orig_dst };
+    let key = CaptureSessionKey {
+        client,
+        orig_dst,
+        // `0` is reserved by the kernel as "unspecified" and is never admitted
+        // by HostIngress, so it is an unambiguous scope for fixed-evidence
+        // pod-netns and Sidecar listeners.
+        ingress_ifindex: ingress_ifindex.unwrap_or(0),
+    };
 
     // Routability is resolved ONCE per (potentially new) flow via a closure so
     // the cap/keying bookkeeping (`admit_or_refresh_session`) stays a pure,
@@ -2116,6 +2127,7 @@ mod tests {
         CaptureSessionKey {
             client: client.parse().unwrap(),
             orig_dst: dst.parse().unwrap(),
+            ingress_ifindex: 0,
         }
     }
 
@@ -2257,6 +2269,37 @@ listen_port: 15011
             other => panic!("expected Admitted, got {}", admission_name(&other)),
         }
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn host_ingress_interface_scopes_the_session_key() {
+        let sessions = new_sessions(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
+        let mut first = key("10.0.0.5:40000", "10.96.0.10:53");
+        first.ingress_ifindex = 11;
+        let mut second = first;
+        second.ingress_ifindex = 12;
+        let mut keepalive = Vec::new();
+
+        for session_key in [first, second] {
+            match admit_or_refresh_session(
+                &sessions,
+                &limiter,
+                session_key,
+                b"x",
+                routable,
+            ) {
+                SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            }
+        }
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "overlapping tenant source tuples on different ingress interfaces must never share \
+             a session or source identity"
+        );
     }
 
     #[test]
