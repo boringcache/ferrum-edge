@@ -936,9 +936,9 @@ def main() -> int:
             "jobs.helm-chart must check out full history so the trusted "
             "base chart runtime checker is reachable"
         )
-    if "Materialize trusted setup-kubernetes-tools" not in chart_runtime_lint_body:
+    if "Verify trusted setup-kubernetes-tools" not in chart_runtime_lint_body:
         planner_errors.append(
-            "jobs.helm-chart must materialize trusted setup-kubernetes-tools "
+            "jobs.helm-chart must verify trusted setup-kubernetes-tools "
             "before installing Helm for the chart runtime lint"
         )
     if "Install Kubernetes tools" not in chart_runtime_lint_body:
@@ -946,8 +946,8 @@ def main() -> int:
             "jobs.helm-chart must install pinned Kubernetes tools before the "
             "chart runtime lint"
         )
-    materialize_at = chart_runtime_lint_body.find(
-        "Materialize trusted setup-kubernetes-tools"
+    verify_installer_at = chart_runtime_lint_body.find(
+        "Verify trusted setup-kubernetes-tools"
     )
     install_at = chart_runtime_lint_body.find("Install Kubernetes tools")
     trusted_check_at = chart_runtime_lint_body.find(
@@ -957,12 +957,28 @@ def main() -> int:
         "Validate proposed chart runtime lint (non-authoritative)"
     )
     if not (
-        0 <= materialize_at < install_at < trusted_check_at < proposed_check_at
+        0 <= verify_installer_at < install_at < trusted_check_at < proposed_check_at
     ):
         planner_errors.append(
             "jobs.helm-chart must order trusted setup-kubernetes-tools "
-            "materialization, Kubernetes tools install, trusted chart runtime "
+            "verification, Kubernetes tools install, trusted chart runtime "
             "lint, then non-authoritative proposed checker validation"
+        )
+    if (
+        'git diff --no-ext-diff --quiet "$trusted_ref" HEAD -- "$action_dir"'
+        not in chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must reject any setup-kubernetes-tools tree "
+            "difference from the trusted base before execution"
+        )
+    if (
+        "local action path must be an ordinary directory"
+        not in chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must reject symlinked setup-kubernetes-tools "
+            "ancestor directories before executing the local action"
         )
     if "git ls-tree -r --full-tree" not in chart_runtime_lint_body:
         planner_errors.append(
@@ -981,7 +997,7 @@ def main() -> int:
         )
     if "cmp -s" not in chart_runtime_lint_body:
         planner_errors.append(
-            "jobs.helm-chart must byte-compare materialized "
+            "jobs.helm-chart must byte-compare local "
             "setup-kubernetes-tools inputs against the trusted base"
         )
     if "uses: ./.github/actions/setup-kubernetes-tools" not in chart_runtime_lint_body:

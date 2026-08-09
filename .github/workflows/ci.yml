@@ -2011,15 +2011,22 @@ jobs:
           persist-credentials: false
 
       # Before the local composite action can install Helm for the trusted chart
-      # runtime lint, materialize `.github/actions/setup-kubernetes-tools` from
-      # the trusted base on pull_request / merge_group. That keeps the renderer
+      # runtime lint, prove `.github/actions/setup-kubernetes-tools` is exactly
+      # the trusted-base tree on pull_request / merge_group. That keeps renderer
       # provenance fail-closed: a PR cannot substitute a fake `helm` via a
-      # modified local action and still satisfy this gate. Regular-file /
-      # no-symlink / no-extra-file constraints are enforced while restoring.
-      - name: Materialize trusted setup-kubernetes-tools
+      # modified local action and still satisfy this gate. Regular-file,
+      # no-symlink, mode, byte-content, and no-extra-file constraints are all
+      # checked before `uses:` can execute the action.
+      - name: Verify trusted setup-kubernetes-tools
         run: |
           set -euo pipefail
           action_dir=".github/actions/setup-kubernetes-tools"
+          for directory in .github .github/actions "$action_dir"; do
+            if [ -L "$directory" ] || [ ! -d "$directory" ]; then
+              echo "::error file=${directory}::local action path must be an ordinary directory" >&2
+              exit 1
+            fi
+          done
           case "$EVENT_NAME" in
             pull_request)
               if [ -z "$BASE_REF" ]; then
@@ -2041,7 +2048,7 @@ jobs:
               trusted_ref="$MERGE_BASE_SHA"
               ;;
             push|workflow_dispatch)
-              echo "Checkout is the trusted revision for ${EVENT_NAME}; keeping local ${action_dir}."
+              echo "Checkout is the trusted revision for ${EVENT_NAME}; ${action_dir} needs no base comparison."
               exit 0
               ;;
             *)
@@ -2060,8 +2067,11 @@ jobs:
             exit 1
           fi
 
-          rm -rf "$action_dir"
-          mkdir -p "$action_dir"
+          if ! git diff --no-ext-diff --quiet "$trusted_ref" HEAD -- "$action_dir"; then
+            echo "::error::${action_dir} must match trusted base ${trusted_ref} byte-for-byte before execution" >&2
+            exit 1
+          fi
+
           expected="$(mktemp)"
           while IFS=$'\t' read -r meta path; do
             mode="${meta%% *}"
@@ -2093,23 +2103,25 @@ jobs:
                 exit 1
                 ;;
             esac
-            out="${action_dir}/${rel}"
-            mkdir -p "$(dirname "$out")"
-            git show "${trusted_ref}:${path}" > "$out"
-            if [ -L "$out" ] || [ ! -f "$out" ]; then
-              echo "::error file=${out}::materialized action input must be a regular file" >&2
+            local_path="${action_dir}/${rel}"
+            if [ -L "$local_path" ] || [ ! -f "$local_path" ]; then
+              echo "::error file=${local_path}::local action input must be a regular file" >&2
               exit 1
             fi
-            if [ "$mode" = "100755" ]; then
-              chmod 0755 "$out"
-            else
-              chmod 0644 "$out"
+            local_entry="$(git ls-files --stage -- "$path")"
+            local_mode="${local_entry%% *}"
+            if [ "$local_mode" != "$mode" ]; then
+              echo "::error file=${local_path}::local action mode differs from trusted base ${trusted_ref}" >&2
+              exit 1
+            fi
+            if ! cmp -s "$local_path" <(git show "${trusted_ref}:${path}"); then
+              echo "::error file=${local_path}::local action input differs from trusted base ${trusted_ref}" >&2
+              exit 1
             fi
             printf '%s\n' "$rel" >> "$expected"
           done < "$listing"
 
-          # Fail closed on extra files that survived materialization or were
-          # introduced beside the trusted blobs.
+          # Fail closed on extra files or symlinks beside the trusted blobs.
           while IFS= read -r -d '' path; do
             rel="${path#"${action_dir}/"}"
             if [ ! -f "$path" ] || [ -L "$path" ]; then
@@ -2122,18 +2134,7 @@ jobs:
             fi
           done < <(find "$action_dir" -type f -print0; find "$action_dir" -type l -print0)
 
-          while IFS= read -r rel; do
-            if [ ! -f "${action_dir}/${rel}" ] || [ -L "${action_dir}/${rel}" ]; then
-              echo "::error file=${action_dir}/${rel}::trusted action file missing after materialization" >&2
-              exit 1
-            fi
-            if ! cmp -s "${action_dir}/${rel}" <(git show "${trusted_ref}:${action_dir}/${rel}"); then
-              echo "::error file=${action_dir}/${rel}::materialized action input drifted from trusted base" >&2
-              exit 1
-            fi
-          done < "$expected"
-
-          echo "Materialized trusted ${action_dir} from ${trusted_ref}."
+          echo "Verified ${action_dir} matches trusted base ${trusted_ref}."
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}

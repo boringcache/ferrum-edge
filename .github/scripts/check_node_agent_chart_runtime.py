@@ -241,17 +241,32 @@ def resolve_helm_binary() -> str:
 def iter_mesh_example_value_files(root: Path) -> list[Path]:
     """Discover ferrum-mesh example inputs in parity with GOVERNED_GLOBS."""
 
-    chart = (root / "charts" / "ferrum-mesh").resolve()
-    examples_root = (chart / "examples").resolve()
+    charts_dir = root / "charts"
+    chart_path = charts_dir / "ferrum-mesh"
+    examples_path = chart_path / "examples"
+    for label, directory in (
+        ("charts", charts_dir),
+        ("ferrum-mesh chart", chart_path),
+        ("ferrum-mesh examples", examples_path),
+    ):
+        if directory.is_symlink():
+            raise OSError(f"{label} directory must not be a symlink: {directory}")
+    if not examples_path.is_dir():
+        return []
+    for candidate in examples_path.rglob("*"):
+        if candidate.is_symlink():
+            raise OSError(
+                f"chart example tree must not contain symlinks: {candidate}"
+            )
+
+    chart = chart_path.resolve()
+    examples_root = examples_path.resolve()
     try:
         examples_root.relative_to(chart)
     except ValueError as exc:
         raise ValueError(
             "ferrum-mesh examples directory escapes chart boundary"
         ) from exc
-    if examples_root.is_symlink() or not examples_root.is_dir():
-        return []
-
     discovered: set[Path] = set()
     for pattern in EXAMPLE_VALUE_GLOBS:
         for path in sorted(chart.glob(pattern)):
@@ -693,6 +708,24 @@ spec:
                     "example discovery missed nested yaml/yml/json inputs: "
                     f"{sorted(discovered)}"
                 )
+
+        outside_examples = Path(tmp) / "outside-examples"
+        _write(outside_examples / "escape-values.yaml", "nodeAgent:\n  enabled: true\n")
+        example_symlink = (
+            example_root / "charts/ferrum-mesh/examples/symlinked-directory"
+        )
+        try:
+            example_symlink.symlink_to(outside_examples, target_is_directory=True)
+        except (NotImplementedError, OSError):
+            # Some non-Linux developer environments do not permit symlinks.
+            pass
+        else:
+            try:
+                iter_mesh_example_value_files(example_root)
+            except OSError:
+                pass
+            else:
+                failures.append("symlinked chart example directory was accepted")
 
         render_root = Path(tmp) / "render-failures"
         _required_tree(

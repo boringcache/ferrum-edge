@@ -228,10 +228,10 @@ runner allocations.
 
 The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
 runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
-after materializing the trusted-base
-`.github/actions/setup-kubernetes-tools` input (byte-for-byte, regular-file /
-no-symlink / no-extra-file) and installing that pinned Helm binary. On pull
-requests and merge groups the checker is extracted from the base revision when
+after verifying the proposed `.github/actions/setup-kubernetes-tools` tree
+matches the trusted base (byte-for-byte, including file modes, with regular-file /
+no-symlink / no-extra-file enforcement) and installing that pinned Helm binary.
+On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
 prevents a PR-modified local installer from substituting a fake `helm` renderer
