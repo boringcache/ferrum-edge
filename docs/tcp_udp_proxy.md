@@ -820,12 +820,13 @@ Route admission is strict and fail closed (required `spec.rules` and
 at most one *supported* rule per `UDPRoute`, same-listener UDPRoute ownership
 by oldest `creationTimestamp` then `{namespace}/{name}`, and no listener at all
 for a declared Gateway parent that matches nothing or lost every claimed
-listener). A `UDPRoute` whose `parentRefs` name only non-Gateway parents (a
-GAMMA `Service` parent, a mistyped `kind`) likewise opens nothing; present
+listener). Every `UDPRoute` requires a concrete attached Gateway UDP listener:
+a route with no `parentRefs`, or whose `parentRefs` name only non-Gateway
+parents (a GAMMA `Service` parent or a mistyped `kind`), opens nothing. Present
 but malformed or explicitly empty `parentRefs` fail closed too. Ferrum
-implements no non-Gateway `UDPRoute` parent, that route is not a status
-candidate, and the backend-port fallback would be an unannounced listener bind.
-Only a `UDPRoute` with no `parentRefs` field at all keeps that fallback.
+implements no non-Gateway `UDPRoute` parent, and treating the backend port as a
+listener would create an unannounced north-south bind. The historical
+backend-port fallback remains only for parentless `TCPRoute`/`TLSRoute` inputs.
 Same-listener ownership suppresses **effective traffic** only: both
 otherwise-valid `UDPRoute`s stay `Accepted=True` (attached), the oldest alone
 is `Programmed`/effective, the shadowed newer route reports
