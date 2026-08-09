@@ -252,6 +252,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }
@@ -522,7 +523,14 @@ mod tests {
         let after = store.load();
         let cache = RouterCache::new(&after.config, 100);
         let matched = cache
-            .find_proxy_in_snapshot(&after.route_table, after.route_generation, None, "/secure")
+            .find_proxy_in_snapshot(
+                &after.route_table,
+                after.route_generation,
+                None,
+                "/secure",
+                None,
+                false,
+            )
             .unwrap_or_else(|| panic!("secure route should be visible"));
         assert_eq!(matched.proxy.id, "secure");
 
@@ -539,7 +547,7 @@ mod tests {
         let old_table = RouterCache::build_route_table_snapshot(&old);
         assert!(
             cache
-                .find_proxy_in_snapshot(&old_table, 1, None, "/old")
+                .find_proxy_in_snapshot(&old_table, 1, None, "/old", None, false)
                 .is_some()
         );
 
@@ -547,12 +555,12 @@ mod tests {
         let new_table = RouterCache::build_route_table_snapshot(&new);
         assert!(
             cache
-                .find_proxy_in_snapshot(&new_table, 2, None, "/old")
+                .find_proxy_in_snapshot(&new_table, 2, None, "/old", None, false)
                 .is_none()
         );
         assert!(
             cache
-                .find_proxy_in_snapshot(&new_table, 2, None, "/new")
+                .find_proxy_in_snapshot(&new_table, 2, None, "/new", None, false)
                 .is_some()
         );
     }

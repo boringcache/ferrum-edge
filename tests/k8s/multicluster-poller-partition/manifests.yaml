@@ -127,6 +127,11 @@ spec:
               value: "true"
             - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
               value: "true"
+            # Bound quiet-scope revision convergence inside the live poller's
+            # eight-second last-good window. This accelerates the authoritative
+            # relist; it does not relax equal-revision content binding.
+            - name: FERRUM_K8S_WATCH_IDLE_RELIST_SECS
+              value: "2"
             - name: FERRUM_K8S_WATCH_ISTIO_CRDS
               value: "false"
             - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS

@@ -9,6 +9,7 @@ pub mod istio_status;
 pub mod metrics;
 pub mod reconciler;
 pub mod resource_store;
+pub mod revision;
 pub mod status;
 pub mod status_plan;
 pub mod watcher;
@@ -33,6 +34,7 @@ pub use reconciler::{
 };
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
+use revision::K8sConfigRevisionTracker;
 use status::GatewayApiStatusWriter;
 use watcher::{RelistPolicy, WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
 
@@ -72,6 +74,13 @@ pub struct K8sControllerConfig {
     /// reflector store, so it cannot recover objects the store never received.
     pub watch_idle_relist_secs: u64,
     pub kubeconfig_path: Option<String>,
+    /// Ordering domain this control plane advertises for authoritative mesh
+    /// config revisions (issue #3611), already composed and validated by
+    /// `EnvConfig` (`k8s`, or `k8s:<FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID>`).
+    ///
+    /// `None` disables revision publication, restoring the pre-#3611 behaviour
+    /// in which mesh data planes apply no cross-CP ordering to this authority.
+    pub mesh_config_authority: Option<String>,
 }
 
 /// A controller task that failed to terminate cleanly (panic or cancellation).
@@ -586,6 +595,25 @@ pub async fn start_k8s_controller(
 
     let store_set = Arc::new(tokio::sync::Mutex::new(ResourceStoreSet::new()));
     let metrics = Arc::new(ControllerMetrics::new());
+    // Shared by every watch scope (evidence producers) and the reconciler
+    // (the single consumer that stamps a published snapshot) — issue #3611.
+    let revision = Arc::new(K8sConfigRevisionTracker::new(
+        controller_config.mesh_config_authority.clone(),
+    ));
+    if let Some(authority) = revision.authority() {
+        info!(
+            authority,
+            "Kubernetes control plane publishes authoritative mesh config revisions from a \
+             resourceVersion convergence watermark; mesh data planes apply cross-CP freshness \
+             ordering"
+        );
+    } else {
+        warn!(
+            "Mesh config revision publication is disabled \
+             (FERRUM_MESH_CONFIG_AUTHORITY_ID is empty); mesh data planes apply no cross-CP \
+             freshness ordering to this control plane"
+        );
+    }
     let watcher_selection = WatcherSelection {
         watch_istio: controller_config.watch_istio,
         watch_gateway_api: controller_config.watch_gateway_api,
@@ -634,6 +662,7 @@ pub async fn start_k8s_controller(
         gateway_api_data_plane_service_namespace.clone(),
         relist_policy,
         metrics.clone(),
+        Arc::clone(&revision),
         shutdown.clone(),
         &registry,
         STARTUP_WATCHER_LABEL,
@@ -698,6 +727,7 @@ pub async fn start_k8s_controller(
         gateway_status_writer,
         istio_status_writer,
         metrics.clone(),
+        Arc::clone(&revision),
         shutdown.clone(),
         &registry,
     );
@@ -713,6 +743,7 @@ pub async fn start_k8s_controller(
         gateway_api_data_plane_service_namespace,
         relist_policy,
         metrics.clone(),
+        revision,
         shutdown,
         Duration::from_secs(300),
         &registry,

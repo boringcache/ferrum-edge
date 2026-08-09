@@ -65,6 +65,7 @@ pub fn default_mesh_runtime() -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: None,
         workload_svid_cert_path: None,
@@ -452,6 +453,7 @@ pub fn gateway_config_with_mesh(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     }

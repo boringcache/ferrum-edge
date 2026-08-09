@@ -32,8 +32,22 @@
 {{- end -}}
 {{- $cni := .Values.nodeAgent.cni }}
 {{- $cniSocketPath := "" }}
+{{- /*
+  Install-time ownership identity (issue #3609). `OWNER_ID` is stable across
+  upgrades of one release, so `helm uninstall` can clean up whichever revision
+  is currently on the node; `INSTALL_GENERATION` is the node-agent pod UID, so
+  the in-pod rollback watcher can only ever remove artifacts its OWN init
+  container wrote and never a newer rollout's. Both are re-validated by the
+  binary before any file is removed.
+*/ -}}
+{{- $cniOwnerId := printf "%s/%s" .Release.Namespace .Release.Name }}
+{{- $cniRollback := dict "enabled" false }}
 {{- if and $cni $cni.enabled }}
 {{- $cniSocketPath = printf "%s/%s" $cni.hostSocketDir $cni.socketFileName }}
+{{- if $cni.rollback }}{{ $cniRollback = $cni.rollback }}{{ end }}
+{{- if and $cniRollback.enabled (le (int (default 300 $cniRollback.readyTimeoutSeconds)) (int (default 5 $cniRollback.pollIntervalSeconds))) }}
+{{- fail "nodeAgent.cni.rollback.readyTimeoutSeconds must be greater than nodeAgent.cni.rollback.pollIntervalSeconds so at least one readiness probe completes before rollback" }}
+{{- end }}
 {{- end }}
 {{- $nodeAgentImageRepository := toString (default .Values.image.repository .Values.nodeAgent.image.repository) -}}
 {{- $nodeAgentImageTag := toString (default .Values.image.tag .Values.nodeAgent.image.tag) -}}
@@ -133,11 +147,73 @@ spec:
         seccompProfile:
           {{- toYaml $seccompProfile | nindent 10 }}
       {{- if and $cni $cni.enabled }}
-      # CNI installer init container (opt-in). Executes the distroless-safe
-      # `ferrum-cni install` mode: it copies the binary into the host CNI
-      # plugin dir, reads the existing primary CNI config, appends Ferrum as a
-      # meta-plugin, and writes the generated conflist.
       initContainers:
+        {{- if $cniRollback.enabled }}
+        # Readiness rollback watcher (issue #3609). A NATIVE SIDECAR: an init
+        # container with `restartPolicy: Always` (Kubernetes 1.29+), ordered
+        # BEFORE the installer so it is already running while — and after —
+        # the chained conflist is written. If it were an ordinary container it
+        # would only start once every init container had SUCCEEDED, which is
+        # exactly the case where a half-finished install needs undoing.
+        #
+        # It polls CNI STATUS and, if the node-agent never becomes usable,
+        # removes this pod's own generation of the CNI artifacts and exits
+        # non-zero (visible CrashLoopBackOff, not a silent success). Once
+        # STATUS answers Ok it retains them permanently for this pod, so a
+        # node-agent that crashes later is never silently unchained.
+        - name: ferrum-cni-rollback
+          image: {{ $nodeAgentImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          restartPolicy: Always
+          command:
+            - /app/ferrum-cni
+            - rollback-watch
+          env:
+            - name: HOST_BIN_DIR
+              value: {{ $cni.hostBinDir | quote }}
+            - name: HOST_CONF_DIR
+              value: {{ $cni.hostConfDir | quote }}
+            - name: CONF_FILE_NAME
+              value: {{ $cni.confFileName | quote }}
+            - name: SOCKET_PATH
+              value: {{ $cniSocketPath | quote }}
+            - name: EXPECTED_OWNER
+              value: {{ $cniOwnerId | quote }}
+            - name: EXPECTED_GENERATION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            {{- /* The readiness budget starts only once THIS generation's
+                   conflist is observed on disk, so the watcher can never
+                   delete state an installer is still publishing. This is the
+                   separate budget for that publication to happen at all. */}}
+            - name: PUBLISH_TIMEOUT_SECS
+              value: {{ default 300 $cniRollback.publishTimeoutSeconds | quote }}
+            - name: READY_TIMEOUT_SECS
+              value: {{ default 300 $cniRollback.readyTimeoutSeconds | quote }}
+            - name: POLL_INTERVAL_SECS
+              value: {{ default 5 $cniRollback.pollIntervalSeconds | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: host-cni-bin
+              mountPath: {{ $cni.hostBinDir }}
+            - name: host-cni-conf
+              mountPath: {{ $cni.hostConfDir }}
+            - name: host-ferrum-socket-dir
+              mountPath: {{ $cni.hostSocketDir }}
+        {{- end }}
+        # CNI installer init container (opt-in). Executes the distroless-safe
+        # `ferrum-cni install` mode: it copies the binary into the host CNI
+        # plugin dir, reads the existing primary CNI config, appends Ferrum as a
+        # meta-plugin, and writes the generated conflist. The ownership marker
+        # (OWNER_ID / INSTALL_GENERATION) is recorded first so nothing can end
+        # up chained without the evidence needed to remove it again.
         - name: ferrum-cni-installer
           image: {{ $nodeAgentImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -157,6 +233,12 @@ spec:
               value: {{ $cni.chainedWith | quote }}
             - name: SOCKET_PATH
               value: {{ $cniSocketPath | quote }}
+            - name: OWNER_ID
+              value: {{ $cniOwnerId | quote }}
+            - name: INSTALL_GENERATION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
           securityContext:
             runAsUser: 0
             runAsGroup: 0

@@ -256,6 +256,7 @@ fn authoritative_empty_translation() -> GatewayConfig {
 fn authoritative_overlay(mesh: Option<MeshConfig>) -> GatewayConfig {
     GatewayConfig {
         mesh: mesh.map(Box::new),
+        http_tls_listen_ports: Default::default(),
         k8s_mesh_overlay: K8sMeshOverlay::authoritative_translation(),
         ..GatewayConfig::default()
     }
@@ -841,16 +842,16 @@ fn repeated_empty_snapshots_are_idempotent_and_publish_once() {
 
     let config_arc = ArcSwap::from_pointee(GatewayConfig::default());
     assert!(
-        swap_merged_k8s_translation(&config_arc, &populated, &managed).is_some(),
+        swap_merged_k8s_translation(&config_arc, &populated, &managed, None).is_some(),
         "the first non-empty publication must commit"
     );
 
-    let withdrawal = swap_merged_k8s_translation(&config_arc, &empty, &managed)
+    let withdrawal = swap_merged_k8s_translation(&config_arc, &empty, &managed, None)
         .expect("the withdrawal must commit exactly once");
     assert!(withdrawal.mesh.is_none());
 
     assert!(
-        swap_merged_k8s_translation(&config_arc, &empty, &managed).is_none(),
+        swap_merged_k8s_translation(&config_arc, &empty, &managed, None).is_none(),
         "a repeated empty snapshot is a no-op — no re-publication, no broadcast"
     );
     assert!(config_arc.load().mesh.is_none());
@@ -868,13 +869,15 @@ fn withdrawal_publishes_one_complete_snapshot() {
     });
 
     let config_arc = ArcSwap::from_pointee(base);
-    swap_merged_k8s_translation(&config_arc, &populated, &managed).expect("initial publication");
+    swap_merged_k8s_translation(&config_arc, &populated, &managed, None)
+        .expect("initial publication");
 
     // An in-flight consumer holding the pre-withdrawal snapshot.
     let in_flight = config_arc.load_full();
     assert_eq!(mesh_of(&in_flight).service_entries.len(), 1);
 
-    swap_merged_k8s_translation(&config_arc, &empty, &managed).expect("withdrawal publication");
+    swap_merged_k8s_translation(&config_arc, &empty, &managed, None)
+        .expect("withdrawal publication");
 
     assert_eq!(
         mesh_of(&in_flight).service_entries.len(),
@@ -904,6 +907,7 @@ fn overlay_slot_does_not_resurrect_an_authoritatively_withdrawn_mesh() {
         &overlay_slot,
         authoritative_translation(&[service_entry("default", "api", "api.example.com")]),
         managed.clone(),
+        None,
     );
     assert!(
         compose_db_with_k8s_overlay(&GatewayConfig::default(), &overlay_slot)
@@ -912,7 +916,12 @@ fn overlay_slot_does_not_resurrect_an_authoritatively_withdrawn_mesh() {
         "the accepted overlay must supply mesh on a CP full reload"
     );
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
 
     assert!(
         compose_db_with_k8s_overlay(&GatewayConfig::default(), &overlay_slot)
@@ -942,6 +951,7 @@ fn overlay_slot_compose_preserves_same_namespace_mesh_from_a_non_kubernetes_base
         &overlay_slot,
         authoritative_translation(&objects),
         managed.clone(),
+        None,
     );
     let composed = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
     assert_eq!(
@@ -950,7 +960,12 @@ fn overlay_slot_compose_preserves_same_namespace_mesh_from_a_non_kubernetes_base
         "the overlay must layer onto the non-Kubernetes mesh base, not replace it"
     );
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
     let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
     let mesh = mesh_of(&withdrawn);
@@ -983,12 +998,18 @@ fn overlay_slot_compose_restores_a_non_kubernetes_object_the_overlay_shadowed() 
         &overlay_slot,
         authoritative_translation(&[service()]),
         managed.clone(),
+        None,
     );
     let composed = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
     assert_eq!(mesh_of(&composed).services.len(), 1);
     assert!(mesh_of(&composed).services[0].cluster_ips.is_empty());
 
-    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_empty_translation(),
+        managed,
+        None,
+    );
     let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
     assert_eq!(mesh_of(&withdrawn).services, vec![base_service]);
@@ -1419,6 +1440,11 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         local_ingress_listeners: _,
         declared_ingress_http_ports: _,
         local_inbound_tcp_routes: _,
+        // EgressGateway external-UDP relay admissions and the source-side
+        // captured-UDP routes that originate them (issue #3263): both are
+        // rebuilt from the slice on every mesh apply, never Kubernetes-owned.
+        egress_udp_destinations: _,
+        external_udp_egress_routes: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

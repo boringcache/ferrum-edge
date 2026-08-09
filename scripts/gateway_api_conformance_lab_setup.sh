@@ -17,10 +17,12 @@ TCP_BLACKBOX_PORT_MAIN="${TCP_BLACKBOX_PORT_MAIN:-9001}"
 TCP_BLACKBOX_PORT_CROSS="${TCP_BLACKBOX_PORT_CROSS:-9002}"
 TCP_BLACKBOX_PORT_FAIL="${TCP_BLACKBOX_PORT_FAIL:-9003}"
 TCP_BLACKBOX_PORT_DELETE="${TCP_BLACKBOX_PORT_DELETE:-9004}"
+TCP_BLACKBOX_PORT_PARENT_CROSS="${TCP_BLACKBOX_PORT_PARENT_CROSS:-9005}"
 TCP_BLACKBOX_NODEPORT_MAIN="${TCP_BLACKBOX_NODEPORT_MAIN:-30901}"
 TCP_BLACKBOX_NODEPORT_CROSS="${TCP_BLACKBOX_NODEPORT_CROSS:-30902}"
 TCP_BLACKBOX_NODEPORT_FAIL="${TCP_BLACKBOX_NODEPORT_FAIL:-30903}"
 TCP_BLACKBOX_NODEPORT_DELETE="${TCP_BLACKBOX_NODEPORT_DELETE:-30904}"
+TCP_BLACKBOX_NODEPORT_PARENT_CROSS="${TCP_BLACKBOX_NODEPORT_PARENT_CROSS:-30905}"
 TCP_ECHO_BACKEND_PORT="${TCP_ECHO_BACKEND_PORT:-9090}"
 
 # Live TLSRoute black-box listeners (TLS Passthrough + SNI). Distinct from TCPRoute
@@ -76,6 +78,9 @@ nodes:
         protocol: TCP
       - containerPort: ${TCP_BLACKBOX_NODEPORT_DELETE}
         hostPort: ${TCP_BLACKBOX_PORT_DELETE}
+        protocol: TCP
+      - containerPort: ${TCP_BLACKBOX_NODEPORT_PARENT_CROSS}
+        hostPort: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
         protocol: TCP
       - containerPort: ${TLS_BLACKBOX_NODEPORT_SNI}
         hostPort: ${TLS_BLACKBOX_PORT_SNI}
@@ -225,6 +230,8 @@ spec:
               containerPort: ${TCP_BLACKBOX_PORT_FAIL}
             - name: tcp-delete
               containerPort: ${TCP_BLACKBOX_PORT_DELETE}
+            - name: tcp-parent-xns
+              containerPort: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
             - name: tls-sni
               containerPort: ${TLS_BLACKBOX_PORT_SNI}
             - name: tls-cross
@@ -309,6 +316,10 @@ spec:
       port: ${TCP_BLACKBOX_PORT_DELETE}
       targetPort: ${TCP_BLACKBOX_PORT_DELETE}
       nodePort: ${TCP_BLACKBOX_NODEPORT_DELETE}
+    - name: tcp-parent-xns
+      port: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
+      targetPort: ${TCP_BLACKBOX_PORT_PARENT_CROSS}
+      nodePort: ${TCP_BLACKBOX_NODEPORT_PARENT_CROSS}
     - name: tls-sni
       port: ${TLS_BLACKBOX_PORT_SNI}
       targetPort: ${TLS_BLACKBOX_PORT_SNI}

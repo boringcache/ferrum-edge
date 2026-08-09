@@ -17,7 +17,7 @@ use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use regex::{Regex, RegexSet};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
@@ -90,24 +90,151 @@ pub struct RouteMatch {
 /// A pre-sorted route entry for longest-prefix matching.
 struct RouteEntry {
     listen_path: String,
+    candidate: PortScopedProxy,
+}
+
+/// How [`select_port_aware_proxy`] ranks a candidate against the request frontend.
+///
+/// A port-scoped proxy carries the Gateway API listener port it was admitted
+/// on. [`crate::proxy::gateway_listener::GatewayListenerManager`] binds those
+/// ports for real, so the ordinary answer is the **exact** match on
+/// `frontend_port`.
+///
+/// The single-port protocol remap below is a deliberate, narrow compatibility
+/// affordance for the Service-fronted topology, where the pod binds
+/// `FERRUM_PROXY_HTTP_PORT` (say `:8000`) and a `Service` maps the Gateway
+/// listener port (`:80`) onto it — in that deployment the listener port is
+/// never bound inside the pod, so an exact match can never happen. It is
+/// admitted only when the route table holds **exactly one** listen port of the
+/// request's protocol class, i.e. when there is no ambiguity about which
+/// listener the request could have been meant for. With two same-class listener
+/// ports (`:80` and `:8080`) the remap is off and only an exact match serves —
+/// which is correct, because both ports are bound.
+#[derive(Clone, Copy)]
+struct HttpPortMatchContext {
+    frontend_port: Option<u16>,
+    frontend_is_tls: bool,
+    /// The one distinct non-TLS HTTP `listen_port` in the table, if there is
+    /// exactly one. `None` means only exact port matches are admitted.
+    single_nontls_listen_port: Option<u16>,
+    /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
+    single_tls_listen_port: Option<u16>,
+}
+
+/// A route-table candidate with its listener scope resolved at build time.
+///
+/// The TLS class is decided **once**, from the proxy's own
+/// `(namespace, listen_port)` entry in `GatewayConfig::http_tls_listen_ports`,
+/// so the request path never consults a shared port set and one namespace's
+/// `:443` listener can never reclassify another's.
+#[derive(Clone)]
+struct PortScopedProxy {
     proxy: Arc<Proxy>,
+    listen_port: Option<u16>,
+    listen_port_tls: bool,
+}
+
+impl PortScopedProxy {
+    /// Rank this candidate against the request frontend. See
+    /// [`port_match_priority`].
+    fn match_priority(&self, ctx: HttpPortMatchContext) -> Option<u8> {
+        port_match_priority(self.listen_port, self.listen_port_tls, ctx)
+    }
+
+    fn new(proxy: Arc<Proxy>, tls_listen_ports: &BTreeSet<(String, u16)>) -> Self {
+        let listen_port = if proxy.dispatch_kind.is_stream() {
+            None
+        } else {
+            proxy.listen_port
+        };
+        let listen_port_tls = listen_port.is_some_and(|port| {
+            // `BTreeSet<(String, u16)>` lookups need an owned key, and this is
+            // build time (once per config publication), not the request path.
+            tls_listen_ports.contains(&(proxy.namespace.clone(), port))
+        });
+        Self {
+            proxy,
+            listen_port,
+            listen_port_tls,
+        }
+    }
+}
+
+/// `Some(rank)` when a candidate may serve this frontend; lower ranks win.
+///
+/// `None` — the candidate is refused — is the fail-closed answer: a route
+/// scoped to a listener the request did not arrive on is never served, even if
+/// no other candidate matches.
+fn port_match_priority(
+    listen_port: Option<u16>,
+    listen_port_tls: bool,
+    ctx: HttpPortMatchContext,
+) -> Option<u8> {
+    let Some(port) = listen_port else {
+        // Port-agnostic route: serves any HTTP-family frontend, but always
+        // loses to a listener-scoped sibling on that listener.
+        return Some(2);
+    };
+    // A listener is plaintext or TLS, never both: a request whose frontend
+    // class disagrees with the listener's did not arrive on that listener.
+    if listen_port_tls != ctx.frontend_is_tls {
+        return None;
+    }
+    // Exact listener match — the request arrived on this listener's socket.
+    if ctx.frontend_port == Some(port) {
+        return Some(0);
+    }
+    // Single-listener protocol remap (Service-fronted topology).
+    let single_for_class = if ctx.frontend_is_tls {
+        ctx.single_tls_listen_port
+    } else {
+        ctx.single_nontls_listen_port
+    };
+    if single_for_class == Some(port) {
+        return Some(1);
+    }
+    None
+}
+
+fn select_port_aware_proxy<'a>(
+    candidates: impl IntoIterator<Item = &'a PortScopedProxy>,
+    ctx: HttpPortMatchContext,
+) -> Option<&'a Arc<Proxy>> {
+    let mut best: Option<(&'a Arc<Proxy>, u8)> = None;
+    for candidate in candidates {
+        let Some(prio) = candidate.match_priority(ctx) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_prio)| prio < best_prio) {
+            best = Some((&candidate.proxy, prio));
+            if prio == 0 {
+                break;
+            }
+        }
+    }
+    best.map(|(proxy, _)| proxy)
 }
 
 /// Literal exact-path routes with O(1) lookup.
+///
+/// Multiple proxies may share a path when they are port-scoped to distinct
+/// `listen_port` values (or one is port-agnostic). Lookup filters by the
+/// request's frontend port / TLS class.
 struct IndexedExactPathRoutes {
-    path_index: HashMap<String, Arc<Proxy>>,
+    path_index: HashMap<String, Vec<PortScopedProxy>>,
 }
 
 /// A collection of prefix routes with both sorted Vec (for fallback) and
 /// HashMap index (for O(path_depth) lookup instead of O(n_routes) linear scan).
 ///
-/// The HashMap maps each listen_path to its proxy, enabling rapid longest-prefix
-/// matching by walking the request path backwards through segment boundaries.
-/// This is the key optimization for scaling to thousands of proxies — without it,
-/// every cache miss triggers a linear scan of ALL routes in the tier.
+/// The HashMap maps each listen_path to its candidate proxies, enabling rapid
+/// longest-prefix matching by walking the request path backwards through
+/// segment boundaries. Port-scoped siblings share a path key and are filtered
+/// at lookup time.
 struct IndexedPrefixRoutes {
-    /// Maps listen_path → Arc<Proxy> for O(1) exact-match and O(depth) prefix lookups.
-    path_index: HashMap<String, Arc<Proxy>>,
+    /// Maps listen_path → candidate proxies for O(1) exact-match and O(depth)
+    /// prefix lookups, with port-aware selection among siblings.
+    path_index: HashMap<String, Vec<PortScopedProxy>>,
 }
 
 /// A pre-compiled regex route entry.
@@ -115,7 +242,8 @@ struct RegexRouteEntry {
     pattern: Regex,
     /// Named capture group names, pre-extracted for O(1) iteration.
     capture_names: Vec<String>,
-    proxy: Arc<Proxy>,
+    /// The candidate plus its build-time-resolved listener scope.
+    candidate: PortScopedProxy,
 }
 
 /// A collection of regex routes with a `RegexSet` for O(1) multi-pattern matching.
@@ -191,17 +319,24 @@ pub(crate) struct HostRouteTable {
     wildcard_hosts_regex: Vec<(String, IndexedRegexRoutes)>,
     /// Catch-all regex routes with RegexSet index.
     catch_all_regex: IndexedRegexRoutes,
-    /// Exact host → host-only proxy (`listen_path.is_none()`). Fallback when
+    /// Exact host → host-only proxies (`listen_path.is_none()`). Fallback when
     /// no prefix or regex route matches the request path under `host`.
-    exact_hosts_host_only: HashMap<String, Arc<Proxy>>,
-    /// Wildcard host → host-only proxy. Sorted by pattern length descending.
-    wildcard_hosts_host_only: Vec<(String, Arc<Proxy>)>,
+    /// Multiple entries share a host when port-scoped to distinct listeners.
+    exact_hosts_host_only: HashMap<String, Vec<PortScopedProxy>>,
+    /// Wildcard host → host-only proxies. Sorted by pattern length descending.
+    wildcard_hosts_host_only: Vec<(String, Vec<PortScopedProxy>)>,
     /// Pre-computed flag: true if any exact-path routes exist.
     has_exact_path_routes: bool,
     /// Pre-computed flag: true if any regex routes exist (skip regex path entirely when false).
     has_regex_routes: bool,
     /// Pre-computed flag: true if any host-only routes exist (skip host-only path entirely when false).
     has_host_only_routes: bool,
+    /// When exactly one distinct non-TLS HTTP `listen_port` exists, plaintext
+    /// frontends may serve it via protocol remap (lab Service :80 → bind).
+    single_nontls_listen_port: Option<u16>,
+    /// When exactly one distinct TLS-scoped HTTP `listen_port` exists, TLS
+    /// frontends may serve it via protocol remap.
+    single_tls_listen_port: Option<u16>,
     /// Mesh outbound per-port sibling groups, keyed by the **representative**
     /// proxy namespace and id (the lowest-port sibling — the only one inserted
     /// into the host/path tiers, since they are (host, path)-keyed and every
@@ -1428,10 +1563,31 @@ impl RouterCache {
     ///
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
-    #[allow(dead_code)] // Library/test API; request hot paths use find_proxy_in_snapshot().
+    /// Library/test API; request hot paths use find_proxy_in_snapshot().
+    #[allow(dead_code)]
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
+        self.find_proxy_on_frontend(host, path, None, false)
+    }
+
+    /// Port-aware library/test lookup. Production request paths pass the
+    /// frontend accept port and TLS class into [`Self::find_proxy_in_snapshot`].
+    #[allow(dead_code)]
+    pub fn find_proxy_on_frontend(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<RouteMatch> {
         let snapshot = self.route_snapshot.load();
-        self.find_proxy_in_snapshot(&snapshot.table, snapshot.generation, host, path)
+        self.find_proxy_in_snapshot(
+            &snapshot.table,
+            snapshot.generation,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+        )
     }
 
     pub(crate) fn find_proxy_in_snapshot(
@@ -1440,15 +1596,23 @@ impl RouterCache {
         route_generation: u64,
         host: Option<&str>,
         path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
         let path: &str = &normalized;
+        let port_ctx = HttpPortMatchContext {
+            frontend_port,
+            frontend_is_tls,
+            single_nontls_listen_port: table.single_nontls_listen_port,
+            single_tls_listen_port: table.single_tls_listen_port,
+        };
 
         // Fast path: use thread-local buffer for cache lookup to avoid String
         // allocation on cache hits (99%+ of requests). Only allocate on misses.
         let hit = CACHE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
-            write_cache_key(&mut buf, host, path);
+            write_cache_key(&mut buf, host, path, frontend_port, frontend_is_tls);
 
             // Fast path 1: check prefix cache (includes negative entries for total misses)
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
@@ -1491,11 +1655,16 @@ impl RouterCache {
         // never filters by direction; direction scoping is handled by the request
         // handlers via `resolve_route_excluding_wrong_direction` when the cached
         // winner turns out to be a wrong-direction mesh route.
-        let result =
-            Self::search_route_table(table, host, path, MeshRouteDirectionFilter::Unfiltered);
+        let result = Self::search_route_table(
+            table,
+            host,
+            path,
+            MeshRouteDirectionFilter::Unfiltered,
+            port_ctx,
+        );
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
-        let cache_key = make_cache_key(host, path);
+        let cache_key = make_cache_key(host, path, frontend_port, frontend_is_tls);
 
         // Cache the result in the appropriate partition.
         // Increment sketch on insert so the new entry starts with a frequency of 1.
@@ -1555,6 +1724,7 @@ impl RouterCache {
         host: Option<&str>,
         path: &str,
         direction_filter: MeshRouteDirectionFilter,
+        port_ctx: HttpPortMatchContext,
     ) -> Option<RouteMatch> {
         // Admit a tier's match unless it is a direction-scoped materialized mesh
         // route (`__mesh-inbound-*` / `__mesh-outbound-*`) excluded by this lookup
@@ -1577,25 +1747,26 @@ impl RouterCache {
             if table.has_exact_path_routes
                 && let Some(routes) = table.exact_hosts_exact_paths.get(host)
                 && let Some(route_match) =
-                    find_exact_path_match_indexed(routes, path).filter(|rm| admit(rm))
+                    find_exact_path_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) =
-                    find_prefix_match_indexed(routes, path).filter(|rm| admit(rm))
+                    find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
             if table.has_regex_routes
                 && let Some(routes) = table.exact_hosts_regex.get(host)
                 && let Some(route_match) =
-                    find_regex_match_indexed(routes, path).filter(|rm| admit(rm))
+                    find_regex_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
             if table.has_host_only_routes
-                && let Some(proxy) = table.exact_hosts_host_only.get(host)
+                && let Some(candidates) = table.exact_hosts_host_only.get(host)
+                && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
             {
                 return Some(RouteMatch {
                     proxy: Arc::clone(proxy),
@@ -1609,7 +1780,8 @@ impl RouterCache {
                 for (pattern, routes) in &table.wildcard_hosts_exact_paths {
                     if wildcard_matches(pattern, host)
                         && let Some(route_match) =
-                            find_exact_path_match_indexed(routes, path).filter(|rm| admit(rm))
+                            find_exact_path_match_indexed(routes, path, port_ctx)
+                                .filter(|rm| admit(rm))
                     {
                         return Some(route_match);
                     }
@@ -1618,7 +1790,7 @@ impl RouterCache {
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) =
-                        find_prefix_match_indexed(routes, path).filter(|rm| admit(rm))
+                        find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
                 {
                     return Some(route_match);
                 }
@@ -1627,15 +1799,17 @@ impl RouterCache {
                 for (pattern, routes) in &table.wildcard_hosts_regex {
                     if wildcard_matches(pattern, host)
                         && let Some(route_match) =
-                            find_regex_match_indexed(routes, path).filter(|rm| admit(rm))
+                            find_regex_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
                     {
                         return Some(route_match);
                     }
                 }
             }
             if table.has_host_only_routes {
-                for (pattern, proxy) in &table.wildcard_hosts_host_only {
-                    if wildcard_matches(pattern, host) {
+                for (pattern, candidates) in &table.wildcard_hosts_host_only {
+                    if wildcard_matches(pattern, host)
+                        && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                    {
                         return Some(RouteMatch {
                             proxy: Arc::clone(proxy),
                             path_params: Vec::new(),
@@ -1646,23 +1820,23 @@ impl RouterCache {
             }
         }
 
-        // 3. Catch-all — exact path, prefix, then regex (no host-only tier: validation
-        //    forbids empty-hosts + no-listen-path).
+        // 3. Catch-all (empty hosts)
         if table.has_exact_path_routes
             && let Some(route_match) =
-                find_exact_path_match_indexed(&table.catch_all_exact_paths, path)
+                find_exact_path_match_indexed(&table.catch_all_exact_paths, path, port_ctx)
                     .filter(|rm| admit(rm))
         {
             return Some(route_match);
         }
         if let Some(route_match) =
-            find_prefix_match_indexed(&table.catch_all, path).filter(|rm| admit(rm))
+            find_prefix_match_indexed(&table.catch_all, path, port_ctx).filter(|rm| admit(rm))
         {
             return Some(route_match);
         }
         if table.has_regex_routes
             && let Some(route_match) =
-                find_regex_match_indexed(&table.catch_all_regex, path).filter(|rm| admit(rm))
+                find_regex_match_indexed(&table.catch_all_regex, path, port_ctx)
+                    .filter(|rm| admit(rm))
         {
             return Some(route_match);
         }
@@ -1686,6 +1860,8 @@ impl RouterCache {
         host: Option<&str>,
         path: &str,
         req_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
         Self::search_route_table(
@@ -1693,6 +1869,12 @@ impl RouterCache {
             host,
             &normalized,
             MeshRouteDirectionFilter::MatchingDirection(req_direction),
+            HttpPortMatchContext {
+                frontend_port,
+                frontend_is_tls,
+                single_nontls_listen_port: table.single_nontls_listen_port,
+                single_tls_listen_port: table.single_tls_listen_port,
+            },
         )
     }
 
@@ -1751,21 +1933,25 @@ impl RouterCache {
     pub fn route_count(&self) -> usize {
         let snapshot = self.route_snapshot.load();
         let table = &snapshot.table;
-        let exact_count: usize = table.exact_hosts.values().map(|v| v.path_index.len()).sum();
+        let exact_count: usize = table
+            .exact_hosts
+            .values()
+            .map(|v| v.path_index.values().map(Vec::len).sum::<usize>())
+            .sum();
         let exact_path_count: usize = table
             .exact_hosts_exact_paths
             .values()
-            .map(|v| v.path_index.len())
+            .map(|v| v.path_index.values().map(Vec::len).sum::<usize>())
             .sum();
         let wildcard_count: usize = table
             .wildcard_hosts
             .iter()
-            .map(|(_, v)| v.path_index.len())
+            .map(|(_, v)| v.path_index.values().map(Vec::len).sum::<usize>())
             .sum();
         let wildcard_exact_path_count: usize = table
             .wildcard_hosts_exact_paths
             .iter()
-            .map(|(_, v)| v.path_index.len())
+            .map(|(_, v)| v.path_index.values().map(Vec::len).sum::<usize>())
             .sum();
         let exact_regex: usize = table
             .exact_hosts_regex
@@ -1781,13 +1967,31 @@ impl RouterCache {
             + exact_path_count
             + wildcard_count
             + wildcard_exact_path_count
-            + table.catch_all_exact_paths.path_index.len()
-            + table.catch_all.path_index.len()
+            + table
+                .catch_all_exact_paths
+                .path_index
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+            + table
+                .catch_all
+                .path_index
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
             + exact_regex
             + wildcard_regex
             + table.catch_all_regex.entries.len()
-            + table.exact_hosts_host_only.len()
-            + table.wildcard_hosts_host_only.len()
+            + table
+                .exact_hosts_host_only
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+            + table
+                .wildcard_hosts_host_only
+                .iter()
+                .map(|(_, v)| v.len())
+                .sum::<usize>()
     }
 
     /// Evict low-frequency entries from the prefix cache using frequency-guided sampling.
@@ -1864,8 +2068,8 @@ impl RouterCache {
         let mut exact_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
         let mut wildcard_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
         let mut catch_all_regex: Vec<RegexRouteEntry> = Vec::new();
-        let mut exact_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
-        let mut wildcard_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
+        let mut exact_hosts_host_only: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
+        let mut wildcard_hosts_host_only: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
         let mut mesh_upstreams: HashMap<&str, HashMap<&str, &Upstream>> = HashMap::new();
         if config.mesh.is_some() {
             for upstream in &config.upstreams {
@@ -2367,6 +2571,50 @@ impl RouterCache {
                     }
                 }
             }
+
+            // ── SOURCE-side EXTERNAL UDP egress (issue #3263) ───────────────
+            // Forward-derived from `external_udp_egress_routes`, which the mesh
+            // materializer builds only for `MESH_EXTERNAL` `ServiceEntry` UDP
+            // ports with STATIC endpoints AND a configured, identity-pinned
+            // EgressGateway. Folded into the SAME `(dest ip, port)` index the
+            // in-mesh datapath uses, so `mesh_udp_capture` needs no external
+            // special case; in-mesh VIP pairs are inserted FIRST and win, so an
+            // external entry can never shadow an in-mesh service VIP. A route
+            // whose upstream did not materialize resolves `CloseNotRoutable`
+            // (drop), never a guess.
+            for route in &mesh.external_udp_egress_routes {
+                let Ok(ip) = route.dest_ip.parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                if route.port == 0 {
+                    continue;
+                }
+                let upstream = mesh_upstreams
+                    .get(route.namespace.as_str())
+                    .and_then(|by_id| by_id.get(route.upstream_id.as_str()))
+                    .copied();
+                let decision = if let Some(upstream) = upstream {
+                    let mut relay_proxy = crate::modes::mesh::mesh_external_udp_relay_proxy(
+                        &route.namespace,
+                        &route.service_entry,
+                        route.port,
+                        &route.dest_ip,
+                        &route.upstream_id,
+                    );
+                    relay_proxy.dispatch_port_overrides =
+                        dispatch_port_overrides_for_upstream(upstream);
+                    MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                        upstream_id: route.upstream_id.clone(),
+                        relay_proxy: Arc::new(relay_proxy),
+                        service_fqdn: route.service_fqdn.clone(),
+                    }))
+                } else {
+                    MeshTcpEgressDecision::CloseNotRoutable
+                };
+                mesh_udp_egress
+                    .entry((ip.to_canonical(), route.port))
+                    .or_insert(decision);
+            }
         }
 
         for proxy in &config.proxies {
@@ -2392,6 +2640,11 @@ impl RouterCache {
                 continue;
             }
             let arc_proxy = Arc::new(proxy.clone());
+            // Listener scope (port + TLS class) is resolved ONCE here, from
+            // this proxy's own `(namespace, listen_port)` entry, so the request
+            // path never re-derives it from a shared set.
+            let scoped =
+                PortScopedProxy::new(Arc::clone(&arc_proxy), &config.http_tls_listen_ports);
 
             let Some(listen_path) = proxy.listen_path.as_deref() else {
                 // Host-only proxy: matches any path under its hosts.
@@ -2410,12 +2663,9 @@ impl RouterCache {
                     } else {
                         &mut exact_hosts_host_only
                     };
-                    // `validate_unique_listen_paths` already rejects overlapping
-                    // host-only proxies, so duplicate keys here shouldn't occur;
-                    // if they do, first-wins matches prefix-route semantics.
-                    target
-                        .entry(host.clone())
-                        .or_insert_with(|| Arc::clone(&arc_proxy));
+                    // Port-scoped host-only siblings share a host key and are
+                    // filtered at lookup time.
+                    target.entry(host.clone()).or_default().push(scoped.clone());
                 }
                 continue;
             };
@@ -2442,52 +2692,40 @@ impl RouterCache {
                     .map(String::from)
                     .collect();
 
-                let add_regex = |target: &mut Vec<RegexRouteEntry>, proxy: &Arc<Proxy>| {
-                    target.push(RegexRouteEntry {
-                        pattern: compiled.clone(),
-                        capture_names: capture_names.clone(),
-                        proxy: Arc::clone(proxy),
-                    });
+                let make_regex_entry = || RegexRouteEntry {
+                    pattern: compiled.clone(),
+                    capture_names: capture_names.clone(),
+                    candidate: scoped.clone(),
                 };
 
                 if proxy.hosts.is_empty() {
-                    add_regex(&mut catch_all_regex, &arc_proxy);
+                    catch_all_regex.push(make_regex_entry());
                 } else {
                     for host in &proxy.hosts {
                         if host.starts_with("*.") {
-                            wildcard_hosts_regex.entry(host.clone()).or_default().push(
-                                RegexRouteEntry {
-                                    pattern: compiled.clone(),
-                                    capture_names: capture_names.clone(),
-                                    proxy: Arc::clone(&arc_proxy),
-                                },
-                            );
+                            wildcard_hosts_regex
+                                .entry(host.clone())
+                                .or_default()
+                                .push(make_regex_entry());
                         } else {
-                            exact_hosts_regex.entry(host.clone()).or_default().push(
-                                RegexRouteEntry {
-                                    pattern: compiled.clone(),
-                                    capture_names: capture_names.clone(),
-                                    proxy: Arc::clone(&arc_proxy),
-                                },
-                            );
+                            exact_hosts_regex
+                                .entry(host.clone())
+                                .or_default()
+                                .push(make_regex_entry());
                         }
                     }
                 }
             } else if let Some(exact_path) = listen_path.strip_prefix('=') {
-                let add_exact_path = |target: &mut Vec<RouteEntry>, proxy: &Arc<Proxy>| {
-                    target.push(RouteEntry {
-                        listen_path: exact_path.to_string(),
-                        proxy: Arc::clone(proxy),
-                    });
-                };
-
                 if proxy.hosts.is_empty() {
-                    add_exact_path(&mut catch_all_exact_paths, &arc_proxy);
+                    catch_all_exact_paths.push(RouteEntry {
+                        listen_path: exact_path.to_string(),
+                        candidate: scoped.clone(),
+                    });
                 } else {
                     for host in &proxy.hosts {
                         let entry = RouteEntry {
                             listen_path: exact_path.to_string(),
-                            proxy: Arc::clone(&arc_proxy),
+                            candidate: scoped.clone(),
                         };
                         if host.starts_with("*.") {
                             wildcard_hosts_exact_paths
@@ -2507,13 +2745,13 @@ impl RouterCache {
                 if proxy.hosts.is_empty() {
                     catch_all.push(RouteEntry {
                         listen_path: listen_path.to_string(),
-                        proxy: Arc::clone(&arc_proxy),
+                        candidate: scoped.clone(),
                     });
                 } else {
                     for host in &proxy.hosts {
                         let entry = RouteEntry {
                             listen_path: listen_path.to_string(),
-                            proxy: Arc::clone(&arc_proxy),
+                            candidate: scoped.clone(),
                         };
                         if host.starts_with("*.") {
                             wildcard_hosts.entry(host.clone()).or_default().push(entry);
@@ -2590,12 +2828,41 @@ impl RouterCache {
 
         // Sort wildcard host-only entries by pattern length descending so
         // more-specific wildcards match first (same ordering as wildcard_hosts).
-        let mut wildcard_host_only_vec: Vec<(String, Arc<Proxy>)> =
+        let mut wildcard_host_only_vec: Vec<(String, Vec<PortScopedProxy>)> =
             wildcard_hosts_host_only.into_iter().collect();
         wildcard_host_only_vec.sort_by_key(|(host, _)| std::cmp::Reverse(host.len()));
 
         let has_host_only_routes =
             !exact_hosts_host_only.is_empty() || !wildcard_host_only_vec.is_empty();
+
+        // Protocol-class remap eligibility: only when the whole table declares
+        // exactly one listen port of that class, so a remapped request can only
+        // ever have meant one listener. Classified per proxy from its own
+        // `(namespace, listen_port)` entry, never from the bare port number.
+        let mut nontls_ports: BTreeSet<u16> = BTreeSet::new();
+        let mut tls_ports: BTreeSet<u16> = BTreeSet::new();
+        for proxy in &config.proxies {
+            if proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            let Some(port) = proxy.listen_port else {
+                continue;
+            };
+            if config
+                .http_tls_listen_ports
+                .contains(&(proxy.namespace.clone(), port))
+            {
+                tls_ports.insert(port);
+            } else {
+                nontls_ports.insert(port);
+            }
+        }
+        let single_nontls_listen_port = (nontls_ports.len() == 1)
+            .then(|| nontls_ports.iter().copied().next())
+            .flatten();
+        let single_tls_listen_port = (tls_ports.len() == 1)
+            .then(|| tls_ports.iter().copied().next())
+            .flatten();
 
         HostRouteTable {
             exact_hosts_exact_paths: exact_hosts_exact_path_indexed,
@@ -2612,6 +2879,8 @@ impl RouterCache {
             has_exact_path_routes,
             has_regex_routes,
             has_host_only_routes,
+            single_nontls_listen_port,
+            single_tls_listen_port,
             mesh_outbound_ports,
             mesh_inbound_ports,
             mesh_tcp_egress,
@@ -2649,10 +2918,13 @@ fn dispatch_port_overrides_for_upstream(
 
 impl IndexedExactPathRoutes {
     fn from_entries(entries: Vec<RouteEntry>) -> Self {
-        let path_index = entries
-            .iter()
-            .map(|entry| (entry.listen_path.clone(), Arc::clone(&entry.proxy)))
-            .collect();
+        let mut path_index: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
+        for entry in entries {
+            path_index
+                .entry(entry.listen_path)
+                .or_default()
+                .push(entry.candidate);
+        }
         Self { path_index }
     }
 
@@ -2664,10 +2936,13 @@ impl IndexedExactPathRoutes {
 impl IndexedPrefixRoutes {
     /// Build from a pre-sorted Vec<RouteEntry> (must already be sorted by length descending).
     fn from_sorted(sorted: Vec<RouteEntry>) -> Self {
-        let path_index: HashMap<String, Arc<Proxy>> = sorted
-            .iter()
-            .map(|entry| (entry.listen_path.clone(), Arc::clone(&entry.proxy)))
-            .collect();
+        let mut path_index: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
+        for entry in sorted {
+            path_index
+                .entry(entry.listen_path)
+                .or_default()
+                .push(entry.candidate);
+        }
         Self { path_index }
     }
 }
@@ -2675,6 +2950,7 @@ impl IndexedPrefixRoutes {
 fn find_exact_path_match_indexed(
     routes: &IndexedExactPathRoutes,
     path: &str,
+    port_ctx: HttpPortMatchContext,
 ) -> Option<RouteMatch> {
     if routes.path_index.is_empty() {
         return None;
@@ -2684,7 +2960,9 @@ fn find_exact_path_match_indexed(
         Some(pos) => &path[..pos],
         None => path,
     };
-    routes.path_index.get(match_path).map(|proxy| RouteMatch {
+    let candidates = routes.path_index.get(match_path)?;
+    let proxy = select_port_aware_proxy(candidates, port_ctx)?;
+    Some(RouteMatch {
         proxy: Arc::clone(proxy),
         path_params: Vec::new(),
         matched_prefix_len: match_path.len(),
@@ -2699,7 +2977,11 @@ fn find_exact_path_match_indexed(
 ///
 /// This is the key optimization that prevents throughput degradation as proxy count
 /// scales from tens to tens of thousands.
-fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option<RouteMatch> {
+fn find_prefix_match_indexed(
+    routes: &IndexedPrefixRoutes,
+    path: &str,
+    port_ctx: HttpPortMatchContext,
+) -> Option<RouteMatch> {
     if routes.path_index.is_empty() {
         return None;
     }
@@ -2710,13 +2992,19 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
         None => path,
     };
 
-    // 1. Exact match (most common case for the scale test pattern)
-    if let Some(proxy) = routes.path_index.get(match_path) {
-        return Some(RouteMatch {
+    let pick = |candidates: &Vec<PortScopedProxy>, matched_prefix_len: usize| {
+        select_port_aware_proxy(candidates, port_ctx).map(|proxy| RouteMatch {
             proxy: Arc::clone(proxy),
             path_params: Vec::new(),
-            matched_prefix_len: match_path.len(),
-        });
+            matched_prefix_len,
+        })
+    };
+
+    // 1. Exact match (most common case for the scale test pattern)
+    if let Some(candidates) = routes.path_index.get(match_path)
+        && let Some(route_match) = pick(candidates, match_path.len())
+    {
+        return Some(route_match);
     }
 
     // 2. Walk backwards through "/" boundaries for longest-prefix match.
@@ -2727,38 +3015,26 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
         match match_path[..search_end].rfind('/') {
             Some(0) => {
                 // Try "/" as a listen_path
-                if let Some(proxy) = routes.path_index.get("/") {
-                    return Some(RouteMatch {
-                        proxy: Arc::clone(proxy),
-                        path_params: Vec::new(),
-                        matched_prefix_len: 1,
-                    });
+                if let Some(candidates) = routes.path_index.get("/")
+                    && let Some(route_match) = pick(candidates, 1)
+                {
+                    return Some(route_match);
                 }
                 break;
             }
             Some(slash_pos) => {
-                // Try with trailing slash: "/api/" matching "/api/users"
-                // (listen_paths ending in "/" pass the boundary check because
-                // the slash IS the boundary)
                 let with_slash = &match_path[..=slash_pos];
-                if let Some(proxy) = routes.path_index.get(with_slash) {
-                    return Some(RouteMatch {
-                        proxy: Arc::clone(proxy),
-                        path_params: Vec::new(),
-                        matched_prefix_len: with_slash.len(),
-                    });
+                if let Some(candidates) = routes.path_index.get(with_slash)
+                    && let Some(route_match) = pick(candidates, with_slash.len())
+                {
+                    return Some(route_match);
                 }
 
-                // Try without trailing slash: "/api" matching "/api/users"
-                // `without_slash` is built directly from `slash_pos`, so the
-                // next byte is the segment boundary that made this candidate.
                 let without_slash = &match_path[..slash_pos];
-                if let Some(proxy) = routes.path_index.get(without_slash) {
-                    return Some(RouteMatch {
-                        proxy: Arc::clone(proxy),
-                        path_params: Vec::new(),
-                        matched_prefix_len: without_slash.len(),
-                    });
+                if let Some(candidates) = routes.path_index.get(without_slash)
+                    && let Some(route_match) = pick(candidates, without_slash.len())
+                {
+                    return Some(route_match);
                 }
 
                 search_end = slash_pos;
@@ -2777,31 +3053,54 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
 /// independent of pattern count). When multiple patterns match, the lowest index wins
 /// (preserving config-order / first-match-wins semantics). Only the winning pattern's
 /// individual `Regex` runs `captures()` to extract named groups.
-fn find_regex_match_indexed(routes: &IndexedRegexRoutes, path: &str) -> Option<RouteMatch> {
+fn find_regex_match_indexed(
+    routes: &IndexedRegexRoutes,
+    path: &str,
+    port_ctx: HttpPortMatchContext,
+) -> Option<RouteMatch> {
     if routes.is_empty() {
         return None;
     }
 
-    let (entry, captures) = if let Some(regex_set) = &routes.regex_set {
-        // O(1) amortized: single DFA pass tests all patterns simultaneously
+    // RegexSet preserves config order, but listener scope has to be ranked
+    // before that order: an earlier port-agnostic regex is the fallback on
+    // other frontends and must not shadow an exact-port sibling on its own
+    // listener. Among entries with the same port rank, first match still wins.
+    let mut best: Option<(&RegexRouteEntry, u8)> = None;
+    if let Some(regex_set) = &routes.regex_set {
         let matches = regex_set.matches(path);
-        // First matching index preserves config-order semantics (first-match-wins)
-        let winner_idx = matches.iter().next()?;
-        let entry = &routes.entries[winner_idx];
-        // Only run captures() on the single winning pattern
-        let captures = entry.pattern.captures(path)?;
-        (entry, captures)
+        for idx in matches.iter() {
+            let entry = &routes.entries[idx];
+            let Some(priority) = entry.candidate.match_priority(port_ctx) else {
+                continue;
+            };
+            if best.is_none_or(|(_, current)| priority < current) {
+                best = Some((entry, priority));
+                if priority == 0 {
+                    break;
+                }
+            }
+        }
     } else {
-        // Fallback preserves route behavior when aggregate RegexSet compilation fails.
-        let (entry, captures) = routes
-            .entries
-            .iter()
-            .find_map(|entry| entry.pattern.captures(path).map(|caps| (entry, caps)))?;
-        (entry, captures)
-    };
+        for entry in &routes.entries {
+            let Some(priority) = entry.candidate.match_priority(port_ctx) else {
+                continue;
+            };
+            if !entry.pattern.is_match(path) {
+                continue;
+            }
+            if best.is_none_or(|(_, current)| priority < current) {
+                best = Some((entry, priority));
+                if priority == 0 {
+                    break;
+                }
+            }
+        }
+    }
 
+    let entry = best?.0;
+    let captures = entry.pattern.captures(path)?;
     let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
-
     let path_params: Vec<(String, String)> = entry
         .capture_names
         .iter()
@@ -2811,9 +3110,8 @@ fn find_regex_match_indexed(routes: &IndexedRegexRoutes, path: &str) -> Option<R
                 .map(|m| (name.clone(), m.as_str().to_string()))
         })
         .collect();
-
     Some(RouteMatch {
-        proxy: Arc::clone(&entry.proxy),
+        proxy: Arc::clone(&entry.candidate.proxy),
         path_params,
         matched_prefix_len: matched_len,
     })
@@ -3152,32 +3450,41 @@ fn frequency_aware_evict<V>(
 /// Write the cache key into an existing buffer (zero-allocation on cache hits).
 /// Used by the thread-local fast path in `find_proxy()`.
 #[inline]
-fn write_cache_key(buf: &mut String, host: Option<&str>, path: &str) {
+fn write_cache_key(
+    buf: &mut String,
+    host: Option<&str>,
+    path: &str,
+    frontend_port: Option<u16>,
+    frontend_is_tls: bool,
+) {
     buf.clear();
     if let Some(h) = host {
         buf.push_str(h);
     }
     buf.push('\0');
     buf.push_str(path);
+    buf.push('\0');
+    match frontend_port {
+        Some(port) => {
+            use std::fmt::Write as _;
+            let _ = write!(buf, "{port}");
+        }
+        None => buf.push('*'),
+    }
+    buf.push('\0');
+    buf.push(if frontend_is_tls { 't' } else { 'p' });
 }
 
 /// Allocate a new String for the cache key (used only on cache misses for DashMap insertion).
-fn make_cache_key(host: Option<&str>, path: &str) -> String {
-    match host {
-        Some(h) => {
-            let mut key = String::with_capacity(h.len() + 1 + path.len());
-            key.push_str(h);
-            key.push('\0');
-            key.push_str(path);
-            key
-        }
-        None => {
-            let mut key = String::with_capacity(1 + path.len());
-            key.push('\0');
-            key.push_str(path);
-            key
-        }
-    }
+fn make_cache_key(
+    host: Option<&str>,
+    path: &str,
+    frontend_port: Option<u16>,
+    frontend_is_tls: bool,
+) -> String {
+    let mut key = String::with_capacity(host.map(str::len).unwrap_or(0) + path.len() + 16);
+    write_cache_key(&mut key, host, path, frontend_port, frontend_is_tls);
+    key
 }
 
 /// Normalizes percent-encoded slashes in a URL path for route matching.
@@ -3261,6 +3568,7 @@ pub(crate) fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::BackendScheme;
 
     // ── CountMinSketch tests ────────────────────────────────────────────
 
@@ -4239,7 +4547,11 @@ mod tests {
         // covered shard windows; this asserts the reservoir+sketch keeps them.
         let surviving_hot = hot
             .iter()
-            .filter(|h| cache.prefix_cache.contains_key(&make_cache_key(None, h)))
+            .filter(|h| {
+                cache
+                    .prefix_cache
+                    .contains_key(&make_cache_key(None, h, None, false))
+            })
             .count();
         assert_eq!(
             surviving_hot,
@@ -4452,6 +4764,8 @@ mod tests {
                 Some("ratings"),
                 "/",
                 Some(MeshTrafficDirection::Outbound),
+                None,
+                false,
             )
             .expect("outbound listener serves the outbound route");
         assert_eq!(outb.proxy.id, "__mesh-outbound-default-ratings-8080");
@@ -4463,13 +4777,22 @@ mod tests {
                     Some("ratings"),
                     "/",
                     Some(MeshTrafficDirection::Inbound),
+                    None,
+                    false,
                 )
                 .is_none(),
             "an outbound route must not serve on the inbound listener"
         );
         assert!(
             cache
-                .resolve_route_excluding_wrong_direction(&table, Some("ratings"), "/", None)
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("ratings"),
+                    "/",
+                    None,
+                    None,
+                    false
+                )
                 .is_none(),
             "a non-mesh listener serves no direction-scoped mesh route"
         );
@@ -4492,6 +4815,8 @@ mod tests {
                     Some("reviews"),
                     "/",
                     Some(MeshTrafficDirection::Inbound),
+                    None,
+                    false,
                 )
                 .expect("inbound listener serves the inbound route")
                 .proxy
@@ -4505,6 +4830,8 @@ mod tests {
                     Some("reviews"),
                     "/",
                     Some(MeshTrafficDirection::Outbound),
+                    None,
+                    false,
                 )
                 .is_none(),
             "an inbound route must not serve on the outbound listener"
@@ -4849,7 +5176,7 @@ mod tests {
         };
         let new_table = RouterCache::build_route_table_snapshot(&new_config);
         let matched = cache
-            .find_proxy_in_snapshot(&new_table, 2, None, "/api/a")
+            .find_proxy_in_snapshot(&new_table, 2, None, "/api/a", None, false)
             .expect("new route should match");
         assert_eq!(matched.proxy.id, "new");
 
@@ -4885,7 +5212,7 @@ mod tests {
         };
         let new_table = RouterCache::build_route_table_snapshot(&new_config);
         let matched = cache
-            .find_proxy_in_snapshot(&new_table, 2, None, "/item/1")
+            .find_proxy_in_snapshot(&new_table, 2, None, "/item/1", None, false)
             .expect("new regex should match");
         assert_eq!(matched.proxy.id, "new-regex");
 
@@ -4951,7 +5278,14 @@ mod tests {
         let snapshot = cache.route_snapshot_for_tests();
         assert_eq!(snapshot.generation, 2);
         let new = cache
-            .find_proxy_in_snapshot(&snapshot.table, snapshot.generation, None, "/api/resource")
+            .find_proxy_in_snapshot(
+                &snapshot.table,
+                snapshot.generation,
+                None,
+                "/api/resource",
+                None,
+                false,
+            )
             .expect("new route should match through the published snapshot");
         assert_eq!(new.proxy.id, "new");
     }
@@ -5847,6 +6181,79 @@ mod tests {
         let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_udp_egress_table_routes_external_service_entry_endpoints() {
+        // Issue #3263 source side: an external ServiceEntry endpoint route folds
+        // into the SAME (dest ip, port) index the in-mesh datapath uses, so a
+        // captured datagram to the endpoint the DNS proxy answered with relays
+        // through the EgressGateway upstream. A route whose upstream did not
+        // materialize is CloseNotRoutable (drop), never a guess, and an in-mesh
+        // VIP claim on the same pair always wins.
+        use crate::modes::mesh::config::{MeshConfig, MeshExternalUdpEgressRoute};
+        let route = MeshExternalUdpEgressRoute {
+            namespace: "default".to_string(),
+            service_entry: "syslog".to_string(),
+            port: 514,
+            dest_ip: "203.0.113.7".to_string(),
+            upstream_id: "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7".to_string(),
+            service_fqdn: "syslog.external.com".to_string(),
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7",
+            "namespace": "default",
+            "name": "syslog.external.com",
+            "targets": [{"host": "egress.istio-system.svc.cluster.local", "port": 514}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                external_udp_egress_routes: vec![route.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        match table.mesh_udp_egress_decision("203.0.113.7:514".parse().expect("addr")) {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(
+                    entry.upstream_id,
+                    "__mesh-out-udp-ext-upstream-default-syslog-514-203-0-113-7"
+                );
+                assert_eq!(entry.service_fqdn, "syslog.external.com");
+                assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Udp));
+            }
+            _ => panic!("expected Relay for an admitted external endpoint"),
+        }
+        // Neighbouring port / address are not external destinations.
+        assert!(
+            table
+                .mesh_udp_egress_decision("203.0.113.7:515".parse().expect("addr"))
+                .is_none()
+        );
+        assert!(
+            table
+                .mesh_udp_egress_decision("203.0.113.8:514".parse().expect("addr"))
+                .is_none()
+        );
+
+        // Route present, upstream withdrawn ⇒ fail closed (drop), never dial.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                external_udp_egress_routes: vec![route],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        assert!(matches!(
+            table.mesh_udp_egress_decision("203.0.113.7:514".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
     }

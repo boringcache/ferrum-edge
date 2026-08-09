@@ -1,8 +1,8 @@
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure, tcp_fault_admission_retry_delays_for_test,
-    tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
-    wait_for_tcp_peer_reset_for_test,
+    classify_stream_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
+    tcp_fault_admission_retry_delays_for_test, tcp_fault_admission_should_cancel_for_test,
+    tcp_stream_summary_from_clocks_for_test, wait_for_tcp_peer_reset_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
@@ -1549,6 +1549,43 @@ fn test_disconnect_cause_missing_side_falls_back_to_recv_error() {
         ),
         DisconnectCause::RecvError,
     );
+}
+
+#[test]
+fn test_client_socket_relay_failures_are_circuit_breaker_neutral() {
+    for failure in [
+        (
+            Direction::ClientToBackend,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Read),
+            String::new(),
+        ),
+        (
+            Direction::BackendToClient,
+            ErrorClass::TlsError,
+            Some(StreamIoSide::Write),
+            String::new(),
+        ),
+    ] {
+        assert!(relay_failure_is_client_facing(&failure));
+    }
+
+    for failure in [
+        (
+            Direction::ClientToBackend,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Write),
+            String::new(),
+        ),
+        (
+            Direction::BackendToClient,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Read),
+            String::new(),
+        ),
+    ] {
+        assert!(!relay_failure_is_client_facing(&failure));
+    }
 }
 
 // ── backend_read_timeout / backend_write_timeout tests ──────────────────────

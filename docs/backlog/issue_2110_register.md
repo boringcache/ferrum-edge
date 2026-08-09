@@ -40,6 +40,7 @@ Current mesh HBONE/DNS perf status lives in
 | Native SMTP/email notification channel | Implemented — [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) (`src/notifications/channels/email.rs`) |
 | MongoDB replica-set change-stream wakeups | Implemented — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs` + `mongo_store.rs`) |
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
+| EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
 
 ## Live dedicated trackers (current backlog)
 
@@ -47,7 +48,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Residual | Issue(s) | Notes |
 |---|---|---|
-| EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
 | Mesh/HBONE/DNS perf baseline publication | [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) | Harnesses exist; `baseline.md` tables still `_TBD_` |
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
@@ -57,7 +57,7 @@ Current mesh HBONE/DNS perf status lives in
 | CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
 | CP/K8s authoritative mesh config revision | [#3611](https://github.com/ferrum-edge/ferrum-edge/issues/3611) | |
-| Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | |
+| Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | Done — `GatewayApiListenerKey` identity, real per-listener socket binding + reload/withdrawal, per-listener cross-kind retention, and `Conflicted` status for same-port incompatible-shape refusals |
 | OIDC RP pending login state (HA) | [#3613](https://github.com/ferrum-edge/ferrum-edge/issues/3613) | |
 | `ai_stream_router` Anthropic multimodal content | [#3616](https://github.com/ferrum-edge/ferrum-edge/issues/3616) | |
 | TCP outbound PROXY protocol v2 | [#3618](https://github.com/ferrum-edge/ferrum-edge/issues/3618) | |

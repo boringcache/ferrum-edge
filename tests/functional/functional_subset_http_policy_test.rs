@@ -556,6 +556,7 @@ fn mesh_runtime_config() -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "0.0.0.0:15090".parse().expect("addr"),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: None,
         xds_node_cluster: "default".to_string(),

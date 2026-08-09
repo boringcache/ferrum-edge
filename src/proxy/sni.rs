@@ -303,6 +303,295 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     parse_client_hello_sni(&handshake)
 }
 
+/// TLS 1.2 cipher suite code points rustls can actually negotiate, grouped by
+/// the kernel TLS cipher family each maps to. Any other offered suite is
+/// unselectable by rustls and therefore cannot influence the negotiated cipher.
+const TLS12_AES128_GCM_SUITES: [u16; 2] = [0xC02B, 0xC02F];
+const TLS12_AES256_GCM_SUITES: [u16; 2] = [0xC02C, 0xC030];
+const TLS12_CHACHA20_POLY1305_SUITES: [u16; 2] = [0xCCA8, 0xCCA9];
+
+/// TLS ClientHello facts that decide Linux kTLS handoff eligibility *before*
+/// any handshake work is performed.
+///
+/// Deciding from the peeked ClientHello is what keeps the fallback free: the
+/// gateway can refuse the kTLS path while the socket is still pristine, so the
+/// ordinary buffered tokio-rustls accept takes over with nothing consumed. It
+/// also avoids paying a second server flight (an extra signature) for the
+/// dominant TLS 1.3 case, which is refused outright because the kernel holds a
+/// static traffic secret and KeyUpdate is not handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientHelloKtlsFacts {
+    /// The client offered TLS 1.3 through `supported_versions` (RFC 8446).
+    pub offers_tls13: bool,
+    /// At least one TLS 1.2 AES-128-GCM suite rustls can select was offered.
+    pub offers_aes128_gcm: bool,
+    /// At least one TLS 1.2 AES-256-GCM suite rustls can select was offered.
+    pub offers_aes256_gcm: bool,
+    /// At least one TLS 1.2 ChaCha20-Poly1305 suite rustls can select was offered.
+    pub offers_chacha20_poly1305: bool,
+    /// A `server_name` extension (RFC 6066, type 0x0000) was present, so the
+    /// buffered accept would have had a hostname to report.
+    pub offers_server_name: bool,
+}
+
+impl ClientHelloKtlsFacts {
+    /// Whether the SNI derived from this peeked ClientHello can stand in for
+    /// the value the buffered accept would have reported.
+    ///
+    /// The kTLS branch has no `ServerConnection::server_name()` to read back —
+    /// `UnbufferedServerConnection` exposes no equivalent accessor — so it
+    /// re-parses the hello with [`extract_sni_from_client_hello`]. That
+    /// validator is deliberately stricter than the `DnsName` rules rustls
+    /// applies to a received SNI: it refuses underscore labels and a trailing
+    /// root dot, both of which rustls accepts and would surface from
+    /// `server_name()`. A present `server_name` extension that yields no
+    /// hostname here would therefore make a handed-off connection report `None`
+    /// where the buffered path reports a name, silently changing what stream
+    /// lifecycle plugins and transaction summaries observe. Declining the
+    /// handoff for those hellos keeps the two paths observationally identical;
+    /// the socket is still pristine, so the buffered accept surfaces rustls's
+    /// own value.
+    pub fn sni_is_representable(&self, parsed_sni: Option<&str>) -> bool {
+        !self.offers_server_name || parsed_sni.is_some()
+    }
+
+    /// Whether a kTLS handoff may be attempted for this ClientHello, given the
+    /// per-cipher handoff-usability results.
+    ///
+    /// The three booleans are *handoff usability*, not bare kernel install
+    /// probes: production marks AES-GCM families unusable (finite
+    /// confidentiality limit; Linux cannot establish a race-free receive-record
+    /// bound after accept) and ChaCha20-Poly1305 usable only when that cipher's
+    /// kernel probe passed.
+    ///
+    /// Fails closed on every axis:
+    /// * a TLS 1.3 offer disqualifies the connection outright, and
+    /// * **every** selectable TLS 1.2 AEAD suite the client offered must be
+    ///   handoff-usable. Predicting rustls's exact suite choice would mean
+    ///   duplicating its selection logic, so an offer set that contains even
+    ///   one unusable suite (AES-GCM under the confidentiality gate, or any
+    ///   suite this kernel cannot install) is declined rather than gambled on.
+    pub fn ktls_eligible(
+        &self,
+        aes128gcm_available: bool,
+        aes256gcm_available: bool,
+        chacha20_poly1305_available: bool,
+    ) -> bool {
+        if self.offers_tls13 {
+            return false;
+        }
+        let mut selectable = false;
+        if self.offers_aes128_gcm {
+            if !aes128gcm_available {
+                return false;
+            }
+            selectable = true;
+        }
+        if self.offers_aes256_gcm {
+            if !aes256gcm_available {
+                return false;
+            }
+            selectable = true;
+        }
+        if self.offers_chacha20_poly1305 {
+            if !chacha20_poly1305_available {
+                return false;
+            }
+            selectable = true;
+        }
+        selectable
+    }
+}
+
+/// Parse kTLS handoff eligibility facts from a TLS ClientHello byte slice.
+///
+/// Returns `None` unless the **complete** ClientHello handshake message is
+/// buffered and well formed. A truncated parse could miss the
+/// `supported_versions` extension and mistake a TLS 1.3 client for a TLS 1.2
+/// one, so partial input is a refusal, never an optimistic answer.
+pub fn client_hello_ktls_facts(data: &[u8]) -> Option<ClientHelloKtlsFacts> {
+    // TLS record header: content_type (1) + version (2) + length (2).
+    if data.len() < 5 || data[0] != 0x16 {
+        return None;
+    }
+
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    let first_payload = data.get(5..5 + record_len.min(data.len() - 5))?;
+
+    // Fast path: the whole ClientHello fits in the first record.
+    if first_payload.len() >= 4 {
+        let msg_len = u24_to_usize(&first_payload[1..4]);
+        if first_payload.len() >= 4 + msg_len {
+            return parse_client_hello_ktls_facts(first_payload);
+        }
+    }
+
+    // Record-fragmented ClientHello: reassemble the handshake layer first.
+    let handshake = reassemble_tls_handshake_records(data)?;
+    parse_client_hello_ktls_facts(&handshake)
+}
+
+/// Parse kTLS facts from a complete handshake message (msg_type + u24 length +
+/// body). Returns `None` if the message is not a fully buffered ClientHello.
+fn parse_client_hello_ktls_facts(handshake: &[u8]) -> Option<ClientHelloKtlsFacts> {
+    if handshake.len() < 4 || handshake[0] != 0x01 {
+        return None;
+    }
+    let body_len = u24_to_usize(&handshake[1..4]);
+    // Strict: the whole body must be present (no `.min(len)` salvage here).
+    let body = handshake.get(4..4usize.checked_add(body_len)?)?;
+    parse_tls_client_hello_ktls_facts(body)
+}
+
+/// Walk a complete ClientHello body for its cipher suite list and the
+/// `supported_versions` extension.
+///
+/// Layout: version (2) + random (32) + session_id_len (1) + session_id (N) +
+///         cipher_suites_len (2) + cipher_suites (N) + compression_len (1) +
+///         compression (N) + [extensions_len (2) + extensions (N)]
+fn parse_tls_client_hello_ktls_facts(body: &[u8]) -> Option<ClientHelloKtlsFacts> {
+    let mut facts = ClientHelloKtlsFacts::default();
+
+    // version (2) + random (32)
+    let mut pos: usize = 34;
+    if body.len() < pos {
+        return None;
+    }
+
+    // session_id
+    let session_id_len = *body.get(pos)? as usize;
+    pos = pos.checked_add(1 + session_id_len)?;
+    if body.len() < pos {
+        return None;
+    }
+
+    // cipher_suites
+    if body.len() < pos.checked_add(2)? {
+        return None;
+    }
+    let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    // RFC 8446 §4.1.2: the vector contains two-byte CipherSuite values and
+    // cannot be empty. An odd or empty vector is not a provable ClientHello;
+    // do not let a trailing byte disappear from the eligibility decision.
+    if cipher_suites_len < 2 || !cipher_suites_len.is_multiple_of(2) {
+        return None;
+    }
+    let suites_start = pos.checked_add(2)?;
+    let suites_end = suites_start.checked_add(cipher_suites_len)?;
+    if body.len() < suites_end {
+        return None;
+    }
+    let mut i = suites_start;
+    while i + 2 <= suites_end {
+        let suite = u16::from_be_bytes([body[i], body[i + 1]]);
+        if TLS12_AES128_GCM_SUITES.contains(&suite) {
+            facts.offers_aes128_gcm = true;
+        } else if TLS12_AES256_GCM_SUITES.contains(&suite) {
+            facts.offers_aes256_gcm = true;
+        } else if TLS12_CHACHA20_POLY1305_SUITES.contains(&suite) {
+            facts.offers_chacha20_poly1305 = true;
+        }
+        i += 2;
+    }
+    pos = suites_end;
+
+    // compression_methods
+    let compression_len = *body.get(pos)? as usize;
+    // The legacy compression vector must contain at least the null method.
+    if compression_len == 0 {
+        return None;
+    }
+    pos = pos.checked_add(1 + compression_len)?;
+    if body.len() < pos {
+        return None;
+    }
+
+    // A ClientHello with no extensions block cannot request TLS 1.3.
+    if body.len() == pos {
+        return Some(facts);
+    }
+
+    // extensions
+    if body.len() < pos.checked_add(2)? {
+        return None;
+    }
+    let extensions_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos = pos.checked_add(2)?;
+    let extensions_end = pos.checked_add(extensions_len)?;
+    // The extension vector is the final ClientHello field. Both truncation and
+    // bytes outside its declared boundary are malformed and must be refused.
+    if body.len() != extensions_end {
+        return None;
+    }
+
+    let scanned = scan_client_hello_extensions(&body[pos..extensions_end])?;
+    facts.offers_tls13 = scanned.offers_tls13;
+    facts.offers_server_name = scanned.offers_server_name;
+    Some(facts)
+}
+
+/// What the ClientHello extension block tells the pre-handshake kTLS gate.
+#[derive(Debug, Clone, Copy, Default)]
+struct ScannedExtensions {
+    /// TLS 1.3 (0x0304) appeared in `supported_versions` (0x002b).
+    offers_tls13: bool,
+    /// A `server_name` extension (0x0000) was present.
+    offers_server_name: bool,
+}
+
+/// Walk the extension list for `supported_versions` (0x002b) and `server_name`
+/// (0x0000), reporting whether TLS 1.3 was offered and whether the hello
+/// carried an SNI extension at all.
+///
+/// Returns `None` on a malformed extension list: callers must treat that as
+/// "cannot prove this is TLS 1.2", never as "this is TLS 1.2".
+fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
+    let mut scanned = ScannedExtensions::default();
+    let mut saw_supported_versions = false;
+
+    while !ext.is_empty() {
+        if ext.len() < 4 {
+            return None;
+        }
+        let ext_type = u16::from_be_bytes([ext[0], ext[1]]);
+        let ext_len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
+        let extension_end = 4usize.checked_add(ext_len)?;
+        if ext.len() < extension_end {
+            return None;
+        }
+        if ext_type == 0x0000 {
+            // Presence only. Whether the name is representable is decided by
+            // `extract_sni_from_client_hello` over the same bytes.
+            scanned.offers_server_name = true;
+        }
+        if ext_type == 0x002b {
+            if saw_supported_versions {
+                // Duplicate extensions are forbidden by the TLS grammar. In
+                // particular, never let an earlier TLS 1.2-only copy hide a
+                // later TLS 1.3 offer from this pre-handshake gate.
+                return None;
+            }
+            saw_supported_versions = true;
+
+            let data = &ext[4..extension_end];
+            // ClientHello form: list_len (1) + versions (2 each).
+            let list_len = *data.first()? as usize;
+            if list_len < 2 || !list_len.is_multiple_of(2) || data.len() != 1 + list_len {
+                return None;
+            }
+            let mut i = 1usize;
+            while i < data.len() {
+                if u16::from_be_bytes([data[i], data[i + 1]]) == 0x0304 {
+                    scanned.offers_tls13 = true;
+                }
+                i += 2;
+            }
+        }
+        ext = &ext[extension_end..];
+    }
+    Some(scanned)
+}
+
 /// Concatenate the handshake-layer payloads of consecutive TLS handshake records
 /// in `data` so a ClientHello fragmented across records can be parsed as one
 /// message. Stops at the first non-handshake record, a record truncated in the

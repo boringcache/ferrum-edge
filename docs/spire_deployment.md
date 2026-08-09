@@ -380,11 +380,11 @@ identity state.
 
 ### North-south gateway pods (database / file / dp / cp modes)
 
-The gateway uses the same gateway-SVID file-watch path that PR-#880's
-trust-bundle changes documented. SPIRE writes the SVID to disk for the gateway
-to pick up, and Ferrum polls the files for atomic content changes once per
-second (see `run_gateway_svid_file_rotation_loop` in
-[`src/proxy/mod.rs`](../src/proxy/mod.rs)).
+The gateway uses the same gateway-SVID watch path that PR-#880's trust-bundle
+changes documented. SPIRE writes the SVID to disk for the gateway to pick up,
+and Ferrum polls the files for atomic content changes once per second (see
+`run_gateway_svid_source_rotation_loop` in
+[`src/identity/svid_source_watch.rs`](../src/identity/svid_source_watch.rs)).
 
 ```bash
 FERRUM_GATEWAY_SVID_CERT_PATH=/etc/ferrum/svid/gateway-chain.pem
@@ -405,6 +405,41 @@ included in the trust bundle.
 Alternative: a small init/sidecar container that runs `spire-agent api fetch
 x509 -write /etc/ferrum/svid/` is simpler if you do not need long-running
 helpers.
+
+#### External-source SVIDs (secret manager, Kubernetes Secret, managed store)
+
+The same three settings accept `_SOURCE` overrides, so a gateway can take its
+SVID from a secret manager or a Kubernetes Secret instead of a mounted file:
+
+```bash
+FERRUM_GATEWAY_SVID_CERT_SOURCE=vault://secret/data/gateway/svid#cert
+FERRUM_GATEWAY_SVID_KEY_SOURCE=vault://secret/data/gateway/svid#key
+FERRUM_GATEWAY_SVID_TRUST_BUNDLE_SOURCE=vault://secret/data/gateway/svid#bundle
+```
+
+These are re-fetched automatically. Each source keeps its own cadence:
+provider URIs (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `acme://`,
+`managed://`) are re-fetched every
+[`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`](configuration.md) (default 300s)
+unless the URI sets its own `?poll=` — for a 1h SVID TTL, `?poll=5m` or the
+default 300s both refresh well inside the SPIFFE half-life rotation window.
+File-backed sources stay on the 1s cadence above. A `k8s://` source uses the
+same provider polling cadence; it does not register a separate Kubernetes
+Secret watch.
+
+Comparison is by configured source identity plus material byte fingerprint
+(and stable kind/scheme); provider version metadata alone does not churn the
+SVID slot or backend pools. A change to any one source reloads all
+three together, so cert, key, and trust bundle never mix generations; a torn
+update fails the key-match check and is refused. A refused reload or an
+unreachable provider keeps the last known-good SVID and does not advance the
+backend SVID generation.
+
+**Inline PEM** (`-----BEGIN ...` supplied directly in the setting) is the one
+static form: it is only re-read on a configuration reload, so rotating an
+inline SVID triple requires updating the configured literal and reloading
+configuration or restarting. Prefer a file or provider source for short-lived
+SVIDs.
 
 ### JWT-SVIDs
 
@@ -440,11 +475,13 @@ The defaults are conservative and match SPIFFE community guidance:
 | Workload X.509-SVID | 1h (configurable per entry) | Agent pushes a fresh SVID over the streaming `FetchX509SVID` RPC roughly halfway through the TTL | The production Workload API fetch loop publishes the new snapshot through `SvidFetchHandle`; reads are lock-free |
 | Trust bundle | rotates with CA TTL (24h default) | Pushed in the same stream when it changes | Ferrum re-validates and stores; mTLS verifiers pick it up via the same `ArcSwap` |
 | Gateway file SVID | matches the file producer (SPIFFE Helper TTL, typically 1h) | File producer writes new content | Ferrum's 1s file-fingerprint poll detects change → bundle reloaded → `backend_svid_rotation_tx` revision bumped → backend TLS configs drained, active HTTP health probes restarted, optional pool drain after [`FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`](configuration.md) |
+| Gateway provider SVID (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `acme://`, `managed://`) | matches the issuing provider (often 1h or shorter) | Provider stores new material | Re-fetched every [`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`](configuration.md) (default 300s) or the source's `?poll=`; changed bytes take the identical reload path as the file SVID row |
+| Gateway inline-PEM SVID | matches whatever produced the literal | Config change only | **Not auto-refreshed.** Update the configured literal and reload configuration or restart |
 
-The narrow live-reload carve-out documented under "TLS Rotation" in
-`CLAUDE.md` is the **only** TLS material Ferrum hot-reloads from disk. Other
-TLS files (frontend cert, frontend key, backend CA bundle outside the gateway
-SVID flow) remain restart-required.
+Gateway SVID material and the live-reload carve-out documented under "TLS
+Rotation" in `CLAUDE.md` are the TLS materials Ferrum hot-reloads. Other TLS
+files (frontend cert, frontend key, backend CA bundle outside the gateway SVID
+flow) remain restart-required unless their own opt-in watcher is enabled.
 
 ### Monitoring
 

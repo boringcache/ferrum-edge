@@ -2393,16 +2393,25 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
         config.consumers.len(),
         config.plugin_configs.len(),
         config.upstreams.len(),
+        config.http_tls_listen_ports.len(),
     );
     config.proxies.retain(|p| p.namespace == namespace);
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    // The Gateway-listener TLS classification is namespace-qualified, so drop
+    // other namespaces' entries with their proxies. Retaining them would leave
+    // this DP able to reclassify nothing (the key would never match), but
+    // dropping keeps the published snapshot minimal and self-consistent.
+    config
+        .http_tls_listen_ports
+        .retain(|(entry_namespace, _)| entry_namespace == namespace);
     let frontend_tls_filtered = filter_frontend_tls_sources_to_namespace(config, namespace);
     (pre.0 - config.proxies.len())
         + (pre.1 - config.consumers.len())
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
+        + (pre.4 - config.http_tls_listen_ports.len())
         + usize::from(frontend_tls_filtered)
 }
 
@@ -2770,6 +2779,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         };
@@ -2785,6 +2795,48 @@ mod tests {
         assert_eq!(cfg.plugin_configs[0].namespace, "production");
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].namespace, "production");
+    }
+
+    /// DP backstop for the same metadata the CP now prunes at its own
+    /// boundary: a snapshot that still carries another namespace's Gateway
+    /// listener classification must not survive the DP filter either.
+    #[test]
+    fn filter_config_strips_foreign_gateway_listener_tls_classification() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy_in_namespace("p-prod", "production")],
+            consumers: Vec::new(),
+            plugin_configs: Vec::new(),
+            upstreams: Vec::new(),
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
+            trust_bundles: None,
+            mesh: None,
+            http_tls_listen_ports: [
+                ("production".to_string(), 8443),
+                ("staging".to_string(), 9443),
+            ]
+            .into_iter()
+            .collect(),
+            mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
+        };
+
+        assert_eq!(
+            filter_config_to_namespace(&mut cfg, "production"),
+            1,
+            "the removed foreign listener classification must trigger the DP warning count"
+        );
+
+        assert_eq!(
+            cfg.http_tls_listen_ports,
+            [("production".to_string(), 8443)].into_iter().collect(),
+            "a foreign namespace's listener port/TLS classification must not survive"
+        );
     }
 
     #[test]
@@ -2803,6 +2855,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         };
