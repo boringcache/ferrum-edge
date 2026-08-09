@@ -314,9 +314,8 @@ fn assert_live_confidentiality_policy(accepted: &KtlsAccepted) {
         policy.stable_receive_ceiling, 0,
         "an unlimited suite must not pin a receive window"
     );
-    assert_eq!(
-        policy.limits.cipher,
-        ktls::KtlsCipher::Chacha20Poly1305,
+    assert!(
+        matches!(policy.limits.cipher, ktls::KtlsCipher::Chacha20Poly1305),
         "the live production handoff must negotiate ChaCha20-Poly1305"
     );
     for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
