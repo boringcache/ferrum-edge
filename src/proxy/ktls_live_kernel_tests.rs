@@ -21,8 +21,9 @@
 //!
 //! # What is proved here, on a real kernel
 //!
-//! 1. A TLS 1.2 client handshakes and the session is handed to the kernel
-//!    (`KtlsAcceptOutcome::Installed`).
+//! 1. A TLS 1.2 ChaCha20-Poly1305 client handshakes and the session is handed
+//!    to the kernel (`KtlsAcceptOutcome::Installed`). An AES-GCM-only offer is
+//!    refused with the socket still pristine before that install path runs.
 //! 2. Application bytes relay in both directions through `splice(2)`, which is
 //!    only possible if the kernel is really decrypting on read and encrypting
 //!    on write.
@@ -35,12 +36,9 @@
 //!    client→backend read failure, not a clean relay close.
 //! 6. A record the kernel cannot authenticate ends the relay with an
 //!    attributed failure and never with EOF.
-//! 7. The handed-off session carries a real per-direction confidentiality
-//!    budget: the negotiated suite's rustls `confidentiality_limit`,
-//!    kernel-reported record sequence numbers that already account for the
-//!    records the handshake itself spent, and a receive window the real kernel
-//!    has actually pinned — `SO_RCVBUF` reads back unchanged after the handoff,
-//!    which is the property the receive record bound is built on.
+//! 7. The handed-off ChaCha20-Poly1305 session carries rustls's unlimited
+//!    confidentiality posture (`u64::MAX`): no per-direction guard is built,
+//!    and no receive window is pinned.
 //!
 //! Peer-originated fatal and non-`close_notify` warning alerts are classified
 //! by [`classify_ktls_control_record`](crate::proxy::ktls_record::classify_ktls_control_record),
@@ -51,16 +49,15 @@
 //!
 //! # Capability gate
 //!
-//! Every test needs a kernel with the TLS ULP and AES-128-GCM kTLS support.
-//! The throwaway client and server providers are deliberately restricted to
-//! the single TLS 1.2 AES-128-GCM suite, so the production admission gate can
-//! prove every offered suite is installable even on hosted kernels that do not
-//! implement ChaCha20-Poly1305 kTLS. This narrows only the test offer set; it
-//! does not weaken production eligibility. Without AES-128 support the tests
-//! print `SKIP:` and pass — unless `FERRUM_KTLS_LIVE_REQUIRED=1`, which turns
-//! an unavailable capability into a failure. The hosted gate sets that
-//! variable, so the required CI signal is "the live path ran", never "the live
-//! path was quietly unavailable".
+//! Every test needs a kernel with the TLS ULP and ChaCha20-Poly1305 kTLS
+//! support (Linux 5.11+). The throwaway client and server providers for the
+//! install path are deliberately restricted to the single TLS 1.2
+//! ChaCha20-Poly1305 suite — the only cipher family production still hands off
+//! — so the admission gate can prove every offered suite is handoff-usable.
+//! Without ChaCha20-Poly1305 support the tests print `SKIP:` and pass — unless
+//! `FERRUM_KTLS_LIVE_REQUIRED=1`, which turns an unavailable capability into a
+//! failure. The hosted gate sets that variable, so the required CI signal is
+//! "the live path ran", never "the live path was quietly unavailable".
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,7 +67,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::plugins::Direction;
 use crate::proxy::ktls_accept::{KtlsAcceptOutcome, KtlsAccepted, try_ktls_accept};
@@ -111,10 +108,10 @@ fn kernel_supports_live_ktls() -> bool {
     let aes128 = ktls::is_ktls_aes128gcm_available();
     let aes256 = ktls::is_ktls_aes256gcm_available();
     let chacha = ktls::is_ktls_chacha20_poly1305_available();
-    // The live provider below offers only AES-128-GCM, so that is the only
-    // capability this proof needs. Keep the other probes in the diagnostic so
-    // a red hosted gate still explains the runner's full kTLS posture.
-    if aes128 {
+    // Production hands off only ChaCha20-Poly1305. Keep the AES probes in the
+    // diagnostic so a red hosted gate still explains the runner's full kTLS
+    // posture.
+    if chacha {
         return true;
     }
     let probes = format!("aes128={aes128} aes256={aes256} chacha20={chacha}");
@@ -125,30 +122,36 @@ fn kernel_supports_live_ktls() -> bool {
     false
 }
 
-/// Provider for the live proof, restricted to one TLS 1.2 cipher that the
-/// hosted Linux kTLS gate supports.
-///
-/// Production remains conservative and declines a ClientHello unless every
-/// selectable TLS 1.2 suite it offered has kernel support. Restricting this
-/// throwaway test provider is how the live proof supplies such an offer set on
-/// kernels that support AES-GCM but not ChaCha20-Poly1305 kTLS.
-fn live_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+/// Restrict a provider to one TLS 1.2 suite used by the live proof.
+fn live_crypto_provider_for(suite: rustls::CipherSuite) -> Arc<rustls::crypto::CryptoProvider> {
     let mut provider = crate::fips::base_crypto_provider();
-    provider.cipher_suites.retain(|suite| {
-        suite.suite() == rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-    });
+    provider.cipher_suites.retain(|s| s.suite() == suite);
     assert_eq!(
         provider.cipher_suites.len(),
         1,
-        "the base provider must expose the TLS 1.2 AES-128-GCM live-test suite"
+        "the base provider must expose the requested TLS 1.2 live-test suite {suite:?}"
     );
     Arc::new(provider)
 }
 
-/// Frontend `ServerConfig`: TLS 1.2 only, self-signed ECDSA leaf, kTLS secret
-/// extraction enabled exactly as `enable_secret_extraction_for_ktls` does in
-/// production.
-fn live_server_config() -> Arc<ServerConfig> {
+/// Provider for the production handoff proof: TLS 1.2 ChaCha20-Poly1305 only.
+fn live_chacha_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    live_crypto_provider_for(
+        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    )
+}
+
+/// Provider for the AES refusal proof: TLS 1.2 AES-128-GCM only.
+fn live_aes128_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    live_crypto_provider_for(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+}
+
+/// Frontend `ServerConfig` for `provider`: TLS 1.2 only, self-signed ECDSA
+/// leaf, kTLS secret extraction enabled exactly as
+/// `enable_secret_extraction_for_ktls` does in production.
+fn live_server_config_with(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Arc<ServerConfig> {
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("generate an ECDSA P-256 key pair");
     let params = rcgen::CertificateParams::new(vec![LIVE_SNI.to_string()])
@@ -158,7 +161,6 @@ fn live_server_config() -> Arc<ServerConfig> {
         .expect("self-sign the live test certificate");
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-    let provider = live_crypto_provider();
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
         .expect("TLS 1.2 is a supported protocol version")
@@ -171,9 +173,12 @@ fn live_server_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
+fn live_server_config() -> Arc<ServerConfig> {
+    live_server_config_with(live_chacha_provider())
+}
+
 /// TLS 1.2-only client that trusts the throwaway self-signed leaf.
-fn live_connector() -> TlsConnector {
-    let provider = live_crypto_provider();
+fn live_connector_with(provider: Arc<rustls::crypto::CryptoProvider>) -> TlsConnector {
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
         .expect("TLS 1.2 is a supported protocol version")
@@ -181,6 +186,10 @@ fn live_connector() -> TlsConnector {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+fn live_connector() -> TlsConnector {
+    live_connector_with(live_chacha_provider())
 }
 
 fn live_server_name() -> ServerName<'static> {
@@ -204,6 +213,68 @@ async fn accept_ktls(listener: &TcpListener, config: &Arc<ServerConfig>) -> Ktls
     }
 }
 
+/// Prove AES-GCM offers are refused before any TLS byte is consumed.
+///
+/// The declined stream must still complete an ordinary buffered tokio-rustls
+/// accept, which is the production fallback contract for a pristine socket.
+async fn assert_aes_gcm_offer_is_refused_with_socket_untouched() {
+    let aes_config = live_server_config_with(live_aes128_provider());
+    let acceptor = TlsAcceptor::from(aes_config.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind AES-refusal listener");
+    let addr = listener.local_addr().expect("AES-refusal listener address");
+
+    let client = tokio::spawn(async move {
+        let connector = live_connector_with(live_aes128_provider());
+        let tcp = TcpStream::connect(addr)
+            .await
+            .expect("AES client connects");
+        let mut tls = connector
+            .connect(live_server_name(), tcp)
+            .await
+            .expect("buffered fallback must complete the AES-GCM handshake");
+        tls.write_all(b"ok").await.expect("AES client writes");
+        tls.flush().await.expect("AES client flush");
+        let mut got = [0u8; 2];
+        tls.read_exact(&mut got)
+            .await
+            .expect("AES client reads the buffered-accept reply");
+        assert_eq!(&got, b"ok");
+        tls.shutdown().await.expect("AES client close_notify");
+    });
+
+    let (stream, peer) = listener.accept().await.expect("AES frontend accept");
+    let budget = Duration::from_secs(HANDSHAKE_SECS);
+    let deadline = Some(tokio::time::Instant::now() + budget);
+    let declined = match try_ktls_accept(stream, &aes_config, deadline, HANDSHAKE_SECS, &peer, false)
+        .await
+    {
+        KtlsAcceptOutcome::Declined(stream) => stream,
+        KtlsAcceptOutcome::Installed(_) => {
+            panic!("AES-GCM must never reach kTLS install under the production gate")
+        }
+        KtlsAcceptOutcome::Failed(e) => {
+            panic!("AES-GCM refusal must be a clean Declined, not Failed: {e}")
+        }
+    };
+
+    let mut tls = acceptor
+        .accept(declined)
+        .await
+        .expect("declined AES stream must still complete the buffered rustls accept");
+    let mut got = [0u8; 2];
+    tls.read_exact(&mut got)
+        .await
+        .expect("buffered accept reads the client payload");
+    assert_eq!(&got, b"ok");
+    tls.write_all(b"ok").await.expect("buffered accept replies");
+    tls.flush().await.expect("buffered accept flush");
+    tls.shutdown().await.expect("buffered accept close_notify");
+
+    client.await.expect("AES refusal client task");
+}
+
 /// Run the relay with the client leg marked as kernel-TLS terminated, bounded
 /// so a wedged direction fails the test instead of hanging CI.
 async fn run_ktls_relay(accepted: KtlsAccepted, backend: TcpStream) -> StreamCopyResult {
@@ -222,89 +293,41 @@ async fn run_ktls_relay(accepted: KtlsAccepted, backend: TcpStream) -> StreamCop
         .expect("the kTLS splice relay must terminate within its budget")
 }
 
-/// Pin the confidentiality budget the real kernel handed back.
+/// Pin the unlimited confidentiality posture the real ChaCha handoff handed back.
 ///
-/// This is the half of the #3619 budget contract that only a live kernel can
-/// answer: that `getsockopt(SOL_TLS, TLS_TX | TLS_RX)` really does report a
-/// per-direction record sequence number, that AES-128-GCM really is a limited
-/// suite (`1 << 24`, straight from the rustls provider), and that the
-/// handshake's own records are already counted — a TLS 1.2 server has
-/// encrypted and decrypted at least its `Finished` record before handoff, so a
-/// budget seeded at zero would be provably wrong.
+/// Production refuses every finite-limit suite before install, so the live
+/// remaining handoff must be ChaCha20-Poly1305 with rustls's `u64::MAX`
+/// encoding, no per-direction guard, and no pinned receive ceiling.
 fn assert_live_confidentiality_policy(accepted: &KtlsAccepted) {
     let policy = accepted.confidentiality;
     assert!(
-        policy.limits.requires_enforcement(),
-        "AES-128-GCM must carry a finite confidentiality limit, got {}",
+        !policy.limits.requires_enforcement(),
+        "ChaCha20-Poly1305 must carry an unlimited confidentiality posture, got {}",
         policy.limits.confidentiality_limit
     );
     assert_eq!(
         policy.limits.confidentiality_limit,
-        1 << 24,
-        "the pinned rustls TLS 1.2 AES-GCM providers limit a traffic key to 2^24 records"
+        u64::MAX,
+        "the pinned rustls TLS 1.2 ChaCha20-Poly1305 providers encode unlimited as u64::MAX"
     );
-    assert!(
-        ktls::is_ktls_record_seq_observable(ktls::KtlsCipher::Aes128Gcm),
-        "a limited suite can only be handed off on a kernel that reports record sequences"
+    assert_eq!(
+        policy.stable_receive_ceiling, 0,
+        "an unlimited suite must not pin a receive window"
     );
-    assert!(
-        policy.initial_transmit_seq >= 1,
-        "the handshake's own transmitted records must already be counted, got {}",
-        policy.initial_transmit_seq
+    assert_eq!(
+        policy.limits.cipher,
+        ktls::KtlsCipher::Chacha20Poly1305,
+        "the live production handoff must negotiate ChaCha20-Poly1305"
     );
-    assert!(
-        policy.initial_receive_seq >= 1,
-        "the handshake's own received records must already be counted, got {}",
-        policy.initial_receive_seq
-    );
-    let threshold = policy.limits.threshold();
-    assert!(
-        policy.initial_transmit_seq < threshold && policy.initial_receive_seq < threshold,
-        "a fresh session must start well inside its budget"
-    );
-    assert_live_receive_window_is_pinned(accepted, &policy);
-    // Both guards must build; an already-exhausted direction would refuse the
-    // relay outright.
     for direction in [KtlsDirection::Transmit, KtlsDirection::Receive] {
         let guard = policy
             .guard(direction)
-            .unwrap_or_else(|e| panic!("{direction} guard must build on a fresh session: {e}"))
-            .unwrap_or_else(|| panic!("{direction} must be enforced for AES-128-GCM"));
-        assert_eq!(guard.threshold(), threshold);
-        assert!(guard.allowance() > 0, "a fresh window must be open");
+            .unwrap_or_else(|e| panic!("{direction} guard must build on a fresh session: {e}"));
+        assert!(
+            guard.is_none(),
+            "{direction} must be unenforced for unlimited ChaCha20-Poly1305"
+        );
     }
-}
-
-/// Prove on a real kernel that the receive window the budget was sized against
-/// is the socket's own, and that the kernel is holding it still.
-///
-/// The receive record bound is only sound if `sk_rcvbuf` cannot grow after the
-/// handoff. `setsockopt(SO_RCVBUF)` sets `SOCK_RCVBUF_LOCK`, which is what makes
-/// that true, but only a live kernel can show that the value the policy carries
-/// really came from this socket and really survives the key install: the pinned
-/// size is read back here, after `enable_ktls` ran, and must still account for
-/// the whole ceiling.
-fn assert_live_receive_window_is_pinned(
-    accepted: &KtlsAccepted,
-    policy: &crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy,
-) {
-    use crate::proxy::ktls_confidentiality::KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES;
-    use std::os::unix::io::AsRawFd;
-
-    let fd = accepted.stream.as_raw_fd();
-    let live = ktls::socket_receive_buffer_bytes(fd)
-        .expect("a kTLS socket must still report SO_RCVBUF after the key install");
-    assert!(
-        live > 0,
-        "a pinned receive buffer must read back as a positive size"
-    );
-    assert!(
-        policy.stable_receive_ceiling >= live + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
-        "the ceiling ({}) must cover the pinned buffer ({live}) plus its overshoot headroom",
-        policy.stable_receive_ceiling
-    );
-    let again = ktls::socket_receive_buffer_bytes(fd).expect("SO_RCVBUF stays readable");
-    assert_eq!(live, again, "a pinned receive buffer must not move");
 }
 
 /// Bind a loopback listener and report its address.
@@ -323,6 +346,11 @@ async fn ktls_live_relays_plaintext_and_completes_the_tls_close_handshake() {
         return;
     }
     tokio::time::timeout(LIVE_TEST_BUDGET, async {
+        // Folded into this test so the required live gate's pass count stays
+        // three: AES-GCM is refused with the socket untouched before the
+        // ChaCha20-Poly1305 install proof below.
+        assert_aes_gcm_offer_is_refused_with_socket_untouched().await;
+
         let server_config = live_server_config();
         let (frontend, frontend_addr) = loopback_listener().await;
         let (backend_listener, backend_addr) = loopback_listener().await;

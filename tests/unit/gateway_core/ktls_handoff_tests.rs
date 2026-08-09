@@ -136,7 +136,7 @@ fn tls13_only_client_is_refused() {
 }
 
 #[test]
-fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
+fn tls12_only_client_offering_aes_is_refused_under_production_handoff_usability() {
     let hello = client_hello_for(&[&rustls::version::TLS12]);
     let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
@@ -145,17 +145,23 @@ fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
         "a TLS 1.2-only rustls client must not advertise TLS 1.3"
     );
     assert!(
-        facts.offers_aes128_gcm || facts.offers_aes256_gcm || facts.offers_chacha20_poly1305,
-        "rustls TLS 1.2 always offers at least one AEAD suite"
+        facts.offers_aes128_gcm || facts.offers_aes256_gcm,
+        "rustls TLS 1.2 offers at least one AES-GCM suite"
     );
+    // Production `cipher_handoff_usable` never marks AES-GCM handoff-usable.
     assert!(
-        eligible(&facts, ALL_CIPHERS),
-        "a TLS 1.2 client whose whole offer set is installable is eligible"
+        !eligible(&facts, (false, false, true)),
+        "an offer set containing AES-GCM must decline under production handoff usability"
     );
 }
 
 #[test]
-fn every_aes_offer_requires_the_receive_window_to_be_pinned_before_handshake() {
+fn finite_limit_aes_offers_are_refused_and_chacha_only_remains_eligible() {
+    // Production handoff usability: AES-GCM is never usable; ChaCha20-Poly1305
+    // is usable only when its kernel probe passed.
+    const PRODUCTION_WITH_CHACHA: (bool, bool, bool) = (false, false, true);
+    const PRODUCTION_WITHOUT_CHACHA: (bool, bool, bool) = (false, false, false);
+
     let aes128 = ClientHelloKtlsFacts {
         offers_aes128_gcm: true,
         ..ClientHelloKtlsFacts::default()
@@ -170,11 +176,21 @@ fn every_aes_offer_requires_the_receive_window_to_be_pinned_before_handshake() {
         ..ClientHelloKtlsFacts::default()
     };
 
-    assert!(aes128.requires_receive_window_pin());
-    assert!(aes256_and_chacha.requires_receive_window_pin());
     assert!(
-        !chacha_only.requires_receive_window_pin(),
-        "the unlimited suite must retain receive autotuning"
+        !eligible(&aes128, PRODUCTION_WITH_CHACHA),
+        "AES-only offers must be refused"
+    );
+    assert!(
+        !eligible(&aes256_and_chacha, PRODUCTION_WITH_CHACHA),
+        "any AES offer fails closed even when ChaCha is also selectable"
+    );
+    assert!(
+        eligible(&chacha_only, PRODUCTION_WITH_CHACHA),
+        "ChaCha-only is eligible when the ChaCha kernel capability is available"
+    );
+    assert!(
+        !eligible(&chacha_only, PRODUCTION_WITHOUT_CHACHA),
+        "ChaCha-only declines when the ChaCha kernel capability is unavailable"
     );
 }
 

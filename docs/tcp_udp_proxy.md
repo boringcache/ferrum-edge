@@ -438,7 +438,7 @@ and is never dropped for it.
 | --- | --- | --- |
 | Platform | Linux with the `tls` kernel module (`modprobe tls`) | userspace relay |
 | TLS version | **TLS 1.2 only** | userspace relay |
-| Cipher | `ECDHE_{RSA,ECDSA}_WITH_AES_128_GCM_SHA256`, `..._AES_256_GCM_SHA384` (Linux 4.13/4.17+), `..._CHACHA20_POLY1305_SHA256` (Linux 5.11+), each gated on its own startup probe | userspace relay |
+| Cipher | `ECDHE_{RSA,ECDSA}_WITH_CHACHA20_POLY1305_SHA256` (Linux 5.11+), gated on its own startup probe. TLS 1.2 AES-GCM suites stay on the userspace rustls relay — Linux cannot establish a race-free receive-record bound after accept (`FIONREAD` omits out-of-order skbs) | userspace relay |
 | Backend | plain `tcp` backend | userspace relay |
 | Plugins | no plugin requesting decrypted first bytes | userspace relay |
 | Frontend mode | terminating `tcp_tls` (not `passthrough`) | unchanged |
@@ -481,11 +481,12 @@ Eligibility is decided from a **peeked** (never consumed) ClientHello, so all
 of the following decline with the socket byte-for-byte intact and the ordinary
 buffered tokio-rustls accept takes over: secret extraction not enabled on the
 listener, no kernel cipher probe passed, no complete ClientHello observable
-before `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, a TLS 1.3 offer, an
-offer set containing any suite this kernel cannot install, a `server_name`
-extension whose hostname this path cannot reproduce as faithfully as
-`ServerConnection::server_name()` would (see "Observability and semantics"),
-or a `TCP_ULP` install failure.
+before `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, a TLS 1.3 offer, any
+selectable AES-GCM suite in the offer set (finite confidentiality limit), an
+offer set containing any suite this kernel cannot install for the remaining
+unlimited ChaCha20-Poly1305 path, a `server_name` extension whose hostname this
+path cannot reproduce as faithfully as `ServerConnection::server_name()` would
+(see "Observability and semantics"), or a `TCP_ULP` install failure.
 `TCP_ULP` is installed *before* the handshake precisely so its
 failure is still recoverable; with no keys installed the ULP is the kernel's
 transparent `TLS_BASE` variant, so the userspace relay on the decline path is
@@ -641,8 +642,10 @@ classifier unit tests are not accepted as evidence on their own. The required
 Linux runner's real kernel with `FERRUM_KTLS_LIVE_REQUIRED=1`, which proves, on
 every pull request:
 
-1. a real rustls TLS 1.2 client reaches `KtlsAcceptOutcome::Installed` — the
-   kernel actually took the keys;
+1. a real rustls TLS 1.2 ChaCha20-Poly1305 client reaches
+   `KtlsAcceptOutcome::Installed` — the kernel actually took the keys — and an
+   AES-GCM-only offer is refused with the socket still pristine (folded into
+   the same test so the required pass count stays three);
 2. application bytes relay both ways through `splice(2)`, i.e. the kernel is
    really decrypting on read and encrypting on write;
 3. an authenticated `close_notify` is a clean EOF that half-closes the backend
@@ -654,22 +657,22 @@ every pull request:
    failure; and
 6. a record the kernel cannot authenticate ends the relay with an attributed
    failure and never with an EOF; and
-7. the handed-off session carries a real per-direction confidentiality budget —
-   the negotiated suite's rustls `confidentiality_limit` (2^24 for AES-128-GCM)
-   plus kernel-reported record sequence numbers that already account for the
-   records the handshake itself spent.
+7. the handed-off ChaCha20-Poly1305 session carries rustls's unlimited
+   confidentiality posture (`u64::MAX`): no per-direction guard is built and no
+   receive window is pinned.
 
-Case 7 is asserted inside case 1's test rather than as a fourth test, so the
-required live gate's expected pass count stays at three.
+Case 7 (and the AES refusal in case 1) is asserted inside case 1's test rather
+than as a fourth test, so the required live gate's expected pass count stays at
+three.
 
-The tests are `#[ignore]`d by default and pin their throwaway TLS 1.2 client
-and server to AES-128-GCM, so the kernel gate needs that kTLS family without
-requiring hosted kernels to implement ChaCha20-Poly1305 too. Production
-eligibility is unchanged: it still requires every selectable suite in the
-actual ClientHello to be installable. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
-unavailable AES-128 capability into a failure rather than a skip, and the CI
-step also fails on any `SKIP:` line or on a pass count other than three — so a
-green required check cannot mean "the live path did not run".
+The tests are `#[ignore]`d by default and pin their throwaway TLS 1.2 install
+client and server to ChaCha20-Poly1305 — the only cipher family production still
+hands off — so the hosted kernel gate needs that kTLS family (Linux 5.11+). The
+AES refusal coverage uses a separate AES-128-GCM-only offer set and never
+requires AES kTLS support. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an unavailable
+ChaCha20-Poly1305 capability into a failure rather than a skip, and the CI step
+also fails on any `SKIP:` line or on a pass count other than three — so a green
+required check cannot mean "the live path did not run".
 
 Residual, covered only by the deterministic unit suite: peer-originated fatal
 alerts and non-`close_notify` warning alerts are classified by
@@ -793,7 +796,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. Finite-limit AES-GCM suites remain on the userspace rustls relay because Linux cannot report all out-of-order data admitted before a receive-buffer pin; ChaCha20-Poly1305 (rustls limit `u64::MAX`) remains eligible. |
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (**ChaCha20-Poly1305 on Linux 5.11+** is the only handoff-eligible family; AES-128-GCM / AES-256-GCM stay on the userspace rustls relay because Linux cannot report all out-of-order data admitted before a receive-buffer pin; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction), but concurrent io_uring relays are capped at 128 — beyond the cap, additional streams transparently fall back to the async libc splice path, so worst-case io_uring blocking-thread usage is 256. Keep `FERRUM_BLOCKING_THREADS` at the 512 default or higher so other `spawn_blocking` work retains headroom. Each blocking thread consumes ~2-4 MB of stack |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
