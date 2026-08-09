@@ -237,16 +237,16 @@ fn udp_route_materializes_udp_stream_proxy_on_listener_port() {
 }
 
 #[test]
-fn udp_route_without_materialized_listener_falls_back_to_backend_port() {
+fn udp_route_without_materialized_listener_opens_no_listener() {
     let objects = [udp_route("dns", simple_rule("coredns", 5353))];
 
     let translated = translate_k8s_objects(&objects, options());
     let result = translated.expect("translation succeeds");
 
-    assert_eq!(result.config.proxies.len(), 1);
-    let proxy = &result.config.proxies[0];
-    assert_eq!(proxy.listen_port, Some(5353));
-    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
+    assert!(result.config.proxies.is_empty());
+    assert!(result.warnings.iter().any(|warning| {
+        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+    }));
 }
 
 #[test]

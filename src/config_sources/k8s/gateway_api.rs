@@ -5928,7 +5928,9 @@ fn l4_route_proxies(
         )
     };
 
-    // Fail closed on a declared-but-unmatched Gateway parent.
+    // Fail closed when there is no attached Gateway listener. UDPRoute is a
+    // Gateway API-only resource, so unlike the legacy TCPRoute/TLSRoute input
+    // shape it must never use its backend port as an implicit public listener.
     //
     // `materialized_listener_bindings` is the set of concrete listener ports
     // that survived every gate: Gateway identity, `sectionName`/`port`
@@ -5939,15 +5941,15 @@ fn l4_route_proxies(
     // attach to, so it must open nothing — falling through to the backend port
     // would bind an unintended OS listener while status correctly reports
     // `NoMatchingParent` / `NotAllowedByListeners`. The backend-port fallback
-    // below is retained only for the parentless legacy shape (a bare
-    // TCPRoute/TLSRoute/UDPRoute supplied by a non-Kubernetes config source),
-    // which has no parent to contradict — see [`l4_route_declares_parent_ref`]
-    // for why a `UDPRoute` counts a *non-Gateway* parent as a declaration too.
+    // below is retained only for the parentless legacy TCPRoute/TLSRoute shape
+    // supplied by a non-Kubernetes config source.
     //
     // For UDPRoute this set is additionally filtered by same-listener conflict
     // losers: a route that lost ownership of every declared listener opens
     // nothing and creates no upstream, so duplicate OS binds cannot race.
-    if materialized_listener_bindings.is_empty() && l4_route_declares_parent_ref(object, scheme) {
+    if materialized_listener_bindings.is_empty()
+        && (scheme.is_udp() || l4_route_declares_parent_ref(object, scheme))
+    {
         if scheme.is_udp()
             && acc
                 .gateway_api_conflict_losers
@@ -5960,8 +5962,7 @@ fn l4_route_proxies(
             ));
         } else if scheme.is_udp() && !route_declares_gateway_parent_ref(object) {
             acc.warnings.push(format!(
-                "{} {}/{} declares parentRefs with no valid Gateway parent, which Ferrum does not implement \
-                 for UDPRoute; no listener was opened",
+                "{} {}/{} has no valid attached Gateway listener; no listener was opened",
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
         } else {
