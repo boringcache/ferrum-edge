@@ -13,8 +13,9 @@ use dashmap::mapref::entry::Entry;
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::metric_tag_cel::{
-    MetricTagCelAttr, MetricTagCelContext, metadata_destination_port, metadata_request_host,
-    metadata_request_method, sanitize_metric_tag_value,
+    MAX_METRIC_TAG_CEL_AST_NODES, MAX_METRIC_TAG_CEL_NESTING, MetricTagCelAttr,
+    MetricTagCelContext, metadata_destination_port, metadata_request_host, metadata_request_method,
+    sanitize_metric_tag_value,
 };
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
@@ -1624,11 +1625,29 @@ fn evaluate_compact_metric_tag_cel(
 }
 
 fn compact_metric_tag_cel_is_valid(body: &str) -> bool {
-    let mut remaining = body;
-    skip_compact_metric_tag_cel_prefix(&mut remaining).is_some() && remaining.is_empty()
+    let mut nodes = 0usize;
+    compact_metric_tag_cel_is_valid_at_depth(body, 0, &mut nodes)
 }
 
-fn skip_compact_metric_tag_cel_prefix(body: &mut &str) -> Option<()> {
+fn compact_metric_tag_cel_is_valid_at_depth(
+    body: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> bool {
+    let mut remaining = body;
+    skip_compact_metric_tag_cel_prefix(&mut remaining, depth, nodes).is_some()
+        && remaining.is_empty()
+}
+
+fn skip_compact_metric_tag_cel_prefix(
+    body: &mut &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Option<()> {
+    if depth > MAX_METRIC_TAG_CEL_NESTING || *nodes >= MAX_METRIC_TAG_CEL_AST_NODES {
+        return None;
+    }
+    *nodes += 1;
     let op = body.as_bytes().first().copied()?;
     *body = &body[1..];
     match op {
@@ -1654,9 +1673,11 @@ fn skip_compact_metric_tag_cel_prefix(body: &mut &str) -> Option<()> {
             let else_body = after_else_len.get(..else_len)?;
             let after_else = after_else_len.get(else_len..)?;
             *body = after_else;
-            compact_metric_tag_cel_is_valid(then_body)
+            compact_metric_tag_cel_is_valid_at_depth(then_body, depth + 1, nodes)
                 .then_some(())
-                .filter(|()| compact_metric_tag_cel_is_valid(else_body))
+                .filter(|()| {
+                    compact_metric_tag_cel_is_valid_at_depth(else_body, depth + 1, nodes)
+                })
         }
         _ => None,
     }
