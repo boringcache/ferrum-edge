@@ -15,6 +15,7 @@ policy freezes the per-job digest of every Cross-sensitive `ci.yml` job, and
 
 The scanner checks both chart sources (after stripping comments) and manifests
 rendered by Helm, so helpers and expressions cannot conceal dangerous output.
+Rendered checks prefer `FERRUM_TRUSTED_HELM` when CI pins the installer output.
 
 Usage:
   python3 -I .github/scripts/check_node_agent_chart_runtime.py --self-test
@@ -25,14 +26,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Bound helm failure detail so a hostile chart cannot flood CI logs or smuggle
+# oversized stderr into the fail-closed diagnostic.
+MAX_HELM_ERROR_CHARS = 2048
+DEFAULT_HELM_RENDER_TIMEOUT_SECONDS = 60.0
+TRUSTED_HELM_ENV = "FERRUM_TRUSTED_HELM"
+
+EXAMPLE_VALUE_GLOBS: tuple[str, ...] = (
+    "examples/**/*.yaml",
+    "examples/**/*.yml",
+    "examples/**/*.json",
+)
 
 
 def default_repo_root() -> Path:
@@ -181,13 +196,96 @@ def scan_file(root: Path, path: Path) -> list[str]:
     return scan_text(relative, text)
 
 
-def render_mesh_manifests(root: Path) -> list[tuple[str, str]]:
+def _bound_helm_detail(text: str) -> str:
+    cleaned = text.replace("\x00", "").strip()
+    if len(cleaned) <= MAX_HELM_ERROR_CHARS:
+        return cleaned
+    return f"{cleaned[:MAX_HELM_ERROR_CHARS]}...[truncated]"
+
+
+def resolve_helm_binary() -> str:
+    """Resolve the Helm binary used for authoritative rendered-manifest checks.
+
+    Prefer `FERRUM_TRUSTED_HELM` when CI points at the pinned installer output so
+    a later PATH prepend cannot substitute a fake renderer. Fall back to
+    `PATH` lookup for local use. Either source must be a regular executable
+    file (never a symlink). When the trusted env var is set it is mandatory:
+    PATH is not consulted as a silent fallback.
+    """
+
+    trusted = os.environ.get(TRUSTED_HELM_ENV, "").strip()
+    candidate = trusted if trusted else (shutil.which("helm") or "")
+    if not candidate:
+        raise FileNotFoundError("helm is required to inspect rendered chart manifests")
+
+    path = Path(candidate)
+    try:
+        if path.is_symlink():
+            raise FileNotFoundError(
+                f"helm binary must not be a symlink: {candidate}"
+            )
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"helm binary is not a regular file: {candidate}"
+            )
+        mode = path.stat().st_mode
+        if not (mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
+            raise FileNotFoundError(f"helm binary is not executable: {candidate}")
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"helm is required to inspect rendered chart manifests ({exc})"
+        ) from exc
+    return str(path)
+
+
+def iter_mesh_example_value_files(root: Path) -> list[Path]:
+    """Discover ferrum-mesh example inputs in parity with GOVERNED_GLOBS."""
+
+    chart = (root / "charts" / "ferrum-mesh").resolve()
+    examples_root = (chart / "examples").resolve()
+    try:
+        examples_root.relative_to(chart)
+    except ValueError as exc:
+        raise ValueError(
+            "ferrum-mesh examples directory escapes chart boundary"
+        ) from exc
+    if examples_root.is_symlink() or not examples_root.is_dir():
+        return []
+
+    discovered: set[Path] = set()
+    for pattern in EXAMPLE_VALUE_GLOBS:
+        for path in sorted(chart.glob(pattern)):
+            if path.is_symlink():
+                relative = path.resolve().as_posix() if path.exists() else path.as_posix()
+                raise OSError(
+                    f"chart example values must not be a symlink: {relative}"
+                )
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(examples_root)
+                resolved.relative_to(root.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"chart example values escape repository/chart boundary: {path}"
+                ) from exc
+            discovered.add(resolved)
+    return sorted(discovered)
+
+
+def render_mesh_manifests(
+    root: Path,
+    *,
+    helm_bin: str | None = None,
+    timeout_seconds: float = DEFAULT_HELM_RENDER_TIMEOUT_SECONDS,
+) -> list[tuple[str, str]]:
     """Render the security-sensitive workloads with their supported inputs."""
 
-    helm = shutil.which("helm")
-    if helm is None:
-        raise FileNotFoundError("helm is required to inspect rendered chart manifests")
+    helm = helm_bin if helm_bin is not None else resolve_helm_binary()
     chart = root / "charts/ferrum-mesh"
+    if chart.is_symlink() or not chart.is_dir():
+        raise OSError("charts/ferrum-mesh must be a regular directory")
     renders: list[tuple[str, list[str]]] = [
         ("defaults", []),
         (
@@ -195,8 +293,9 @@ def render_mesh_manifests(root: Path) -> list[tuple[str, str]]:
             ["--set", "nodeAgent.enabled=true", "--set", "ambient.enabled=true"],
         ),
     ]
-    for values in sorted((chart / "examples").glob("*.y*ml")):
-        renders.append((f"values:{values.name}", ["--values", str(values)]))
+    for values in iter_mesh_example_value_files(root):
+        label = values.relative_to((root / "charts/ferrum-mesh").resolve()).as_posix()
+        renders.append((f"values:{label}", ["--values", str(values)]))
 
     manifests: list[tuple[str, str]] = []
     for label, extra_args in renders:
@@ -208,18 +307,26 @@ def render_mesh_manifests(root: Path) -> list[tuple[str, str]]:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
             raise OSError(f"helm render {label} timed out") from exc
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
+            detail = _bound_helm_detail(result.stderr) or _bound_helm_detail(
+                result.stdout
+            )
             raise OSError(f"helm render {label} failed: {detail}")
         manifests.append((label, result.stdout))
     return manifests
 
 
-def check_repository(root: Path | None = None, *, render: bool = False) -> list[str]:
+def check_repository(
+    root: Path | None = None,
+    *,
+    render: bool = False,
+    helm_bin: str | None = None,
+    timeout_seconds: float = DEFAULT_HELM_RENDER_TIMEOUT_SECONDS,
+) -> list[str]:
     base = default_repo_root() if root is None else root
     if not base.is_dir():
         raise NotADirectoryError(f"chart check root is not a directory: {base}")
@@ -227,7 +334,9 @@ def check_repository(root: Path | None = None, *, render: bool = False) -> list[
     for path in iter_scan_paths(base):
         findings.extend(scan_file(base, path))
     if render:
-        for label, manifest in render_mesh_manifests(base):
+        for label, manifest in render_mesh_manifests(
+            base, helm_bin=helm_bin, timeout_seconds=timeout_seconds
+        ):
             findings.extend(scan_text(f"helm-render:{label}", manifest))
     return findings
 
@@ -321,6 +430,11 @@ def run_self_test() -> list[str]:
     constructed_render = "path: /var/run/docker.sock"
     if not scan_text("constructed-render", constructed_render):
         failures.append("rendered Helm expression did not expose its prohibited path")
+    constructed_privileged_render = "securityContext:\n  privileged: true\n"
+    if not scan_text("constructed-privileged-render", constructed_privileged_render):
+        failures.append(
+            "rendered Helm privileged assignment did not expose privileged: true"
+        )
 
     with tempfile.TemporaryDirectory(prefix="ferrum-chart-runtime-lint-") as tmp:
         good_root = Path(tmp) / "good"
@@ -539,6 +653,189 @@ spec:
                     failures.append("unreadable chart surface did not fail closed")
         finally:
             target.chmod(0o644)
+
+        example_root = Path(tmp) / "examples-discovery"
+        _required_tree(
+            example_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        _write(
+            example_root / "charts/ferrum-mesh/examples/nested/dev-values.yaml",
+            "nodeAgent:\n  enabled: true\n",
+        )
+        _write(
+            example_root / "charts/ferrum-mesh/examples/nested/prod-values.yml",
+            "ambient:\n  enabled: true\n",
+        )
+        _write(
+            example_root / "charts/ferrum-mesh/examples/nested/extra-values.json",
+            '{"nodeAgent":{"enabled":true}}\n',
+        )
+        try:
+            discovered = {
+                path.relative_to(
+                    (example_root / "charts/ferrum-mesh").resolve()
+                ).as_posix()
+                for path in iter_mesh_example_value_files(example_root)
+            }
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"example discovery raised: {exc}")
+        else:
+            expected = {
+                "examples/nested/dev-values.yaml",
+                "examples/nested/prod-values.yml",
+                "examples/nested/extra-values.json",
+            }
+            if discovered != expected:
+                failures.append(
+                    "example discovery missed nested yaml/yml/json inputs: "
+                    f"{sorted(discovered)}"
+                )
+
+        render_root = Path(tmp) / "render-failures"
+        _required_tree(
+            render_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        bin_dir = Path(tmp) / "fake-helm-bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+
+        missing_helm = bin_dir / "missing"
+        missing_helm.mkdir(parents=True, exist_ok=True)
+        original_path = os.environ.get("PATH", "")
+        original_trusted = os.environ.pop(TRUSTED_HELM_ENV, None)
+        try:
+            os.environ["PATH"] = str(missing_helm)
+            try:
+                check_repository(render_root, render=True)
+            except FileNotFoundError:
+                pass
+            else:
+                failures.append("missing helm binary did not fail closed")
+        finally:
+            os.environ["PATH"] = original_path
+            if original_trusted is not None:
+                os.environ[TRUSTED_HELM_ENV] = original_trusted
+
+        nonzero_helm = bin_dir / "nonzero-helm"
+        _write(
+            nonzero_helm,
+            "#!/bin/sh\n"
+            "echo 'synthetic helm failure detail' >&2\n"
+            "exit 7\n",
+        )
+        nonzero_helm.chmod(0o755)
+        try:
+            check_repository(render_root, render=True, helm_bin=str(nonzero_helm))
+        except OSError as exc:
+            if "helm render" not in str(exc) or "failed" not in str(exc):
+                failures.append(f"nonzero helm render error malformed: {exc}")
+        else:
+            failures.append("nonzero helm render did not fail closed")
+
+        timeout_helm = bin_dir / "timeout-helm"
+        _write(timeout_helm, "#!/bin/sh\nwhile true; do sleep 1; done\n")
+        timeout_helm.chmod(0o755)
+        try:
+            check_repository(
+                render_root,
+                render=True,
+                helm_bin=str(timeout_helm),
+                timeout_seconds=0.05,
+            )
+        except OSError as exc:
+            if "timed out" not in str(exc):
+                failures.append(f"helm timeout error malformed: {exc}")
+        else:
+            failures.append("helm render timeout did not fail closed")
+
+        recording_helm = bin_dir / "recording-helm"
+        record_path = Path(tmp) / "helm-args.txt"
+        _write(
+            recording_helm,
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{record_path}"\n'
+            "cat <<'EOF'\n"
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ok\n"
+            "EOF\n",
+        )
+        recording_helm.chmod(0o755)
+        try:
+            findings = check_repository(
+                example_root, render=True, helm_bin=str(recording_helm)
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"recording helm render raised: {exc}")
+        else:
+            if findings:
+                failures.append(
+                    f"clean example render unexpectedly failed: {findings}"
+                )
+            recorded = (
+                record_path.read_text(encoding="utf-8") if record_path.is_file() else ""
+            )
+            for needle in (
+                "nested/dev-values.yaml",
+                "nested/prod-values.yml",
+                "nested/extra-values.json",
+                "nodeAgent.enabled=true",
+                "ambient.enabled=true",
+            ):
+                if needle not in recorded:
+                    failures.append(
+                        f"recording helm did not receive expected render input "
+                        f"({needle})"
+                    )
+            # defaults + node-agent/ambient + 3 nested examples
+            if recorded.count("template ferrum-runtime-lint") < 5:
+                failures.append(
+                    "recording helm did not observe default, ambient, and "
+                    f"example renders: {recorded.count('template ferrum-runtime-lint')}"
+                )
+
+        hostile_render_helm = bin_dir / "hostile-render-helm"
+        _write(
+            hostile_render_helm,
+            "#!/bin/sh\n"
+            "cat <<'EOF'\n"
+            "apiVersion: apps/v1\n"
+            "kind: DaemonSet\n"
+            "spec:\n"
+            "  template:\n"
+            "    spec:\n"
+            "      containers:\n"
+            "        - securityContext:\n"
+            "            privileged: true\n"
+            "      volumes:\n"
+            "        - hostPath:\n"
+            "            path: /var/run/docker.sock\n"
+            "EOF\n",
+        )
+        hostile_render_helm.chmod(0o755)
+        try:
+            findings = check_repository(
+                render_root, render=True, helm_bin=str(hostile_render_helm)
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"hostile render fixture raised: {exc}")
+        else:
+            if not any("privileged" in finding for finding in findings):
+                failures.append(
+                    "hostile rendered privileged: true was not rejected"
+                )
+            if not any("docker.sock" in finding for finding in findings):
+                failures.append(
+                    "hostile rendered docker.sock mount was not rejected"
+                )
+
+        oversized = "x" * (MAX_HELM_ERROR_CHARS + 50)
+        bounded = _bound_helm_detail(oversized)
+        if "truncated" not in bounded or len(bounded) > MAX_HELM_ERROR_CHARS + 20:
+            failures.append("helm error detail was not bounded")
 
     # The live repository tree must also pass (guards regressing main).
     try:

@@ -936,6 +936,68 @@ def main() -> int:
             "jobs.helm-chart must check out full history so the trusted "
             "base chart runtime checker is reachable"
         )
+    if "Materialize trusted setup-kubernetes-tools" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must materialize trusted setup-kubernetes-tools "
+            "before installing Helm for the chart runtime lint"
+        )
+    if "Install Kubernetes tools" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must install pinned Kubernetes tools before the "
+            "chart runtime lint"
+        )
+    materialize_at = chart_runtime_lint_body.find(
+        "Materialize trusted setup-kubernetes-tools"
+    )
+    install_at = chart_runtime_lint_body.find("Install Kubernetes tools")
+    trusted_check_at = chart_runtime_lint_body.find(
+        "Check node-agent chart runtime mounts"
+    )
+    proposed_check_at = chart_runtime_lint_body.find(
+        "Validate proposed chart runtime lint (non-authoritative)"
+    )
+    if not (
+        0 <= materialize_at < install_at < trusted_check_at < proposed_check_at
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must order trusted setup-kubernetes-tools "
+            "materialization, Kubernetes tools install, trusted chart runtime "
+            "lint, then non-authoritative proposed checker validation"
+        )
+    if "git ls-tree -r --full-tree" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must enumerate trusted setup-kubernetes-tools "
+            "inputs with git ls-tree"
+        )
+    if '"100644"' not in chart_runtime_lint_body or '"100755"' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must require trusted setup-kubernetes-tools "
+            "inputs to be regular non-symlink blobs"
+        )
+    if "extra file not present on trusted base" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must reject extra setup-kubernetes-tools files "
+            "absent from the trusted base"
+        )
+    if "cmp -s" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must byte-compare materialized "
+            "setup-kubernetes-tools inputs against the trusted base"
+        )
+    if "uses: ./.github/actions/setup-kubernetes-tools" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must invoke ./.github/actions/setup-kubernetes-tools"
+        )
+    if "FERRUM_TRUSTED_HELM" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must pin FERRUM_TRUSTED_HELM for authoritative "
+            "rendered-manifest checks"
+        )
+    if "ferrum-k8s-tools/bin/helm" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must point FERRUM_TRUSTED_HELM at the pinned "
+            "installer helm binary"
+        )
     if "check_node_agent_chart_runtime.py" not in chart_runtime_lint_body:
         planner_errors.append(
             "jobs.helm-chart must invoke check_node_agent_chart_runtime.py"
@@ -944,6 +1006,28 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must keep the node-agent chart runtime "
             "mounts step"
+        )
+    if (
+        "Validate proposed chart runtime lint (non-authoritative)"
+        not in chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must validate the proposed chart runtime checker "
+            "in a clearly non-authoritative step"
+        )
+    if 'proposed=.github/scripts/check_node_agent_chart_runtime.py' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must run the proposed in-tree chart runtime "
+            "checker for non-authoritative validation"
+        )
+    if 'python3 -I "$proposed" --self-test' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must self-test the proposed chart runtime checker"
+        )
+    if not re.search(r'(?m)^\s*python3 -I "\$proposed"\s*$', chart_runtime_lint_body):
+        planner_errors.append(
+            "jobs.helm-chart must execute the proposed chart runtime checker "
+            "against the checkout during non-authoritative validation"
         )
     if 'python3 -I "$checker" --self-test' not in chart_runtime_lint_body:
         planner_errors.append(
