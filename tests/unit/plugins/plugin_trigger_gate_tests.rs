@@ -1037,12 +1037,9 @@ async fn stream_triggers_gate_on_network_facts() {
 async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_scheme() {
     let gated = with_trigger(
         make_plugin_config_with_json(
-            "fault",
-            "fault_injection",
-            json!({
-                "abort": {"status_code": 503, "percentage": 100.0},
-                "runtime_overlay_scope": "checkout"
-            }),
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("udp"),
         ),
@@ -1054,7 +1051,7 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
                 "udp",
                 BackendScheme::Udp,
                 19_316,
-                vec!["fault"],
+                vec!["throttle"],
             )],
             vec![gated],
         ),
@@ -1065,11 +1062,16 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
     let mut dtls_frontend = stream_ctx("203.0.113.5");
     dtls_frontend.backend_scheme = BackendScheme::Udp;
     dtls_frontend.frontend_transport = StreamFrontendTransport::Dtls;
+    assert!(matches!(
+        plugin.on_stream_connect(&mut dtls_frontend).await,
+        PluginResult::Continue
+    ));
     assert!(
-        !matches!(
-            plugin.on_stream_connect(&mut dtls_frontend).await,
-            PluginResult::Continue
-        ),
+        dtls_frontend
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("plugin_trigger.throttle.skipped"))
+            .is_none(),
         "DTLS accepted at the frontend must match even when the backend is plain UDP"
     );
 
@@ -1084,7 +1086,7 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
         udp_frontend
             .metadata
             .as_ref()
-            .and_then(|metadata| metadata.get("plugin_trigger.fault.skipped"))
+            .and_then(|metadata| metadata.get("plugin_trigger.throttle.skipped"))
             .map(String::as_str),
         Some("true"),
         "plain UDP must not be mislabeled DTLS by its encrypted backend"
