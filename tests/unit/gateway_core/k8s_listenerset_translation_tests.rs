@@ -312,6 +312,64 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
 }
 
 #[test]
+fn listenerset_outside_source_namespaces_cannot_publish_route_policy() {
+    let mut excluded = listenerset(
+        "excluded-set",
+        "edge",
+        json!([{
+            "name": "http",
+            "port": 8081,
+            "protocol": "HTTP",
+            "hostname": "excluded.example.com",
+            "allowedRoutes": { "namespaces": { "from": "All" } }
+        }]),
+    );
+    excluded.metadata.namespace = "excluded".to_string();
+
+    let mut gateway = http_gateway("edge", None);
+    gateway.spec.as_object_mut().unwrap().insert(
+        "allowedListeners".to_string(),
+        json!({ "namespaces": { "from": "All" } }),
+    );
+
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        excluded,
+        service("backend"),
+        http_route(
+            "must-not-use-excluded-listenerset",
+            json!([{
+                "group": "gateway.networking.k8s.io",
+                "kind": "ListenerSet",
+                "name": "excluded-set",
+                "namespace": "excluded"
+            }]),
+            "excluded.example.com",
+            "/excluded",
+        ),
+    ];
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translate");
+    assert!(
+        skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("must-not-use-excluded-listenerset")
+                && error.contains("not permitted by the target ListenerSet listener")
+        }),
+        "an out-of-scope ListenerSet must not publish route policy: {skipped:?}"
+    );
+    assert!(translation.listenerset_statuses.is_empty());
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.hosts.iter().any(|host| host == "excluded.example.com"))
+    );
+}
+
+#[test]
 fn listenerset_attaches_and_materializes_http_route() {
     let objects = vec![
         gateway_class(),

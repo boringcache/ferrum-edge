@@ -25,7 +25,7 @@ use super::gateway_api::{
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
     GatewayApiListenerPolicy, GatewayApiListenerSetStatus, K8sAccumulator, K8sObject,
-    K8sResourceKey, K8sTranslateError, string_field,
+    K8sResourceKey, K8sTranslateError, includes_object_namespace, string_field,
 };
 use crate::modes::mesh::config::{MeshService, ServicePort};
 
@@ -47,6 +47,7 @@ pub(crate) fn collect_listenersets_from_snapshot(
     let gateways: HashMap<(String, String), &K8sObject> = objects
         .iter()
         .filter(|object| object.kind == "Gateway")
+        .filter(|object| includes_object_namespace(&acc.options, object))
         .filter(|object| acc.gateway_is_managed_by_ferrum(object))
         .map(|object| {
             (
@@ -60,7 +61,7 @@ pub(crate) fn collect_listenersets_from_snapshot(
         .collect();
 
     for object in objects {
-        if object.kind != "ListenerSet" {
+        if object.kind != "ListenerSet" || !includes_object_namespace(&acc.options, object) {
             continue;
         }
         collect_one_listenerset(acc, object, &gateways)?;
