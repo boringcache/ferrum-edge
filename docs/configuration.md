@@ -1140,7 +1140,7 @@ proxies:
     backend_tls_verify_server_cert: false
 ```
 
-**Port validation:** Each `listen_port` must be unique across all stream proxies and must not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Ports set to `0` (disabled) are excluded from conflict checks. In database mode, the Admin API also probes OS-level port availability before accepting the config. See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation including per-mode behavior.
+**Port validation:** A stream `listen_port` normally belongs to one proxy. Multiple proxies may share it only when the complete candidate set forms one validated opaque-TLS SNI group (homogeneous passthrough, or ordinary opaque TCP with at least one `hosts` predicate) or one L4 `stream_match` group; every other duplicate shape is rejected. Ports must not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Ports set to `0` (disabled) are excluded from conflict checks. In database mode, the Admin API probes OS-level availability for a newly owned port, but skips that probe when another validated group member already owns the Ferrum listener that reconcile will rebuild. See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation including per-mode behavior.
 
 ### Service Discovery
 

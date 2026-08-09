@@ -7542,6 +7542,55 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
 }
 
 #[tokio::test]
+async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let tenant_a = json!({
+        "id": "shared-sni-tenant-a",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_a).await;
+    assert_eq!(status, 201, "Create first SNI route failed: {body:?}");
+
+    let tenant_b = json!({
+        "id": "shared-sni-tenant-b",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-b.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-b.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_b).await;
+    assert_eq!(
+        status, 201,
+        "A validated SNI group must survive Admin admission and SQL persistence: {body:?}"
+    );
+
+    let duplicate_owner = json!({
+        "id": "shared-sni-duplicate-owner",
+        "backend_scheme": "tcp",
+        "backend_host": "attacker.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/proxies", &token, &duplicate_owner).await;
+    assert_eq!(status, 409, "An ambiguous SNI owner was persisted: {body:?}");
+    assert!(
+        body.to_string().contains("overlapping hosts"),
+        "Expected the canonical listener-group conflict diagnostic: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

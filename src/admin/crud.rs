@@ -2458,6 +2458,69 @@ pub(crate) async fn check_port_available(
     super::check_port_available(port, bind_address, udp).await
 }
 
+/// Validate the exact stream-listener group produced by creating or updating
+/// `resource` in `namespace`.
+///
+/// Stream ports are no longer unconditionally unique: an opaque-TLS SNI group
+/// or an L4 `stream_match` group deliberately stores multiple proxy rows on one
+/// port. Persistence therefore cannot use a unique `(namespace, listen_port)`
+/// index as its admission rule. Instead, admin writes load the authoritative
+/// namespace snapshot under the namespace admission lease, replace this
+/// resource in the affected port bucket, and run the same group validator used
+/// by file, database-poll, and DP admission.
+///
+/// The returned boolean reports whether another stream proxy already owns the
+/// port. In database mode that means the OS bind probe must be skipped: the
+/// running Ferrum listener is expected to own the socket, and reconcile will
+/// rebuild it as the validated shared listener after the write commits.
+pub(crate) async fn validate_stream_port_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    resource: &Proxy,
+) -> Result<bool, AfterValidateError> {
+    if !resource.dispatch_kind.is_stream() {
+        return Ok(false);
+    }
+    let Some(port) = resource.listen_port else {
+        // The resource-level validator emits the field-specific missing-port
+        // error before this helper is called.
+        return Ok(false);
+    };
+
+    // Classify resource-local mistakes (for example `hosts` on a terminating
+    // or backend-TLS-originating listener) as a field-level bad request. Only
+    // conflicts introduced by combining otherwise-valid rows on one port are
+    // 409 listener-group conflicts.
+    GatewayConfig {
+        proxies: vec![resource.clone()],
+        ..Default::default()
+    }
+    .validate_stream_proxies()
+    .map_err(AfterValidateError::BadRequest)?;
+
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let shares_existing_port = candidate.proxies.iter().any(|proxy| {
+        proxy.namespace == namespace
+            && proxy.id != resource.id
+            && proxy.dispatch_kind.is_stream()
+            && proxy.listen_port == Some(port)
+    });
+    candidate.proxies.retain(|proxy| {
+        proxy.namespace == namespace
+            && proxy.id != resource.id
+            && proxy.dispatch_kind.is_stream()
+            && proxy.listen_port == Some(port)
+    });
+    candidate.proxies.push(resource.clone());
+    candidate
+        .validate_stream_proxies()
+        .map_err(AfterValidateError::Conflict)?;
+    Ok(shares_existing_port)
+}
+
 pub(crate) async fn check_consumer_credential_uniqueness(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -3645,24 +3708,6 @@ impl AdminResource for Proxy {
             }
         }
 
-        if resource.dispatch_kind.is_stream()
-            && let Some(port) = resource.listen_port
-        {
-            match db
-                .check_listen_port_unique(namespace, port, exclude_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(Some(format!(
-                        "listen_port {} is already in use by another proxy",
-                        port
-                    )));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
         Ok(None)
     }
 
@@ -3778,6 +3823,12 @@ impl AdminResource for Proxy {
             Err(error) => return Err(AfterValidateError::Db(error)),
         }
 
+        // Validate the exact post-write stream listener bucket before any
+        // persistence. A valid shared SNI/L4 port is admitted; every invalid
+        // duplicate remains fail-closed with the canonical group diagnostic.
+        let shares_existing_stream_port =
+            validate_stream_port_candidate(db, namespace, resource).await?;
+
         // HTTP proxy associations can make a dormant/global `san_dns` policy
         // effective just as stream proxies can. The candidate helper checks
         // every transport but returns immediately when this proxy has no
@@ -3814,7 +3865,8 @@ impl AdminResource for Proxy {
             let transport_changed = existing
                 .map(|proxy| proxy.dispatch_kind.is_udp() != resource.dispatch_kind.is_udp())
                 .unwrap_or(false);
-            let should_probe = existing.is_none() || port_changed || transport_changed;
+            let should_probe = (existing.is_none() || port_changed || transport_changed)
+                && !shares_existing_stream_port;
             if should_probe
                 && let Err(error) = check_port_available(
                     port,
