@@ -14,6 +14,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [Configuration Consumption](#configuration-consumption)
   - [Native MeshSubscribe (default)](#native-meshsubscribe-default)
   - [xDS ADS](#xds-ads)
+  - [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability)
   - [Ferrum mesh-slice ECDS carriers (full parity over xDS)](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds)
   - [ECDS DestinationRule carrier (full DR semantics over xDS)](#ecds-destinationrule-carrier-full-dr-semantics-over-xds)
   - [Bootstrap Behavior](#bootstrap-behavior)
@@ -78,7 +79,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. Enrolled in the conformance GA contract as `mesh.config_transport.native_subscribe` (semantics: `tests/conformance/mesh_config_transport.rs`; live: `sidecar.config.native_subscribe_delivered` via the `mesh-e2e-sidecar` CP + native-subscribe leg). |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`), including `ProxyConfig` on `ProxyConfigsCarrier`. **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
 | Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load; SIGHUP reload (Unix) keeps the last good slice on error. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
-| Stock Envoy / third-party Istio xDS interop | **Not supported** | See [Limitations](#limitations-and-not-supported). Use native or a Ferrum CP. |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
 
 ### Topology maturity
 
@@ -122,7 +123,7 @@ This section consolidates every known residual gap so operators do not have to r
 
 ### Not interoperable / not planned
 
-- **Stock Envoy / third-party Istio xDS interop** — Ferrum's `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path. It follows the Envoy ADS gRPC contract, but CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names, and all security/policy fields ride Ferrum-defined ECDS carriers. A stock Envoy/Istio CP does not emit these, so pointing Ferrum's xDS client at a non-Ferrum CP is unsupported and may be NACKed. Use native, or a Ferrum CP over xDS.
+- **Stock Envoy / third-party Istio xDS interop** — `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path and stays that way: CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names, and all security/policy fields ride Ferrum-defined ECDS carriers, so pointing *that* client at a non-Ferrum CP remains unsupported. For a third-party control plane use the separate `FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` profile, which consumes standard v3 CDS/EDS/LDS/RDS for **discovery only** — see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability) for the exact capability boundary. Enforcement policy is never sourced from a stock CP.
 - **`EnvoyFilter`** — not planned. Use Ferrum custom plugins (`custom_plugins/`).
 - **`WasmPlugin`** — not planned. Use Ferrum custom plugins.
 - **Per-node ADS stream ceiling** — `FERRUM_XDS_MAX_STREAMS_PER_NODE` (default `4`, `0`=unbounded) bounds concurrent ADS streams under one node id; excess streams are rejected with gRPC `RESOURCE_EXHAUSTED` and counted by `ferrum_xds_streams_rejected_total`. (Resource warming / make-before-break across types is now implemented — see [xDS ADS Compatibility](#xds-ads-compatibility).)
@@ -374,6 +375,171 @@ Aggregated Discovery Service client over the Envoy ADS gRPC service path. Consum
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
 - **DestinationRule support across xDS**: standard CDS/EDS bakes DR traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS alone. The Ferrum CP ships the full DR via its own ECDS carrier (see [ECDS DestinationRule carrier](#ecds-destinationrule-carrier-full-dr-semantics-over-xds)); native protocol carries it too. Both produce identical DR semantics on the DP.
 - **RTDS subscription** (`type.googleapis.com/envoy.service.runtime.v3.Runtime`): subscribed alongside CDS/EDS/LDS/RDS/SDS/ECDS so operators can flip runtime knobs without churning the entire slice. The xDS client decodes every layer through `translate_rtds_layer`, sorts Runtime resources lexicographically by name, and merges top-level fields into a single `MeshRuntimeOverlay` carried on `MeshSlice.runtime_overlay` (later names win; duplicate names NACK). Supported value kinds: numeric (`f64`), string, bool, and Envoy `FractionalPercent`-shaped structs (`{numerator, denominator: HUNDRED | TEN_THOUSAND | MILLION}`). Other struct, list, and null values are silently dropped. The overlay is exposed via `GET /mesh/runtime-overlay`; fault percentages and transformer gates both publish with their request epoch (so a request never straddles a gate change), while the gateway-wide tracing filter and the transformer gate *provenance* maps publish after slice acceptance. See the reserved-key table under [xDS ADS Compatibility](#xds-ads-compatibility) for the full contract.
+
+#### Stock Envoy / third-party Istio xDS interoperability
+
+`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` (issue #3317) is a **separate protocol
+name** from `xds`, not a mode of it. Everything described above about the
+Ferrum-private profile — name-only resources, `ferrum.config.extension.v3.*`
+ECDS carriers, the required-type version-coherence gate — is unchanged and is
+never reached by this path.
+
+**Split of authority.** Two config sources, and the split is the whole security
+story:
+
+| Half | Source | Owns |
+|---|---|---|
+| Discovery | the stock ADS server (`FERRUM_MESH_STOCK_XDS_URLS`) | `MeshService` (namespace/name/ports/protocol/cluster VIPs) and `Workload` (endpoint addresses + peer identity) |
+| Policy | the local mesh document (`FERRUM_MESH_FILE_CONFIG_PATH`, **mandatory**) | authorization policies, PeerAuthentication, RequestAuthentication, trust bundles, DestinationRules, ServiceEntries, Sidecar scope, ProxyConfig, telemetry |
+
+A third-party control plane Ferrum does not otherwise trust can therefore add or
+remove **reachability**, but it can never author or weaken Ferrum's
+**enforcement posture**. Startup fails closed if the policy document is missing,
+invalid, or declares `services` / `workloads` — those belong to the control
+plane, and two authorities for one field would make "which endpoint is
+reachable" ambiguous. The document is re-read on SIGHUP (Unix); a failed reload
+keeps the last good policy baseline, and a successful one rebuilds the slice
+from the current discovery view.
+
+Ferrum **never mints a CP/DP JWT for a stock control plane**. The only
+credential it presents is an externally issued bearer token at
+`FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (typically a projected Kubernetes
+service-account token), re-read on every connection attempt so rotation is
+picked up on reconnect. `FERRUM_MESH_STOCK_XDS_URLS` is deliberately separate
+from `FERRUM_DP_CP_GRPC_URLS` so a Ferrum CP is never dialed as a stock server
+and a stock server never receives Ferrum CP/DP credentials.
+
+**What is consumed.**
+
+| Resource | Mapped to |
+|---|---|
+| `Cluster` (`outbound\|<port>\|\|<svc>.<ns>.svc.<domain>`, `EDS` or `STATIC`) | a `MeshService` port in `<ns>/<svc>` |
+| `Cluster.transport_socket` → `UpstreamTlsContext` URI SAN matcher | the pinned peer SPIFFE identity for that service port |
+| `ClusterLoadAssignment` | `Workload` entries (address, container port → `targetPort`, weight, locality); `UNHEALTHY` / `DRAINING` / `TIMEOUT` endpoints are excluded |
+| `Listener` filter chains | per-port protocol classification (HCM → HTTP/HTTP2, TcpProxy → TCP) and, for a concrete-bind listener, the service VIP |
+| `RouteConfiguration` virtual hosts | IP-literal domains become `MeshService.cluster_ips` |
+
+**Namespace narrowing applies unchanged.** Discovered services flow through the
+same `MeshSlice::from_gateway_config` projection as native/file config, so a
+workload sees only its own namespace's services unless the local policy document
+declares an Istio `Sidecar` with a wider `egress.hosts` (for example `*/*`).
+That is existing mesh behaviour, not a stock-profile restriction, but it is the
+first thing to check when a discovered service in another namespace does not
+appear in the slice.
+
+Peer identity comes from the control plane's **own** SAN pin, never from
+endpoint metadata. A cluster with no pinned SPIFFE, or with more than one
+candidate, publishes the service shape with **no dialable endpoint** plus an
+explicit `no_pinned_peer_identity` / `ambiguous_peer_identity` diagnostic —
+Ferrum will not dial a peer whose identity the control plane did not assert.
+
+**Protocol behaviour.** State-of-the-world ADS with per-type nonces, ACK/NACK
+carrying a field-specific `error_detail`, dependency-ordered subscriptions (EDS
+follows the accepted CDS clusters by resource name, RDS follows the accepted LDS
+listeners), a 25 ms debounce capped at 500 ms before a
+make-before-break `install_slice`, a
+five-consecutive-NACK circuit breaker, jittered 1–30 s backoff, and multi-server
+failover. There is deliberately **no** cross-type version-coherence gate: a
+stock CP versions each type independently and carries no Ferrum security
+carriers a skew could leave stale. Warming waits for CDS, and for EDS only when
+some accepted cluster actually needs it. Convergence is visible on the
+JWT-gated `GET /mesh/config-drift`.
+
+**Deletion follows the SotW rule for each type, not the response contents.**
+`Cluster` and `Listener` are the two types a state-of-the-world server must send
+as complete state, so those responses replace what is held and a resource absent
+from one is deleted. `ClusterLoadAssignment` and `RouteConfiguration` are
+subscribed by name and a response for them may legitimately carry only the
+subset a push touched (istiod skips recomputing a cluster its update did not
+change), so those responses are **merged**, and an assignment or route
+configuration is dropped only once no accepted cluster/listener references it
+any more. Reading an omitted assignment as "this service has no endpoints" would
+blackhole every service an ordinary endpoint update did not mention.
+
+On reconnect the client re-subscribes with an **empty** `response_nonce` (nonces
+are stream-scoped) and with the last version it actually ACCEPTED — a NACKed
+version is never re-asserted, so a control plane that suppresses a resource
+whose version the client already claims cannot leave the data plane
+unconverged.
+
+**Two failure outcomes, and the difference matters.** A *structural* error —
+bytes that are not a well-formed resource of the announced type, an empty or
+duplicated name, or a declared bound exceeded — NACKs the whole response and
+rolls the accumulator back, so the last good slice keeps serving. A *capability
+refusal* — a well-formed resource using something Ferrum does not model — drops
+that resource with a field-specific diagnostic and ACKs, because a stock CP
+legitimately programs Envoy features Ferrum has no counterpart for and NACKing
+would leave the data plane permanently unconverged. A refusal always narrows:
+it contributes no route, no endpoint, and no identity, so the worst case is
+traffic that is not routed. Refusals are logged (bounded, and only when the set
+changes) with a stable reason code and the offending field path — never a
+resource payload.
+
+**The extension-escape closure.** Every field through which an Envoy extension,
+a filesystem path, credential material, an enforcement filter, or a second
+delivery channel could enter is refused:
+
+- Cluster `cluster_type`, `filters`, `load_balancing_policy`,
+  `lb_subset_config`, and any `typed_extension_protocol_options` key other than
+  `envoy.extensions.upstreams.http.v3.HttpProtocolOptions`.
+- Any transport socket that is not `UpstreamTlsContext` or `RawBuffer`; inline
+  `tls_certificates`; a `trusted_ca` `DataSource` naming a `filename` or
+  `environment_variable`; `custom_validator_config`; `custom_handshaker`; a
+  non-`exact` (regex/prefix/suffix) peer-identity matcher.
+- Listener `api_listener`, `filter_chain_matcher`, `additional_addresses`; any
+  listener filter outside `original_dst` / `tls_inspector` / `http_inspector` /
+  `workload_metadata` (notably `proxy_protocol` and `original_src`, which
+  rewrite an authorization input); any network filter outside
+  `http_connection_manager` / `tcp_proxy` plus the metadata-exchange/stats
+  telemetry filters.
+- **Any HTTP filter other than `envoy.filters.http.router`** and a small
+  observability allowlist (`istio.metadata_exchange`, `istio.stats`,
+  `istio.alpn`, `grpc_stats`, `grpc_web`, `fault`). `rbac`, `jwt_authn`,
+  `ext_authz`, `cors`, `local_ratelimit`, `lua`, and `wasm` refuse the whole
+  listener — silently reducing an Istio listener that carries an RBAC or JWT
+  filter to plain routing would turn the control plane's DENY into an ALLOW.
+  This holds even when the filter is marked `disabled` or `is_optional`,
+  because either can be re-enabled per route.
+- HCM `scoped_routes`; route `typed_per_filter_config`, `redirect`,
+  `direct_response`, `filter_action`, `non_forwarding_action`; `safe_regex` /
+  header / query-parameter / gRPC / dynamic-metadata route matchers;
+  `weighted_clusters`, `cluster_header`, and cluster specifier plugins;
+  virtual-host `matcher` and a non-zero `require_tls`; `vhds`.
+- Any `ConfigSource` that is not `ads`.
+- Every SDS `Secret`. The profile does not subscribe to SDS at all — workload
+  identity and trust anchors come from Ferrum's own SPIFFE/SVID configuration —
+  and an unsolicited push closes the ADS stream without sending an SDS request
+  (a NACK for an unrequested type would itself subscribe under SotW semantics).
+  Each key-bearing variant is refused **by field name without being decoded**,
+  so control-plane-delivered private key material is never parsed, stored, or
+  logged.
+
+**Bounds.** `FERRUM_MESH_STOCK_XDS_MAX_RESOURCES` (per response, default 10000),
+`FERRUM_MESH_STOCK_XDS_MAX_RESOURCE_BYTES` (per resource, default 1 MiB), and
+`FERRUM_MESH_STOCK_XDS_MAX_ENDPOINTS` (per cluster, default 4096), plus internal
+ceilings on filter chains, virtual hosts, routes, domains, and pinned identities
+per cluster. `0` is rejected at startup — a bound of `0` would disable the
+fail-closed ceiling, not lift it.
+
+**Declared residuals.** Not driven by a stock control plane through this
+profile: VirtualService-equivalent traffic shaping (weighted clusters,
+header/regex matching, retries, timeouts, fault injection, mirroring),
+DestinationRule subsets and traffic policy, external
+`STRICT_DNS` / `LOGICAL_DNS` / `ORIGINAL_DST` clusters (so third-party egress
+still needs a local `ServiceEntry`), inbound listener materialization (Ferrum
+builds its own from the policy document), SDS, ECDS/RTDS, and delta xDS. The
+decode surface is a field-exact **projection** of the upstream Envoy v3 messages
+(`proto/envoy/stock/v3/stock_xds.proto`), not the vendored upstream proto tree;
+every field number is taken from Envoy `v1.31.0` and a field that can change
+routing, trust, or identity is either consumed or refused.
+
+**Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
+projection onto the typed mesh model) and
+`src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
+the policy/discovery merge). Tests:
+`tests/unit/gateway_core/stock_xds_tests.rs`,
+`tests/integration/mesh_stock_xds_tests.rs`, and
+`tests/conformance/stock_xds_interop.rs`.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)
 
@@ -3201,6 +3367,8 @@ VirtualService L4 routing is materialized into Ferrum stream proxies, reusing th
 - **`spec.tls[]`** → a **passthrough TCP** proxy keyed by SNI: `match[].sniHosts` become the proxy's `hosts`, `match[].port` (or the destination port) the listen port, and the proxy forwards the **encrypted** bytes to the destination without terminating TLS. Multiple `tls[]` matches sharing a port are SNI-routed (`resolve_proxy_by_sni`), then filtered by any compiled L4 `stream_match`.
 - **`spec.tcp[]`** → a plain **TCP** proxy keyed by `listen_port` (`match[].port`, or the destination port), forwarding to the destination. Multiple matches sharing a port with L4 predicates share one listener and resolve by first-match `stream_match` evaluation.
 
+SNI routing is not exclusive to `passthrough: true`: the same plane admits any stream listener that terminates nothing, including an ordinary `tcp` listener with `frontend_tls: false` that declares `hosts` (issue #3264). The peek, precedence ladder, normalization rules, and fail-closed admission for indeterminate ClientHellos are documented once in [TCP/UDP stream proxy → Opaque TLS SNI routing](tcp_udp_proxy.md#opaque-tls-sni-routing) and apply identically to mesh-materialized `tls[]` proxies, Gateway API `TLSRoute`, east-west passthrough, and hand-authored stream proxies.
+
 Optional L4 match predicates compile onto `Proxy.stream_match` (AND within one match arm; OR across match candidates) and are evaluated from trustworthy evidence before the stream route is selected:
 
 | Predicate | Evidence | Deny-by-absence |
@@ -3444,7 +3612,8 @@ The following Istio mesh surfaces are either deferred or have Ferrum-specific su
 
 | Surface | Status | Workaround |
 |---|---|---|
-| Stock Envoy / third-party Istio xDS interop (point Ferrum's xDS client at a non-Ferrum CP) | Not interoperable | Ferrum's `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path: it follows the Envoy ADS gRPC contract, but CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names and all security/policy fields ride [Ferrum-specific ECDS carriers](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds) with Ferrum-defined inner type URLs. A stock Envoy/Istio CP does not emit these carriers or names, so the response is unsupported and may be NACKed. Use a Ferrum CP (either protocol), or `FERRUM_MESH_CONFIG_PROTOCOL=native` |
+| Stock Envoy / third-party Istio xDS interop (point Ferrum's **Ferrum-private** xDS client at a non-Ferrum CP) | Not interoperable | `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path: CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names and all security/policy fields ride [Ferrum-specific ECDS carriers](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds). A stock CP emits neither, so that response is unsupported and may be NACKed |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | Supported for discovery | Consumes standard v3 CDS/EDS/LDS/RDS from a stock control plane and maps it onto `MeshService` / `Workload`. Enforcement policy (authorization, PeerAuthentication, JWT, trust bundles, DestinationRule, Sidecar scope) comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, never from the stock CP. Traffic shaping, subsets, external DNS clusters, SDS, ECDS/RTDS, and delta xDS are out of scope — see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability) |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only`, the native/CRD slice-supplied mesh-wide `outbound_traffic_policy`, or a workload-scoped `Sidecar.outboundTrafficPolicy` that overrides both (see [Sidecar Outbound Traffic Policy](#sidecar-outbound-traffic-policy)) covers both HTTP-family egress (auto-injected `mesh_outbound_registry` plugin and outbound-capture route misses, both rejecting with `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS`, default 502) and stream-family egress on mesh outbound capture listener ports (TCP / TCP+TLS: graceful close before backend dial; UDP / UDP+DTLS: silent datagram drop). Both surfaces read the same slice-derived registry (services, ServiceEntries including wildcard hosts, workload addresses); resources with no declared ports admit any explicit Host port for that known destination, and empty registries fail closed. HTTP decision metrics use fixed host buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`); stream rejects export `ferrum_mesh_outbound_registry_stream_decisions_total{protocol, decision}` instead. Inbound sidecar/ambient traffic is not gated by this outbound policy |

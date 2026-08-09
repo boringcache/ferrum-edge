@@ -1,0 +1,436 @@
+syntax = "proto3";
+
+package ferrum.stockxds.v3;
+
+// Decode-only projections of the upstream Envoy v3 API messages Ferrum's
+// **stock xDS interoperability profile** (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`)
+// consumes from a third-party control plane (istiod, go-control-plane, ...).
+//
+// These are NOT a re-declaration of the Envoy API and they are never used to
+// ENCODE anything: Ferrum's own CP still speaks the Ferrum-private xDS profile
+// declared in `proto/envoy/service/discovery/v3/discovery.proto`. Vendoring the
+// real `envoy/**` proto tree would pull in its full closure (`xds/core`,
+// `udpa/annotations`, `validate`, `google/api`, ...), so — following the same
+// precedent as the Phase B discovery/RTDS shims — each message below is a
+// truncated projection that declares ONLY:
+//
+//   1. the fields Ferrum actually consumes, and
+//   2. the fields whose mere PRESENCE must make Ferrum refuse the resource
+//      (the "extension-escape closure": every field that can smuggle an Envoy
+//      extension, a filesystem path, credentials, a second delivery channel,
+//      or an enforcement filter).
+//
+// Every field number below was taken from the upstream Envoy API at tag
+// `v1.31.0`; the upstream source file is named above each message. Protobuf
+// wire compatibility does not depend on the declared package or on declaring
+// every field, so a real Envoy/Istio control plane's full payload decodes here
+// and unmodelled fields are skipped by prost.
+//
+// Two encoding conventions keep this file free of `optional` (and therefore
+// free of any protoc `--experimental_allow_proto3_optional` dependency):
+//
+//   * A field that exists only for PRESENCE detection is declared
+//     `repeated bytes` — message fields are length-delimited on the wire
+//     exactly like `bytes`, and a singular field decodes into a one-element
+//     vector, so "non-empty" means "the CP set it".
+//   * A consumed scalar uses its proto3 default as the absent marker, which is
+//     always unambiguous here (an empty cluster name, a zero port, and an empty
+//     filename are all invalid inputs in their own right).
+//
+// INVARIANT: adding a field here is a capability decision. A field that can
+// change routing, trust, or identity must be either consumed or refused —
+// never silently ignored. See `src/xds/stock.rs`.
+
+// google.protobuf.Any
+message Any {
+  string type_url = 1;
+  bytes value = 2;
+}
+
+// google.protobuf.UInt32Value
+message UInt32Value {
+  uint32 value = 1;
+}
+
+// google.protobuf.BoolValue
+message BoolValue {
+  bool value = 1;
+}
+
+// ── envoy/config/core/v3/base.proto ──────────────────────────────────────
+
+// envoy.config.core.v3.DataSource
+message DataSource {
+  // Filesystem escape: a stock CP must never make Ferrum read a local path.
+  string filename = 1;
+  bytes inline_bytes = 2;
+  string inline_string = 3;
+  // Environment escape.
+  string environment_variable = 4;
+  repeated bytes watched_directory = 5;
+}
+
+// envoy.config.core.v3.Locality
+message Locality {
+  string region = 1;
+  string zone = 2;
+  string sub_zone = 3;
+}
+
+// envoy.config.core.v3.TransportSocket
+message TransportSocket {
+  string name = 1;
+  Any typed_config = 3;
+}
+
+// ── envoy/config/core/v3/address.proto ───────────────────────────────────
+
+// envoy.config.core.v3.SocketAddress
+message SocketAddress {
+  // Protocol enum: TCP = 0, UDP = 1.
+  int32 protocol = 1;
+  string address = 2;
+  uint32 port_value = 3;
+  // A named port cannot be resolved by Ferrum; presence is refused.
+  string named_port = 4;
+  // A non-default resolver is an extension escape.
+  string resolver_name = 5;
+}
+
+// envoy.config.core.v3.Address
+message Address {
+  SocketAddress socket_address = 1;
+  // Unix pipes and Envoy-internal addresses are refused (presence only).
+  repeated bytes pipe = 2;
+  repeated bytes envoy_internal_address = 3;
+}
+
+// ── envoy/config/core/v3/config_source.proto ─────────────────────────────
+
+// envoy.config.core.v3.ConfigSource. Only `ads` is honoured: Ferrum's stock
+// profile holds exactly one aggregated stream, so a resource that asks for a
+// second delivery channel (REST/gRPC/filesystem/self) is refused.
+message ConfigSource {
+  string path = 1;
+  repeated bytes api_config_source = 2;
+  // AggregatedConfigSource is an EMPTY message upstream, so the `repeated`
+  // presence encoding is load-bearing: presence, not content, is the signal.
+  repeated bytes ads = 3;
+  repeated bytes self = 5;
+  repeated bytes path_config_source = 8;
+}
+
+// ── envoy/type/matcher/v3/string.proto ───────────────────────────────────
+
+// envoy.type.matcher.v3.StringMatcher
+message StringMatcher {
+  string exact = 1;
+  string prefix = 2;
+  string suffix = 3;
+  // Regex matchers are refused outright: an operator-supplied pattern from a
+  // third-party CP must never reach Ferrum's matcher engine.
+  repeated bytes safe_regex = 5;
+  bool ignore_case = 6;
+  string contains = 7;
+  repeated bytes custom = 8;
+}
+
+// ── envoy/extensions/transport_sockets/tls/v3/common.proto ───────────────
+
+// envoy.extensions.transport_sockets.tls.v3.SubjectAltNameMatcher
+message SubjectAltNameMatcher {
+  // SanType enum: SAN_TYPE_UNSPECIFIED = 0, EMAIL = 1, DNS = 2, URI = 3,
+  // IP_ADDRESS = 4, OTHER_NAME = 5.
+  int32 san_type = 1;
+  StringMatcher matcher = 2;
+  string oid = 3;
+}
+
+// envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext
+message CertificateValidationContext {
+  DataSource trusted_ca = 1;
+  // Upstream declares several of these as `repeated string` or as messages;
+  // `bytes` decodes the same wire shape without imposing UTF-8 validity on
+  // hostile input.
+  repeated bytes verify_certificate_hash = 2;
+  repeated bytes verify_certificate_spki = 3;
+  repeated bytes crl = 7;
+  repeated bytes match_subject_alt_names = 9;
+  repeated bytes watched_directory = 11;
+  repeated bytes custom_validator_config = 12;
+  repeated bytes ca_certificate_provider_instance = 13;
+  repeated SubjectAltNameMatcher match_typed_subject_alt_names = 15;
+}
+
+// envoy.extensions.transport_sockets.tls.v3.CommonTlsContext.CombinedCertificateValidationContext
+message CombinedCertificateValidationContext {
+  CertificateValidationContext default_validation_context = 1;
+  repeated bytes validation_context_sds_secret_config = 2;
+}
+
+// envoy.extensions.transport_sockets.tls.v3.CommonTlsContext
+message CommonTlsContext {
+  repeated bytes tls_params = 1;
+  repeated bytes tls_certificates = 2;
+  CertificateValidationContext validation_context = 3;
+  repeated bytes alpn_protocols = 4;
+  repeated bytes tls_certificate_sds_secret_configs = 6;
+  repeated bytes validation_context_sds_secret_config = 7;
+  CombinedCertificateValidationContext combined_validation_context = 8;
+  repeated bytes custom_handshaker = 13;
+  repeated bytes tls_certificate_provider_instance = 14;
+}
+
+// envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+message UpstreamTlsContext {
+  CommonTlsContext common_tls_context = 1;
+  string sni = 2;
+  bool allow_renegotiation = 3;
+}
+
+// ── envoy/extensions/transport_sockets/tls/v3/secret.proto ───────────────
+
+// envoy.extensions.transport_sockets.tls.v3.Secret. Every key-bearing variant
+// is presence-only: Ferrum refuses CP-delivered private key material and never
+// decodes, stores, or logs it.
+message Secret {
+  string name = 1;
+  repeated bytes tls_certificate = 2;
+  repeated bytes session_ticket_keys = 3;
+  CertificateValidationContext validation_context = 4;
+  repeated bytes generic_secret = 5;
+}
+
+// ── envoy/config/cluster/v3/cluster.proto ────────────────────────────────
+
+// envoy.config.cluster.v3.Cluster.EdsClusterConfig
+message EdsClusterConfig {
+  ConfigSource eds_config = 1;
+  string service_name = 2;
+}
+
+// envoy.config.cluster.v3.Cluster.TransportSocketMatch
+message TransportSocketMatch {
+  string name = 1;
+  TransportSocket transport_socket = 3;
+}
+
+// envoy.config.cluster.v3.Cluster
+message Cluster {
+  string name = 1;
+  // DiscoveryType enum: STATIC = 0, STRICT_DNS = 1, LOGICAL_DNS = 2, EDS = 3,
+  // ORIGINAL_DST = 4. `cluster_type` is the other arm of the same oneof, so a
+  // zero here is only meaningful when `cluster_type` is absent (and a present
+  // `cluster_type` is refused outright).
+  int32 type = 2;
+  EdsClusterConfig eds_cluster_config = 3;
+  // LbPolicy enum: ROUND_ROBIN = 0, LEAST_REQUEST = 1, RING_HASH = 2,
+  // RANDOM = 3, MAGLEV = 5, CLUSTER_PROVIDED = 6,
+  // LOAD_BALANCING_POLICY_CONFIG = 7.
+  int32 lb_policy = 6;
+  // Subset load balancing is refused: Ferrum has no stock-xDS subset model.
+  repeated bytes lb_subset_config = 22;
+  TransportSocket transport_socket = 24;
+  ClusterLoadAssignment load_assignment = 33;
+  // Extension escape: per-protocol typed options keyed by extension name.
+  map<string, Any> typed_extension_protocol_options = 36;
+  // Extension escape: a custom cluster discovery type.
+  repeated bytes cluster_type = 38;
+  // Extension escape: upstream network filters.
+  repeated bytes filters = 40;
+  // Extension escape: a typed load-balancing policy extension.
+  repeated bytes load_balancing_policy = 41;
+  repeated TransportSocketMatch transport_socket_matches = 43;
+}
+
+// ── envoy/config/endpoint/v3/endpoint_components.proto ───────────────────
+
+// envoy.config.endpoint.v3.Endpoint
+message Endpoint {
+  Address address = 1;
+  string hostname = 3;
+  repeated bytes additional_addresses = 4;
+}
+
+// envoy.config.endpoint.v3.LbEndpoint
+message LbEndpoint {
+  Endpoint endpoint = 1;
+  // HealthStatus enum: UNKNOWN = 0, HEALTHY = 1, UNHEALTHY = 2, DRAINING = 3,
+  // TIMEOUT = 4, DEGRADED = 5.
+  int32 health_status = 2;
+  UInt32Value load_balancing_weight = 4;
+  // An endpoint referenced by name lives in a `named_endpoints` map Ferrum
+  // does not consume; presence is refused.
+  string endpoint_name = 5;
+}
+
+// envoy.config.endpoint.v3.LocalityLbEndpoints
+message LocalityLbEndpoints {
+  Locality locality = 1;
+  repeated LbEndpoint lb_endpoints = 2;
+  UInt32Value load_balancing_weight = 3;
+  uint32 priority = 5;
+  // LEDS is a separate delivery channel Ferrum does not hold.
+  repeated bytes leds_cluster_locality_config = 8;
+}
+
+// ── envoy/config/endpoint/v3/endpoint.proto ─────────────────────────────
+
+// envoy.config.endpoint.v3.ClusterLoadAssignment
+message ClusterLoadAssignment {
+  string cluster_name = 1;
+  repeated LocalityLbEndpoints endpoints = 2;
+}
+
+// ── envoy/config/listener/v3/listener_components.proto ──────────────────
+
+// envoy.config.listener.v3.Filter (network filter)
+message NetworkFilter {
+  string name = 1;
+  Any typed_config = 4;
+  // Extension Config Discovery is a separate delivery channel.
+  repeated bytes config_discovery = 5;
+}
+
+// envoy.config.listener.v3.ListenerFilter
+message ListenerFilter {
+  string name = 1;
+  Any typed_config = 3;
+  repeated bytes config_discovery = 5;
+}
+
+// envoy.config.listener.v3.FilterChainMatch
+message FilterChainMatch {
+  UInt32Value destination_port = 8;
+  string transport_protocol = 9;
+  repeated bytes application_protocols = 10;
+  repeated bytes server_names = 11;
+}
+
+// envoy.config.listener.v3.FilterChain
+message FilterChain {
+  FilterChainMatch filter_chain_match = 1;
+  repeated NetworkFilter filters = 3;
+  TransportSocket transport_socket = 6;
+  string name = 7;
+}
+
+// ── envoy/config/listener/v3/listener.proto ─────────────────────────────
+
+// envoy.config.listener.v3.Listener
+message Listener {
+  string name = 1;
+  Address address = 2;
+  repeated FilterChain filter_chains = 3;
+  repeated ListenerFilter listener_filters = 9;
+  // TrafficDirection enum: UNSPECIFIED = 0, INBOUND = 1, OUTBOUND = 2.
+  int32 traffic_direction = 16;
+  // An API listener turns the listener into an in-process extension surface.
+  repeated bytes api_listener = 19;
+  FilterChain default_filter_chain = 25;
+  // The unified matcher API selects filter chains by an extension matcher tree.
+  repeated bytes filter_chain_matcher = 32;
+  repeated bytes additional_addresses = 33;
+}
+
+// ── envoy/extensions/filters/network/http_connection_manager/v3 ─────────
+
+// envoy.extensions.filters.network.http_connection_manager.v3.Rds
+message Rds {
+  ConfigSource config_source = 1;
+  string route_config_name = 2;
+}
+
+// envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter
+message HttpFilter {
+  string name = 1;
+  Any typed_config = 4;
+  repeated bytes config_discovery = 5;
+  bool is_optional = 6;
+  bool disabled = 7;
+}
+
+// envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+message HttpConnectionManager {
+  // CodecType enum: AUTO = 0, HTTP1 = 1, HTTP2 = 2, HTTP3 = 3.
+  int32 codec_type = 1;
+  string stat_prefix = 2;
+  Rds rds = 3;
+  RouteConfiguration route_config = 4;
+  repeated HttpFilter http_filters = 5;
+  // Scoped RDS is a second route-delivery channel Ferrum does not hold.
+  repeated bytes scoped_routes = 31;
+}
+
+// ── envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto ───────
+
+// envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+message TcpProxy {
+  string stat_prefix = 1;
+  string cluster = 2;
+  repeated bytes weighted_clusters = 10;
+  repeated bytes tunneling_config = 12;
+}
+
+// ── envoy/config/route/v3/route_components.proto ────────────────────────
+
+// envoy.config.route.v3.RouteMatch
+message RouteMatch {
+  string prefix = 1;
+  string path = 2;
+  BoolValue case_sensitive = 4;
+  repeated bytes headers = 6;
+  repeated bytes query_parameters = 7;
+  repeated bytes grpc = 8;
+  repeated bytes runtime_fraction = 9;
+  repeated bytes safe_regex = 10;
+  repeated bytes connect_matcher = 12;
+  repeated bytes dynamic_metadata = 13;
+  string path_separated_prefix = 14;
+  repeated bytes path_match_policy = 15;
+}
+
+// envoy.config.route.v3.RouteAction
+message RouteAction {
+  string cluster = 1;
+  string cluster_header = 2;
+  repeated bytes weighted_clusters = 3;
+  string cluster_specifier_plugin = 37;
+  repeated bytes inline_cluster_specifier_plugin = 39;
+}
+
+// envoy.config.route.v3.Route
+message Route {
+  RouteMatch match = 1;
+  RouteAction route = 2;
+  repeated bytes redirect = 3;
+  repeated bytes direct_response = 7;
+  map<string, Any> typed_per_filter_config = 13;
+  string name = 14;
+  repeated bytes filter_action = 17;
+  repeated bytes non_forwarding_action = 18;
+}
+
+// envoy.config.route.v3.VirtualHost
+message VirtualHost {
+  string name = 1;
+  repeated string domains = 2;
+  repeated Route routes = 3;
+  // TlsRequirementType enum: NONE = 0, EXTERNAL_ONLY = 1, ALL = 2. A non-zero
+  // requirement is an enforcement decision Ferrum would otherwise drop.
+  int32 require_tls = 4;
+  map<string, Any> typed_per_filter_config = 15;
+  repeated bytes matcher = 21;
+}
+
+// ── envoy/config/route/v3/route.proto ───────────────────────────────────
+
+// envoy.config.route.v3.RouteConfiguration
+message RouteConfiguration {
+  string name = 1;
+  repeated VirtualHost virtual_hosts = 2;
+  // VHDS is a separate delivery channel.
+  repeated bytes vhds = 9;
+  repeated bytes cluster_specifier_plugins = 12;
+  map<string, Any> typed_per_filter_config = 16;
+}

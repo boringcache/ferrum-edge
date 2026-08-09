@@ -7603,6 +7603,11 @@ impl ProxyState {
         // private per-listener limiter (which would make the effective ceiling
         // `cap` per listener plus another `cap` for the whole HTTP family).
         stream_listener_manager.attach_backend_conn_limit(backend_conn_limit.clone());
+        // Publish the opaque-TLS SNI plaintext-fallback authorization before the
+        // first `reconcile()`. Absent the call every SNI-routed stream listener
+        // stays fail-closed, which is the intended default.
+        stream_listener_manager
+            .set_stream_sni_plaintext_fallback(env_config_arc.stream_sni_plaintext_fallback);
 
         let state = Self {
             config: config_arc,

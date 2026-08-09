@@ -4975,37 +4975,6 @@ impl DatabaseStore {
         }
     }
 
-    /// Check if a listen_port is unique across all stream proxies.
-    /// Returns `true` if the port is unique (no conflicts found).
-    pub async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(
-                &self.q(
-                    "SELECT id FROM proxies WHERE namespace = ? AND listen_port = ? AND id != ?",
-                ),
-            )
-            .bind(namespace)
-            .bind(port as i32)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?
-        } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND listen_port = ?"))
-                .bind(namespace)
-                .bind(port as i32)
-                .fetch_all(&self.pool())
-                .await?
-        };
-        self.check_slow_query("check_listen_port_unique", start);
-        Ok(rows.is_empty())
-    }
-
     /// Check if an upstream with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace.
     ///
@@ -9732,15 +9701,6 @@ impl DatabaseBackend for DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         DatabaseStore::check_mtls_identity_unique(self, namespace, identity, exclude_consumer_id)
             .await
-    }
-
-    async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_proxy_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
     }
 
     async fn check_upstream_exists(
