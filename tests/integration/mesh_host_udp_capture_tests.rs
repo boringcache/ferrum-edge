@@ -574,7 +574,11 @@ async fn guard_release_failure_removes_capture_rather_than_capturing_behind_a_dr
         "a retained guard must be retried, not left dropping forever: {:?}",
         backend.calls()
     );
-    assert_eq!(backend.listeners(), 2, "the retry must create a fresh listener");
+    assert_eq!(
+        backend.listeners(),
+        2,
+        "the retry must create a fresh listener"
+    );
 }
 
 #[tokio::test]
