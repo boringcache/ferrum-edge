@@ -373,6 +373,7 @@ async fn try_spawn_fast_path_gateway(
             ktls_enabled: false,
             io_uring_splice_enabled: false,
             record_mesh_mtls_metric: false,
+            stream_sni_plaintext_fallback: false,
             mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
             node_waypoint_identity_resolver: None,
             stream_gateway_ref: None,

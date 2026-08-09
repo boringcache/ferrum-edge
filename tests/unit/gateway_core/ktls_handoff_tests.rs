@@ -677,6 +677,16 @@ fn a_disabled_handshake_clock_yields_no_deadline() {
     assert!(frontend_tls_handshake_deadline(0).is_none());
 }
 
+#[test]
+fn an_unrepresentable_handshake_clock_fails_closed_without_panicking() {
+    let before = tokio::time::Instant::now();
+    let deadline = frontend_tls_handshake_deadline(u64::MAX)
+        .expect("a nonzero timeout must retain a deadline");
+
+    assert!(deadline <= tokio::time::Instant::now());
+    assert!(deadline >= before);
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_fallback_inherits_the_remaining_budget_not_a_fresh_one() {
     // Budget is opened once, then an earlier admission stage (ClientHello peek
