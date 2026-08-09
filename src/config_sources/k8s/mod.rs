@@ -456,6 +456,10 @@ pub struct GatewayApiListenerSetStatus {
     pub programmed: bool,
     pub programmed_reason: String,
     pub programmed_message: String,
+    /// Listener names for which translation emitted the ListenerSet-owned mesh
+    /// service. This typed forward evidence avoids reconstructing ownership
+    /// from collision-prone synthetic service names in the status writer.
+    pub programmed_listeners: Vec<String>,
     /// Listener name → conflict reason (`HostnameConflict` / `ProtocolConflict`).
     pub listener_conflicts: Vec<(String, String)>,
 }
@@ -1821,13 +1825,7 @@ where
         core::finalize(&mut acc)?;
     }
 
-    let mut translation = acc.finish();
-    listenerset::mark_listenerset_programmed_from_config(
-        &mut translation.listenerset_statuses,
-        &included_objects,
-        &translation.config,
-    );
-    Ok(translation)
+    Ok(acc.finish())
 }
 
 /// O(1)-average skipped-object membership that preserves

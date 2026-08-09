@@ -751,6 +751,95 @@ fn listenerset_update_and_delete_withdraw_materialization() {
 }
 
 #[test]
+fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
+    let mut gateway = object(
+        "Gateway",
+        "shared",
+        json!({
+            "gatewayClassName": "ferrum",
+            "allowedListeners": {"namespaces": {"from": "Same"}},
+            "listeners": [{
+                "name": "same",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "gateway.example.com",
+                "allowedRoutes": {"namespaces": {"from": "Same"}},
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{"name": "gateway-cert"}]
+                }
+            }]
+        }),
+    );
+    gateway.metadata.uid = "uid-gateway-shared".to_string();
+    let mut set = listenerset(
+        "shared",
+        "shared",
+        json!([{
+            "name": "same",
+            "port": 8443,
+            "protocol": "HTTPS",
+            "hostname": "set.example.com",
+            "allowedRoutes": {"namespaces": {"from": "Same"}},
+            "tls": {
+                "mode": "Terminate",
+                "certificateRefs": [{"name": "set-cert"}]
+            }
+        }]),
+    );
+    set.metadata.uid = "uid-listenerset-shared".to_string();
+
+    let mut gateway_secret = object(
+        "Secret",
+        "gateway-cert",
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {"tls.crt": "Y2VydA==", "tls.key": "a2V5"}
+        }),
+    );
+    gateway_secret.api_version = "v1".to_string();
+    let mut set_secret = object(
+        "Secret",
+        "set-cert",
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {"tls.crt": "c2V0LWNlcnQ=", "tls.key": "c2V0LWtleQ=="}
+        }),
+    );
+    set_secret.api_version = "v1".to_string();
+
+    let translation = translate_k8s_objects(
+        &[
+            gateway_class(),
+            gateway,
+            set,
+            gateway_secret,
+            set_secret,
+        ],
+        options(),
+    )
+    .expect("translate same-named Gateway and ListenerSet");
+    assert!(
+        translation.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
+                .iter()
+                .any(|service| service.name == "shared-same")
+        }),
+        "the winning Gateway listener should emit the colliding synthetic name"
+    );
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.kind == "ListenerSet" && status.resource.name == "shared")
+        .expect("ListenerSet translation status");
+    assert!(status.accepted, "the non-conflicting ListenerSet stays accepted");
+    assert!(
+        !status.programmed && status.programmed_listeners.is_empty(),
+        "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"
+    );
+}
+
+#[test]
 fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
     let mut secret = object(
         "Secret",

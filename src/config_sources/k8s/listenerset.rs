@@ -414,69 +414,26 @@ pub(crate) fn materialize_listenerset_mesh_services(
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
         });
-    }
-    Ok(())
-}
-
-/// Mark ListenerSet Programmed when at least one of its listeners produced a
-/// mesh service in the translated config.
-pub(crate) fn mark_listenerset_programmed_from_config(
-    statuses: &mut [GatewayApiListenerSetStatus],
-    objects: &[&K8sObject],
-    config: &crate::config::types::GatewayConfig,
-) {
-    let Some(mesh) = config.mesh.as_ref() else {
-        for status in statuses.iter_mut() {
-            if status.accepted && !status.programmed {
-                status.programmed = false;
-                status.programmed_reason = "ListenersNotValid".to_string();
-                status.programmed_message = ferrum_listenerset_status_message(
-                    "Ferrum accepted this ListenerSet but found no materialized listeners",
-                );
+        if let Some(status) = acc
+            .listenerset_statuses
+            .iter_mut()
+            .find(|status| status.resource.matches_object(object))
+        {
+            if !status
+                .programmed_listeners
+                .iter()
+                .any(|name| name == listener_name)
+            {
+                status.programmed_listeners.push(listener_name.to_string());
             }
-        }
-        return;
-    };
-    for status in statuses.iter_mut() {
-        if !status.accepted {
-            continue;
-        }
-        let Some(object) = objects
-            .iter()
-            .find(|object| object.kind == "ListenerSet" && status.resource.matches_object(object))
-        else {
-            continue;
-        };
-        let programmed = object
-            .spec
-            .get("listeners")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|listener| {
-                let listener_name = listener
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("listener");
-                let expected = format!("{}-{listener_name}", object.metadata.name);
-                mesh.services.iter().any(|service| {
-                    service.namespace == object.metadata.namespace && service.name == expected
-                })
-            });
-        if programmed {
             status.programmed = true;
             status.programmed_reason = "Programmed".to_string();
             status.programmed_message = ferrum_listenerset_status_message(
                 "Ferrum programmed at least one ListenerSet listener",
             );
-        } else {
-            status.programmed = false;
-            status.programmed_reason = "ListenersNotValid".to_string();
-            status.programmed_message = ferrum_listenerset_status_message(
-                "Ferrum accepted this ListenerSet but found no materialized listeners",
-            );
         }
     }
+    Ok(())
 }
 
 /// Whether `gateway.spec.allowedListeners` selects `listenerset`.
@@ -563,6 +520,7 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
             status.programmed = false;
             status.programmed_reason = "ListenersNotValid".to_string();
             status.programmed_message = status.accepted_message.clone();
+            status.programmed_listeners.clear();
         }
     }
 }
@@ -737,6 +695,7 @@ fn record_listenerset_status(
         programmed,
         programmed_reason: programmed_reason.to_string(),
         programmed_message: ferrum_listenerset_status_message(programmed_message),
+        programmed_listeners: Vec::new(),
         listener_conflicts: Vec::new(),
     });
 }

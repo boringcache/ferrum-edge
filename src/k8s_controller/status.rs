@@ -1493,15 +1493,10 @@ fn listenerset_status(
         ),
     };
 
-    // Align Programmed with live mesh materialization when translation ran.
-    let programmed_from_config = result.ok().is_some_and(|translation| {
-        listenerset_has_materialized_listener(object, &translation.config)
-    });
-    let programmed =
-        accepted && (programmed_base || programmed_from_config) && status_context.data_plane_ready;
+    let programmed = accepted && programmed_base && status_context.data_plane_ready;
     let (programmed_reason, programmed_message) = if programmed {
         ("Programmed", "Ferrum programmed this ListenerSet")
-    } else if accepted && (programmed_base || programmed_from_config) {
+    } else if accepted && programmed_base {
         (
             "DataPlaneNotReady",
             "Ferrum accepted this ListenerSet, but the serving Ferrum data plane is not ready",
@@ -1538,7 +1533,6 @@ fn listenerset_status(
         Value::Array(listenerset_listener_statuses(
             object,
             indexes,
-            result.ok().map(|translation| &translation.config),
             accepted,
             status_context.data_plane_ready,
             result.ok(),
@@ -1577,32 +1571,9 @@ fn has_ferrum_condition_status(status: &Value) -> bool {
         })
 }
 
-fn listenerset_has_materialized_listener(object: &K8sObject, config: &GatewayConfig) -> bool {
-    let Some(mesh) = config.mesh.as_ref() else {
-        return false;
-    };
-    object
-        .spec
-        .get("listeners")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|listener| {
-            let listener_name = listener
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("listener");
-            let expected = format!("{}-{listener_name}", object.metadata.name);
-            mesh.services.iter().any(|service| {
-                service.namespace == object.metadata.namespace && service.name == expected
-            })
-        })
-}
-
 fn listenerset_listener_statuses(
     listenerset: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
-    config: Option<&GatewayConfig>,
     listenerset_accepted: bool,
     data_plane_ready: bool,
     translation: Option<&crate::config_sources::k8s::K8sTranslation>,
@@ -1646,8 +1617,17 @@ fn listenerset_listener_statuses(
                 && listener_validation_error.is_none()
                 && !conflicted;
             let resolved_refs = accepted && route_kinds.route_kinds_valid;
-            let materialized = config.is_some_and(|config| {
-                listenerset_listener_programmed(listenerset, listener, config)
+            let materialized = translation.is_some_and(|translation| {
+                translation
+                    .listenerset_statuses
+                    .iter()
+                    .find(|status| status.resource.matches_object(listenerset))
+                    .is_some_and(|status| {
+                        status
+                            .programmed_listeners
+                            .iter()
+                            .any(|name| name == listener_name)
+                    })
             });
             let programmed = resolved_refs && materialized && data_plane_ready && !conflicted;
             let accepted_reason = if conflicted {
@@ -1732,24 +1712,6 @@ fn listenerset_listener_statuses(
             })
         })
         .collect()
-}
-
-fn listenerset_listener_programmed(
-    object: &K8sObject,
-    listener: &Value,
-    config: &GatewayConfig,
-) -> bool {
-    let Some(mesh) = config.mesh.as_ref() else {
-        return false;
-    };
-    let listener_name = listener
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("listener");
-    let expected = format!("{}-{listener_name}", object.metadata.name);
-    mesh.services
-        .iter()
-        .any(|service| service.namespace == object.metadata.namespace && service.name == expected)
 }
 
 fn attached_route_count_for_listenerset(
