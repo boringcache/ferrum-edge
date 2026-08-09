@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
+use crate::config::types::{
+    BackendScheme, FrontendTlsNamespaceSource, MAX_ID_LENGTH, MAX_TARGET_WEIGHT,
+};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
@@ -6041,13 +6043,23 @@ fn l4_route_proxies_for_namespace(
                 || base_suffix.clone(),
                 |namespace_suffix| format!("{base_suffix}-{namespace_suffix}"),
             );
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
+            let id = if scheme.is_udp() || config_namespace == object.metadata.namespace {
+                resource_id(
                     "gwapi-l4",
                     &object.metadata.namespace,
                     &object.metadata.name,
                     &suffix,
-                ),
+                )
+            } else {
+                gateway_api_l4_proxy_id(
+                    &object.kind,
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                )
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id,
                 // The parent Gateway namespace owns the stream listener.
                 namespace: config_namespace.to_string(),
                 hosts: hosts.clone(),
@@ -6070,6 +6082,47 @@ fn l4_route_proxies_for_namespace(
         }
     }
     Ok(proxies)
+}
+
+const GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN: usize = 16;
+const GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN: usize = 2 + GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN;
+
+fn gateway_api_l4_proxy_id(
+    route_kind: &str,
+    namespace: &str,
+    route_name: &str,
+    suffix: &str,
+) -> String {
+    // Cross-namespace routes are materialized in their parent Gateway's
+    // namespace, so distinct route owners can share the proxy keyspace. Keep
+    // the readable legacy id, but bind it to the unambiguous, unsanitized
+    // source identity so dash-join and sanitization collisions cannot replace
+    // another tenant's proxy.
+    let identity = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        route_kind.len(),
+        route_kind,
+        namespace.len(),
+        namespace,
+        route_name.len(),
+        route_name,
+        suffix.len(),
+        suffix
+    );
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    let mut readable = resource_id("gwapi-l4", namespace, route_name, suffix);
+    let readable_budget = MAX_ID_LENGTH - GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN;
+    if readable.len() > readable_budget {
+        let mut end = readable_budget;
+        while end > 0 && !readable.is_char_boundary(end) {
+            end -= 1;
+        }
+        readable.truncate(end);
+    }
+    format!(
+        "{readable}__{}",
+        &digest[..GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN]
+    )
 }
 
 /// UDP listener ports and parentRefs that survive same-listener conflict loss.
