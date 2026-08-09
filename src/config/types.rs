@@ -6711,8 +6711,7 @@ impl Proxy {
     /// `validate_stream_proxies` rather than silently ignored.
     #[inline]
     pub fn joins_opaque_tls_sni_plane(&self) -> bool {
-        self.passthrough
-            || (!self.frontend_tls && self.effective_scheme() == BackendScheme::Tcp)
+        self.passthrough || (!self.frontend_tls && self.effective_scheme() == BackendScheme::Tcp)
     }
 }
 

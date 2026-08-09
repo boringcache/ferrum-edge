@@ -1483,7 +1483,10 @@ fn classify_reports_not_tls_for_plaintext_application_bytes() {
     );
     // A SOCKS5 greeting, an SMTP banner — anything whose first byte is not a
     // TLS handshake record — is determinately not TLS.
-    assert_eq!(classify_client_hello(&[0x05, 0x01, 0x00]), ClientHelloSni::NotTls);
+    assert_eq!(
+        classify_client_hello(&[0x05, 0x01, 0x00]),
+        ClientHelloSni::NotTls
+    );
 }
 
 #[test]
@@ -1745,7 +1748,10 @@ async fn extractor_stays_a_projection_of_the_typed_peek() {
             "no sni",
             build_client_hello_with_extension_block(&non_sni_extension_block()),
         ),
-        ("malformed", build_client_hello_with_extension_block(&[0x00, 0x0f])),
+        (
+            "malformed",
+            build_client_hello_with_extension_block(&[0x00, 0x0f]),
+        ),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1756,9 +1762,11 @@ async fn extractor_stays_a_projection_of_the_typed_peek() {
             let typed =
                 peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5)))
                     .await;
-            let flat =
-                extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5)))
-                    .await;
+            let flat = extract_sni_from_tcp_stream(
+                &server_stream,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .await;
             (typed, flat)
         });
 

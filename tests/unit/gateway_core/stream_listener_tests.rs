@@ -699,7 +699,10 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
     let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
     let manager = create_manager_with_config_arc(config_arc.clone(), &initial);
     let failures = manager.reconcile().await;
-    assert!(failures.is_empty(), "initial reconcile failed: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "initial reconcile failed: {failures:?}"
+    );
     manager
         .wait_until_started(Duration::from_secs(5))
         .await

@@ -1528,7 +1528,9 @@ impl StreamListenerManager {
         for (identity, entry) in &desired {
             if sni_ports
                 .get(&entry.port)
-                .is_some_and(|port_has_passthrough| entry.is_sni_group_member(*port_has_passthrough))
+                .is_some_and(|port_has_passthrough| {
+                    entry.is_sni_group_member(*port_has_passthrough)
+                })
             {
                 sni_groups
                     .entry(entry.port)
@@ -1607,13 +1609,12 @@ impl StreamListenerManager {
 
         // Build the effective desired map: individual proxies + SNI/L4 group entries.
         // Proxies in a group are replaced by a single shared-port entry.
-        let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> =
-            sni_groups
-                .values()
-                .chain(l4_match_groups.values())
-                .flatten()
-                .chain(incompatible_shared_ids.iter())
-                .collect();
+        let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> = sni_groups
+            .values()
+            .chain(l4_match_groups.values())
+            .flatten()
+            .chain(incompatible_shared_ids.iter())
+            .collect();
 
         for identity in &incompatible_shared_ids {
             if let Some(entry) = desired.get(identity) {
