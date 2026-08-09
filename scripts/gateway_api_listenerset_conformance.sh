@@ -43,6 +43,14 @@ condition_status() {
     -o "jsonpath={.status.conditions[?(@.type==\"${ctype}\")].status}" 2>/dev/null || true
 }
 
+route_parent_condition_status() {
+  local kind="$1"
+  local name="$2"
+  local ctype="$3"
+  kubectl -n "$DP_GATEWAY_NAMESPACE" get "$kind" "$name" \
+    -o "jsonpath={.status.parents[0].conditions[?(@.type==\"${ctype}\")].status}" 2>/dev/null || true
+}
+
 apply_resources() {
   cat <<YAML | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
@@ -178,8 +186,8 @@ run_blackbox() {
   local route_accepted=""
   local route_programmed=""
   for _ in $(seq 1 45); do
-    route_accepted="$(condition_status httproute ferrum-blackbox-listenerset Accepted)"
-    route_programmed="$(condition_status httproute ferrum-blackbox-listenerset Programmed)"
+    route_accepted="$(route_parent_condition_status httproute ferrum-blackbox-listenerset Accepted)"
+    route_programmed="$(route_parent_condition_status httproute ferrum-blackbox-listenerset Programmed)"
     if [ "$route_accepted" = "True" ] && [ "$route_programmed" = "True" ]; then
       break
     fi
