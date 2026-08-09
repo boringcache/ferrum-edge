@@ -1880,10 +1880,7 @@ async fn condition_match_on_destination_ip_uses_connection_destination() {
         .headers
         .insert("host".to_string(), "10.96.4.7".to_string());
     assert!(
-        matches!(
-            plugin.authorize(&mut spoofed).await,
-            PluginResult::Continue
-        ),
+        matches!(plugin.authorize(&mut spoofed).await, PluginResult::Continue),
         "destination.ip must never be derived from a client-supplied header"
     );
 

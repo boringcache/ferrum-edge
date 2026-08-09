@@ -609,7 +609,10 @@ fn authz_translates_the_complete_documented_condition_key_set() {
     );
 
     let documented: &[(&str, Value)] = &[
-        ("source.principal", json!(["cluster.local/ns/default/sa/web"])),
+        (
+            "source.principal",
+            json!(["cluster.local/ns/default/sa/web"]),
+        ),
         ("source.namespace", json!(["default"])),
         ("source.ip", json!(["10.1.2.3", "10.2.0.0/16"])),
         ("remote.ip", json!(["203.0.113.0/24"])),
@@ -622,7 +625,10 @@ fn authz_translates_the_complete_documented_condition_key_set() {
         ("request.auth.claims[iss]", json!(["issuer.example.com"])),
         ("request.auth.claims[realm_access][roles]", json!(["admin"])),
         ("request.headers[user-agent]", json!(["Mozilla/*"])),
-        ("experimental.envoy.filters.network.mysql_proxy[db.table]", json!(["books"])),
+        (
+            "experimental.envoy.filters.network.mysql_proxy[db.table]",
+            json!(["books"]),
+        ),
     ];
 
     for (key, values) in documented {
@@ -633,8 +639,7 @@ fn authz_translates_the_complete_documented_condition_key_set() {
             "documented condition key '{key}' must translate to exactly one rule"
         );
         assert_eq!(
-            policy.rules[0].when[0].key,
-            *key,
+            policy.rules[0].when[0].key, *key,
             "documented condition key '{key}' must be preserved verbatim"
         );
     }
