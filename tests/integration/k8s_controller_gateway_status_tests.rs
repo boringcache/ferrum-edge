@@ -2,7 +2,7 @@
 //! materialization records.
 
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    GatewayApiListenerKey, K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -576,9 +576,8 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
             "allowedRoutes": {"kinds": [{"kind": "GRPCRoute"}]}
         }
     ]));
-    // Distinct listen paths: Ferrum materializes Gateway API HTTP-family routes
-    // as port-agnostic `(hosts, listen_path)` proxies, so two Routes surviving
-    // on different listeners still occupy different route-table slots.
+    // Distinct listen paths keep dispatch lists separate; port-aware
+    // representation also stamps distinct listener ports onto each proxy.
     let mut http_route = object(
         "gateway.networking.k8s.io/v1",
         "HTTPRoute",
@@ -644,19 +643,12 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
 }
 
 /// The fail-closed edge between the two cases above: one wildcard parentRef
-/// reaches a shared listener *and* a GRPCRoute-only listener, emitting a single
-/// `(parentRef, hostname)` claim. It loses the cross-kind arbitration on the
-/// shared listener and would otherwise be accepted on the GRPCRoute-only one.
-///
-/// Ferrum materializes HTTP-family Gateway API routes as port-agnostic
-/// `(hosts, listen_path)` proxies, so a claim kept for the listener it won
-/// cannot be restricted to that listener — it would still route on the shared
-/// listener, exactly where Gateway API forbids HTTPRoute/GRPCRoute merging.
-/// The claim is therefore withdrawn whole: the GRPCRoute contributes no proxy,
-/// no upstream, no plugin, and no materialized parent anywhere, and is reported
-/// `Accepted=False`/`Conflicted` — independent of object observation order.
+/// reaches a shared listener *and* a GRPCRoute-only listener. It loses the
+/// cross-kind arbitration on the shared listener. With port-aware
+/// representation it retains the grpc-only claim, keeps Accepted=True for the
+/// surviving parent, and continues to program traffic on that listener.
 #[test]
-fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners() {
+fn cross_kind_wildcard_claim_losing_one_listener_retains_sibling_claims() {
     let gateway = cross_kind_gateway(json!([
         {
             "name": "shared",
@@ -672,9 +664,6 @@ fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners
         }
     ]));
     // The HTTPRoute pins the shared listener and is older, so it wins there.
-    // Its distinct listen path means the GRPCRoute would have had a route-table
-    // slot of its own had the claim been kept — the withdrawal is the conflict
-    // decision, not a `(hosts, listen_path)` collision.
     let mut http_route = object(
         "gateway.networking.k8s.io/v1",
         "HTTPRoute",
@@ -722,62 +711,55 @@ fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners
     ] {
         let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
-        // The losing GRPCRoute materializes no traffic state on *either*
-        // listener, including the one it would otherwise have won.
-        let ports: Vec<u16> = translation
+        let mut ports: Vec<u16> = translation
             .config
             .proxies
             .iter()
             .map(|proxy| proxy.backend_port)
             .collect();
+        ports.sort_unstable();
         assert_eq!(
             ports,
-            vec![8080],
-            "the withdrawn GRPCRoute must not keep the grpc-only listener"
+            vec![8080, 50051],
+            "the GRPCRoute loses on the shared listener but retains the grpc-only claim"
         );
         assert!(
-            !translation
+            translation
                 .config
-                .upstreams
+                .proxies
                 .iter()
-                .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
-            "the withdrawn GRPCRoute must not leave an upstream: {:?}",
-            translation.config.upstreams
+                .any(|proxy| { proxy.backend_port == 50051 && proxy.listen_port == Some(8080) }),
+            "retained GRPCRoute claim must be scoped to the grpc-only listener"
         );
         assert!(
-            !translation
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
-            "the withdrawn GRPCRoute must contribute no dispatch rules"
-        );
-        assert!(
-            !translation
+            translation
                 .materialized_route_parents
                 .iter()
                 .any(|entry| entry.route.kind == "GRPCRoute"),
-            "the withdrawn GRPCRoute must claim no materialized parent"
+            "the retained GRPCRoute must claim a materialized parent"
         );
 
-        // ...and the withdrawal is reported, naming a real applicable winner.
         let conflict = translation
             .route_conflicts
             .iter()
             .find(|conflict| conflict.loser.kind == "GRPCRoute")
-            .expect("the withdrawal must be reported as a conflict");
+            .expect("the shared-listener loss must still be reported as a conflict");
         assert_eq!(conflict.winner.kind, "HTTPRoute");
         assert_eq!(conflict.winner.name, "web");
+        assert_eq!(conflict.key.listen_port, Some(80));
 
         let updates =
             plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
         let grpc_update = updates
             .iter()
             .find(|update| update.kind == "GRPCRoute" && update.name == "grpc")
-            .expect("the withdrawn GRPCRoute gets a status update");
+            .expect("the GRPCRoute gets a status update");
         let accepted = accepted_condition(grpc_update);
-        assert_eq!(accepted["status"].as_str(), Some("False"));
-        assert_eq!(accepted["reason"].as_str(), Some("Conflicted"));
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "partial listener loss must keep Accepted=True: {accepted:?}"
+        );
 
         let http_update = updates
             .iter()
@@ -904,4 +886,1157 @@ fn cross_kind_rejection_does_not_reach_l4_routes_on_the_same_gateway() {
             .any(|proxy| proxy.backend_port == 50051),
         "the rejected GRPCRoute must not produce a proxy"
     );
+}
+
+// ── Same-port listener conflicts on `Gateway.status.listeners[]` ────────────
+//
+// `refuse_incompatible_same_port_listeners()` makes a listener non-
+// materializable when one numeric port is claimed with physically
+// incompatible frontend shapes. Status must say so: a refused listener
+// reports `Conflicted=True`, `Programmed=False`, and `Accepted=False`
+// (`PortUnavailable`) — never `Accepted=True` / `NoConflicts`.
+
+fn tls_secret_object(name: &str) -> K8sObject {
+    tls_secret_object_in(name, "default")
+}
+
+fn tls_secret_object_in(name: &str, namespace: &str) -> K8sObject {
+    use base64::Engine as _;
+    let cert = include_str!("../certs/server.crt");
+    let key = include_str!("../certs/server.key");
+    object(
+        "v1",
+        "Secret",
+        name,
+        namespace,
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {
+                "tls.crt": base64::engine::general_purpose::STANDARD.encode(cert),
+                "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
+            }
+        }),
+    )
+}
+
+fn listener_status<'a>(update: &'a GatewayApiStatusUpdate, name: &str) -> &'a Value {
+    update.status["listeners"]
+        .as_array()
+        .expect("listener statuses")
+        .iter()
+        .find(|listener| listener["name"].as_str() == Some(name))
+        .expect("the listener must be reported")
+}
+
+fn listener_condition<'a>(listener: &'a Value, condition_type: &str) -> &'a Value {
+    listener["conditions"]
+        .as_array()
+        .expect("listener conditions")
+        .iter()
+        .find(|condition| condition["type"].as_str() == Some(condition_type))
+        .unwrap_or_else(|| panic!("a {condition_type} condition"))
+}
+
+fn gateway_update(objects: &[K8sObject], name: &str) -> GatewayApiStatusUpdate {
+    gateway_update_with_options(objects, options(), name)
+}
+
+fn gateway_update_with_options(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    name: &str,
+) -> GatewayApiStatusUpdate {
+    plan_gateway_api_status_updates(objects, options, &[])
+        .into_iter()
+        .find(|update| update.kind == "Gateway" && update.name == name)
+        .expect("a Gateway status update")
+}
+
+fn assert_listener_refused(update: &GatewayApiStatusUpdate, name: &str, reason: &str) {
+    let listener = listener_status(update, name);
+    let conflicted = listener_condition(listener, "Conflicted");
+    assert_eq!(
+        conflicted["status"].as_str(),
+        Some("True"),
+        "listener {name} must report Conflicted=True: {conflicted:?}"
+    );
+    assert_eq!(
+        conflicted["reason"].as_str(),
+        Some(reason),
+        "listener {name} conflict reason: {conflicted:?}"
+    );
+    let accepted = listener_condition(listener, "Accepted");
+    assert_eq!(
+        accepted["status"].as_str(),
+        Some("False"),
+        "a refused listener must not report Accepted=True: {accepted:?}"
+    );
+    assert_eq!(accepted["reason"].as_str(), Some("PortUnavailable"));
+    let programmed = listener_condition(listener, "Programmed");
+    assert_eq!(
+        programmed["status"].as_str(),
+        Some("False"),
+        "a refused listener must not report Programmed=True: {programmed:?}"
+    );
+}
+
+#[test]
+fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "plain",
+                    "port": 8443,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "secure",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let update = gateway_update(&objects, "edge");
+    assert_listener_refused(&update, "plain", "ProtocolConflict");
+    assert_listener_refused(&update, "secure", "ProtocolConflict");
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert_eq!(
+        translation.listener_conflicts.len(),
+        2,
+        "translation must refuse both plaintext and effective TLS claims: {:?}",
+        translation.listener_conflicts
+    );
+    for (key, conflict) in &translation.listener_conflicts {
+        assert_eq!(
+            conflict.reason, "ProtocolConflict",
+            "listener {key} must report ProtocolConflict"
+        );
+    }
+}
+
+/// Physically refused same-port listeners must not be advertised as
+/// MeshServices. A healthy sibling on a different port must still be exposed.
+#[test]
+fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "plain",
+                    "port": 8443,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "secure",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "healthy",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "healthy.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    let services = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.services.as_slice())
+        .unwrap_or(&[]);
+    let names: Vec<&str> = services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| *name == "edge-plain" || *name == "edge-secure"),
+        "refused same-port listeners must not become MeshServices: {names:?}"
+    );
+    assert!(
+        names.contains(&"edge-healthy"),
+        "healthy plaintext sibling on another port must remain exposed: {names:?}"
+    );
+    assert!(
+        services.iter().any(|service| {
+            service.name == "edge-healthy"
+                && service.ports.len() == 1
+                && service.ports[0].port == 8080
+        }),
+        "healthy winner must keep its listen port: {services:?}"
+    );
+}
+
+/// Gateway API v1.5.1 defines HTTP-family listener distinctness on
+/// `(port, hostname)` and states that "the `tls` field is not used for
+/// determining if a listener is distinct". Sibling HTTPS listeners with
+/// disjoint hostnames and *different* `certificateRefs` are therefore distinct
+/// and must keep reporting `Accepted=True` / no `Conflicted`. Ferrum resolves
+/// one frontend TLS serving slot per Gateway namespace, so the listener whose
+/// credential does not win the slot simply materializes no routes — it never
+/// serves traffic under the other listener's certificate.
+///
+/// This is the shape the upstream conformance suite exercises with
+/// `same-namespace-with-https-listener` and the ReferenceGrant Gateways, which
+/// all share port 443 inside `gateway-conformance-infra`.
+#[test]
+fn tls_listeners_sharing_a_port_in_one_namespace_with_different_credentials_stay_accepted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "first",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "a.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-a"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "second",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-b"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![
+        class,
+        gateway,
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    let update = gateway_update(&objects, "edge");
+    for name in ["first", "second"] {
+        let listener = listener_status(&update, name);
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "listener {name} differs only by TLS credential, which is not a distinctness \
+             field: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "listener {name} must stay Accepted: {accepted:?}"
+        );
+    }
+}
+
+/// The exact upstream conformance shape: two *different* Gateways in one
+/// namespace both claim port 443 with catch-all HTTPS listeners naming
+/// different Secrets (`GatewaySecretReferenceGrant*` beside
+/// `same-namespace-with-https-listener`). Both stay Accepted because this is
+/// not a physical port conflict, but only the deterministic namespace-slot
+/// winner may report Programmed while Ferrum serves one credential per
+/// namespace.
+#[test]
+fn tls_listeners_sharing_a_port_across_gateways_in_one_namespace_stay_accepted() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            "default",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "cert-a"),
+        gateway_for("reference-grant-edge", "cert-b"),
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    for gateway in ["edge", "reference-grant-edge"] {
+        let update = gateway_update(&objects, gateway);
+        let listener = listener_status(&update, "https");
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "Gateway {gateway} must not be reported Conflicted: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "Gateway {gateway} listener must stay Accepted: {accepted:?}"
+        );
+        let programmed = listener_condition(listener, "Programmed");
+        let expected_programmed = if gateway == "edge" { "True" } else { "False" };
+        assert_eq!(
+            programmed["status"].as_str(),
+            Some(expected_programmed),
+            "only the namespace TLS-slot winner may report Programmed: {programmed:?}"
+        );
+        if gateway != "edge" {
+            assert_eq!(
+                programmed["reason"].as_str(),
+                Some("NoListeners"),
+                "the accepted non-winner must honestly report that no listener was materialized: {programmed:?}"
+            );
+        }
+    }
+}
+
+/// Two same-namespace Gateways with different credentials: only the planned
+/// lexicographic winner is exposed as a MeshService. The non-winning Gateway
+/// keeps Accepted listener status but must not advertise a listener under the
+/// wrong serving credential.
+#[test]
+fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            "default",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "cert-a"),
+        gateway_for("reference-grant-edge", "cert-b"),
+        tls_secret_object("cert-a"),
+        tls_secret_object("cert-b"),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    let services = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.services.as_slice())
+        .unwrap_or(&[]);
+    let names: Vec<&str> = services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"edge-https"),
+        "planned namespace TLS winner must remain exposed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"reference-grant-edge-https"),
+        "non-winning same-namespace Gateway must not advertise a MeshService under the wrong serving slot: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|name| name.ends_with("-https")).count(),
+        1,
+        "exactly one TLS MeshService must be exposed for the namespace slot: {names:?}"
+    );
+    assert!(
+        translation.warnings.iter().all(|warning| {
+            !warning.contains("k8s://")
+                && !warning.contains("sha256=")
+                && !warning.contains("#tls.crt")
+                && !warning.contains("#tls.key")
+        }),
+        "namespace-slot warnings must not expose credential source metadata: {:?}",
+        translation.warnings
+    );
+    // Reversed object order must not promote the non-winner.
+    let mut reversed = objects.clone();
+    reversed.reverse();
+    let reversed_translation =
+        translate_k8s_objects(&reversed, options()).expect("reversed translation");
+    let reversed_names: Vec<&str> = reversed_translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| {
+            mesh.services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        reversed_names.contains(&"edge-https"),
+        "order-independent winner exposure: {reversed_names:?}"
+    );
+    assert!(
+        !reversed_names.contains(&"reference-grant-edge-https"),
+        "order-independent non-winner refusal: {reversed_names:?}"
+    );
+}
+
+/// Across Gateway namespaces, physical compatibility is decided from each
+/// namespace's deterministic effective serving credential — not from every raw
+/// `certificateRef` that will lose same-namespace slot arbitration. Disagreeing
+/// effective slots on one socket stay fail-closed on both effective claims.
+#[test]
+fn tls_listeners_on_one_port_across_namespaces_with_different_certs_conflict() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, namespace: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            namespace,
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "hostname": format!("{name}.example.com"),
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge", "default", "cert-a"),
+        gateway_for("other-edge", "other", "cert-b"),
+        tls_secret_object_in("cert-a", "default"),
+        tls_secret_object_in("cert-b", "other"),
+    ];
+    let namespaces = vec!["default".to_string(), "other".to_string()];
+    let options = options().with_source_namespaces(namespaces);
+
+    let update = gateway_update_with_options(&objects, options.clone(), "edge");
+    assert_listener_refused(&update, "https", "HostnameConflict");
+    let other = gateway_update_with_options(&objects, options, "other-edge");
+    assert_listener_refused(&other, "https", "HostnameConflict");
+}
+
+/// Namespace A has raw same-port claims X and Y but deterministically serves X;
+/// namespace B serves the same credential X on the same port (cross-namespace
+/// Secret ref). The physical socket can present X for both namespaces, so raw
+/// credential `{X,Y}` must not manufacture a `HostnameConflict`.
+#[test]
+fn effective_same_credential_across_namespaces_is_not_a_conflict_despite_raw_sibling() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, namespace: &str, secret: Value| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            namespace,
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "hostname": format!("{name}.example.com"),
+                        "tls": {"mode": "Terminate", "certificateRefs": [secret]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let grant = object(
+        "gateway.networking.k8s.io/v1beta1",
+        "ReferenceGrant",
+        "allow-other-gateway-cert",
+        "default",
+        json!({
+            "from": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "namespace": "other"
+            }],
+            "to": [{
+                "group": "",
+                "kind": "Secret",
+                "name": "cert-a"
+            }]
+        }),
+    );
+    // Lexicographic winner in `default` is `edge-a` → cert-a (X). `edge-b` is
+    // the non-winning raw sibling with cert-b (Y). `other-edge` also terminates
+    // with cert-a via ReferenceGrant, so effective slots agree on X.
+    let objects = vec![
+        class,
+        grant,
+        gateway_for("edge-a", "default", json!({"name": "cert-a"})),
+        gateway_for("edge-b", "default", json!({"name": "cert-b"})),
+        gateway_for(
+            "other-edge",
+            "other",
+            json!({"name": "cert-a", "namespace": "default"}),
+        ),
+        tls_secret_object_in("cert-a", "default"),
+        tls_secret_object_in("cert-b", "default"),
+    ];
+    let namespaces = vec!["default".to_string(), "other".to_string()];
+    let options = options().with_source_namespaces(namespaces);
+
+    for gateway in ["edge-a", "edge-b", "other-edge"] {
+        let update = gateway_update_with_options(&objects, options.clone(), gateway);
+        let listener = listener_status(&update, "https");
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "Gateway {gateway} effective slots both serve cert-a; raw cert-b must not conflict: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "Gateway {gateway} must stay Accepted: {accepted:?}"
+        );
+    }
+
+    // Reversed object order must not change the status decision.
+    let mut reversed = objects.clone();
+    reversed.reverse();
+    for gateway in ["edge-a", "edge-b", "other-edge"] {
+        let update = gateway_update_with_options(&reversed, options.clone(), gateway);
+        let conflicted = listener_condition(listener_status(&update, "https"), "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "order-independent status for {gateway}: {conflicted:?}"
+        );
+    }
+
+    let translation = translate_k8s_objects(&objects, options.clone()).expect("translation");
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "translation must agree with status: no physical conflict when effective slots share a credential: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "default")
+            .is_some_and(|source| source.cert_path.contains("/cert-a#")),
+        "default must serve the planned cert-a slot, not the raw cert-b sibling"
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "other")
+            .is_some_and(|source| source.cert_path.contains("/cert-a#")),
+        "other must serve the shared cert-a credential"
+    );
+}
+
+/// When two namespaces' effective serving slots on one port resolve to
+/// different credentials, only those effective claims are refused —
+/// symmetrically and independently of object order.
+#[test]
+fn effective_different_credentials_across_namespaces_refuse_both_effective_claims() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway_for = |name: &str, namespace: &str, secret: &str| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            name,
+            namespace,
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "hostname": format!("{name}.example.com"),
+                        "tls": {"mode": "Terminate", "certificateRefs": [{"name": secret}]},
+                        "allowedRoutes": {"namespaces": {"from": "All"}}
+                    }
+                ]
+            }),
+        )
+    };
+    let objects = vec![
+        class,
+        gateway_for("edge-a", "default", "cert-a"),
+        gateway_for("edge-b", "default", "cert-b"),
+        gateway_for("other-edge", "other", "cert-b"),
+        tls_secret_object_in("cert-a", "default"),
+        tls_secret_object_in("cert-b", "default"),
+        tls_secret_object_in("cert-b", "other"),
+        object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "sibling-route",
+            "default",
+            json!({
+                "parentRefs": [{"name": "edge-b", "sectionName": "https"}],
+                "hostnames": ["edge-b.example.com"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/sibling"}}],
+                    "backendRefs": [{"name": "backend", "port": 8080}]
+                }]
+            }),
+        ),
+    ];
+    let namespaces = vec!["default".to_string(), "other".to_string()];
+    let options = options().with_source_namespaces(namespaces);
+
+    // Effective: default→cert-a (edge-a wins), other→cert-b. Both effective
+    // claims refuse; the non-winning default/edge-b sibling must not.
+    let edge_a = gateway_update_with_options(&objects, options.clone(), "edge-a");
+    assert_listener_refused(&edge_a, "https", "HostnameConflict");
+    let other = gateway_update_with_options(&objects, options.clone(), "other-edge");
+    assert_listener_refused(&other, "https", "HostnameConflict");
+
+    let edge_b = gateway_update_with_options(&objects, options.clone(), "edge-b");
+    let sibling = listener_status(&edge_b, "https");
+    let conflicted = listener_condition(sibling, "Conflicted");
+    assert_eq!(
+        conflicted["status"].as_str(),
+        Some("False"),
+        "non-winning same-namespace sibling must not be marked HostnameConflict: {conflicted:?}"
+    );
+    assert_eq!(
+        listener_condition(sibling, "Accepted")["status"].as_str(),
+        Some("True"),
+        "non-winning sibling keeps Accepted listener status"
+    );
+
+    let translation = translate_k8s_objects(&objects, options).expect("translation");
+    assert!(
+        translation
+            .listener_conflicts
+            .contains_key(&GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                gateway: "edge-a".to_string(),
+                listener: "https".to_string(),
+            }),
+        "translation must refuse the default effective claim: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        translation
+            .listener_conflicts
+            .contains_key(&GatewayApiListenerKey {
+                namespace: "other".to_string(),
+                gateway: "other-edge".to_string(),
+                listener: "https".to_string(),
+            }),
+        "translation must refuse the other-namespace effective claim: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation
+            .listener_conflicts
+            .contains_key(&GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                gateway: "edge-b".to_string(),
+                listener: "https".to_string(),
+            }),
+        "translation must not refuse the non-winning sibling: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        translation.config.proxies.is_empty(),
+        "non-winning sibling must still materialize no routes under the wrong certificate: {:?}",
+        translation.config.proxies
+    );
+}
+
+/// A compatible same-port pair must stay clean: no `Conflicted`, and the
+/// listeners keep their ordinary `Accepted=True` reporting.
+#[test]
+fn compatible_same_port_listeners_report_no_conflict() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "first",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "a.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "second",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "b.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "app-cert"}]},
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway, tls_secret_object("app-cert")];
+
+    let update = gateway_update(&objects, "edge");
+    for name in ["first", "second"] {
+        let listener = listener_status(&update, name);
+        let conflicted = listener_condition(listener, "Conflicted");
+        assert_eq!(
+            conflicted["status"].as_str(),
+            Some("False"),
+            "listener {name} must not be reported Conflicted: {conflicted:?}"
+        );
+        let accepted = listener_condition(listener, "Accepted");
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "listener {name} must stay Accepted: {accepted:?}"
+        );
+    }
+}
+
+/// A plaintext HTTP Gateway named `name` exposing one listener `http` on `port`.
+fn plain_gateway(name: &str, port: u16) -> K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        name,
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "http",
+                "port": port,
+                "protocol": "HTTP",
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    )
+}
+
+/// An HTTPRoute claiming `/api` on `app.example.com` through the `http`
+/// listener of every named Gateway.
+fn slot_claim_route(name: &str, gateways: &[&str]) -> K8sObject {
+    let parent_refs: Vec<Value> = gateways
+        .iter()
+        .map(|gateway| json!({"name": gateway, "sectionName": "http"}))
+        .collect();
+    object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        name,
+        "default",
+        json!({
+            "parentRefs": parent_refs,
+            "hostnames": ["app.example.com"],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "backendRefs": [{"name": "web", "port": 8080}]
+            }]
+        }),
+    )
+}
+
+/// Listener identity must not be derived by lossy punctuation replacement.
+/// Both Gateway names are valid, but `edge.a` and `edge-a` sanitize to the same
+/// Ferrum ID fragment. A Route attached to both must retain two distinct proxy
+/// resources and both listener ports.
+#[test]
+fn punctuation_colliding_gateway_names_keep_distinct_listener_claims() {
+    let dotted = plain_gateway("edge.a", 8080);
+    let dashed = plain_gateway("edge-a", 9090);
+    let route = slot_claim_route("route-a", &["edge.a", "edge-a"]);
+    let objects = vec![gateway_class(), dotted, dashed, route];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let mut ports: Vec<u16> = translation
+        .config
+        .proxies
+        .iter()
+        .filter_map(|proxy| proxy.listen_port)
+        .collect();
+    ports.sort_unstable();
+    assert_eq!(
+        ports,
+        vec![8080, 9090],
+        "lossy listener IDs must not overwrite one of the two claims: {:?}",
+        translation.config.proxies
+    );
+
+    let ids: std::collections::HashSet<&str> = translation
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "each listener claim needs a unique proxy ID");
+}
+
+fn route_update<'a>(
+    updates: &'a [GatewayApiStatusUpdate],
+    name: &str,
+) -> &'a GatewayApiStatusUpdate {
+    updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == name)
+        .unwrap_or_else(|| panic!("a status update for HTTPRoute {name}"))
+}
+
+/// One condition of the `status.parents[]` entry whose parentRef names
+/// `gateway`. Keyed on the parentRef the operator wrote, so a multi-parent
+/// Route can be asserted parent by parent.
+fn parent_condition<'a>(
+    update: &'a GatewayApiStatusUpdate,
+    gateway: &str,
+    condition_type: &str,
+) -> &'a Value {
+    let parent = update.status["parents"]
+        .as_array()
+        .expect("route parents")
+        .iter()
+        .find(|parent| parent["parentRef"]["name"].as_str() == Some(gateway))
+        .unwrap_or_else(|| panic!("a status.parents[] entry for {gateway}"));
+    parent["conditions"]
+        .as_array()
+        .expect("parent conditions")
+        .iter()
+        .find(|condition| condition["type"].as_str() == Some(condition_type))
+        .unwrap_or_else(|| panic!("a {condition_type} condition for {gateway}"))
+}
+
+fn assert_condition(condition: &Value, status: &str, reason: &str, context: &str) {
+    assert_eq!(
+        condition["status"].as_str(),
+        Some(status),
+        "{context}: {condition:?}"
+    );
+    assert_eq!(
+        condition["reason"].as_str(),
+        Some(reason),
+        "{context}: {condition:?}"
+    );
+}
+
+/// Two different Gateway API listeners materialize one physical
+/// `(namespace, hosts, listen path, listen port)` route slot. The translator
+/// refuses both claims fail closed, so neither Route may report a materialized
+/// Ferrum parent: a Route advertising `Programmed=True` for a slot the data
+/// plane withdrew is exactly the contradiction issue #3612 has to close.
+///
+/// Both observation orders are checked. The refusal is symmetric, so which
+/// claim the translator saw first must not decide what status reports.
+#[test]
+fn same_slot_listener_ambiguity_reports_both_routes_conflicted_in_status() {
+    let gateway_a = plain_gateway("edge-a", 8080);
+    let gateway_b = plain_gateway("edge-b", 8080);
+    let route_a = slot_claim_route("route-a", &["edge-a"]);
+    let route_b = slot_claim_route("route-b", &["edge-b"]);
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway_a.clone(),
+            gateway_b.clone(),
+            route_a.clone(),
+            route_b.clone(),
+        ],
+        vec![
+            gateway_class(),
+            gateway_b.clone(),
+            gateway_a.clone(),
+            route_b.clone(),
+            route_a.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+        assert!(
+            translation.config.proxies.is_empty(),
+            "an ambiguous same-slot claim must materialize nothing: {:?}",
+            translation.config.proxies
+        );
+        assert!(
+            translation.materialized_route_parents.is_empty(),
+            "a refused claim must leave no materialized parent behind: {:?}",
+            translation.materialized_route_parents
+        );
+
+        let mut refused: Vec<String> = Vec::new();
+        for attachment in &translation.refused_route_attachments {
+            let listener = match attachment.listener.as_ref() {
+                Some(listener) => listener.to_string(),
+                None => "<unresolved>".to_string(),
+            };
+            refused.push(format!("{} on {listener}", attachment.route.name));
+        }
+        refused.sort();
+        assert_eq!(
+            refused,
+            vec![
+                "route-a on default/edge-a#http".to_string(),
+                "route-b on default/edge-b#http".to_string(),
+            ],
+            "both claims must be refused, each named by its exact listener"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+        for (route, gateway) in [("route-a", "edge-a"), ("route-b", "edge-b")] {
+            let update = route_update(&updates, route);
+            assert_condition(
+                parent_condition(update, gateway, "Accepted"),
+                "False",
+                "Conflicted",
+                &format!("{route} must not report Accepted for a refused slot"),
+            );
+            assert_condition(
+                parent_condition(update, gateway, "Programmed"),
+                "False",
+                "Conflicted",
+                &format!("{route} must not report Programmed for a refused slot"),
+            );
+            let conflicted = parent_condition(update, gateway, "Conflicted");
+            assert_condition(
+                conflicted,
+                "True",
+                "Conflicted",
+                &format!("{route} must report the ambiguity as a conflict"),
+            );
+            let message = conflicted["message"].as_str().unwrap_or_default();
+            let expected = format!("default/{gateway}#http");
+            assert!(
+                message.contains(&expected),
+                "the conflict message must name the refused listener: {message}"
+            );
+        }
+    }
+}
+
+/// The refusal is confined to the exact listener-scoped claim. A Route with one
+/// refused parentRef and one surviving parentRef keeps serving — and keeps
+/// reporting `Accepted`/`Programmed` — on the survivor, while only the refused
+/// parentRef is withdrawn. Rejecting the whole Route here would take a healthy
+/// listener offline in status for a collision it never participated in.
+#[test]
+fn a_route_with_one_refused_and_one_surviving_parent_keeps_the_survivor() {
+    let gateway_a = plain_gateway("edge-a", 8080);
+    let gateway_b = plain_gateway("edge-b", 8080);
+    // A third listener on its own port: the contested claim cannot reach it.
+    let gateway_c = plain_gateway("edge-c", 9090);
+    let route_a = slot_claim_route("route-a", &["edge-a", "edge-c"]);
+    let route_b = slot_claim_route("route-b", &["edge-b"]);
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway_a.clone(),
+            gateway_b.clone(),
+            gateway_c.clone(),
+            route_a.clone(),
+            route_b.clone(),
+        ],
+        vec![
+            gateway_class(),
+            gateway_c.clone(),
+            gateway_b.clone(),
+            gateway_a.clone(),
+            route_b.clone(),
+            route_a.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+        let listen_ports: Vec<Option<u16>> = translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_port)
+            .collect();
+        assert_eq!(
+            listen_ports,
+            vec![Some(9090)],
+            "only the uncontested :9090 claim may materialize: {:?}",
+            translation.config.proxies
+        );
+
+        let parents: Vec<&str> = translation
+            .materialized_route_parents
+            .iter()
+            .filter(|entry| entry.route.name == "route-a")
+            .map(|entry| entry.parent_ref.as_str())
+            .collect();
+        assert!(
+            parents.iter().any(|parent| parent.contains("edge-c")),
+            "the surviving parentRef must keep its record: {parents:?}"
+        );
+        assert!(
+            !parents.iter().any(|parent| parent.contains("edge-a")),
+            "the refused parentRef must lose its record: {parents:?}"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+        let update = route_update(&updates, "route-a");
+        assert_condition(
+            parent_condition(update, "edge-c", "Accepted"),
+            "True",
+            "Accepted",
+            "the surviving parentRef must stay Accepted",
+        );
+        assert_condition(
+            parent_condition(update, "edge-c", "Programmed"),
+            "True",
+            "Programmed",
+            "the surviving parentRef must stay Programmed",
+        );
+        assert_condition(
+            parent_condition(update, "edge-c", "Conflicted"),
+            "False",
+            "NoConflicts",
+            "the surviving parentRef must report no conflict",
+        );
+        assert_condition(
+            parent_condition(update, "edge-a", "Accepted"),
+            "False",
+            "Conflicted",
+            "the refused parentRef must not report Accepted",
+        );
+        assert_condition(
+            parent_condition(update, "edge-a", "Programmed"),
+            "False",
+            "Conflicted",
+            "the refused parentRef must not report Programmed",
+        );
+
+        let other = route_update(&updates, "route-b");
+        assert_condition(
+            parent_condition(other, "edge-b", "Programmed"),
+            "False",
+            "Conflicted",
+            "the colliding Route must not report Programmed either",
+        );
+    }
 }

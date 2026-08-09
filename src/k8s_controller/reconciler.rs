@@ -1587,6 +1587,7 @@ pub fn merge_k8s_translation(
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
     merge_k8s_frontend_tls(&mut merged, k8s_config);
+    merge_http_tls_listen_ports(&mut merged, k8s_config, managed_namespaces);
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -1662,6 +1663,44 @@ fn merge_k8s_mesh_overlay(merged: &mut GatewayConfig, k8s_config: &GatewayConfig
     merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative { base_mesh };
 }
 
+/// Recompose the `(namespace, listen_port)` TLS classification for Gateway API
+/// listener ports.
+///
+/// This field is derived state that must travel with the proxies it describes.
+/// Composition rebuilds `merged.proxies` from the retained base plus this
+/// translation, so the classification is rebuilt the same way: drop every entry
+/// no surviving HTTP-family proxy still claims (that is how a deleted Gateway
+/// listener is withdrawn), then adopt this translation's entries.
+///
+/// Dropping this step is not cosmetic — an HTTPS listener's routes would be
+/// published classified as plaintext and every TLS request to them would 404.
+fn merge_http_tls_listen_ports(
+    merged: &mut GatewayConfig,
+    k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+) {
+    let claimed: BTreeSet<(String, u16)> = merged
+        .proxies
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .listen_port
+                .map(|port| (proxy.namespace.clone(), port))
+        })
+        .collect();
+    merged.http_tls_listen_ports.retain(|entry| {
+        // A current translation is authoritative for every managed
+        // namespace. Do not infer ownership from a surviving proxy at the
+        // same `(namespace, port)`: that proxy may be file/native-authored,
+        // and retaining the old Kubernetes bit would silently reclassify
+        // it as TLS after the Gateway listener was deleted.
+        !namespace_is_managed(&entry.0, managed_namespaces) && claimed.contains(entry)
+    });
+    merged
+        .http_tls_listen_ports
+        .extend(k8s_config.http_tls_listen_ports.iter().cloned());
+}
+
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
     let k8s_supplies_tls = !k8s_config.frontend_tls_namespace_sources.is_empty()
         || k8s_config.frontend_tls_cert_path.is_some()
@@ -1700,6 +1739,10 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "frontend_tls_key_path": &config.frontend_tls_key_path,
         "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
         "frontend_tls_namespace_sources": &config.frontend_tls_namespace_sources,
+        // Derived Gateway-listener TLS classification. Included because a
+        // listener flipping HTTP<->HTTPS leaves every other field identical,
+        // and a dedupe that ignored it would keep serving the old class.
+        "http_tls_listen_ports": &config.http_tls_listen_ports,
         "mesh": &config.mesh,
     });
     strip_volatile_timestamps(&mut value);

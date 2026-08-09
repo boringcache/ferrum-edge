@@ -389,13 +389,11 @@ fn test_direct_stream_match_enforces_public_arm_bound() {
 }
 
 #[test]
-fn test_validate_http_proxy_with_listen_port_rejected() {
+fn test_validate_http_proxy_with_listen_port_allowed() {
     let mut proxy = make_http_proxy("http1", "/api");
     proxy.listen_port = Some(8080);
     let config = test_config(vec![proxy]);
-    let err = config.validate_stream_proxies().unwrap_err();
-    assert_eq!(err.len(), 1);
-    assert!(err[0].contains("must not set listen_port"));
+    assert!(config.validate_stream_proxies().is_ok());
 }
 
 #[test]

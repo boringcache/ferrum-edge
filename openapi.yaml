@@ -7546,13 +7546,24 @@ components:
           format: uint16
           minimum: 1
           description: |
-            Port for this TCP/UDP proxy to listen on (must be >= 1). Required when
-            backend_scheme is tcp, tcps, udp, or dtls. Must NOT be set for HTTP
-            proxies. Each stream proxy binds its own dedicated port; duplicate ports
-            across stream proxies are rejected. In database mode, the Admin API also
-            rejects ports that conflict with gateway reserved ports (proxy/admin/gRPC
-            listeners) or are already bound on the host. In CP mode, local port
-            checks are skipped since stream proxies run on remote DP nodes.
+            Listen-port identity for this proxy (must be >= 1 when set).
+
+            Stream family (`tcp`/`tcps`/`udp`/`dtls`): required. The proxy binds
+            this port and routes by it (not by path). Duplicate ports across
+            stream proxies are rejected unless every sharer is `passthrough: true`
+            (SNI) or participates in an L4 `stream_match` group. In database mode,
+            the Admin API also rejects ports that conflict with gateway reserved
+            ports (proxy/admin/gRPC listeners) or are already bound on the host.
+            In CP mode, local port checks are skipped since stream proxies run on
+            remote DP nodes.
+
+            HTTP family: optional. When set, the proxy is port-scoped and only
+            matches requests accepted on that frontend port (or the protocol-class
+            remap when a single HTTP/HTTPS Gateway listener port is projected onto
+            `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`). When omitted,
+            the proxy remains port-agnostic and matches any HTTP-family frontend
+            (manual / non-Kubernetes default). Distinct `listen_port` values do not
+            conflict on the same `hosts`+`listen_path`.
         frontend_tls:
           type: boolean
           default: false
@@ -7755,7 +7766,9 @@ components:
 
         **Validation rules** (enforced at admin API + file/DB load time):
         - HTTP-family proxies: at least one of `hosts` or `listen_path` must
-          be set. A proxy with neither is rejected (400).
+          be set. A proxy with neither is rejected (400). Optional `listen_port`
+          scopes the route to that frontend port (or the HTTP/HTTPS protocol
+          remap); omit it for port-agnostic matching.
         - Stream-family proxies (`tcp`/`tcps`/`udp`/`dtls`): `listen_path`
           MUST be null/omitted, and `listen_port` MUST be set,
           and `backend_scheme` MUST be set explicitly.
