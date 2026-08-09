@@ -390,7 +390,20 @@ impl Http3Client {
         &self,
         url: &str,
     ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
-        self.open_grpc_stream_with_content_type(url, "application/grpc")
+        self.open_grpc_stream_with_content_type(url, "application/grpc", &[])
+            .await
+    }
+
+    /// [`Self::open_grpc_stream`] with extra request metadata. Needed to drive
+    /// client-supplied gRPC call metadata over the H3 frontend — in particular
+    /// `grpc-timeout`, whose propagation onto the selected backend transport is
+    /// otherwise unobservable from a client.
+    pub async fn open_grpc_stream_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, "application/grpc", headers)
             .await
     }
 
@@ -402,7 +415,7 @@ impl Http3Client {
         url: &str,
         content_type: &str,
     ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
-        self.open_grpc_stream_with_content_type(url, content_type)
+        self.open_grpc_stream_with_content_type(url, content_type, &[])
             .await
     }
 
@@ -410,6 +423,7 @@ impl Http3Client {
         &self,
         url: &str,
         content_type: &str,
+        extra_headers: &[(&str, &str)],
     ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
@@ -431,10 +445,14 @@ impl Http3Client {
         });
         // The gateway synthesizes `te: trailers` toward the backend itself, so
         // the client only needs the selected native/gRPC-Web content type.
-        let req = Request::builder()
+        let mut builder = Request::builder()
             .method(http::Method::POST)
             .uri(url)
-            .header(http::header::CONTENT_TYPE, content_type)
+            .header(http::header::CONTENT_TYPE, content_type);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
         let stream = tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))

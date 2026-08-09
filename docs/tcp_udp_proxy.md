@@ -751,7 +751,11 @@ parents (a GAMMA `Service` parent or a mistyped `kind`), opens nothing. Present
 but malformed or explicitly empty `parentRefs` fail closed too. Ferrum
 implements no non-Gateway `UDPRoute` parent, and treating the backend port as a
 listener would create an unannounced north-south bind. The historical
-backend-port fallback remains only for parentless `TCPRoute`/`TLSRoute` inputs.
+backend-port fallback remains only for genuinely parentless
+`TCPRoute`/`TLSRoute` inputs. A TCPRoute or TLSRoute carrying only a
+non-Gateway parent (including a GAMMA `Service` parent) also opens nothing:
+Ferrum implements no such L4 parent, and treating the declaration as absent
+would create the same unannounced listener.
 Same-listener ownership suppresses **effective traffic** only: both
 otherwise-valid `UDPRoute`s stay `Accepted=True` (attached), the oldest alone
 is `Programmed`/effective, the shadowed newer route reports

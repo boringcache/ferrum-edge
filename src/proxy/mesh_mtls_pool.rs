@@ -20,14 +20,17 @@
 //! stream, so the dispatch error mapping stays single-sourced.
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::Either;
+use http_body::Frame;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -109,9 +112,64 @@ pub const MESH_EASTWEST_SNI_TAG: &str = "mesh.eastwest_sni";
 pub const MESH_CROSS_CLUSTER_TAG: &str = "mesh.cross_cluster";
 
 /// Request representation accepted by the multiplexed sidecar H2 pool.
-/// Streaming requests retain the existing inline size limiter; retry-enabled
-/// requests use immutable bytes finalized once before the first attempt.
-pub type MeshMtlsRequestBody = Either<SizeLimitedIncoming, ReplayableRequestBody>;
+///
+/// * [`Streaming`](MeshMtlsRequestBody::Streaming) — generic HTTP-family
+///   requests, retaining the inline size limiter.
+/// * [`Replayable`](MeshMtlsRequestBody::Replayable) — retry-enabled requests
+///   whose bytes were finalized once before the first attempt.
+/// * [`Grpc`](MeshMtlsRequestBody::Grpc) — a gRPC dispatch handing the SHARED
+///   [`GrpcBody`](crate::proxy::grpc_proxy::GrpcBody) through unchanged, so the
+///   direct-dial gRPC pool and the mesh transport cannot drift on request
+///   framing: buffered DATA, buffered DATA plus a terminal TRAILERS frame, a
+///   hyper `Incoming`, or the H3 bridge's channel source all keep their inline
+///   receive-limit accounting, upload-termination observer, and gRPC message
+///   counting when they ride the mesh (issue #3284).
+///
+/// A manual [`http_body::Body`] impl (rather than nested `Either`s) keeps the
+/// arms named at every construction site and boxes each arm's error into the
+/// one shared error type hyper needs.
+pub enum MeshMtlsRequestBody {
+    Streaming(SizeLimitedIncoming),
+    Replayable(ReplayableRequestBody),
+    Grpc(crate::proxy::grpc_proxy::GrpcBody),
+}
+
+impl http_body::Body for MeshMtlsRequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::poll_frame(Pin::new(body), cx),
+            // `ReplayableRequestBody` is infallible; the `match never {}` keeps
+            // that provable rather than boxing an impossible error.
+            MeshMtlsRequestBody::Replayable(body) => {
+                http_body::Body::poll_frame(Pin::new(body), cx)
+                    .map(|polled| polled.map(|frame| frame.map_err(|never| match never {})))
+            }
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::poll_frame(Pin::new(body), cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::is_end_stream(body),
+            MeshMtlsRequestBody::Replayable(body) => http_body::Body::is_end_stream(body),
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::is_end_stream(body),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::size_hint(body),
+            MeshMtlsRequestBody::Replayable(body) => http_body::Body::size_hint(body),
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::size_hint(body),
+        }
+    }
+}
 
 /// Multiplexed hyper H2 sender over the SVID-mTLS session.
 pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;

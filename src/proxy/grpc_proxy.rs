@@ -50,6 +50,7 @@ use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
     parse_connection_listed_headers,
@@ -66,16 +67,23 @@ use crate::util::body_limit::is_length_limit_error;
 /// HTTP/2 requires a structurally valid initial SETTINGS frame, so completing
 /// one and giving Hyper a final validation poll proves the peer preface even
 /// when MAX_CONCURRENT_STREAMS is zero.
-struct H2cSettingsIo {
-    inner: TcpStream,
+///
+/// Generic over the byte transport: the direct-dial gRPC pool wraps a
+/// [`TcpStream`], and the Ambient HBONE gRPC transport wraps the CONNECT byte
+/// tunnel it runs its NESTED cleartext HTTP/2 connection over (issue #3284).
+/// Both need the same proof for the same reason — cleartext HTTP/2 has no ALPN,
+/// so a peer that merely accepted the connection must not be mistaken for an
+/// HTTP/2 server.
+struct H2cSettingsIo<T> {
+    inner: T,
     settings_received: Arc<AtomicBool>,
     first_frame_header: [u8; 9],
     header_len: usize,
     frame_remaining: Option<usize>,
 }
 
-impl H2cSettingsIo {
-    fn new(inner: TcpStream, settings_received: Arc<AtomicBool>) -> Self {
+impl<T> H2cSettingsIo<T> {
+    fn new(inner: T, settings_received: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             settings_received,
@@ -138,7 +146,7 @@ impl H2cSettingsIo {
     }
 }
 
-impl AsyncRead for H2cSettingsIo {
+impl<T: AsyncRead + Unpin> AsyncRead for H2cSettingsIo<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -155,7 +163,7 @@ impl AsyncRead for H2cSettingsIo {
     }
 }
 
-impl AsyncWrite for H2cSettingsIo {
+impl<T: AsyncWrite + Unpin> AsyncWrite for H2cSettingsIo<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -182,6 +190,72 @@ impl AsyncWrite for H2cSettingsIo {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
+    }
+}
+
+/// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
+///
+/// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely accepts
+/// the connection must not be treated as an HTTP/2 server. `handshake()`
+/// resolves once the *client* preface is written; readiness is the peer's
+/// complete, structurally valid initial SETTINGS frame having been observed by
+/// the transport and accepted by a subsequent Hyper connection poll.
+///
+/// `conn` is hyper's connection-driver future. Polling it drives the peer's
+/// preface and SETTINGS processing and surfaces a protocol error or close, but
+/// the future does not resolve merely because SETTINGS arrived. The short
+/// timeout therefore supplies a bounded recheck cadence for the transport
+/// observation flag while also continuing to drive the connection.
+///
+/// There is no timeout here by design; every caller already runs inside a
+/// connect budget: the direct-dial pool inside `dns::connect_candidates`
+/// (whose per-candidate share of `backend_connect_timeout_ms` moves on to the
+/// next address), and the Ambient HBONE gRPC transport inside the whole-
+/// acquisition deadline `GrpcDispatchTransport::get_sender` applies.
+async fn await_h2c_peer_settings<T>(
+    conn: &mut http2::Connection<TokioIo<H2cSettingsIo<T>>, GrpcBody, TokioExecutor>,
+    settings_received: &AtomicBool,
+) -> Result<(), String>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // First re-read delay; the common case resolves on the first or second
+    // pass over a loopback or same-datacenter RTT.
+    const FIRST_RECHECK: Duration = Duration::from_millis(1);
+    // Ceiling for the doubling backoff, so a peer that accepts the connection
+    // and then stalls costs a bounded number of timer wakeups per candidate.
+    const MAX_RECHECK: Duration = Duration::from_millis(20);
+
+    let mut recheck = FIRST_RECHECK;
+    loop {
+        if settings_received.load(Ordering::Acquire) {
+            // The transport observer fires while Hyper is consuming the read.
+            // Poll the connection once more before accepting the peer so a
+            // protocol error discovered from that same frame wins over the raw
+            // readiness flag instead of leaving an invalid sender cached and
+            // suppressing DNS-candidate failover.
+            let post_observation = std::future::poll_fn(|cx| {
+                Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        Some(Err("h2c connection closed after peer SETTINGS".to_string()))
+                    }
+                    Poll::Ready(Err(error)) => Some(Err(format!("h2c handshake failed: {error}"))),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+            if let Some(result) = post_observation {
+                return result;
+            }
+            return Ok(());
+        }
+        match tokio::time::timeout(recheck, &mut *conn).await {
+            Ok(Ok(())) => {
+                return Err("h2c connection closed before peer SETTINGS".to_string());
+            }
+            Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
+            Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
+        }
     }
 }
 
@@ -1255,7 +1329,7 @@ impl GrpcPoolManager {
             )
         })?;
 
-        if let Err(message) = Self::await_h2c_peer_settings(&mut conn, &settings_received).await {
+        if let Err(message) = await_h2c_peer_settings(&mut conn, &settings_received).await {
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
@@ -1273,70 +1347,6 @@ impl GrpcPoolManager {
         });
 
         Ok(sender)
-    }
-
-    /// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
-    ///
-    /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
-    /// accepts TCP must not pin this pool to its DNS address. `handshake()`
-    /// resolves once the *client* preface is written; readiness is the peer's
-    /// complete, structurally valid initial SETTINGS frame having been observed
-    /// by the transport and accepted by a subsequent Hyper connection poll.
-    ///
-    /// `conn` is hyper's connection-driver future. Polling it drives the peer's
-    /// preface and SETTINGS processing and surfaces a protocol error or close,
-    /// but the future does not resolve merely because SETTINGS arrived. The
-    /// short timeout therefore supplies a bounded recheck cadence for the
-    /// transport observation flag while also continuing to drive the connection.
-    ///
-    /// There is no timeout here by design: the caller runs inside
-    /// `dns::connect_candidates`, whose per-candidate share of
-    /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
-    /// address.
-    async fn await_h2c_peer_settings(
-        conn: &mut http2::Connection<TokioIo<H2cSettingsIo>, GrpcBody, TokioExecutor>,
-        settings_received: &AtomicBool,
-    ) -> Result<(), String> {
-        // First re-read delay; the common case resolves on the first or second
-        // pass over a loopback or same-datacenter RTT.
-        const FIRST_RECHECK: Duration = Duration::from_millis(1);
-        // Ceiling for the doubling backoff, so a peer that accepts TCP and
-        // then stalls costs a bounded number of timer wakeups per candidate.
-        const MAX_RECHECK: Duration = Duration::from_millis(20);
-
-        let mut recheck = FIRST_RECHECK;
-        loop {
-            if settings_received.load(Ordering::Acquire) {
-                // The transport observer fires while Hyper is consuming the
-                // read. Poll the connection once more before accepting the peer
-                // so a protocol error discovered from that same frame wins over
-                // the raw readiness flag instead of leaving an invalid sender
-                // cached and suppressing DNS-candidate failover.
-                let post_observation = std::future::poll_fn(|cx| {
-                    Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
-                        Poll::Ready(Ok(())) => {
-                            Some(Err("h2c connection closed after peer SETTINGS".to_string()))
-                        }
-                        Poll::Ready(Err(error)) => {
-                            Some(Err(format!("h2c handshake failed: {error}")))
-                        }
-                        Poll::Pending => None,
-                    })
-                })
-                .await;
-                if let Some(result) = post_observation {
-                    return result;
-                }
-                return Ok(());
-            }
-            match tokio::time::timeout(recheck, &mut *conn).await {
-                Ok(Ok(())) => {
-                    return Err("h2c connection closed before peer SETTINGS".to_string());
-                }
-                Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
-                Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
-            }
-        }
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -2551,10 +2561,9 @@ pub enum GrpcMeshDispatch {
     Direct,
     /// Same-cluster Sidecar `mesh.mtls=true` target: dispatch through the
     /// generic SVID-mTLS HTTP/2 path (`proxy_to_backend_mesh_mtls`), which is
-    /// hyper h2 end-to-end and preserves gRPC trailers. Only the H1/H2
-    /// frontend path can do this today; surfaces without a mesh-mTLS
-    /// dispatch (the H3 cross-protocol bridge, the gRPC retry loop after a
-    /// target rotation) must fail closed instead.
+    /// hyper h2 end-to-end and preserves gRPC trailers. Surfaces that dispatch
+    /// through [`GrpcDispatchTransport`] (the H3 cross-protocol bridge, issue
+    /// #3284) ride the SAME SVID-mTLS pool directly instead.
     MeshMtls,
     /// CROSS-CLUSTER Sidecar `mesh.mtls` east-west target that is WELL-FORMED
     /// (carries `mesh.cross_cluster=true`, a destination-FQDN SNI override
@@ -2565,18 +2574,23 @@ pub enum GrpcMeshDispatch {
     /// ClientHello SNI to the destination service FQDN, and verifies the peer
     /// SVID trust-domain-only (no pinned pod SPIFFE). gRPC is HTTP/2 with
     /// trailers and rides that path natively, exactly like the HTTP family
-    /// already does cross-cluster (issue #2010). Falls through only on the
-    /// H1/H2 frontend path (like `MeshMtls`); the H3 bridge and the gRPC
-    /// retry loop still fail closed.
+    /// already does cross-cluster (issue #2010). Falls through on the H1/H2
+    /// frontend path (like `MeshMtls`); [`GrpcDispatchTransport`] surfaces ride
+    /// the same pool directly (issue #3284).
     MeshMtlsCrossCluster,
-    /// Cross-cluster Ambient `mesh.hbone` east-west target (or a corrupted
-    /// target carrying BOTH transport tags): fail closed. The HBONE inner
-    /// protocol is HTTP/1.1 over a byte tunnel and cannot carry the HTTP/2
-    /// trailers gRPC requires — routing it cross-cluster does not change that,
-    /// so native gRPC over cross-cluster HBONE stays out of scope, the same
-    /// limitation as [`RefuseHbone`](Self::RefuseHbone) (declared out of scope
-    /// in #2023; issue #2010).
-    RefuseCrossCluster,
+    /// CROSS-CLUSTER Ambient `mesh.hbone` east-west target: dispatch through the
+    /// nested-HTTP/2 HBONE transport, exactly like [`Hbone`](Self::Hbone), over
+    /// the cross-cluster dial (remote east-west gateway + destination-FQDN SNI
+    /// override + trust-domain-only verification). A corrupted target carrying
+    /// BOTH transport tags also lands here and is refused at transport
+    /// materialization — the two topologies are mutually exclusive and a
+    /// mixed-tag target must never pick one silently (issues #2010, #3284).
+    ///
+    /// This class does NOT fall through to the generic HTTP-family mesh path
+    /// (that path's HBONE dispatch runs an HTTP/1.1 client inside the byte
+    /// tunnel and would drop gRPC trailers), so `grpc_mesh_dispatch_falls_through`
+    /// still refuses it for native gRPC.
+    HboneCrossCluster,
     /// Cross-cluster Sidecar `mesh.mtls` east-west target that is MALFORMED —
     /// missing the destination-FQDN SNI override (`mesh.eastwest_sni`) or the
     /// remote trust domain (`mesh.trust_domain`) the cross-cluster mesh-mTLS
@@ -2590,25 +2604,36 @@ pub enum GrpcMeshDispatch {
     /// closed. It is not a valid pass-through gRPC-Web mesh transport either,
     /// so it must not use the plain HTTP-family fallback.
     RefuseCrossClusterNoTransport,
-    /// Same-cluster Ambient `mesh.hbone=true` target: fail closed. The HBONE
-    /// inner protocol is HTTP/1.1 over a byte tunnel (`hyper::client::conn::
-    /// http1` inside the CONNECT stream; the destination relays raw bytes to
-    /// the app), which cannot carry the HTTP/2 trailers gRPC requires for
-    /// `grpc-status`.
-    RefuseHbone,
+    /// Same-cluster Ambient `mesh.hbone=true` target: dispatch through the
+    /// nested-HTTP/2 HBONE transport (issue #3284).
+    ///
+    /// The GENERIC HTTP-family HBONE path runs `hyper::client::conn::http1`
+    /// inside the CONNECT byte tunnel, which cannot carry the HTTP/2 trailers
+    /// `grpc-status` needs — which is why native gRPC was refused here before.
+    /// The gRPC transport instead runs a `hyper::client::conn::http2` client
+    /// over the SAME authenticated byte tunnel: the destination's HBONE relay
+    /// byte-copies the stream to the local app, so an HTTP/2 gRPC server sees an
+    /// ordinary h2c connection and DATA, HEADERS, TRAILERS, flow control, and
+    /// RST_STREAM all survive end to end.
+    ///
+    /// Still does NOT fall through to the generic HTTP-family mesh path for
+    /// native gRPC (see [`HboneCrossCluster`](Self::HboneCrossCluster)).
+    Hbone,
 }
 
 /// Classify how a gRPC request may dispatch for `target`. See
 /// [`GrpcMeshDispatch`]. A target that carries BOTH transport tags (should not
-/// happen — topologies are mutually exclusive) is classified by the stricter
-/// HBONE refusal so it can never fall through to a direct dial. The
-/// cross-cluster check runs FIRST: an Ambient HBONE cross-cluster target (or a
-/// transport-less one) stays fail-closed, but a WELL-FORMED Sidecar mesh-mTLS
-/// cross-cluster target (SNI override + trust domain present) is now allowed to
-/// ride the mesh-mTLS pool's cross-cluster branch (issue #2010) — the same
-/// east-west transport the HTTP family already uses. A cross-cluster target
-/// with no transport tag, or a Sidecar one missing its SNI/trust-domain
-/// metadata, still fails closed.
+/// happen — topologies are mutually exclusive) is classified into an HBONE
+/// class so it can never fall through to a direct dial or silently pick one of
+/// the two transports; [`GrpcDispatchTransport::for_target`] then REFUSES it
+/// outright. The cross-cluster check runs FIRST so the east-west variants are
+/// distinguished from their same-cluster siblings: a WELL-FORMED Sidecar
+/// mesh-mTLS cross-cluster target (SNI override + trust domain present) rides
+/// the mesh-mTLS pool's cross-cluster branch (issue #2010) and an Ambient HBONE
+/// cross-cluster target rides the nested-HTTP/2 HBONE transport's cross-cluster
+/// dial (issue #3284) — the same east-west transports the HTTP family already
+/// uses. A cross-cluster target with no transport tag, or a Sidecar one missing
+/// its SNI/trust-domain metadata, still fails closed.
 pub fn classify_grpc_mesh_dispatch(
     target: &crate::config::types::UpstreamTarget,
 ) -> GrpcMeshDispatch {
@@ -2617,12 +2642,13 @@ pub fn classify_grpc_mesh_dispatch(
     let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
         || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
     if cross_cluster {
-        // HBONE cross-cluster (or a corrupted BOTH-tags target) takes the
-        // stricter refusal: gRPC over the HBONE HTTP/1.1 inner tunnel cannot
-        // carry trailers, and a mixed-tag target must never fall through to the
-        // mesh-mTLS pool. Checked FIRST so `hbone` wins over `mesh_mtls`.
+        // HBONE cross-cluster (or a corrupted BOTH-tags target) is checked
+        // FIRST so `hbone` wins over `mesh_mtls`: a mixed-tag target must never
+        // fall through to the mesh-mTLS pool, and the HBONE class is the one
+        // `GrpcDispatchTransport::for_target` re-screens for mixed tags before
+        // materializing anything.
         if hbone {
-            return GrpcMeshDispatch::RefuseCrossCluster;
+            return GrpcMeshDispatch::HboneCrossCluster;
         }
         // Sidecar cross-cluster mesh-mTLS is allowed to ride the mesh-mTLS
         // pool's cross-cluster branch (east-west gateway dial + destination-FQDN
@@ -2643,7 +2669,7 @@ pub fn classify_grpc_mesh_dispatch(
         return GrpcMeshDispatch::RefuseCrossClusterNoTransport;
     }
     if hbone {
-        return GrpcMeshDispatch::RefuseHbone;
+        return GrpcMeshDispatch::Hbone;
     }
     if mesh_mtls {
         return GrpcMeshDispatch::MeshMtls;
@@ -2664,9 +2690,14 @@ pub fn classify_grpc_mesh_dispatch(
 ///   Sidecar mesh-mTLS transport tag is present but the target lacks the SNI
 ///   override / trust domain the dial needs, so even pass-through gRPC-Web
 ///   would fail closed at the mesh-mTLS dispatch — refuse cleanly in-branch.
-/// * `RefuseCrossCluster` / `RefuseHbone` fall through ONLY for PASS-THROUGH
+/// * `HboneCrossCluster` / `Hbone` fall through ONLY for PASS-THROUGH
 ///   gRPC-Web (body-framed trailers, rides the HTTP-family transport like
-///   plain HTTP). Native gRPC must be refused inside the branch, and so must
+///   plain HTTP). This is about the GENERIC HTTP-family mesh path, which runs
+///   an HTTP/1.1 client inside the HBONE byte tunnel and so cannot carry
+///   `grpc-status` trailers; it is unrelated to
+///   [`GrpcDispatchTransport`]'s nested-HTTP/2 HBONE transport, which native
+///   gRPC surfaces use directly instead of falling through (issue #3284).
+///   Native gRPC must therefore still be refused inside the branch, and so must
 ///   gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1): by dispatch time
 ///   the outbound request is wire-native gRPC (`content-type:
 ///   application/grpc`), so letting it ride the HBONE HTTP/1.1 inner tunnel
@@ -2688,9 +2719,709 @@ pub fn grpc_mesh_dispatch_falls_through(
         GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => true,
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
-        GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
+        GrpcMeshDispatch::HboneCrossCluster | GrpcMeshDispatch::Hbone => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }
+    }
+}
+
+/// The concrete HTTP/2 transport a gRPC dispatch uses to reach its selected
+/// target (issue #3284).
+///
+/// Every gRPC dispatch surface classifies its target through
+/// [`classify_grpc_mesh_dispatch`] and then materializes exactly ONE of these.
+/// There is deliberately no "direct dial anyway" arm for a mesh-tagged target:
+/// [`Self::for_target`] either returns the authenticated mesh transport or an
+/// error, so a resolution failure fails closed instead of silently bypassing
+/// SVID-mTLS, identity pinning, and mesh authz identity.
+pub enum GrpcDispatchTransport<'a> {
+    /// Untagged target: the direct `GrpcConnectionPool` h2c / TLS dial.
+    Direct(&'a GrpcConnectionPool),
+    /// Sidecar `mesh.mtls` target (same-cluster pinned peer or well-formed
+    /// cross-cluster east-west): the SVID-mTLS HTTP/2 pool. Hyper h2
+    /// end-to-end, so gRPC framing, trailers, flow control, and cancellation
+    /// ride it exactly as they do the direct pool.
+    MeshMtls(MeshMtlsGrpcTransport<'a>),
+    /// Ambient `mesh.hbone` target (same-cluster pinned peer or cross-cluster
+    /// east-west): a hyper HTTP/2 client run over the authenticated HBONE
+    /// CONNECT byte tunnel. The destination's HBONE relay byte-copies the
+    /// tunnel to the local app socket, so the inner connection is an ordinary
+    /// h2c connection to the gRPC server and DATA, HEADERS, TRAILERS, flow
+    /// control, and RST_STREAM survive end to end.
+    Hbone(HboneGrpcTransport<'a>),
+}
+
+/// A materialized Sidecar mesh-mTLS gRPC transport: the pool, the target it was
+/// resolved for, and the fail-closed dial plan (pinned peer OR trust-domain
+/// scope + destination-FQDN SNI override).
+pub struct MeshMtlsGrpcTransport<'a> {
+    pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+    target: &'a crate::config::types::UpstreamTarget,
+    plan: crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan<'a>,
+}
+
+/// A materialized Ambient HBONE gRPC transport: the pool, the target it was
+/// resolved for, and the fail-closed dial plan (dial host + CONNECT authority
+/// host + HBONE port, plus either a pinned peer OR a trust-domain scope +
+/// destination-FQDN SNI override).
+pub struct HboneGrpcTransport<'a> {
+    pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
+    target: &'a crate::config::types::UpstreamTarget,
+    plan: crate::proxy::hbone_pool::HboneDialPlan<'a>,
+}
+
+/// Client-visible refusal when a `mesh.mtls` target's destination identity
+/// cannot be materialized (missing / corrupt `mesh.spiffe_id` pin, or a
+/// cross-cluster target whose SNI / trust-domain tags did not survive
+/// re-resolution). Deliberately names the failed contract and nothing else.
+const UNRESOLVABLE_MESH_MTLS_IDENTITY: &str =
+    "gRPC over the sidecar mesh mTLS transport requires a resolvable destination identity";
+
+/// Client-visible refusal when a `mesh.hbone` target's dial metadata cannot be
+/// materialized: a corrupt dial-host / CONNECT-authority-host tag, a corrupt
+/// `mesh.spiffe_id` pin, or a cross-cluster target missing its SNI override /
+/// remote trust domain. Names the failed contract and nothing else.
+const UNRESOLVABLE_HBONE_IDENTITY: &str =
+    "gRPC over the Ambient HBONE mesh transport requires a resolvable destination identity";
+
+/// Client-visible refusal for a target carrying BOTH mesh transport tags. The
+/// topologies are mutually exclusive, so this is a corrupted target and picking
+/// either transport would be a guess about which secured hop the operator meant.
+const AMBIGUOUS_MESH_TRANSPORT: &str =
+    "gRPC dispatch refused: the selected target declares two conflicting mesh transports";
+
+/// Client-visible refusal for a cross-cluster Sidecar mesh-mTLS target whose
+/// east-west SNI / trust-domain metadata is incomplete. Fixed wording — which
+/// field failed is carried only by [`GrpcTransportDiagnostic`].
+const CROSS_CLUSTER_MALFORMED_METADATA: &str = "gRPC over cross-cluster east-west routing requires a destination SNI override \
+     and a remote trust domain";
+
+/// Client-visible refusal for a cross-cluster target with no mesh transport tag.
+const CROSS_CLUSTER_MISSING_TRANSPORT: &str =
+    "gRPC over cross-cluster east-west routing requires a mesh transport tag";
+
+/// Redacted, field-shaped diagnostic for a gRPC transport materialization
+/// refusal (issue #3284). Identifies WHICH mesh tag / contract failed without
+/// echoing any tag value, SPIFFE ID, SNI name, trust domain, dial address,
+/// credential, or other target secret. Safe to log on every H3→gRPC refusal
+/// path; the client-visible [`GrpcTransportError::message`] stays a fixed
+/// metadata-free constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcTransportDiagnostic {
+    /// `mesh.spiffe_id` (or HBONE peer-SPIFFE override) missing or unparseable.
+    MeshSpiffeId,
+    /// `mesh.hbone_dial_host` present but empty / invalid.
+    MeshHboneDialHost,
+    /// `mesh.hbone_authority_host` missing (cross-cluster) or empty / invalid.
+    MeshHboneAuthorityHost,
+    /// `mesh.eastwest_sni` missing or empty.
+    MeshEastwestSni,
+    /// `mesh.trust_domain` missing, empty, or unparseable.
+    MeshTrustDomain,
+    /// Target declares both `mesh.mtls` and `mesh.hbone`.
+    ConflictingMeshTransports,
+    /// `mesh.cross_cluster` without any mesh transport tag.
+    CrossClusterMissingTransport,
+}
+
+impl GrpcTransportDiagnostic {
+    /// Stable, redacted label for structured logs and metrics. Tag *names* only —
+    /// never tag values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MeshSpiffeId => "mesh.spiffe_id",
+            Self::MeshHboneDialHost => "mesh.hbone_dial_host",
+            Self::MeshHboneAuthorityHost => "mesh.hbone_authority_host",
+            Self::MeshEastwestSni => "mesh.eastwest_sni",
+            Self::MeshTrustDomain => "mesh.trust_domain",
+            Self::ConflictingMeshTransports => "conflicting_mesh_transports",
+            Self::CrossClusterMissingTransport => "cross_cluster_missing_transport",
+        }
+    }
+}
+
+/// Why a gRPC dispatch could not materialize a transport for its selected
+/// target. Every variant is FAIL CLOSED — the caller answers with a gRPC
+/// UNAVAILABLE and never falls back to an unauthenticated direct dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcTransportError {
+    /// The target is not dispatchable at all: cross-cluster with no transport
+    /// tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust
+    /// domain, or a corrupted target declaring BOTH mesh transports. Carries
+    /// the client-visible reason plus a redacted field/contract diagnostic.
+    Unsupported {
+        message: &'static str,
+        diagnostic: GrpcTransportDiagnostic,
+    },
+    /// The transport class IS supported but the target's identity / dial
+    /// metadata is unmaterializable: a missing / corrupt `mesh.spiffe_id` pin,
+    /// a corrupt HBONE dial-host / authority-host tag, or a cross-cluster
+    /// target whose SNI / trust-domain tags did not survive re-resolution.
+    /// Field-specific detail is the redacted [`GrpcTransportDiagnostic`];
+    /// nothing identity-bearing reaches the client via [`Self::message`].
+    UnmaterializableIdentity {
+        message: &'static str,
+        diagnostic: GrpcTransportDiagnostic,
+    },
+}
+
+impl GrpcTransportError {
+    /// Client-visible gRPC status message. Deliberately free of tag values,
+    /// SPIFFE IDs, SNI names, and trust domains — a refusal must not leak the
+    /// mesh identity metadata of a target the caller could not reach.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unsupported { message, .. } | Self::UnmaterializableIdentity { message, .. } => {
+                message
+            }
+        }
+    }
+
+    /// Redacted field/contract category for operator diagnostics. Safe to log;
+    /// never contains raw tag values or identity secrets.
+    pub fn diagnostic(self) -> GrpcTransportDiagnostic {
+        match self {
+            Self::Unsupported { diagnostic, .. }
+            | Self::UnmaterializableIdentity { diagnostic, .. } => diagnostic,
+        }
+    }
+}
+
+/// Map a Sidecar mesh-mTLS dial-plan failure onto a fail-closed transport error
+/// whose diagnostic names the failed tag and whose client message stays fixed.
+fn grpc_transport_error_from_mesh_mtls_dial(
+    err: crate::proxy::mesh_mtls_pool::MeshMtlsDialError,
+) -> GrpcTransportError {
+    use crate::proxy::mesh_mtls_pool::MeshMtlsDialError;
+    let diagnostic = match &err {
+        MeshMtlsDialError::PinnedPeer(_) => GrpcTransportDiagnostic::MeshSpiffeId,
+        MeshMtlsDialError::MissingCrossClusterSni => GrpcTransportDiagnostic::MeshEastwestSni,
+        MeshMtlsDialError::MissingCrossClusterTrustDomain => {
+            GrpcTransportDiagnostic::MeshTrustDomain
+        }
+    };
+    GrpcTransportError::UnmaterializableIdentity {
+        message: UNRESOLVABLE_MESH_MTLS_IDENTITY,
+        diagnostic,
+    }
+}
+
+/// Map an Ambient HBONE dial-plan failure onto a fail-closed transport error
+/// whose diagnostic names the failed tag and whose client message stays fixed.
+/// Dial-plan resolve only surfaces identity / dial-tag shapes; any other
+/// [`HbonePoolError`] variant is treated as an unmaterializable dial contract
+/// without inventing a field name that did not fail.
+fn grpc_transport_error_from_hbone_dial(
+    err: crate::proxy::hbone_pool::HbonePoolError,
+) -> GrpcTransportError {
+    use crate::proxy::hbone_pool::HbonePoolError;
+    let diagnostic = match &err {
+        HbonePoolError::InvalidDialHostTag { .. } => GrpcTransportDiagnostic::MeshHboneDialHost,
+        HbonePoolError::InvalidAuthorityHostTag { .. }
+        | HbonePoolError::MissingCrossClusterAuthorityHost => {
+            GrpcTransportDiagnostic::MeshHboneAuthorityHost
+        }
+        HbonePoolError::InvalidPeerSpiffeTag { .. } => GrpcTransportDiagnostic::MeshSpiffeId,
+        HbonePoolError::MissingCrossClusterSni => GrpcTransportDiagnostic::MeshEastwestSni,
+        HbonePoolError::MissingCrossClusterTrustDomain => GrpcTransportDiagnostic::MeshTrustDomain,
+        // `HboneDialPlan::resolve` only surfaces the dial-plan / identity arms
+        // above. Keep fail-closed if a non-dial-plan shape ever appears, and pin
+        // the diagnostic to the first resolve check (`mesh.hbone_dial_host`)
+        // rather than inventing a secret-bearing label.
+        _ => GrpcTransportDiagnostic::MeshHboneDialHost,
+    };
+    GrpcTransportError::UnmaterializableIdentity {
+        message: UNRESOLVABLE_HBONE_IDENTITY,
+        diagnostic,
+    }
+}
+
+/// Field-specific diagnostic for a classifier-level
+/// [`GrpcMeshDispatch::RefuseCrossClusterMalformed`]: re-check SNI then trust
+/// domain (same order as the classifier) so the H3 warning names the missing
+/// contract without echoing its value.
+fn cross_cluster_malformed_diagnostic(
+    target: &crate::config::types::UpstreamTarget,
+) -> GrpcTransportDiagnostic {
+    if crate::proxy::mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target).is_none() {
+        GrpcTransportDiagnostic::MeshEastwestSni
+    } else {
+        GrpcTransportDiagnostic::MeshTrustDomain
+    }
+}
+
+impl<'a> GrpcDispatchTransport<'a> {
+    /// Resolve the transport for `target`, or a fail-closed
+    /// [`GrpcTransportError`].
+    ///
+    /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
+    /// backend host is the destination and no mesh tag exists to honor.
+    pub fn for_target(
+        grpc_pool: &'a GrpcConnectionPool,
+        mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
+        hbone_pool: &'a crate::proxy::hbone_pool::HboneConnectionPool,
+        target: Option<&'a crate::config::types::UpstreamTarget>,
+    ) -> Result<Self, GrpcTransportError> {
+        let Some(target) = target else {
+            return Ok(Self::Direct(grpc_pool));
+        };
+        match classify_grpc_mesh_dispatch(target) {
+            GrpcMeshDispatch::Direct => Ok(Self::Direct(grpc_pool)),
+            GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => {
+                // The classifier already proved the cross-cluster metadata is
+                // present; re-resolving here is what actually binds it, so a
+                // target that mutated between classification and dispatch still
+                // fails closed rather than dialing with a missing pin/scope.
+                let plan = match crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        return Err(grpc_transport_error_from_mesh_mtls_dial(err));
+                    }
+                };
+                Ok(Self::MeshMtls(MeshMtlsGrpcTransport {
+                    pool: mesh_mtls_pool,
+                    target,
+                    plan,
+                }))
+            }
+            GrpcMeshDispatch::Hbone | GrpcMeshDispatch::HboneCrossCluster => {
+                // A target carrying BOTH transport tags lands in an HBONE class
+                // by classifier precedence. Refuse it outright rather than
+                // dialing HBONE: the topologies are mutually exclusive, so this
+                // is a corrupted target and either choice would be a guess.
+                if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+                    return Err(GrpcTransportError::Unsupported {
+                        message: AMBIGUOUS_MESH_TRANSPORT,
+                        diagnostic: GrpcTransportDiagnostic::ConflictingMeshTransports,
+                    });
+                }
+                // Same re-resolution contract as the mesh-mTLS arm: this is what
+                // binds the dial host, CONNECT authority host, pinned peer, and
+                // (cross-cluster) SNI + trust-domain scope, so a corrupt or
+                // incomplete tag set fails closed here instead of dialing.
+                let plan = match crate::proxy::hbone_pool::HboneDialPlan::resolve(target) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        return Err(grpc_transport_error_from_hbone_dial(err));
+                    }
+                };
+                Ok(Self::Hbone(HboneGrpcTransport {
+                    pool: hbone_pool,
+                    target,
+                    plan,
+                }))
+            }
+            GrpcMeshDispatch::RefuseCrossClusterMalformed => Err(GrpcTransportError::Unsupported {
+                message: CROSS_CLUSTER_MALFORMED_METADATA,
+                diagnostic: cross_cluster_malformed_diagnostic(target),
+            }),
+            GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
+                Err(GrpcTransportError::Unsupported {
+                    message: CROSS_CLUSTER_MISSING_TRANSPORT,
+                    diagnostic: GrpcTransportDiagnostic::CrossClusterMissingTransport,
+                })
+            }
+        }
+    }
+
+    /// Short transport label for structured logs. Never carries target metadata.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "direct",
+            Self::MeshMtls(_) => "mesh_mtls",
+            Self::Hbone(_) => "hbone",
+        }
+    }
+
+    /// Acquire an HTTP/2 sender. Pool acquisition is the caller's connect
+    /// budget; deadline handling stays at the call site so both dispatch paths
+    /// keep their existing regimes.
+    async fn get_sender(&self, proxy: &Proxy) -> Result<GrpcDispatchSender, GrpcProxyError> {
+        match self {
+            Self::Direct(pool) => pool.get_sender(proxy).await.map(GrpcDispatchSender::H2),
+            Self::MeshMtls(mesh) => {
+                let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(mesh.target);
+                mesh.pool
+                    .get_sender(
+                        proxy,
+                        &mesh.target.host,
+                        mesh.target.port,
+                        mesh.target.dispatch_policy_port(),
+                        mtls_port,
+                        mesh.plan.expected_peer.as_ref(),
+                        mesh.plan.expected_trust_domain.as_ref(),
+                        mesh.plan.sni_override,
+                    )
+                    .await
+                    .map(GrpcDispatchSender::MeshMtls)
+                    .map_err(mesh_mtls_pool_error_to_grpc)
+            }
+            Self::Hbone(hbone) => {
+                // Bound the WHOLE Ambient acquisition, including the nested
+                // HTTP/2 handshake after CONNECT succeeds. Without this outer
+                // deadline, an app that accepted the relayed TCP connection
+                // but never sent HTTP/2 SETTINGS could retain a request
+                // forever when the client supplied no grpc-timeout.
+                let timeout_ms =
+                    crate::proxy::hbone_pool::effective_connect_timeout_ms_for_policy_port(
+                        proxy,
+                        hbone.target.dispatch_policy_port(),
+                    );
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    open_hbone_grpc_sender(hbone, proxy),
+                )
+                .await
+                {
+                    Ok(result) => result.map(GrpcDispatchSender::H2),
+                    Err(_) => Err(GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Connect,
+                        message: format!("Ambient HBONE connect timeout after {timeout_ms}ms"),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolve the outbound request URI for this transport from the
+    /// gateway-built `backend_url`.
+    ///
+    /// The direct pool dials the URL's own authority, so it is parsed as-is. A
+    /// mesh transport instead dials a peer listener, and the request
+    /// `:authority` is what selects the destination on the far side, so only the
+    /// PATH and QUERY are taken from `backend_url` and the authority is
+    /// replaced:
+    ///
+    /// * Sidecar mesh-mTLS routes on the peer sidecar's materialized inbound
+    ///   route, which matches the destination SERVICE (see
+    ///   `mesh_mtls_dispatch_authority`) — the same resolver the generic
+    ///   HTTP-family mesh path uses, so the two cannot drift.
+    /// * Ambient HBONE has already selected the destination in the CONNECT
+    ///   `:authority`, so the inner request carries the destination's own
+    ///   app address:port (or a preserved client `Host`), matching the HBONE
+    ///   inner-request Host fallback on the generic HTTP-family path.
+    ///
+    /// Reading the path TEXTUALLY rather than from a parsed URL is load-bearing
+    /// for CROSS-CLUSTER Ambient targets: their `target.host` is a scoped
+    /// SYNTHETIC identity carrying `|` separators (so LB / health / circuit
+    /// breaker / retry keys cannot collapse two remote pods that share an IP
+    /// behind different gateways), which is NOT a valid URI authority — parsing
+    /// the whole URL would fail before the authority was ever replaced. The
+    /// generic HTTP-family HBONE path solves the same problem by rewriting the
+    /// authority before parsing (`rewrite_backend_url_authority_host`).
+    fn resolve_backend_uri(
+        &self,
+        backend_url: &str,
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Result<hyper::Uri, GrpcProxyError> {
+        let (scheme, authority, what) = match self {
+            Self::Direct(_) => {
+                return backend_url
+                    .parse()
+                    .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)));
+            }
+            Self::MeshMtls(mesh) => (
+                "https",
+                crate::proxy::mesh_mtls_dispatch_authority(
+                    mesh.target,
+                    preserve_host_header,
+                    client_host,
+                ),
+                "sidecar mTLS",
+            ),
+            Self::Hbone(hbone) => (
+                // The authenticated CONNECT is the secured OUTER hop. The
+                // nested HTTP/2 connection is h2c to the destination app, so
+                // its request semantics must remain `http` rather than
+                // claiming end-to-end TLS to the application.
+                "http",
+                hbone_dispatch_authority(hbone, preserve_host_header, client_host),
+                "Ambient HBONE",
+            ),
+        };
+        let path_and_query: http::uri::PathAndQuery = backend_url_path_and_query(backend_url)
+            .parse()
+            .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL path: {}", e)))?;
+        hyper::Uri::builder()
+            .scheme(scheme)
+            .authority(authority.as_ref())
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(|e| {
+                GrpcProxyError::Internal(format!("Invalid {} request authority: {}", what, e))
+            })
+    }
+
+    /// Drop a stale pooled sender after a provably pre-wire `is_canceled`
+    /// dispatch failure. The mesh pools self-heal instead: the mesh-mTLS
+    /// cached-sender scans skip `is_closed()` senders, and the HBONE gRPC
+    /// transport dials a FRESH inner HTTP/2 connection per RPC, so neither has
+    /// a stale sender to invalidate.
+    fn invalidate_on_pre_wire_cancel(&self, proxy: &Proxy) {
+        if let Self::Direct(pool) = self {
+            pool.invalidate_shards_for_proxy(proxy);
+        }
+    }
+}
+
+/// The path + query of a gateway-built backend URL, read TEXTUALLY so a target
+/// whose host is not a valid URI authority (a cross-cluster Ambient synthetic
+/// identity) can still have its request line rebuilt — see
+/// [`GrpcDispatchTransport::resolve_backend_uri`].
+///
+/// The gateway builds `backend_url` itself, so the shape is always
+/// `scheme://authority[/path][?query]`; a URL with no path yields `/`, and the
+/// caller still PARSES the result so a malformed path fails closed rather than
+/// riding through unvalidated.
+fn backend_url_path_and_query(backend_url: &str) -> &str {
+    let after_scheme = match backend_url.find("://") {
+        Some(index) => &backend_url[index + 3..],
+        None => backend_url,
+    };
+    match after_scheme.find('/') {
+        Some(index) => &after_scheme[index..],
+        None => "/",
+    }
+}
+
+/// The request `:authority` an Ambient HBONE gRPC dispatch presents to the
+/// destination workload, INSIDE the CONNECT tunnel.
+///
+/// The outer CONNECT `:authority` already pinned the destination (the relay
+/// byte-copies to exactly that address), so this only has to be an authority the
+/// destination app accepts. A preserved client `Host` wins when the route asks
+/// for it; otherwise fall back to the destination's own app address:port —
+/// byte-for-byte the same fallback the generic HTTP-family HBONE path uses for
+/// its inner request Host.
+fn hbone_dispatch_authority<'a>(
+    hbone: &'a HboneGrpcTransport<'_>,
+    preserve_host_header: bool,
+    client_host: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
+    if preserve_host_header && let Some(host) = client_host.filter(|host| !host.is_empty()) {
+        return std::borrow::Cow::Borrowed(host);
+    }
+    std::borrow::Cow::Owned(crate::proxy::hbone_pool::authority_for_host_port(
+        hbone.plan.app_host,
+        hbone.target.port,
+    ))
+}
+
+/// Open the authenticated HBONE CONNECT byte tunnel and run a NESTED hyper
+/// HTTP/2 client over it (issue #3284).
+///
+/// The outer hop is the ordinary pooled Ambient HBONE dial — SVID-mTLS to the
+/// peer's `:15008` (or the remote east-west gateway with the destination-FQDN
+/// SNI override and trust-domain scope), with the destination identity pinned.
+/// The destination's HBONE relay byte-copies the tunnel to the local app socket,
+/// so the INNER connection is an ordinary h2c connection to the gRPC server and
+/// carries HEADERS, DATA, TRAILERS, flow control, and RST_STREAM unmodified.
+///
+/// The inner connection is 1:1 with the tunnel (one CONNECT stream per RPC on a
+/// POOLED outer connection, the same model the WebSocket-over-HBONE and
+/// raw-TCP-over-HBONE egress paths use), so there is no inner-connection cache
+/// to poison across SVID rotation and nothing to invalidate on a pre-wire
+/// cancel. HTTP/2 PING keepalive is deliberately NOT enabled on the inner
+/// connection: it lives for one RPC, and the outer pooled HBONE connection
+/// already carries the pool's keepalive.
+///
+/// The inner connection is admitted only once the destination app's OWN HTTP/2
+/// connection preface has been observed ([`await_h2c_peer_settings`], shared
+/// with the direct-dial h2c pool). hyper's handshake resolves as soon as the
+/// CLIENT preface is written, and the outer CONNECT only proves the relay
+/// reached the app socket — so without that gate an app that is not an HTTP/2
+/// server would be misreported as an established sender and an app that answers
+/// nothing would stall the RPC outside the connect budget.
+///
+/// The asserted source identity is left `None`, which makes the CONNECT baggage
+/// carry this gateway's own SVID — the ambient-egress default. A gRPC request
+/// arriving on the H3 frontend is a north-south client, not an authenticated
+/// mesh peer whose principal could be forwarded.
+async fn open_hbone_grpc_sender(
+    hbone: &HboneGrpcTransport<'_>,
+    proxy: &Proxy,
+) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    let plan = &hbone.plan;
+    let tunnel = hbone
+        .pool
+        .get_tunnel_via(
+            proxy,
+            plan.dial_host,
+            plan.app_host,
+            hbone.target.port,
+            hbone.target.dispatch_policy_port(),
+            plan.hbone_port,
+            plan.expected_peer.as_ref(),
+            plan.expected_trust_domain.as_ref(),
+            plan.sni_override,
+            None,
+        )
+        .await
+        .map_err(hbone_pool_error_to_grpc)?;
+
+    let pool_config = hbone.pool.pool_config_for(proxy);
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder.timer(TokioTimer::new());
+    builder
+        .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+        .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+        .adaptive_window(pool_config.http2_adaptive_window)
+        .max_frame_size(pool_config.http2_max_frame_size);
+    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+        builder.max_concurrent_streams(max_streams);
+    }
+
+    // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
+    // on the direct-dial h2c path — nothing about the outer hop proves the app
+    // speaks HTTP/2 at all: the destination relay byte-copies the tunnel to the
+    // app socket, so a successful CONNECT only proves the relay reached it.
+    // Observe the app's own connection preface before treating the sender as
+    // usable, so a non-HTTP/2 app is an `H2cHandshake` failure and a silent one
+    // is bounded by the caller's connect deadline instead of stalling the RPC.
+    let settings_received = Arc::new(AtomicBool::new(false));
+    let io = TokioIo::new(H2cSettingsIo::new(tunnel, Arc::clone(&settings_received)));
+    let (sender, mut connection) = builder.handshake(io).await.map_err(|error| {
+        let message =
+            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {error}");
+        // The secured OUTER HBONE session is already established here;
+        // this is the cleartext h2c handshake with the destination app.
+        // Keep it distinct from an outer TLS/H2 handshake so retry and
+        // backend-health accounting classify the failure accurately.
+        GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2cHandshake,
+            message,
+            error,
+        )
+    })?;
+
+    if let Err(message) = await_h2c_peer_settings(&mut connection, &settings_received).await {
+        let message =
+            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {message}");
+        return Err(GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2cHandshake,
+            message.clone(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        ));
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);
+        }
+    });
+    Ok(sender)
+}
+
+/// An acquired HTTP/2 sender for one gRPC dispatch attempt.
+pub(crate) enum GrpcDispatchSender {
+    /// A hyper h2 sender carrying [`GrpcBody`] directly. Used by the direct-dial
+    /// gRPC pool AND by the nested HTTP/2 connection the HBONE transport runs
+    /// inside its CONNECT byte tunnel — the wire shape is identical, so the
+    /// request path cannot diverge between them.
+    H2(http2::SendRequest<GrpcBody>),
+    MeshMtls(crate::proxy::mesh_mtls_pool::MeshMtlsSender),
+}
+
+impl GrpcDispatchSender {
+    /// Send the outbound gRPC request. The mesh-mTLS arm wraps the SHARED
+    /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
+    /// terminal TRAILERS frame), inline receive-limit accounting, upload
+    /// cancellation, and gRPC message counting are byte-identical across
+    /// transports; the HBONE arm hands the very same `GrpcBody` to hyper.
+    async fn send_request(
+        &mut self,
+        request: Request<GrpcBody>,
+    ) -> Result<hyper::Response<Incoming>, hyper::Error> {
+        match self {
+            Self::H2(sender) => sender.send_request(request).await,
+            Self::MeshMtls(sender) => {
+                let (parts, body) = request.into_parts();
+                let request = Request::from_parts(
+                    parts,
+                    crate::proxy::mesh_mtls_pool::MeshMtlsRequestBody::Grpc(body),
+                );
+                sender.send_request(request).await
+            }
+        }
+    }
+}
+
+/// Map an Ambient HBONE dial / nested-handshake failure onto the gRPC transport
+/// error taxonomy. Shares the mesh-mTLS mapping (both pools raise the same
+/// [`HbonePoolError`]) so the two mesh transports keep one pre-wire / post-wire
+/// boundary, retry eligibility, and health-accounting story; only the
+/// connect-timeout message names its own transport.
+fn hbone_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
+    if let HbonePoolError::ConnectTimeout { timeout_ms, .. } = &error {
+        return GrpcProxyError::BackendTimeout {
+            kind: GrpcTimeoutKind::Connect,
+            message: format!("Ambient HBONE connect timeout after {}ms", timeout_ms),
+        };
+    }
+    mesh_mtls_pool_error_to_grpc(error)
+}
+
+/// Map a mesh-mTLS pool failure onto the gRPC transport error taxonomy so the
+/// mesh transport shares the direct pool's pre-wire / post-wire boundary, retry
+/// eligibility, and health accounting.
+fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
+    use HbonePoolError as E;
+    let message = error.to_string();
+    match error {
+        E::ConnectTimeout { timeout_ms, .. } => GrpcProxyError::BackendTimeout {
+            kind: GrpcTimeoutKind::Connect,
+            message: format!("sidecar mTLS connect timeout after {}ms", timeout_ms),
+        },
+        E::DnsLookup { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::DnsResolution,
+            message,
+            error,
+        ),
+        E::Connect { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::Connect,
+            message,
+            error,
+        ),
+        E::InvalidServerName { .. }
+        | E::InvalidDialHostTag { .. }
+        | E::InvalidAuthorityHostTag { .. }
+        | E::InvalidPeerSpiffeTag { .. }
+        | E::MissingCrossClusterSni
+        | E::MissingCrossClusterTrustDomain
+        | E::MissingCrossClusterAuthorityHost => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::InvalidServerName,
+            message,
+            error,
+        ),
+        E::NoSvid | E::NoLeafCert | E::TlsConfig(_) | E::TlsHandshake { .. } => {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                message,
+                error,
+            )
+        }
+        E::H2Handshake { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::H2Handshake,
+            message,
+            error,
+        ),
+        E::MaxConnectionsExceeded { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::MaxConnections,
+            message,
+            error,
+        ),
+        // CONNECT-tunnel and Extended-CONNECT shapes belong to the raw-TCP /
+        // WebSocket egress paths and are unreachable from `get_sender`; classify
+        // them pre-wire connect-class rather than inventing a post-wire kind.
+        E::InvalidConnectRequest { .. }
+        | E::ConnectStream { .. }
+        | E::ConnectRejected { .. }
+        | E::ExtendedConnectUnsupported { .. } => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::Connect,
+            message,
+            error,
+        ),
     }
 }
 
@@ -2905,7 +3636,7 @@ pub async fn proxy_grpc_request_from_bytes(
     request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
@@ -2919,7 +3650,7 @@ pub async fn proxy_grpc_request_from_bytes(
         request_trailers,
         proxy,
         backend_url,
-        grpc_pool,
+        transport,
         dns_cache,
         proxy_headers,
         stream_response,
@@ -2985,7 +3716,10 @@ pub async fn proxy_grpc_request_streaming(
         grpc_body,
         proxy,
         backend_url,
-        grpc_pool,
+        // The H1/H2 streaming fast path is direct-dial only: a mesh-tagged
+        // target never reaches it (`grpc_mesh_dispatch_falls_through` routes it
+        // onto the generic mesh-mTLS path first).
+        &GrpcDispatchTransport::Direct(grpc_pool),
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
@@ -3015,7 +3749,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
@@ -3052,7 +3786,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         grpc_body,
         proxy,
         backend_url,
-        grpc_pool,
+        transport,
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
@@ -3078,26 +3812,12 @@ async fn proxy_grpc_streaming_dispatch(
     grpc_body: GrpcBody,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    let uri: hyper::Uri = match backend_url.parse() {
-        Ok(uri) => uri,
-        Err(e) => {
-            // Preserve the unread frontend upload so the caller controls its
-            // termination relative to the synthesized Trailers-Only response:
-            // response-body ownership on H2 and post-HEADERS+FIN on H3 (#2057).
-            *held_frontend_upload = Some(grpc_body);
-            return Err(GrpcProxyError::Internal(format!(
-                "Invalid backend URL: {}",
-                e
-            )));
-        }
-    };
-
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
     // The helper encapsulates the merge-then-strip ordering so this
@@ -3106,6 +3826,26 @@ async fn proxy_grpc_streaming_dispatch(
     // why merging FIRST is required and why `te: trailers` is
     // synthesised at the end.
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+
+    // Bind the request line to the selected transport BEFORE the Host override,
+    // mirroring `proxy_grpc_request_core` (issue #3284). The direct pool parses
+    // `backend_url` as-is; a mesh dispatch keeps its path/query and presents the
+    // authority its peer routes on. A failure here is pre-dial, so retain the
+    // unread frontend upload so the caller controls its termination relative to
+    // the synthesized Trailers-Only response: response-body ownership on H2 and
+    // post-HEADERS+FIN on H3 (#2057).
+    let client_host_header = headers
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let resolved_uri =
+        transport.resolve_backend_uri(backend_url, proxy.preserve_host_header, client_host_header);
+    let uri = match resolved_uri {
+        Ok(uri) => uri,
+        Err(e) => {
+            *held_frontend_upload = Some(grpc_body);
+            return Err(e);
+        }
+    };
 
     // Apply per-route Host override AFTER the strip, mirroring
     // `proxy_grpc_request_core` and the plain HTTP path in
@@ -3153,7 +3893,7 @@ async fn proxy_grpc_streaming_dispatch(
     // H2 retains it with the response as defense-in-depth, while H3 must defer
     // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
     let mut sender = if let Some(deadline) = grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy)).await {
+        match tokio::time::timeout_at(deadline, transport.get_sender(proxy)).await {
             Err(_) => {
                 *held_frontend_upload = Some(grpc_body);
                 return Err(GrpcProxyError::ClientDeadlineExceeded(
@@ -3167,7 +3907,7 @@ async fn proxy_grpc_streaming_dispatch(
             Ok(Ok(sender)) => sender,
         }
     } else {
-        match grpc_pool.get_sender(proxy).await {
+        match transport.get_sender(proxy).await {
             Ok(sender) => sender,
             Err(e) => {
                 *held_frontend_upload = Some(grpc_body);
@@ -3207,7 +3947,7 @@ async fn proxy_grpc_streaming_dispatch(
                 // classification even when hyper reports `is_canceled`, but still
                 // drop the stale pooled sender so the next RPC dials fresh.
                 if e.is_canceled() {
-                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -3238,7 +3978,7 @@ async fn proxy_grpc_streaming_dispatch(
                     ));
                 }
                 if e.is_canceled() {
-                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -3256,7 +3996,7 @@ async fn proxy_grpc_streaming_dispatch(
                 ));
             }
             if e.is_canceled() {
-                grpc_pool.invalidate_shards_for_proxy(proxy);
+                transport.invalidate_on_pre_wire_cancel(proxy);
             }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::backend_unavailable_with_source(
@@ -3398,24 +4138,32 @@ pub(crate) async fn proxy_grpc_request_core(
     request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_response_body_size_bytes: usize,
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    // Parse the backend URL to extract path and authority
-    let uri: hyper::Uri = backend_url
-        .parse()
-        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
-
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
     // Mirrors `proxy_grpc_request_streaming` via the shared helper so
     // the two gRPC dispatch paths cannot drift on header handling. See
     // `proxy::headers` for the rationale.
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+
+    // Bind the request line to the selected transport BEFORE the Host override
+    // below, so a mesh dispatch presents (and, without `preserve_host_header`,
+    // echoes) the authority its peer routes on. The direct pool parses
+    // `backend_url` as-is (issue #3284).
+    let client_host_header = headers
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let uri = transport.resolve_backend_uri(
+        backend_url,
+        proxy.preserve_host_header,
+        client_host_header,
+    )?;
 
     // Apply per-route Host override AFTER the proxy_headers merge, mirroring
     // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
@@ -3497,7 +4245,7 @@ pub(crate) async fn proxy_grpc_request_core(
     // after a sender exists; applying it here would turn a read-stall policy
     // into an unintended shorter connect timeout.
     let mut sender = if let Some(client_deadline) = client_grpc_deadline_at {
-        tokio::time::timeout_at(client_deadline, grpc_pool.get_sender(proxy))
+        tokio::time::timeout_at(client_deadline, transport.get_sender(proxy))
             .await
             .map_err(|_| {
                 GrpcProxyError::ClientDeadlineExceeded(
@@ -3505,7 +4253,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 )
             })??
     } else {
-        grpc_pool.get_sender(proxy).await?
+        transport.get_sender(proxy).await?
     };
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
@@ -3544,9 +4292,13 @@ pub(crate) async fn proxy_grpc_request_core(
         // proves the request never hit the wire, so classify pre-wire and
         // drop the stale pooled sender for the next attempt / RPC.
         if e.is_canceled() {
-            grpc_pool.invalidate_shards_for_proxy(proxy);
+            transport.invalidate_on_pre_wire_cancel(proxy);
         }
-        error!("gRPC: backend request failed: {}", e);
+        error!(
+            transport = transport.label(),
+            error = %e,
+            "gRPC: backend request failed"
+        );
         if e.is_timeout() {
             GrpcProxyError::BackendTimeout {
                 kind: GrpcTimeoutKind::Read,
@@ -4681,7 +5433,7 @@ mod tests {
             "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
         assert!(
-            body.contains("timeout_at(client_deadline, grpc_pool.get_sender(proxy))"),
+            body.contains("timeout_at(client_deadline, transport.get_sender(proxy))"),
             "pool acquisition must be bounded by only the client deadline"
         );
         let sender_acquisition = body

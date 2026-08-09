@@ -185,10 +185,20 @@ need them, or because they are blocked upstream / architecturally:
   preparation while the policy update still applies to supported TCP/HTTP
   traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
   supported topology for workload-scoped UDP/DTLS authorization.
-- **Ambient native gRPC over HBONE** — explicit non-goal: the Ambient HBONE HTTP
-  path relays an inner HTTP/1.1 byte stream through the CONNECT tunnel, so it has
-  no HTTP/2 trailer path for native gRPC. Use Sidecar mesh-mTLS for native gRPC,
-  or use gRPC-Web pass-through when Ambient transport is required.
+- **Ambient native gRPC over HBONE on the H1/H2 frontend** — the generic
+  HTTP-family HBONE dispatch relays an inner HTTP/1.1 byte stream through the
+  CONNECT tunnel, so it has no HTTP/2 trailer path for native gRPC and refuses
+  such a request pre-dial with gRPC UNAVAILABLE. On that frontend, use Sidecar
+  mesh-mTLS for native gRPC, or gRPC-Web pass-through when Ambient transport is
+  required. **The HTTP/3 frontend is not affected and is Supported** (issue
+  #3284): its gRPC bridge runs a nested `hyper::client::conn::http2` client over
+  the same authenticated HBONE CONNECT byte tunnel — same-cluster (identity
+  pinned) and cross-cluster (remote east-west gateway + destination-FQDN SNI
+  override + trust-domain scope) — so `grpc-status` trailers, flow control,
+  deadlines, and cancellation relay end-to-end. Reusing that transport on the
+  H1/H2 frontend is now mechanically possible and is a residual, not a
+  non-goal — it is untracked and unimplemented, so this row stays here until an
+  issue owns it.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
