@@ -11,8 +11,8 @@
 //! `tests/unit/config/plugin_trigger_tests.rs`.
 
 use chrono::Utc;
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::set_request_wire_protocol_for_test;
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
     BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig, PluginScope, Proxy,
 };
@@ -99,8 +99,7 @@ fn request_from(
     client_ip: &str,
     transport: HttpWireTransport,
 ) -> RequestContext {
-    let mut ctx =
-        RequestContext::new(client_ip.to_string(), method.to_string(), path.to_string());
+    let mut ctx = RequestContext::new(client_ip.to_string(), method.to_string(), path.to_string());
     set_request_wire_protocol_for_test(&mut ctx, transport, false);
     ctx
 }
@@ -380,7 +379,10 @@ async fn a_skipped_instance_does_not_request_request_body_buffering() {
         json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
     );
     let plugins = published(
-        &config(vec![make_proxy("api", "/api", vec!["validate"])], vec![gated]),
+        &config(
+            vec![make_proxy("api", "/api", vec!["validate"])],
+            vec![gated],
+        ),
         "api",
     );
     let plugin = plugins.first().expect("one published instance");
@@ -407,7 +409,10 @@ async fn a_capability_predicate_fails_closed_to_running_before_any_decision_exis
         json!({"when": {"match": {"path": {"prefix": ["/never"]}}}}),
     );
     let plugins = published(
-        &config(vec![make_proxy("api", "/api", vec!["validate"])], vec![gated]),
+        &config(
+            vec![make_proxy("api", "/api", vec!["validate"])],
+            vec![gated],
+        ),
         "api",
     );
     let plugin = plugins.first().expect("one published instance");
@@ -559,7 +564,12 @@ async fn stream_triggers_gate_on_network_facts() {
     );
     let plugins = published(
         &config(
-            vec![stream_proxy("tcp", BackendScheme::Tcp, 19_311, vec!["throttle"])],
+            vec![stream_proxy(
+                "tcp",
+                BackendScheme::Tcp,
+                19_311,
+                vec!["throttle"],
+            )],
             vec![gated],
         ),
         "tcp",
@@ -635,7 +645,10 @@ fn a_trigger_on_a_websocket_frame_plugin_is_refused_rather_than_half_applied() {
         )],
     );
     let error = publication_error(&cfg);
-    assert!(error.contains("cannot carry an execution trigger"), "{error}");
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
     assert!(error.contains("WebSocket"), "{error}");
 }
 
@@ -654,7 +667,10 @@ fn a_trigger_on_a_udp_datagram_plugin_is_refused() {
         )],
     );
     let error = publication_error(&cfg);
-    assert!(error.contains("cannot carry an execution trigger"), "{error}");
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
     assert!(error.contains("UDP datagram"), "{error}");
 }
 
@@ -668,7 +684,10 @@ fn an_identity_predicate_on_an_authentication_plugin_is_refused() {
         )],
     );
     let error = publication_error(&cfg);
-    assert!(error.contains("cannot carry an execution trigger"), "{error}");
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
     assert!(error.contains("authentication plugin"), "{error}");
 }
 

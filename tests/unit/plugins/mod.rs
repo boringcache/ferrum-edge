@@ -79,9 +79,9 @@ pub(crate) use plugin_cache_tests::{
     make_plugin_config_with_json, make_proxy, minimal_plugin_config,
 };
 mod plugin_doc_parity_tests;
-mod plugin_trigger_gate_tests;
 mod plugin_http_client_tests;
 mod plugin_integration_tests;
+mod plugin_trigger_gate_tests;
 mod plugin_utils_core_tests;
 mod prometheus_metric_contract_tests;
 mod prometheus_metrics_tests;

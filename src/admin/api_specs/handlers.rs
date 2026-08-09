@@ -1568,7 +1568,7 @@ fn plugin_canonical_key(
                     pc.plugin_name, e
                 ))
             })?;
-            format!("{config_str}\u{{1e}}{trigger_str}")
+            format!("{config_str}\u{1e}{trigger_str}")
         }
         None => config_str,
     };

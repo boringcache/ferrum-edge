@@ -301,13 +301,31 @@ fn regex_source_length_and_program_size_are_bounded() {
 #[test]
 fn malformed_cidrs_methods_field_names_and_ports_are_rejected() {
     for (value, needle) in [
-        (serde_json::json!({"source_cidr": ["10.0.0.0/33"]}), "source_cidr"),
-        (serde_json::json!({"source_cidr": ["not-an-ip"]}), "source_cidr"),
-        (serde_json::json!({"source_cidr": ["::1/129"]}), "source_cidr"),
+        (
+            serde_json::json!({"source_cidr": ["10.0.0.0/33"]}),
+            "source_cidr",
+        ),
+        (
+            serde_json::json!({"source_cidr": ["not-an-ip"]}),
+            "source_cidr",
+        ),
+        (
+            serde_json::json!({"source_cidr": ["::1/129"]}),
+            "source_cidr",
+        ),
         (serde_json::json!({"source_cidr": []}), "at least one"),
-        (serde_json::json!({"method": ["GET LIST"]}), "valid HTTP token"),
-        (serde_json::json!({"header": {"name": "bad header"}}), "printable ASCII"),
-        (serde_json::json!({"header": {"name": "bad:header"}}), "valid HTTP field name"),
+        (
+            serde_json::json!({"method": ["GET LIST"]}),
+            "valid HTTP token",
+        ),
+        (
+            serde_json::json!({"header": {"name": "bad header"}}),
+            "printable ASCII",
+        ),
+        (
+            serde_json::json!({"header": {"name": "bad:header"}}),
+            "valid HTTP field name",
+        ),
         (serde_json::json!({"listen_port": [0]}), "1-65535"),
     ] {
         let error = compile_error(serde_json::json!({"when": {"match": value}}));
@@ -350,7 +368,10 @@ fn all_any_and_not_compose_as_documented() {
 
     facts.method = Some("PUT".to_string());
     facts.path = Some("/internal/debug".to_string());
-    assert!(!trigger.evaluate(&facts), "NOT branch must reject /internal");
+    assert!(
+        !trigger.evaluate(&facts),
+        "NOT branch must reject /internal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +429,10 @@ fn repeated_field_occurrences_honor_any_and_all_semantics() {
     let mixed = Facts::http()
         .with_header("x-tier", "silver")
         .with_header("x-tier", "gold");
-    assert!(any.evaluate(&mixed), "any: one matching occurrence suffices");
+    assert!(
+        any.evaluate(&mixed),
+        "any: one matching occurrence suffices"
+    );
     assert!(!all.evaluate(&mixed), "all: every occurrence must match");
 
     let uniform = Facts::http()
@@ -478,9 +502,15 @@ fn path_regex_is_anchored_so_it_cannot_partially_match() {
     facts.path = Some("/v1/orders/42".to_string());
     assert!(trigger.evaluate(&facts));
     facts.path = Some("/v1/orders/42/refunds".to_string());
-    assert!(!trigger.evaluate(&facts), "anchored regex must not match a longer path");
+    assert!(
+        !trigger.evaluate(&facts),
+        "anchored regex must not match a longer path"
+    );
     facts.path = Some("/public/v1/orders/42".to_string());
-    assert!(!trigger.evaluate(&facts), "anchored regex must not match a prefix-extended path");
+    assert!(
+        !trigger.evaluate(&facts),
+        "anchored regex must not match a prefix-extended path"
+    );
 }
 
 #[test]
@@ -546,7 +576,10 @@ fn protocol_identity_is_a_set_so_transport_and_flavor_both_match() {
     assert!(grpc.evaluate(&facts));
     assert!(!h3_or_ws.evaluate(&facts));
 
-    facts.protocols = vec![PluginTriggerProtocol::Http1, PluginTriggerProtocol::Websocket];
+    facts.protocols = vec![
+        PluginTriggerProtocol::Http1,
+        PluginTriggerProtocol::Websocket,
+    ];
     assert!(h3_or_ws.evaluate(&facts));
 }
 
