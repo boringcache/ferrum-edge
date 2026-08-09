@@ -345,6 +345,7 @@ impl PodCaptureSource for FakeSource {
 struct FakeBackendState {
     calls: Vec<String>,
     interfaces: HashMap<String, ResolvedInterface>,
+    fail_install_guard: bool,
     fail_install_capture: bool,
     fail_release_guard: bool,
     /// The next `start_listener` hands back a capture loop that returns on its
@@ -391,6 +392,10 @@ impl FakeBackend {
     fn set_listener_exits(&self, exits: bool) {
         self.inner.lock().unwrap().listener_exits = exits;
     }
+
+    fn set_fail_install_guard(&self, fail: bool) {
+        self.inner.lock().unwrap().fail_install_guard = fail;
+    }
 }
 
 impl HostUdpCaptureBackend for FakeBackend {
@@ -406,6 +411,9 @@ impl HostUdpCaptureBackend for FakeBackend {
 
     fn install_guard(&self, ifaces: &[String]) -> Result<(), String> {
         self.record(&format!("guard:{}", ifaces.join(",")));
+        if self.inner.lock().unwrap().fail_install_guard {
+            return Err("iptables guard failed".to_string());
+        }
         Ok(())
     }
 
@@ -951,6 +959,40 @@ async fn shutdown_without_a_gate_close_acknowledgement_stays_fail_closed() {
     assert!(
         !ready_dir.join(POD_A_UID).is_file(),
         "readiness must be retracted before capture stops"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_guard_failure_retains_capture_rules() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(source, backend.clone(), Some(ready_dir))
+        .with_gate_close_timeout(Duration::from_millis(50));
+    manager.reconcile_once().await;
+    backend.reset_calls();
+    backend.set_fail_install_guard(true);
+
+    // Without an acknowledgement, failure to install the shutdown DROP guard
+    // must retain the existing TPROXY/routing path. Removing it here would let
+    // a still-open node-agent gate release the pod's UDP egress as plaintext.
+    manager.shutdown().await;
+
+    let calls = backend.calls();
+    assert!(calls.contains(&"guard:vetha".to_string()), "{calls:?}");
+    assert!(
+        !calls.contains(&"teardown_capture".to_string())
+            && !calls.contains(&"teardown_all".to_string()),
+        "capture and routing objects must remain fail-closed when the replacement guard fails: \
+         {calls:?}"
+    );
+    assert_eq!(
+        backend.listener_stops(),
+        1,
+        "the shared listener still stops during process shutdown"
     );
 }
 

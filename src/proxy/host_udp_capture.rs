@@ -1082,9 +1082,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
     /// confirm the BPF gates are closed, then remove Ferrum-owned host state.
     ///
     /// If the acknowledgement does not arrive, the fail-closed guard is installed
-    /// and only the capture rules are removed. That leaves the node dropping
-    /// enrolled UDP egress instead of releasing it as plaintext while the
-    /// node-agent still believes capture is live.
+    /// and only the capture rules are removed. If the guard itself cannot be
+    /// installed, the existing capture/routing objects are retained after the
+    /// listener stops; a socketless TPROXY path drops traffic, while removing the
+    /// path could release it as plaintext while the node-agent still believes
+    /// capture is live.
     pub async fn shutdown(&mut self) {
         // Every pod this process ever published readiness for, INCLUDING the ones
         // a reconcile already moved onto the handshake but could not retire: both
@@ -1103,12 +1105,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         let requested = self.begin_gate_close(&leaving);
         let acknowledged = requested && self.await_gate_close(budget).await;
 
-        if let Some(listener) = self.listener.take() {
-            listener.stop().await;
-        }
-        self.index.clear();
-
         if acknowledged {
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
+            }
+            self.index.clear();
             if let Err(error) = self.backend.teardown_all() {
                 warn!(%error, "Host UDP capture: shutdown teardown did not complete");
             }
@@ -1117,18 +1118,31 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             warn!(
                 pods,
                 "Host UDP capture: node-agent did not acknowledge closing its UDP gates; \
-                 retaining the fail-closed guard and removing only the capture rules"
+                 preserving a fail-closed shutdown posture"
             );
-            if !ifaces.is_empty()
-                && let Err(error) = self.backend.install_guard(&ifaces)
-            {
-                warn!(
-                    %error,
-                    "Host UDP capture: could not install the shutdown fail-closed guard; \
-                     removing capture rules anyway (a socketless TPROXY jump is worse)"
-                );
+            let guard_installed = if ifaces.is_empty() {
+                true
+            } else {
+                match self.backend.install_guard(&ifaces) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            "Host UDP capture: could not install the shutdown fail-closed guard; \
+                             retaining the existing capture and routing objects so egress cannot \
+                             escape in plaintext"
+                        );
+                        false
+                    }
+                }
+            };
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
             }
-            if let Err(error) = self.backend.teardown_capture_rules() {
+            self.index.clear();
+            if guard_installed
+                && let Err(error) = self.backend.teardown_capture_rules()
+            {
                 warn!(%error, "Host UDP capture: shutdown capture cleanup did not complete");
             }
         }
