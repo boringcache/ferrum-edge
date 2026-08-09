@@ -360,13 +360,12 @@ fn listenerset_outside_source_namespaces_cannot_publish_route_policy() {
         "an out-of-scope ListenerSet must not publish route policy: {skipped:?}"
     );
     assert!(translation.listenerset_statuses.is_empty());
-    assert!(
-        translation
-            .config
-            .proxies
+    assert!(translation.config.proxies.iter().all(|proxy| {
+        !proxy
+            .hosts
             .iter()
-            .all(|proxy| !proxy.hosts.iter().any(|host| host == "excluded.example.com"))
-    );
+            .any(|host| host == "excluded.example.com")
+    }));
 }
 
 #[test]
