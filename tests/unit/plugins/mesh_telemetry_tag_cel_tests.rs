@@ -452,7 +452,10 @@ fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
         let barrier = std::sync::Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
             let mut metadata = mesh_identity_metadata(HashMap::new());
-            metadata.insert("mesh.source.workload".into(), format!("host-{i}.example"));
+            metadata.insert(
+                "mesh.source.workload".into(),
+                format!("host-{i}.example"),
+            );
             let summary = TransactionSummary {
                 http_method: "GET".into(),
                 response_status_code: 200,
