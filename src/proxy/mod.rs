@@ -44,6 +44,7 @@ pub mod grpc_proxy;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
+pub mod host_udp_capture;
 pub mod http2_pool;
 /// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
 /// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps

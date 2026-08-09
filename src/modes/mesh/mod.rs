@@ -11702,6 +11702,35 @@ type PreparedMeshRuntimeBeforeOwner = (
     Vec<JoinHandle<()>>,
 );
 
+/// Refuse the host-network UDP capture placement on any topology but Ambient.
+///
+/// [`crate::capture::udp_capture_settings_from_env`] already rejects the
+/// placement switch without the capture switch, but it is shared with the
+/// injector and the node-agent — neither of which knows the mesh topology — so
+/// the topology half of the contract has to be enforced on the serving path
+/// instead. Without it a Sidecar (or waypoint, or gateway) process ACCEPTS
+/// `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` and comes up with no host
+/// capture producer at all, while `docs/configuration.md`, `docs/mesh.md`, and
+/// the chart all promise a startup error. The Helm gate is not enforcement: a
+/// direct-env, non-Helm, or hand-rolled manifest deployment never sees it.
+///
+/// Ambient is the only topology whose proxy runs OUTSIDE the workload pod netns,
+/// which is the entire premise of the placement; every other topology either
+/// captures UDP from inside the pod netns (Sidecar) or has no UDP relay at all.
+pub fn validate_udp_host_netns_placement(
+    topology: MeshTopology,
+    settings: &crate::capture::UdpCaptureSettings,
+) -> Result<(), String> {
+    if !settings.udp_host_netns_enabled || topology == MeshTopology::Ambient {
+        return Ok(());
+    }
+    Err(format!(
+        "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient \
+         (host-network UDP capture is the Ambient placement whose proxy runs outside the workload \
+         pod network namespace); this process resolved topology {topology:?}"
+    ))
+}
+
 fn prepare_mesh_runtime_before_owner(
     env_config: &EnvConfig,
     runtime: &MeshRuntimeConfig,
@@ -11718,7 +11747,12 @@ fn prepare_mesh_runtime_before_owner(
     // the very top of the serving path, makes an operator config error abort
     // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
     // (which a later `?` would have left running for in-process retries/tests).
-    crate::capture::udp_capture_settings_from_env()
+    let udp_capture_settings = crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+    // Same contract, topology half: the shared parser cannot see the topology,
+    // so this is the boundary that makes the documented "startup error" real for
+    // a non-Helm deployment.
+    validate_udp_host_netns_placement(runtime.topology, &udp_capture_settings)
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
 
     // Same contract for the NodeWaypoint transparent inbound capture listener
@@ -11817,6 +11851,31 @@ fn prepare_mesh_runtime_before_owner(
         proxy_state,
         health_check_handles,
     ))
+}
+
+/// Delay only the incoming Ambient UDP producer until stale host readiness can
+/// no longer be retracted. Unrelated mesh/admin listeners continue startup while
+/// the predecessor datapath stays installed and fail-closed.
+async fn await_host_udp_retraction(
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(mut ready) = ready else {
+        return !*shutdown.borrow();
+    };
+    loop {
+        if *shutdown.borrow() {
+            return false;
+        }
+        tokio::select! {
+            result = &mut ready => return result.is_ok(),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
@@ -12009,11 +12068,51 @@ async fn arm_mesh_runtime_startup(
         let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
             anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
         })?;
+        // Reap host-namespace UDP state whenever THIS process is not the one that
+        // owns it. Host capture's own manager recovers (and then rebuilds) its
+        // state at startup, but a node that switched to the pod-netns placement or
+        // disabled UDP entirely would otherwise keep a `PREROUTING` jump into a
+        // chain no socket serves — captured egress diverted into a black hole with
+        // no remaining code path to clean it up.
+        //
+        // The reap is SEQUENCED behind the durable readiness handshake for two
+        // reasons that both concern the producer started below:
+        //
+        // * the node-agent still holds a BPF UDP gate open for every pod the
+        //   previous host generation readied, so removing that generation's rules
+        //   before those gates are acknowledged closed would release the pods'
+        //   UDP egress in plaintext; and
+        // * the retraction must land BEFORE the incoming per-pod-netns producer
+        //   starts publishing readiness of its own, so the two never fight over
+        //   the shared `.udp-ready` markers.
+        //
+        // One bounded recovery pass runs here. If discovery/retraction cannot
+        // complete, only the incoming UDP producer waits on its returned barrier;
+        // unrelated mesh/admin listeners continue startup. Once retraction is
+        // complete, the incoming producer may safely republish readiness while
+        // stale host-state reaping continues in the background.
+        let mut host_udp_retraction_ready = None;
+        if !settings.udp_host_netns_enabled {
+            let host_ready_dir =
+                std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                    .join(".udp-ready");
+            let recovery = crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
+                Some(host_ready_dir),
+                std::time::Duration::from_secs(2),
+                shutdown_tx.subscribe(),
+            )
+            .await;
+            host_udp_retraction_ready = recovery.retraction_ready;
+            if let Some(handle) = recovery.retry_task {
+                owner.push_mesh_background(handle);
+            }
+        }
         if settings.udp_capture_enabled {
             if !cfg!(target_os = "linux") {
                 warn!(
-                    "Ambient UDP capture is enabled but the per-pod-netns producer is Linux-only; \
-                     not starting it (UDP egress passes through un-captured)"
+                    "Ambient UDP capture is enabled but both the per-pod-netns producer and the \
+                     host-network capture path are Linux-only; not starting either (UDP egress \
+                     passes through un-captured)"
                 );
             } else {
                 // Fail closed on a malformed capture config (codex): an invalid
@@ -12025,14 +12124,17 @@ async fn arm_mesh_runtime_startup(
                             "Ambient UDP capture is enabled but the capture config is invalid: {e}"
                         )
                     })?;
-                // Producer posture: UDP enabled, POD netns (never host-netns — the
-                // producer installs rules INSIDE each pod netns), on the resolved
-                // capture port/mark. The include/exclude scope is node-level (from
-                // the proxy's `FERRUM_MESH_CAPTURE_*` env); per-pod
-                // `includeOutboundPorts` annotation scoping is a documented
-                // follow-up (it would ride the registry).
+                // Producer posture: UDP enabled, on the resolved capture
+                // port/mark. `host_netns` selects WHICH rule generator is valid —
+                // the pod-netns producer installs rules INSIDE each pod netns
+                // (`false`), while the host-network path installs interface-scoped
+                // rules in the proxy's own namespace (`true`). The
+                // include/exclude scope is node-level (from the proxy's
+                // `FERRUM_MESH_CAPTURE_*` env); per-pod `includeOutboundPorts`
+                // annotation scoping is a documented follow-up (it would ride the
+                // registry).
                 capture_config.udp_capture_enabled = true;
-                capture_config.host_netns = false;
+                capture_config.host_netns = settings.udp_host_netns_enabled;
                 capture_config.udp_outbound_port = settings.udp_outbound_port;
                 capture_config.tproxy_mark = settings.tproxy_mark;
                 // The sidecar default excludes (15001/15006/15008/15020) only make
@@ -12064,34 +12166,86 @@ async fn arm_mesh_runtime_startup(
                 let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                     env_config.mesh_node_waypoint_pod_registry_dir.clone(),
                 ));
-                let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
-                    Arc::new(proxy_state.clone()),
-                    capture_config,
-                    settings.udp_outbound_port,
-                    env_config.udp_max_sessions,
-                    env_config.udp_cleanup_interval_seconds,
-                    env_config.udp_recvmmsg_batch_size,
-                    env_config.pool_shard_amount,
-                );
-                let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
-                    settings.udp_outbound_port,
-                    source,
-                    backend,
-                    std::time::Duration::from_secs(2),
-                )
-                .with_ready_dir(Some(
+                let ready_dir =
                     std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
-                        .join(".udp-ready"),
-                ));
+                        .join(".udp-ready");
                 let manager_shutdown = shutdown_tx.subscribe();
-                info!(
-                    registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
-                    capture_port = settings.udp_outbound_port,
-                    "Ambient per-pod-netns UDP capture producer enabled"
-                );
-                owner.push_mesh_background(tokio::spawn(async move {
-                    manager.run(manager_shutdown).await;
-                }));
+                if settings.udp_host_netns_enabled {
+                    // Host-network capture (issue #3288). The proxy already runs
+                    // in the host namespace, so this needs no `setns` and no
+                    // `hostPID`/`SYS_ADMIN`/`SYS_PTRACE` — only `NET_ADMIN` for
+                    // the mangle rules and the transparent binds. Direction is
+                    // split by INGRESS INTERFACE, and each datagram is attributed
+                    // to a pod by that interface plus its registered source
+                    // address, so node traffic is never captured and one pod can
+                    // never be relayed under another's identity.
+                    //
+                    // Placement migration: this path reaps only HOST-namespace
+                    // state. Rules a previous per-pod-netns generation installed
+                    // live inside each pod's own namespace and are destroyed with
+                    // that namespace, so switching placement on a running node
+                    // leaves already-running pods diverting UDP to a socket that
+                    // no longer exists there — fail-closed (dropped, never
+                    // plaintext), but not captured either. Roll the workloads, or
+                    // do one transitional rollout with UDP capture disabled so the
+                    // pod-netns cleanup manager reaps them first. Documented in
+                    // docs/node_agent.md.
+                    let backend = crate::proxy::host_udp_capture::ProxyHostUdpBackend::new(
+                        Arc::new(proxy_state.clone()),
+                        capture_config,
+                        settings.udp_outbound_port,
+                        env_config.udp_max_sessions,
+                        env_config.udp_cleanup_interval_seconds,
+                        env_config.udp_recvmmsg_batch_size,
+                        env_config.pool_shard_amount,
+                    );
+                    let manager = crate::proxy::host_udp_capture::HostUdpCaptureManager::new(
+                        source,
+                        backend,
+                        std::time::Duration::from_secs(2),
+                    )
+                    .with_ready_dir(Some(ready_dir));
+                    info!(
+                        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                        capture_port = settings.udp_outbound_port,
+                        "Ambient host-network UDP capture enabled (per-pod ingress-interface \
+                         scoping; no pod-netns entry)"
+                    );
+                    owner.push_mesh_background(tokio::spawn(async move {
+                        manager.run(manager_shutdown).await;
+                    }));
+                } else {
+                    let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
+                        Arc::new(proxy_state.clone()),
+                        capture_config,
+                        settings.udp_outbound_port,
+                        env_config.udp_max_sessions,
+                        env_config.udp_cleanup_interval_seconds,
+                        env_config.udp_recvmmsg_batch_size,
+                        env_config.pool_shard_amount,
+                    );
+                    let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
+                        settings.udp_outbound_port,
+                        source,
+                        backend,
+                        std::time::Duration::from_secs(2),
+                    )
+                    .with_ready_dir(Some(ready_dir));
+                    info!(
+                        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                        capture_port = settings.udp_outbound_port,
+                        "Ambient per-pod-netns UDP capture producer enabled"
+                    );
+                    let retraction_ready = host_udp_retraction_ready.take();
+                    owner.push_mesh_background(tokio::spawn(async move {
+                        let mut manager_shutdown = manager_shutdown;
+                        if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await
+                        {
+                            return;
+                        }
+                        manager.run(manager_shutdown).await;
+                    }));
+                }
             }
         } else if cfg!(target_os = "linux") {
             let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
@@ -12112,7 +12266,12 @@ async fn arm_mesh_runtime_startup(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
                 "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
             );
+            let retraction_ready = host_udp_retraction_ready.take();
             owner.push_mesh_background(tokio::spawn(async move {
+                let mut manager_shutdown = manager_shutdown;
+                if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await {
+                    return;
+                }
                 manager.run(manager_shutdown).await;
             }));
         }

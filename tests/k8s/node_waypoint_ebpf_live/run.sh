@@ -2812,7 +2812,8 @@ expect_attributed_forged_assertion_blocked() {
   local url="$3"
   local family="${4:-4}"
   local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
-  local out_dir before_file after_file output code body err status before_count after_count
+  local out_dir before_file after_file output code body err status before_count after_count attempt
+  local dispatch_not_ready_body
   from_record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
   destination_record="$(workload_pod_record_for_app "$destination")"
@@ -2835,19 +2836,34 @@ expect_attributed_forged_assertion_blocked() {
   fi
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
-  set +e
-  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
-  status=$?
-  set -e
-  code="${output##*$'\n'}"
-  body="${output%$'\n'*}"
-  printf '%s\n' "$output" >"$out_dir/curl.out"
-  printf '%s\n' "$status" >"$out_dir/curl.status"
-  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+  dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
+  for attempt in $(seq 1 30); do
+    set +e
+    output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+    status=$?
+    set -e
+    code="${output##*$'\n'}"
+    body="${output%$'\n'*}"
+    printf '%s\n' "$output" >"$out_dir/curl.out"
+    printf '%s\n' "$status" >"$out_dir/curl.status"
+    if [[ "$status" -eq 0 ]] && forged_assertion_response_is_policy_rejection "$code" "$body"; then
+      break
+    fi
+
+    # A restarted source NodeWaypoint can report ready after accepting the
+    # slice but before its per-workload HBONE target tags are materialized.
+    # Retry only that explicit convergence response; every other transport or
+    # HTTP outcome remains an immediate failure, and success still requires a
+    # destination policy rejection plus the deny-recorder increment below.
+    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 30 ]]; then
+      sleep 0.5
+      continue
+    fi
+
     echo "expected forged assertion request to fail via destination HBONE policy rejection, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}'" >&2
     cat "$err" >&2 || true
     return 1
-  fi
+  done
 
   for _ in $(seq 1 20); do
     if fetch_policy_denies_for_node "$dst_node" "$after_file"; then

@@ -345,10 +345,78 @@ listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
 netns and `SYS_ADMIN`/`SYS_PTRACE` for `setns(CLONE_NEWNET)` — plus **`NET_ADMIN`**
 to install the in-netns `iptables`/`ip` TPROXY rules and to bind the
 `IP_TRANSPARENT` capture and reply sockets, and `iptables`/`ip6tables`/`ip`/`sh`
-present in the proxy image. The proxy's own (host) network namespace is never
-given UDP TPROXY rules — the host-netns iptables fallback emits none (there is no
-host-netns-safe direction discriminator); the rules live **only** inside each pod
-netns.
+present in the proxy image. Its rules live **only** inside each pod netns; the
+node-agent's own host-netns iptables fallback emits none (there is no
+host-netns-safe `addrtype` direction discriminator, and the node-agent has no UDP
+listener to serve them).
+
+### Host-network UDP capture placement (issue #3288)
+
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on the **ambient proxy** (with
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`) moves UDP source-capture into the proxy's
+own network namespace instead. The **node-agent's role is unchanged**: it still
+publishes the per-pod registry and still keeps each pod's BPF UDP gate closed
+until the producer publishes `<registry_dir>/.udp-ready/<pod_uid>`, and it still
+installs no UDP rules of its own. What changes is where the rules and the socket
+live. A readiness-marker write that fails after capture becomes live is retried
+on every otherwise-idle producer reconcile; only a successful publication is
+recorded as ready, so a transient registry I/O failure cannot strand the pod's
+BPF gate permanently closed.
+
+The producer also drives the same **gate-close handshake** the pod-netns producer
+uses when a pod stops being captured: it persists
+`<registry_dir>/.udp-ack-required/<pod_uid>`, retracts `.udp-ready`, and keeps the
+pod's host capture rule in place behind a DROP guard until the node-agent
+publishes `<registry_dir>/.udp-not-ready/<pod_uid>`. Retracting readiness does not
+close the BPF gate synchronously, so removing the rule first would let that pod's
+UDP egress leave the node in plaintext for as long as the node-agent took to
+notice.
+
+That handshake also crosses the **process boundary**. Those markers are durable,
+so a producer that dies leaves the node-agent holding an open UDP gate for every
+pod it had readied — and the node-agent has no way to tell a dead producer from a
+busy one. A replacement therefore does not reap the previous generation's host
+rules first: it re-issues the close handshake for every pod the durable state
+names, waits for `.udp-not-ready`, and only then removes anything. Until it
+settles, the predecessor's rules stay installed (a capture path whose socket died
+with its process drops rather than leaks) and this generation applies nothing.
+The same recovery runs on a node that switched **away** from the host placement.
+One bounded pass runs during mesh initialization; if safe marker retraction is
+still incomplete, recovery continues in the background and only the replacement
+UDP producer waits for that boundary. Other mesh/admin listeners still start,
+while predecessor rules retain a fail-closed UDP posture. Once retraction is
+complete the producer may safely republish `.udp-ready`; stale host-state reaping
+can continue without retracting those new markers. A node-agent that stops
+acknowledging therefore leaves those pods' UDP dropped rather than released — the
+mesh proxy logs the outstanding pods periodically and keeps retrying.
+
+Direction is discriminated by INGRESS INTERFACE — `mangle PREROUTING -i <the
+pod's host-side interface>` — which is exact in the host namespace: a pod's egress
+is the only traffic entering there on that pod's own interface, pod-destined
+traffic arrives on the node uplink, and the node's own traffic is locally
+generated and traverses `OUTPUT` only. **No `mangle OUTPUT` chain is installed at
+all**, so node traffic cannot be captured. Each datagram is attributed to a pod by
+its ingress interface index plus its registry-published source address; anything
+not attributable to exactly one enrolled pod is dropped rather than relayed under
+an absent or neighbouring identity, and two pods resolving to one interface are
+both refused.
+
+This placement enters no namespace, so the host UDP path needs `NET_ADMIN` and
+the capture tools but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart
+narrows the ambient DaemonSet's capabilities accordingly while retaining its
+baseline `NET_RAW`. It keeps the registry hostPath and the read-only host cgroup
+mount (the enrolled-pod set and interface resolution use them), and falls back to
+the host route table keyed on the registry-published pod IP when host `/proc` is
+not shared — `/proc/net/route` for a v4 address and `/proc/net/ipv6_route` for a
+v6 one, so an **IPv6-only** enrolled pod resolves on this path too rather than
+being refused for want of an address it does not have. The fallback accepts only
+an unambiguous `/32` or `/128` host route, and sysfs must identify the resolved
+device as a distinct peer rather than a self-linked bridge/uplink. A broader
+route through a shared bridge is refused because it is not per-pod interface
+ownership evidence. It requires a CNI that gives each pod its own host-side
+interface.
+Full behaviour, ownership, and the placement-migration constraint are in
+[`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

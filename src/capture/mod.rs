@@ -117,6 +117,64 @@ pub(crate) const TPROXY_ROUTE_RULE_PRIORITY: u32 = 100;
 const UDP_FAIL_CLOSED_CHAIN_A: &str = "FERRUM_UDP_FAIL_CLOSED_A";
 const UDP_FAIL_CLOSED_CHAIN_B: &str = "FERRUM_UDP_FAIL_CLOSED_B";
 
+/// The single `mangle PREROUTING` chain holding the HOST-network UDP capture
+/// rules (issue #3288). Deliberately distinct from the pod-netns chain names
+/// (`FERRUM_MESH_UDP_OUTBOUND` / `_INBOUND` / `_OUTPUT_MARK` / `_REINJECT`) so
+/// host-netns and pod-netns state can never be confused by a teardown: each
+/// path only ever removes objects it owns by exact name.
+pub(crate) const UDP_HOST_CAPTURE_CHAIN: &str = "FERRUM_MESH_UDP_HOST";
+
+/// Alternating fail-closed DROP guards for the host-netns UDP capture path.
+/// Same A/B replacement discipline as the pod-netns guards, but jumped from
+/// `mangle PREROUTING` (host-netns pod egress is FORWARDED, so it never
+/// traverses `OUTPUT`) and scoped to the enrolled pods' host-side interfaces.
+pub(crate) const UDP_HOST_GUARD_CHAIN_A: &str = "FERRUM_MESH_UDP_HOST_GUARD_A";
+pub(crate) const UDP_HOST_GUARD_CHAIN_B: &str = "FERRUM_MESH_UDP_HOST_GUARD_B";
+
+/// Dedicated **Ferrum-owned** policy routing table for HOST-netns transparent
+/// UDP local delivery, deliberately DIFFERENT from the pod-netns
+/// [`TPROXY_ROUTE_TABLE`] (`33133`) and from the node-agent's tc ingress-redirect
+/// table (`33134`).
+///
+/// The pod-netns and host-netns paths normally live in different network
+/// namespaces, but a misconfigured registry entry, a `hostNetwork` workload, or
+/// a future co-resident deployment could put both in the SAME namespace. Giving
+/// the host path its own table + rule priority means neither path's teardown can
+/// ever remove the other's routing state — ownership stays exact.
+pub(crate) const TPROXY_HOST_ROUTE_TABLE: u16 = 33135;
+
+/// `ip rule` priority for the host-netns UDP fwmark selector. Like
+/// [`TPROXY_ROUTE_RULE_PRIORITY`] it MUST sit below the kernel's `main` rule
+/// (32766) or transparent local delivery never engages; it is one above the
+/// pod-netns priority so the two rules are individually addressable for exact
+/// delete-by-priority teardown.
+pub(crate) const TPROXY_HOST_ROUTE_RULE_PRIORITY: u32 = 101;
+
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_TABLE != TPROXY_ROUTE_TABLE,
+    "host-netns UDP routing table must be distinct from the pod-netns table"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_RULE_PRIORITY != TPROXY_ROUTE_RULE_PRIORITY,
+    "host-netns UDP rule priority must be distinct from the pod-netns priority"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_RULE_PRIORITY < 32766,
+    "host-netns UDP fwmark rule must sort below the kernel `main` table rule"
+);
+
+/// Linux `IFNAMSIZ` is 16 bytes including the NUL terminator, so an interface
+/// name is at most 15 characters.
+const MAX_INTERFACE_NAME_LEN: usize = 15;
+
+/// Upper bound on host capture interfaces folded into one plan. Each interface
+/// multiplies the emitted rule count by the number of capture selectors, and the
+/// plan is rebuilt on every enrolled-pod change, so an unbounded set would turn
+/// pod churn into an unbounded `iptables` workload. Nodes do not run anywhere
+/// near this many mesh-enrolled pods; exceeding it is a configuration error and
+/// fails closed rather than installing a partial ruleset.
+pub const MAX_HOST_UDP_CAPTURE_INTERFACES: usize = 512;
+
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the
 /// node-agent eBPF backend both read this key — keep the spelling exactly
 /// in sync with Istio so existing operator annotations apply unchanged.
@@ -233,19 +291,25 @@ pub struct CaptureConfig {
     /// node-agent DaemonSet, `hostNetwork: true`), `false` for the injector init
     /// container (the POD's own network namespace).
     ///
-    /// This gates ONLY the UDP TPROXY direction split. The TCP path separates
-    /// inbound vs outbound by netfilter HOOK (`nat PREROUTING` vs `nat OUTPUT`),
-    /// which is netns-agnostic, so it is unaffected. The UDP TPROXY path cannot
-    /// use `OUTPUT` (TPROXY is `PREROUTING`-only) so it splits direction by
-    /// destination ADDRESS TYPE (`-m addrtype --dst-type LOCAL`). That
-    /// discriminator is only correct in the POD netns, where the pod's own IP is
-    /// `LOCAL`: in the HOST netns pod IPs are FORWARDED (not `LOCAL`), so inbound
-    /// UDP to a pod would match the OUTBOUND chain's `! --dst-type LOCAL`
-    /// discriminator and be mis-captured. There is no host-netns-safe
-    /// `addrtype`-style discriminator without per-pod IP knowledge the iptables
-    /// fallback does not carry, so the host-netns UDP iptables fallback emits NO
-    /// UDP TPROXY rules (eBPF is the node-agent's supported UDP capture path). See
+    /// This gates ONLY the pod-netns UDP TPROXY direction split. The TCP path
+    /// separates inbound vs outbound by netfilter HOOK (`nat PREROUTING` vs
+    /// `nat OUTPUT`), which is netns-agnostic, so it is unaffected. The pod-netns
+    /// UDP TPROXY path cannot use that trick (TPROXY is `PREROUTING`-only) so it
+    /// splits direction by destination ADDRESS TYPE (`-m addrtype --dst-type
+    /// LOCAL`). That discriminator is only correct in the POD netns, where the
+    /// pod's own IP is `LOCAL`: in the HOST netns pod IPs are FORWARDED (not
+    /// `LOCAL`), so inbound UDP to a pod would match the OUTBOUND chain's
+    /// `! --dst-type LOCAL` discriminator and be mis-captured. So the pod-netns
+    /// rule generator emits NO UDP TPROXY rules when this flag is set. See
     /// [`udp_tproxy_commands_for_family`].
+    ///
+    /// The **host-network UDP capture path** (issue #3288) is a SEPARATE rule
+    /// generator ([`IptablesPlan::host_udp_setup_script`]) that does not use an
+    /// `addrtype` direction split at all: it discriminates by INGRESS INTERFACE
+    /// (`-i <host-side pod interface>` in `mangle PREROUTING`), which is exact in
+    /// the host netns — a pod's egress is the only traffic that enters the host
+    /// namespace on that pod's own interface. Setting `host_netns` therefore does
+    /// NOT disable host UDP capture; it selects which generator is valid.
     pub host_netns: bool,
 }
 
@@ -339,6 +403,9 @@ impl CaptureConfig {
             udp_capture_enabled,
             udp_outbound_port,
             tproxy_mark,
+            // Placement (pod netns vs host netns) is decided by the mesh proxy's
+            // Ambient wiring, not by this scope config.
+            udp_host_netns_enabled: _,
         } = udp_capture_settings_from_env()?;
         Ok(Self {
             mode,
@@ -389,11 +456,24 @@ pub struct UdpCaptureSettings {
     pub udp_capture_enabled: bool,
     pub udp_outbound_port: u16,
     pub tproxy_mark: u32,
+    /// Whether the Ambient mesh proxy captures UDP from its OWN (host) network
+    /// namespace, using host-side per-pod interface scoping, instead of entering
+    /// each enrolled pod's netns (issue #3288). Default `false`: the per-pod-netns
+    /// producer stays the default because it needs no interface attribution, and
+    /// the host path is only correct on a CNI that gives each pod its own
+    /// host-side interface. Requires `udp_capture_enabled`.
+    pub udp_host_netns_enabled: bool,
 }
 
 /// Parse `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default `false`),
-/// `FERRUM_MESH_CAPTURE_UDP_PORT` (default [`DEFAULT_UDP_OUTBOUND_PORT`]), and
-/// `FERRUM_MESH_TPROXY_MARK` (default [`DEFAULT_TPROXY_MARK`]).
+/// `FERRUM_MESH_CAPTURE_UDP_PORT` (default [`DEFAULT_UDP_OUTBOUND_PORT`]),
+/// `FERRUM_MESH_TPROXY_MARK` (default [`DEFAULT_TPROXY_MARK`]), and
+/// `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED` (default `false`).
+///
+/// Fails closed on an inconsistent combination: enabling the host-netns path
+/// without enabling UDP capture is a configuration error, not a silent no-op —
+/// an operator who set only the host switch would otherwise get NO capture while
+/// believing UDP was covered.
 pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
     let udp_capture_enabled = parse_bool_env(
         resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_ENABLED").as_deref(),
@@ -407,11 +487,93 @@ pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
         Some(raw) => parse_tproxy_mark(&raw)?,
         None => DEFAULT_TPROXY_MARK,
     };
+    let udp_host_netns_enabled = parse_bool_env(
+        resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED").as_deref(),
+        "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED",
+    )?;
+    if udp_host_netns_enabled && !udp_capture_enabled {
+        return Err("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires \
+             FERRUM_MESH_CAPTURE_UDP_ENABLED=true (the host-network capture path is a \
+             placement choice for UDP capture, not a separate feature switch)"
+            .to_string());
+    }
     Ok(UdpCaptureSettings {
         udp_capture_enabled,
         udp_outbound_port,
         tproxy_mark,
+        udp_host_netns_enabled,
     })
+}
+
+/// Validate a host-side interface name before it is interpolated into an
+/// `iptables -i <iface>` argument inside a `sh -c` script.
+///
+/// The name reaches this function from kernel/procfs discovery driven by a
+/// node-agent-published registry file, i.e. from OUTSIDE this process, so it is
+/// treated as hostile input at the boundary:
+///
+/// * Length is bounded by Linux `IFNAMSIZ` (15 usable characters). A longer name
+///   cannot name a real interface and would only widen the script.
+/// * The character set is restricted to `[A-Za-z0-9._-]`. This rejects every
+///   shell metacharacter (`;`, `&`, `|`, `$`, backticks, quotes, whitespace,
+///   newlines), so a crafted registry entry cannot inject a command into the
+///   generated script.
+/// * A leading `-` is rejected so a name can never be parsed as an `iptables`
+///   option, and `.` / `..` are rejected outright.
+/// * `+` is rejected even though the character is otherwise harmless: in an
+///   `iptables -i` argument a trailing `+` is a PREFIX WILDCARD (`veth+` matches
+///   every `veth*` interface). Accepting it would silently widen capture from one
+///   enrolled pod to every interface sharing a prefix — the exact wildcard
+///   overreach this path must not have.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn validate_host_capture_interface(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("host capture interface name must not be empty".to_string());
+    }
+    if name.len() > MAX_INTERFACE_NAME_LEN {
+        return Err(format!(
+            "host capture interface name is longer than the {MAX_INTERFACE_NAME_LEN}-character \
+             kernel limit"
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err("host capture interface name must not be '.' or '..'".to_string());
+    }
+    if name.starts_with('-') {
+        return Err("host capture interface name must not start with '-'".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(
+            "host capture interface name must contain only ASCII letters, digits, '.', '_', \
+             or '-' (a '+' suffix would be an iptables prefix wildcard)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Validate an entire host capture interface set, rejecting duplicates and an
+/// over-large set. Duplicates would emit duplicate rules that teardown reaps only
+/// once, so they are refused rather than deduplicated silently.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn validate_host_capture_interfaces(ifaces: &[String]) -> Result<(), String> {
+    if ifaces.len() > MAX_HOST_UDP_CAPTURE_INTERFACES {
+        return Err(format!(
+            "host UDP capture is scoped to {} interfaces, above the supported maximum of \
+             {MAX_HOST_UDP_CAPTURE_INTERFACES}",
+            ifaces.len()
+        ));
+    }
+    for (index, iface) in ifaces.iter().enumerate() {
+        validate_host_capture_interface(iface)?;
+        if ifaces[..index].iter().any(|earlier| earlier == iface) {
+            return Err("host UDP capture interface set contains a duplicate entry".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn parse_cidr_env(raw: &str) -> Vec<String> {
@@ -1039,6 +1201,168 @@ impl IptablesPlan {
         chunks.join("\n")
     }
 
+    /// Build the HOST-network UDP capture plan (issue #3288) for the enrolled
+    /// pods' host-side interfaces.
+    ///
+    /// `ifaces` is validated before a single command is rendered: the names are
+    /// interpolated into an `iptables -i <iface>` argument inside a `sh -c`
+    /// script, and they originate outside this process (kernel/procfs discovery
+    /// driven by the node-agent's registry). A rejected name fails the whole plan
+    /// rather than being skipped, so a hostile or corrupt entry can never yield a
+    /// partially-scoped ruleset that silently captures the wrong pods.
+    ///
+    /// Family gating mirrors [`Self::udp_only_for_config`]: IPv4 always, IPv6
+    /// only when `ip6tables` is enabled AND a v6 CIDR is configured.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_for_config(config: &CaptureConfig, ifaces: &[String]) -> Result<Self, String> {
+        if !config.udp_capture_enabled {
+            return Err(
+                "host-network UDP capture requires FERRUM_MESH_CAPTURE_UDP_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        validate_host_capture_interfaces(ifaces)?;
+        let v4_commands = host_udp_commands_for_family(config, CidrFamily::V4, ifaces);
+        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
+        let v6_has_cidrs = config
+            .include_cidrs
+            .iter()
+            .chain(config.exclude_cidrs.iter())
+            .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6));
+        let v6_commands = if v6_enabled && v6_has_cidrs {
+            host_udp_commands_for_family(config, CidrFamily::V6, ifaces)
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            v4_commands,
+            v6_commands,
+            ip6tables_mode: config.ip6tables_mode,
+        })
+    }
+
+    /// The `set -e` host UDP capture setup script. Fail-closed: any rule failure
+    /// aborts, so the caller treats a partial install as a failure, tears its
+    /// partial state down, and retries with the DROP guard still active.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_setup_script(
+        config: &CaptureConfig,
+        ifaces: &[String],
+    ) -> Result<String, String> {
+        let plan = Self::host_udp_for_config(config, ifaces)?;
+        if plan.v4_commands.is_empty() && plan.v6_commands.is_empty() {
+            return Err(
+                "host-network UDP capture emitted no rules for any address family; check \
+                 FERRUM_MESH_CAPTURE_INCLUDE_CIDRS / includeOutboundPorts"
+                    .to_string(),
+            );
+        }
+        Ok(format!(
+            "set -e\n{}",
+            udp_iptables_script(
+                &plan.v4_commands,
+                &plan.v6_commands,
+                plan.ip6tables_mode,
+                true
+            )
+        ))
+    }
+
+    /// The `set -e` fail-closed DROP guard installed BEFORE the host capture
+    /// path is (re)built or the transparent socket is bound. It mirrors the
+    /// configured capture scope exactly and uses alternating chains, so a
+    /// reconcile never flushes the currently active guard before its replacement
+    /// is live. Returns an empty string when there is nothing to guard (no
+    /// enrolled interfaces yet).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_guard_script(
+        config: &CaptureConfig,
+        ifaces: &[String],
+    ) -> Result<String, String> {
+        validate_host_capture_interfaces(ifaces)?;
+        let v4_commands =
+            host_udp_guard_commands_for_family("iptables", config, CidrFamily::V4, ifaces);
+        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
+        let v6_has_cidrs = config
+            .include_cidrs
+            .iter()
+            .chain(config.exclude_cidrs.iter())
+            .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6));
+        let v6_commands = if v6_enabled && v6_has_cidrs {
+            host_udp_guard_commands_for_family("ip6tables", config, CidrFamily::V6, ifaces)
+        } else {
+            Vec::new()
+        };
+        if v4_commands.is_empty() && v6_commands.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!(
+            "set -e\n{}",
+            udp_iptables_script(&v4_commands, &v6_commands, config.ip6tables_mode, true)
+        ))
+    }
+
+    /// Strictly remove the host fail-closed guard chains after the capture path
+    /// is live. Deletion failures abort (`set -e`) so the caller can never report
+    /// readiness while a DROP jump is still black-holing enrolled egress.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_guard_release_script() -> String {
+        let mut chunks = vec!["set -e".to_string()];
+        chunks.extend(host_udp_guard_teardown_for("iptables"));
+        // Probe stale IPv6 guards regardless of the current setting: a node can
+        // restart with IPv6 capture disabled after an earlier enabled generation
+        // retained a v6 guard. Only an unavailable binary/table is skipped;
+        // resource errors (notably an xtables-lock timeout) stay fatal.
+        let v6_release = host_udp_guard_teardown_for("ip6tables").join("\n");
+        chunks.push(ip6tables_strict_probe_guard(&v6_release, "mangle"));
+        chunks.join("\n")
+    }
+
+    /// Remove the host capture chain + routing while leaving any active
+    /// fail-closed guard intact. Used before rebuilding and on setup failure, so
+    /// a retry never reopens plaintext egress.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_capture_rules_teardown_script() -> String {
+        let v4 = host_udp_capture_teardown_for("iptables");
+        let mut chunks = Vec::new();
+        chunks.extend(v4.iptables);
+        chunks.extend(v4.ip_routing);
+        // Always probe for stale IPv6 state, even when IPv6 capture is disabled
+        // in the current generation. A prior enabled generation may have left a
+        // jump, chain, fwmark rule, or local route behind.
+        let v6 = host_udp_capture_teardown_for("ip6tables");
+        chunks.extend(
+            v6.iptables
+                .iter()
+                .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+        );
+        chunks.extend(v6.ip_routing);
+        chunks.join("\n")
+    }
+
+    /// Complete host UDP teardown (capture path + both guard generations),
+    /// used on shutdown, on disabling the path, and unconditionally before setup
+    /// so a prior crashed generation's state is reaped even when the current
+    /// configuration would emit nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_udp_teardown_script() -> String {
+        let v4 = host_udp_teardown_for("iptables");
+        let mut chunks: Vec<String> = Vec::new();
+        chunks.extend(v4.iptables);
+        chunks.extend(v4.ip_routing);
+        // Complete teardown is generation-independent: always probe IPv6 table
+        // state and always remove the raw IPv6 routing objects. This matters when
+        // a node restarts with IPv6 capture disabled after an enabled generation.
+        let v6 = host_udp_teardown_for("ip6tables");
+        chunks.extend(
+            v6.iptables
+                .iter()
+                .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+        );
+        chunks.extend(v6.ip_routing);
+        chunks.join("\n")
+    }
+
     #[cfg(test)]
     pub fn cleanup_script(
         include_v6: bool,
@@ -1390,22 +1714,48 @@ fn udp_fail_closed_commands_for_family(
         &include_cidrs,
         &exclude_cidrs,
     );
-    let jump_a = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_A}");
-    let jump_b = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_B}");
+    udp_guard_switch_commands(
+        binary,
+        "OUTPUT",
+        UDP_FAIL_CLOSED_CHAIN_A,
+        UDP_FAIL_CLOSED_CHAIN_B,
+        &build_a,
+        &build_b,
+    )
+}
+
+/// Render the A/B fail-closed guard switch for one `mangle` hook.
+///
+/// Shared by the pod-netns producer (hook `OUTPUT`) and the host-netns capture
+/// path (hook `PREROUTING`) so the two can never drift in the one place where a
+/// mistake is a fail-OPEN window: the replacement guard is fully populated and
+/// jumped BEFORE the previous generation's jump is released, so at no point is
+/// selected UDP egress unguarded.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn udp_guard_switch_commands(
+    binary: &str,
+    hook: &str,
+    chain_a: &str,
+    chain_b: &str,
+    build_a: &[String],
+    build_b: &[String],
+) -> Vec<String> {
+    let jump_a = format!("-p udp -j {chain_a}");
+    let jump_b = format!("-p udp -j {chain_b}");
     let a_active =
-        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump_a} 2>/dev/null");
-    let release_a = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
-    let release_b = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_B);
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump_a} 2>/dev/null");
+    let release_a = udp_strict_jump_release_for(binary, hook, chain_a);
+    let release_b = udp_strict_jump_release_for(binary, hook, chain_b);
     let replace_a = [
         release_b.clone(),
         build_b.join("\n"),
-        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_b}"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I {hook} 1 {jump_b}"),
         release_a,
     ]
     .join("\n");
     let replace_b_or_install = [
         build_a.join("\n"),
-        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_a}"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I {hook} 1 {jump_a}"),
         release_b,
     ]
     .join("\n");
@@ -1431,14 +1781,13 @@ fn udp_fail_closed_commands_for_family(
     // The existence check itself fails closed too: `-S` returns 1 only for an
     // absent chain; any other non-zero status (e.g. an xtables-lock timeout)
     // aborts rather than being misread as absence.
-    let a_exists = format!(
-        "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {UDP_FAIL_CLOSED_CHAIN_A} >/dev/null 2>&1"
-    );
+    let a_exists =
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain_a} >/dev/null 2>&1");
 
     vec![format!(
         "if {a_exists}; then\n\
          if {a_active}; then\n{replace_a}\nelse\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect active UDP fail-closed guard (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi\n\
-         else\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect UDP fail-closed guard chain {UDP_FAIL_CLOSED_CHAIN_A} (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
+         else\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect UDP fail-closed guard chain {chain_a} (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
     )]
 }
 
@@ -2241,9 +2590,20 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
 }
 
 fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
+    udp_strict_jump_release_for(binary, "OUTPUT", chain)
+}
+
+/// Strictly remove EVERY jump into `chain` from the built-in `hook` chain in the
+/// `mangle` table. Shared by the pod-netns guards (hook `OUTPUT`, where a pod's
+/// own egress is locally generated) and the host-netns guard + capture chains
+/// (hook `PREROUTING`, where an enrolled pod's egress is FORWARDED and never
+/// traverses `OUTPUT`). Only an absent chain (`-S` status 1) is tolerated; any
+/// other status is a genuine xtables error that aborts, so a caller can never
+/// report a completed release while a jump is still live.
+fn udp_strict_jump_release_for(binary: &str, hook: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
-        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
+        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D {hook} {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check {hook} jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
     )
 }
 
@@ -2258,6 +2618,360 @@ fn udp_teardown_for(binary: &str) -> CleanupCommands {
     // never prevent cleanup from detaching a socketless TPROXY path.
     let mut iptables = capture.iptables;
     iptables.extend(udp_fail_closed_teardown_for(binary));
+    CleanupCommands {
+        iptables,
+        ip_routing: capture.ip_routing,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Host-network UDP capture (issue #3288)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The pod-netns generator above splits inbound from outbound by DESTINATION
+// ADDRESS TYPE, which is only meaningful inside a pod's own namespace. The host
+// path uses a different, exact discriminator: the INGRESS INTERFACE.
+//
+// In the host network namespace an enrolled pod's traffic is visible in three
+// disjoint ways, and only one of them is workload-originated egress:
+//
+//  1. **Pod egress** enters the host namespace on THAT POD's host-side interface
+//     (the veth peer) and traverses `mangle PREROUTING` with
+//     `skb->dev == <pod interface>`. This is what the host path captures.
+//  2. **Traffic destined for a pod** arrives on the NODE UPLINK, traverses
+//     `PREROUTING` with `skb->dev == <uplink>`, and is then FORWARDED out the
+//     pod interface. It never matches an `-i <pod interface>` rule, so inbound
+//     UDP is untouched — no `--dst-type LOCAL` guesswork required.
+//  3. **The node's own traffic** (kubelet, CNI, the mesh proxy's relay egress,
+//     DNS, anything `hostNetwork`) is locally generated and traverses `OUTPUT`,
+//     never `PREROUTING`. The host path installs NO `mangle OUTPUT` chain at
+//     all, so host traffic is structurally incapable of being captured. This is
+//     the load-bearing difference from the pod-netns generator, which DOES
+//     install an OUTPUT MARK chain (correct there, because the only locally
+//     generated traffic in a pod netns is the workload's).
+//
+// Everything else follows the pod path: TPROXY in `mangle` delivers without
+// rewriting the destination, so the consuming listener recovers the original
+// destination from the `IP_RECVORIGDSTADDR` cmsg, and transparent local delivery
+// needs the fwmark `ip rule` + `local` route (installed BEFORE the jump, and
+// fatally requiring `ip`, so the half-state of TPROXY-without-routing can never
+// exist).
+
+/// Per-family host UDP capture rules. `ifaces` is the set of host-side
+/// interfaces owned by enrolled pods; every capture rule carries `-i <iface>`.
+///
+/// An EMPTY `ifaces` set is valid and meaningful: the chain, routing, and the
+/// stable `PREROUTING` jump are still installed, but the chain contains only
+/// exclusion RETURNs, so nothing is captured. That keeps reconciliation a pure
+/// flush-and-repopulate of one chain (the jump never moves), which is what makes
+/// pod add/remove atomic from the datapath's point of view.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_tproxy_commands_for_family(
+    binary: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+    include_cidrs: &[&str],
+    exclude_cidrs: &[&str],
+    ifaces: &[String],
+) -> Vec<String> {
+    let selectors = udp_outbound_selectors_for_family(config, family, include_cidrs);
+    if selectors.is_empty() {
+        // A pure cross-family CIDR skip: emit NO state for this family rather
+        // than an inert chain + routing, matching `udp_tproxy_commands_for_family`.
+        return Vec::new();
+    }
+
+    let mark = config.tproxy_mark;
+    let mark_arg = format!("0x{mark:x}/0x{TPROXY_MARK_MASK:x}");
+    let tproxy_jump = format!(
+        "-j TPROXY --on-port {} --tproxy-mark {mark_arg}",
+        config.udp_outbound_port
+    );
+
+    let mut commands = vec![
+        // FAIL CLOSED before any rule: transparent local delivery is useless
+        // without the `ip rule`/`ip route local` plumbing, so an image without
+        // iproute2 must install NOTHING rather than a silent black hole.
+        "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for UDP TPROXY transparent routing\" >&2; exit 1; }"
+            .to_string(),
+        idempotent_new_chain(binary, "mangle", UDP_HOST_CAPTURE_CHAIN),
+        // Flush before populating: the per-rule `-C ... || -A` guard is an EXACT
+        // match, so a changed port/mark/interface set would append a new rule
+        // BEHIND the stale one and the stale one would keep winning. Flushing is
+        // also what makes reconciliation of the enrolled-pod set correct — a
+        // removed pod's rule disappears instead of lingering.
+        flush_chain(binary, "mangle", UDP_HOST_CAPTURE_CHAIN),
+    ];
+
+    // Exclusions first (RETURN wins by rule order), mirroring the pod path.
+    // These are interface-independent: an excluded destination is excluded for
+    // every enrolled pod.
+    for cidr in exclude_cidrs {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            UDP_HOST_CAPTURE_CHAIN,
+            &format!("-p udp -d {cidr} -j RETURN"),
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            UDP_HOST_CAPTURE_CHAIN,
+            &format!("-p udp --dport {port} -j RETURN"),
+        ));
+    }
+    // NOTE: no `-m owner --uid-owner` self-exclusion. Owner-match is only valid
+    // for locally generated packets (an OUTPUT-context chain), and this chain is
+    // reached from PREROUTING. It is also unnecessary: the proxy's own relay
+    // egress is locally generated and therefore never traverses PREROUTING at
+    // all, and it does not arrive on an enrolled pod's interface.
+    for iface in ifaces {
+        for selector in &selectors {
+            commands.push(idempotent_append(
+                binary,
+                "mangle",
+                UDP_HOST_CAPTURE_CHAIN,
+                &format!("-i {iface} {selector} {tproxy_jump}"),
+            ));
+        }
+    }
+
+    // Transparent-routing plumbing on the HOST-owned table/priority, installed
+    // BEFORE the jump so a routing failure aborts the `set -e` script while the
+    // chain is still unreachable.
+    let (ip, local_route) = match family {
+        CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
+        CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
+    };
+    commands.push(ip_delete_best_effort(&format!(
+        "{ip} rule del priority {TPROXY_HOST_ROUTE_RULE_PRIORITY} lookup {TPROXY_HOST_ROUTE_TABLE}"
+    )));
+    commands.push(format!(
+        "{ip} rule add priority {TPROXY_HOST_ROUTE_RULE_PRIORITY} fwmark 0x{mark:x}/0x{TPROXY_MARK_MASK:x} lookup {TPROXY_HOST_ROUTE_TABLE}"
+    ));
+    commands.push(ip_delete_best_effort(&format!(
+        "{ip} route del {local_route} table {TPROXY_HOST_ROUTE_TABLE}"
+    )));
+    commands.push(format!(
+        "{ip} route add {local_route} table {TPROXY_HOST_ROUTE_TABLE}"
+    ));
+
+    // The single stable PREROUTING jump, LAST. It is deliberately NOT
+    // interface-scoped: keeping the jump constant across reconciles means the
+    // enrolled-pod set is changed by rebuilding the chain's CONTENTS, never by
+    // adding/removing built-in-chain rules, so a crash mid-reconcile can only
+    // leave a chain whose contents are a subset of the intended set — never an
+    // orphaned jump into a chain nobody reaps. Interface scoping lives on the
+    // TPROXY rules inside the chain; non-enrolled UDP falls through to RETURN.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        &format!("-p udp -j {UDP_HOST_CAPTURE_CHAIN}"),
+    ));
+
+    commands
+}
+
+/// Per-family host UDP fail-closed DROP guard chain contents. Mirrors the
+/// capture chain's exclusions and selectors EXACTLY (so the guard never drops
+/// traffic capture would have let through, and never lets through traffic
+/// capture would have taken) but terminates in `-j DROP`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_guard_chain_commands(
+    binary: &str,
+    chain: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+    include_cidrs: &[&str],
+    exclude_cidrs: &[&str],
+    ifaces: &[String],
+) -> Vec<String> {
+    let selectors = udp_outbound_selectors_for_family(config, family, include_cidrs);
+    if selectors.is_empty() || ifaces.is_empty() {
+        // Nothing this family/interface set would capture, so nothing to guard.
+        return Vec::new();
+    }
+    // Strict reset of the inactive generation: treating an xtables resource
+    // error as "already exists" could leave stale selectors in the replacement.
+    let mut commands = vec![format!(
+        "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -N {chain} 2>/dev/null || \
+         {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -F {chain}"
+    )];
+    for cidr in exclude_cidrs {
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp -d {cidr} -j RETURN"
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp --dport {port} -j RETURN"
+        ));
+    }
+    for iface in ifaces {
+        for selector in &selectors {
+            commands.push(format!(
+                "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+                 -i {iface} {selector} -j DROP"
+            ));
+        }
+    }
+    commands
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_guard_commands_for_family(
+    binary: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+    ifaces: &[String],
+) -> Vec<String> {
+    if !config.udp_capture_enabled {
+        return Vec::new();
+    }
+    let include_cidrs: Vec<&str> = config
+        .include_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let exclude_cidrs: Vec<&str> = config
+        .exclude_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let build_a = host_udp_guard_chain_commands(
+        binary,
+        UDP_HOST_GUARD_CHAIN_A,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+        ifaces,
+    );
+    if build_a.is_empty() {
+        return Vec::new();
+    }
+    let build_b = host_udp_guard_chain_commands(
+        binary,
+        UDP_HOST_GUARD_CHAIN_B,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+        ifaces,
+    );
+    udp_guard_switch_commands(
+        binary,
+        "PREROUTING",
+        UDP_HOST_GUARD_CHAIN_A,
+        UDP_HOST_GUARD_CHAIN_B,
+        &build_a,
+        &build_b,
+    )
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_commands_for_family(
+    config: &CaptureConfig,
+    family: CidrFamily,
+    ifaces: &[String],
+) -> Vec<String> {
+    let binary = match family {
+        CidrFamily::V4 => "iptables",
+        CidrFamily::V6 => "ip6tables",
+    };
+    let include_cidrs: Vec<&str> = config
+        .include_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let exclude_cidrs: Vec<&str> = config
+        .exclude_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    host_udp_tproxy_commands_for_family(
+        binary,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+        ifaces,
+    )
+}
+
+/// The EXACT Ferrum-owned host UDP capture teardown for one family: the stable
+/// `PREROUTING` jump, the capture chain, and the host-owned fwmark rule + local
+/// route. Every target is addressed by an exact Ferrum-owned name/priority, so
+/// this is safe to run unconditionally before setup to reap a prior generation's
+/// state, and it can never touch the pod-netns objects (different chain names,
+/// different table, different rule priority) or a co-resident CNI's routing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_capture_teardown_for(binary: &str) -> CleanupCommands {
+    let family = if binary == "ip6tables" {
+        CidrFamily::V6
+    } else {
+        CidrFamily::V4
+    };
+    let iptables = vec![
+        idempotent_delete(
+            binary,
+            "mangle",
+            "PREROUTING",
+            &format!("-p udp -j {UDP_HOST_CAPTURE_CHAIN}"),
+        ),
+        flush_chain(binary, "mangle", UDP_HOST_CAPTURE_CHAIN),
+        delete_chain(binary, "mangle", UDP_HOST_CAPTURE_CHAIN),
+    ];
+    let (ip, local_route) = match family {
+        CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
+        CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
+    };
+    let ip_routing = vec![
+        ip_delete_best_effort(&format!(
+            "{ip} rule del priority {TPROXY_HOST_ROUTE_RULE_PRIORITY} lookup {TPROXY_HOST_ROUTE_TABLE}"
+        )),
+        ip_delete_best_effort(&format!(
+            "{ip} route del {local_route} table {TPROXY_HOST_ROUTE_TABLE}"
+        )),
+    ];
+    CleanupCommands {
+        iptables,
+        ip_routing,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_guard_teardown_for(binary: &str) -> Vec<String> {
+    [UDP_HOST_GUARD_CHAIN_A, UDP_HOST_GUARD_CHAIN_B]
+        .into_iter()
+        .flat_map(|chain| {
+            [
+                udp_strict_jump_release_for(binary, "PREROUTING", chain),
+                flush_chain(binary, "mangle", chain),
+                delete_chain(binary, "mangle", chain),
+            ]
+        })
+        .collect()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_udp_teardown_for(binary: &str) -> CleanupCommands {
+    let capture = host_udp_capture_teardown_for(binary);
+    // Detach the capture path first while any retained DROP guard still protects
+    // enrolled egress; strict guard removal comes last so a transient xtables
+    // error can leave the node fail-CLOSED but can never leave a socketless
+    // TPROXY jump behind an already-released guard.
+    let mut iptables = capture.iptables;
+    iptables.extend(host_udp_guard_teardown_for(binary));
     CleanupCommands {
         iptables,
         ip_routing: capture.ip_routing,
