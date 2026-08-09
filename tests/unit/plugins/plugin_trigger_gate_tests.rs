@@ -409,7 +409,11 @@ async fn unrepresentable_query_components_preserve_safe_scan_and_presence_semant
 async fn a_non_utf8_header_value_remains_present_but_matches_no_text() {
     let plugins = published(
         &config(
-            vec![make_proxy("api", "/api", vec!["present", "value", "absent"])],
+            vec![make_proxy(
+                "api",
+                "/api",
+                vec!["present", "value", "absent"],
+            )],
             vec![
                 with_trigger(
                     header_stamper("present", PluginScope::Proxy, Some("api"), "x-present"),
@@ -449,7 +453,11 @@ async fn a_non_utf8_header_value_remains_present_but_matches_no_text() {
 async fn a_cookie_with_a_non_utf8_value_remains_present_but_matches_no_text() {
     let plugins = published(
         &config(
-            vec![make_proxy("api", "/api", vec!["present", "value", "absent"])],
+            vec![make_proxy(
+                "api",
+                "/api",
+                vec!["present", "value", "absent"],
+            )],
             vec![
                 with_trigger(
                     header_stamper("present", PluginScope::Proxy, Some("api"), "x-present"),
