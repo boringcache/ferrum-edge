@@ -12094,13 +12094,12 @@ async fn arm_mesh_runtime_startup(
             let host_ready_dir =
                 std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
                     .join(".udp-ready");
-            let recovery =
-                crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
-                    Some(host_ready_dir),
-                    std::time::Duration::from_secs(2),
-                    shutdown_tx.subscribe(),
-                )
-                .await;
+            let recovery = crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
+                Some(host_ready_dir),
+                std::time::Duration::from_secs(2),
+                shutdown_tx.subscribe(),
+            )
+            .await;
             host_udp_retraction_ready = recovery.retraction_ready;
             if let Some(handle) = recovery.retry_task {
                 owner.push_mesh_background(handle);
@@ -12238,8 +12237,7 @@ async fn arm_mesh_runtime_startup(
                     let retraction_ready = host_udp_retraction_ready.take();
                     owner.push_mesh_background(tokio::spawn(async move {
                         let mut manager_shutdown = manager_shutdown;
-                        if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown)
-                            .await
+                        if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await
                         {
                             return;
                         }
