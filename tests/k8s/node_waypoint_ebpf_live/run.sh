@@ -2325,7 +2325,7 @@ expect_allowed() {
   local url="$3"
   local expected_body="$4"
   local family="${5:-}"
-  local retry_http_response="${6:-false}"
+  local retry_route_not_found="${6:-false}"
   local max_attempts="${7:-8}"
   local output="" code="" body="" status=1 err
   err="$(mktemp)"
@@ -2347,14 +2347,20 @@ expect_allowed() {
       fi
       break
     fi
-    if [[ "$status" -eq 0 && "$retry_http_response" != "true" ]]; then
+    if [[ "$status" -eq 0 ]]; then
+      if [[ "$retry_route_not_found" == "true" ]] &&
+        [[ "$code" == "404" ]] &&
+        [[ "$body" == '{"error":"Not Found"}' ]]; then
+        sleep 1
+        continue
+      fi
       break
     fi
     # A rolling NodeWaypoint restart becomes Kubernetes-Ready before the CP's
     # updated waypoint inventory has necessarily rematerialized every outbound
-    # route. Only callers that opt into this bounded convergence mode retry an
-    # HTTP response; ordinary authorization assertions still fail immediately
-    # on a 4xx/5xx so policy regressions cannot be hidden.
+    # route. Only callers that opt into this bounded convergence mode retry the
+    # exact route-missing response above; authorization failures and other HTTP
+    # errors still fail immediately so policy regressions cannot be hidden.
     sleep 1
   done
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
