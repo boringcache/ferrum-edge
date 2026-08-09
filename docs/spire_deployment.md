@@ -434,18 +434,16 @@ be changed to. Minting for a delegated subject requires SPIRE's delegated
 identity / admin API: an explicitly authorized integration outside the Workload
 API surface Ferrum consumes.
 
-**Consumption is a different capability, and it still works.** Under `spire`
-Ferrum consumes the agent's X.509 trust bundles and its own `FetchJWTBundles`
-stream, converts each JWKS document into the SPKI-PEM form its identity
-subsystem speaks, and admits it through the same bounds a locally published
-bundle goes through (authority count, trust-domain binding, duplicate `kid`,
-key type/size, declared-`alg` compatibility, total JWKS size). That stream is
-independent of the X.509 SVID readiness gate, and an agent that answers
-`UNIMPLEMENTED` — a SPIRE deployment with no JWT-SVID registration entries — is
-retried on the ordinary reconnect schedule rather than failing startup. A
-malformed bundle is never installed; the last good snapshot is retained. This
-material backs peer verification and Ferrum's own JWT-SVID validation; it does
-**not** amount to issuance, and none of it makes a Workload API servable here.
+**X.509 consumption is a different capability, and it still works.** Under
+`spire` the active mesh runtime consumes the agent's X.509 SVID and trust
+bundles through its dedicated fetch loop, retains the last good identity across
+reconnects, and publishes rotations to the live TLS slots. The reusable
+`SpireAgentCa` / `WorkloadApiClient` adapter can decode a bounded
+`FetchJWTBundles` stream when explicitly constructed, but mesh startup does not
+construct that adapter or start its JWT stream today. This change therefore
+makes no production claim that SPIRE JWT authorities back Ferrum validation.
+The active X.509 consumption does **not** amount to issuance, and none of it
+makes a Workload API servable here.
 
 Workloads that need SVID **mint** under a SPIRE deployment should call their
 local SPIRE agent's Workload API directly (that is the socket SPIRE authorizes

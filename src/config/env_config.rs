@@ -5340,9 +5340,20 @@ impl EnvConfig {
                 // File-based SVID material is the explicit identity override.
                 // Blank paths were normalized to `None` at parse, so a presence
                 // check is exact.
+                let any_file_workload_identity = self.gateway_svid_cert_path.is_some()
+                    || self.gateway_svid_key_path.is_some()
+                    || self.gateway_svid_trust_bundle_path.is_some();
                 let has_file_workload_identity = self.gateway_svid_cert_path.is_some()
                     && self.gateway_svid_key_path.is_some()
                     && self.gateway_svid_trust_bundle_path.is_some();
+                // File SVIDs deliberately override the CA-backed runtime
+                // identity source, and therefore leave no issuer for this
+                // server. Refuse the combination before validating the
+                // otherwise-suppressed backend so partial and complete file
+                // tuples receive the same decisive diagnostic.
+                if self.mesh_workload_api_enabled && any_file_workload_identity {
+                    return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
+                }
                 if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
@@ -5398,12 +5409,6 @@ impl EnvConfig {
                         }
                     }
                 }
-                // JWT-SVID signing material and the Workload API socket
-                // contract are validated here so `validate` and mesh startup
-                // agree: an operator must not get a clean `validate` for a
-                // Workload API surface that cannot bind, or for a JWT authority
-                // whose keys vanish on restart.
-                self.validate_mesh_jwt_svid_settings(&mesh_ca_backend)?;
                 if self.mesh_workload_api_enabled {
                     // The backend gate runs FIRST. A backend that cannot serve
                     // this surface at all is the decisive diagnostic; reporting
@@ -5429,6 +5434,14 @@ impl EnvConfig {
                         }
                         crate::identity::ca::CaBackend::Internal => {}
                     }
+                }
+                // JWT-SVID signing material and the Workload API socket
+                // contract are validated here so `validate` and mesh startup
+                // agree: an operator must not get a clean `validate` for a
+                // Workload API surface that cannot bind, or for a JWT authority
+                // whose keys vanish on restart.
+                self.validate_mesh_jwt_svid_settings(&mesh_ca_backend)?;
+                if self.mesh_workload_api_enabled {
                     let socket =
                         crate::identity::workload_api::WorkloadApiSocketConfig::from_parts(
                             self.mesh_workload_api_socket_path.as_str(),
@@ -6123,6 +6136,15 @@ impl EnvConfig {
     const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
          API has an authority to mint SVIDs from";
 
+    /// Enabling the Workload API while explicit file identity suppresses the
+    /// automatic CA-backed issuer at mesh startup.
+    const WORKLOAD_API_FILE_SVID_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true cannot be combined with \
+         FERRUM_GATEWAY_SVID_CERT_PATH, FERRUM_GATEWAY_SVID_KEY_PATH, or \
+         FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH. File-based gateway SVID material overrides \
+         automatic CA-backed issuance, so Ferrum would have no certificate authority to issue \
+         SVIDs for attested downstream workloads. Remove the FERRUM_GATEWAY_SVID_* override and \
+         use FERRUM_MESH_CA_BACKEND=internal, or disable Ferrum's Workload API";
+
     /// Enabling the Workload API surface on the SPIRE backend, which can only
     /// ever issue Ferrum's own identity (issue #3617).
     const WORKLOAD_API_SPIRE_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
@@ -6131,7 +6153,7 @@ impl EnvConfig {
          workload through it — serving the surface would either fail every request or substitute \
          Ferrum's own SPIFFE ID. Point workloads at their local SPIRE agent socket \
          (FERRUM_MESH_SPIRE_AGENT_SOCKET) instead, or use FERRUM_MESH_CA_BACKEND=internal with \
-         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes SPIRE's X.509 and JWT trust \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes SPIRE's X.509 SVID and trust \
          bundles for peer verification under FERRUM_MESH_CA_BACKEND=spire; only serving a \
          Workload API is refused";
 

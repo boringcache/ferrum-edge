@@ -24,15 +24,19 @@
 //!
 //! ## JWT trust material (issue #3617)
 //!
-//! A second background task consumes the agent's own `FetchJWTBundles` stream
-//! and converts each JWKS document back into the SPKI-PEM form the identity
-//! subsystem speaks, so `FetchJWTBundles` and `ValidateJWTSVID` are available on
-//! this backend. It is independent of the X.509 readiness gate: a SPIRE
-//! deployment with no JWT-SVID registration entries answers `UNIMPLEMENTED`, and
-//! that is retried on the ordinary reconnect schedule rather than failing
-//! startup. A malformed bundle is never installed — the last good snapshot is
-//! retained — so hostile or corrupt material can neither widen nor blank the
-//! trusted set.
+//! When this adapter is constructed directly, a second background task consumes
+//! the agent's own `FetchJWTBundles` stream and converts each JWKS document back
+//! into the SPKI-PEM form the identity subsystem speaks. It is independent of
+//! the X.509 readiness gate: a SPIRE deployment with no JWT-SVID registration
+//! entries answers `UNIMPLEMENTED`, and that is retried on the ordinary
+//! reconnect schedule rather than failing construction. A malformed bundle is
+//! never installed — the last good snapshot is retained — so hostile or corrupt
+//! material can neither widen nor blank the trusted set.
+//!
+//! The active mesh `FERRUM_MESH_CA_BACKEND=spire` path uses the dedicated X.509
+//! fetch loop and does **not** construct this adapter or start its JWT stream.
+//! Consequently this helper must not be described as live mesh SPIRE JWT-bundle
+//! consumption until that runtime wiring exists.
 //!
 //! JWT-SVID **mint** stays fail-closed here; see [`SpireAgentCa::jwt_authorities`]
 //! for why that is a terminal capability boundary rather than a deferral.
@@ -453,11 +457,13 @@ impl CertificateAuthority for SpireAgentCa {
     /// Publish the JWT authorities the SPIRE agent's own `FetchJWTBundles`
     /// stream has delivered for `td` (issue #3617).
     ///
-    /// This makes `FetchJWTBundles` and `ValidateJWTSVID` fully available under
-    /// `FERRUM_MESH_CA_BACKEND=spire`: Ferrum consumes the agent's JWKS
-    /// documents, converts them to the SPKI-PEM form the identity subsystem
-    /// speaks, and holds them to exactly the bounds a locally published bundle
-    /// is held to. Nothing here carries a private key.
+    /// For a caller that explicitly constructs this adapter, Ferrum consumes
+    /// the agent's JWKS documents, converts them to the SPKI-PEM form the
+    /// identity subsystem speaks, and holds them to exactly the bounds a locally
+    /// published bundle is held to. Nothing here carries a private key. Mesh
+    /// startup currently uses its dedicated X.509 fetch loop instead and does
+    /// not construct `SpireAgentCa`, so this is helper capability rather than a
+    /// claim about live `FERRUM_MESH_CA_BACKEND=spire` runtime wiring.
     ///
     /// A trust domain the agent has published no JWT authorities for returns an
     /// empty vector, which the Workload API reports as `UNIMPLEMENTED` — never

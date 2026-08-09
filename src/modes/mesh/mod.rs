@@ -12704,7 +12704,8 @@ async fn start_spire_agent_mesh_svid_source(
     // cannot back a Workload API surface — and `EnvConfig::validate` refuses
     // that combination outright. Opening a second pair of agent streams for a
     // capability nothing can use would be pure waste. Ferrum still CONSUMES
-    // SPIRE's trust material for peer verification through the fetch loop above.
+    // SPIRE's X.509 SVID and trust bundles for peer verification through the
+    // fetch loop above.
     Ok(inbound_slot)
 }
 

@@ -118,7 +118,14 @@ async fn rotation_main(config: RotationConfig) {
         // X.509 SVID's validity window. Driving it from this tick keeps key
         // generation off every request path; the authority itself decides
         // whether anything is due.
-        rotate_jwt_authority_if_due(&config.ca).await;
+        if let Some(generation) = rotate_jwt_authority_if_due(&config.ca).await {
+            let revision = bump_revision(&config.revision_tx);
+            debug!(
+                generation,
+                svid_revision = revision,
+                "JWT-SVID signing key rotated by rotation task"
+            );
+        }
 
         let snapshot = config.current.load_full();
         let needs_rotation = match snapshot.as_ref() {
@@ -156,17 +163,15 @@ async fn rotation_main(config: RotationConfig) {
 /// is warned and retried on the next tick: the previous key stays active and
 /// every already-minted token remains verifiable, so failing here degrades
 /// nothing.
-async fn rotate_jwt_authority_if_due(ca: &SharedCa) {
+async fn rotate_jwt_authority_if_due(ca: &SharedCa) -> Option<u64> {
     let Some(signer) = ca.jwt_signer() else {
-        return;
+        return None;
     };
     match signer.rotate_if_due().await {
-        Ok(Some(generation)) => {
-            debug!(generation, "JWT-SVID signing key rotated by rotation task");
-        }
-        Ok(None) => {}
+        Ok(generation) => generation,
         Err(e) => {
             warn!(error = %e, "JWT-SVID signing key rotation failed; keeping the current key");
+            None
         }
     }
 }

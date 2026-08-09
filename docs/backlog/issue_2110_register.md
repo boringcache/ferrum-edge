@@ -40,6 +40,7 @@ Current mesh HBONE/DNS perf status lives in
 | Native SMTP/email notification channel | Implemented — [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) (`src/notifications/channels/email.rs`) |
 | MongoDB replica-set change-stream wakeups | Implemented — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs` + `mongo_store.rs`) |
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
+| SPIFFE Workload API JWT-SVID mint/validate/bundles | Implemented by [#3675](https://github.com/ferrum-edge/ferrum-edge/pull/3675), resolving [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); empty bundle success removed and the SPIRE serving boundary documented |
 
 ## Live dedicated trackers (current backlog)
 
@@ -52,7 +53,6 @@ Current mesh HBONE/DNS perf status lives in
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
-| SPIFFE Workload API delegated issuance (SPIRE backend) | [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) | Implemented for `FERRUM_MESH_CA_BACKEND=internal` (mint / bundles / validate, ES256, externally-rotated configured signing material) behind `FERRUM_MESH_WORKLOAD_API_ENABLED`. Serving the surface on `spire` is **refused at startup** — a terminal boundary needing SPIRE's delegated-identity/admin API, since that agent issues only the calling process's own identity and proxying its mint RPC would substitute Ferrum's own SPIFFE ID. Ferrum still consumes SPIRE X.509/JWT trust material for peer verification. Empty JWT bundle streams remain non-conformant |
 | Mesh/SPIRE CA-health signal + startup contract | [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) | |
 | CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
@@ -81,7 +81,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Item | Notes |
 |---|---|
-| SPIFFE Workload API JWT-SVID mint/validate | X.509-SVID path complete; JWT-SVID live tracker [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) |
 | Admin CRUD refactor (retired `REFACTORING_PLAN.md` remainder) | Discretionary; fold into future admin-surface work |
 
 ## Explicit non-goals (unchanged)

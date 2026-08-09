@@ -243,10 +243,12 @@ impl WorkloadApiClient {
     /// Open the streaming `FetchJWTBundles` RPC and decode each response into
     /// per-trust-domain JWT authorities.
     ///
-    /// This is how a SPIRE-backed deployment obtains JWT trust material: the
-    /// agent publishes a JWKS document per trust domain, and Ferrum converts it
-    /// back into the SPKI-PEM form the rest of the identity subsystem speaks
-    /// (issue #3617). It carries no private key and mints nothing.
+    /// This helper lets an explicitly wired SPIRE client obtain JWT trust
+    /// material: the agent publishes a JWKS document per trust domain, and
+    /// Ferrum converts it back into the SPKI-PEM form the rest of the identity
+    /// subsystem speaks (issue #3617). It carries no private key and mints
+    /// nothing. The active mesh SPIRE identity path currently starts only the
+    /// X.509 fetch loop; it does not call this helper.
     pub async fn fetch_jwt_bundles_stream(
         &mut self,
     ) -> Result<
