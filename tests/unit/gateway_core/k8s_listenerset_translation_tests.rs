@@ -926,7 +926,16 @@ fn listenerset_update_and_delete_withdraw_materialization() {
     // Tighten allowedListeners to None and retranslate — ListenerSet withdraws.
     let mut tightened = base.clone();
     tightened[1] = http_gateway("edge", None);
-    let second = translate_k8s_objects(&tightened, options()).expect("second translate");
+    let (second, second_skipped) =
+        translate_k8s_objects_collecting_skips(&tightened, options()).expect("second translate");
+    assert!(
+        second_skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("via-listenerset")
+                && error.contains("not permitted by the target ListenerSet listener")
+        }),
+        "the route to the withdrawn ListenerSet must be skipped: {second_skipped:?}"
+    );
     assert!(
         second
             .listenerset_statuses
@@ -947,7 +956,16 @@ fn listenerset_update_and_delete_withdraw_materialization() {
         .into_iter()
         .filter(|object| object.kind != "ListenerSet")
         .collect();
-    let third = translate_k8s_objects(&deleted, options()).expect("third translate");
+    let (third, third_skipped) =
+        translate_k8s_objects_collecting_skips(&deleted, options()).expect("third translate");
+    assert!(
+        third_skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("via-listenerset")
+                && error.contains("not permitted by the target ListenerSet listener")
+        }),
+        "the route to the deleted ListenerSet must be skipped: {third_skipped:?}"
+    );
     assert!(third.listenerset_statuses.is_empty());
     assert!(
         !third
