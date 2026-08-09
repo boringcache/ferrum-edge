@@ -1431,7 +1431,13 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
         .expect("status");
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "ListenersNotValid");
-    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| mesh.services.is_empty()));
+    assert!(
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .is_none_or(|mesh| mesh.services.is_empty())
+    );
     assert!(
         translation
             .warnings
@@ -1497,7 +1503,13 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "Invalid");
     assert!(status.accepted_message.contains("at most 64"));
-    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| mesh.services.is_empty()));
+    assert!(
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .is_none_or(|mesh| mesh.services.is_empty())
+    );
 
     let malformed = vec![
         gateway_class(),
@@ -1542,7 +1554,10 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
         .iter()
         .find(|status| status.resource.name == "malformed")
         .expect("status");
-    assert!(status.accepted, "partially valid ListenerSets may remain accepted");
+    assert!(
+        status.accepted,
+        "partially valid ListenerSets may remain accepted"
+    );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
