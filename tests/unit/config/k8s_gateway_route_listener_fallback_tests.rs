@@ -311,7 +311,7 @@ fn a_route_without_parent_refs_materializes_a_listener_less_claim() {
 #[test]
 fn httproute_with_unknown_gateway_parent_materializes_no_traffic() {
     let route = http_route("sample", Some(json!([{"name": "not-in-this-snapshot"}])));
-    assert_no_http_family_traffic(&[route.clone()], "HTTPRoute", "sample");
+    assert_no_http_family_traffic(std::slice::from_ref(&route), "HTTPRoute", "sample");
     assert_no_ferrum_route_status(&[route]);
 }
 
@@ -319,7 +319,7 @@ fn httproute_with_unknown_gateway_parent_materializes_no_traffic() {
 #[test]
 fn grpcroute_with_unknown_gateway_parent_materializes_no_traffic() {
     let route = grpc_route("sample", Some(json!([{"name": "not-in-this-snapshot"}])));
-    assert_no_http_family_traffic(&[route.clone()], "GRPCRoute", "sample");
+    assert_no_http_family_traffic(std::slice::from_ref(&route), "GRPCRoute", "sample");
     assert_no_ferrum_route_status(&[route]);
 }
 
