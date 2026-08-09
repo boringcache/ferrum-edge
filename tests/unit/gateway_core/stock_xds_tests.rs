@@ -1488,6 +1488,49 @@ fn stock_api_listener_and_scoped_routes_are_extension_escapes() {
     );
 }
 
+#[test]
+fn stock_filter_chain_constraints_and_transport_socket_are_refused() {
+    let constrained_matches = [
+        sp::FilterChainMatch {
+            destination_port: Some(sp::UInt32Value { value: 443 }),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            transport_protocol: "tls".to_string(),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            application_protocols: vec![b"h2".to_vec()],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            server_names: vec![b"admin.example.test".to_vec()],
+            ..Default::default()
+        },
+    ];
+    for filter_chain_match in constrained_matches {
+        let mut listener = hcm_listener(
+            "0.0.0.0_9080",
+            "0.0.0.0",
+            9080,
+            "9080",
+            &["envoy.filters.http.router"],
+        );
+        listener.filter_chains[0].filter_chain_match = Some(filter_chain_match);
+        assert_eq!(
+            refusal_reasons(&lds_with(listener)),
+            vec![refusal::LISTENER_EXTENSION_ESCAPE]
+        );
+    }
+
+    let mut listener = tcp_listener("0.0.0.0_9080", "0.0.0.0", 9080, REVIEWS_CLUSTER);
+    listener.filter_chains[0].transport_socket = Some(sp::TransportSocket::default());
+    assert_eq!(
+        refusal_reasons(&lds_with(listener)),
+        vec![refusal::UNSUPPORTED_TRANSPORT_SOCKET]
+    );
+}
+
 // ── route refusals ───────────────────────────────────────────────────────
 
 fn rds_with(config: sp::RouteConfiguration) -> StockXdsAccumulator {
@@ -1534,6 +1577,37 @@ fn stock_regex_route_match_refuses_the_virtual_host() {
         accumulator.route_configs()["9080"].virtual_hosts.is_empty(),
         "a refused virtual host contributes no host alias"
     );
+}
+
+#[test]
+fn stock_path_limited_route_matches_refuse_the_virtual_host() {
+    let constrained_matches = [
+        sp::RouteMatch {
+            prefix: "/admin-only".to_string(),
+            ..Default::default()
+        },
+        sp::RouteMatch {
+            path: "/admin-only".to_string(),
+            ..Default::default()
+        },
+        sp::RouteMatch {
+            path_separated_prefix: "/admin".to_string(),
+            ..Default::default()
+        },
+    ];
+    for route_match in constrained_matches {
+        let mut config = route_config("9080", &["10.96.0.5"], REVIEWS_CLUSTER);
+        config.virtual_hosts[0].routes[0].r#match = Some(route_match);
+        let accumulator = rds_with(config);
+        assert_eq!(
+            refusal_reasons(&accumulator),
+            vec![refusal::UNSUPPORTED_ROUTE_MATCH]
+        );
+        assert!(
+            accumulator.route_configs()["9080"].virtual_hosts.is_empty(),
+            "a path-constrained virtual host must not contribute a VIP"
+        );
+    }
 }
 
 #[test]
