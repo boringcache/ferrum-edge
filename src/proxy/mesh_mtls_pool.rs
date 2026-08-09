@@ -1646,13 +1646,17 @@ fn datagram_tunnel_baggage(
     gateway_svid: &SharedSvidBundle,
     source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
 ) -> Result<String, HbonePoolError> {
+    // Re-read the bundle after `current_svid_fingerprint_cached`: rotation can
+    // clear the slot between those loads. Ambient source evidence selects the
+    // baggage principal, but it must never replace the gateway SVID required
+    // to authenticate the tunnel itself.
+    let snapshot = gateway_svid.load_full();
+    let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
     if let Some(source) = source_identity {
         return Ok(crate::modes::mesh::hbone::baggage_header_for_udp_source(
             source,
         ));
     }
-    let snapshot = gateway_svid.load_full();
-    let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
     Ok(crate::modes::mesh::hbone::baggage_header_for_source(
         &bundle.spiffe_id,
     ))
@@ -2003,13 +2007,22 @@ mod tests {
     }
 
     #[test]
-    fn datagram_tunnel_baggage_fails_closed_without_svid_when_unasserted() {
+    fn datagram_tunnel_baggage_fails_closed_without_svid() {
         let gateway = Arc::new(ArcSwap::new(Arc::new(None)));
-        match datagram_tunnel_baggage(&gateway, None) {
-            Err(HbonePoolError::NoSvid) => {}
-            Err(other) => panic!("expected NoSvid, got {other:?}"),
-            Ok(_) => panic!("missing gateway SVID must fail closed for unasserted baggage"),
-        }
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+
+        assert!(matches!(
+            datagram_tunnel_baggage(&gateway, None),
+            Err(HbonePoolError::NoSvid)
+        ));
+        assert!(matches!(
+            datagram_tunnel_baggage(&gateway, Some(&asserted)),
+            Err(HbonePoolError::NoSvid)
+        ));
     }
 
     #[test]
