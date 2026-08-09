@@ -2515,6 +2515,17 @@ pub(crate) async fn validate_stream_port_candidate(
             && proxy.listen_port == Some(port)
     });
     candidate.proxies.push(resource.clone());
+    // `Proxy.resolved_tls` is a `#[serde(skip)]` derived projection, not a wire
+    // field. The namespace snapshot arrives with it resolved, but the incoming
+    // admin resource has only run `Proxy::normalize_fields()`, which cannot
+    // resolve it (that needs the namespace's upstream set). Leaving the bucket
+    // half-projected makes `validate_stream_proxies`'s shared-`tcps`
+    // backend-TLS agreement check compare a resolved peer against a defaulted
+    // candidate — `verify_server_cert` alone flips `true` → `false` — and reject
+    // an identical, valid L4 `stream_match` group. Re-derive over the assembled
+    // bucket (the snapshot's upstreams are untouched by the retain above) so the
+    // comparison is like-for-like.
+    candidate.resolve_upstream_tls();
     candidate
         .validate_stream_proxies()
         .map_err(AfterValidateError::Conflict)?;
