@@ -3124,9 +3124,7 @@ mod live_netns_tests {
         // namespace. Reading the runner's own `/sys/class/net` here would always
         // inspect the original network namespace, even after a thread-level
         // `setns`, and would make the live validator fail for the wrong reason.
-        let child_sysfs = std::path::PathBuf::from(format!(
-            "/proc/{pid}/root/sys/class/net"
-        ));
+        let child_sysfs = std::path::PathBuf::from(format!("/proc/{pid}/root/sys/class/net"));
         let expected_ifindex =
             super::super::host_udp_capture::dedicated_host_ifindex(&child_sysfs, "vethhost")
                 .unwrap_or_else(|error| panic!("validate live host-side veth: {error}"));
