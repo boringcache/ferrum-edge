@@ -907,7 +907,7 @@ async fn a_false_stream_trigger_suppresses_connect_and_disconnect_together() {
                 "host": "127.0.0.1",
                 "port": sink_port,
                 "batch_size": 1,
-                "flush_interval_ms": 20,
+                "flush_interval_ms": 100,
                 "max_retries": 0
             }),
             PluginScope::Proxy,
@@ -1001,7 +1001,7 @@ async fn a_disconnect_without_a_recorded_decision_fails_closed_to_running() {
                 "host": "127.0.0.1",
                 "port": sink_port,
                 "batch_size": 1,
-                "flush_interval_ms": 20,
+                "flush_interval_ms": 100,
                 "max_retries": 0
             }),
             PluginScope::Proxy,
@@ -1226,7 +1226,7 @@ async fn an_identity_predicate_never_gates_a_stream_connection() {
                     "host": "127.0.0.1",
                     "port": sink_port,
                     "batch_size": 1,
-                    "flush_interval_ms": 20,
+                    "flush_interval_ms": 100,
                     "max_retries": 0
                 }),
                 PluginScope::Proxy,
