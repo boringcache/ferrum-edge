@@ -99,6 +99,7 @@ fn plugin_config(
     plugin_name: &str,
     config: serde_json::Value,
     priority_override: Option<u16>,
+    trigger: None,
 ) -> PluginConfig {
     PluginConfig {
         id: id.to_string(),

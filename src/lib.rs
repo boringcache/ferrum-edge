@@ -6162,6 +6162,17 @@ pub mod _test_support {
         ctx.set_request_http_flavor(flavor);
     }
 
+    /// Stamp the authoritative client-visible wire transport a frontend would
+    /// record, so trigger `protocol:` predicates can be exercised without
+    /// standing up an H1/H2/H3 listener.
+    pub fn set_request_wire_protocol_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        transport: crate::config::types::HttpWireTransport,
+        is_grpc_web: bool,
+    ) {
+        ctx.set_request_wire_protocol(transport, is_grpc_web);
+    }
+
     pub async fn wait_for_tcp_peer_reset_for_test(stream: &tokio::net::TcpStream) {
         crate::proxy::tcp_proxy::wait_for_tcp_peer_reset(stream).await;
     }

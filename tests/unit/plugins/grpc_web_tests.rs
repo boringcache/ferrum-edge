@@ -165,6 +165,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,

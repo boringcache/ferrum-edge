@@ -126,6 +126,7 @@ fn audit_plugin_config(config: Value) -> PluginConfig {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
     }
 }

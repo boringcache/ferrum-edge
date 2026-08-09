@@ -43,9 +43,10 @@ use crate::plugins::{
 };
 
 // ---------------------------------------------------------------------------
-// PriorityOverridePlugin — wraps any plugin with a user-specified priority
+// PluginInstanceWrapper — per-instance priority override + execution trigger
 // ---------------------------------------------------------------------------
 
+use crate::plugins::trigger::{PluginTriggerGate, TriggerPhase};
 use crate::plugins::{
     PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
@@ -53,11 +54,70 @@ use crate::plugins::{
 };
 use async_trait::async_trait;
 
-/// Thin wrapper that overrides a plugin's built-in priority with a
-/// user-configured value from `PluginConfig.priority_override`.
-struct PriorityOverridePlugin {
+/// Thin wrapper carrying the two generic per-instance `PluginConfig` controls
+/// that are not part of a plugin's own configuration: `priority_override` and
+/// the declarative execution `trigger`.
+///
+/// # Why one wrapper
+///
+/// This is the single central eligibility point for triggers, so built-in and
+/// custom plugins get identical semantics without reimplementing matching.
+/// Every capability declaration, protocol filter, scope merge, and priority
+/// decision still comes from the inner plugin, so the published chain shape is
+/// byte-for-byte what it would be without a trigger.
+///
+/// # What a false trigger suppresses
+///
+/// Every request/response hook of THAT instance, plus its per-request buffering
+/// and policy-enforcement claims — so a skipped instance performs no external
+/// call, takes no lease, retains no state, and never forces a body buffer of
+/// its own. Static chain-shape declarations (`supported_protocols`,
+/// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
+/// gated: they describe the published generation, not one request, and gating
+/// them would make the plugin cache's composition admission depend on request
+/// data.
+///
+/// # Phase boundary
+///
+/// `WS frame`, `UDP datagram`, WS-disconnect, and the `log` phase have no
+/// request context at the point they run, so they cannot be gated coherently.
+/// Plugin-cache admission REFUSES a trigger on an instance that declares those
+/// hooks rather than silently half-applying one; see
+/// `trigger_composition_error`.
+struct PluginInstanceWrapper {
     inner: Arc<dyn Plugin>,
     priority: u16,
+    /// `None` for a priority-only wrapper — the historical behavior.
+    trigger: Option<PluginTriggerGate>,
+}
+
+impl PluginInstanceWrapper {
+    /// Decide (and memoize) whether the instance runs for this request.
+    #[inline]
+    fn runs(&self, ctx: &mut RequestContext, phase: TriggerPhase) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_request(ctx, phase),
+            None => true,
+        }
+    }
+
+    /// Read an already-memoized decision; fails closed to "runs".
+    #[inline]
+    fn runs_cached(&self, ctx: &RequestContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.request_decision_or_run(ctx),
+            None => true,
+        }
+    }
+
+    /// Decide (and memoize) whether the instance runs for a stream connection.
+    #[inline]
+    fn runs_stream(&self, ctx: &mut StreamConnectionContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_stream(ctx),
+            None => true,
+        }
+    }
 }
 
 /// Pure capability view used by candidate admission. Runtime construction of
@@ -669,6 +729,56 @@ pub(crate) fn validate_plugin_security_composition(
     Ok(())
 }
 
+/// Refuse a per-instance execution trigger whose phase surface the gate cannot
+/// cover coherently, or whose input the plugin's own phase is what establishes.
+///
+/// This is deliberately validation-time, fail-closed rejection rather than a
+/// partially-applied trigger: the failure mode of a half-gated instance is
+/// exactly the asymmetric-skip / stale-state class the decide-once memo exists
+/// to prevent.
+///
+/// The refused surfaces are:
+///
+/// * **WebSocket frame, WS-disconnect, and UDP datagram hooks.** They run with
+///   no `RequestContext` / `StreamConnectionContext` in hand (`on_ws_frame`
+///   takes only a proxy id, connection id, direction, and message), so there is
+///   nothing authoritative left to evaluate. Gating the upgrade but not the
+///   frames would let a "skipped" WAF stop inspecting the handshake while still
+///   inspecting — or stop inspecting — the messages. Tracked for a typed
+///   frame-phase predicate surface in a follow-up.
+/// * **An identity-reading trigger on an authentication plugin.** `authenticate`
+///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
+///   such a trigger could only ever read another mechanism's committed identity,
+///   which makes the effective auth chain order-dependent.
+fn trigger_composition_error(plugin: &dyn Plugin, gate: &PluginTriggerGate) -> Option<&'static str> {
+    if plugin.requires_ws_frame_hooks() || plugin.observes_ws_frame_decisions() {
+        return Some(
+            "the plugin runs WebSocket frame hooks, which execute without a request context and therefore cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_websocket_framing() {
+        return Some(
+            "the plugin requires WebSocket framing, whose per-frame phase cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_ws_disconnect_hooks() {
+        return Some(
+            "the plugin runs WebSocket disconnect hooks, which execute without a request context and therefore cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_udp_datagram_hooks() {
+        return Some(
+            "the plugin runs UDP datagram hooks, which execute without a connection context and therefore cannot be gated by a trigger",
+        );
+    }
+    if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
+        return Some(
+            "an authentication plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`, which its own phase establishes",
+        );
+    }
+    None
+}
+
 /// A correlation header names one trust-domain value. Allowing two instances
 /// that can execute for the same protocol to own the same normalized header
 /// would make their instance-scoped metadata and stream-generated IDs
@@ -733,7 +843,7 @@ pub(crate) fn validate_correlation_id_composition(
 }
 
 #[async_trait]
-impl Plugin for PriorityOverridePlugin {
+impl Plugin for PluginInstanceWrapper {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -768,12 +878,22 @@ impl Plugin for PriorityOverridePlugin {
         self.priority
     }
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.prepare_grpc_deadline(ctx)
     }
     fn requires_grpc_deadline_preflight(&self) -> bool {
         self.inner.requires_grpc_deadline_preflight()
     }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        // Every dispatcher runs this hook for every plugin on the chain, so
+        // this is where a trigger decision is normally taken and memoized —
+        // before any later `&RequestContext`-only capability predicate is
+        // consulted.
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.on_request_received(ctx).await
     }
     async fn authenticate(
@@ -781,6 +901,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         consumer_index: &crate::consumer_index::ConsumerIndex,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.authenticate(ctx, consumer_index).await
     }
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
@@ -790,6 +913,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.request_headers_to_redact()
     }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.authorize(ctx).await
     }
     fn is_authorize_plugin(&self) -> bool {
@@ -832,6 +958,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner.enforce_final_backend_header_policy(ctx, headers)
     }
     async fn dispatch_finalized_request_egress(
@@ -841,6 +970,11 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
         backend_header_overlay: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        // Irreversible outbound egress. A skipped instance must contact
+        // nothing, so this gate precedes the inner call.
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .dispatch_finalized_request_egress(ctx, headers, body, backend_header_overlay)
             .await
@@ -865,6 +999,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &mut std::collections::HashMap<String, String>,
         body: &mut Vec<u8>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
             .await
@@ -878,6 +1015,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .validate_client_request_body_contract(ctx, headers, body)
             .await
@@ -890,6 +1030,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         consumer_index: &crate::consumer_index::ConsumerIndex,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .should_buffer_request_body_before_authenticate(ctx, consumer_index)
     }
@@ -922,6 +1066,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.before_proxy(ctx, headers).await
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
@@ -939,6 +1086,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         backend_path: &str,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn apply_websocket_handshake_response_headers(
@@ -947,6 +1097,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner.apply_websocket_handshake_response_headers(
             ctx,
             response_status,
@@ -964,9 +1117,16 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         admission: &crate::plugins::BackendAdmissionContext<'_>,
     ) -> crate::plugins::BackendAdmissionDecision {
+        if !self.runs_cached(ctx) {
+            return crate::plugins::BackendAdmissionDecision::Continue;
+        }
         self.inner.try_backend_admission(ctx, admission)
     }
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.should_buffer_request_body(ctx)
     }
     async fn after_proxy(
@@ -975,14 +1135,24 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .after_proxy(ctx, response_status, response_headers)
             .await
     }
     fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner.observe_origin_http_response_status(ctx, status);
     }
     fn enforces_origin_response_header_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.enforces_origin_response_header_policy(ctx)
     }
     fn enforce_origin_response_header_policy(
@@ -991,10 +1161,17 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner
             .enforce_origin_response_header_policy(ctx, response_status, response_headers);
     }
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.owns_deadline_response_header(ctx, name)
     }
     fn is_initial_response_header_policy(&self) -> bool {
@@ -1014,6 +1191,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.response_trailer_policy()
     }
     fn request_applies_unbounded_response_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .request_applies_unbounded_response_trailer_policy(ctx)
     }
@@ -1022,6 +1203,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_content_type: Option<&str>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_modify_response_content_type(ctx, response_content_type)
     }
@@ -1030,6 +1215,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_add_response_cache_control_no_transform(ctx, response_headers)
     }
@@ -1038,6 +1227,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_add_response_strong_etag(ctx, response_headers)
     }
@@ -1046,6 +1239,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .simulate_after_proxy_response_headers(ctx, response_headers);
     }
@@ -1069,15 +1265,27 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.warn_on_rejection_response_replacement()
     }
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.requires_buffered_grpc_web_trailer_policy(ctx)
     }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.should_buffer_response_body(ctx)
     }
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.may_release_response_body_under_retries(ctx)
     }
     fn should_release_response_body_under_retries(
@@ -1151,6 +1359,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         // Must forward, not fall back to the trait default (which ignores
         // content-type): a priority-overridden inspect-mode policy needs the
         // buffer->stream downgrade for SSE, else it buffers an unbounded stream.
@@ -1168,6 +1379,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &mut std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_response_body(ctx, response_status, response_headers, body)
             .await
@@ -1180,6 +1394,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .normalize_response_body_with_context(
                 ctx,
@@ -1207,6 +1424,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .transform_request_body_with_context(ctx, body, content_type, request_headers)
             .await
@@ -1224,6 +1444,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_final_request_body_with_context(ctx, headers, body)
             .await
@@ -1235,6 +1458,12 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
     ) -> bool {
         // Security phase declarations must survive a priority-only wrapper.
+        // They must NOT survive a false trigger: the claiming hook will not run,
+        // so claiming here would reserve a decode budget nobody consumes.
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .enforces_final_request_body_policy(ctx, headers, body)
     }
@@ -1262,6 +1491,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
@@ -1274,6 +1506,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.response_body_production()
     }
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.requires_replay_response_body_transform(ctx)
     }
     /// Must forward: this wrapper still runs the inner plugin's response-body
@@ -1290,6 +1526,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.applies_response_transport_encoding()
     }
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.enforces_final_client_visible_response_body(ctx)
     }
     async fn finalize_client_visible_response_body(
@@ -1299,11 +1539,18 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .finalize_client_visible_response_body(ctx, response_status, response_headers, body)
             .await
     }
     fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .enforces_final_client_visible_response_headers(ctx)
     }
@@ -1313,6 +1560,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .finalize_client_visible_response_headers(ctx, response_status, response_headers)
             .await
@@ -1323,6 +1573,10 @@ impl Plugin for PriorityOverridePlugin {
         response_content_type: Option<&str>,
         response_body: &[u8],
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         // Must forward: falling back to the trait default (`false`) would make a
         // priority-overridden body policy invisible to the shared representation
         // gate, reopening the encoded/partial bypass for exactly the proxies that
@@ -1331,6 +1585,10 @@ impl Plugin for PriorityOverridePlugin {
             .enforces_response_body_policy(ctx, response_content_type, response_body)
     }
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.may_enforce_response_body_policy(ctx)
     }
     fn on_response_body_transformed(
@@ -1338,6 +1596,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_body_transformed(ctx, response_headers);
     }
@@ -1348,6 +1609,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await
@@ -1362,6 +1626,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_committed(ctx, response_status, response_headers, body)
             .await;
@@ -1372,6 +1639,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_stream_terminated(ctx, response_status, outcome)
             .await;
@@ -1401,6 +1671,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.tracked_keys_count()
     }
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        if !self.runs_stream(ctx) {
+            return PluginResult::Continue;
+        }
         self.inner.on_stream_connect(ctx).await
     }
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
@@ -1475,10 +1748,17 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         content_type: Option<&str>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner
             .on_response_stream_selected(ctx, response_status, content_type);
     }
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.forces_reqwest_dispatch(ctx)
     }
     fn response_stream_inspector(
@@ -1487,6 +1767,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.runs_cached(ctx) {
+            return None;
+        }
         self.inner
             .response_stream_inspector(ctx, response_status, content_type)
     }
@@ -1757,10 +2040,42 @@ fn try_create_plugin(
 
     match created {
         Ok(Some(plugin)) => {
-            let plugin: Arc<dyn Plugin> = if let Some(priority) = pc.priority_override {
-                Arc::new(PriorityOverridePlugin {
+            let trigger = match pc.trigger.as_ref() {
+                Some(trigger) => {
+                    let gate = PluginTriggerGate::compile(trigger, &pc.id).map_err(|error| {
+                        let msg = format!(
+                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) execution trigger is invalid: {}",
+                            pc.plugin_name,
+                            pc.id,
+                            pc.scope,
+                            pc.proxy_id.as_deref().unwrap_or("<none>"),
+                            error
+                        );
+                        error!("Config rejected: {}", msg);
+                        msg
+                    })?;
+                    if let Some(reason) = trigger_composition_error(plugin.as_ref(), &gate) {
+                        let msg = format!(
+                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) cannot carry an execution trigger: {}",
+                            pc.plugin_name,
+                            pc.id,
+                            pc.scope,
+                            pc.proxy_id.as_deref().unwrap_or("<none>"),
+                            reason
+                        );
+                        error!("Config rejected: {}", msg);
+                        return Err(msg);
+                    }
+                    Some(gate)
+                }
+                None => None,
+            };
+            let plugin: Arc<dyn Plugin> = if pc.priority_override.is_some() || trigger.is_some() {
+                let priority = pc.priority_override.unwrap_or_else(|| plugin.priority());
+                Arc::new(PluginInstanceWrapper {
                     inner: plugin,
                     priority,
+                    trigger,
                 })
             } else {
                 plugin
@@ -3633,6 +3948,10 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
         && left.proxy_id == right.proxy_id
         && left.enabled == right.enabled
         && left.priority_override == right.priority_override
+        // A proxy-group instance is shared across its associated proxies, so a
+        // changed execution trigger is a different policy and must not be
+        // treated as the same shared instance.
+        && left.trigger == right.trigger
 }
 
 // ---------------------------------------------------------------------------

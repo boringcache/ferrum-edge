@@ -1146,6 +1146,166 @@ When no plugins on a proxy return `true` from `requires_udp_datagram_hooks()`, t
 
 Both plain UDP and DTLS frontend paths support per-datagram hooks.
 
+## Per-Instance Execution Triggers
+
+Every `PluginConfig` accepts an optional `trigger` block that decides whether
+**that one instance** executes for a given request or stream connection. It is a
+generic layer shared by built-in and custom plugins — it does not replace route
+selection, mesh routing, or a plugin's own business-policy matchers (for example
+`request_termination` rules, `fault_injection` selectors, or
+`mesh_route_dispatch`), and those are never reinterpreted as triggers.
+
+**An absent `trigger` preserves today's behavior exactly.**
+
+### Schema
+
+```yaml
+plugin_configs:
+  - id: audit-writes-only
+    plugin_name: http_logging
+    scope: proxy
+    proxy_id: orders-api
+    enabled: true
+    config: { endpoint: "https://logs.internal/ingest" }
+    trigger:
+      when:
+        all:
+          - match: { method: [POST, PUT, PATCH, DELETE] }
+          - match: { path: { prefix: ["/v1/orders"] } }
+          - not:
+              match: { header: { name: x-ferrum-synthetic, presence: present } }
+```
+
+A node sets **exactly one** of `all`, `any`, `not`, or `match`. An empty `all` or
+`any` list is rejected rather than given an implicit truth value. A `match` leaf
+sets **exactly one** predicate; combine predicates with `all` / `any` / `not`.
+
+Available `match` predicates:
+
+| Predicate | Input | Notes |
+|---|---|---|
+| `method` | HTTP method | list is an OR, ASCII-case-insensitive |
+| `path` | canonical policy path | `exact` / `prefix` / `regex`; never the raw target |
+| `host` | request authority host | lowercased, trailing dot and port removed |
+| `sni` | frontend TLS/QUIC SNI | available on HTTP **and** stream contexts |
+| `header` | request header field | pristine inbound wire view; name case-insensitive |
+| `query` | query parameter | percent-decoded; names/values case-sensitive |
+| `cookie` | `Cookie` entry | names case-sensitive (RFC 6265); quoted values unquoted |
+| `protocol` | wire protocol identity | `http1` `http2` `http3` `grpc` `grpc_web` `websocket` `tcp` `udp` `dtls` |
+| `source_cidr` | gateway-resolved client IP | exact address or CIDR; IPv4-mapped IPv6 normalized |
+| `namespace` / `proxy_id` | matched proxy identity | list is an OR |
+| `listen_port` | accepting frontend port | list is an OR |
+| `consumer` | authenticated consumer / external identity | **post-authentication only** |
+| `auth_method` | successful mechanism name | **post-authentication only** |
+| `spiffe_id` | peer SPIFFE ID | **post-authentication only** |
+
+`path`, `host`, `sni`, and every `value` use one of `exact` (list, OR), `prefix`
+(list, OR), or `regex` (implicitly anchored `^(?:…)$`), plus optional
+`case_insensitive`.
+
+### Deterministic semantics
+
+* **Absent input never matches a positive predicate.** A header that is not
+  present fails `presence: present`; `presence: absent` succeeds. Wrap a leaf in
+  `not` for the complement.
+* **HTTP-only predicates are false on a stream connection.** `method`, `path`,
+  `host`, `header`, `query`, and `cookie` do not exist for a TCP/UDP/DTLS
+  connection, so "only run on `/orders`" faithfully means "do not run".
+* **Multi-occurrence.** `multi_value: any` (default) needs one matching
+  occurrence; `multi_value: all` needs every occurrence to match and at least one
+  to exist. `presence: absent` cannot be combined with `value`.
+* **Case.** Header names are ASCII-case-insensitive. Query and cookie names, and
+  all values, are case-sensitive unless `case_insensitive: true`.
+* **Protocol identity is a set.** Transport and flavor are independent, so an
+  HTTP/2 native-gRPC request matches both `http2` and `grpc`.
+
+### Decide-once and phase safety
+
+A trigger is evaluated **at most once per request per instance**, at the first
+gated hook, and the outcome is memoized on the request/connection. Every later
+phase of that instance reuses it. This is what makes a skip *symmetric*: a
+`before_proxy` rewrite of the path, headers, or query can never flip an instance
+from "skipped its request hooks" to "runs its response hooks", which would leave
+half-initialized plugin state behind.
+
+Identity predicates (`consumer`, `auth_method`, `spiffe_id`) are not
+authoritative before the authentication boundary. A trigger that uses them
+therefore **does not gate** hooks at or before `authenticate` — the instance runs
+and no decision is memoized, so the first `authorize`-or-later hook makes the
+real decision. Failing toward "run" there is the only fail-closed choice:
+skipping a guard because its identity input has not been populated yet would
+widen access.
+
+### What a false trigger suppresses
+
+Every request and response hook of that instance, plus its per-request buffering
+and policy-enforcement claims — `should_buffer_request_body`,
+`should_buffer_response_body`, `enforces_final_request_body_policy`,
+`enforces_response_body_policy`, `enforces_final_client_visible_response_*`,
+`try_backend_admission`, `response_stream_inspector`, and the finalized-request
+egress dispatch. A skipped instance therefore performs no external call, takes no
+lease or reservation, retains no state, and never forces a body buffer of its
+own. A trigger can only ever *remove* work; it never adds buffering.
+
+Static chain-shape declarations (`supported_protocols`,
+`requires_request_body_buffering`, `modifies_request_headers`, priority) are
+deliberately **not** gated: they describe the published generation, not one
+request, and gating them would make plugin-cache composition admission depend on
+request data. Scope merge, protocol filtering, instance identity, priority
+override, and lifecycle order are all unchanged.
+
+### Phases outside the trigger boundary (fail-closed)
+
+`on_ws_frame`, `on_ws_reassembly_frames`, `on_ws_disconnect`, and
+`on_udp_datagram` run with no request or connection context in hand, so there is
+nothing authoritative left to evaluate at that point. Rather than half-applying a
+trigger, plugin-cache publication **rejects** a trigger on any instance that
+declares those hooks (`requires_ws_frame_hooks`, `observes_ws_frame_decisions`,
+`requires_websocket_framing`, `requires_ws_disconnect_hooks`,
+`requires_udp_datagram_hooks`). A typed frame/datagram-phase predicate surface is
+tracked as follow-up work.
+
+The `log` phase (12) receives only a `TransactionSummary` and is likewise not
+gated; a triggered logger still emits its record for a request whose earlier
+hooks were skipped. The skip is visible in that record — see below.
+
+An **authentication** plugin may not carry an identity predicate: `authenticate`
+is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a
+trigger could only read another mechanism's committed identity and would make the
+effective auth chain order-dependent. That composition is rejected at
+publication.
+
+### Validation and bounds
+
+Patterns are compiled once, at config load, admin write, and plugin-cache
+publication — never per request. Rejected fail-closed: unknown fields, a node
+with zero or multiple branches, a `match` leaf with zero or multiple predicates,
+an empty `all`/`any`, `presence: absent` combined with `value`, a malformed or
+oversized regex, a malformed CIDR, a non-token header name, a zero
+`listen_port`, and the composition rules above.
+
+| Bound | Limit |
+|---|---|
+| predicate-tree depth | 8 |
+| total nodes per trigger | 128 |
+| entries per list | 64 |
+| literal value length | 1024 bytes |
+| field-name length | 256 bytes |
+| regex source length | 512 bytes |
+| compiled regex program | 64 KiB |
+| regex lazy-DFA cache | 256 KiB |
+
+Regexes are anchored and use the `regex` crate (no backreferences, no
+lookaround), so matching is linear in input length.
+
+### Observability
+
+A skipped instance records exactly one bounded metadata pair,
+`plugin_trigger.<plugin-config-id>.skipped = "true"`, which flows into the
+transaction summary through the ordinary redacted-metadata path. Cardinality is
+bounded by the configured instance count. No header, cookie, query value, claim,
+token, or body byte is ever copied into it or logged.
+
 ## Priority Bands
 
 Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Each plugin has a built-in priority constant, but this can be overridden per plugin-config via the `priority_override` field (0–10000). When two plugins share the same effective priority, their relative order is stable (based on config order) but not explicitly controllable — use `priority_override` to guarantee ordering.

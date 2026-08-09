@@ -8678,6 +8678,263 @@ components:
         - $ref: "#/components/schemas/MtlsAuthCredential"
 
     # ── Plugin Config ───────────────────────────────────────────────
+    PluginTrigger:
+      type: object
+      additionalProperties: false
+      required: [when]
+      description: |
+        Declarative per-instance plugin execution trigger. The instance runs
+        when `when` evaluates to true for the request or stream connection.
+
+        Bounds enforced at validation time: predicate-tree depth 8, 128 total
+        nodes, 64 entries per list, 1024 bytes per literal value, 256 bytes per
+        field name, 512 bytes of regex source, and a 64 KiB compiled-program /
+        256 KiB lazy-DFA ceiling per regex.
+
+        A trigger is evaluated at most once per request per instance and the
+        outcome is memoized, so every phase of that instance agrees even after a
+        later plugin rewrites the path, headers, or query.
+      properties:
+        when:
+          $ref: "#/components/schemas/PluginTriggerNode"
+    PluginTriggerNode:
+      type: object
+      additionalProperties: false
+      description: >-
+        One node of the predicate tree. Exactly one of `all`, `any`, `not`, or
+        `match` must be set; any other combination (including an empty `all` or
+        `any` list) is rejected, because it would have no defined truth value.
+      properties:
+        all:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Logical AND over the child nodes.
+          items:
+            $ref: "#/components/schemas/PluginTriggerNode"
+        any:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Logical OR over the child nodes.
+          items:
+            $ref: "#/components/schemas/PluginTriggerNode"
+        not:
+          description: Logical NOT of the child node.
+          $ref: "#/components/schemas/PluginTriggerNode"
+        match:
+          description: Leaf predicate.
+          $ref: "#/components/schemas/PluginTriggerMatch"
+    PluginTriggerMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        A leaf predicate. Exactly one field must be set; combine predicates with
+        `all` / `any` / `not` so a leaf never needs an implicit combination rule.
+        An input that does not exist for the current context never satisfies a
+        positive predicate: HTTP-only predicates (method, path, host, header,
+        query, cookie) are false on a TCP/UDP/DTLS stream connection.
+      properties:
+        method:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            HTTP methods, compared ASCII-case-insensitively. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        path:
+          description: >-
+            Canonical policy path (the same value every security decision uses),
+            never the raw request target.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        host:
+          description: >-
+            Request authority host, ASCII-lowercased with the trailing DNS dot
+            and any port removed.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        sni:
+          description: >-
+            Frontend TLS/QUIC SNI hostname, when the client supplied one.
+            Available on HTTP and stream connections alike.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        header:
+          description: >-
+            Request header field, evaluated against the pristine inbound wire
+            view. Field names are ASCII-case-insensitive; non-UTF-8 field lines
+            are skipped rather than lossily transcoded.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        query:
+          description: >-
+            Query parameter of the client's original request target. Names and
+            values are compared after percent-decoding, case-sensitively.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        cookie:
+          description: >-
+            Cookie from the request `Cookie` header. Names are case-sensitive
+            per RFC 6265; a quoted cookie-value is unquoted before comparison.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        protocol:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Authoritative wire-protocol identity. The list is an OR. Transport
+            and flavor are independent, so an HTTP/2 native-gRPC request matches
+            both `http2` and `grpc`.
+          items:
+            $ref: "#/components/schemas/PluginTriggerProtocol"
+        source_cidr:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Exact addresses or CIDRs matched against the gateway-resolved client
+            IP. IPv4-mapped IPv6 rules and peers are normalized onto the IPv4
+            space so one rule matches both forms. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        namespace:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Namespace of the matched proxy. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        proxy_id:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: ID of the matched proxy. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        listen_port:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Frontend listener port that accepted the request or connection.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        consumer:
+          description: >-
+            Authenticated consumer username, falling back to the external
+            authenticated identity. Only authoritative after the authentication
+            boundary — a trigger using it does not gate hooks at or before
+            `authenticate`, and is rejected outright on an authentication plugin.
+          $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+        auth_method:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Successful authentication mechanism name (for example `jwt_auth`),
+            compared ASCII-case-insensitively. Post-authentication only.
+          items:
+            type: string
+            maxLength: 1024
+        spiffe_id:
+          description: >-
+            Peer SPIFFE ID established by mesh/mTLS identity.
+            Post-authentication only.
+          $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+    PluginTriggerStringMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        String comparison. Exactly one of `exact`, `prefix`, or `regex` must be
+        set. `exact` and `prefix` lists are an OR.
+      properties:
+        exact:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 1024
+        prefix:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 1024
+        regex:
+          type: string
+          maxLength: 512
+          description: >-
+            Regular expression, implicitly anchored as `^(?:…)$` so it can never
+            partially match a longer value. Compiled once at validation time
+            under a 64 KiB program and 256 KiB lazy-DFA ceiling; there are no
+            backreferences or lookaround, so matching is linear in input length.
+        case_insensitive:
+          type: boolean
+          default: false
+          description: ASCII case-insensitive comparison.
+    PluginTriggerFieldMatch:
+      type: object
+      additionalProperties: false
+      required: [name]
+      description: >-
+        Header / query / cookie predicate with explicit presence and
+        multi-occurrence semantics.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            Field name. Header names must be valid HTTP tokens and are matched
+            case-insensitively; query and cookie names are matched exactly.
+        presence:
+          type: string
+          enum: [present, absent]
+          default: present
+          description: >-
+            `present` requires at least one occurrence; `absent` requires none
+            and cannot be combined with `value`.
+        value:
+          description: >-
+            Optional value comparison. Requires `presence: present`.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        multi_value:
+          type: string
+          enum: [any, all]
+          default: any
+          description: >-
+            How `value` applies when the field occurs more than once: `any`
+            requires at least one matching occurrence, `all` requires every
+            occurrence to match (and at least one to exist).
+    PluginTriggerIdentityMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        Authenticated-identity predicate. An empty identity string is treated as
+        absent.
+      properties:
+        presence:
+          type: string
+          enum: [present, absent]
+          default: present
+        value:
+          description: >-
+            Optional value comparison. Requires `presence: present`.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+    PluginTriggerProtocol:
+      type: string
+      enum: [http1, http2, http3, grpc, grpc_web, websocket, tcp, udp, dtls]
+      description: >-
+        Authoritative wire-protocol identity. `http1` / `http2` / `http3` are
+        the accepted frontend transport; `grpc` is a native gRPC request,
+        `grpc_web` a recognized gRPC-Web request, and `websocket` a WebSocket
+        upgrade (HTTP/1.1 Upgrade or RFC 8441 Extended CONNECT). `tcp`, `udp`,
+        and `dtls` are stream-proxy connections.
     PluginConfig:
       type: object
       required: [plugin_name, scope, enabled]
@@ -8762,6 +9019,21 @@ components:
             multiple instances of the same plugin type are attached to a proxy
             (e.g., two http_logging instances shipping to Splunk and Datadog).
             When null (default), the plugin uses its built-in priority.
+        trigger:
+          oneOf:
+            - $ref: "#/components/schemas/PluginTrigger"
+            - type: "null"
+          description: >-
+            Optional declarative execution trigger for this one plugin instance.
+            When omitted (the default) the instance executes exactly as it does
+            today, governed only by scope, protocol filtering, and priority.
+            When present, the compiled predicate tree decides once per
+            request/connection whether this instance's hooks run at all. Patterns
+            are compiled and bounded at write time and at plugin-cache
+            publication; invalid shapes, unbounded regexes, malformed CIDRs, and
+            unsupported plugin/phase combinations are rejected with HTTP 400.
+            See `docs/plugin_execution_order.md` for the phase model and the
+            fail-closed composition rules.
         api_spec_id:
           type: [string, "null"]
           description: |

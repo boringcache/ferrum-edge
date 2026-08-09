@@ -762,6 +762,7 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

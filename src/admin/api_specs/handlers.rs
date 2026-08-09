@@ -1557,6 +1557,21 @@ fn plugin_canonical_key(
             pc.plugin_name, e
         ))
     })?;
+    // Fold the per-instance execution trigger into the canonical config
+    // component. Two otherwise identical spec-owned plugins that run under
+    // different triggers are different policies and must not dedup together.
+    let config_str = match pc.trigger.as_ref() {
+        Some(trigger) => {
+            let trigger_str = serde_json::to_string(trigger).map_err(|e| {
+                ApiSpecError::Internal(format!(
+                    "plugin '{}': failed to serialise canonical trigger: {}",
+                    pc.plugin_name, e
+                ))
+            })?;
+            format!("{config_str}\u{{1e}}{trigger_str}")
+        }
+        None => config_str,
+    };
     Ok((pc.plugin_name.clone(), config_str, pc.priority_override))
 }
 

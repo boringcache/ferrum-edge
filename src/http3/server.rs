@@ -1909,6 +1909,12 @@ async fn handle_h3_request(
     // gRPC-Web is promoted only for gRPC policy selection above and must not
     // become native gRPC merely because its policy chain is gRPC-scoped.
     ctx.set_request_http_flavor(detected_http_flavor);
+    // Native H3 frontend: the wire transport is HTTP/3 by construction, and the
+    // gRPC-Web classification is the one already resolved above.
+    ctx.set_request_wire_protocol(
+        crate::config::types::HttpWireTransport::Http3,
+        grpc_web_response_content_type.is_some(),
+    );
     // Namespace-composed lookup: the protocol snapshot is keyed by
     // `namespace|proxy_id`, so a bare `proxy.id` would miss every proxy entry
     // and fall back to the global policy chain.

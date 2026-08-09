@@ -17,6 +17,7 @@ mod config_file_loader_tests;
 mod config_migration_tests;
 mod config_types_tests;
 mod config_validation_tests;
+mod plugin_trigger_tests;
 mod cp_grpc_conn_limit_tests;
 mod cp_overlay_poll_isolation_tests;
 mod cp_poll_interval_tests;

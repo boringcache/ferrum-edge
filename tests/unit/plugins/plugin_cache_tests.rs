@@ -363,7 +363,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     }
 }
 
-fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
+pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -500,6 +500,7 @@ fn make_plugin_config(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -684,6 +685,7 @@ fn cors_config(
     methods: &[&str],
     headers: &[&str],
     priority_override: Option<u16>,
+    trigger: None,
 ) -> PluginConfig {
     let mut config = make_plugin_config_with_json(
         id,
@@ -4762,6 +4764,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("cors-no-body".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4775,6 +4778,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("graphql-guarded".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4788,6 +4792,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("response-only".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4801,6 +4806,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("request-xml".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4910,6 +4916,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4923,6 +4930,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5011,6 +5019,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -5163,6 +5172,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5216,6 +5226,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5569,6 +5580,7 @@ fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
             proxy_id: Some("p1".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -7281,7 +7293,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     }
 }
 
-fn make_plugin_config_with_json(
+pub(crate) fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,
     config: serde_json::Value,
@@ -7297,6 +7309,7 @@ fn make_plugin_config_with_json(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -8116,6 +8129,7 @@ fn make_plugin_config_with_priority(
     proxy_id: Option<&str>,
     enabled: bool,
     priority_override: Option<u16>,
+    trigger: None,
 ) -> PluginConfig {
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {

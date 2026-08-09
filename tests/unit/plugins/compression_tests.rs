@@ -4982,6 +4982,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
                     proxy_id: Some("p1".to_string()),
                     enabled: true,
                     priority_override: Some(*priority),
+                    trigger: None,
                     api_spec_id: None,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),

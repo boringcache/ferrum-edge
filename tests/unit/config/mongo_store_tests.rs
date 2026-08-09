@@ -283,6 +283,7 @@ fn mtls_dns_policy_gate_skips_consumers_until_san_dns_is_effective() {
             scope: PluginScope::Global,
             proxy_id: None,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,

@@ -146,6 +146,37 @@ behavior. Pricing and `currency` may still differ per proxy. See
 
 Use `priority_override` to control the relative execution order of instances that share the same built-in priority. Without it, instances at the same priority execute in a stable but implicit order based on config iteration
 
+### Per-Instance Execution Triggers
+
+Every `PluginConfig` also accepts an optional `trigger` block that decides
+whether that one instance executes for a given request or stream connection.
+An absent `trigger` preserves today's behavior exactly.
+
+```yaml
+plugin_configs:
+  - id: waf-external-only
+    plugin_name: request_size_limiting
+    scope: proxy
+    proxy_id: orders-api
+    enabled: true
+    config: { max_body_size: 1048576 }
+    trigger:
+      when:
+        not:
+          match: { source_cidr: ["10.0.0.0/8", "fd00::/8"] }
+```
+
+The trigger is a generic layer and never replaces route selection, mesh routing,
+or a plugin's own policy matchers. It is compiled and bounded at config load,
+admin write, and plugin-cache publication — the request path only walks
+precompiled matchers. A false trigger suppresses every hook of that instance,
+including its per-request buffering and enforcement claims, so a skipped
+instance makes no external call, takes no lease, and retains no state.
+
+See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
+for the full predicate table, the deterministic absent/multi-value/case rules,
+the decide-once phase model, the fail-closed composition rules, and the bounds.
+
 ## Multi-Authentication Mode
 
 With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.

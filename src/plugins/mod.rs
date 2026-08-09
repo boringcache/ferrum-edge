@@ -122,6 +122,7 @@ pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod transaction_debugger;
 pub mod transaction_log_schema;
+pub mod trigger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
@@ -154,7 +155,7 @@ use std::time::Duration;
 
 use self::utils::runtime_bool_gate::GatePolicyStamp;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, HttpWireTransport, Proxy,
     ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
@@ -2277,6 +2278,28 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot forge origin success for
     /// invalidation or similar origin-success boundaries.
     origin_http_response_status: Option<u16>,
+    /// Client-visible HTTP wire transport stamped once at frontend intake
+    /// (H1/H2 in `crate::proxy`, H3 in `crate::http3::server`).
+    ///
+    /// Private: it is authoritative transport provenance for declarative plugin
+    /// execution triggers, so a plugin or a client header must never be able to
+    /// restate it. `None` for direct plugin callers and tests that never went
+    /// through a frontend.
+    request_wire_transport: Option<HttpWireTransport>,
+    /// Whether the frontend classified this request as recognized gRPC-Web.
+    /// Stamped beside `request_wire_transport` from the same pre-routing
+    /// classification the dispatchers already computed.
+    request_is_grpc_web: bool,
+    /// Memoized per-instance execution-trigger decisions, keyed by the opaque
+    /// process-local token the plugin cache assigned to each triggered
+    /// instance.
+    ///
+    /// One request evaluates a given instance's trigger at most once, so every
+    /// phase of that instance agrees even after a later plugin rewrites the
+    /// path, headers, or query. Empty (and non-allocating) unless some
+    /// effective instance actually carries a trigger; bounded by the number of
+    /// triggered instances on the published chain.
+    plugin_trigger_decisions: Vec<(u64, bool)>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -3194,6 +3217,9 @@ impl RequestContext {
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
+            request_wire_transport: None,
+            request_is_grpc_web: false,
+            plugin_trigger_decisions: Vec::new(),
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -4258,6 +4284,14 @@ impl RequestContext {
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
+            request_wire_transport: self.request_wire_transport,
+            request_is_grpc_web: self.request_is_grpc_web,
+            // Carried, not dropped: the memoized trigger decisions ARE the
+            // authority for whether an instance runs. Re-deriving them on this
+            // clone would let a `before_proxy` header/path/query rewrite flip a
+            // decision between the request hooks and the final-body hooks, which
+            // is exactly the asymmetric-skip class the memo exists to prevent.
+            plugin_trigger_decisions: self.plugin_trigger_decisions.clone(),
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -4568,6 +4602,53 @@ impl RequestContext {
     pub(crate) fn set_request_http_flavor(&mut self, flavor: HttpFlavor) {
         self.request_http_flavor = flavor;
         self.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    }
+
+    /// Client-visible request flavor recorded at frontend intake.
+    pub(crate) fn request_http_flavor(&self) -> HttpFlavor {
+        self.request_http_flavor
+    }
+
+    /// Stamp the client-visible HTTP wire transport and the frontend's
+    /// gRPC-Web classification. Called once per request by the H1/H2 and H3
+    /// dispatchers, from the same pre-routing classification they already
+    /// computed for protocol policy selection.
+    pub(crate) fn set_request_wire_protocol(
+        &mut self,
+        transport: HttpWireTransport,
+        is_grpc_web: bool,
+    ) {
+        self.request_wire_transport = Some(transport);
+        self.request_is_grpc_web = is_grpc_web;
+    }
+
+    /// Client-visible HTTP wire transport, or `None` for a context that never
+    /// passed through a frontend (direct plugin callers, tests).
+    pub fn request_wire_transport(&self) -> Option<HttpWireTransport> {
+        self.request_wire_transport
+    }
+
+    /// Whether the frontend classified this request as recognized gRPC-Web.
+    pub fn request_is_grpc_web(&self) -> bool {
+        self.request_is_grpc_web
+    }
+
+    /// Previously memoized execution-trigger decision for `token`, if any.
+    pub(crate) fn plugin_trigger_decision(&self, token: u64) -> Option<bool> {
+        self.plugin_trigger_decisions
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
+    }
+
+    /// Memoize an execution-trigger decision. Write-once per token: the first
+    /// evaluation is the authority for every later phase of that instance.
+    pub(crate) fn record_plugin_trigger_decision(&mut self, token: u64, run: bool) -> bool {
+        if let Some(existing) = self.plugin_trigger_decision(token) {
+            return existing;
+        }
+        self.plugin_trigger_decisions.push((token, run));
+        run
     }
 
     pub(crate) fn is_native_grpc_request(&self) -> bool {
@@ -7235,6 +7316,10 @@ pub struct StreamConnectionContext {
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
     pub trusted_gateway_ref: Option<Arc<str>>,
+    /// Memoized per-instance execution-trigger decisions for this connection.
+    /// Mirrors `RequestContext::plugin_trigger_decisions`; private so a plugin
+    /// cannot restate another instance's admission decision.
+    plugin_trigger_decisions: Vec<(u64, bool)>,
 }
 
 impl StreamConnectionContext {
@@ -7284,6 +7369,7 @@ impl StreamConnectionContext {
             // Callers that know the peer/forwarded port (TCP accept path) set
             // this after construction; UDP/DTLS leave it at 0.
             client_port: 0,
+            plugin_trigger_decisions: Vec::new(),
         }
     }
 
@@ -7310,6 +7396,24 @@ impl StreamConnectionContext {
         if publish_canonical {
             metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
         }
+    }
+
+    /// Previously memoized execution-trigger decision for `token`, if any.
+    pub(crate) fn plugin_trigger_decision(&self, token: u64) -> Option<bool> {
+        self.plugin_trigger_decisions
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
+    }
+
+    /// Memoize an execution-trigger decision for this connection. Write-once
+    /// per token so connect and disconnect always agree.
+    pub(crate) fn record_plugin_trigger_decision(&mut self, token: u64, run: bool) -> bool {
+        if let Some(existing) = self.plugin_trigger_decision(token) {
+            return existing;
+        }
+        self.plugin_trigger_decisions.push((token, run));
+        run
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
