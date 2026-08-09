@@ -2005,28 +2005,31 @@ async fn validate_bundle(
                 // resulting group is an opaque-TLS SNI listener or an L4
                 // stream_match listener. Apply the canonical group validator
                 // instead of an unconditional uniqueness check.
-                let shares_existing_stream_port =
-                    match validate_stream_port_candidate(db, namespace, proxy).await {
-                        Ok(shares) => shares,
-                        Err(AfterValidateError::BadRequest(errors))
-                        | Err(AfterValidateError::Conflict(errors)) => {
-                            failures.push(ValidationFailure {
-                                resource_type: "proxy",
-                                id: proxy.id.clone(),
-                                errors,
-                            });
-                            false
-                        }
-                        Err(AfterValidateError::Db(error)) => {
-                            return Err(classify_db_error(error));
-                        }
-                        Err(AfterValidateError::Response(_)) => {
-                            return Err(ApiSpecError::Internal(
-                                "stream-listener candidate validation returned an unexpected response"
-                                    .to_string(),
-                            ));
-                        }
-                    };
+                let shares_existing_stream_port = match validate_stream_port_candidate(
+                    db, namespace, proxy,
+                )
+                .await
+                {
+                    Ok(shares) => shares,
+                    Err(AfterValidateError::BadRequest(errors))
+                    | Err(AfterValidateError::Conflict(errors)) => {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors,
+                        });
+                        false
+                    }
+                    Err(AfterValidateError::Db(error)) => {
+                        return Err(classify_db_error(error));
+                    }
+                    Err(AfterValidateError::Response(_)) => {
+                        return Err(ApiSpecError::Internal(
+                            "stream-listener candidate validation returned an unexpected response"
+                                .to_string(),
+                        ));
+                    }
+                };
 
                 // Reserved gateway ports check (skip in CP mode — CP can't know each
                 // DP's reserved ports; matches the Proxy::after_validate guard).
@@ -2050,10 +2053,9 @@ async fn validate_bundle(
                     let transport_changed = existing_proxy
                         .map(|p| p.dispatch_kind.is_udp() != proxy.dispatch_kind.is_udp())
                         .unwrap_or(false);
-                    let should_probe = (existing_proxy.is_none()
-                        || port_changed
-                        || transport_changed)
-                        && !shares_existing_stream_port;
+                    let should_probe =
+                        (existing_proxy.is_none() || port_changed || transport_changed)
+                            && !shares_existing_stream_port;
                     if should_probe
                         && let Err(error) = crate::admin::crud::check_port_available(
                             port,

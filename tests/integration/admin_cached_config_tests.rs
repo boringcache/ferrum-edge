@@ -7581,9 +7581,11 @@ async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups(
         "listen_port": 19013,
         "hosts": ["tenant-a.example.com"]
     });
-    let (status, body) =
-        admin_post(&base_url, "/proxies", &token, &duplicate_owner).await;
-    assert_eq!(status, 409, "An ambiguous SNI owner was persisted: {body:?}");
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &duplicate_owner).await;
+    assert_eq!(
+        status, 409,
+        "An ambiguous SNI owner was persisted: {body:?}"
+    );
     assert!(
         body.to_string().contains("overlapping hosts"),
         "Expected the canonical listener-group conflict diagnostic: {body:?}"
