@@ -417,6 +417,7 @@ struct GatewayApiStatusIndexes<'a> {
     managed_gateways: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     services_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    service_imports_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     namespaces_by_name: HashMap<&'a str, &'a K8sObject>,
     /// Routes that parentRef a Gateway, keyed by `(gateway_ns, gateway_name)`.
     /// Built once so attachedRoutes and listener evaluation never rescan the
@@ -447,6 +448,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         let mut gateways_by_ns_name = HashMap::new();
         let mut secrets_by_ns_name = HashMap::new();
         let mut services_by_ns_name = HashMap::new();
+        let mut service_imports_by_ns_name = HashMap::new();
         let mut namespaces_by_name = HashMap::new();
         let mut routes_by_gateway: HashMap<(&str, &str), Vec<&K8sObject>> = HashMap::new();
         let mut reference_grant_permissions = ReferenceGrantPermissionIndex::default();
@@ -478,6 +480,19 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 "Service" => {
                     has_any_service = true;
                     services_by_ns_name.insert(
+                        (
+                            object.metadata.namespace.as_str(),
+                            object.metadata.name.as_str(),
+                        ),
+                        object,
+                    );
+                }
+                "ServiceImport"
+                    if crate::config_sources::k8s::backend_ref::is_service_import_object(
+                        object,
+                    ) =>
+                {
+                    service_imports_by_ns_name.insert(
                         (
                             object.metadata.namespace.as_str(),
                             object.metadata.name.as_str(),
@@ -556,6 +571,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             managed_gateways,
             secrets_by_ns_name,
             services_by_ns_name,
+            service_imports_by_ns_name,
             namespaces_by_name,
             routes_by_gateway,
             reference_grant_permissions,
@@ -3002,7 +3018,16 @@ fn route_unresolved_backend_ref_reason(
     route: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Option<&'static str> {
-    let services_observed = indexes.has_any_service;
+    use crate::config_sources::k8s::backend_ref::{
+        BackendRefStatusInventory, unresolved_backend_ref_reason,
+    };
+
+    let inventory = BackendRefStatusInventory {
+        services_by_ns_name: &indexes.services_by_ns_name,
+        service_imports_by_ns_name: &indexes.service_imports_by_ns_name,
+        has_any_service: indexes.has_any_service,
+    };
+
     for backend_ref in route
         .spec
         .get("rules")
@@ -3015,70 +3040,26 @@ fn route_unresolved_backend_ref_reason(
         if backend_ref.get("weight").and_then(Value::as_u64) == Some(0) {
             continue;
         }
-        let to_group = backend_ref
-            .get("group")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let to_kind = backend_ref
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("Service");
-        if !to_group.is_empty() || to_kind != "Service" {
-            return Some("InvalidKind");
-        }
-
-        let backend_namespace = backend_ref
-            .get("namespace")
-            .and_then(Value::as_str)
-            .unwrap_or(&route.metadata.namespace);
-        let backend_name = backend_ref.get("name").and_then(Value::as_str);
-        if backend_namespace != route.metadata.namespace
-            && !reference_grant_allows_backend_ref(
-                indexes,
-                route,
-                backend_namespace,
-                to_group,
-                to_kind,
-                backend_name,
-            )
-        {
-            return Some("RefNotPermitted");
-        }
-        if services_observed && let Some(backend_name) = backend_name {
-            if !indexes
-                .services_by_ns_name
-                .contains_key(&(backend_namespace, backend_name))
-            {
-                return Some("BackendNotFound");
-            }
-            let backend_port = backend_ref
-                .get("port")
-                .and_then(Value::as_u64)
-                .and_then(|port| u16::try_from(port).ok())
-                .unwrap_or(if route.kind == "GRPCRoute" { 50051 } else { 80 });
-            if !service_has_port_indexed(indexes, backend_namespace, backend_name, backend_port) {
-                return Some("BackendNotFound");
-            }
+        if let Some(reason) = unresolved_backend_ref_reason(
+            route,
+            backend_ref,
+            &inventory,
+            |to_namespace, to_group, to_kind, to_name| {
+                reference_grant_allows_backend_ref(
+                    indexes,
+                    route,
+                    to_namespace,
+                    to_group,
+                    to_kind,
+                    to_name,
+                )
+            },
+        ) {
+            return Some(reason);
         }
     }
 
     None
-}
-
-fn service_has_port_indexed(
-    indexes: &GatewayApiStatusIndexes<'_>,
-    namespace: &str,
-    name: &str,
-    port: u16,
-) -> bool {
-    indexes
-        .services_by_ns_name
-        .get(&(namespace, name))
-        .and_then(|service| service.spec.get("ports"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|entry| entry.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
 }
 
 fn reference_grant_allows_backend_ref(
@@ -3113,8 +3094,13 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("ReferenceGrant")
-                || message.contains("only core Service")
-                || message.contains("backendRef Service")
+                || crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_kind(
+                    message,
+                )
+                || crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message)
+                || crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_protocol(
+                    message,
+                )
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -3123,14 +3109,23 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
 fn reference_resolution_reason(error: &K8sTranslateError) -> &'static str {
     match error {
         K8sTranslateError::InvalidResource { message, .. }
-            if message.contains("backendRef Service") =>
+            if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_protocol(
+                message,
+            ) =>
         {
-            "BackendNotFound"
+            "UnsupportedProtocol"
         }
         K8sTranslateError::InvalidResource { message, .. }
-            if message.contains("only core Service") =>
+            if crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_kind(
+                message,
+            ) =>
         {
             "InvalidKind"
+        }
+        K8sTranslateError::InvalidResource { message, .. }
+            if crate::config_sources::k8s::backend_ref::message_is_backend_not_found(message) =>
+        {
+            "BackendNotFound"
         }
         _ => "RefNotPermitted",
     }
@@ -4865,10 +4860,9 @@ mod tests {
 
     #[test]
     fn route_status_reports_unresolved_non_service_backend_ref() {
-        // Guards the second prong of `error_is_reference_resolution` against
-        // wording drift in the translator's "only core Service backendRefs are
-        // supported" error. A change to that message would silently flip this
-        // route from `Accepted=True, ResolvedRefs=False` to `Accepted=False`.
+        // Guards status `InvalidKind` against wording drift in the shared
+        // backend-kind classifier: unknown groups/kinds must stay
+        // `Accepted=True, ResolvedRefs=False` rather than flipping Accepted.
         let route = object(
             "HTTPRoute",
             "api",
