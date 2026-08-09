@@ -810,8 +810,7 @@ pub(crate) const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 d
 // Reserved, validation-safe ID for the gateway-injected instance. Keep this
 // deliberately unlike a normal operator-selected ID: the injector treats it
 // as managed state and may replace its contents on SVID rotation/reload.
-const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str =
-    "ferrum-internal-gateway-workload-metrics";
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "ferrum-internal-gateway-workload-metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
     "source.",
