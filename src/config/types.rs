@@ -2199,6 +2199,37 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
+/// Outbound PROXY protocol version written on backend TCP connects.
+///
+/// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
+/// protocol v2 binary header to every backend connection **before** any
+/// relayed application bytes (and before backend TLS handshake when
+/// originating TLS). UDP/DTLS are rejected at validation — PROXY is
+/// TCP-borne. See `docs/tcp_udp_proxy.md`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendProxyProtocol {
+    /// PROXY protocol v2 binary (HAProxy / AWS NLB compatible).
+    V2,
+}
+
+impl BackendProxyProtocol {
+    /// Wire / SQL form (`"v2"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Parse a stored wire / SQL value. Unknown values fail closed.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
 /// Plugin scope (global, per-proxy, or proxy-group).
 ///
 /// - **Global**: Plugin runs on ALL proxies (unless overridden by a proxy-scoped
@@ -2507,6 +2538,20 @@ pub struct Proxy {
     /// Default: `false` (PROXY protocol disabled; socket peer is always used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_proxy_protocol: Option<bool>,
+    /// Opt-in outbound PROXY protocol written on backend TCP connects for this
+    /// stream proxy. When set to [`BackendProxyProtocol::V2`], Ferrum prepends
+    /// a PROXY v2 header carrying the trusted stream `client_ip` (and port)
+    /// immediately after the backend TCP connect — before any relayed bytes
+    /// and before backend TLS handshake when originating TLS. Compatible with
+    /// passthrough (header precedes the client's encrypted ClientHello).
+    ///
+    /// Only valid for `tcp` / `tcps` stream proxies. Setting it on UDP,
+    /// DTLS, or HTTP proxies produces a validation error. UDP outbound PROXY
+    /// is intentionally out of scope (session semantics differ).
+    ///
+    /// Default: `None` (disabled — backends see the gateway egress IP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_proxy_protocol: Option<BackendProxyProtocol>,
     /// Optional VirtualService L4 (`tcp[]`/`tls[]`) match predicates evaluated
     /// from trustworthy connection / workload metadata before the stream route
     /// is selected. `None` / empty arms = port (and SNI for passthrough) alone.
@@ -4448,6 +4493,21 @@ impl GatewayConfig {
                     errors.push(format!(
                         "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol \
                          is only valid for tcp/tcp_tls stream proxies",
+                        proxy.id,
+                        proxy.scheme_display()
+                    ));
+                }
+            }
+            // Outbound PROXY is likewise TCP-borne only.
+            if proxy.backend_proxy_protocol.is_some() {
+                let is_tcp_stream = matches!(
+                    proxy.dispatch_kind,
+                    DispatchKind::TcpRaw | DispatchKind::TcpTls
+                );
+                if !is_tcp_stream {
+                    errors.push(format!(
+                        "Proxy '{}' (scheme {}) sets backend_proxy_protocol but outbound PROXY \
+                         protocol is only valid for tcp/tcps stream proxies",
                         proxy.id,
                         proxy.scheme_display()
                     ));
@@ -6614,6 +6674,17 @@ impl Proxy {
         {
             errors.push(
                 "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                    .to_string(),
+            );
+        }
+
+        // Outbound PROXY protocol is also TCP-borne only.
+        if self.backend_proxy_protocol.is_some()
+            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        {
+            errors.push(
+                "backend_proxy_protocol is only valid for tcp/tcps stream proxies \
+                 (outbound PROXY protocol is TCP-borne)"
                     .to_string(),
             );
         }

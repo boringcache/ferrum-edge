@@ -41,6 +41,7 @@ Current mesh HBONE/DNS perf status lives in
 | MongoDB replica-set change-stream wakeups | Implemented — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs` + `mongo_store.rs`) |
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
 | SPIFFE Workload API JWT-SVID mint/validate/bundles | Implemented by [#3675](https://github.com/ferrum-edge/ferrum-edge/pull/3675), resolving [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); empty bundle success removed and the SPIRE serving boundary documented |
+| EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
 
 ## Live dedicated trackers (current backlog)
 
@@ -48,7 +49,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Residual | Issue(s) | Notes |
 |---|---|---|
-| EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
 | Mesh/HBONE/DNS perf baseline publication | [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) | Harnesses exist; `baseline.md` tables still `_TBD_` |
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |

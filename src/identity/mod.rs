@@ -14,6 +14,10 @@
 //!   Workload API's three JWT RPCs.
 //! - [`rotation`] — background task that renews SVIDs and hot-swaps via
 //!   `ArcSwap` for the lock-free TLS-resolver path.
+//! - [`svid_source_watch`] — polls the configured gateway SVID material
+//!   sources (files and external providers) and republishes the bundle when
+//!   material bytes or configured source identity change (provider version
+//!   metadata alone does not).
 //!
 //! Mesh mode wires the Workload API / internal rotation pieces into the
 //! gateway SVID slot when `FERRUM_MESH_CA_BACKEND` is enabled. The TLS builders
@@ -33,6 +37,7 @@ pub mod file_loader;
 pub mod jwt_svid;
 pub mod rotation;
 pub mod spiffe;
+pub mod svid_source_watch;
 pub mod workload_api;
 
 #[allow(unused_imports)]

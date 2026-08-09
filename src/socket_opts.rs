@@ -1340,7 +1340,10 @@ pub mod ktls {
     use zeroize::{Zeroize, Zeroizing};
 
     // Linux TLS ULP constants (from <linux/tls.h>)
-    const SOL_TLS: libc::c_int = 282;
+    /// `setsockopt`/`cmsg` level for the kernel TLS ULP. Also used by
+    /// [`crate::proxy::ktls_record`] for the record-type ancillary contract, so
+    /// the two cannot drift.
+    pub const SOL_TLS: libc::c_int = 282;
     const TLS_TX: libc::c_int = 1;
     const TLS_RX: libc::c_int = 2;
 
@@ -1448,6 +1451,237 @@ pub mod ktls {
         /// ChaCha20-Poly1305 — requires Linux 5.11+ for kTLS support.
         /// (AES-GCM kTLS support landed in 4.13/4.17.)
         Chacha20Poly1305,
+    }
+
+    /// Where a cipher's `tls12_crypto_info_*` struct keeps the fields the
+    /// record-sequence readback has to validate and extract.
+    ///
+    /// Sizes and offsets come from the real `#[repr(C)]` definitions above via
+    /// `size_of` / `offset_of`, so the parser cannot drift from the structs the
+    /// installer hands the kernel.
+    struct CryptoInfoLayout {
+        size: usize,
+        seq_offset: usize,
+        cipher_type: u16,
+    }
+
+    fn crypto_info_layout(cipher: KtlsCipher) -> CryptoInfoLayout {
+        match cipher {
+            KtlsCipher::Aes128Gcm => CryptoInfoLayout {
+                size: std::mem::size_of::<TlsCryptoInfoAes128Gcm>(),
+                seq_offset: std::mem::offset_of!(TlsCryptoInfoAes128Gcm, rec_seq),
+                cipher_type: TLS_CIPHER_AES_GCM_128,
+            },
+            KtlsCipher::Aes256Gcm => CryptoInfoLayout {
+                size: std::mem::size_of::<TlsCryptoInfoAes256Gcm>(),
+                seq_offset: std::mem::offset_of!(TlsCryptoInfoAes256Gcm, rec_seq),
+                cipher_type: TLS_CIPHER_AES_GCM_256,
+            },
+            KtlsCipher::Chacha20Poly1305 => CryptoInfoLayout {
+                size: std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>(),
+                seq_offset: std::mem::offset_of!(TlsCryptoInfoChaCha20Poly1305, rec_seq),
+                cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
+            },
+        }
+    }
+
+    /// Read one direction's live TLS record sequence number from the kernel.
+    ///
+    /// `getsockopt(SOL_TLS, TLS_TX | TLS_RX)` returns the direction's whole
+    /// `tls12_crypto_info_*` structure, whose `rec_seq` field is the **next**
+    /// record sequence number the kernel will use — i.e. exactly the count of
+    /// records that traffic key has already protected, including everything
+    /// consumed by the handshake before the keys were installed. That is the
+    /// message counter `rustls`'s kernel-connection API requires the caller to
+    /// track once it stops tracking it itself (see
+    /// [`crate::proxy::ktls_confidentiality`]).
+    ///
+    /// Everything about the answer is validated rather than assumed: the
+    /// option length must be exactly the struct this cipher installs, and the
+    /// echoed `version` / `cipher_type` must be the ones this session
+    /// installed. A kernel that answers with a different layout therefore fails
+    /// closed instead of yielding a plausible-looking wrong counter.
+    ///
+    /// The reply also carries the session key, so the scratch buffer is
+    /// `Zeroizing` and nothing but `rec_seq` is ever read out of it or logged.
+    pub fn read_ktls_record_seq(
+        fd: std::os::unix::io::RawFd,
+        cipher: KtlsCipher,
+        tls_version: u16,
+        is_tx: bool,
+    ) -> std::io::Result<u64> {
+        let layout = crypto_info_layout(cipher);
+        let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; layout.size]);
+        let mut len = layout.size as libc::socklen_t;
+        let optname = if is_tx { TLS_TX } else { TLS_RX };
+        // SAFETY: `buf` is a live allocation of exactly `layout.size` bytes and
+        // `len` describes it, so the kernel cannot write past it. `fd` is
+        // borrowed from a live socket by the caller for the duration of the
+        // call.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                SOL_TLS,
+                optname,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len as usize != layout.size {
+            return Err(std::io::Error::other(format!(
+                "kTLS: crypto info readback returned {len} bytes, expected {}",
+                layout.size
+            )));
+        }
+        let version = u16::from_ne_bytes([buf[0], buf[1]]);
+        let cipher_type = u16::from_ne_bytes([buf[2], buf[3]]);
+        if version != tls_version {
+            return Err(std::io::Error::other(format!(
+                "kTLS: crypto info readback reports version 0x{version:04x}, \
+                 expected 0x{tls_version:04x}"
+            )));
+        }
+        if cipher_type != layout.cipher_type {
+            return Err(std::io::Error::other(format!(
+                "kTLS: crypto info readback reports cipher {cipher_type}, expected {}",
+                layout.cipher_type
+            )));
+        }
+        let mut seq = [0u8; 8];
+        seq.copy_from_slice(&buf[layout.seq_offset..layout.seq_offset + 8]);
+        Ok(u64::from_be_bytes(seq))
+    }
+
+    /// Current `SO_RCVBUF` for a socket, in bytes.
+    ///
+    /// This is the kernel's `sk_rcvbuf`, already doubled for skb overhead. TCP
+    /// admits another skb only while the receive-memory charge is at or below
+    /// this value, so it bounds unread wire data together with one admitted-skb
+    /// overshoot. On its own it is **not** a stable bound: TCP receive
+    /// autotuning rewrites it as the connection runs.
+    /// [`pin_socket_receive_buffer`] is what makes a readback hold still.
+    pub fn socket_receive_buffer_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` is a live `c_int` and `len` describes it exactly.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len as usize != std::mem::size_of::<libc::c_int>() || value < 0 {
+            return Err(std::io::Error::other(
+                "kTLS: SO_RCVBUF readback is not a non-negative int",
+            ));
+        }
+        Ok(value as u64)
+    }
+
+    /// Bytes currently queued on `fd` for reading, from the kernel's own
+    /// `FIONREAD` accounting.
+    ///
+    /// Called on a socket that carries the TLS ULP but no keys yet, so this is
+    /// still plain `tcp_ioctl` accounting: exactly the unread wire bytes
+    /// `rcv_nxt - copied_seq`. It is the *only* sound way to bound data that
+    /// was already queued before [`pin_socket_receive_buffer`] took effect —
+    /// that data was admitted under whatever `sk_rcvbuf` autotuning had reached
+    /// at the time, which no later observation can reconstruct.
+    pub fn socket_receive_queue_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: `fd` is borrowed from a live socket by the caller and
+        // `FIONREAD` writes exactly one `c_int` through the pointer.
+        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, std::ptr::addr_of_mut!(queued)) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if queued < 0 {
+            return Err(std::io::Error::other(
+                "kTLS: FIONREAD reported a negative receive queue",
+            ));
+        }
+        Ok(queued as u64)
+    }
+
+    /// Pin this socket's receive buffer so the kernel can never grow it again,
+    /// and return the kernel's own readback of the pinned size.
+    ///
+    /// # The invariant this establishes
+    ///
+    /// A successful `setsockopt(SOL_SOCKET, SO_RCVBUF)` sets `SOCK_RCVBUF_LOCK`
+    /// in `sk->sk_userlocks`, and every kernel path that would otherwise raise
+    /// `sk_rcvbuf` — `tcp_rcv_space_adjust`, `tcp_clamp_window` — is gated on
+    /// that flag being clear. From the moment this returns, `sk_rcvbuf` for this
+    /// socket can only change through another `setsockopt` on this same fd,
+    /// which the gateway never issues. Raising `net.ipv4.tcp_rmem[2]` or
+    /// `net.core.rmem_max` afterwards therefore cannot move it: those sysctls
+    /// feed autotuning and future `setsockopt` clamping, not a locked socket.
+    ///
+    /// That is what a confidentiality bound needs and what a `/proc` snapshot
+    /// can never give: a *per-socket* ceiling the kernel itself enforces for the
+    /// remaining life of the connection.
+    ///
+    /// # Linux doubling and clamping, handled by readback
+    ///
+    /// The kernel clamps the requested value to `net.core.rmem_max`, then stores
+    /// `max(2 * value, SOCK_MIN_RCVBUF)`. Neither adjustment is predicted here —
+    /// the `getsockopt` readback afterwards *is* the answer, and it is the value
+    /// the caller must bound with. `request_bytes` is only a request.
+    ///
+    /// The request is floored at half the socket's live `SO_RCVBUF`, converting
+    /// the doubled readback back into `setsockopt` request units so pinning does
+    /// not accidentally double an already-large buffer. If the kernel still
+    /// lands below the prior readback (a small `rmem_max` against an
+    /// already-autotuned socket), no queued byte is lost: Linux keeps skbs that
+    /// are already on the receive queue and merely stops admitting more, and
+    /// the caller bounds the pre-existing queue separately with
+    /// [`socket_receive_queue_bytes`].
+    pub fn pin_socket_receive_buffer(
+        fd: std::os::unix::io::RawFd,
+        request_bytes: u64,
+    ) -> std::io::Result<u64> {
+        let current = socket_receive_buffer_bytes(fd)?;
+        // `sk_setsockopt` rejects a negative value and internally clamps to
+        // `INT_MAX / 2` before doubling, so saturate here rather than wrap. A
+        // getsockopt readback is already doubled; convert it back to request
+        // units before applying the throughput floor.
+        let current_request_units = current.div_ceil(2);
+        let want = request_bytes
+            .max(current_request_units)
+            .min(libc::c_int::MAX as u64 / 2) as libc::c_int;
+        // SAFETY: `want` is a live `c_int` and `len` describes it exactly; `fd`
+        // is borrowed from a live socket by the caller.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(want).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The readback, not the request, is the bound. A kernel that answered
+        // the set but cannot report the result leaves nothing to bound with, so
+        // the error propagates and the caller refuses the handoff.
+        let pinned = socket_receive_buffer_bytes(fd)?;
+        if pinned == 0 {
+            return Err(std::io::Error::other(
+                "kTLS: pinned SO_RCVBUF read back as zero",
+            ));
+        }
+        Ok(pinned)
     }
 
     /// Attempt to enable kTLS on a connected TCP socket.
@@ -1722,13 +1956,26 @@ pub mod ktls {
     /// would fail AFTER we have already consumed the TLS stream via
     /// `into_inner()` + `dangerous_extract_secrets()` — at which point
     /// there is no safe way back to userspace TLS, forcing a hard
-    /// connection drop. The per-cipher gate in `try_ktls_splice` prevents
+    /// connection drop. The per-cipher gate in `proxy::ktls_accept` prevents
     /// this by refusing connections for ciphers whose kernel probe failed
     /// BEFORE extracting secrets.
+    ///
+    /// The `*_record_seq` flags are a second, independent capability: whether
+    /// this kernel will hand back the direction's live `rec_seq` through
+    /// `getsockopt(SOL_TLS, TLS_TX | TLS_RX)`. A cipher with a finite
+    /// confidentiality limit (both AES-GCM suites) cannot be handed off without
+    /// it, because that counter is the only trustworthy record count once
+    /// rustls stops tracking one. It is probed separately from installability
+    /// so a kernel that cannot report sequence numbers still keeps
+    /// ChaCha20-Poly1305 kTLS, whose rustls confidentiality limit is
+    /// `u64::MAX`.
     struct KtlsAvailability {
         aes128gcm: bool,
         aes256gcm: bool,
         chacha20_poly1305: bool,
+        aes128gcm_record_seq: bool,
+        aes256gcm_record_seq: bool,
+        chacha20_poly1305_record_seq: bool,
     }
 
     static KTLS_AVAILABILITY: std::sync::OnceLock<KtlsAvailability> = std::sync::OnceLock::new();
@@ -1782,12 +2029,128 @@ pub mod ktls {
                     std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>() as libc::socklen_t,
                 )
             };
+            // Sequence-number observability is probed only for ciphers that
+            // installed: an unusable cipher has nothing to report.
+            let aes128gcm_record_seq =
+                aes128gcm && probe_record_seq_observable(KtlsCipher::Aes128Gcm);
+            let aes256gcm_record_seq =
+                aes256gcm && probe_record_seq_observable(KtlsCipher::Aes256Gcm);
+            let chacha20_poly1305_record_seq =
+                chacha20_poly1305 && probe_record_seq_observable(KtlsCipher::Chacha20Poly1305);
             KtlsAvailability {
                 aes128gcm,
                 aes256gcm,
                 chacha20_poly1305,
+                aes128gcm_record_seq,
+                aes256gcm_record_seq,
+                chacha20_poly1305_record_seq,
             }
         })
+    }
+
+    /// Whether this kernel exposes a usable live record sequence number for
+    /// `cipher` in **both** directions.
+    ///
+    /// Probed once at startup on a throwaway loopback socket, exactly like
+    /// installability, so a cipher whose confidentiality limit could not be
+    /// enforced is refused *before* a handshake is consumed rather than after
+    /// the keys have already left userspace.
+    pub fn is_ktls_record_seq_observable(cipher: KtlsCipher) -> bool {
+        let a = ktls_availability();
+        match cipher {
+            KtlsCipher::Aes128Gcm => a.aes128gcm_record_seq,
+            KtlsCipher::Aes256Gcm => a.aes256gcm_record_seq,
+            KtlsCipher::Chacha20Poly1305 => a.chacha20_poly1305_record_seq,
+        }
+    }
+
+    /// Install both directions on a throwaway kTLS socket with two distinct,
+    /// non-zero record sequence numbers and require the kernel to hand each of
+    /// them back on the direction it belongs to.
+    ///
+    /// That single check covers everything the enforcement path depends on:
+    /// the `getsockopt` exists for `TLS_TX` *and* `TLS_RX`, the reply matches
+    /// this cipher's `tls12_crypto_info_*` layout and version, the `rec_seq`
+    /// field is where the struct says it is and is big-endian, and TX and RX
+    /// are not aliased onto one counter. Distinct probe values are what make
+    /// the direction check meaningful — equal values would pass even on a
+    /// kernel that answered both queries from the same context.
+    fn probe_record_seq_observable(cipher: KtlsCipher) -> bool {
+        /// Distinctive, direction-specific, non-zero probe sequence numbers.
+        const PROBE_TX_SEQ: u64 = 0x0102_0304_0506_0708;
+        const PROBE_RX_SEQ: u64 = 0x1112_1314_1516_1718;
+
+        // SAFETY: raw socket setup and teardown, with every fd closed on every
+        // exit path below.
+        let Some((server_fd, client_fd)) = (unsafe { probe_socket_pair() }) else {
+            return false;
+        };
+        let observable = probe_record_seq_on_fd(server_fd, cipher, PROBE_TX_SEQ, PROBE_RX_SEQ);
+        // SAFETY: both fds were produced by `probe_socket_pair` and are closed
+        // exactly once here.
+        unsafe {
+            libc::close(server_fd);
+            libc::close(client_fd);
+        }
+        if !observable {
+            debug!(
+                "kTLS: kernel does not report a usable record sequence number for {cipher:?}; \
+                 handoff for this cipher will be declined when its suite has a \
+                 confidentiality limit"
+            );
+        }
+        observable
+    }
+
+    /// Install and read back both directions on an already-connected socket.
+    fn probe_record_seq_on_fd(
+        fd: std::os::unix::io::RawFd,
+        cipher: KtlsCipher,
+        tx_seq: u64,
+        rx_seq: u64,
+    ) -> bool {
+        let ulp_name = b"tls\0";
+        // SAFETY: `fd` is a live connected TCP socket and `ulp_name` is a
+        // NUL-terminated buffer of the given length.
+        let ulp_ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                ulp_name.as_ptr() as *const libc::c_void,
+                ulp_name.len() as libc::socklen_t,
+            )
+        };
+        if ulp_ret != 0 {
+            return false;
+        }
+        let key_len = match cipher {
+            KtlsCipher::Aes128Gcm => 16,
+            KtlsCipher::Aes256Gcm | KtlsCipher::Chacha20Poly1305 => 32,
+        };
+        // Throwaway all-zero key material: nothing is ever encrypted or
+        // decrypted on this socket, only the sequence bookkeeping is read.
+        let key = vec![0u8; key_len];
+        let iv = [0u8; 12];
+        let version = TLS_1_2_VERSION;
+        let install = |is_tx: bool, seq: u64| -> bool {
+            let seq = seq.to_be_bytes();
+            let installed = match cipher {
+                KtlsCipher::Aes128Gcm => install_aes128gcm(fd, version, is_tx, &key, &iv, &seq),
+                KtlsCipher::Aes256Gcm => install_aes256gcm(fd, version, is_tx, &key, &iv, &seq),
+                KtlsCipher::Chacha20Poly1305 => {
+                    install_chacha20_poly1305(fd, version, is_tx, &key, &iv, &seq)
+                }
+            };
+            installed.is_ok()
+        };
+        if !install(true, tx_seq) || !install(false, rx_seq) {
+            return false;
+        }
+        let observed_tx = read_ktls_record_seq(fd, cipher, TLS_1_2_VERSION, true);
+        let observed_rx = read_ktls_record_seq(fd, cipher, TLS_1_2_VERSION, false);
+        matches!(observed_tx, Ok(seq) if seq == tx_seq)
+            && matches!(observed_rx, Ok(seq) if seq == rx_seq)
     }
 
     /// Attempts to load the TLS ULP module via `modprobe tls` (requires root).
@@ -1807,7 +2170,7 @@ pub mod ktls {
     }
 
     /// Returns `true` if the kernel accepts AES-128-GCM kTLS key installs.
-    /// Gate `try_ktls_splice` on this before extracting secrets for AES-128-GCM
+    /// Gate the kTLS accept on this before extracting secrets for AES-128-GCM
     /// sessions.
     pub fn is_ktls_aes128gcm_available() -> bool {
         ktls_availability().aes128gcm
@@ -1821,7 +2184,7 @@ pub mod ktls {
     /// Returns `true` if the kernel accepts ChaCha20-Poly1305 kTLS key installs
     /// (Linux 5.11+). Kernels with AES-GCM kTLS but no ChaCha20 kTLS exist in
     /// the wild (4.13+ vs 5.11+), so this MUST be checked independently before
-    /// handing a ChaCha20-Poly1305 connection to `try_ktls_splice`.
+    /// handing a ChaCha20-Poly1305 connection to the kTLS accept path.
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         ktls_availability().chacha20_poly1305
     }
@@ -1844,10 +2207,49 @@ pub mod ktls {
     #[allow(clippy::cast_possible_truncation)]
     unsafe fn probe_cipher(info_ptr: *const libc::c_void, info_len: libc::socklen_t) -> bool {
         unsafe {
+            let Some((server_fd, client_fd)) = probe_socket_pair() else {
+                return false;
+            };
+
+            // Install `TCP_ULP` "tls" on the server-side TCP socket.
+            let ulp_name = b"tls\0";
+            let ulp_ret = libc::setsockopt(
+                server_fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                ulp_name.as_ptr() as *const libc::c_void,
+                ulp_name.len() as libc::socklen_t,
+            );
+            if ulp_ret != 0 {
+                libc::close(server_fd);
+                libc::close(client_fd);
+                return false;
+            }
+
+            // Install a dummy TX key for the cipher under test. A value of 0
+            // for tx_ret means the kernel accepted the cipher install and the
+            // full kTLS path works for this cipher.
+            let tx_ret = libc::setsockopt(server_fd, SOL_TLS, TLS_TX, info_ptr, info_len);
+
+            libc::close(server_fd);
+            libc::close(client_fd);
+            tx_ret == 0
+        }
+    }
+
+    /// Establish a throwaway loopback TCP connection and return
+    /// `(server_fd, client_fd)`, or `None` if anything in the setup failed.
+    ///
+    /// The caller owns both fds and must close them. Shared by the
+    /// installability probe and the record-sequence observability probe so the
+    /// two cannot drift on what "a real kTLS-capable socket" means.
+    #[allow(clippy::cast_possible_truncation)]
+    unsafe fn probe_socket_pair() -> Option<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
+        unsafe {
             // 1. Create listener socket, bind to 127.0.0.1:0, listen.
             let listener_fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
             if listener_fd < 0 {
-                return false;
+                return None;
             }
 
             let mut addr: libc::sockaddr_in = std::mem::zeroed();
@@ -1864,12 +2266,12 @@ pub mod ktls {
             ) < 0
             {
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             if libc::listen(listener_fd, 1) < 0 {
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             // Read back the assigned ephemeral port.
@@ -1883,21 +2285,21 @@ pub mod ktls {
             ) < 0
             {
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             // 2. Create client socket, set O_NONBLOCK, connect (EINPROGRESS expected).
             let client_fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
             if client_fd < 0 {
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
             if flags < 0 || libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
                 libc::close(client_fd);
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             let connect_ret = libc::connect(
@@ -1910,7 +2312,7 @@ pub mod ktls {
                 if err != libc::EINPROGRESS {
                     libc::close(client_fd);
                     libc::close(listener_fd);
-                    return false;
+                    return None;
                 }
             }
 
@@ -1926,35 +2328,13 @@ pub mod ktls {
             if server_fd < 0 {
                 libc::close(client_fd);
                 libc::close(listener_fd);
-                return false;
+                return None;
             }
 
             // We no longer need the listener.
             libc::close(listener_fd);
 
-            // 4. Install TCP_ULP "tls" on the server-side TCP socket.
-            let ulp_name = b"tls\0";
-            let ulp_ret = libc::setsockopt(
-                server_fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_ULP,
-                ulp_name.as_ptr() as *const libc::c_void,
-                ulp_name.len() as libc::socklen_t,
-            );
-            if ulp_ret != 0 {
-                libc::close(server_fd);
-                libc::close(client_fd);
-                return false;
-            }
-
-            // 5. Install dummy TX key for the cipher under test. A value of 0
-            //    for tx_ret means the kernel accepted the cipher install and
-            //    the full kTLS path works for this cipher.
-            let tx_ret = libc::setsockopt(server_fd, SOL_TLS, TLS_TX, info_ptr, info_len);
-
-            libc::close(server_fd);
-            libc::close(client_fd);
-            tx_ret == 0
+            Some((server_fd, client_fd))
         }
     }
 }
@@ -2005,6 +2385,41 @@ pub mod ktls {
     #[allow(dead_code)]
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         false
+    }
+
+    /// No kernel TLS ULP exists off Linux, so no record sequence number can be
+    /// observed. Reporting `false` keeps the confidentiality-limit gate
+    /// fail-closed on every non-Linux build.
+    #[allow(dead_code)]
+    pub fn is_ktls_record_seq_observable(_cipher: KtlsCipher) -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn read_ktls_record_seq(
+        _fd: i32,
+        _cipher: KtlsCipher,
+        _tls_version: u16,
+        _is_tx: bool,
+    ) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
+    }
+
+    #[allow(dead_code)]
+    pub fn socket_receive_buffer_bytes(_fd: i32) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
+    }
+
+    #[allow(dead_code)]
+    pub fn socket_receive_queue_bytes(_fd: i32) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
+    }
+
+    /// No socket can be pinned off Linux because no socket can carry kTLS
+    /// there. Failing keeps the receive-window bound fail-closed.
+    #[allow(dead_code)]
+    pub fn pin_socket_receive_buffer(_fd: i32, _request_bytes: u64) -> std::io::Result<u64> {
+        Err(std::io::Error::other("kTLS is Linux-only"))
     }
 }
 
@@ -2906,7 +3321,7 @@ mod ktls_availability_tests {
     fn composite_is_any_of_three() {
         // `is_ktls_available()` must return true iff at least one per-cipher
         // probe returned true. This invariant is what upstream auto-detection
-        // depends on to set `ktls_enabled`, and is what the `try_ktls_splice`
+        // depends on to set `ktls_enabled`, and is what the `ktls_accept`
         // per-cipher gate relies on to safely refuse connections whose
         // specific cipher's probe failed.
         let any_supported = is_ktls_aes128gcm_available()

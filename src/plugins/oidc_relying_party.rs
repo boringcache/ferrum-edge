@@ -52,6 +52,8 @@ const DEFAULT_CHALLENGE_API_STATUS: u64 = 401;
 const MAX_STATE_TTL_SECS: u64 = 3600;
 const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
+const PENDING_FLOW_PAYLOAD_VERSION: u8 = 1;
+const MAX_PENDING_FLOW_ORIGINAL_URL_BYTES: usize = 2048;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_USERINFO_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 256 * 1024;
@@ -180,6 +182,10 @@ struct DiscoveryDoc {
 
 struct SessionRuntime {
     codec: super::utils::session_cookie::SessionCookieCodec,
+    /// Seals short-lived pending authorization-code flows into the host-only
+    /// correlation cookie. Uses the same encryption secret(s) as sessions, but a
+    /// distinct AAD so session cookies cannot be reused as pending-flow state.
+    pending_codec: super::utils::session_cookie::SessionCookieCodec,
     cookie_name: String,
     cookie_attrs: String,
     context_id: String,
@@ -239,27 +245,55 @@ impl fmt::Display for SecretString {
     }
 }
 
+/// Per-instance admission/replay stub for a pending browser login.
+///
+/// PKCE verifier, nonce, and original redirect live only in the AEAD-sealed
+/// correlation cookie so a callback can complete on any replica that shares the
+/// plugin configuration and encryption secrets. This cache bounds login starts
+/// on the issuing instance and provides best-effort same-instance one-time use;
+/// it must never be required for a valid cross-replica callback.
 #[derive(Clone)]
 struct FlowState {
-    code_verifier: String,
-    nonce: String,
-    original_url: String,
-    browser_binding_hash: [u8; 32],
+    sealed_binding_hash: [u8; 32],
     source_ip: String,
     expires_at: Instant,
 }
 
 struct StateCache {
     entries: DashMap<String, FlowState>,
+    /// States already accepted for callback processing on this instance. This
+    /// is a bounded, best-effort local replay aid; the provider's one-time
+    /// authorization code remains the cross-replica replay authority.
+    spent: DashMap<String, Instant>,
     expiry_buckets: DashMap<u64, Arc<DashMap<String, ()>>>,
     per_source_entries: DashMap<String, usize>,
     active_entries: AtomicUsize,
+    active_spent: AtomicUsize,
     last_evicted_bucket: AtomicU64,
     origin: Instant,
     max_entries: usize,
     max_entries_per_source: usize,
     shard_amount: usize,
     ttl: Duration,
+}
+
+/// Stateless pending authorization-code flow sealed into the correlation cookie.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingFlowPayload {
+    version: u8,
+    context_id: String,
+    state: String,
+    code_verifier: String,
+    nonce: String,
+    original_url: String,
+    expires_at_unix: i64,
+}
+
+struct CreatedFlow {
+    state: String,
+    code_verifier: String,
+    nonce: String,
+    sealed_cookie: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -562,6 +596,8 @@ impl OidcRelyingParty {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_context);
         let mut session_aad = b"ferrum-edge/oidc-session/v2\0".to_vec();
         session_aad.extend_from_slice(&session_context);
+        let mut pending_aad = b"ferrum-edge/oidc-pending-flow/v1\0".to_vec();
+        pending_aad.extend_from_slice(&session_context);
         let correlation_cookie_name_prefix =
             derived_cookie_name("ferrum_oidc_state", &session_context);
         let store = optional_string(session_obj, "store", "session")?
@@ -638,6 +674,12 @@ impl OidcRelyingParty {
                 previous_secret.as_deref(),
                 max_cookie_bytes as usize,
                 &session_aad,
+            )?,
+            pending_codec: super::utils::session_cookie::SessionCookieCodec::new_with_aad(
+                &encryption_secret,
+                previous_secret.as_deref(),
+                max_cookie_bytes as usize,
+                &pending_aad,
             )?,
             cookie_name,
             cookie_attrs,
@@ -810,25 +852,33 @@ impl OidcRelyingParty {
             return self.callback_reject(400, r#"{"error":"Missing state"}"#.to_string(), None);
         };
         let correlation_cookie_name = self.correlation_cookie_name(&state);
-        let Some(browser_binding) = cookie_value(ctx, &correlation_cookie_name) else {
+        let Some(sealed_cookie) = cookie_value(ctx, &correlation_cookie_name) else {
             return self.callback_reject(
                 400,
                 r#"{"error":"Invalid state"}"#.to_string(),
                 Some(&state),
             );
         };
-        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes());
-        let Some(flow) = self
+        let Some(flow) = self.open_pending_flow(sealed_cookie, &state) else {
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid state"}"#.to_string(),
+                Some(&state),
+            );
+        };
+        let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
+        if self
             .session
             .state_cache
-            .take_bound(&state, &browser_binding_hash)
-        else {
+            .admit_callback(&state, &sealed_binding_hash)
+            .is_err()
+        {
             return self.callback_reject(
                 400,
                 r#"{"error":"Invalid state"}"#.to_string(),
                 Some(&state),
             );
-        };
+        }
         if let Some(error) = ctx.query_params.get("error") {
             return self.callback_reject(400, json!({"error": error}).to_string(), Some(&state));
         };
@@ -1426,11 +1476,11 @@ impl OidcRelyingParty {
 
     fn challenge(&self, ctx: &mut RequestContext, clear: bool) -> PluginResult {
         if is_browser_request(ctx, &self.behavior) {
-            // The correlation secret is deliberately host-only. Do not start a
-            // flow when the configured callback host differs from the host on
-            // which the browser would receive the cookie: the callback could
-            // never return the binding, and restoring a parent Domain would
-            // reintroduce sibling-host disclosure and overwrite attacks.
+            // The sealed pending-flow cookie is deliberately host-only. Do not
+            // start a flow when the configured callback host differs from the
+            // host on which the browser would receive the cookie: the callback
+            // could never return the sealed state, and restoring a parent Domain
+            // would reintroduce sibling-host disclosure and overwrite attacks.
             let Some(request_host) = correlation_cookie_host_from_request(ctx) else {
                 return reject(
                     400,
@@ -1443,7 +1493,7 @@ impl OidcRelyingParty {
                     r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
                 );
             }
-            let (state, flow, browser_binding) = match self.create_flow(ctx) {
+            let created = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
             };
@@ -1452,11 +1502,14 @@ impl OidcRelyingParty {
             // Redirecting to the relative post_login_default_path would send the
             // browser back to the protected app root and loop. Drop the just-inserted
             // state slot so an outage cannot exhaust the state cache.
-            let Some(location) = self.authorization_url(&state, &flow) else {
-                self.session.state_cache.take(&state);
+            let Some(location) =
+                self.authorization_url(&created.state, &created.code_verifier, &created.nonce)
+            else {
+                self.session.state_cache.take(&created.state);
                 return reject(503, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
             };
-            let correlation_cookie = self.correlation_cookie(&state, &browser_binding);
+            let correlation_cookie =
+                self.correlation_cookie(&created.state, &created.sealed_cookie);
             let cookie = if clear {
                 join_set_cookies(correlation_cookie, self.clear_cookie())
             } else {
@@ -1480,34 +1533,45 @@ impl OidcRelyingParty {
         }
     }
 
-    fn create_flow(&self, ctx: &RequestContext) -> Result<(String, FlowState, String), String> {
+    fn create_flow(&self, ctx: &RequestContext) -> Result<CreatedFlow, String> {
         let state = random_b64(32)?;
         let code_verifier = random_b64(64)?;
         let nonce = random_b64(32)?;
-        let browser_binding = random_b64(32)?;
-        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes());
-        let original_url = original_url(ctx, &self.behavior);
-        let flow = FlowState {
-            code_verifier,
-            nonce,
+        let original_url = bounded_original_url(ctx, &self.behavior);
+        let now = chrono::Utc::now().timestamp();
+        let expires_at_unix = now.saturating_add(self.behavior.state_ttl.as_secs() as i64);
+        let payload = PendingFlowPayload {
+            version: PENDING_FLOW_PAYLOAD_VERSION,
+            context_id: self.session.context_id.clone(),
+            state: state.clone(),
+            code_verifier: code_verifier.clone(),
+            nonce: nonce.clone(),
             original_url,
-            browser_binding_hash,
+            expires_at_unix,
+        };
+        let sealed_cookie = self.seal_pending_flow(&payload)?;
+        let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
+        let flow = FlowState {
+            sealed_binding_hash,
             source_ip: ctx.client_ip.clone(),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
-        self.session
-            .state_cache
-            .insert(state.clone(), flow.clone())?;
-        Ok((state, flow, browser_binding))
+        self.session.state_cache.insert(state.clone(), flow)?;
+        Ok(CreatedFlow {
+            state,
+            code_verifier,
+            nonce,
+            sealed_cookie,
+        })
     }
 
     /// Build the absolute IdP authorization URL for a browser challenge. Returns
     /// `None` when discovery has not loaded yet or the discovered
     /// `authorization_endpoint` fails to parse, so the caller fails closed instead
     /// of redirecting the browser to the protected app root (which would loop).
-    fn authorization_url(&self, state: &str, flow: &FlowState) -> Option<String> {
+    fn authorization_url(&self, state: &str, code_verifier: &str, nonce: &str) -> Option<String> {
         let discovery = self.provider.discovery.load().as_ref().as_ref().cloned()?;
-        let challenge = pkce_challenge(&flow.code_verifier);
+        let challenge = pkce_challenge(code_verifier);
         let mut url = Url::parse(&discovery.authorization_endpoint).ok()?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
@@ -1515,10 +1579,58 @@ impl OidcRelyingParty {
             .append_pair("redirect_uri", &self.provider.redirect_uri)
             .append_pair("scope", &self.provider.scopes.join(" "))
             .append_pair("state", state)
-            .append_pair("nonce", &flow.nonce)
+            .append_pair("nonce", nonce)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
         Some(url.to_string())
+    }
+
+    fn seal_pending_flow(&self, payload: &PendingFlowPayload) -> Result<String, String> {
+        if payload.original_url.len() > MAX_PENDING_FLOW_ORIGINAL_URL_BYTES {
+            return Err(r#"{"error":"OIDC pending redirect too large"}"#.to_string());
+        }
+        let bytes = serde_json::to_vec(payload)
+            .map_err(|_| r#"{"error":"OIDC state creation failed"}"#.to_string())?;
+        if encoded_session_cookie_len(bytes.len()) > self.session.max_cookie_bytes {
+            return Err(r#"{"error":"OIDC state creation failed"}"#.to_string());
+        }
+        self.session.pending_codec.seal(&bytes).map_err(|error| {
+            warn!(
+                plugin = "oidc_relying_party",
+                error = %error,
+                max_cookie_bytes = self.session.max_cookie_bytes,
+                "OIDC sealed pending-flow cookie exceeded max_cookie_bytes"
+            );
+            r#"{"error":"OIDC state creation failed"}"#.to_string()
+        })
+    }
+
+    fn open_pending_flow(&self, sealed: &str, expected_state: &str) -> Option<PendingFlowPayload> {
+        if sealed.is_empty() || sealed.len() > self.session.max_cookie_bytes {
+            return None;
+        }
+        let bytes = self.session.pending_codec.open(sealed)?;
+        if bytes.len() > self.session.max_cookie_bytes {
+            return None;
+        }
+        let payload: PendingFlowPayload = serde_json::from_slice(&bytes).ok()?;
+        if payload.version != PENDING_FLOW_PAYLOAD_VERSION
+            || !constant_time_eq(
+                payload.context_id.as_bytes(),
+                self.session.context_id.as_bytes(),
+            )
+            || !constant_time_eq(payload.state.as_bytes(), expected_state.as_bytes())
+            || payload.code_verifier.is_empty()
+            || payload.nonce.is_empty()
+            || payload.original_url.len() > MAX_PENDING_FLOW_ORIGINAL_URL_BYTES
+        {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        if payload.expires_at_unix <= now {
+            return None;
+        }
+        Some(payload)
     }
 
     fn seal_session_cookie(&self, payload: &SessionPayload) -> Result<String, String> {
@@ -1884,9 +1996,11 @@ impl StateCache {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            spent: DashMap::with_shard_amount(shard_amount),
             expiry_buckets: DashMap::with_shard_amount(shard_amount),
             per_source_entries: DashMap::with_shard_amount(shard_amount),
             active_entries: AtomicUsize::new(0),
+            active_spent: AtomicUsize::new(0),
             last_evicted_bucket: AtomicU64::new(0),
             origin: Instant::now(),
             max_entries,
@@ -1930,18 +2044,73 @@ impl StateCache {
         (flow.expires_at > Instant::now()).then_some(flow)
     }
 
-    fn take_bound(&self, state: &str, browser_binding_hash: &[u8]) -> Option<FlowState> {
+    /// Admit a callback for `state` after the sealed correlation cookie has
+    /// already been validated.
+    ///
+    /// - Missing local admission entry is success (cross-replica callback).
+    /// - Matching local entry is consumed (same-instance one-time + DoS release).
+    /// - Wrong binding or already-spent state fails closed without consuming a
+    ///   still-valid sibling entry.
+    fn admit_callback(&self, state: &str, sealed_binding_hash: &[u8]) -> Result<(), ()> {
+        self.evict_expired();
         let now = Instant::now();
-        let (_, flow) = self.entries.remove_if(state, |_, flow| {
+        if let Some(expires_at) = self.spent.get(state).map(|entry| *entry) {
+            if expires_at > now {
+                return Err(());
+            }
+            if let Some((_, removed_expiry)) =
+                self.spent.remove_if(state, |_, expires| *expires <= now)
+            {
+                self.remove_expiry_record(state, removed_expiry);
+                decrement_atomic(&self.active_spent);
+            }
+        }
+
+        if let Some((_, flow)) = self.entries.remove_if(state, |_, flow| {
             flow.expires_at <= now
-                || constant_time_eq(&flow.browser_binding_hash, browser_binding_hash)
-        })?;
-        self.remove_expiry_record(state, flow.expires_at);
-        decrement_atomic(&self.active_entries);
-        self.release_source(&flow.source_ip);
-        (flow.expires_at > now
-            && constant_time_eq(&flow.browser_binding_hash, browser_binding_hash))
-        .then_some(flow)
+                || constant_time_eq(&flow.sealed_binding_hash, sealed_binding_hash)
+        }) {
+            self.remove_expiry_record(state, flow.expires_at);
+            decrement_atomic(&self.active_entries);
+            self.release_source(&flow.source_ip);
+        } else if self.entries.contains_key(state) {
+            // Present but binding mismatch: leave the entry for the
+            // legitimate browser and reject this attempt.
+            return Err(());
+        }
+
+        self.record_spent_best_effort(state, now + self.ttl);
+        Ok(())
+    }
+
+    /// Record a local replay marker without allowing local bookkeeping pressure
+    /// to reject a valid callback that completed on another replica. The map is
+    /// capped at the configured pending-flow capacity and expiry-bucketed, so a
+    /// callback stream cannot grow process memory permanently. If the marker
+    /// budget is full, provider-side authorization-code one-time semantics still
+    /// reject a repeated token exchange.
+    fn record_spent_best_effort(&self, state: &str, expires_at: Instant) {
+        if self
+            .active_spent
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_entries).then_some(active + 1)
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        use dashmap::mapref::entry::Entry;
+        match self.spent.entry(state.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(expires_at);
+                self.expiry_buckets
+                    .entry(self.bucket_for(expires_at))
+                    .or_insert_with(|| Arc::new(DashMap::with_shard_amount(self.shard_amount)))
+                    .insert(state.to_string(), ());
+            }
+            Entry::Occupied(_) => decrement_atomic(&self.active_spent),
+        }
     }
 
     fn evict_expired(&self) {
@@ -1984,6 +2153,13 @@ impl StateCache {
             {
                 decrement_atomic(&self.active_entries);
                 self.release_source(&flow.source_ip);
+            }
+            if self
+                .spent
+                .remove_if(state.key(), |_, expires_at| *expires_at <= now)
+                .is_some()
+            {
+                decrement_atomic(&self.active_spent);
             }
         }
     }
@@ -2748,10 +2924,11 @@ fn build_cookie_attrs(
     attrs
 }
 
-/// Build the fixed scope for the short-lived browser correlation secret.
+/// Build the fixed scope for the short-lived sealed pending-flow cookie.
 ///
 /// Unlike the durable session cookie, this cookie must remain host-only: a
-/// parent `Domain` would let sibling hosts receive or overwrite the binding.
+/// parent `Domain` would let sibling hosts receive or overwrite the sealed
+/// authorization-code flow.
 fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
     build_cookie_attrs(secure, true, "Lax", None, callback_path)
 }
@@ -2884,6 +3061,23 @@ fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
         original.push_str(raw_query);
     }
     original
+}
+
+/// Cap the URL sealed into the pending-flow cookie so cookie/size bounds stay
+/// honest under hostile redirect parameters.
+fn bounded_original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
+    let original = original_url(ctx, behavior);
+    if original.len() <= MAX_PENDING_FLOW_ORIGINAL_URL_BYTES {
+        return original;
+    }
+    let scheme = frontend_scheme(ctx);
+    let host = request_host(ctx);
+    let fallback = format!("{scheme}://{host}{}", behavior.post_login_default_path);
+    if fallback.len() <= MAX_PENDING_FLOW_ORIGINAL_URL_BYTES {
+        fallback
+    } else {
+        behavior.post_login_default_path.clone()
+    }
 }
 
 fn frontend_scheme(ctx: &RequestContext) -> &str {
@@ -3442,16 +3636,32 @@ mod tests {
             plugin
                 .session
                 .state_cache
-                .take_bound(&first.0, &first_hash)
-                .is_some()
+                .admit_callback(&second.0, &first_hash)
+                .is_err(),
+            "wrong sealed binding must fail closed without consuming the sibling"
         );
         assert!(
             plugin
                 .session
                 .state_cache
-                .take_bound(&second.0, &second_hash)
-                .is_some(),
+                .admit_callback(&first.0, &first_hash)
+                .is_ok()
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .admit_callback(&second.0, &second_hash)
+                .is_ok(),
             "consuming one browser-bound flow must not evict its sibling"
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .admit_callback(&first.0, &first_hash)
+                .is_err(),
+            "same-instance admission must reject replay of a spent state"
         );
     }
 
@@ -3764,10 +3974,7 @@ mod tests {
 
     fn flow_for(source_ip: &str, expires_at: Instant) -> FlowState {
         FlowState {
-            code_verifier: "verifier".to_string(),
-            nonce: "nonce".to_string(),
-            original_url: "https://app.example.com/".to_string(),
-            browser_binding_hash: [7; 32],
+            sealed_binding_hash: [7; 32],
             source_ip: source_ip.to_string(),
             expires_at,
         }
@@ -3826,6 +4033,42 @@ mod tests {
                 flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
             )
             .expect("released capacity is reusable");
+    }
+
+    #[test]
+    fn spent_markers_are_bounded_without_blocking_cross_replica_callbacks() {
+        let cache = StateCache::new(2, 2, Duration::from_secs(600), 16);
+
+        for index in 0..32 {
+            assert!(
+                cache
+                    .admit_callback(&format!("remote-state-{index}"), &[7; 32])
+                    .is_ok(),
+                "local replay-marker pressure must not reject a valid cross-replica callback"
+            );
+        }
+
+        assert_eq!(cache.spent.len(), 2);
+        assert_eq!(cache.active_spent.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn expired_spent_markers_are_reclaimed_from_expiry_buckets() {
+        let cache = StateCache::new(2, 2, Duration::from_millis(1), 16);
+        cache
+            .admit_callback("remote-state", &[7; 32])
+            .expect("cross-replica callback is admitted");
+        let expires_at = *cache.spent.get("remote-state").expect("spent marker");
+
+        std::thread::sleep(Duration::from_millis(5));
+        cache.evict_bucket(cache.bucket_for(expires_at), Instant::now());
+
+        assert!(cache.spent.is_empty());
+        assert_eq!(cache.active_spent.load(Ordering::Acquire), 0);
+        assert!(
+            cache.admit_callback("replacement-state", &[8; 32]).is_ok(),
+            "reclaimed replay-marker capacity must be reusable"
+        );
     }
 
     fn discovery_config(discovery_url: &str) -> Value {

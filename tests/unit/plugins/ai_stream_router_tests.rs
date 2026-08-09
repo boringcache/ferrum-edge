@@ -5724,6 +5724,128 @@ async fn final_query_preserves_a_safe_unchanged_client_query() {
 }
 
 #[tokio::test]
+async fn pre_deferred_query_capture_would_leak_client_material_after_empty_commit() {
+    let plugins = router_config_then_transformer(
+        azure_final_query_config(),
+        json!([{"operation": "add", "target": "query", "key": "backend_token",
+                "value": "INTERNAL-BACKEND-SECRET"}]),
+    );
+    let raw = "client_secret=leaked";
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx_with_query(&body, raw);
+    let mut headers = json_headers();
+
+    let stale = captured_backend_query(&ctx, raw);
+    assert_eq!(
+        stale, raw,
+        "before claim the client wire query is still visible"
+    );
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let fresh = captured_backend_query(&ctx, raw);
+    assert_eq!(fresh, "");
+    assert_ne!(
+        stale, fresh,
+        "dispatch must recompute after deferred claim, not reuse a pre-claim capture"
+    );
+}
+
+/// Simulates the native-H3 / H1/H2 rebind contract after RemainingDeferred:
+/// a proxy/path/query baked before the claim must not survive into dispatch.
+/// If the ladder skipped rebinding, provider credentials would ride the
+/// original backend destination.
+#[tokio::test]
+async fn deferred_provider_claim_rebakes_proxy_path_and_query_before_dispatch() {
+    // Azure endpoint carries provider query in the URL; a claim folds it (and any
+    // client query) into the absolute override path, so the canonical backend
+    // query after claim is empty — unlike a plain OpenAI endpoint where the
+    // client-visible query would legitimately survive unchanged.
+    let plugin = build(azure_final_query_config());
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "backend.internal".to_string();
+    proxy.backend_port = 8443;
+    proxy.dns_override = Some("10.0.0.9".to_string());
+    let proxy = Arc::new(proxy);
+
+    let raw = "client_secret=leaked";
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx_with_query(&body, raw);
+    ctx.path = "/v1/internal/completions".to_string();
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    let mut headers = json_headers();
+
+    // Pre-claim bake: what the H3 ladder computes before RemainingDeferred.
+    let pre_claim_proxy = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert!(
+        Arc::ptr_eq(&proxy, &pre_claim_proxy),
+        "no override yet: apply must be identity"
+    );
+    let pre_claim_path = ctx.path.clone();
+    let pre_claim_query = captured_backend_query(&ctx, raw);
+    assert_eq!(pre_claim_proxy.backend_host, "backend.internal");
+    assert_eq!(pre_claim_query, raw);
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // Movement gate used by both ladders: pointer identity against the
+    // retained pre-pass Arc is the allocation-free destination-moved test.
+    let rebound_proxy = ctx.apply_route_overrides(Arc::clone(&pre_claim_proxy));
+    assert!(
+        !Arc::ptr_eq(&pre_claim_proxy, &rebound_proxy),
+        "a deferred provider claim must move the baked proxy Arc"
+    );
+    assert_eq!(rebound_proxy.backend_host, "azure.example.com");
+    assert_eq!(rebound_proxy.backend_port, 443);
+    assert_eq!(rebound_proxy.dns_override, None);
+    assert!(rebound_proxy.upstream_id.is_none());
+    // Prefer committed provider budgets when present; otherwise preserve the
+    // route's existing timeout defaults while rebaking the destination.
+    assert_eq!(
+        rebound_proxy.backend_connect_timeout_ms,
+        ctx.route_override_backend_connect_timeout_ms
+            .unwrap_or(pre_claim_proxy.backend_connect_timeout_ms)
+    );
+    assert_eq!(
+        rebound_proxy.backend_read_timeout_ms,
+        ctx.route_override_backend_read_timeout_ms
+            .unwrap_or(pre_claim_proxy.backend_read_timeout_ms)
+    );
+
+    let claimed_path = ctx
+        .route_override_path
+        .as_deref()
+        .expect("claim must publish an absolute provider path");
+    assert_ne!(
+        claimed_path, pre_claim_path,
+        "path-only or destination claims must not keep the pre-claim path"
+    );
+    assert!(ctx.route_override_path_is_absolute);
+    assert!(
+        claimed_path.contains("api-version=2024-06-01")
+            && claimed_path.contains("client_secret=leaked"),
+        "endpoint and client query must be folded into the committed path: {claimed_path}"
+    );
+
+    let fresh_query = captured_backend_query(&ctx, raw);
+    assert_ne!(
+        pre_claim_query, fresh_query,
+        "canonical query must be recomputed after the claim, never reused"
+    );
+    assert_eq!(fresh_query, "");
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-azure-secret")
+    );
+}
+
+#[tokio::test]
 async fn final_query_is_empty_when_an_endpoint_query_is_folded_into_the_path() {
     let plugins = router_config_then_transformer(
         azure_final_query_config(),
@@ -6369,6 +6491,58 @@ fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
     assert!(
         h3.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
         "the native HTTP/3 ladder must capture its backend query through the shared funnel"
+    );
+
+    for (label, ladder, deferred_needle) in [
+        (
+            "H1/H2",
+            h1h2.as_str(),
+            "BackendPathBeforeProxyPass::RemainingDeferred",
+        ),
+        (
+            "native HTTP/3",
+            h3.as_str(),
+            "BackendPathBeforeProxyPass::RemainingDeferred",
+        ),
+    ] {
+        let deferred = ladder
+            .find(deferred_needle)
+            .unwrap_or_else(|| panic!("{label} remaining deferred pass must remain present"));
+        let before_deferred = &ladder[..deferred];
+        assert!(
+            !before_deferred
+                .contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            "{label} must not capture backend query before the remaining deferred pass"
+        );
+        assert!(
+            ladder[deferred..]
+                .contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+            "{label} must capture backend query after the remaining deferred pass"
+        );
+    }
+
+    // Native H3 previously recomputed only the query after RemainingDeferred.
+    // Destination rebind must precede that capture so credentials cannot ride
+    // the pre-claim proxy/path/upstream.
+    let h3_deferred = h3
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("native HTTP/3 remaining deferred pass must remain present");
+    let h3_after = &h3[h3_deferred..];
+    let h3_rebind = h3_after
+        .find("apply_route_overrides_with_upstreams(")
+        .expect("native HTTP/3 must rebind deferred destination overrides");
+    let h3_query = h3_after
+        .find("effective_backend_query_string_with_raw(&ctx, &query_string)")
+        .expect("native HTTP/3 must capture backend query after deferred pass");
+    assert!(
+        h3_rebind < h3_query,
+        "native HTTP/3 must rebind the destination before capturing the canonical query"
+    );
+    assert!(
+        h3_after.contains(
+            "let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);"
+        ),
+        "native HTTP/3 must gate reselection on routing-proxy identity movement"
     );
 }
 

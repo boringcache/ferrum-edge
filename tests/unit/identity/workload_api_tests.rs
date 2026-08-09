@@ -553,6 +553,54 @@ async fn revision_tx_attached_after_clone_is_seen_by_installer_clone() {
     assert_eq!(*revision_rx.borrow_and_update(), 1);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spire_fetch_loop_publishes_unhealthy_ca_and_spire_source_on_connect_failure() {
+    use ferrum_edge::identity::workload_api::{
+        FetchLoopConfig, FetchLoopMetricsSource, spawn_fetch_loop,
+    };
+    use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().expect("create isolated missing-socket directory");
+    let config = FetchLoopConfig {
+        socket_path: temp
+            .path()
+            .join("missing-agent.sock")
+            .to_string_lossy()
+            .into_owned(),
+        reconnect_backoff: Duration::from_secs(30),
+        max_reconnect_backoff: Duration::from_secs(30),
+        metrics_source: FetchLoopMetricsSource::SpireAgent,
+        ..Default::default()
+    };
+    let (_handle, join) = spawn_fetch_loop(config);
+
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let output = MetricsRegistry::new().render_uncached();
+            let ca_unhealthy = output.lines().any(|line| {
+                line.contains("ferrum_mesh_ca_health{")
+                    && line.contains("ca_type=\"spire_agent\"")
+                    && line.ends_with("} 0")
+            });
+            let spire_failure = output.lines().any(|line| {
+                line.contains("ferrum_mesh_cert_rotation_failures_total{")
+                    && line.contains("spiffe_id=\"unknown\"")
+                    && line.contains("source=\"spire_agent\"")
+            });
+            if ca_unhealthy && spire_failure {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    join.abort();
+
+    observed.expect("SPIRE fetch-loop outage telemetry was not published");
+}
+
 // ── Long-lived stream + rotation signal tests ──────────────────────────────
 
 #[tokio::test]

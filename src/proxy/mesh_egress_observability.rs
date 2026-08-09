@@ -553,6 +553,11 @@ mod tests {
                 .to_string(),
             "1".to_string(),
         );
+        metadata.insert(
+            crate::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
+                .to_string(),
+            "1".to_string(),
+        );
         let mut lifecycle = CapturedMeshEgressLifecycle {
             plugins: vec![],
             stream_ctx: Some(ctx),
