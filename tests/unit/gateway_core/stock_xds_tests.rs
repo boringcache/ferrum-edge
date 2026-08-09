@@ -1492,6 +1492,26 @@ fn stock_api_listener_and_scoped_routes_are_extension_escapes() {
 
 fn rds_with(config: sp::RouteConfiguration) -> StockXdsAccumulator {
     let mut accumulator = StockXdsAccumulator::default();
+    // RDS SotW merges and then prunes against listener subscriptions: without
+    // an LDS that names this route config, the accumulator would drop it
+    // immediately and refusal fixtures could not observe the retained shape.
+    let route_name = config.name.clone();
+    accumulator
+        .apply_sotw(
+            LDS_TYPE_URL,
+            &[any(
+                LDS_TYPE_URL,
+                &hcm_listener(
+                    &format!("{route_name}_listener"),
+                    "10.96.0.5",
+                    9080,
+                    &route_name,
+                    &["envoy.filters.http.router"],
+                ),
+            )],
+            "lds-1",
+        )
+        .expect("LDS applies so the route config stays subscribed");
     accumulator
         .apply_sotw(RDS_TYPE_URL, &[any(RDS_TYPE_URL, &config)], "rds-1")
         .expect("a well-formed but unsupported route config is ACKed, not NACKed");
@@ -1580,6 +1600,24 @@ fn stock_virtual_host_targeting_two_services_is_refused_rather_than_guessed() {
     accumulator
         .apply_sotw(EDS_TYPE_URL, &[], "eds-1")
         .expect("EDS applies");
+    // Subscribe the route config via LDS before RDS: prune_unsubscribed_route_configs
+    // drops CP-delivered RDS that no accepted listener references.
+    accumulator
+        .apply_sotw(
+            LDS_TYPE_URL,
+            &[any(
+                LDS_TYPE_URL,
+                &hcm_listener(
+                    "10.96.0.5_9080",
+                    "10.96.0.5",
+                    9080,
+                    "9080",
+                    &["envoy.filters.http.router"],
+                ),
+            )],
+            "lds-1",
+        )
+        .expect("LDS applies");
 
     let mut config = route_config("9080", &["10.96.0.5"], REVIEWS_CLUSTER);
     config.virtual_hosts[0].routes.push(sp::Route {
