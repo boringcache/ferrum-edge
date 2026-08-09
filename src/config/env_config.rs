@@ -5462,8 +5462,7 @@ impl EnvConfig {
                 if self.mesh_workload_api_enabled && any_file_workload_identity {
                     return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
                 }
-                let workload_spiffe_id = if mesh_ca_backend
-                    != crate::identity::ca::CaBackend::None
+                let workload_spiffe_id = if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
                     let workload_spiffe_id = crate::config::conf_file::resolve_ferrum_var(
@@ -5479,8 +5478,8 @@ impl EnvConfig {
                     // `configured_mesh_workload_spiffe_id` so `validate` and
                     // mesh startup agree: a non-SPIFFE value must fail here,
                     // not silently pass settings validation then abort at boot.
-                    let workload_spiffe_id =
-                        crate::identity::SpiffeId::new(workload_spiffe_id).map_err(|e| {
+                    let workload_spiffe_id = crate::identity::SpiffeId::new(workload_spiffe_id)
+                        .map_err(|e| {
                             format!(
                                 "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
                                  FERRUM_MESH_CA_BACKEND is enabled: {e}"
@@ -5584,9 +5583,7 @@ impl EnvConfig {
                             trust_domain,
                         )
                         .map_err(|error| {
-                            format!(
-                                "Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}"
-                            )
+                            format!("Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}")
                         })?;
                         has_unix_attestor = true;
                     }
