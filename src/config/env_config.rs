@@ -1514,12 +1514,16 @@ pub struct EnvConfig {
     /// identity it was not told to assign.
     pub mesh_workload_api_unix_identity_rules: Vec<String>,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
-    /// `xds` consumes Envoy-compatible ADS; `file` loads a localized mesh
-    /// config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control plane).
+    /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
+    /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
+    /// plane); `stock_xds` consumes standard v3 CDS/EDS/LDS/RDS from a stock
+    /// Envoy / third-party Istio control plane for discovery only, with the
+    /// enforcement posture supplied by `FERRUM_MESH_FILE_CONFIG_PATH`.
     pub mesh_config_protocol: String,
     /// Path to the localized mesh config document (YAML/JSON) consumed when
-    /// `mesh_config_protocol` is `file`. The document carries only the `mesh`
-    /// section of a gateway config; reloaded on SIGHUP (Unix).
+    /// `mesh_config_protocol` is `file` (the whole slice) or `stock_xds` (the
+    /// mandatory policy half). The document carries only the `mesh` section of
+    /// a gateway config; reloaded on SIGHUP (Unix).
     pub mesh_file_config_path: Option<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -2216,6 +2220,25 @@ pub struct EnvConfig {
     /// enforces per-connection timeouts and per-direction failure attribution
     /// is not consumed by your dashboards/alerts.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Whether an opaque-TLS SNI stream listener may fall back to its catch-all
+    /// route for a connection whose opening bytes are provably **not** TLS.
+    ///
+    /// An SNI-routed stream listener (`passthrough: true`, or an ordinary `tcp`
+    /// listener whose group declares `hosts`) selects its backend from the
+    /// client's TLS `server_name`. A connection that never sends a ClientHello
+    /// has no attributable route, so the default (`false`) closes it before any
+    /// backend is resolved or dialed. Set `true` only when the same port is
+    /// deliberately shared with direct, non-TLS TCP clients that should reach
+    /// the group's catch-all proxy — the pre-#3264 behavior.
+    ///
+    /// This authorizes the **determinate** non-TLS case only. A ClientHello
+    /// that times out, overruns the 16 KiB peek bound, ends early, is malformed,
+    /// or names a host this gateway cannot represent is always refused: such a
+    /// connection may have declared any tenant's hostname, and defaulting it
+    /// would be a cross-tenant downgrade.
+    ///
+    /// Default: `false` (fail closed).
+    pub stream_sni_plaintext_fallback: bool,
 
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
@@ -3010,6 +3033,7 @@ impl Default for EnvConfig {
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
+            stream_sni_plaintext_fallback: false,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             udp_recvmmsg_batch_size: 64,
@@ -3547,6 +3571,7 @@ impl EnvConfig {
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
+            stream_sni_plaintext_fallback: bool = "FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK" => false;
             udp_max_sessions: usize = "FERRUM_UDP_MAX_SESSIONS" => 10_000usize, max(1usize);
             udp_cleanup_interval_seconds: u64 = "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS" => 10u64;
             udp_recvmmsg_batch_size: usize = "FERRUM_UDP_RECVMMSG_BATCH_SIZE" => 64usize, clamp(1usize, 1024usize);
@@ -4276,6 +4301,7 @@ impl EnvConfig {
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
+            stream_sni_plaintext_fallback,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             udp_recvmmsg_batch_size,
@@ -5364,35 +5390,38 @@ impl EnvConfig {
                 // Validate the protocol value before the per-protocol CP
                 // requirements so a typo'd FERRUM_MESH_CONFIG_PROTOCOL fails
                 // with the protocol error, not a misleading missing-CP-URL one.
-                match self
-                    .mesh_config_protocol
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "native" | "xds" | "file" => {}
+                let normalized_mesh_protocol =
+                    self.mesh_config_protocol.trim().to_ascii_lowercase();
+                match normalized_mesh_protocol.as_str() {
+                    "native" | "xds" | "file" | "stock_xds" | "stock-xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
-                             Expected: native, xds, or file",
+                             Expected: native, xds, file, or stock_xds",
                             crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
-                // The localized `file` protocol has no control plane: the CP
-                // URL and CP/DP JWT secret are not required (nor consumed).
+                // The localized `file` protocol has no control plane, and
+                // `stock_xds` dials a THIRD-PARTY ADS server named by
+                // `FERRUM_MESH_STOCK_XDS_URLS` — neither consumes the Ferrum
+                // CP URL or the CP/DP JWT secret, and `stock_xds` must never
+                // present a Ferrum-minted CP/DP JWT to a stock control plane.
+                // Both require the local mesh document instead (`file` for the
+                // whole slice, `stock_xds` for the mandatory policy half).
                 // Native/xDS keep both hard requirements, including the
                 // minimum secret length the env macro used to enforce when
                 // `required_for` still listed "mesh".
-                let file_protocol = self
-                    .mesh_config_protocol
-                    .trim()
-                    .eq_ignore_ascii_case("file");
-                if file_protocol {
+                let local_document_protocol = matches!(
+                    normalized_mesh_protocol.as_str(),
+                    "file" | "stock_xds" | "stock-xds"
+                );
+                if local_document_protocol {
                     if self.mesh_file_config_path.is_none() {
-                        return Err("FERRUM_MESH_FILE_CONFIG_PATH is required when \
-                             FERRUM_MESH_CONFIG_PROTOCOL=file"
-                            .into());
+                        return Err(format!(
+                            "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                             FERRUM_MESH_CONFIG_PROTOCOL={normalized_mesh_protocol}"
+                        ));
                     }
                 } else {
                     if self.dp_cp_grpc_urls.is_empty() {

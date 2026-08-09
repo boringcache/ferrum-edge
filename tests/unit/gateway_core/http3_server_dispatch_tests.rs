@@ -604,7 +604,7 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         .split("async fn handle_h3_grpc_streaming_response")
         .nth(1)
         .expect("H3 cross-protocol streaming gRPC response handler")
-        .split("/// Mesh-transport fail-closed guard")
+        .split("/// Resolve the gRPC dispatch transport")
         .next()
         .expect("bounded streaming handler body");
     let strip = handler
@@ -1711,7 +1711,7 @@ fn h3_streaming_grpc_web_preserves_native_statuses_and_metadata() {
         .split("async fn handle_h3_grpc_streaming_response")
         .nth(1)
         .expect("H3 cross-protocol streaming gRPC response handler")
-        .split("/// Mesh-transport fail-closed guard")
+        .split("/// Resolve the gRPC dispatch transport")
         .next()
         .expect("bounded streaming handler body");
 
@@ -2421,6 +2421,89 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
         src[handler..].contains("ctx.peer_connection = Some(peer_connection);"),
         "the watch must reach the plugin pipeline through the request context"
     );
+}
+
+/// Regression guard (issue #3284): both H3→gRPC dispatch paths must obtain
+/// their HTTP/2 sender from the RESOLVED transport, never from
+/// `state.grpc_pool` directly.
+///
+/// Passing the direct-dial pool would silently restore the unauthenticated
+/// dial the mesh refusal existed to prevent — the failure mode is invisible
+/// under PERMISSIVE PeerAuthentication (the RPC succeeds, just without
+/// SVID-mTLS, identity pinning, and mesh authz identity), so it is worth
+/// freezing structurally.
+#[test]
+fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+
+    let buffered = source
+        .split("async fn dispatch_grpc<S>(")
+        .nth(1)
+        .expect("buffered H3→gRPC dispatcher must remain present")
+        .split("pub(crate) async fn dispatch_grpc_streaming(")
+        .next()
+        .expect("buffered H3→gRPC dispatcher must remain bounded");
+    assert!(
+        buffered.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
+        "the buffered path must resolve a transport for its selected target"
+    );
+    assert!(
+        buffered.contains("&initial_grpc_transport,"),
+        "the initial attempt must dial through the resolved transport"
+    );
+    assert!(
+        buffered.contains("&grpc_retry_transport,"),
+        "a rotated retry target must dial through ITS OWN re-resolved transport"
+    );
+    assert_eq!(
+        buffered
+            .matches("resolve_h3_grpc_transport(state, current_target.as_deref())")
+            .count(),
+        2,
+        "the initial target and every rotated retry target must each be resolved"
+    );
+    assert_eq!(
+        buffered
+            .matches("transport_error.diagnostic().as_str()")
+            .count(),
+        2,
+        "initial and retry-rotated transport refusals must both log the redacted diagnostic"
+    );
+
+    let streaming = source
+        .split("pub(crate) async fn dispatch_grpc_streaming(")
+        .nth(1)
+        .expect("streaming H3→gRPC dispatcher must remain present")
+        .split("\nasync fn apply_buffered_plain_plugin_reject")
+        .next()
+        .expect("streaming H3→gRPC dispatcher must remain bounded");
+    assert!(
+        streaming.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
+        "the streaming path must resolve a transport for its selected target"
+    );
+    assert!(
+        streaming.contains("&grpc_transport,"),
+        "the streaming dispatch must dial through the resolved transport"
+    );
+
+    for (path, body) in [("buffered", buffered), ("streaming", streaming)] {
+        assert!(
+            !body.contains("&state.grpc_pool"),
+            "the {path} H3→gRPC path must not hand the direct-dial pool to a dispatch call — \
+             that reintroduces the unauthenticated mesh bypass"
+        );
+        assert!(
+            body.contains("write_grpc_error_for_request(")
+                && body.contains("grpc_proxy::grpc_status::UNAVAILABLE"),
+            "the {path} H3→gRPC path must still fail closed with gRPC UNAVAILABLE when no \
+             dispatchable transport exists"
+        );
+        assert!(
+            body.contains("transport_error.diagnostic().as_str()") && body.contains("diagnostic,"),
+            "the {path} H3→gRPC refusal warning must expose the redacted field/contract \
+             diagnostic category (issue #3284)"
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
