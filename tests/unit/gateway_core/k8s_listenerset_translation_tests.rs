@@ -1571,10 +1571,14 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
             })
     }));
     let updates = plan_gateway_api_status_updates(&malformed, options(), &[]);
-    for listener in ["bad-proto", "bad-tls", "bad-host"] {
+    for (listener, expected_reason) in [
+        ("bad-proto", "UnsupportedProtocol"),
+        ("bad-tls", "Invalid"),
+        ("bad-host", "Invalid"),
+    ] {
         let accepted = listenerset_listener_condition(&updates, "malformed", listener, "Accepted");
         assert_eq!(accepted["status"], "False");
-        assert_eq!(accepted["reason"], "Invalid");
+        assert_eq!(accepted["reason"], expected_reason);
     }
     let ok = listenerset_listener_condition(&updates, "malformed", "ok", "Accepted");
     assert_eq!(ok["status"], "True");
