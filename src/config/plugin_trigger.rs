@@ -548,7 +548,9 @@ fn compile_match(
     }
     if let Some(rules) = &leaf.source_cidr {
         if rules.is_empty() {
-            return Err("trigger: `source_cidr` must list at least one address or CIDR".to_string());
+            return Err(
+                "trigger: `source_cidr` must list at least one address or CIDR".to_string(),
+            );
         }
         if rules.len() > MAX_TRIGGER_LIST_LEN {
             return Err(format!(
@@ -611,7 +613,8 @@ fn compile_match(
         .ok_or_else(|| "trigger: empty `match` leaf".to_string())?;
     budget.reads_authenticated_identity = true;
     Ok(CompiledMatch::SpiffeId(compile_identity_match(
-        identity, "spiffe_id",
+        identity,
+        "spiffe_id",
     )?))
 }
 
@@ -903,10 +906,16 @@ fn eval_match(leaf: &CompiledMatch, facts: &dyn TriggerFacts) -> bool {
                 })
         }
         CompiledMatch::Path(matcher) => {
-            facts.is_http() && facts.path().is_some_and(|path| matches_string(matcher, path))
+            facts.is_http()
+                && facts
+                    .path()
+                    .is_some_and(|path| matches_string(matcher, path))
         }
         CompiledMatch::Host(matcher) => {
-            facts.is_http() && facts.host().is_some_and(|host| matches_string(matcher, host))
+            facts.is_http()
+                && facts
+                    .host()
+                    .is_some_and(|host| matches_string(matcher, host))
         }
         // SNI is a transport fact, available on HTTP and stream contexts alike.
         CompiledMatch::Sni(matcher) => facts.sni().is_some_and(|sni| matches_string(matcher, sni)),

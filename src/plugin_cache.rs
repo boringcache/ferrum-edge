@@ -750,7 +750,10 @@ pub(crate) fn validate_plugin_security_composition(
 ///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
 ///   which makes the effective auth chain order-dependent.
-fn trigger_composition_error(plugin: &dyn Plugin, gate: &PluginTriggerGate) -> Option<&'static str> {
+fn trigger_composition_error(
+    plugin: &dyn Plugin,
+    gate: &PluginTriggerGate,
+) -> Option<&'static str> {
     if plugin.requires_ws_frame_hooks() || plugin.observes_ws_frame_decisions() {
         return Some(
             "the plugin runs WebSocket frame hooks, which execute without a request context and therefore cannot be gated by a trigger",
