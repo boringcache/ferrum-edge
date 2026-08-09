@@ -17,11 +17,11 @@
 //! that same frame wins over the raw observation.
 //!
 //! Two facts shape [`await_peer_settings`]'s recheck loop rather than a plain
-//! await. `handshake()` spawns the h2 connection driver on the executor, so the
-//! future it hands back is the *request dispatcher*, not the driver; and that
-//! dispatcher registers no waker for arriving peer `SETTINGS`. Polling it drives
-//! and surfaces connection errors, but it never resolves merely because the
-//! peer's preface landed.
+//! await. `handshake()` returns the h2 connection-driver future, which must be
+//! polled to drive reads and surface connection errors; and a healthy driver
+//! stays pending after peer `SETTINGS` rather than resolving with a separate
+//! readiness result. The short recheck cadence therefore lets the transport's
+//! observation flag end establishment while the same polls keep driving Hyper.
 //!
 //! The wait itself is deliberately unbounded here — the caller owns the bound,
 //! because the two callers derive it differently (a per-candidate share of the
@@ -188,13 +188,12 @@ impl std::fmt::Display for H2cPrefaceFailure {
 
 /// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
 ///
-/// `conn` is the future `handshake()` returned. Polling it drives the peer's
-/// preface and SETTINGS processing and surfaces a protocol error or close, but
-/// it does not resolve merely because SETTINGS arrived: hyper already spawned
-/// the h2 driver on the executor, and this future — the request dispatcher —
-/// registers no waker for peer SETTINGS. The short timeout therefore supplies a
-/// bounded recheck cadence for the transport observation flag while also
-/// continuing to drive the connection.
+/// `conn` is the connection-driver future `handshake()` returned. Polling it
+/// drives the peer's preface and SETTINGS processing and surfaces a protocol
+/// error or close, but a healthy connection remains pending after SETTINGS
+/// arrives. The short timeout therefore supplies a bounded recheck cadence for
+/// the transport observation flag while also continuing to drive the same
+/// connection future.
 ///
 /// There is no timeout here by design; the CALLER owns the bound. The gRPC pool
 /// runs inside `dns::connect_candidates`, whose per-candidate share of

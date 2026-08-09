@@ -509,7 +509,14 @@ pub async fn dial_unix_h2c_sender(
     // the sender-readiness deadline in `proxy::mod` handles the same overflow.
     let deadline = tokio::time::Instant::now().checked_add(budget);
 
-    let stream = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
+    let connect = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids);
+    let stream = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, connect).await {
+            Ok(result) => result?,
+            Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
+        },
+        None => connect.await?,
+    };
 
     let settings_received = Arc::new(AtomicBool::new(false));
     let io = TokioIo::new(H2cPrefaceIo::new(stream, Arc::clone(&settings_received)));
