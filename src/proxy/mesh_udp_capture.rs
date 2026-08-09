@@ -2845,12 +2845,11 @@ mod live_netns_tests {
         let table = crate::capture::TPROXY_HOST_ROUTE_TABLE;
         let prio = crate::capture::TPROXY_HOST_ROUTE_RULE_PRIORITY;
         let mark_arg = format!("0x{mark:x}/0x{mask:x}");
-        // Pin the host peer's locally administered MAC before bringing it up.
-        // Rtnetlink makes the veth usable before its sysfs entry is guaranteed
-        // visible, so reading `/sys/class/net/vethhost/address` immediately
-        // after `ip link add` made hosted setup race kernel sysfs publication.
-        // The scenario still validates the production sysfs lookup after the
-        // setup child reaches its steady-state sleep.
+        // Pin the host peer's locally administered MAC before bringing it up so
+        // neighbour setup uses an explicit fixture value rather than consulting
+        // sysfs while the namespace is still being assembled. The scenario
+        // separately validates the production sysfs lookup through the child's
+        // namespace-local mount after the exact readiness marker is observed.
         let script = format!(
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
