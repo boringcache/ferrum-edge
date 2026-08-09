@@ -294,6 +294,7 @@ async fn try_spawn_tcp_listener(
         ktls_enabled: false,
         io_uring_splice_enabled: false,
         record_mesh_mtls_metric: false,
+        stream_sni_plaintext_fallback: false,
         mesh_outbound_enforcement: enforcement,
         node_waypoint_identity_resolver: None,
         stream_gateway_ref: None,

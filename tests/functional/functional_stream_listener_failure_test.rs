@@ -400,8 +400,9 @@ async fn functional_stream_listener_duplicate_port_different_namespaces() {
     // Namespace "bar" — same port, must also succeed because uniqueness is
     // scoped per-namespace. Port-availability probing is skipped here because
     // the admin API doesn't check OS-level uniqueness in CP mode and in
-    // database mode the probe happens *before* insertion — we rely on the
-    // namespace filter in check_listen_port_unique() to allow the duplicate.
+    // database mode the probe happens *before* insertion. Listener-group
+    // admission loads only the selected namespace, so the other namespace does
+    // not become a false same-port peer.
     let resp_b = client
         .post(format!("{}/proxies", harness.admin_base_url))
         .header("Authorization", auth_header())
@@ -415,7 +416,7 @@ async fn functional_stream_listener_duplicate_port_different_namespaces() {
     // machines conceptually, but in this single-binary test they would both
     // bind to the same host, the probe may or may not reject the second
     // create. Accept either 2xx (probe passed / gateway not yet bound) or
-    // 409 (probe tripped) — but the *uniqueness check itself* must not
+    // 409 (probe tripped) — but same-namespace listener-group admission must not
     // be the reason for rejection.
     let status = resp_b.status();
     let text = resp_b.text().await.unwrap_or_default();
@@ -433,11 +434,11 @@ async fn functional_stream_listener_duplicate_port_different_namespaces() {
             !text
                 .to_lowercase()
                 .contains("already in use by another proxy"),
-            "cross-namespace create should not hit the same-namespace uniqueness check: {}",
+            "cross-namespace create should not hit same-namespace listener-group admission: {}",
             text
         );
         // Any conflict here must be OS-level (port not available), not the
-        // namespace-aware uniqueness check.
+        // namespace-aware listener-group check.
         assert!(
             text.to_lowercase().contains("not available") || text.to_lowercase().contains("host"),
             "cross-namespace create may only be rejected by OS port probe, got: {}",
