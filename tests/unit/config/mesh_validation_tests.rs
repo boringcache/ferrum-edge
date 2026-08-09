@@ -2138,6 +2138,7 @@ fn ingress_resolve_rejects_hostile_unix_socket_paths() {
         ("unix:///var//run/app.sock", R::EmptyComponent),
         ("unix:///var/run/", R::TrailingSlash),
         ("unix:///", R::TrailingSlash),
+        ("unix:///var/run/app.sock ", R::SurroundingWhitespace),
         ("unix:///var/run/a\u{0}b.sock", R::InteriorNul),
         ("unix:///var/run/a\u{7}b.sock", R::ControlCharacter),
     ];

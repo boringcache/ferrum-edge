@@ -30957,6 +30957,52 @@ async fn handle_proxy_request_inner(
                 .await);
             }
 
+            // This retry planner has no Unix-stream attempt implementation.
+            // Screen every rotated (and same-target) candidate before mesh
+            // transport selection, circuit-breaker admission, plugins, or a
+            // network dial. This also rejects a corrupted target carrying both
+            // Unix and HBONE/mTLS markers instead of letting tag ordering pick
+            // a different security boundary than the materializer declared.
+            if current_target
+                .as_deref()
+                .is_some_and(unix_backend::target_is_unix_backend)
+            {
+                let reason = "Unix socket retry dispatch is unavailable";
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                    target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                    "Unix-socket retry target cannot be dispatched by the network retry planner; failing closed"
+                );
+                result = if is_grpc_request {
+                    mesh_grpc_unavailable_response(
+                        None,
+                        reason,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    )
+                } else {
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::buffered(
+                            br#"{"error":"Bad Gateway","message":"Unix socket retry dispatch unavailable"}"#
+                                .to_vec(),
+                        ),
+                        headers: HashMap::from([(
+                            "gateway-error-reason".to_string(),
+                            reason.to_string(),
+                        )]),
+                        connection_error: false,
+                        backend_resolved_ip: None,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    }
+                };
+                final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
+                backend_admission_started_at = Instant::now();
+                skip_final_cb_record = true;
+                break;
+            }
+
             // Resolve the exact selected target's transport for this attempt.
             // This is deliberately repeated even for a same-target retry: SVID
             // rotation, capability refresh, and target policy reloads can all

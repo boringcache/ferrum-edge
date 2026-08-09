@@ -1629,8 +1629,7 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
         let endpoint = entry
             .get("defaultEndpoint")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
+            .unwrap_or("");
         if !http_family {
             push_unique(
                 &mut deferred,
@@ -3835,6 +3834,7 @@ mod tests {
                     { "port": { "number": 9080, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
                     { "port": { "number": 7000, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/grpc.sock" },
                     { "port": { "number": 7100, "protocol": "GRPC" }, "defaultEndpoint": "unix://../etc/passwd" },
+                    { "port": { "number": 7200, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/padded.sock " },
                     { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" }
                 ]
             }),
@@ -3855,6 +3855,10 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("not absolute")),
             "inadmissible unix-socket path must be deferred, got {deferred:?}"
+        );
+        assert!(
+            deferred.iter().any(|f| f.contains("whitespace")),
+            "a padded unix-socket path must not be silently rewritten, got {deferred:?}"
         );
         assert!(
             deferred.iter().any(|f| f.contains("non-HTTP-family")),

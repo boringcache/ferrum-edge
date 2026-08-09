@@ -3592,7 +3592,6 @@ fn resolve_selected_sidecar_ingress(
                     sidecar = %sidecar.name,
                     namespace = %sidecar.namespace,
                     port = entry.port,
-                    default_endpoint = %entry.default_endpoint,
                     reason = ?reason,
                     "Skipping unsupported Sidecar ingress[] listener (kept in deferred_fields)"
                 );

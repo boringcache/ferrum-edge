@@ -1240,18 +1240,19 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west dispatch path.
-    // A direct dial to a mesh-tagged target would bypass the secured mesh
-    // transport, so fail closed before backend admission or body relay.
+    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west / Unix dispatch
+    // path. A direct network dial would either bypass the secured mesh
+    // transport or hit a Unix target's schema-only loopback placeholder, so
+    // fail closed before backend admission or body relay.
     if let Some(reason) =
-        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(current_target)
+        crate::proxy::backend_dispatch::direct_network_http_transport_refusal(current_target)
     {
         warn!(
             proxy_id = %dispatch_proxy.id,
             target_host = current_target.map(|target| target.host.as_str()).unwrap_or(""),
             target_port = current_target.map(|target| target.port).unwrap_or(0),
             reason,
-            "cross-protocol H3→HTTP: refusing direct dial to a mesh-transport-tagged target"
+            "cross-protocol H3→HTTP: refusing direct dial to a target requiring another transport"
         );
         record_backend_outcome_no_conn_end(
             state,

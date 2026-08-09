@@ -2227,7 +2227,6 @@ pub(crate) fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
 fn parse_ingress_default_endpoint(
     endpoint: &str,
 ) -> Result<MeshIngressBackend, IngressListenerUnsupported> {
-    let endpoint = endpoint.trim();
     if let Some(path) = endpoint.strip_prefix("unix://") {
         // Istio writes `unix://` + an ABSOLUTE path, so the canonical form is
         // the triple-slash `unix:///var/run/app.sock`. The leading `/` is part
