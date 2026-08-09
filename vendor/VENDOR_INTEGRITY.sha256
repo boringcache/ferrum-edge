@@ -198,6 +198,11 @@ b76031a8233b6afe4089eb3967f9965e59cf3be9f1b2239aada5c527a9e3251c  vendor/h3-0.0.
 67a6d6ef94c8204df4005f0d33140c14955fec7154d435881c11e3c5c6861fab  vendor/h3-0.0.8-ferrum-patched/src/stream.rs
 f949117f4c335c064cbafd4c855f92002948d64d2f74b61d850625e37bd3be07  vendor/h3-0.0.8-ferrum-patched/src/webtransport/mod.rs
 c3a03ed9e78fc494b54985d65f05581c268c6e629d206ac0dc5cb9d7358be76d  vendor/h3-0.0.8-ferrum-patched/src/webtransport/session_id.rs
+3e2d07739d60a97a976fccb93326a9a865be3a403da92d0371598ab2b3ba54a3  vendor/h3-quinn-0.0.10-ferrum-patched/Cargo.toml
+a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1  vendor/h3-quinn-0.0.10-ferrum-patched/LICENSE
+de39e24c89386f75c36156710331b96831b84a25cb637ab831adef04d6fa623a  vendor/h3-quinn-0.0.10-ferrum-patched/README.md
+9ab347d7b90a104c80e590ebc5b048a27336e4bdd0bad7cc033032f51a6e9c01  vendor/h3-quinn-0.0.10-ferrum-patched/src/datagram.rs
+b14023fcd7d63985fa0ee4900760f864107247d8ac74895ee362d1877b3937ee  vendor/h3-quinn-0.0.10-ferrum-patched/src/lib.rs
 5a62c632e480f07edb899e31f759cc37ee09a7db4c6ac52ee687b4a50711c2ac  vendor/reqwest-0.13.3-ferrum-patched/Cargo.toml
 751963a8b88c0e3a9f27e98933079fbcf09b9998b2c13ac49c2e4d58444520d6  vendor/reqwest-0.13.3-ferrum-patched/LICENSE-APACHE
 dd87e27dfbaa888cb77ea34592648a7743636b8dce07e49543bddda0fcfc73bc  vendor/reqwest-0.13.3-ferrum-patched/LICENSE-MIT

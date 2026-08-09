@@ -71,12 +71,23 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
         !MESH_SUPPORTED_MATRIX.contains("remains part of #2038"),
         "closed #2038 must not be cited as pending enrolled-destination work"
     );
-    for issue in ["#3263", "#3228", "#3331", "#3334", "#3621"] {
+    for issue in ["#3228", "#3331", "#3334", "#3621"] {
         assert!(
             MESH_SUPPORTED_MATRIX.contains(issue),
             "product deferral index must cite live tracker {issue}"
         );
     }
+    // #3263 shipped: external UDP ServiceEntry ports now materialize a
+    // datagram-over-mesh destination allowlist on the EgressGateway. It must be
+    // recorded as completed, never re-listed as an open deferral row.
+    assert!(
+        !MESH_SUPPORTED_MATRIX.contains("issues/3263"),
+        "closed #3263 must not remain in the canonical open product deferral index"
+    );
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains("EgressGateway UDP `ServiceEntry` materialization (#3263"),
+        "completed #3263 must stay recorded in the completed historical rows"
+    );
     assert!(
         MESH_SUPPORTED_MATRIX.contains("sniHosts"),
         "matrix must name the supported tls[] SNI surface"
@@ -148,13 +159,19 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         "k8s status ownership must document the intentional RMW+SSA mixed strategy"
     );
     for issue in [
-        "#3228", "#3263", "#3299", "#3302", "#3304", "#3331", "#3332", "#3621",
+        "#3228", "#3299", "#3302", "#3304", "#3331", "#3332", "#3621",
     ] {
         assert!(
             ISSUE_2110_REGISTER.contains(issue),
             "register must cite live tracker {issue}"
         );
     }
+    // #3263 moved from the live-tracker table to the completed table.
+    assert!(
+        ISSUE_2110_REGISTER
+            .contains("| EgressGateway UDP `ServiceEntry` materialization | Implemented"),
+        "completed #3263 must be recorded as implemented, not as a live residual"
+    );
     assert!(
         ISSUE_2110_REGISTER.contains("EnvoyFilter / WasmPlugin"),
         "explicit non-goals must remain documented"

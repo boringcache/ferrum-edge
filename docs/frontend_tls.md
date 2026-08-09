@@ -450,7 +450,7 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **CP gRPC TLS live reload** | `FERRUM_CP_GRPC_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_CP_GRPC_TLS_KEY_PATH` / `_SOURCE`, and `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` / `_SOURCE` in CP mode |
 | **DP gRPC TLS live reload** | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` / `_SOURCE`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` / `_SOURCE`, and `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` / `_SOURCE` in DP mode |
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
-| **SVID file rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE` when all three sources are file-backed |
+| **Gateway SVID rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE`: file-backed sources are re-read once per second, provider URIs are re-fetched on `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` or the source's `?poll=`, and inline PEM stays static until config reload |
 
 All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 

@@ -556,9 +556,28 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # in zeroizing storage. No compatible upstream release currently provides
 # either security property. See
 # `docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md`.
+#
+# We also carry a vendored copy of h3-quinn 0.0.10 whose `RecvStream` owns its
+# `quinn::RecvStream` inline instead of moving it into a `ReusableBoxFuture` for
+# the duration of a pending read. Upstream leaves the field as `None` while
+# `poll_data` is `Pending`, so `stop_sending` unwraps that `None` — a process
+# abort under `panic = "abort"` — exactly when an HTTP/3 server needs it most:
+# retiring a request-body read to send `STOP_SENDING(H3_NO_ERROR)` after the
+# response is complete. Working around it gateway-side is not possible (quinn
+# exposes no connection-level STOP_SENDING and the parked stream is
+# unreachable), and skipping the call downgrades the wire signal to
+# `quinn::RecvStream::drop`'s `STOP_SENDING(0)`, which is not an HTTP/3 error
+# code. `quinn::RecvStream::read_chunk` is documented cancel-safe, so building
+# it per poll is equivalent — and allocation-free.
+#
+# Retirement plan: when h3-quinn ships a release whose `stop_sending` is
+# correct while a read is in flight, remove the `[patch.crates-io]` line, drop
+# `vendor/h3-quinn-0.0.10-ferrum-patched/`, and bump the `h3-quinn` floor. See
+# `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
+h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
