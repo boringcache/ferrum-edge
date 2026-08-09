@@ -552,11 +552,11 @@ nodeAgent:
     #
     # The cleanup ServiceAccounts, Role and RoleBinding are ordinary release
     # resources, not hook resources, and the cleanup DaemonSet carries no
-    # `hook-succeeded` deletion policy: when a hook fails, Helm deletes the
-    # earlier hooks that carry that policy, so a failed wait would otherwise
-    # take the identity, the RBAC and the evidence with it. As written, a
-    # failed uninstall leaves the DaemonSet, its logs and its identity in
-    # place, and re-running `helm uninstall` retries cleanly.
+    # `hook-succeeded` deletion policy: on Helm 3.19+ / v4 a hook failure also
+    # deletes the earlier hooks that carry that policy, so a failed wait would
+    # otherwise take the identity, the RBAC and the evidence with it. As
+    # written, a failed uninstall leaves the DaemonSet, its logs and its
+    # identity in place, and re-running `helm uninstall` retries cleanly.
     #
     # Cleanup is scoped by the ownership marker written at install time and
     # is a no-op for artifacts owned by a different release. It runs on

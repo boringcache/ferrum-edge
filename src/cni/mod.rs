@@ -12,16 +12,15 @@
 //!
 //! - [`spec`] — the CNI specification's stdin/stdout JSON, plus the
 //!   parsed-env representation of `CNI_*` invocation variables.
+//! - [`rpc`] — the small node-agent RPC the CNI binary speaks once it has
+//!   extracted the K8s pod metadata from CNI args. Keeping these shapes
+//!   distinct keeps the CNI parser independent of the node-agent surface
+//!   so we can evolve either side without churning the other.
 //!
 //! Two more modules cover the host-side install lifecycle rather than the
 //! wire: [`install`] writes and provably removes the Ferrum-owned binary and
 //! chained conflist, and [`lifecycle`] rolls that install back when the
 //! node-agent never reaches CNI readiness.
-//!
-//! - [`rpc`] — the small node-agent RPC the CNI binary speaks once it has
-//!   extracted the K8s pod metadata from CNI args. Keeping these shapes
-//!   distinct keeps the CNI parser independent of the node-agent surface
-//!   so we can evolve either side without churning the other.
 //!
 //! Why both? The CNI spec defines the byte-for-byte JSON the kubelet hands
 //! us; the node-agent RPC is internal and intentionally minimal (no

@@ -2123,11 +2123,13 @@ jobs:
             echo "::error title=CNI cleanup pods are not hostNetwork::cleanup would deadlock behind the chain it removes"
             exit 1
           fi
-          # Hook deletion policies are asymmetric and load-bearing. Helm
-          # deletes every earlier `hook-succeeded` hook when a later hook in
-          # the same phase fails (pkg/action/hooks.go, v3 and v4), so the
-          # cleanup DaemonSet must NOT carry that policy: the wait Job deletes
-          # it explicitly, and a failed wait has to leave it for the retry.
+          # Hook deletion policies are asymmetric and load-bearing. Helm 3.19+
+          # and v4 delete every earlier `hook-succeeded` hook when a later hook
+          # in the same phase fails (deleteHooksByPolicy in
+          # pkg/action/hooks.go; 3.18 and older delete only the failing hook),
+          # so the cleanup DaemonSet must NOT carry that policy: the wait Job
+          # deletes it explicitly, and a failed wait has to leave it for the
+          # retry.
           if [ "$(grep -c '"helm.sh/hook-delete-policy": before-hook-creation$' "$cni_hook_out")" -ne 1 ]; then
             echo "::error title=CNI cleanup DaemonSet deletion policy changed::the cleanup DaemonSet must carry before-hook-creation only, so a failed wait leaves it for the retry"
             exit 1

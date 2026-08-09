@@ -381,9 +381,10 @@ impl CleanupWaitReport {
 /// The DaemonSet is deleted here rather than by a Helm `hook-succeeded`
 /// policy because that policy would also delete it the moment the *DaemonSet*
 /// hook "succeeded" — which for a non-waitable kind is immediately — and,
-/// worse, Helm deletes every previously succeeded `hook-succeeded` resource
-/// when a later hook in the same phase fails. Owning the deletion here is what
-/// lets a failed wait leave the DaemonSet, its logs, and its pods in place.
+/// worse, Helm 3.19+ / v4 additionally delete every previously succeeded
+/// `hook-succeeded` resource when a later hook in the same phase fails.
+/// Owning the deletion here is what lets a failed wait leave the DaemonSet,
+/// its logs, and its pods in place, on every Helm version.
 pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWaitReport, String> {
     use k8s_openapi::api::apps::v1::DaemonSet;
     use kube::Api;

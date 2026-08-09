@@ -4,14 +4,17 @@
   These are ORDINARY release resources, deliberately NOT hook resources.
 
   Helm's hook lifecycle is why. Within one hook phase, hooks run in weight
-  order, and when a later hook FAILS, Helm deletes every earlier hook that
-  carries `hook-delete-policy: hook-succeeded` — `pkg/action/hooks.go` in both
-  Helm v3 and v4 calls `deleteHooksByPolicy(executingHooks[0:i],
-  HookSucceeded, ...)` on the failure path. If the cleanup identity and RBAC
-  were hook resources with that policy, a wait-Job failure would take them
-  with it: the retry would then have to recreate the ServiceAccounts before
-  any cleanup pod could even be admitted, and the failed DaemonSet's pods
-  would be running against a ServiceAccount that no longer existed.
+  order, and on Helm 3.19+ and Helm v4 a later hook's FAILURE also deletes
+  every earlier hook that carries `hook-delete-policy: hook-succeeded` —
+  `execHook` in `pkg/action/hooks.go` calls
+  `deleteHooksByPolicy(executingHooks[0:i], HookSucceeded, ...)` on the
+  failure path. (Helm 3.18 and older delete only the failing hook, by its
+  `hook-failed` policy; this chart is written for the stricter newer
+  behaviour so it is correct on both.) If the cleanup identity and RBAC were
+  hook resources with that policy, a wait-Job failure would take them with
+  it: the retry would then have to recreate the ServiceAccounts before any
+  cleanup pod could even be admitted, and the failed DaemonSet's pods would
+  be running against a ServiceAccount that no longer existed.
 
   As release resources they are created at install time and removed by the
   normal `helm uninstall` sweep, which runs only AFTER the pre-delete phase

@@ -31,16 +31,16 @@
   * Narrow identities, held OUTSIDE this hook. The cleanup ServiceAccounts,
     Role and RoleBinding are ordinary release resources in
     cni-cleanup-rbac.yaml, not hook resources — see the long explanation
-    there. In short: when a hook fails, Helm deletes the earlier hooks that
-    carry `hook-succeeded`, so identity and RBAC held that way would vanish
-    exactly when a retry needs them.
+    there. In short: on Helm 3.19+ / v4 a hook failure also deletes the
+    earlier hooks that carry `hook-succeeded`, so identity and RBAC held that
+    way would vanish exactly when a retry needs them.
   * Deletion policies are asymmetric, on purpose:
       - the DaemonSet gets `before-hook-creation` ONLY. Helm's hook wait
         understands neither DaemonSets nor readiness of their pods, so a
-        `hook-succeeded` policy would delete it the instant it was created,
-        and would also delete it (together with any other succeeded hook) if
-        the wait Job later failed. The wait Job removes it explicitly instead,
-        after every node has reported success.
+        `hook-succeeded` policy would delete it the instant it was created —
+        and on Helm 3.19+ / v4 would also delete it (together with any other
+        succeeded hook) if the wait Job later failed. The wait Job removes it
+        explicitly instead, after every node has reported success.
       - the wait Job may keep `hook-succeeded`: it is the last hook in the
         phase, and everything a retry depends on — the ServiceAccounts, the
         Role, the RoleBinding, and (on failure) the DaemonSet itself — is
