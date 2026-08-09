@@ -178,7 +178,7 @@ fn epoch_tags(state: &ProxyState) -> HashMap<String, String> {
     state
         .request_epoch
         .load()
-        .config
+        .config()
         .upstreams
         .iter()
         .find(|upstream| upstream.id == "h3-mesh-grpc-upstream")
