@@ -3289,7 +3289,10 @@ fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
     }
 
     let rejected: Vec<(String, &str)> = vec![
-        (format!("{ECHO_PROBE}*local"), "leading or trailing wildcard"),
+        (
+            format!("{ECHO_PROBE}*local"),
+            "leading or trailing wildcard",
+        ),
         (format!("*{ECHO_PROBE}*"), "at most one '*'"),
         (format!("{ECHO_PROBE}/ns"), "must not contain '/'"),
     ];

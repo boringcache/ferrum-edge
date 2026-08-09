@@ -1249,12 +1249,24 @@ fn authz_source_service_account_and_trust_domain_grammars_fail_closed_at_transla
 
     let rejected: &[(&str, &str, &str)] = &[
         ("source.serviceAccount", "*", "must not contain '*'"),
-        ("source.serviceAccount", "payments/*", "must not contain '*'"),
+        (
+            "source.serviceAccount",
+            "payments/*",
+            "must not contain '*'",
+        ),
         ("source.serviceAccount", "a/b/c", "at most one '/'"),
         ("source.serviceAccount", "/checkout", "non-empty namespace"),
-        ("source.trustDomain", "clus*er.local", "leading or trailing wildcard"),
+        (
+            "source.trustDomain",
+            "clus*er.local",
+            "leading or trailing wildcard",
+        ),
         ("source.trustDomain", "*a*b*", "at most one '*'"),
-        ("source.trustDomain", "cluster.local/ns", "must not contain '/'"),
+        (
+            "source.trustDomain",
+            "cluster.local/ns",
+            "must not contain '/'",
+        ),
     ];
 
     for (key, value, reason) in rejected {
