@@ -2185,6 +2185,25 @@ pub struct EnvConfig {
     /// enforces per-connection timeouts and per-direction failure attribution
     /// is not consumed by your dashboards/alerts.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Whether an opaque-TLS SNI stream listener may fall back to its catch-all
+    /// route for a connection whose opening bytes are provably **not** TLS.
+    ///
+    /// An SNI-routed stream listener (`passthrough: true`, or an ordinary `tcp`
+    /// listener whose group declares `hosts`) selects its backend from the
+    /// client's TLS `server_name`. A connection that never sends a ClientHello
+    /// has no attributable route, so the default (`false`) closes it before any
+    /// backend is resolved or dialed. Set `true` only when the same port is
+    /// deliberately shared with direct, non-TLS TCP clients that should reach
+    /// the group's catch-all proxy — the pre-#3264 behavior.
+    ///
+    /// This authorizes the **determinate** non-TLS case only. A ClientHello
+    /// that times out, overruns the 16 KiB peek bound, ends early, is malformed,
+    /// or names a host this gateway cannot represent is always refused: such a
+    /// connection may have declared any tenant's hostname, and defaulting it
+    /// would be a cross-tenant downgrade.
+    ///
+    /// Default: `false` (fail closed).
+    pub stream_sni_plaintext_fallback: bool,
 
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
@@ -2971,6 +2990,7 @@ impl Default for EnvConfig {
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
+            stream_sni_plaintext_fallback: false,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             udp_recvmmsg_batch_size: 64,
@@ -3501,6 +3521,7 @@ impl EnvConfig {
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
+            stream_sni_plaintext_fallback: bool = "FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK" => false;
             udp_max_sessions: usize = "FERRUM_UDP_MAX_SESSIONS" => 10_000usize, max(1usize);
             udp_cleanup_interval_seconds: u64 = "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS" => 10u64;
             udp_recvmmsg_batch_size: usize = "FERRUM_UDP_RECVMMSG_BATCH_SIZE" => 64usize, clamp(1usize, 1024usize);
@@ -4223,6 +4244,7 @@ impl EnvConfig {
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
+            stream_sni_plaintext_fallback,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             udp_recvmmsg_batch_size,

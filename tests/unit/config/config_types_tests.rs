@@ -5391,7 +5391,7 @@ fn test_stream_proxy_shared_port_validation_keeps_same_id_namespaces_distinct() 
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("all proxies sharing a port must have passthrough: true")),
+            .any(|error| error.contains("mixes passthrough and non-passthrough proxies")),
         "the non-passthrough staging proxy must not be replaced by prod's same-ID entry"
     );
 }
