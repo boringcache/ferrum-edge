@@ -402,7 +402,11 @@ pub(crate) fn materialize_listenerset_mesh_services(
         };
         let port = super::port_from_u64(object, raw_port, "listeners[].port")?;
         acc.mesh.services.push(MeshService {
-            name: format!("{}-{listener_name}", object.metadata.name),
+            // Gateway and ListenerSet are distinct Kubernetes resources and
+            // may legally share namespace/name/listener. Keep the synthetic
+            // service identity kind-scoped so one resource can never masquerade
+            // as the other's materialization in downstream consumers.
+            name: format!("listenerset-{}-{listener_name}", object.metadata.name),
             namespace: object.metadata.namespace.clone(),
             ports: vec![ServicePort {
                 port,

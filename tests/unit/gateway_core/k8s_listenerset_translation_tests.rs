@@ -231,7 +231,7 @@ fn listenerset_attaches_and_materializes_http_route() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "extra-extra-http")
+                .any(|service| service.name == "listenerset-extra-extra-http")
         }),
         "accepted ListenerSet listener must materialize a mesh service"
     );
@@ -827,6 +827,14 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         }),
         "the winning Gateway listener should emit the colliding synthetic name"
     );
+    assert!(
+        translation.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
+                .iter()
+                .all(|service| service.name != "listenerset-shared-same")
+        }),
+        "the non-winning ListenerSet must not emit its kind-scoped service"
+    );
     let status = translation
         .listenerset_statuses
         .iter()
@@ -836,6 +844,60 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
     assert!(
         !status.programmed && status.programmed_listeners.is_empty(),
         "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"
+    );
+}
+
+#[test]
+fn listenerset_service_cannot_program_same_named_gateway() {
+    let gateway = object(
+        "Gateway",
+        "shared",
+        json!({
+            "gatewayClassName": "ferrum",
+            "allowedListeners": {"namespaces": {"from": "Same"}},
+            "listeners": [{
+                "name": "same",
+                "protocol": "HTTP",
+                "allowedRoutes": {"namespaces": {"from": "Same"}}
+            }]
+        }),
+    );
+    let set = listenerset(
+        "shared",
+        "shared",
+        json!([{
+            "name": "same",
+            "port": 8080,
+            "protocol": "HTTP",
+            "allowedRoutes": {"namespaces": {"from": "Same"}}
+        }]),
+    );
+    let objects = vec![gateway_class(), gateway, set];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    assert!(
+        translation.config.mesh.as_ref().is_some_and(|mesh| {
+            mesh.services
+                .iter()
+                .any(|service| service.name == "listenerset-shared-same")
+        }),
+        "the ListenerSet should emit a kind-scoped service"
+    );
+
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    let gateway_update = updates
+        .iter()
+        .find(|update| update.kind == "Gateway" && update.name == "shared")
+        .expect("Gateway status update");
+    let programmed = gateway_update.status["conditions"]
+        .as_array()
+        .expect("Gateway conditions")
+        .iter()
+        .find(|condition| condition["type"] == "Programmed")
+        .expect("Gateway Programmed condition");
+    assert_eq!(
+        programmed["status"], "False",
+        "a ListenerSet-owned service must not program the same-named Gateway"
     );
 }
 

@@ -1445,9 +1445,9 @@ impl K8sAccumulator {
             !gateway_api::dispatch_rule_internal_metadata_present(&self.config.plugin_configs),
             "internal Gateway API dispatch precedence metadata must be stripped before translation output"
         );
-        // Programmed for ListenerSets is derived from mesh services created
-        // during translate; callers refresh after `finish()` once the mesh
-        // slice is sealed into `config.mesh`.
+        // ListenerSet Programmed evidence is recorded at the same point its
+        // kind-scoped mesh service is emitted. Normalize only after all
+        // translation-time ownership evidence is final.
         self.mesh.normalize();
         // Sort single-winner / additive mesh resources by (namespace, name) for
         // deterministic slice order. `peer_authentications` is sorted alongside
