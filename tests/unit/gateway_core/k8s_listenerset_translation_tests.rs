@@ -539,18 +539,19 @@ fn gateway_https_catch_all_and_hostname_siblings_stay_materializable() {
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
     assert!(
-        translation.config.proxies.iter().any(|proxy| {
-            proxy.hosts.iter().any(|host| host == "example.org")
-        }),
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "example.org") }),
         "catch-all HTTPS listener must still materialize hostname routes"
     );
     assert!(
-        translation.config.proxies.iter().any(|proxy| {
-            proxy
-                .hosts
-                .iter()
-                .any(|host| host == "second-example.org")
-        }),
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| { proxy.hosts.iter().any(|host| host == "second-example.org") }),
         "hostname-specific HTTPS sibling must stay materializable for sectionName routes"
     );
 
