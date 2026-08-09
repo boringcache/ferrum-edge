@@ -1590,7 +1590,7 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
             key.gateway.clone(),
         )) || match (
             plan.serving_by_namespace
-                .get(gateway_frontend_tls_slot_namespace(key, policy)),
+                .get(gateway_frontend_tls_slot_namespace(&key, policy)),
             policy.frontend_tls_source.as_ref(),
         ) {
             (Some(serving), Some(source)) => serving != source,
