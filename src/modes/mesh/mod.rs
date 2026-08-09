@@ -14116,15 +14116,17 @@ fn load_mesh_frontend_server_identity(
     // mesh's workload identity, so it should back the listener's server cert.
     //
     // The identity resolves LIVE from the shared SVID slot — the same slot the
-    // gateway SVID file watcher (`run_gateway_svid_file_rotation_loop`) and any
-    // future CA-backend rotation loop store into — so a file-based SVID
-    // rotation reaches inbound handshakes without a restart (this closes the
-    // old "inbound server cert pinned at startup" caveat from issue #1523).
+    // gateway SVID source watcher
+    // (`identity::svid_source_watch::run_gateway_svid_source_rotation_loop`)
+    // and any future CA-backend rotation loop store into — so an SVID rotation
+    // from files or an external provider reaches inbound handshakes without a
+    // restart (this closes the old "inbound server cert pinned at startup"
+    // caveat from issue #1523).
     // Startup still hard-errors when the slot's current material cannot back a
     // server certificate (fail closed): configured-but-broken identity is a
     // real fault, not a dev-plaintext posture ("no identity at all" is gated
     // separately at config time by #1522). `ProxyState` construction loaded
-    // and validated the same files into this slot before we got here.
+    // and validated the same sources into this slot before we got here.
     if let (Some(cert_path), Some(key_path)) = (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),

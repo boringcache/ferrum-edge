@@ -160,11 +160,20 @@ pub fn material_set_poll_interval(
         .unwrap_or(file_default)
 }
 
-fn source_poll_interval(
+/// Effective polling interval for one material source.
+///
+/// `None` means the source cannot change underneath the running process
+/// (inline PEM, or a URI scheme with no refreshable loader) and therefore
+/// contributes no cadence. File-backed sources use `file_default`, every other
+/// refreshable scheme uses `provider_default`, and a URI `?poll=` option
+/// overrides both for that source.
+pub fn source_poll_interval(
     source: &CertSource,
     file_default: Duration,
     provider_default: Duration,
 ) -> Option<Duration> {
+    let file_default = clamp_poll_interval(file_default);
+    let provider_default = clamp_poll_interval(provider_default);
     match source {
         CertSource::Path(_) => Some(file_default),
         CertSource::InlinePem(_) => None,
@@ -241,56 +250,66 @@ pub fn material_set_fingerprint(
 ) -> Result<MaterialSetFingerprint, MaterialError> {
     let mut entries = Vec::with_capacity(sources.len());
     for watched in sources {
-        if let Some(entry) = opaque_key_fingerprint_entry(watched) {
-            entries.push(entry);
-            continue;
-        }
-        let configured_scheme = configured_source_scheme(&watched.source);
-        let started = Instant::now();
-        let material = match load_material_blocking(&watched.source, watched.kind) {
-            Ok(material) => material,
-            Err(error) => {
-                let registry = crate::plugins::prometheus_metrics::global_registry();
-                registry.record_tls_source_fetch_duration(
-                    configured_scheme.as_str(),
-                    watched.kind.as_str(),
-                    started.elapsed().as_secs_f64(),
-                );
-                registry.record_tls_source_fetch_failure(
-                    configured_scheme.as_str(),
-                    watched.kind.as_str(),
-                    material_error_reason(&error),
-                );
-                return Err(error);
-            }
-        };
-        crate::plugins::prometheus_metrics::global_registry().record_tls_source_fetch_duration(
-            material.source_kind.as_str(),
-            material.kind.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        entries.push(MaterialFingerprintEntry {
-            label: watched.label,
-            // Identity, taken from the *configured* source, never from the
-            // materialized value. `MaterializedMaterial::display_source_id` is
-            // redacted at the producer, so every `vault://` reference renders
-            // identically there; using it here would make two distinct
-            // provider references compare equal whenever their bytes and
-            // version match, and `MaterialSetFingerprint` equality is the
-            // rotation predicate. A configured source change would then evade
-            // reload/rebuild detection, and `tls::events` — which derives
-            // `cert_id`, `source_id`, and source-id filtering from this entry —
-            // would collapse distinct sources onto one event identity. This is
-            // also the same rendering `events::event_material_from_source`
-            // uses for the not-yet-loaded case, so the two event paths agree.
-            source_id: watched.source.source_id(),
-            fingerprint: material.fingerprint,
-            version: material.version,
-            source_kind: material.source_kind,
-            kind: material.kind,
-        });
+        entries.push(material_fingerprint(watched)?);
     }
     Ok(MaterialSetFingerprint { entries })
+}
+
+/// Fingerprint one configured source using its material bytes.
+///
+/// This is the per-source half of [`material_set_fingerprint`]; surfaces whose
+/// members are polled on independent cadences (gateway SVID cert / key / trust
+/// bundle) refresh one entry at a time and assemble the set themselves.
+pub fn material_fingerprint(
+    watched: &WatchedMaterialSource,
+) -> Result<MaterialFingerprintEntry, MaterialError> {
+    if let Some(entry) = opaque_key_fingerprint_entry(watched) {
+        return Ok(entry);
+    }
+    let configured_scheme = configured_source_scheme(&watched.source);
+    let started = Instant::now();
+    let material = match load_material_blocking(&watched.source, watched.kind) {
+        Ok(material) => material,
+        Err(error) => {
+            let registry = crate::plugins::prometheus_metrics::global_registry();
+            registry.record_tls_source_fetch_duration(
+                configured_scheme.as_str(),
+                watched.kind.as_str(),
+                started.elapsed().as_secs_f64(),
+            );
+            registry.record_tls_source_fetch_failure(
+                configured_scheme.as_str(),
+                watched.kind.as_str(),
+                material_error_reason(&error),
+            );
+            return Err(error);
+        }
+    };
+    crate::plugins::prometheus_metrics::global_registry().record_tls_source_fetch_duration(
+        material.source_kind.as_str(),
+        material.kind.as_str(),
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(MaterialFingerprintEntry {
+        label: watched.label,
+        // Identity, taken from the *configured* source, never from the
+        // materialized value. `MaterializedMaterial::display_source_id` is
+        // redacted at the producer, so every `vault://` reference renders
+        // identically there; using it here would make two distinct
+        // provider references compare equal whenever their bytes and
+        // version match, and `MaterialSetFingerprint` equality is the
+        // rotation predicate. A configured source change would then evade
+        // reload/rebuild detection, and `tls::events` — which derives
+        // `cert_id`, `source_id`, and source-id filtering from this entry —
+        // would collapse distinct sources onto one event identity. This is
+        // also the same rendering `events::event_material_from_source`
+        // uses for the not-yet-loaded case, so the two event paths agree.
+        source_id: watched.source.source_id(),
+        fingerprint: material.fingerprint,
+        version: material.version,
+        source_kind: material.source_kind,
+        kind: material.kind,
+    })
 }
 
 fn opaque_key_fingerprint_entry(
@@ -1085,7 +1104,10 @@ async fn wait_material_set_reload_tick(
     }
 }
 
-fn record_refresh_for_entries(
+/// Record a `ferrum_tls_source_refresh_total` sample per already-fingerprinted
+/// entry. `outcome` is one of `rotated`, `unchanged`, `rebuild_error`, or
+/// `load_error`.
+pub fn record_refresh_for_entries(
     surface: &'static str,
     entries: &[MaterialFingerprintEntry],
     outcome: &'static str,
