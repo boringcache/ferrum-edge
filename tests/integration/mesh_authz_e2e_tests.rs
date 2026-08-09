@@ -38,9 +38,7 @@ use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{
     JwtAuthAttributeValue, Plugin, PluginResult, RequestContext, StreamConnectionContext,
 };
-use ferrum_edge::proxy::stream_match::{
-    StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
-};
+use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence};
 use serde_json::json;
 use std::sync::Arc;
 

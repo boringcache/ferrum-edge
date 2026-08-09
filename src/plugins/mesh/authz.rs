@@ -910,7 +910,11 @@ fn http_header_attribute(
         return Some(ctx.path.clone());
     }
     if name.eq_ignore_ascii_case(":scheme") {
-        let scheme = if ctx.request_is_secure { "https" } else { "http" };
+        let scheme = if ctx.request_is_secure {
+            "https"
+        } else {
+            "http"
+        };
         return Some(scheme.to_string());
     }
 
@@ -2591,10 +2595,8 @@ impl Plugin for MeshAuthz {
         // similarly separated via XFF / real-IP resolution.
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
-        let destination_ip = mesh_authz_destination_ip(
-            None,
-            ctx.connection_destination_ip.or(ctx.destination_ip),
-        );
+        let destination_ip =
+            mesh_authz_destination_ip(None, ctx.connection_destination_ip.or(ctx.destination_ip));
         // Transparent stream listeners bind a fixed interception port while the
         // trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
         // destination. Both operation `ports` and `when: destination.port` must

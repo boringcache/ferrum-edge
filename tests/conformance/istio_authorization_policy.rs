@@ -917,12 +917,7 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "request.auth.claims[realm_access[roles]",
         "request.auth.claims[realm_access][]",
     ] {
-        let policy = condition_policy(
-            "DENY",
-            istio_admitted_map_key,
-            json!(["x"]),
-            Value::Null,
-        );
+        let policy = condition_policy("DENY", istio_admitted_map_key, json!(["x"]), Value::Null);
         assert_eq!(
             policy.rules[0].when[0].key, istio_admitted_map_key,
             "Istio-admitted dynamic map key must survive translation"
