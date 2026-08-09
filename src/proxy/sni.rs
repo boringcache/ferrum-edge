@@ -521,15 +521,14 @@ fn terminal_client_hello(data: &[u8], reason: SniPeekFailure) -> ClientHelloSni 
 
 /// Classify a buffered TLS ClientHello prefix.
 ///
-/// The hostname answer is **exactly** [`extract_sni_from_client_hello`]'s: the
-/// lenient extractor runs first, so any prefix that already carries a complete,
-/// internally consistent `server_name` entry still resolves (a later record
-/// cannot retract a name whose own length fields were fully buffered, and a
-/// duplicate `server_name` extension is forbidden by the TLS grammar). Only the
-/// former `None` is subdivided, and it is subdivided using parsers that already
-/// exist in this module — [`tls_clienthello_wire_span`] for framing and
-/// [`client_hello_ktls_facts`] for strict whole-hello structure — so there is
-/// one ClientHello parser in the gateway, not two.
+/// The bounded wire span and strict whole-hello parser run before the lenient
+/// hostname extractor. This ordering is security-sensitive: a prefix can carry
+/// a complete, readable `server_name` and still belong to an oversized hello or
+/// be followed by malformed/duplicate extension data. Routing on that prefix
+/// would let an indeterminate hello select and dial a tenant backend despite
+/// the fail-closed admission contract. Once the whole hello is proven valid,
+/// [`extract_sni_from_client_hello`] supplies the same normalized hostname used
+/// by the other SNI consumers.
 ///
 /// * not a handshake record / not `client_hello` → [`ClientHelloSni::NotTls`]
 /// * hello not fully buffered → `Indeterminate(Truncated)`
@@ -538,9 +537,6 @@ fn terminal_client_hello(data: &[u8], reason: SniPeekFailure) -> ClientHelloSni 
 ///   `Indeterminate(UnrepresentableName)`
 /// * complete but structurally invalid → `Indeterminate(Malformed)`
 pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
-    if let Some(hostname) = extract_sni_from_client_hello(data) {
-        return ClientHelloSni::Sni(hostname);
-    }
     let Some(&first) = data.first() else {
         return ClientHelloSni::Indeterminate(SniPeekFailure::Truncated);
     };
@@ -559,10 +555,13 @@ pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
         // parser: it refuses any structural violation and reports whether a
         // `server_name` extension was present at all.
         WireSpan::Span(_) => match client_hello_ktls_facts(data) {
-            Some(facts) if facts.offers_server_name => {
-                ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName)
-            }
-            Some(_) => ClientHelloSni::NoSni,
+            Some(facts) => match extract_sni_from_client_hello(data) {
+                Some(hostname) => ClientHelloSni::Sni(hostname),
+                None if facts.offers_server_name => {
+                    ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName)
+                }
+                None => ClientHelloSni::NoSni,
+            },
             // `tls_clienthello_wire_span` clamps its answer to the hard bound,
             // so a buffer sitting exactly at the bound may hold only a prefix
             // of a larger hello. At the bound, "oversized" is the actionable
@@ -867,6 +866,7 @@ struct ScannedExtensions {
 fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
     let mut scanned = ScannedExtensions::default();
     let mut saw_supported_versions = false;
+    let mut saw_server_name = false;
 
     while !ext.is_empty() {
         if ext.len() < 4 {
@@ -879,8 +879,20 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
             return None;
         }
         if ext_type == 0x0000 {
-            // Presence only. Whether the name is representable is decided by
-            // `extract_sni_from_client_hello` over the same bytes.
+            // Duplicate extensions are forbidden by the TLS grammar. The
+            // lenient hostname extractor returns from the first SNI extension,
+            // so this strict pass must prevent a later duplicate from turning
+            // a malformed hello into a routable tenant selection.
+            if saw_server_name {
+                return None;
+            }
+            saw_server_name = true;
+            if !server_name_extension_is_well_formed(&ext[4..extension_end]) {
+                return None;
+            }
+            // Presence and structure only. Whether the host_name bytes are a
+            // representable DNS name is decided by the extractor over the same
+            // validated hello so it can produce `UnrepresentableName`.
             scanned.offers_server_name = true;
         }
         if ext_type == 0x002b {
@@ -909,6 +921,51 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
         ext = &ext[extension_end..];
     }
     Some(scanned)
+}
+
+/// Validate the RFC 6066 `ServerNameList` shape without interpreting DNS bytes.
+///
+/// Unknown future name types remain structurally valid, but `host_name` may
+/// appear at most once and must be non-empty. Representability is deliberately
+/// left to [`parse_sni_hostname`] so the typed classifier can distinguish an
+/// unreadable name from a malformed extension.
+fn server_name_extension_is_well_formed(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let names = &data[2..];
+    if list_len == 0 || names.len() != list_len {
+        return false;
+    }
+
+    let mut pos = 0usize;
+    let mut saw_host_name = false;
+    while pos < names.len() {
+        let Some(header_end) = pos.checked_add(3) else {
+            return false;
+        };
+        let Some(header) = names.get(pos..header_end) else {
+            return false;
+        };
+        let name_type = header[0];
+        let name_len = u16::from_be_bytes([header[1], header[2]]) as usize;
+        pos = header_end;
+        let Some(next) = pos.checked_add(name_len) else {
+            return false;
+        };
+        if next > names.len() {
+            return false;
+        }
+        if name_type == 0x00 {
+            if name_len == 0 || saw_host_name {
+                return false;
+            }
+            saw_host_name = true;
+        }
+        pos = next;
+    }
+    true
 }
 
 /// Concatenate the handshake-layer payloads of consecutive TLS handshake records

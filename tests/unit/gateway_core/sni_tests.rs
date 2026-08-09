@@ -1447,6 +1447,27 @@ fn non_sni_extension_block() -> Vec<u8> {
     ext
 }
 
+/// One complete RFC 6066 `server_name` extension containing a DNS hostname.
+fn sni_extension_block(hostname: &str) -> Vec<u8> {
+    let hostname = hostname.as_bytes();
+    let hostname_len = u16::try_from(hostname.len()).expect("test hostname fits in u16");
+    let server_name_list_len = hostname_len
+        .checked_add(3)
+        .expect("test ServerNameList length fits in u16");
+    let extension_len = server_name_list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&extension_len.to_be_bytes());
+    ext.extend_from_slice(&server_name_list_len.to_be_bytes());
+    ext.push(0x00); // host_name
+    ext.extend_from_slice(&hostname_len.to_be_bytes());
+    ext.extend_from_slice(hostname);
+    ext
+}
+
 #[test]
 fn classify_reports_hostname_for_a_valid_client_hello() {
     let hello = build_tls_client_hello("tenant-a.example.com");
@@ -1521,6 +1542,43 @@ fn classify_reports_malformed_for_a_complete_but_invalid_extension_block() {
     assert_eq!(
         classify_client_hello(&hello),
         ClientHelloSni::Indeterminate(SniPeekFailure::Malformed)
+    );
+}
+
+#[test]
+fn classify_rejects_malformed_data_after_an_early_valid_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    // A second extension begins but omits its length. The historical lenient
+    // extractor has already found the first SNI by this point, which is why
+    // classification must validate the entire declared ClientHello first.
+    extensions.extend_from_slice(&[0x00, 0x0f]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "a valid early SNI must not hide malformed trailing extension data"
+    );
+}
+
+#[test]
+fn classify_rejects_duplicate_server_name_extensions() {
+    let mut extensions = sni_extension_block("first.example.com");
+    extensions.extend_from_slice(&sni_extension_block("second.example.com"));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("first.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "duplicate SNI extensions are malformed and must never select the first tenant"
     );
 }
 
@@ -1660,6 +1718,42 @@ async fn peek_reports_oversized_when_the_hello_exceeds_the_hard_bound() {
         accept_task.await.expect("accept_task"),
         ClientHelloSni::Indeterminate(SniPeekFailure::Oversized),
         "a hello past the 16 KiB peek bound must be attributed, never defaulted"
+    );
+}
+
+#[tokio::test]
+async fn peek_rejects_an_oversized_hello_with_sni_before_the_hard_bound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let mut extensions = sni_extension_block("early-overcap.example.com");
+    extensions.extend_from_slice(&0x0015u16.to_be_bytes()); // padding
+    extensions.extend_from_slice(&20_000u16.to_be_bytes());
+    extensions.extend_from_slice(&vec![0u8; 20_000]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+    assert!(hello.len() > 16 * 1024);
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early-overcap.example.com".to_string()),
+        "the regression requires the lenient extractor to see SNI before the cap"
+    );
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    assert_eq!(
+        accept_task.await.expect("accept_task"),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Oversized),
+        "an early SNI must not make an oversized ClientHello routable"
     );
 }
 
