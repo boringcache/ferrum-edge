@@ -195,3 +195,35 @@ fn listenerset_not_allowed_by_default_fails_closed() {
         Some(0)
     );
 }
+
+#[test]
+fn foreign_listenerset_status_does_not_claim_ferrum_ownership() {
+    let mut foreign = listenerset();
+    foreign.spec["parentRef"]["name"] = json!("foreign-edge");
+    foreign.status = json!({
+        "conditions": [{
+            "type": "Accepted",
+            "status": "True",
+            "reason": "Accepted",
+            "message": "Another controller accepted this ListenerSet"
+        }]
+    });
+
+    let foreign_updates = plan_gateway_api_status_updates(&[foreign.clone()], options(), &[]);
+    assert!(
+        foreign_updates
+            .iter()
+            .all(|update| update.kind != "ListenerSet"),
+        "a generic foreign Accepted reason must not make Ferrum overwrite an unmanaged ListenerSet"
+    );
+
+    foreign.status["conditions"][0]["message"] =
+        json!("[ferrum-edge] previously managed ListenerSet");
+    let cleanup_updates = plan_gateway_api_status_updates(&[foreign], options(), &[]);
+    assert!(
+        cleanup_updates
+            .iter()
+            .any(|update| update.kind == "ListenerSet"),
+        "Ferrum's explicit marker must retain eligibility to clean up its own stale status"
+    );
+}

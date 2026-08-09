@@ -1489,10 +1489,10 @@ fn listenerset_status(
         None => (
             false,
             "Pending",
-            "Ferrum has not evaluated this ListenerSet yet",
+            "[ferrum-edge] Ferrum has not evaluated this ListenerSet yet",
             false,
             "Pending",
-            "Ferrum has not evaluated this ListenerSet yet",
+            "[ferrum-edge] Ferrum has not evaluated this ListenerSet yet",
         ),
     };
 
@@ -1559,8 +1559,6 @@ fn listenerset_status_candidate_is_eligible(
         object.metadata.name.as_str(),
     );
     indexes.listenersets_on_managed_gateways.contains(&key)
-        || (indexes.listenersets_by_ns_name.contains_key(&key)
-            && has_ferrum_condition_status(&object.status))
         || has_ferrum_condition_status(&object.status)
 }
 
@@ -1571,27 +1569,14 @@ fn has_ferrum_condition_status(status: &Value) -> bool {
         .into_iter()
         .flatten()
         .any(|condition| {
-            // ListenerSet has no controllerName on conditions; presence of our
-            // reasons after a prior write is enough to keep reconciling.
+            // ListenerSet conditions carry no controllerName, and reasons such
+            // as Accepted/Pending are shared across implementations. Only the
+            // explicit message marker written by Ferrum proves ownership for a
+            // stale-status cleanup after the parent stops being managed.
             condition
-                .get("reason")
+                .get("message")
                 .and_then(Value::as_str)
-                .is_some_and(|reason| {
-                    matches!(
-                        reason,
-                        "Accepted"
-                            | "Programmed"
-                            | "NotAllowed"
-                            | "ParentNotAccepted"
-                            | "ParentNotProgrammed"
-                            | "ListenersNotValid"
-                            | "Invalid"
-                            | "HostnameConflict"
-                            | "ProtocolConflict"
-                            | "DataPlaneNotReady"
-                            | "Pending"
-                    )
-                })
+                .is_some_and(|message| message.starts_with("[ferrum-edge] "))
         })
 }
 

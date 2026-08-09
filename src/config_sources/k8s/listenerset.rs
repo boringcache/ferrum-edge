@@ -29,6 +29,11 @@ use super::{
 use crate::modes::mesh::config::{MeshService, ServicePort};
 
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
+const LISTENERSET_STATUS_OWNER_MARKER: &str = "[ferrum-edge]";
+
+fn ferrum_listenerset_status_message(message: &str) -> String {
+    format!("{LISTENERSET_STATUS_OWNER_MARKER} {message}")
+}
 
 /// Collect ListenerSets from a snapshot, resolving parent Gateways from the
 /// same snapshot. Call after Gateway listener policies are indexed.
@@ -418,9 +423,9 @@ pub(crate) fn mark_listenerset_programmed_from_config(
             if status.accepted && !status.programmed {
                 status.programmed = false;
                 status.programmed_reason = "ListenersNotValid".to_string();
-                status.programmed_message =
-                    "Ferrum accepted this ListenerSet but found no materialized listeners"
-                        .to_string();
+                status.programmed_message = ferrum_listenerset_status_message(
+                    "Ferrum accepted this ListenerSet but found no materialized listeners",
+                );
             }
         }
         return;
@@ -454,13 +459,15 @@ pub(crate) fn mark_listenerset_programmed_from_config(
         if programmed {
             status.programmed = true;
             status.programmed_reason = "Programmed".to_string();
-            status.programmed_message =
-                "Ferrum programmed at least one ListenerSet listener".to_string();
+            status.programmed_message = ferrum_listenerset_status_message(
+                "Ferrum programmed at least one ListenerSet listener",
+            );
         } else {
             status.programmed = false;
             status.programmed_reason = "ListenersNotValid".to_string();
-            status.programmed_message =
-                "Ferrum accepted this ListenerSet but found no materialized listeners".to_string();
+            status.programmed_message = ferrum_listenerset_status_message(
+                "Ferrum accepted this ListenerSet but found no materialized listeners",
+            );
         }
     }
 }
@@ -536,15 +543,16 @@ fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulator) {
             status.attached = true;
             status.accepted = true;
             status.accepted_reason = "Accepted".to_string();
-            status.accepted_message =
-                "Ferrum accepted this ListenerSet on the parent Gateway".to_string();
+            status.accepted_message = ferrum_listenerset_status_message(
+                "Ferrum accepted this ListenerSet on the parent Gateway",
+            );
         } else if any_conflicted {
             status.attached = false;
             status.accepted = false;
             status.accepted_reason = "ListenersNotValid".to_string();
-            status.accepted_message =
-                "Every ListenerSet listener conflicted with a higher-precedence listener"
-                    .to_string();
+            status.accepted_message = ferrum_listenerset_status_message(
+                "Every ListenerSet listener conflicted with a higher-precedence listener",
+            );
             status.programmed = false;
             status.programmed_reason = "ListenersNotValid".to_string();
             status.programmed_message = status.accepted_message.clone();
@@ -717,10 +725,10 @@ fn record_listenerset_status(
         attached,
         accepted,
         accepted_reason: accepted_reason.to_string(),
-        accepted_message: accepted_message.to_string(),
+        accepted_message: ferrum_listenerset_status_message(accepted_message),
         programmed,
         programmed_reason: programmed_reason.to_string(),
-        programmed_message: programmed_message.to_string(),
+        programmed_message: ferrum_listenerset_status_message(programmed_message),
         listener_conflicts: Vec::new(),
     });
 }
