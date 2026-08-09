@@ -672,6 +672,7 @@ mod tests {
 
     fn stream_summary() -> StreamTransactionSummary {
         StreamTransactionSummary {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum".into(),
             proxy_id: "tcp-p1".into(),
             proxy_lifecycle_generation: None,

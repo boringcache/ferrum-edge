@@ -3960,6 +3960,12 @@ jobs:
           components: clippy
 
       - name: Run clippy
+        # Keep all-target lint below the hosted runner's peak-memory limit on
+        # cold caches. Large integration targets can otherwise overlap several
+        # clippy-driver processes and starve the runner heartbeat before Cargo
+        # has a chance to emit a diagnostic.
+        env:
+          CARGO_BUILD_JOBS: 1
         run: cargo clippy --all-targets -- -D warnings
 
   fuzz-smoke:

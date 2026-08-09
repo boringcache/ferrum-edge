@@ -591,6 +591,7 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
 
 fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_lifecycle_generation: None,

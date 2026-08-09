@@ -2194,6 +2194,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let connected = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
     let disconnected = connected - chrono::Duration::hours(1);
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "udp-1".to_string(),
         proxy_lifecycle_generation: None,
@@ -2611,6 +2612,7 @@ fn grpc_status_rules_ignore_stream_and_websocket_samples() {
         .collect();
     let store = WindowStore::new(specs);
     let stream = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-1".to_string(),
         proxy_lifecycle_generation: None,

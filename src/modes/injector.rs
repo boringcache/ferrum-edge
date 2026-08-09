@@ -197,6 +197,10 @@ impl InjectorConfig {
             udp_capture_enabled,
             udp_outbound_port,
             tproxy_mark,
+            // The injector always renders the POD-netns init-container script; the
+            // host-network capture path is an Ambient mesh-proxy placement and has
+            // no injector representation.
+            udp_host_netns_enabled: _,
         } = udp_capture_settings_from_env()?;
         let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
             .filter(|value| !value.trim().is_empty())

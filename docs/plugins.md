@@ -146,6 +146,58 @@ behavior. Pricing and `currency` may still differ per proxy. See
 
 Use `priority_override` to control the relative execution order of instances that share the same built-in priority. Without it, instances at the same priority execute in a stable but implicit order based on config iteration
 
+### Per-Instance Execution Triggers
+
+Every `PluginConfig` also accepts an optional `trigger` block that decides
+whether that one instance executes for a given request or stream connection.
+An absent `trigger` preserves today's behavior exactly.
+
+```yaml
+plugin_configs:
+  - id: mark-external-only
+    plugin_name: request_transformer
+    scope: proxy
+    proxy_id: orders-api
+    enabled: true
+    config:
+      rules:
+        - { operation: add, target: header, key: x-external, value: "true" }
+    trigger:
+      when:
+        not:
+          match: { source_cidr: ["10.0.0.0/8", "fd00::/8"] }
+```
+
+The trigger is a generic layer and never replaces route selection, mesh routing,
+or a plugin's own policy matchers. It is compiled and bounded at config load,
+admin write, and plugin-cache publication — the request path only walks
+precompiled matchers. A false trigger suppresses every hook of that instance —
+request, response, and stream connect/disconnect alike — including its
+per-request buffering, body-release, and enforcement claims, so a skipped
+instance makes no external call, takes no lease, and retains no state.
+
+Some surfaces cannot be gated coherently and are refused at publication rather
+than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
+contextless initial response-header policy (`security_headers`), an identity
+predicate on an authentication plugin, an identity predicate on a stream-only
+plugin, fixed core request/response body ceilings, and contextless
+response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
+`spiffe_id`) also never gates a stream connection at all — the one gated stream
+phase is where stream authentication itself runs — so on a plugin that serves
+both families it governs the HTTP half only. A triggered response-presentation
+transform makes finalized response-cache/dedup replay provenance unprovable;
+those replay consumers fail closed rather than reuse bytes across two trigger
+decisions. Non-identity triggers on auth plugins remove skipped mechanisms from
+that request's effective auth chain; if all are skipped, the excluded path is
+intentionally public. For `response_caching`, the default
+`add_cache_status_header: true` publishes contextless trailer ownership and is
+therefore incompatible with a trigger; set it to `false` for a triggered cache
+instance.
+
+See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
+for the full predicate table, the deterministic absent/multi-value/case rules,
+the decide-once phase model, the fail-closed composition rules, and the bounds.
+
 ## Multi-Authentication Mode
 
 With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
@@ -4684,7 +4736,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `cache_key_include_query` | bool | `true` | Legacy keyspace toggle. The backend-effective query is now always bound because an origin may vary on it; this flag remains in the digest so changing it rotates the keyspace but can no longer authorize cross-query replay |
 | `cache_key_include_consumer` | bool | `false` | Legacy key-partition toggle. Caller isolation no longer depends on it: every key binds a mandatory caller-authorization partition (see below). The flag is still bound into the key digest so flipping it yields a disjoint keyspace. It does not authorize storage of a response to an `Authorization`-bearing request; the response still requires `public`, `must-revalidate`, or `s-maxage`. |
 | `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address (which the origin observes through Ferrum's regenerated `X-Forwarded-For`); a request whose canonical address cannot be parsed bypasses the cache rather than being keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route — it re-opens cross-caller replay for address-sensitive origins and must only be set when that is known-safe. It does not apply to authenticated callers, which always bind their canonical address. |
-| `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
+| `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses. Must be `false` when this PluginConfig carries a per-instance `trigger`, because the enabled form declares contextless response-trailer ownership |
 | `invalidate_on_unsafe_methods` | bool | `true` | After a non-error origin response (status below 400) to an unsafe method (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension/custom method, which fails closed as unsafe), invalidate cached entries for the same matched proxy, normalized/transformed Host/authority partition, and path prefix (including descendants). Method safety is classified independently of `cacheable_methods`: an unsafe method listed there still invalidates after an origin MISS and non-error response, while a served cache HIT that never contacted the origin does not. Safe methods that are not in `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics that never receive a non-error origin status do not invalidate. Invalidation uses private origin-status provenance recorded before `after_proxy` hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation |
 
 Behavior:
