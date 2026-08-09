@@ -6,6 +6,7 @@
 
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -163,7 +164,16 @@ fn listenerset_attachment_status_and_withdrawal_round_trip() {
         .into_iter()
         .filter(|object| object.kind != "ListenerSet")
         .collect();
-    let withdrawn = translate_k8s_objects(&without_set, options()).expect("withdraw");
+    let (withdrawn, skipped) =
+        translate_k8s_objects_collecting_skips(&without_set, options()).expect("withdraw");
+    assert!(
+        skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("set-route")
+                && error.contains("not permitted by the target ListenerSet listener")
+        }),
+        "the route to the deleted ListenerSet must be skipped: {skipped:?}"
+    );
     assert!(withdrawn.listenerset_statuses.is_empty());
     assert!(
         !withdrawn
