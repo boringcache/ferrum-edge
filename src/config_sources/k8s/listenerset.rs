@@ -31,7 +31,7 @@ use crate::modes::mesh::config::{MeshService, ServicePort};
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 
 /// Collect ListenerSets from a snapshot, resolving parent Gateways from the
-//! same snapshot. Call after Gateway listener policies are indexed.
+/// same snapshot. Call after Gateway listener policies are indexed.
 pub(crate) fn collect_listenersets_from_snapshot(
     acc: &mut K8sAccumulator,
     objects: &[&K8sObject],
