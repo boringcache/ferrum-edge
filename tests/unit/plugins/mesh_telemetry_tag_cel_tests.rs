@@ -407,14 +407,24 @@ async fn mesh_series_budget_caps_cel_cardinality_and_keeps_admitted_keys_updatin
         .mesh_request_counter
         .iter()
         .find(|entry| entry.key().source_workload.as_ref() == admitted_host)
-        .map(|entry| entry.value().value.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|entry| {
+            entry
+                .value()
+                .value
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
         .expect("admitted host series");
     emit_host(&workload_metrics, &registry, admitted_host).await;
     let after = registry
         .mesh_request_counter
         .iter()
         .find(|entry| entry.key().source_workload.as_ref() == admitted_host)
-        .map(|entry| entry.value().value.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|entry| {
+            entry
+                .value()
+                .value
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
         .expect("admitted host series after update");
     assert_eq!(after, before + 1);
     assert_eq!(registry.mesh_request_counter.len(), 4);
@@ -452,10 +462,7 @@ fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
         let barrier = std::sync::Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
             let mut metadata = mesh_identity_metadata(HashMap::new());
-            metadata.insert(
-                "mesh.source.workload".into(),
-                format!("host-{i}.example"),
-            );
+            metadata.insert("mesh.source.workload".into(), format!("host-{i}.example"));
             let summary = TransactionSummary {
                 http_method: "GET".into(),
                 response_status_code: 200,
@@ -472,10 +479,7 @@ fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
         worker.join().expect("concurrent admission worker");
     }
 
-    assert_eq!(
-        registry.mesh_series_live_for_test("REQUEST_COUNT"),
-        Some(4)
-    );
+    assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(4));
     assert_eq!(registry.mesh_request_counter.len(), 4);
     assert_eq!(
         registry.mesh_series_overflow_for_test("REQUEST_COUNT"),
