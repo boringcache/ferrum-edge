@@ -231,6 +231,15 @@ fn rejects_unsupported_malformed_and_costly_cel() {
     assert!(err.contains("exceeds maximum length"));
     assert!(!err.contains("xxxxx"));
 
+    let whitespace_padded = format!(
+        "{}request.host",
+        " ".repeat(MAX_METRIC_TAG_CEL_EXPR_LEN)
+    );
+    let err = parse_metric_tag_cel_expression(&whitespace_padded)
+        .expect_err("raw expression length must include surrounding whitespace");
+    assert!(err.contains("exceeds maximum length"));
+    assert!(!err.contains("request.host"));
+
     let expr = parse_metric_tag_cel_expression("request.host").unwrap();
     assert!(validate_metric_tag_cel_for_families(&expr, true).is_err());
     assert!(sanitize_metric_tag_value("a\nb\"c").contains('_'));

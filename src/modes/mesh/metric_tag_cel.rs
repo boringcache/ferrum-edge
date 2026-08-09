@@ -295,14 +295,14 @@ impl<'a> MetricTagCelContext<'a> {
 /// Diagnostics are field-specific and never echo the operator-controlled
 /// expression text (it may contain credentials or control characters).
 pub fn parse_metric_tag_cel_expression(expr: &str) -> Result<MetricTagCelExpr, String> {
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return Err("Telemetry metrics.overrides[].tagOverrides UPSERT value is required".into());
-    }
-    if trimmed.len() > MAX_METRIC_TAG_CEL_EXPR_LEN {
+    if expr.len() > MAX_METRIC_TAG_CEL_EXPR_LEN {
         return Err(format!(
             "Telemetry metrics.overrides[].tagOverrides UPSERT CEL expression exceeds maximum length of {MAX_METRIC_TAG_CEL_EXPR_LEN} bytes"
         ));
+    }
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Err("Telemetry metrics.overrides[].tagOverrides UPSERT value is required".into());
     }
     let mut parser = CelParser::new(trimmed);
     let parsed = parser.parse_expression()?;
