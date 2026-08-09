@@ -2741,11 +2741,12 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
                     && let Some(issue) = issues.first()
                 {
                     return Err(format!(
-                        "mesh_authz: invalid condition in policy '{}'/{} rule {} when {} {}: {}",
+                        "mesh_authz: invalid condition in policy '{}'/{} rule {} when {} key '{}' {}: {}",
                         policy.namespace,
                         policy.name,
                         rule_idx,
                         condition_idx,
+                        condition.key,
                         issue.istio_path(),
                         issue.reason
                     ));
