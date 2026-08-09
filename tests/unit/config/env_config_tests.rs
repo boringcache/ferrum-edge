@@ -2115,6 +2115,100 @@ fn test_env_config_k8s_cp_validates_the_composed_kubernetes_authority() {
     );
 }
 
+/// The Kubernetes qualifier is a DIFFERENT variable from the one that disables
+/// publication, so disabling publication must not turn it into an unchecked
+/// input (issue #3611). Accepting an ill-formed ordering-domain name while
+/// `FERRUM_MESH_CONFIG_AUTHORITY_ID` is empty would defer the startup failure
+/// to whenever an operator re-enables publication — typically during the
+/// incident that made them disable it in the first place.
+#[test]
+fn test_env_config_k8s_cp_validates_the_qualifier_even_when_publication_is_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            // Publication disabled on either ordering domain.
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east\n2"),
+        ],
+        || {
+            let error = EnvConfig::from_env()
+                .expect_err("an ill-formed qualifier must fail closed even while disabled");
+            assert!(error.contains("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID"));
+            assert!(
+                !error.contains("east"),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+
+    // A well-formed qualifier still starts, and publication stays disabled.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east-2"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a well-formed qualifier is accepted");
+            assert_eq!(config.mesh_config_k8s_authority_id, "east-2");
+            assert_eq!(config.mesh_config_authority_id, "");
+        },
+    );
+
+    // An empty change-log authority on a NON-Kubernetes CP still disables
+    // publication without being validated as an authority.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+        ],
+        || {
+            let config =
+                EnvConfig::from_env().expect("an empty change-log authority disables publication");
+            assert_eq!(config.mesh_config_authority_id, "");
+        },
+    );
+}
+
 #[test]
 fn test_env_config_cp_rejects_oversized_mesh_config_authority() {
     let oversized = "a".repeat(129);

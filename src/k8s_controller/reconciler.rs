@@ -735,12 +735,16 @@ pub fn publish_k8s_reconcile(
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
         let previous = overlay_slot.load_full();
-        let binding = bind_k8s_mesh_revision_publication(
+        let K8sMeshRevisionBinding {
+            translation: retained_translation,
+            revision: effective_revision,
+            retained_mesh,
+        } = bind_k8s_mesh_revision_publication(
             previous.as_ref().as_ref(),
             translation,
             mesh_revision,
         );
-        if binding.retained_mesh {
+        if retained_mesh {
             // Retention is the fail-closed answer, but it means the data plane
             // is serving mesh content older than the cluster's. The aggregate
             // watermark is a MINIMUM, so a quiet scope pins it until its next
@@ -752,8 +756,9 @@ pub fn publish_k8s_reconcile(
                 tracker.request_evidence_refresh();
             }
         }
-        let effective_translation = binding.translation;
-        let effective_revision = binding.revision;
+        // A retention publishes its edited copy; every other reconcile
+        // publishes the candidate itself, with no clone at all.
+        let effective_translation = retained_translation.as_ref().unwrap_or(translation);
 
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin
@@ -773,7 +778,7 @@ pub fn publish_k8s_reconcile(
         if crate::fips::is_enforcing() {
             let candidate = merge_k8s_translation(
                 config_arc.load().as_ref(),
-                &effective_translation,
+                effective_translation,
                 managed_namespaces,
             );
             if let Err(error) = crate::fips::policy::check_gateway_config(&candidate) {
@@ -791,7 +796,7 @@ pub fn publish_k8s_reconcile(
         );
         let new_config = swap_merged_k8s_translation(
             config_arc,
-            &effective_translation,
+            effective_translation,
             managed_namespaces,
             effective_revision.as_ref(),
         )?;
@@ -817,11 +822,17 @@ pub fn publish_k8s_reconcile(
     })
 }
 
-/// Outcome of [`bind_k8s_mesh_revision_publication`]: the effective translation
-/// (candidate non-mesh fields, possibly retained mesh), the revision that must
-/// stamp it, and whether mesh content was actually withheld.
+/// Outcome of [`bind_k8s_mesh_revision_publication`]: the revision that must
+/// stamp this publication, an optional owned override of the translation to
+/// publish in the candidate's place, and whether mesh content was withheld.
 struct K8sMeshRevisionBinding {
-    translation: GatewayConfig,
+    /// `None` when the candidate translation publishes exactly as it arrived,
+    /// which is every ordinary reconcile. Only a retention needs an owned,
+    /// edited copy, so the common path borrows the candidate instead of
+    /// deep-cloning the whole `GatewayConfig` to hand back an unmodified one —
+    /// the same reason [`publish_k8s_reconcile`] gates its FIPS composition on
+    /// enforcement rather than composing unconditionally.
+    translation: Option<GatewayConfig>,
     revision: Option<MeshConfigRevision>,
     /// The candidate mesh could not be published under the sequence available
     /// for it, so the last accepted mesh is serving instead.
@@ -837,11 +848,28 @@ struct K8sMeshRevisionBinding {
 
 impl K8sMeshRevisionBinding {
     /// Publish the candidate as-is under `revision`.
-    fn released(translation: GatewayConfig, revision: Option<MeshConfigRevision>) -> Self {
+    fn released(revision: Option<MeshConfigRevision>) -> Self {
         Self {
-            translation,
+            translation: None,
             revision,
             retained_mesh: false,
+        }
+    }
+
+    /// Withhold the candidate mesh: publish the candidate's non-mesh fields
+    /// carrying the previously accepted mesh, still stamped with the sequence
+    /// that mesh was accepted under. The one place the candidate is cloned.
+    fn retaining(
+        translation: &GatewayConfig,
+        previous: &AcceptedK8sOverlay,
+        previous_revision: &MeshConfigRevision,
+    ) -> Self {
+        let mut effective = translation.clone();
+        retain_previously_accepted_k8s_mesh(&mut effective, previous);
+        Self {
+            translation: Some(effective),
+            revision: Some(previous_revision.clone()),
+            retained_mesh: true,
         }
     }
 }
@@ -864,12 +892,11 @@ fn bind_k8s_mesh_revision_publication(
     translation: &GatewayConfig,
     mesh_revision: Option<&MeshConfigRevision>,
 ) -> K8sMeshRevisionBinding {
-    let mut effective = translation.clone();
     let Some(previous) = previous else {
         // Unversioned bootstrap / disabled authority: no prior scalar exists
         // to bind. A present malformed value is retained for the existing
         // downstream validation boundary to reject rather than normalized.
-        return K8sMeshRevisionBinding::released(effective, mesh_revision.cloned());
+        return K8sMeshRevisionBinding::released(mesh_revision.cloned());
     };
     let Some(previous_revision) = previous
         .mesh_revision
@@ -877,7 +904,7 @@ fn bind_k8s_mesh_revision_publication(
         .filter(|revision| revision.is_well_formed())
     else {
         // First established sequence after unversioned publication.
-        return K8sMeshRevisionBinding::released(effective, mesh_revision.cloned());
+        return K8sMeshRevisionBinding::released(mesh_revision.cloned());
     };
     // Every arm below that cannot authorize the candidate mesh retains the last
     // accepted one AND reports it, so the caller can ask for the fresh
@@ -888,24 +915,19 @@ fn bind_k8s_mesh_revision_publication(
         // cannot authorize different mesh content. The tracker is expected to
         // retain its floor, but this publication boundary must fail closed if
         // that invariant is ever violated.
-        retain_previously_accepted_k8s_mesh(&mut effective, previous);
-        return K8sMeshRevisionBinding {
-            translation: effective,
-            revision: Some(previous_revision.clone()),
-            retained_mesh: true,
-        };
+        return K8sMeshRevisionBinding::retaining(translation, previous, previous_revision);
     };
 
     match MeshConfigRevision::compare(Some(previous_revision), Some(candidate_revision)) {
         MeshRevisionOrder::Newer | MeshRevisionOrder::Incomparable => {
             // Sequence advanced (or a new ordering domain): release the newest
             // mesh, including authoritative withdrawals.
-            K8sMeshRevisionBinding::released(effective, Some(candidate_revision.clone()))
+            K8sMeshRevisionBinding::released(Some(candidate_revision.clone()))
         }
         MeshRevisionOrder::Same => {
-            if k8s_published_mesh_content_matches(&previous.translation, &effective) {
+            if k8s_published_mesh_content_matches(&previous.translation, translation) {
                 // Idempotent equal-revision republish.
-                K8sMeshRevisionBinding::released(effective, Some(candidate_revision.clone()))
+                K8sMeshRevisionBinding::released(Some(candidate_revision.clone()))
             } else {
                 warn!(
                     retained_sequence = previous_revision.sequence,
@@ -913,34 +935,19 @@ fn bind_k8s_mesh_revision_publication(
                      retaining the last accepted mesh snapshot and requesting fresh convergence \
                      evidence so the sequence can advance"
                 );
-                retain_previously_accepted_k8s_mesh(&mut effective, previous);
-                K8sMeshRevisionBinding {
-                    translation: effective,
-                    revision: Some(previous_revision.clone()),
-                    retained_mesh: true,
-                }
+                K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
             }
         }
         MeshRevisionOrder::Older => {
             // A non-advancing claim cannot authorize different mesh content.
             // The tracker floor normally prevents Older; fail closed anyway.
-            retain_previously_accepted_k8s_mesh(&mut effective, previous);
-            K8sMeshRevisionBinding {
-                translation: effective,
-                revision: Some(previous_revision.clone()),
-                retained_mesh: true,
-            }
+            K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
         }
         MeshRevisionOrder::Unversioned | MeshRevisionOrder::Bootstrap => {
             // Both inputs above are known well formed, so these outcomes would
             // violate `MeshConfigRevision::compare`'s contract. Fail closed if
             // that contract changes instead of treating this as bootstrap.
-            retain_previously_accepted_k8s_mesh(&mut effective, previous);
-            K8sMeshRevisionBinding {
-                translation: effective,
-                revision: Some(previous_revision.clone()),
-                retained_mesh: true,
-            }
+            K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
         }
     }
 }

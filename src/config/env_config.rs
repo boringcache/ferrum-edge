@@ -5167,9 +5167,7 @@ impl EnvConfig {
         // the accepted watermark is rendered into the reset audit log and the
         // `/mesh/config-drift` diagnostics, so refusing an ill-formed one
         // without repeating it keeps those records unshapeable from config.
-        if matches!(&self.mode, OperatingMode::ControlPlane)
-            && !self.mesh_config_authority_id.is_empty()
-        {
+        if matches!(&self.mode, OperatingMode::ControlPlane) {
             let malformed_authority = || {
                 format!(
                     "must be empty or a printable, control-character-free value with no \
@@ -5178,6 +5176,13 @@ impl EnvConfig {
                     crate::modes::mesh::revision::MAX_AUTHORITY_LEN
                 )
             };
+            // The Kubernetes qualifier is validated whenever this CP runs the
+            // CRD controller, INDEPENDENTLY of the disable switch. It is a
+            // separate variable from the one that disables publication, so
+            // gating it on `FERRUM_MESH_CONFIG_AUTHORITY_ID` would silently
+            // accept an ill-formed ordering-domain name and defer the startup
+            // failure to whenever an operator re-enables publication — usually
+            // during the incident that made them disable it.
             if self.k8s_controller_enabled {
                 // The Kubernetes domain is COMPOSED, so both halves are
                 // checked. The composed value is what a data plane orders
@@ -5198,7 +5203,9 @@ impl EnvConfig {
                         malformed_authority()
                     ));
                 }
-            } else {
+            } else if !self.mesh_config_authority_id.is_empty() {
+                // Empty is the explicit disable switch, so there is no
+                // change-log authority to check.
                 let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
                     self.mesh_config_authority_id.as_str(),
                     0,
