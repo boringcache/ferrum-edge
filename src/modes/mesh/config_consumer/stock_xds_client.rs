@@ -342,7 +342,6 @@ struct StockStreamState {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_stock_xds_client_with_shutdown(
     config: StockXdsClientConfig,
-    mut baseline: Arc<MeshConfig>,
     request: MeshSliceRequest,
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -388,7 +387,7 @@ pub async fn start_stock_xds_client_with_shutdown(
         );
         // Pick up a SIGHUP-reloaded policy baseline before opening the stream so
         // the next slice already carries it.
-        baseline = policy_rx.borrow_and_update().clone();
+        let baseline = policy_rx.borrow_and_update().clone();
 
         let xds_url = &xds_urls[current_index];
         if last_url.as_deref() != Some(xds_url.as_str()) {

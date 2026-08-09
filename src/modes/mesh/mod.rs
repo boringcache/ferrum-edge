@@ -11455,7 +11455,6 @@ pub async fn run(
         background_handles.push(tokio::spawn(
             config_consumer::stock_xds_client::start_stock_xds_client_with_shutdown(
                 stock_config,
-                baseline,
                 runtime.mesh_slice_request(),
                 mesh_state.clone(),
                 shutdown_tx.subscribe(),

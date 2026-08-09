@@ -311,7 +311,6 @@ impl StockHarness {
 
         tokio::spawn(start_stock_xds_client_with_shutdown(
             config,
-            Arc::new(baseline),
             request,
             state.clone(),
             shutdown_rx,
