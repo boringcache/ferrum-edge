@@ -648,14 +648,10 @@ fn listenerset_section_name_and_allowed_routes_gates() {
                 .is_some_and(|path| path.contains("/a"))
     }));
     assert!(
-        !translation
-            .config
-            .proxies
-            .iter()
-            .any(|proxy| proxy
-                .listen_path
-                .as_deref()
-                .is_some_and(|path| path.contains("missing"))),
+        !translation.config.proxies.iter().any(|proxy| proxy
+            .listen_path
+            .as_deref()
+            .is_some_and(|path| path.contains("missing"))),
         "unknown sectionName must fail closed"
     );
 }

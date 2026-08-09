@@ -14,18 +14,18 @@ use crate::plugins::utils::route_header_transform::route_header_transform_rules_
 
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
-    GatewayApiListenerParentKind,
-    GatewayApiListenerPolicy, GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
-    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
-    GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
-    K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
-    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
-    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route, upstream_for_route_with_session,
+    GatewayApiListenerParentKind, GatewayApiListenerPolicy, GatewayApiListenerValidationError,
+    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
+    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
+    GatewayApiRouteSlot, GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
+    RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy,
+    exact_path_listen_path, invalid_resource, mesh_route_dispatch_plugin_from_rules,
+    namespaced_resource_key, optional_port_field, optional_target_weight_field,
+    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id,
+    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
+    service_dns_name, string_array, string_field, upstream_for_route,
+    upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -1489,6 +1489,9 @@ struct GatewayFrontendTlsNamespaceSlotPlan {
     multi_cert_gateways: BTreeSet<(GatewayApiListenerParentKind, String, String)>,
 }
 
+type GatewayFrontendTlsCredentials =
+    BTreeMap<(GatewayApiListenerParentKind, String), BTreeSet<(String, String)>>;
+
 /// Build the shared namespace TLS-slot plan from listener policies alone.
 fn plan_gateway_frontend_tls_namespace_slots(
     acc: &K8sAccumulator,
@@ -1497,10 +1500,8 @@ fn plan_gateway_frontend_tls_namespace_slots(
     // resource's materializable TLS listeners. Including the kind prevents a
     // same-named Gateway and ListenerSet from collapsing into one credential
     // claim. BTree maps keep selection order-independent.
-    let mut credentials_by_gateway: BTreeMap<
-        String,
-        BTreeMap<(GatewayApiListenerParentKind, String), BTreeSet<(String, String)>>,
-    > = BTreeMap::new();
+    let mut credentials_by_gateway: BTreeMap<String, GatewayFrontendTlsCredentials> =
+        BTreeMap::new();
     for (key, policy) in &acc.gateway_api_listener_policies {
         if !policy.materializable
             || !policy.requires_frontend_tls
@@ -1524,10 +1525,8 @@ fn plan_gateway_frontend_tls_namespace_slots(
 
     let mut plan = GatewayFrontendTlsNamespaceSlotPlan::default();
     for (namespace, gateways) in credentials_by_gateway {
-        let mut candidates: BTreeMap<
-            (GatewayApiListenerParentKind, String),
-            (String, String),
-        > = BTreeMap::new();
+        let mut candidates: BTreeMap<(GatewayApiListenerParentKind, String), (String, String)> =
+            BTreeMap::new();
         for ((parent_kind, gateway), sources) in gateways {
             if sources.len() != 1 {
                 plan.multi_cert_gateways
@@ -1563,18 +1562,19 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
         if !policy.requires_frontend_tls || !policy.routes_materializable {
             continue;
         }
-        let clear_routes = plan
-            .multi_cert_gateways
-            .contains(&(key.parent_kind, key.namespace.clone(), key.gateway.clone()))
-            || match (
-                plan.serving_by_namespace.get(&key.namespace),
-                policy.frontend_tls_source.as_ref(),
-            ) {
-                (Some(serving), Some(source)) => serving != source,
-                // Multi-cert Gateways are cleared above. Unresolved TLS listeners
-                // are already non-materializable at collection time.
-                _ => false,
-            };
+        let clear_routes = plan.multi_cert_gateways.contains(&(
+            key.parent_kind,
+            key.namespace.clone(),
+            key.gateway.clone(),
+        )) || match (
+            plan.serving_by_namespace.get(&key.namespace),
+            policy.frontend_tls_source.as_ref(),
+        ) {
+            (Some(serving), Some(source)) => serving != source,
+            // Multi-cert Gateways are cleared above. Unresolved TLS listeners
+            // are already non-materializable at collection time.
+            _ => false,
+        };
         if clear_routes && let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
             policy.routes_materializable = false;
         }
@@ -1623,9 +1623,11 @@ fn listener_is_effective_tls_serving_claim(
     plan: &GatewayFrontendTlsNamespaceSlotPlan,
 ) -> bool {
     if !policy.requires_frontend_tls
-        || plan
-            .multi_cert_gateways
-            .contains(&(key.parent_kind, key.namespace.clone(), key.gateway.clone()))
+        || plan.multi_cert_gateways.contains(&(
+            key.parent_kind,
+            key.namespace.clone(),
+            key.gateway.clone(),
+        ))
     {
         return false;
     }
@@ -4669,11 +4671,7 @@ fn ensure_route_parent_refs_allowed(
     Ok(())
 }
 
-fn parent_ref_is_gateway(parent_ref: &Value) -> bool {
-    parent_ref_listener_parent_kind(parent_ref) == Some(GatewayApiListenerParentKind::Gateway)
-}
-
-#[allow(dead_code)] // Kept for symmetry with parent_ref_is_gateway; attachable helper covers both.
+#[allow(dead_code)] // Kept for callers that need the narrower ListenerSet predicate.
 fn parent_ref_is_listenerset(parent_ref: &Value) -> bool {
     parent_ref_listener_parent_kind(parent_ref) == Some(GatewayApiListenerParentKind::ListenerSet)
 }

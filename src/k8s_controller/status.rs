@@ -416,7 +416,6 @@ impl<'a> ReferenceGrantPermissionIndex<'a> {
 struct GatewayApiStatusIndexes<'a> {
     gateways_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     managed_gateways: HashSet<(&'a str, &'a str)>,
-    listenersets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     /// ListenerSets whose parentRef selects a Ferrum-managed Gateway.
     listenersets_on_managed_gateways: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
@@ -624,7 +623,6 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         Self {
             gateways_by_ns_name,
             managed_gateways,
-            listenersets_by_ns_name,
             listenersets_on_managed_gateways,
             secrets_by_ns_name,
             services_by_ns_name,

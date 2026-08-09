@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::gateway_api::{
     allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
     listener_is_materializable, listener_protocol_mode_is_supported,
-    listener_requires_frontend_tls, namespace_selector_matches, normalize_gateway_hostname,
-    listener_selected_frontend_tls_source,
+    listener_requires_frontend_tls, listener_selected_frontend_tls_source,
+    namespace_selector_matches, normalize_gateway_hostname,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
