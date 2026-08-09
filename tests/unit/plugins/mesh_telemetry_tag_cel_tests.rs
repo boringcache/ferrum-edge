@@ -175,7 +175,8 @@ fn rejects_unsupported_malformed_and_costly_cel() {
             }]
         }
     }))
-    .expect_err("headers unsupported");
+    .err()
+    .expect("headers unsupported");
     assert!(err.contains("unsupported attribute") || err.contains("rejected"));
     assert!(!err.contains("authorization"));
 
@@ -188,7 +189,8 @@ fn rejects_unsupported_malformed_and_costly_cel() {
             }]
         }
     }))
-    .expect_err("http-only on tcp");
+    .err()
+    .expect("http-only on tcp");
     assert!(
         err.contains("HTTP-only") || err.contains("unrepresentable") || err.contains("rejected")
     );
