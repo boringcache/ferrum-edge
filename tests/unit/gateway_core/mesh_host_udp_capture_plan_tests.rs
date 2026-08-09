@@ -332,9 +332,7 @@ fn host_capture_interface_names_reject_shell_and_wildcard_injection() {
 
 #[test]
 fn host_capture_interface_set_rejects_duplicates_and_overflow() {
-    assert!(
-        validate_host_capture_interfaces(&ifaces(&["vetha", "vethb"])).is_ok()
-    );
+    assert!(validate_host_capture_interfaces(&ifaces(&["vetha", "vethb"])).is_ok());
     assert!(
         validate_host_capture_interfaces(&ifaces(&["vetha", "vetha"])).is_err(),
         "a duplicate would emit a rule teardown reaps only once"
@@ -393,8 +391,8 @@ fn host_udp_ipv6_rules_follow_the_configured_v6_scope() {
 
     let mut v6_disabled = config.clone();
     v6_disabled.ip6tables_mode = Ip6TablesMode::Disabled;
-    let plan = IptablesPlan::host_udp_for_config(&v6_disabled, &ifaces(&["vetha"]))
-        .expect("v4-only plan");
+    let plan =
+        IptablesPlan::host_udp_for_config(&v6_disabled, &ifaces(&["vetha"])).expect("v4-only plan");
     assert!(plan.v6_commands.is_empty());
 }
 

@@ -492,12 +492,10 @@ pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
         "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED",
     )?;
     if udp_host_netns_enabled && !udp_capture_enabled {
-        return Err(
-            "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires \
+        return Err("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires \
              FERRUM_MESH_CAPTURE_UDP_ENABLED=true (the host-network capture path is a \
              placement choice for UDP capture, not a separate feature switch)"
-                .to_string(),
-        );
+            .to_string());
     }
     Ok(UdpCaptureSettings {
         udp_capture_enabled,

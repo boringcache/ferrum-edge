@@ -264,10 +264,10 @@ pub fn plan_host_udp_bindings(
     // guessed identity is precisely the cross-tenant confusion this path must
     // not have. Interface index and name are both checked so a rename between
     // resolutions cannot smuggle two pods onto one index.
-    let mut iface_claims: HashMap<&str, usize> = HashMap::new();
+    let mut iface_claims: HashMap<String, usize> = HashMap::new();
     let mut index_claims: HashMap<u32, usize> = HashMap::new();
     for binding in &candidates {
-        *iface_claims.entry(binding.iface.as_str()).or_insert(0) += 1;
+        *iface_claims.entry(binding.iface.clone()).or_insert(0) += 1;
         *index_claims.entry(binding.ifindex).or_insert(0) += 1;
     }
 
@@ -737,7 +737,9 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         }
 
         // 7. Stop a listener nobody needs (every pod unenrolled or refused).
-        if desired.bindings.is_empty() && let Some(listener) = self.listener.take() {
+        if desired.bindings.is_empty()
+            && let Some(listener) = self.listener.take()
+        {
             listener.stop().await;
             self.index.clear();
         }
@@ -895,8 +897,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             );
             self.logged_refusals.insert(pod_uid.clone(), *reason);
         }
-        let still_refused: HashSet<&String> =
-            desired.refused.iter().map(|(uid, _)| uid).collect();
+        let still_refused: HashSet<&String> = desired.refused.iter().map(|(uid, _)| uid).collect();
         self.logged_refusals
             .retain(|uid, _| still_refused.contains(uid));
     }
@@ -1051,9 +1052,7 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
             // Both live in the proxy's own (host) namespace here; a reply is
             // sourced from the captured VIP:port and reaches the pod over the
             // ordinary host route out its interface.
-            reply_socket_factory: Arc::new(
-                super::mesh_udp_capture::CurrentNetnsReplySocketFactory,
-            ),
+            reply_socket_factory: Arc::new(super::mesh_udp_capture::CurrentNetnsReplySocketFactory),
         };
         let (stop_tx, stop_rx) = watch::channel(false);
         info!(

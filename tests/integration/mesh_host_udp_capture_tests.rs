@@ -410,8 +410,7 @@ fn manager(
     backend: FakeBackend,
     ready_dir: Option<std::path::PathBuf>,
 ) -> HostUdpCaptureManager<FakeBackend> {
-    HostUdpCaptureManager::new(source, backend, Duration::from_millis(10))
-        .with_ready_dir(ready_dir)
+    HostUdpCaptureManager::new(source, backend, Duration::from_millis(10)).with_ready_dir(ready_dir)
 }
 
 #[tokio::test]
