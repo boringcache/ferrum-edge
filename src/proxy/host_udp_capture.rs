@@ -1140,9 +1140,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                 listener.stop().await;
             }
             self.index.clear();
-            if guard_installed
-                && let Err(error) = self.backend.teardown_capture_rules()
-            {
+            if guard_installed && let Err(error) = self.backend.teardown_capture_rules() {
                 warn!(%error, "Host UDP capture: shutdown capture cleanup did not complete");
             }
         }

@@ -2282,13 +2282,7 @@ listen_port: 15011
         let mut keepalive = Vec::new();
 
         for session_key in [first, second] {
-            match admit_or_refresh_session(
-                &sessions,
-                &limiter,
-                session_key,
-                b"x",
-                routable,
-            ) {
+            match admit_or_refresh_session(&sessions, &limiter, session_key, b"x", routable) {
                 SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
                 other => panic!("expected Admitted, got {}", admission_name(&other)),
             }
