@@ -156,8 +156,9 @@ proxies:
 ### Validation rules
 
 - HTTP-family proxies MUST set at least one of `hosts` or `listen_path`. A proxy with neither is rejected at admission (400 from the admin API, config load failure in file mode).
+- Optional HTTP-family `listen_port` scopes the route to that frontend port. In `file`/`database`/`dp` mode the gateway binds a real socket for every declared HTTP-family `listen_port` (see `docs/gateway_api_conformance.md`), in addition to `FERRUM_PROXY_HTTP_PORT`/`FERRUM_PROXY_HTTPS_PORT`. When the whole table declares exactly one listen port of the request's protocol class, the global process bind also serves it (the Service-fronted projection of `:80`/`:443`); with two or more same-class ports only an exact listener match serves. Distinct ports do not conflict on the same hosts+path. Omit `listen_port` for port-agnostic matching.
 - Stream proxies (`tcp`/`tcps`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
-- Two host-only proxies whose `hosts` overlap are rejected (409 from admin API).
+- Two host-only proxies whose `hosts` overlap on the same effective `listen_port` are rejected (409 from admin API).
 
 ## Exact Path Routing
 

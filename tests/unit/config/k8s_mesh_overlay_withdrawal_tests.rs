@@ -256,6 +256,7 @@ fn authoritative_empty_translation() -> GatewayConfig {
 fn authoritative_overlay(mesh: Option<MeshConfig>) -> GatewayConfig {
     GatewayConfig {
         mesh: mesh.map(Box::new),
+        http_tls_listen_ports: Default::default(),
         k8s_mesh_overlay: K8sMeshOverlay::authoritative_translation(),
         ..GatewayConfig::default()
     }

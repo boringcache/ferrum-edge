@@ -866,6 +866,7 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
+              integration::port_aware_route_traffic_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_mutation_decode_fail_closed_tests
@@ -1114,6 +1115,7 @@ jobs:
               functional_gateway_backend_tls_policy_test
               functional_gateway_service_import_test
               functional_host_only_routing_test
+              functional_port_aware_routes_test
               functional_migrate_mode_test
               functional_protocol_validation_test
               functional_regex_routing_test

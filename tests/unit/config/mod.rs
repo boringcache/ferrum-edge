@@ -31,6 +31,8 @@ mod field_validation_tests;
 mod frontend_tls_tests;
 mod istio_docs_capability_parity_tests;
 mod jwt_secret_separation_tests;
+mod k8s_gateway_listener_overlay_tests;
+mod k8s_gateway_route_listener_fallback_tests;
 mod k8s_mesh_overlay_withdrawal_tests;
 mod k8s_mesh_revision_binding_tests;
 mod l4_route_cross_namespace_parentref_tests;
