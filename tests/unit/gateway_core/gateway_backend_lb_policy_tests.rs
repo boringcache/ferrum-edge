@@ -12,6 +12,11 @@
 //!   *fallback* used for unbound requests — deterministic re-hashing is NOT by
 //!   itself session persistence and is asserted as such.
 //!
+//! Full-foreign `status.ancestors` capacity is also covered here: a MaxItems=16
+//! third-party map must not suppress session-persistence translation, must not
+//! produce a seventeenth Ferrum ancestor, and must not mark a valid policy
+//! rejected (#3665).
+//!
 //! Token validation, foreign/stale/removed/unhealthy bindings, and
 //! subset/port isolation live in `sticky_session_binding_tests.rs`.
 
@@ -24,8 +29,11 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::k8s_controller::status::{
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
+};
 use ferrum_edge::load_balancer::{HashOnStrategy, LoadBalancerCache};
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -315,4 +323,160 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
         updated_at: chrono::Utc::now(),
     };
     assert!(upstream.validate_fields().is_ok());
+}
+
+/// Gateway API `PolicyStatus.ancestors` MaxItems=16.
+const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
+
+fn http_route_to_service(service: &str) -> K8sObject {
+    object(
+        "HTTPRoute",
+        "gateway.networking.k8s.io/v1",
+        "sample",
+        json!({
+            "hostnames": ["api.example.com"],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "backendRefs": [{"name": service, "port": 8080}]
+            }]
+        }),
+    )
+}
+
+fn sticky_cookie_policy(kind: &str, api_version: &str) -> K8sObject {
+    object(
+        kind,
+        api_version,
+        "sticky",
+        json!({
+            "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+            "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
+        }),
+    )
+}
+
+/// Sixteen ancestors owned by other controllers — the CRD MaxItems ceiling.
+fn full_foreign_ancestors() -> Value {
+    Value::Array(
+        (0..POLICY_ANCESTOR_MAX_ITEMS)
+            .map(|index| {
+                json!({
+                    "ancestorRef": {
+                        "group": "",
+                        "kind": "Service",
+                        "name": format!("foreign-{index}"),
+                        "namespace": "default"
+                    },
+                    "controllerName": format!("example.com/controller-{index}"),
+                    "conditions": []
+                })
+            })
+            .collect(),
+    )
+}
+
+fn policy_status_update(
+    objects: &[K8sObject],
+    kind: &str,
+    name: &str,
+) -> Option<GatewayApiStatusUpdate> {
+    let translated = translate_k8s_objects(objects, options()).expect("translate");
+    plan_gateway_api_status_updates(objects, options(), &translated.route_conflicts)
+        .into_iter()
+        .find(|update| update.kind == kind && update.name == name)
+}
+
+fn ferrum_ancestors(update: &GatewayApiStatusUpdate) -> Vec<&Value> {
+    update
+        .status
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|ancestor| {
+            ancestor.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
+        .collect()
+}
+
+/// A live status already carrying sixteen third-party ancestors leaves Ferrum
+/// no representable slot. Gateway API forbids adding a seventeenth entry, so
+/// Ferrum writes nothing — but third-party status must not suppress
+/// session-persistence translation or mark the valid policy rejected.
+fn assert_full_foreign_ancestors_apply_without_ferrum_status_write(
+    mut policy: K8sObject,
+    kind: &str,
+) {
+    policy.status = json!({ "ancestors": full_foreign_ancestors() });
+    let objects = vec![policy, http_route_to_service("api")];
+
+    let translated = translate_k8s_objects(&objects, options())
+        .expect("a full foreign ancestor map must not suppress session-persistence translation");
+    assert_eq!(translated.config.upstreams.len(), 1);
+    assert!(
+        translated.config.upstreams[0]
+            .hash_on
+            .as_deref()
+            .is_some_and(|value| value.starts_with("cookie:lb-affinity-fe-")),
+        "session persistence must still reach the data plane: {:?}",
+        translated.config.upstreams[0].hash_on
+    );
+    assert!(
+        translated
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("status.ancestors")),
+        "a status reporting gap must not mark the valid policy rejected: {:?}",
+        translated.warnings
+    );
+
+    match policy_status_update(&objects, kind, "sticky") {
+        None => {
+            // Desired status equals the live full-foreign map — no patch.
+        }
+        Some(update) => {
+            let ancestors = update
+                .status
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .expect("status.ancestors");
+            assert_eq!(
+                ancestors.len(),
+                POLICY_ANCESTOR_MAX_ITEMS,
+                "Ferrum must never write a seventeenth status ancestor"
+            );
+            assert!(
+                ferrum_ancestors(&update).is_empty(),
+                "a full foreign ancestor map must leave Ferrum with no status slot: {update:?}"
+            );
+            assert!(
+                ancestors.iter().all(|entry| {
+                    entry["controllerName"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("example.com/controller-"))
+                }),
+                "Ferrum must not evict foreign status entries"
+            );
+        }
+    }
+}
+
+#[test]
+fn backend_lb_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status() {
+    assert_full_foreign_ancestors_apply_without_ferrum_status_write(
+        sticky_cookie_policy("BackendLBPolicy", "gateway.networking.k8s.io/v1alpha2"),
+        "BackendLBPolicy",
+    );
+}
+
+#[test]
+fn x_backend_traffic_policy_full_foreign_ancestors_applies_and_writes_no_ferrum_status() {
+    assert_full_foreign_ancestors_apply_without_ferrum_status_write(
+        sticky_cookie_policy(
+            "XBackendTrafficPolicy",
+            "gateway.networking.x-k8s.io/v1alpha1",
+        ),
+        "XBackendTrafficPolicy",
+    );
 }
