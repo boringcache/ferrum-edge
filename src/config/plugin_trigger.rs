@@ -588,7 +588,7 @@ fn compile_match(
                 ports.len()
             ));
         }
-        if ports.iter().any(|port| *port == 0) {
+        if ports.contains(&0) {
             return Err("trigger: `listen_port` entries must be 1-65535".to_string());
         }
         return Ok(CompiledMatch::ListenPort(ports.clone()));
@@ -970,7 +970,7 @@ fn matches_identity(identity: &CompiledIdentityMatch, observed: Option<&str>) ->
         PluginTriggerPresence::Absent => observed.is_none_or(str::is_empty),
         PluginTriggerPresence::Present => match (&identity.value, observed) {
             (_, None) => false,
-            (_, Some(value)) if value.is_empty() => false,
+            (_, Some("")) => false,
             (None, Some(_)) => true,
             (Some(matcher), Some(value)) => matches_string(matcher, value),
         },
