@@ -290,8 +290,11 @@ pub struct MeshSlice {
     /// see [`crate::modes::mesh::revision`] for the comparison contract the DP
     /// freshness gate enforces before any `ArcSwap` replacement.
     ///
-    /// `None` when the CP's config authority has no shared monotonic sequence
-    /// (K8s CRD controller, file source). Deliberately EXCLUDED from
+    /// `None` when the CP publishes no ordering domain at all: the file source,
+    /// an explicitly disabled `FERRUM_MESH_CONFIG_AUTHORITY_ID`, or a
+    /// Kubernetes-controller CP that has not yet established a
+    /// `resourceVersion` convergence watermark (issue #3611). Deliberately
+    /// EXCLUDED from
     /// [`MeshSlice::content_eq`]: like `version`, it is ordering metadata, not
     /// content, and CP-side dedupe must keep suppressing frames whose resources
     /// did not change.

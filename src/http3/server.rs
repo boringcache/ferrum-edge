@@ -1800,6 +1800,8 @@ async fn handle_h3_request(
         epoch.route_generation,
         request_host.as_deref(),
         &path,
+        ctx.frontend_listen_port,
+        true,
     );
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
@@ -1817,6 +1819,8 @@ async fn handle_h3_request(
                 request_host.as_deref(),
                 &path,
                 ctx.mesh_direction,
+                ctx.frontend_listen_port,
+                true,
             )
         }
         other => other,
@@ -15751,6 +15755,7 @@ mod build_h3_backend_headers_tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         };

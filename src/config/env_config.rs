@@ -1560,9 +1560,27 @@ pub struct EnvConfig {
     /// shared `config_changes` change log. Bump it after a deliberate source
     /// reset (restore from backup, migration to a new store) so data planes see
     /// a new ordering domain rather than a silent sequence rewind. Empty
-    /// disables revision publication entirely. Ignored when the K8s CRD
-    /// controller is enabled (that authority has no shared monotonic sequence).
+    /// disables revision publication entirely, on either ordering domain.
+    ///
+    /// `k8s` and any `k8s:...` value are RESERVED for the Kubernetes
+    /// `resourceVersion` ordering domain and refused here (issue #3611). When
+    /// the K8s CRD controller is enabled this setting is only the on/off
+    /// switch: that CP advertises the Kubernetes domain instead, built from
+    /// [`Self::mesh_config_k8s_authority_id`].
     pub mesh_config_authority_id: String,
+    /// CP-side: qualifier for the Kubernetes mesh config ordering domain
+    /// (`FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID`, issue #3611).
+    ///
+    /// Only meaningful when the K8s CRD controller is enabled. The effective
+    /// authority is the reserved domain `k8s`, or `k8s:<this value>` when set.
+    /// Every CP replica watching the SAME Kubernetes cluster must carry the same
+    /// value, because their sequences come from that cluster's shared
+    /// `resourceVersion` space. Set it to name a NEW domain after an etcd
+    /// restore-from-backup (the one event that can rewind `resourceVersion`
+    /// inside a cluster), or to distinguish two clusters whose control planes a
+    /// single data plane lists in `FERRUM_DP_CP_GRPC_URLS`. Publication is
+    /// disabled by an empty `FERRUM_MESH_CONFIG_AUTHORITY_ID`, not by this.
+    pub mesh_config_k8s_authority_id: String,
     /// DP-side: seconds a foreign config authority must be observed
     /// continuously before the mesh data plane adopts it
     /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`, issue #2473).
@@ -2833,6 +2851,7 @@ impl Default for EnvConfig {
             mesh_sidecar_identity_narrowing: false,
             mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
                 .to_string(),
+            mesh_config_k8s_authority_id: String::new(),
             mesh_config_revision_adopt_secs:
                 crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
@@ -3349,6 +3368,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
+            mesh_config_k8s_authority_id: String = "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID" => String::new();
             mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
@@ -4097,6 +4117,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
             mesh_config_authority_id,
+            mesh_config_k8s_authority_id,
             mesh_config_revision_adopt_secs,
             mesh_egress_stream_enabled,
             mesh_egress_stream_allow_plaintext,
@@ -5163,21 +5184,79 @@ impl EnvConfig {
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
 
-        if matches!(&self.mode, OperatingMode::ControlPlane)
-            && !self.k8s_controller_enabled
-            && !self.mesh_config_authority_id.is_empty()
-        {
-            let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
-                self.mesh_config_authority_id.as_str(),
-                0,
-            );
-            if !authority.is_well_formed() {
-                return Err(format!(
-                    "FERRUM_MESH_CONFIG_AUTHORITY_ID must be empty or a \
-                     printable, control-character-free value with no surrounding \
-                     whitespace and no longer than {} bytes",
+        // Mesh config ordering domains (issues #2473 / #3611). Both are
+        // validated here, at the single configuration boundary, and neither
+        // error echoes the operator-supplied value: an authority that reaches
+        // the accepted watermark is rendered into the reset audit log and the
+        // `/mesh/config-drift` diagnostics, so refusing an ill-formed one
+        // without repeating it keeps those records unshapeable from config.
+        if matches!(&self.mode, OperatingMode::ControlPlane) {
+            let malformed_authority = || {
+                format!(
+                    "must be empty or a printable, control-character-free value with no \
+                     surrounding whitespace, and the effective authority must be no longer \
+                     than {} bytes",
                     crate::modes::mesh::revision::MAX_AUTHORITY_LEN
-                ));
+                )
+            };
+            // The Kubernetes qualifier is validated whenever this CP runs the
+            // CRD controller, INDEPENDENTLY of the disable switch. It is a
+            // separate variable from the one that disables publication, so
+            // gating it on `FERRUM_MESH_CONFIG_AUTHORITY_ID` would silently
+            // accept an ill-formed ordering-domain name and defer the startup
+            // failure to whenever an operator re-enables publication — usually
+            // during the incident that made them disable it.
+            if self.k8s_controller_enabled {
+                // The Kubernetes domain is COMPOSED, so both halves are
+                // checked. The composed value is what a data plane orders
+                // against and what the bounded diagnostics render, so it must
+                // be well formed; but the qualifier is also checked for
+                // surrounding whitespace on its own, because the `k8s:` prefix
+                // would otherwise turn a leading space into a merely interior
+                // one and let `k8s: east-2` through.
+                let qualifier = self.mesh_config_k8s_authority_id.as_str();
+                let trimmed = qualifier.trim() == qualifier;
+                let printable = !qualifier.chars().any(char::is_control);
+                let qualifier_ok = qualifier.is_empty() || (trimmed && printable);
+                let authority = crate::modes::mesh::revision::kubernetes_authority(qualifier);
+                let composed = crate::modes::mesh::revision::MeshConfigRevision::new(authority, 0);
+                if !qualifier_ok || !composed.is_well_formed() {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID {}",
+                        malformed_authority()
+                    ));
+                }
+            } else if !self.mesh_config_authority_id.is_empty() {
+                // Empty is the explicit disable switch, so there is no
+                // change-log authority to check.
+                let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
+                    self.mesh_config_authority_id.as_str(),
+                    0,
+                );
+                if !authority.is_well_formed() {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_AUTHORITY_ID {}",
+                        malformed_authority()
+                    ));
+                }
+                // `k8s` is reserved for the Kubernetes `resourceVersion`
+                // ordering domain. A change-log control plane that claimed it
+                // would advertise sequences from an unrelated number space
+                // under a name a Kubernetes control plane's data planes treat
+                // as comparable — a silent cross-domain ordering claim the gate
+                // could not detect, because comparability is exactly what an
+                // equal authority asserts.
+                if crate::modes::mesh::revision::is_kubernetes_authority(
+                    self.mesh_config_authority_id.as_str(),
+                ) {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_AUTHORITY_ID must not use the reserved '{}' \
+                         ordering domain (that domain sequences from Kubernetes \
+                         resourceVersion, not from the config change log); choose another \
+                         authority id",
+                        crate::modes::mesh::revision::KUBERNETES_AUTHORITY_DOMAIN
+                    ));
+                }
             }
         }
 
