@@ -220,7 +220,7 @@ impl MeshMetricFamily {
         }
     }
 
-    pub(crate) fn disabled_name(self) -> &'static str {
+    pub(crate) const fn disabled_name(self) -> &'static str {
         match self {
             Self::RequestCount => "request_count",
             Self::RequestDuration => "request_duration",
