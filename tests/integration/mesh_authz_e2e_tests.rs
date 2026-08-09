@@ -1613,9 +1613,7 @@ async fn stream_authz_prefers_trusted_original_destination_port_over_capture_lis
     let mut operation_ctx = inbound_stream_ctx(15006, CLIENT_SPIFFE);
     operation_ctx.destination_port = Some(6379);
     assert!(matches!(
-        operation_plugin
-            .on_stream_connect(&mut operation_ctx)
-            .await,
+        operation_plugin.on_stream_connect(&mut operation_ctx).await,
         PluginResult::Reject { .. }
     ));
 
@@ -1630,9 +1628,7 @@ async fn stream_authz_prefers_trusted_original_destination_port_over_capture_lis
     let mut condition_ctx = inbound_stream_ctx(15006, CLIENT_SPIFFE);
     condition_ctx.destination_port = Some(6379);
     assert!(matches!(
-        condition_plugin
-            .on_stream_connect(&mut condition_ctx)
-            .await,
+        condition_plugin.on_stream_connect(&mut condition_ctx).await,
         PluginResult::Reject { .. }
     ));
 }

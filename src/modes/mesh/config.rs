@@ -1116,9 +1116,7 @@ fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
     (!path.is_empty()
         && path
             .split("][")
-            .all(|segment| {
-                !segment.is_empty() && !segment.contains('[') && !segment.contains(']')
-            }))
+            .all(|segment| !segment.is_empty() && !segment.contains('[') && !segment.contains(']')))
     .then_some(path)
 }
 
