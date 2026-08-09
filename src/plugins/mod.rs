@@ -3108,15 +3108,17 @@ pub struct RequestContext {
     /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
     pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
-    /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
-    /// the request handler from `select_mesh_inbound_port_route` when the matched
-    /// route is an ingress group. `mesh_authz` uses this so an
-    /// `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
-    /// listener port matches — the route forwards to a different
-    /// `defaultEndpoint` backend port, and authorizing on that backend port
-    /// would let a DENY on the listener port fail OPEN. `None` for service-port
-    /// default inbound routes (which authorize on the container/backend port,
-    /// matching Istio inbound authz) and for all non-ingress traffic.
+    /// or synthesized inbound HBONE relay (TCP ambient/Waypoint or UDP
+    /// EgressGateway). For ingress (F6 §6.2), this is the operator-declared
+    /// LISTENER port (e.g. `8443`), stamped by the request handler from
+    /// `select_mesh_inbound_port_route`. For HBONE relays this is the CONNECT
+    /// authority port (the ServiceEntry port for UDP egress), kept separate
+    /// from a targetPort-remapped socket dial port. `mesh_authz` uses this so
+    /// an `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
+    /// declared port matches — authorizing on the dial/backend port would let
+    /// a DENY on the declared port fail OPEN. `None` for service-port default
+    /// inbound routes (which authorize on the container/backend port, matching
+    /// Istio inbound authz) and outside ingress/HBONE-relay synthesis.
     pub mesh_inbound_listener_authz_port: Option<u16>,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
