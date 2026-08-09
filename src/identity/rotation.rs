@@ -164,9 +164,7 @@ async fn rotation_main(config: RotationConfig) {
 /// every already-minted token remains verifiable, so failing here degrades
 /// nothing.
 async fn rotate_jwt_authority_if_due(ca: &SharedCa) -> Option<u64> {
-    let Some(signer) = ca.jwt_signer() else {
-        return None;
-    };
+    let signer = ca.jwt_signer()?;
     match signer.rotate_if_due().await {
         Ok(generation) => generation,
         Err(e) => {
