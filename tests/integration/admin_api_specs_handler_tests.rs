@@ -5080,6 +5080,63 @@ async fn post_spec_with_stream_proxy_port_collision_returns_422() {
     );
 }
 
+/// A persisted opaque-TLS SNI route and a spec-owned route may share one port
+/// when the complete candidate group is unambiguous. This covers both the
+/// API-spec preflight and the SQL baseline that previously enforced unconditional
+/// `(namespace, listen_port)` uniqueness.
+#[tokio::test]
+async fn post_spec_persists_a_valid_shared_sni_listener_group() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    let existing_id = uid("existing-sni-route");
+    let existing: Proxy = serde_json::from_value(json!({
+        "id": existing_id,
+        "namespace": "ferrum",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "backend_scheme": "tcp",
+        "listen_port": 7778,
+        "hosts": ["tenant-a.example.com"]
+    }))
+    .expect("SNI proxy deserialization");
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("create existing SNI route");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("spec-sni-route");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Shared SNI route", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "tenant-b.internal",
+            "backend_port": 443,
+            "backend_scheme": "tcp",
+            "listen_port": 7778,
+            "hosts": ["tenant-b.example.com"]
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "valid shared SNI group was rejected: {body}"
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .expect("read spec proxy")
+            .is_some(),
+        "spec-owned shared SNI route was not persisted"
+    );
+}
+
 /// POST a spec with a TCP proxy on a reserved gateway port → must return 422.
 #[tokio::test]
 async fn post_spec_with_reserved_gateway_port_returns_422() {

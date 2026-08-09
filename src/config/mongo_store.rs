@@ -155,8 +155,9 @@ mod inner {
         namespace: String,
         listen_path: Option<String>,
         hosts: Vec<String>,
-        /// Stream schemes (tcp/tcps/udp/dtls) skip route-bucket enforcement —
-        /// they route on `listen_port` and have `check_listen_port_unique`.
+        /// Stream schemes (tcp/tcps/udp/dtls) skip HTTP route-bucket
+        /// enforcement. Their shared-port shape is validated from the complete
+        /// candidate listener group by the admin/config admission layer.
         is_stream: bool,
         upstream_id: Option<String>,
     }
@@ -1917,15 +1918,15 @@ mod inner {
                         collection = entry.collection,
                         index_keys = %entry.model.keys,
                         index_name = %index_name,
-                        "MongoDB index exists with conflicting options; dropping legacy \
-                         index and recreating with canonical options (one-time upgrade)"
+                        "MongoDB index exists with conflicting options; replacing it with the \
+                         canonical baseline definition"
                     );
                     match collection.drop_index(&index_name).await {
                         Ok(_) => {}
                         Err(drop_err) if is_index_not_found(&drop_err) => {}
                         Err(drop_err) => {
                             return Err(anyhow::anyhow!(
-                                "Failed to drop legacy {} index `{index_name}` during upgrade: \
+                                "Failed to drop conflicting {} index `{index_name}` during baseline reconciliation: \
                                  {drop_err}. Run `db.{}.dropIndex(\"{index_name}\")` manually \
                                  and restart.",
                                 entry.collection,
@@ -3786,9 +3787,9 @@ mod inner {
         /// the upstream reference guard + existence check.
         ///
         /// Mirrors the SQL backend's `ensure_proxy_route_unique_tx`: stream
-        /// schemes (tcp/tcps/udp/dtls) skip route enforcement — they have
-        /// their own `check_listen_port_unique` — and route conflicts surface
-        /// as [`PROXY_ROUTE_CONFLICT_ERROR`] so the admin layer maps 409.
+        /// schemes (tcp/tcps/udp/dtls) skip HTTP route enforcement. Their
+        /// shared-port listener shape is admitted from the complete candidate
+        /// config under the namespace lease before persistence.
         async fn ensure_proxy_admission_guards_in_session(
             &self,
             session: &mut ClientSession,
@@ -5079,20 +5080,22 @@ mod inner {
     // BSON serialization helpers
     // -----------------------------------------------------------------------
 
-    /// Strip explicit `null` values for fields that participate in unique
-    /// + sparse compound indexes.
+    /// Strip explicit `null` values from optional indexed identity/routing
+    /// fields.
     ///
     /// MongoDB's sparse indexes skip documents where the indexed field is
     /// **absent**, but they DO index documents where the field is explicitly
     /// set to `null`. Under `unique: true`, two documents in the same
-    /// namespace with `{listen_port: null}` (or `{name: null}`, etc.) both
-    /// land on the same index entry and the second insert fails with
-    /// `E11000 duplicate key error`.
+    /// namespace with `{name: null}` both land on the same unique name-index
+    /// entry and the second insert fails with `E11000 duplicate key error`.
+    /// `listen_port` is no longer unique, but keeping absent values out of its
+    /// partial secondary index preserves the same compact canonical document
+    /// shape.
     ///
     /// The domain structs use `Option<T>` without `skip_serializing_if`, so
     /// `None` serializes to BSON `Null`. Stripping these fields from the
-    /// document before insert restores sparse-index semantics while keeping
-    /// JSON admin-API responses (which read `name`/`listen_port`/`custom_id`
+    /// document before insert keeps them outside the partial indexes while
+    /// preserving JSON admin-API responses (which read `name`/`listen_port`/`custom_id`
     /// via serde) unchanged.
     ///
     /// Only the fields listed here need stripping. Other `Option` fields
@@ -5131,11 +5134,9 @@ mod inner {
         let mut doc = mongodb::bson::to_document(proxy)?;
         // Use the proxy's id as the MongoDB _id
         doc.insert("_id", proxy.id.as_str());
-        // `name` and `listen_port` both participate in unique+sparse
-        // compound indexes (`{namespace, name}` and
-        // `{namespace, listen_port}`). Two HTTP proxies in the same
-        // namespace both have `listen_port: None` — without stripping,
-        // the second insert would fail with a duplicate-null-key error.
+        // `name` participates in a unique+partial compound index;
+        // `listen_port` participates in a non-unique partial routing index.
+        // Omit null optionals so neither index contains meaningless null keys.
         strip_null_fields(&mut doc, &["name", "listen_port"]);
         Ok(doc)
     }
@@ -8982,8 +8983,8 @@ mod inner {
             // have empty `hosts` (which `hosts_overlap` treats as catch-all).
             // Without this exclusion, a host-only HTTP create/update can be
             // falsely rejected whenever any stream proxy exists in the
-            // namespace. Stream proxies have their own uniqueness check
-            // (`check_listen_port_unique`). Matches the sqlx impl.
+            // namespace. Stream proxies use listener-group validation instead.
+            // Matches the sqlx impl.
             let mut filter = match listen_path {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
@@ -9131,20 +9132,6 @@ mod inner {
                 filter.insert("id", doc! { "$ne": id });
             }
             let count = self.consumers().count_documents(filter).await?;
-            Ok(count == 0)
-        }
-
-        async fn check_listen_port_unique(
-            &self,
-            namespace: &str,
-            port: u16,
-            exclude_proxy_id: Option<&str>,
-        ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "namespace": namespace, "listen_port": port as i32 };
-            if let Some(id) = exclude_proxy_id {
-                filter.insert("_id", doc! { "$ne": id });
-            }
-            let count = self.proxies().count_documents(filter).await?;
             Ok(count == 0)
         }
 
@@ -13891,14 +13878,13 @@ mod inner {
             );
         }
 
-        /// Regression guard for the MongoDB unique+sparse index on
-        /// `{namespace, name}` and `{namespace, listen_port}`. MongoDB treats
-        /// explicit `null` as a valid indexed value, so two HTTP proxies in
-        /// the same namespace (both `name: None`, both `listen_port: None`)
-        /// would collide with `E11000 duplicate key error`. `proxy_to_doc`
-        /// strips these fields so the sparse index actually skips them.
+        /// Regression guard for optional indexed proxy fields. MongoDB treats
+        /// explicit `null` as an indexed value, so two HTTP proxies in the
+        /// same namespace would collide on the unique name index when both
+        /// carry `name: None`; the non-unique listen-port partial index should
+        /// likewise omit meaningless null keys. `proxy_to_doc` strips both.
         #[test]
-        fn proxy_to_doc_strips_null_sparse_index_fields() {
+        fn proxy_to_doc_strips_null_index_fields() {
             let now = chrono::Utc::now();
             let proxy = Proxy {
                 id: "http-proxy".to_string(),

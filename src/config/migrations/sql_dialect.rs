@@ -29,11 +29,12 @@
 //!   label-set serialization), and `proxies.allowed_ws_origins` (uncapped
 //!   admitted JSON), and `proxies.stream_match` (bounded matcher JSON).
 //!
-//! The proxy schema intentionally omits a *unique* index on
-//! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
-//! namespace/name and namespace/listen_port uniqueness constraints belong in
-//! V001. A non-unique secondary `idx_proxies_ns_listen_path` still covers the
-//! listen-path candidate scan under the route-bucket write lock. MySQL uses a
+//! The proxy schema intentionally omits *unique* indexes on both
+//! `(namespace, listen_path)` and `(namespace, listen_port)`: HTTP path
+//! uniqueness is host-scoped, while multiple stream proxies may deliberately
+//! form one validated SNI/L4 listener group on a port. Non-unique secondary
+//! indexes cover both candidate scans under the namespace admission lease.
+//! MySQL uses a
 //! 255-character `listen_path` prefix because InnoDB appends the `VARCHAR(255)`
 //! primary key to secondary-index records; full namespace + path + primary-key
 //! columns can exceed its 3072-byte key limit. The query retains its full
@@ -107,19 +108,19 @@ impl V001SqlBuilder {
         Ok(())
     }
 
-    /// Idempotently ensure baseline tables that were folded into V001 *after*
-    /// some databases had already recorded V001 in `_ferrum_migrations`.
+    /// Idempotently reconcile baseline tables/indexes that were folded into
+    /// V001 *after* some databases had already recorded V001 in
+    /// `_ferrum_migrations`.
     ///
     /// During build-out, schema additions are folded into the V001 baseline
     /// rather than carried as upgrade migrations (see the project build-out
     /// policy). The migration runner skips V001 entirely once version 1 is
-    /// recorded, so a table added to V001 here would never be created on an
-    /// already-initialized database — yet persistence writes compatibility
-    /// tables such as `proxy_route_locks` and `config_admission_locks` on every
-    /// guarded mutation. Re-running this idempotent `CREATE TABLE IF NOT EXISTS`
-    /// pass on every startup guarantees those tables exist regardless of when
-    /// V001 was recorded. Every statement here must be idempotent (no error on
-    /// re-run) so the pass is safe on fresh databases that just applied V001.
+    /// recorded, so a table or changed baseline index here would never reach an
+    /// already-initialized database. Re-running this idempotent reconciliation
+    /// pass on every startup guarantees current baseline tables and indexes are
+    /// present (and obsolete baseline constraints are absent) regardless of
+    /// when V001 was recorded. Every statement here must tolerate re-run so the
+    /// pass is safe on fresh databases that just applied V001.
     pub(super) async fn ensure_compatibility_tables(
         &self,
         connection: &mut AnyConnection,
@@ -144,6 +145,8 @@ impl V001SqlBuilder {
             .await?;
         self.ensure_audit_event_context_columns(connection).await?;
         self.create_audit_event_indexes(connection).await?;
+        self.remove_obsolete_listen_port_uniqueness(connection)
+            .await?;
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
         Ok(())
@@ -288,6 +291,10 @@ impl V001SqlBuilder {
             // under the route-bucket lock. This secondary index covers
             // `listen_path_candidate_sql` equality on `(namespace, listen_path)`.
             self.proxies_ns_listen_path_index_sql(),
+            // Non-unique: stream-listener group validity is application-enforced
+            // from the exact post-mutation namespace snapshot. Multiple SNI/L4
+            // route rows may intentionally share this key.
+            self.proxies_ns_listen_port_index_sql(),
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
@@ -335,9 +342,6 @@ impl V001SqlBuilder {
         &self,
         connection: &mut AnyConnection,
     ) -> Result<(), anyhow::Error> {
-        self.execute_index_sql(connection, self.unique_listen_port_sql())
-            .await?;
-
         for idx_sql in self.namespace_unique_index_sqls() {
             self.execute_index_sql(connection, idx_sql).await?;
         }
@@ -388,6 +392,7 @@ impl V001SqlBuilder {
             // V001 before this secondary index was folded into the baseline
             // receive it without a new migration.
             self.proxies_ns_listen_path_index_sql(),
+            self.proxies_ns_listen_port_index_sql(),
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
@@ -422,6 +427,37 @@ impl V001SqlBuilder {
             sqlx::query(idx_sql).execute(&mut *connection).await?;
         }
 
+        Ok(())
+    }
+
+    /// Remove the former V001 uniqueness constraint before installing the
+    /// non-unique listener-group lookup index. This stays in the idempotent
+    /// baseline compatibility pass rather than introducing a new migration:
+    /// build-out databases that already recorded V001 must not keep rejecting
+    /// the shared SNI/L4 rows the current baseline admits.
+    async fn remove_obsolete_listen_port_uniqueness(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        if self.is_mysql() {
+            match sqlx::query("DROP INDEX idx_proxies_unique_listen_port ON proxies")
+                .execute(&mut *connection)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    // MySQL error 1091: index does not exist. The compatibility
+                    // pass runs on every startup, so absence is the steady state.
+                    if !error.to_string().contains("1091") {
+                        return Err(error.into());
+                    }
+                }
+            }
+        } else {
+            sqlx::query("DROP INDEX IF EXISTS idx_proxies_unique_listen_port")
+                .execute(&mut *connection)
+                .await?;
+        }
         Ok(())
     }
 
@@ -472,6 +508,10 @@ impl V001SqlBuilder {
                 "CREATE INDEX IF NOT EXISTS idx_proxies_ns_listen_path ON proxies (namespace, listen_path)"
             }
         }
+    }
+
+    fn proxies_ns_listen_port_index_sql(&self) -> &'static str {
+        "CREATE INDEX IF NOT EXISTS idx_proxies_ns_listen_port ON proxies (namespace, listen_port)"
     }
 
     fn mesh_route_dispatch_index_sql(&self) -> &'static str {
@@ -1130,14 +1170,6 @@ impl V001SqlBuilder {
         }
     }
 
-    fn unique_listen_port_sql(&self) -> &'static str {
-        if self.is_mysql() {
-            "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (namespace, listen_port)"
-        } else {
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_port ON proxies (namespace, listen_port) WHERE listen_port IS NOT NULL"
-        }
-    }
-
     fn namespace_unique_index_sqls(&self) -> &'static [&'static str] {
         if self.is_mysql() {
             &[
@@ -1171,11 +1203,6 @@ mod tests {
             builder
                 .create_upstreams_sql()
                 .contains("id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY")
-        );
-        assert!(
-            builder
-                .unique_listen_port_sql()
-                .contains("CREATE UNIQUE INDEX idx_proxies_unique_listen_port")
         );
     }
 
@@ -1454,6 +1481,23 @@ mod tests {
     }
 
     #[test]
+    fn test_proxies_ns_listen_port_index_is_non_unique() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.proxies_ns_listen_port_index_sql();
+            assert!(
+                sql.contains("idx_proxies_ns_listen_port"),
+                "{dialect} must name the listen_port secondary index consistently"
+            );
+            assert!(
+                !sql.contains("UNIQUE"),
+                "{dialect} must allow validated SNI/L4 listener groups to share a port"
+            );
+            assert!(sql.contains("ON proxies (namespace, listen_port)"));
+        }
+    }
+
+    #[test]
     fn test_proxy_route_lock_table_uses_compact_route_hash_key() {
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
@@ -1703,11 +1747,6 @@ mod tests {
             builder
                 .create_upstreams_sql()
                 .contains("DEFAULT CURRENT_TIMESTAMP")
-        );
-        assert!(
-            builder
-                .unique_listen_port_sql()
-                .contains("WHERE listen_port IS NOT NULL")
         );
     }
 

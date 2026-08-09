@@ -26,6 +26,7 @@ use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs, hash_resource_bundle,
 };
 use crate::admin::audit::{self, AuditActor};
+use crate::admin::crud::{AfterValidateError, validate_stream_port_candidate};
 use crate::admin::spec_codec;
 use crate::admin::{AdminRequestLimits, AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
@@ -2011,25 +2012,37 @@ async fn validate_bundle(
         }
 
         if proxy.dispatch_kind.is_stream() {
-            // Stream-family: validate port uniqueness, reserved-port conflict, and
-            // OS-level port availability.
-            // Mirrors Proxy::check_uniqueness + Proxy::after_validate in crud.rs.
+            // Stream-family: validate the exact post-replacement listener group,
+            // reserved-port conflict, and OS-level port availability. Mirrors
+            // Proxy::after_validate in crud.rs.
             if let Some(port) = proxy.listen_port {
-                // Port uniqueness (across all stream proxies in this namespace).
-                match db
-                    .check_listen_port_unique(namespace, port, existing_proxy_id)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => failures.push(ValidationFailure {
-                        resource_type: "proxy",
-                        id: proxy.id.clone(),
-                        errors: vec![format!(
-                            "listen_port {port} is already in use by another proxy"
-                        )],
-                    }),
-                    Err(e) => return Err(classify_db_error(e)),
-                }
+                // Multiple rows may deliberately share one port when the
+                // resulting group is an opaque-TLS SNI listener or an L4
+                // stream_match listener. Apply the canonical group validator
+                // instead of an unconditional uniqueness check.
+                let stream_port_validation =
+                    validate_stream_port_candidate(db, namespace, proxy).await;
+                let shares_existing_stream_port = match stream_port_validation {
+                    Ok(shares) => shares,
+                    Err(AfterValidateError::BadRequest(errors))
+                    | Err(AfterValidateError::Conflict(errors)) => {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors,
+                        });
+                        false
+                    }
+                    Err(AfterValidateError::Db(error)) => {
+                        return Err(classify_db_error(error));
+                    }
+                    Err(AfterValidateError::Response(_)) => {
+                        return Err(ApiSpecError::Internal(
+                            "stream-listener candidate validation returned an unexpected response"
+                                .to_string(),
+                        ));
+                    }
+                };
 
                 // Reserved gateway ports check (skip in CP mode — CP can't know each
                 // DP's reserved ports; matches the Proxy::after_validate guard).
@@ -2054,7 +2067,8 @@ async fn validate_bundle(
                         .map(|p| p.dispatch_kind.is_udp() != proxy.dispatch_kind.is_udp())
                         .unwrap_or(false);
                     let should_probe =
-                        existing_proxy.is_none() || port_changed || transport_changed;
+                        (existing_proxy.is_none() || port_changed || transport_changed)
+                            && !shares_existing_stream_port;
                     if should_probe
                         && let Err(error) = crate::admin::crud::check_port_available(
                             port,

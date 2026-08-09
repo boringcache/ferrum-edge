@@ -1551,6 +1551,54 @@ impl RequestEpochStore {
         })
     }
 
+    /// Republish a config snapshot into an existing store for an integration test.
+    ///
+    /// Harnesses that drive [`crate::proxy::stream_listener::StreamListenerManager`]
+    /// without a full [`crate::proxy::ProxyState`] reload must call this before
+    /// (or together with) swapping the manager's config `ArcSwap` and calling
+    /// `reconcile()`. Stream accept paths dial backends from the published
+    /// request epoch, while reconcile only reads the config `ArcSwap` for
+    /// listener identity / SNI-group membership — updating one without the
+    /// other leaves new connections on a restarted `__sni_{port}` listener
+    /// dialing the previous backend.
+    ///
+    /// Production reloads must keep using [`Self::update_config`] through
+    /// `ProxyState::update_config`, which publishes the epoch and mirrors it
+    /// into the shared config slot under the writer lock.
+    #[doc(hidden)]
+    pub fn republish_from_runtime_parts_for_test(
+        &self,
+        config: GatewayConfig,
+        plugin_cache: &PluginCache,
+        consumer_index: &ConsumerIndex,
+        load_balancer_cache: &LoadBalancerCache,
+    ) -> Result<(), String> {
+        let staged_config = Arc::new(config);
+        let route_table = RouterCache::build_route_table_snapshot(&staged_config);
+        let plugin_inner = plugin_cache.load_inner();
+        let consumer_inner = consumer_index.load_inner();
+        let lb_inner = load_balancer_cache.load_inner();
+        // Harness-only path: the staged snapshot is already validated by the
+        // caller, and there are no compatibility wrappers to mirror.
+        match self.update_config(
+            |_| {
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::clone(&staged_config),
+                    route_table: Arc::clone(&route_table),
+                    plugin_cache: Arc::clone(&plugin_inner),
+                    consumer_index: Arc::clone(&consumer_inner),
+                    load_balancer: Arc::clone(&lb_inner),
+                    route_changed: true,
+                    lb_changed: true,
+                }))
+            },
+            |_| {},
+        )? {
+            Some(_) => Ok(()),
+            None => Err("request epoch harness republish produced no epoch".to_string()),
+        }
+    }
+
     #[inline]
     pub fn load(&self) -> Arc<RequestEpoch> {
         self.current.load_full()

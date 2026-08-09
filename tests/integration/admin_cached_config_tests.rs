@@ -7544,6 +7544,118 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
 }
 
 #[tokio::test]
+async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let tenant_a = json!({
+        "id": "shared-sni-tenant-a",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_a).await;
+    assert_eq!(status, 201, "Create first SNI route failed: {body:?}");
+
+    let tenant_b = json!({
+        "id": "shared-sni-tenant-b",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-b.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-b.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_b).await;
+    assert_eq!(
+        status, 201,
+        "A validated SNI group must survive Admin admission and SQL persistence: {body:?}"
+    );
+
+    let duplicate_owner = json!({
+        "id": "shared-sni-duplicate-owner",
+        "backend_scheme": "tcp",
+        "backend_host": "attacker.internal",
+        "backend_port": 443,
+        "listen_port": 19013,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &duplicate_owner).await;
+    assert_eq!(
+        status, 409,
+        "An ambiguous SNI owner was persisted: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("overlapping hosts"),
+        "Expected the canonical listener-group conflict diagnostic: {body:?}"
+    );
+}
+
+/// An L4 `stream_match` group of `tcps` proxies is a shape the shared-port
+/// validator explicitly admits, so Admin admission must admit it too.
+///
+/// `Proxy.resolved_tls` is a `#[serde(skip)]` derived projection: the namespace
+/// snapshot arrives with it resolved while the incoming resource has only run
+/// `Proxy::normalize_fields()`. If the candidate bucket is validated
+/// half-projected, the shared-`tcps` backend-TLS agreement check compares a
+/// resolved peer (`verify_server_cert: true`) against a defaulted candidate
+/// (`false`) and rejects an identical, valid group.
+#[tokio::test]
+async fn test_stream_proxy_admin_persists_shared_tcps_l4_match_group() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let constrained = json!({
+        "id": "shared-tcps-constrained",
+        "backend_scheme": "tcps",
+        "backend_host": "constrained.internal",
+        "backend_port": 8443,
+        "listen_port": 19016,
+        "stream_match": {"arms": [{"source_subnets": ["10.0.0.0/8"]}]}
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &constrained).await;
+    assert_eq!(status, 201, "First tcps route create failed: {body:?}");
+
+    let catch_all = json!({
+        "id": "shared-tcps-catch-all",
+        "backend_scheme": "tcps",
+        "backend_host": "catch-all.internal",
+        "backend_port": 8443,
+        "listen_port": 19016
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &catch_all).await;
+    assert_eq!(
+        status, 201,
+        "A validated L4 stream_match group of identical tcps candidates must be admitted, \
+         not rejected as mixing backend TLS listener settings: {body:?}"
+    );
+
+    // The group rule itself must still bite: a second unconstrained candidate
+    // makes OR selection ambiguous and stays fail-closed.
+    let second_catch_all = json!({
+        "id": "shared-tcps-second-catch-all",
+        "backend_scheme": "tcps",
+        "backend_host": "other.internal",
+        "backend_port": 8443,
+        "listen_port": 19016
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &second_catch_all).await;
+    assert_eq!(
+        status, 409,
+        "A second unconstrained L4 candidate was persisted: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("catch-all"),
+        "Expected the canonical L4 catch-all conflict diagnostic: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
