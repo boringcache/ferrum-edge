@@ -1034,6 +1034,10 @@ upstreams: []
         .expect("authorized plaintext fallback must reach the default route")
         .expect("backend channel open");
     assert_eq!(received, payload, "plaintext bytes relay unmodified");
+    default_route
+        .accepts
+        .try_recv()
+        .expect("the authorized plaintext connection must record one backend accept");
 
     // The authorization is scoped to non-TLS bytes only: a truncated hello is
     // still refused.
