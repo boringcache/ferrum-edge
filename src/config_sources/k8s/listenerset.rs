@@ -1,0 +1,723 @@
+//! Gateway API `ListenerSet` attachment, merge/conflict, and status projection.
+//!
+//! ListenerSets add listeners to a managed Gateway that explicitly opts in via
+//! `spec.allowedListeners`. Routes attach by parentRef to the ListenerSet
+//! (optionally with `sectionName`). Listener policies reuse the same
+//! [`super::GatewayApiListenerPolicy`] map as Gateway listeners so HTTP/L4
+//! route materialization stays one engine.
+//!
+//! Precedence for conflict resolution (pinned Gateway API v1.5.1):
+//! 1. Parent Gateway listeners
+//! 2. ListenerSets by oldest `metadata.creationTimestamp`
+//! 3. ListenerSets by `{namespace}/{name}`
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde_json::Value;
+
+use super::gateway_api::{
+    allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
+    listener_is_materializable, listener_protocol_mode_is_supported, listener_requires_frontend_tls,
+    namespace_selector_matches, normalize_gateway_hostname,
+};
+use super::{
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
+    GatewayApiListenerPolicy, GatewayApiListenerSetStatus, GatewayApiNamespaceSelector,
+    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator, K8sAccumulator,
+    K8sObject, K8sResourceKey, K8sTranslateError, string_field,
+};
+use crate::modes::mesh::config::{MeshService, ServicePort};
+
+const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
+
+/// Collect ListenerSets from a snapshot, resolving parent Gateways from the
+//! same snapshot. Call after Gateway listener policies are indexed.
+pub(crate) fn collect_listenersets_from_snapshot(
+    acc: &mut K8sAccumulator,
+    objects: &[&K8sObject],
+) -> Result<(), K8sTranslateError> {
+    let gateways: HashMap<(String, String), &K8sObject> = objects
+        .iter()
+        .filter(|object| object.kind == "Gateway")
+        .filter(|object| acc.gateway_is_managed_by_ferrum(object))
+        .map(|object| {
+            (
+                (
+                    object.metadata.namespace.clone(),
+                    object.metadata.name.clone(),
+                ),
+                *object,
+            )
+        })
+        .collect();
+
+    for object in objects {
+        if object.kind != "ListenerSet" {
+            continue;
+        }
+        collect_one_listenerset(acc, object, &gateways)?;
+    }
+    finalize_listenerset_conflicts(acc, objects);
+    Ok(())
+}
+
+fn collect_one_listenerset(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    gateways: &HashMap<(String, String), &K8sObject>,
+) -> Result<(), K8sTranslateError> {
+    let resource = K8sResourceKey::from_object(object);
+    let Some(parent_ref) = object.spec.get("parentRef") else {
+        record_listenerset_status(
+            acc,
+            resource,
+            None,
+            false,
+            false,
+            "Invalid",
+            "ListenerSet spec.parentRef is required",
+            false,
+            "Invalid",
+            "ListenerSet spec.parentRef is required",
+        );
+        return Ok(());
+    };
+
+    let parent = match parse_parent_gateway_ref(object, parent_ref) {
+        Ok(parent) => parent,
+        Err(message) => {
+            record_listenerset_status(
+                acc,
+                resource,
+                None,
+                false,
+                false,
+                "Invalid",
+                &message,
+                false,
+                "Invalid",
+                &message,
+            );
+            return Ok(());
+        }
+    };
+
+    let Some(gateway) = gateways.get(&(parent.namespace.clone(), parent.name.clone())) else {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "ParentNotAccepted",
+            "ListenerSet parentRef does not select a Ferrum-managed Gateway",
+            false,
+            "ParentNotProgrammed",
+            "ListenerSet parentRef does not select a Ferrum-managed Gateway",
+        );
+        return Ok(());
+    };
+
+    if !allowed_listeners_permits(acc, gateway, object) {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "NotAllowed",
+            "Gateway spec.allowedListeners does not permit this ListenerSet",
+            false,
+            "Invalid",
+            "Gateway spec.allowedListeners does not permit this ListenerSet",
+        );
+        return Ok(());
+    }
+
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must be a non-empty array",
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must be a non-empty array",
+        );
+        return Ok(());
+    };
+    if listeners.is_empty() {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must be a non-empty array",
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must be a non-empty array",
+        );
+        return Ok(());
+    }
+
+    let mut saw_valid_listener = false;
+    for listener in listeners {
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let requires_frontend_tls = listener_requires_frontend_tls(listener);
+        let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
+            Ok(namespaces) => (namespaces, None),
+            Err(error) => {
+                acc.warnings.push(format!(
+                    "Gateway API ListenerSet {}/{} listener {} rejected: {}",
+                    object.metadata.namespace, object.metadata.name, listener_name, error
+                ));
+                (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
+            }
+        };
+        if !listener_protocol_mode_is_supported(listener) {
+            acc.warnings.push(format!(
+                "Gateway API ListenerSet {}/{} listener {} rejected: spec.listeners[].tls.mode must be Passthrough for protocol TLS",
+                object.metadata.namespace, object.metadata.name, listener_name
+            ));
+        }
+        let protocol = string_field(listener, "protocol").map(|protocol| protocol.to_string());
+        let materializable = validation_error.is_none()
+            && listener_protocol_mode_is_supported(listener)
+            && listener_is_materializable(acc, object, listener);
+        if materializable {
+            saw_valid_listener = true;
+        }
+        let policy = GatewayApiListenerPolicy {
+            namespaces,
+            validation_error,
+            hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
+            port: listener.get("port").and_then(Value::as_u64),
+            protocol,
+            route_kinds: listener_allowed_route_kinds(listener),
+            materializable,
+            routes_materializable: materializable,
+            requires_frontend_tls,
+            conflict_reason: None,
+            parent_gateway: Some((parent.namespace.clone(), parent.name.clone())),
+        };
+        acc.gateway_api_listener_policies.insert(
+            GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                parent_kind: GatewayApiListenerParentKind::ListenerSet,
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            },
+            policy,
+        );
+    }
+
+    let accepted = saw_valid_listener;
+    record_listenerset_status(
+        acc,
+        resource,
+        Some((parent.namespace, parent.name)),
+        accepted,
+        accepted,
+        if accepted {
+            "Accepted"
+        } else {
+            "ListenersNotValid"
+        },
+        if accepted {
+            "Ferrum accepted this ListenerSet on the parent Gateway"
+        } else {
+            "Every ListenerSet listener was invalid or unsupported"
+        },
+        false,
+        if accepted {
+            "Pending"
+        } else {
+            "ListenersNotValid"
+        },
+        if accepted {
+            "Waiting for ListenerSet listeners to be programmed"
+        } else {
+            "Every ListenerSet listener was invalid or unsupported"
+        },
+    );
+    Ok(())
+}
+
+/// Apply Gateway→ListenerSet precedence and mark conflicted listeners.
+pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: &[&K8sObject]) {
+    let listenerset_order = listenerset_precedence_index(objects);
+    let mut by_gateway: HashMap<(String, String), Vec<ConflictCandidate>> = HashMap::new();
+
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        let Some(port) = policy.port else {
+            continue;
+        };
+        let Some(protocol) = policy.protocol.as_deref() else {
+            continue;
+        };
+        let gateway = match key.parent_kind {
+            GatewayApiListenerParentKind::Gateway => (key.namespace.clone(), key.gateway.clone()),
+            GatewayApiListenerParentKind::ListenerSet => match &policy.parent_gateway {
+                Some(parent) => parent.clone(),
+                None => continue,
+            },
+        };
+        let precedence = match key.parent_kind {
+            GatewayApiListenerParentKind::Gateway => 0u64,
+            GatewayApiListenerParentKind::ListenerSet => {
+                1 + listenerset_order
+                    .get(&(key.namespace.clone(), key.gateway.clone()))
+                    .copied()
+                    .unwrap_or(u64::MAX / 2)
+            }
+        };
+        by_gateway.entry(gateway).or_default().push(ConflictCandidate {
+            key: key.clone(),
+            precedence,
+            port,
+            protocol: protocol.to_ascii_uppercase(),
+            hostname: policy.hostname.clone(),
+            eligible: policy.materializable && policy.conflict_reason.is_none(),
+        });
+    }
+
+    let mut conflicted: HashMap<GatewayApiListenerKey, &'static str> = HashMap::new();
+    for candidates in by_gateway.values_mut() {
+        candidates.sort_by(|left, right| {
+            (
+                left.precedence,
+                left.key.namespace.as_str(),
+                left.key.gateway.as_str(),
+                left.key.listener.as_str(),
+            )
+                .cmp(&(
+                    right.precedence,
+                    right.key.namespace.as_str(),
+                    right.key.gateway.as_str(),
+                    right.key.listener.as_str(),
+                ))
+        });
+        let mut accepted: Vec<&ConflictCandidate> = Vec::new();
+        for candidate in candidates.iter() {
+            if !candidate.eligible {
+                continue;
+            }
+            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
+                conflicted.insert(candidate.key.clone(), reason);
+                continue;
+            }
+            accepted.push(candidate);
+        }
+    }
+
+    for (key, reason) in &conflicted {
+        if let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) {
+            policy.conflict_reason = Some(*reason);
+            policy.materializable = false;
+            policy.routes_materializable = false;
+            acc.warnings.push(format!(
+                "Gateway API {} {}/{} listener {} rejected: {reason}",
+                key.parent_kind.as_str(),
+                key.namespace,
+                key.gateway,
+                key.listener
+            ));
+        }
+    }
+
+    refresh_listenerset_status_after_conflicts(acc);
+}
+
+/// Materialize mesh listener services for one accepted ListenerSet.
+pub(crate) fn materialize_listenerset_mesh_services(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    namespace_tls_ready: bool,
+) -> Result<(), K8sTranslateError> {
+    let attached = acc
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.matches_object(object))
+        .is_some_and(|status| status.attached);
+    if !attached {
+        return Ok(());
+    }
+
+    for listener in object
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let key = GatewayApiListenerKey {
+            namespace: object.metadata.namespace.clone(),
+            parent_kind: GatewayApiListenerParentKind::ListenerSet,
+            gateway: object.metadata.name.clone(),
+            listener: listener_name.to_string(),
+        };
+        let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
+            continue;
+        };
+        if !policy.materializable || policy.conflict_reason.is_some() {
+            continue;
+        }
+        if policy.validation_error.is_some() {
+            continue;
+        }
+        if !listener_protocol_mode_is_supported(listener) {
+            continue;
+        }
+        if listener_requires_frontend_tls(listener)
+            && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
+        {
+            acc.warnings.push(format!(
+                "Gateway API ListenerSet {}/{} listener {} has unresolved TLS material and will not be exposed",
+                object.metadata.namespace, object.metadata.name, listener_name
+            ));
+            continue;
+        }
+        let Some(raw_port) = listener.get("port").and_then(Value::as_u64) else {
+            continue;
+        };
+        let port = super::port_from_u64(object, raw_port, "listeners[].port")?;
+        acc.mesh.services.push(MeshService {
+            name: format!("{}-{listener_name}", object.metadata.name),
+            namespace: object.metadata.namespace.clone(),
+            ports: vec![ServicePort {
+                port,
+                protocol: listener_app_protocol(string_field(listener, "protocol")),
+                name: Some(listener_name.to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+/// Mark ListenerSet Programmed when at least one of its listeners produced a
+/// mesh service in the translated config.
+pub(crate) fn mark_listenerset_programmed_from_config(
+    statuses: &mut [GatewayApiListenerSetStatus],
+    objects: &[&K8sObject],
+    config: &crate::config::types::GatewayConfig,
+) {
+    let Some(mesh) = config.mesh.as_ref() else {
+        for status in statuses.iter_mut() {
+            if status.accepted && !status.programmed {
+                status.programmed = false;
+                status.programmed_reason = "ListenersNotValid".to_string();
+                status.programmed_message = "Ferrum accepted this ListenerSet but found no materialized listeners"
+                    .to_string();
+            }
+        }
+        return;
+    };
+    for status in statuses.iter_mut() {
+        if !status.accepted {
+            continue;
+        }
+        let Some(object) = objects
+            .iter()
+            .find(|object| object.kind == "ListenerSet" && status.resource.matches_object(object))
+        else {
+            continue;
+        };
+        let programmed = object
+            .spec
+            .get("listeners")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|listener| {
+                let listener_name = listener
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("listener");
+                let expected = format!("{}-{listener_name}", object.metadata.name);
+                mesh.services.iter().any(|service| {
+                    service.namespace == object.metadata.namespace && service.name == expected
+                })
+            });
+        if programmed {
+            status.programmed = true;
+            status.programmed_reason = "Programmed".to_string();
+            status.programmed_message =
+                "Ferrum programmed at least one ListenerSet listener".to_string();
+        } else {
+            status.programmed = false;
+            status.programmed_reason = "ListenersNotValid".to_string();
+            status.programmed_message =
+                "Ferrum accepted this ListenerSet but found no materialized listeners".to_string();
+        }
+    }
+}
+
+/// Whether `gateway.spec.allowedListeners` selects `listenerset`.
+pub(crate) fn allowed_listeners_permits(
+    acc: &K8sAccumulator,
+    gateway: &K8sObject,
+    listenerset: &K8sObject,
+) -> bool {
+    let Some(allowed) = gateway.spec.get("allowedListeners") else {
+        return false;
+    };
+    let Some(namespaces) = allowed.get("namespaces") else {
+        return false;
+    };
+    let from = match namespaces.get("from") {
+        None => "None",
+        Some(Value::String(from)) => from.as_str(),
+        Some(_) => return false,
+    };
+    match from {
+        "All" => true,
+        "Same" => gateway.metadata.namespace == listenerset.metadata.namespace,
+        "None" => false,
+        "Selector" => {
+            let Some(selector) = namespaces.get("selector") else {
+                return false;
+            };
+            let Ok(selector) = parse_listener_namespace_selector(selector) else {
+                return false;
+            };
+            acc.namespace_labels
+                .get(&listenerset.metadata.namespace)
+                .is_some_and(|labels| namespace_selector_matches(labels, &selector))
+        }
+        _ => false,
+    }
+}
+
+fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulator) {
+    for status in &mut acc.listenerset_statuses {
+        let ns = status.resource.namespace.clone();
+        let name = status.resource.name.clone();
+        let mut any_materializable = false;
+        let mut any_conflicted = false;
+        let mut saw_listener = false;
+        let mut listener_conflicts = Vec::new();
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.parent_kind != GatewayApiListenerParentKind::ListenerSet
+                || key.namespace != ns
+                || key.gateway != name
+            {
+                continue;
+            }
+            saw_listener = true;
+            if let Some(reason) = policy.conflict_reason {
+                any_conflicted = true;
+                listener_conflicts.push((key.listener.clone(), reason.to_string()));
+            }
+            if policy.materializable {
+                any_materializable = true;
+            }
+        }
+        status.listener_conflicts = listener_conflicts;
+        if !status.accepted && status.accepted_reason != "Accepted" && !saw_listener {
+            continue;
+        }
+        if !saw_listener {
+            continue;
+        }
+        if any_materializable {
+            status.attached = true;
+            status.accepted = true;
+            status.accepted_reason = "Accepted".to_string();
+            status.accepted_message =
+                "Ferrum accepted this ListenerSet on the parent Gateway".to_string();
+        } else if any_conflicted {
+            status.attached = false;
+            status.accepted = false;
+            status.accepted_reason = "ListenersNotValid".to_string();
+            status.accepted_message =
+                "Every ListenerSet listener conflicted with a higher-precedence listener"
+                    .to_string();
+            status.programmed = false;
+            status.programmed_reason = "ListenersNotValid".to_string();
+            status.programmed_message = status.accepted_message.clone();
+        }
+    }
+}
+
+fn conflict_against_accepted(
+    candidate: &ConflictCandidate,
+    accepted: &[&ConflictCandidate],
+) -> Option<&'static str> {
+    for prior in accepted {
+        if prior.port != candidate.port {
+            continue;
+        }
+        if !prior.protocol.eq_ignore_ascii_case(&candidate.protocol) {
+            return Some("ProtocolConflict");
+        }
+        if hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref()) {
+            return Some("HostnameConflict");
+        }
+    }
+    None
+}
+
+fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left == right,
+        (None, Some(_)) | (Some(_), None) => true,
+    }
+}
+
+struct ConflictCandidate {
+    key: GatewayApiListenerKey,
+    precedence: u64,
+    port: u64,
+    protocol: String,
+    hostname: Option<String>,
+    eligible: bool,
+}
+
+struct ParentGatewayRef {
+    namespace: String,
+    name: String,
+}
+
+fn parse_parent_gateway_ref(
+    object: &K8sObject,
+    parent_ref: &Value,
+) -> Result<ParentGatewayRef, String> {
+    let group = string_field(parent_ref, "group").unwrap_or(GATEWAY_API_GROUP);
+    let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+    if group != GATEWAY_API_GROUP || kind != "Gateway" {
+        return Err(format!(
+            "ListenerSet spec.parentRef must reference {GATEWAY_API_GROUP}/Gateway"
+        ));
+    }
+    let Some(name) = string_field(parent_ref, "name") else {
+        return Err("ListenerSet spec.parentRef.name is required".to_string());
+    };
+    let namespace =
+        string_field(parent_ref, "namespace").unwrap_or(object.metadata.namespace.as_str());
+    Ok(ParentGatewayRef {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn parse_listener_namespace_selector(selector: &Value) -> Result<GatewayApiNamespaceSelector, ()> {
+    let Some(selector) = selector.as_object() else {
+        return Err(());
+    };
+    let mut match_labels = HashMap::new();
+    if let Some(labels) = selector.get("matchLabels").and_then(Value::as_object) {
+        for (key, value) in labels {
+            let Some(value) = value.as_str() else {
+                return Err(());
+            };
+            match_labels.insert(key.clone(), value.to_string());
+        }
+    }
+    let mut match_expressions = Vec::new();
+    if let Some(expressions) = selector.get("matchExpressions").and_then(Value::as_array) {
+        for expression in expressions {
+            let Some(key) = string_field(expression, "key") else {
+                return Err(());
+            };
+            let Some(operator) = string_field(expression, "operator") else {
+                return Err(());
+            };
+            let operator = match operator {
+                "In" => GatewayApiNamespaceSelectorOperator::In,
+                "NotIn" => GatewayApiNamespaceSelectorOperator::NotIn,
+                "Exists" => GatewayApiNamespaceSelectorOperator::Exists,
+                "DoesNotExist" => GatewayApiNamespaceSelectorOperator::DoesNotExist,
+                _ => return Err(()),
+            };
+            let values = expression
+                .get("values")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            match_expressions.push(GatewayApiNamespaceSelectorExpression {
+                key: key.to_string(),
+                operator,
+                values,
+            });
+        }
+    }
+    Ok(GatewayApiNamespaceSelector {
+        match_labels,
+        match_expressions,
+    })
+}
+
+fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, String), u64> {
+    let mut entries: Vec<(&K8sObject, &str, &str)> = objects
+        .iter()
+        .filter(|object| object.kind == "ListenerSet")
+        .map(|object| {
+            (
+                *object,
+                object.metadata.namespace.as_str(),
+                object.metadata.name.as_str(),
+            )
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        (
+            left.0.metadata.creation_timestamp.as_deref().unwrap_or(""),
+            left.1,
+            left.2,
+        )
+            .cmp(&(
+                right.0.metadata.creation_timestamp.as_deref().unwrap_or(""),
+                right.1,
+                right.2,
+            ))
+    });
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, namespace, name))| {
+            ((namespace.to_string(), name.to_string()), index as u64)
+        })
+        .collect()
+}
+
+fn record_listenerset_status(
+    acc: &mut K8sAccumulator,
+    resource: K8sResourceKey,
+    parent_gateway: Option<(String, String)>,
+    attached: bool,
+    accepted: bool,
+    accepted_reason: &str,
+    accepted_message: &str,
+    programmed: bool,
+    programmed_reason: &str,
+    programmed_message: &str,
+) {
+    acc.listenerset_statuses
+        .retain(|status| status.resource != resource);
+    acc.listenerset_statuses.push(GatewayApiListenerSetStatus {
+        resource,
+        parent_gateway,
+        attached,
+        accepted,
+        accepted_reason: accepted_reason.to_string(),
+        accepted_message: accepted_message.to_string(),
+        programmed,
+        programmed_reason: programmed_reason.to_string(),
+        programmed_message: programmed_message.to_string(),
+        listener_conflicts: Vec::new(),
+    });
+}

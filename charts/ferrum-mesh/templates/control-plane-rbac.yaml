@@ -19,6 +19,7 @@ rules:
       - udproutes
       - referencegrants
       - backendtlspolicies
+      - listenersets
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
@@ -44,6 +45,7 @@ rules:
       # (`status.ancestors[]`). The writer reads live status first so
       # third-party controllers' ancestors are preserved.
       - backendtlspolicies/status
+      - listenersets/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API
