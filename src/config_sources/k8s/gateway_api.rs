@@ -4845,6 +4845,13 @@ fn route_namespace_allowed_by_listener(
             }
         }
     }
+    // A ListenerSet whose attachment was rejected (for example by the parent
+    // Gateway's allowedListeners policy) deliberately publishes no listener
+    // policies. Do not let the legacy same-namespace fallback turn that absence
+    // into permission for a Route parentRef.
+    if !saw_listener && parent_kind == GatewayApiListenerParentKind::ListenerSet {
+        return false;
+    }
     !saw_listener && route.metadata.namespace == parent_namespace
 }
 

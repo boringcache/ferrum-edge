@@ -417,6 +417,7 @@ impl<'a> ReferenceGrantPermissionIndex<'a> {
 struct GatewayApiStatusIndexes<'a> {
     gateways_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     managed_gateways: HashSet<(&'a str, &'a str)>,
+    listenersets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     /// ListenerSets whose parentRef selects a Ferrum-managed Gateway.
     listenersets_on_managed_gateways: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
@@ -624,6 +625,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         Self {
             gateways_by_ns_name,
             managed_gateways,
+            listenersets_by_ns_name,
             listenersets_on_managed_gateways,
             secrets_by_ns_name,
             services_by_ns_name,
@@ -1665,7 +1667,11 @@ fn listenerset_listener_statuses(
                 references.message
             };
             let accepted_reason = if conflicted {
-                conflict_reason.unwrap_or("HostnameConflict")
+                // ListenerEntry Accepted/Programmed use PortUnavailable when
+                // a higher-precedence listener owns the port. Preserve the
+                // specific HostnameConflict/ProtocolConflict reason only on
+                // the orthogonal Conflicted condition.
+                "PortUnavailable"
             } else if !listenerset_accepted {
                 "Invalid"
             } else if !route_kinds.protocol_supported {
@@ -1730,7 +1736,7 @@ fn listenerset_listener_statuses(
                     if programmed {
                         "Programmed"
                     } else if conflicted {
-                        conflict_reason.unwrap_or("HostnameConflict")
+                        "PortUnavailable"
                     } else if accepted && !resolved_refs {
                         unresolved_reason
                     } else if accepted && !materialized {
@@ -3420,20 +3426,10 @@ fn route_parent_ref_has_matching_listener(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return true;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return true;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return true;
-    }
-    gateway
+    parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -3442,7 +3438,7 @@ fn route_parent_ref_has_matching_listener(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(indexes, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, parent, listener)
                 && route_intersects_listener_hostname(route, listener)
         })
 }
@@ -3452,22 +3448,12 @@ fn route_parent_ref_not_allowed_by_listener(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return false;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return false;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return false;
-    }
 
     let mut saw_matching_listener = false;
-    for listener in gateway
+    for listener in parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -3479,7 +3465,7 @@ fn route_parent_ref_not_allowed_by_listener(
         }
         saw_matching_listener = true;
         if route_kind_allowed_by_listener(route, listener)
-            && route_allowed_by_listener(indexes, route, gateway, listener)
+            && route_allowed_by_listener(indexes, route, parent, listener)
         {
             return false;
         }
@@ -3492,20 +3478,10 @@ fn route_parent_ref_has_matching_parent(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return false;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return false;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return false;
-    }
-    gateway
+    parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -3514,8 +3490,26 @@ fn route_parent_ref_has_matching_parent(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(indexes, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, parent, listener)
         })
+}
+
+/// Resolve the direct parent named by a Route parentRef without conflating a
+/// ListenerSet with a same-named Gateway. ListenerSet routes have their own
+/// listener namespace/section/port policy and must be evaluated against that
+/// object for status just as they are during translation.
+fn route_parent_object<'a>(
+    route: &K8sObject,
+    parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'a>,
+) -> Option<&'a K8sObject> {
+    if let Some(target) = parent_ref_gateway_target(route, parent_ref) {
+        return indexes.gateways_by_ns_name.get(&target).copied();
+    }
+    if let Some(target) = parent_ref_listenerset_target(route, parent_ref) {
+        return indexes.listenersets_by_ns_name.get(&target).copied();
+    }
+    None
 }
 
 fn parent_ref_matches_listener(parent_ref: &Value, listener: &Value) -> bool {

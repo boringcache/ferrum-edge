@@ -174,8 +174,29 @@ fn listenerset_default_not_allowed() {
                 "allowedRoutes": { "namespaces": { "from": "Same" } }
             }]),
         ),
+        service("backend"),
+        http_route(
+            "via-disallowed-listenerset",
+            json!([{
+                "group": "gateway.networking.k8s.io",
+                "kind": "ListenerSet",
+                "name": "extra",
+                "namespace": "default"
+            }]),
+            "extra.example.com",
+            "/must-not-attach",
+        ),
     ];
-    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translate");
+    assert!(
+        skipped.values().any(|error| {
+            let error = error.to_string();
+            error.contains("via-disallowed-listenerset")
+                && error.contains("not permitted by the target ListenerSet listener")
+        }),
+        "the disallowed ListenerSet route must fail closed: {skipped:?}"
+    );
     let status = translation
         .listenerset_statuses
         .iter()
@@ -198,6 +219,20 @@ fn listenerset_default_not_allowed() {
         .unwrap();
     assert_eq!(accepted["status"], "False");
     assert_eq!(accepted["reason"], "NotAllowed");
+
+    let route_update = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == "via-disallowed-listenerset")
+        .expect("HTTPRoute status update");
+    let route_conditions = route_update.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("route parent conditions");
+    let route_accepted = route_conditions
+        .iter()
+        .find(|condition| condition["type"] == "Accepted")
+        .expect("route Accepted condition");
+    assert_eq!(route_accepted["status"], "False");
+    assert_eq!(route_accepted["reason"], "NotAllowedByListeners");
 }
 
 #[test]
@@ -354,6 +389,24 @@ fn listenerset_attaches_and_materializes_http_route() {
         .find(|condition| condition["type"] == "Accepted")
         .unwrap();
     assert_eq!(accepted["status"], "True");
+
+    let route_update = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == "via-listenerset")
+        .expect("HTTPRoute status");
+    let route_conditions = route_update.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("route parent conditions");
+    for condition_type in ["Accepted", "Programmed"] {
+        let condition = route_conditions
+            .iter()
+            .find(|condition| condition["type"] == condition_type)
+            .expect("route condition");
+        assert_eq!(
+            condition["status"], "True",
+            "ListenerSet route {condition_type} condition: {condition:?}"
+        );
+    }
 }
 
 #[test]
@@ -511,6 +564,16 @@ fn listenerset_hostname_conflict_marks_loser_not_materialized() {
         .unwrap();
     assert_eq!(conflicted["status"], "True");
     assert_eq!(conflicted["reason"], "HostnameConflict");
+    for condition_type in ["Accepted", "Programmed"] {
+        let condition = listener["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|condition| condition["type"] == condition_type)
+            .expect("listener condition");
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "PortUnavailable");
+    }
 }
 
 #[test]
