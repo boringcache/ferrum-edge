@@ -2850,6 +2850,13 @@ mod live_netns_tests {
         // sysfs while the namespace is still being assembled. The scenario
         // separately validates the production sysfs lookup through the child's
         // namespace-local mount after the exact readiness marker is observed.
+        // Both veth ends intentionally live in this one throwaway namespace, so
+        // the packet entering `vethhost` has a source address locally assigned
+        // to `pod0`. Disable reverse-path filtering before sending it; otherwise
+        // a strict runner default can discard that fixture-only local-source
+        // shape before PREROUTING. Real host-veth capture has the pod address
+        // routed back through the same peer, and the repository's other live
+        // veth harness likewise makes the rp_filter prerequisite explicit.
         let script = format!(
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
@@ -2862,6 +2869,8 @@ mod live_netns_tests {
              ip link set pod0 up || exit 98; \
              ip link set vethhost up || exit 98; \
              ip address add 10.0.0.2/32 dev pod0 || exit 98; \
+             printf '0\n' > /proc/sys/net/ipv4/conf/all/rp_filter || exit 98; \
+             printf '0\n' > /proc/sys/net/ipv4/conf/vethhost/rp_filter || exit 98; \
              printf '1\n' > /proc/sys/net/ipv4/conf/vethhost/accept_local || exit 98; \
              ip neigh add {REMOTE_DST} lladdr 02:00:00:00:00:01 dev pod0 nud permanent || exit 98; \
              ip route add {REMOTE_DST}/32 dev pod0 src 10.0.0.2 || exit 98; \
