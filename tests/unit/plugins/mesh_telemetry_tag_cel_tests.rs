@@ -131,6 +131,49 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
 }
 
 #[tokio::test]
+async fn cel_reads_original_attribution_not_prior_label_mutations() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set", "value": "overridden"}
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "destination_service",
+                "operation": {"type": "set_expr", "cel": "source.workload"}
+            }]
+        }
+    }))
+    .expect("mixed ordered overrides");
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+
+    let registry = MetricsRegistry::new();
+    let summary = TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    };
+    registry.record(&summary);
+    let counter = registry
+        .render_uncached()
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter")
+        .to_string();
+
+    assert!(counter.contains(r#"source_workload="overridden""#), "{counter}");
+    assert!(
+        counter.contains(r#"destination_service="frontend""#),
+        "CEL must read the original source.workload attribution: {counter}"
+    );
+}
+
+#[tokio::test]
 async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     let workload_metrics = WorkloadMetrics::new(&json!({
         "metrics": {

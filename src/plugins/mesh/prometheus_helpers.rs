@@ -1436,7 +1436,7 @@ pub(crate) fn mesh_request_key_for_family(
         response_code: Some(summary.response_status_code),
         destination_port: metadata_destination_port(&summary.metadata),
     };
-    apply_metric_override_plan(&mut key, plan, extras);
+    apply_metric_override_plan(&mut key, base, plan, extras);
     normalize_removed_labels(&mut key);
     key
 }
@@ -1473,6 +1473,7 @@ struct MetricTagCelExtras<'a> {
 
 fn apply_metric_override_plan(
     key: &mut MeshRequestKey,
+    attribution: &MeshRequestKey,
     mut plan: &str,
     extras: MetricTagCelExtras<'_>,
 ) {
@@ -1569,28 +1570,30 @@ fn apply_metric_override_plan(
                 };
                 let value = {
                     let live_ctx = MetricTagCelContext {
-                        source_workload: key.source_workload.as_ref(),
-                        source_namespace: key.source_namespace.as_ref(),
-                        source_principal: key.source_principal.as_ref(),
-                        source_app: key.source_app.as_ref(),
-                        source_service: key.source_service.as_ref(),
-                        destination_workload: key.destination_workload.as_ref(),
-                        destination_namespace: key.destination_namespace.as_ref(),
-                        destination_principal: key.destination_principal.as_ref(),
-                        destination_app: key.destination_app.as_ref(),
-                        destination_service: key.destination_service.as_ref(),
-                        request_protocol: key.request_protocol.as_ref(),
-                        response_flags: key.response_flags.as_ref(),
-                        connection_security_policy: key.connection_security_policy.as_ref(),
+                        source_workload: attribution.source_workload.as_ref(),
+                        source_namespace: attribution.source_namespace.as_ref(),
+                        source_principal: attribution.source_principal.as_ref(),
+                        source_app: attribution.source_app.as_ref(),
+                        source_service: attribution.source_service.as_ref(),
+                        destination_workload: attribution.destination_workload.as_ref(),
+                        destination_namespace: attribution.destination_namespace.as_ref(),
+                        destination_principal: attribution.destination_principal.as_ref(),
+                        destination_app: attribution.destination_app.as_ref(),
+                        destination_service: attribution.destination_service.as_ref(),
+                        request_protocol: attribution.request_protocol.as_ref(),
+                        response_flags: attribution.response_flags.as_ref(),
+                        connection_security_policy: attribution
+                            .connection_security_policy
+                            .as_ref(),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
-                        response_code: extras.response_code.or((key
+                        response_code: extras.response_code.or((attribution
                             .response_code_override
                             .is_none()
-                            && key.removed_labels
+                            && attribution.removed_labels
                                 & (1u16 << MeshMetricLabel::ResponseCode.index())
                                 == 0)
-                            .then_some(key.response_code)),
+                            .then_some(attribution.response_code)),
                         destination_port: extras.destination_port,
                     };
                     let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {
@@ -1991,7 +1994,7 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
         response_code: None,
         destination_port: metadata_destination_port(metadata),
     };
-    apply_metric_override_plan(&mut key, plan, extras);
+    apply_metric_override_plan(&mut key, base, plan, extras);
     // TCP families never carry an HTTP response-code dimension. Preserve that
     // fixed schema even when an ALL_METRICS plan contains a response-code
     // UPSERT/rename intended for the HTTP/gRPC families.
