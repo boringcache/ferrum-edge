@@ -4684,11 +4684,11 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                // Request-aware writer with halt_recv=false: mid-recv_data cancel
-                // leaves h3-quinn's recv slot None, so STOP_SENDING would
-                // unwrap-abort under panic=abort. Quinn Drop still stops the peer
-                // when the stream is released. Keep gRPC-Web trailer-frame shaping
-                // via ctx, and bound the terminal write with the shared grace.
+                // Request-aware writer with halt_recv=false so the bounded
+                // terminal write completes before STOP_SENDING. The vendored
+                // h3-quinn transport keeps the receive stream reachable after
+                // this mid-recv_data cancel, so halt it explicitly once the
+                // shared grace settles. Keep gRPC-Web shaping via ctx.
                 let write = write_grpc_error_for_request_with_recv_halt(
                     stream,
                     ctx,
@@ -4699,36 +4699,39 @@ where
                     initial_response_header_policy_plugins,
                     false,
                 );
-                return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                    write,
-                )
-                .await
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                        // Client reset the response half after rejection was
-                        // selected — keep accounting rather than dropping the
-                        // already-rejected request as a bare transport Err.
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        Ok(terminal_deadline_write_aborted_outcome(
-                            StatusCode::OK.as_u16(),
-                            0,
-                            backend_start,
-                            0,
-                            true,
-                        ))
-                    }
-                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        Ok(terminal_deadline_write_aborted_outcome(
-                            StatusCode::OK.as_u16(),
-                            0,
-                            backend_start,
-                            0,
-                            false,
-                        ))
-                    }
-                };
+                let result =
+                    match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                        write,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => Ok(outcome),
+                        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                            // Client reset the response half after rejection was
+                            // selected — keep accounting rather than dropping the
+                            // already-rejected request as a bare transport Err.
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            Ok(terminal_deadline_write_aborted_outcome(
+                                StatusCode::OK.as_u16(),
+                                0,
+                                backend_start,
+                                0,
+                                true,
+                            ))
+                        }
+                        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            Ok(terminal_deadline_write_aborted_outcome(
+                                StatusCode::OK.as_u16(),
+                                0,
+                                backend_start,
+                                0,
+                                false,
+                            ))
+                        }
+                    };
+                crate::http3::stream_util::halt_request_body(stream);
+                return result;
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
                 ctx.mark_gateway_deadline_response_selected();
@@ -4762,7 +4765,6 @@ where
                 )
                 .await;
                 outcome.rejection_logged = true;
-                // Do not STOP_SENDING here: the drain was cancelled mid-recv_data.
                 return Ok(outcome);
             }
         }
@@ -6338,6 +6340,10 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         // STOP_SENDING(H3_NO_ERROR): a bare recv-half drop surfaces as
         // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
+        // Unconditional even when shutdown cancelled a frontend `recv_data` /
+        // `recv_trailers` mid-poll — reaching the QUIC stream while a read is in
+        // flight is exactly what the vendored `h3-quinn` patch provides. See
+        // `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/`.
         crate::http3::stream_util::halt_request_body(&mut recv_half);
     });
     let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(
@@ -7898,8 +7904,9 @@ where
     // not park forever on exhausted QUIC flow-control credit. Already-selected
     // deadline rejections use the shared post-deadline grace (not the expired
     // absolute deadline) so HEADERS can become visible without unbounded
-    // retention; grace expiry aborts the send half without STOP_SENDING after
-    // a mid-recv_data cancel.
+    // retention. The send-only inner writer keeps response-before-teardown
+    // ordering; the full-stream branch halts the request direction after the
+    // bounded write settles, including after a mid-recv_data cancel.
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         if terminal_gateway_deadline {
@@ -7913,33 +7920,34 @@ where
                 false,
                 RejectBodyDisposition::WireBody,
             );
-            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                write,
-            )
-            .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    Ok(terminal_deadline_write_aborted_outcome(
-                        StatusCode::OK.as_u16(),
-                        0,
-                        backend_start,
-                        bytes_sent,
-                        true,
-                    ))
-                }
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    Ok(terminal_deadline_write_aborted_outcome(
-                        StatusCode::OK.as_u16(),
-                        0,
-                        backend_start,
-                        bytes_sent,
-                        false,
-                    ))
-                }
-            };
+            let result =
+                match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                    .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            true,
+                        ))
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            false,
+                        ))
+                    }
+                };
+            crate::http3::stream_util::halt_request_body(stream);
+            return result;
         }
         write_reject_with_headers(
             stream,
@@ -7953,13 +7961,54 @@ where
         .await
     } else if matches!(flavor, HttpFlavor::Grpc) {
         if terminal_gateway_deadline {
-            // Send-only: skip STOP_SENDING after mid-recv_data cancel.
+            // Send-only while the bounded terminal write is in flight; this
+            // full-stream caller halts the receive direction afterward.
             let write =
                 write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
-            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                write,
-            )
-            .await
+            let result =
+                match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                    .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            normalized.http_status.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            true,
+                        ))
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            normalized.http_status.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            false,
+                        ))
+                    }
+                };
+            crate::http3::stream_util::halt_request_body(stream);
+            return result;
+        }
+        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+    } else if terminal_gateway_deadline {
+        let write = write_reject_with_headers_and_recv_halt(
+            stream,
+            normalized.http_status,
+            normalized.body,
+            &normalized.headers,
+            backend_start,
+            bytes_sent,
+            false,
+            normalized.body_disposition,
+        );
+        let result =
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                .await
             {
                 Ok(outcome) => Ok(outcome),
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
@@ -7983,42 +8032,8 @@ where
                     ))
                 }
             };
-        }
-        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
-    } else if terminal_gateway_deadline {
-        let write = write_reject_with_headers_and_recv_halt(
-            stream,
-            normalized.http_status,
-            normalized.body,
-            &normalized.headers,
-            backend_start,
-            bytes_sent,
-            false,
-            normalized.body_disposition,
-        );
-        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
-            Ok(outcome) => Ok(outcome),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    normalized.http_status.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    true,
-                ))
-            }
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    normalized.http_status.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    false,
-                ))
-            }
-        }
+        crate::http3::stream_util::halt_request_body(stream);
+        result
     } else {
         write_reject_with_headers(
             stream,
@@ -8327,8 +8342,9 @@ where
 }
 
 /// Request-aware gRPC error writer with explicit recv-half control.
-/// Mid-`recv_data` cancel paths pass `halt_recv=false` so STOP_SENDING cannot
-/// unwrap-abort h3-quinn's empty recv slot under `panic = "abort"`.
+/// Mid-`recv_data` cancel paths pass `halt_recv=false` so their post-deadline
+/// wrapper can preserve response-before-teardown ordering, then halt the full
+/// stream explicitly once the bounded write settles.
 #[allow(clippy::too_many_arguments)]
 async fn write_grpc_error_for_request_with_recv_halt<S>(
     stream: &mut RequestStream<S, Bytes>,

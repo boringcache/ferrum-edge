@@ -40,6 +40,7 @@ mod http3_websocket_tests;
 mod json_dup_keys_tests;
 mod k8s_status_planning_tests;
 mod k8s_status_snapshot_tests;
+mod k8s_udproute_translation_tests;
 mod ktls_handoff_tests;
 mod lazy_timeout_tests;
 mod load_balancer_rr_counter_sharding_tests;

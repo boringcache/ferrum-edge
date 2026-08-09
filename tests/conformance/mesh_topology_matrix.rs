@@ -34,6 +34,7 @@ fn runtime_for(topology: MeshTopology) -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:15090".parse::<SocketAddr>().unwrap(),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: match topology {
             // ServiceWaypoint REQUIRES a waypoint name (env validation rejects

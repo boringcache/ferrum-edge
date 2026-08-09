@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
 use super::{
-    AI_COST_SUBMICRO_SCALE, AiCost, Direction, Plugin, StreamTransactionSummary,
-    TransactionSummary, WsDisconnectContext,
+    AI_COST_SUBMICRO_SCALE, AiCost, Direction, Plugin, PluginResult, RequestContext,
+    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
 };
 use crate::ebpf::NodeAgentMetrics;
 use crate::retry::ErrorClass;
@@ -896,8 +896,9 @@ impl MetricsRegistry {
     ///
     /// This is a connection lifecycle finalizer, not an authorization-success
     /// counter: rejection and client-disconnect-during-admission paths that
-    /// reached workload-metrics observation finalize here too so opened/closed
-    /// stay balanced. The stamp gates `record_mesh_tcp_closed_and_bytes`.
+    /// reached both the Prometheus and workload-metrics hooks finalize here too
+    /// so opened/closed stay balanced. The stamp gates
+    /// `record_mesh_tcp_closed_and_bytes`.
     pub fn finalize_mesh_tcp_opened(
         &self,
         metadata: &mut std::collections::HashMap<String, String>,
@@ -3811,6 +3812,22 @@ impl Plugin for PrometheusMetrics {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        ctx.metadata.insert(
+            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        );
+        PluginResult::Continue
+    }
+
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        ctx.metadata.get_or_insert_with(Default::default).insert(
+            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+            "1".to_string(),
+        );
+        PluginResult::Continue
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

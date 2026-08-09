@@ -33,11 +33,10 @@ assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
 RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 `mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
-visibility and lookup-namespace resolution are also GA-enrolled and
-semantically blocking, with focused Rust conformance/integration coverage;
-their declared live IDs remain `live_deferred` because Trusted Cross policy
-forbids PR-authored changes to the sidecar suite's executable/configuration
-surfaces. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
+visibility and lookup-namespace resolution are also GA-enrolled and live
+blocking: the sidecar fixture drives those behaviors on the captured client
+egress datapath against a multi-namespace DestinationRule model and requires
+both emitted assertion IDs to pass. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
 plugin onto its materialized outbound routes. **SPIFFE identity plumbing
 (SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):
@@ -76,13 +75,16 @@ CI today."
   evidence is authoritative over a conflicting upstream container namespace, and
   VirtualService-derived CORS
   policy narrows through the SAME shared `exportTo` evaluator at the same
-  enforcement points a DestinationRule does. These new DestinationRule semantics are pinned by
-  Rust conformance/integration gates and are explicitly live-deferred under
-  Trusted Cross policy. The existing sidecar traffic surface **and the native
+  enforcement points a DestinationRule does. These DestinationRule semantics are
+  pinned by Rust conformance/integration gates **and** by live
+  `sidecar.destination_rule.export_to_namespace_visibility` /
+  `sidecar.destination_rule.lookup_tier_client_wins` assertions from the
+  `mesh-e2e-sidecar` suite. The existing sidecar traffic surface **and the native
   config transport** remain **live-verified
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
   captured datapath (STRICT mTLS positive + plaintext-rejected negative,
-  destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
+  destination-side authz 403, JWT valid/missing/invalid, DR exportTo visibility
+  + lookup hierarchy, DR connectTimeout
   two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
   CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
   end) on every relevant PR and every main push, the artifact is
@@ -216,10 +218,9 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
 | Enrolled Ambient destination pod UDP round trip (source-capture → HBONE → destination pod-netns relay; tc-inbound admit + reply socket inside destination pod netns) | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | `docs/mesh.md` UDP TPROXY capture footnote [12] |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

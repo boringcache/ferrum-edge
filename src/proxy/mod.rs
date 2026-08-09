@@ -44,6 +44,37 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+/// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
+/// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
+/// the buffered tokio-rustls accept and the userspace relay.
+#[cfg(target_os = "linux")]
+pub(crate) mod ktls_accept;
+/// Per-direction traffic-key confidentiality budget for handed-off kTLS
+/// sessions (issue #3619). rustls stops counting protected messages at
+/// `dangerous_into_kernel_connection`, so the relay tracks the kernel's own
+/// record sequence numbers against the negotiated suite's
+/// `confidentiality_limit`. The arithmetic is platform-independent and public
+/// so the deterministic unit suite can pin it.
+///
+/// `#[allow(dead_code)]` because the enforcement consumers are Linux-only
+/// (`ktls_accept`, the splice relay) while the arithmetic and its tests are
+/// not, and the `ferrum-edge` binary compiles this as an internal tree where
+/// `pub` does not imply an external consumer.
+#[allow(dead_code)]
+pub mod ktls_confidentiality;
+/// Live-kernel proof that the #3619 handoff is not inert: real TLS 1.2
+/// sessions, real `setsockopt(SOL_TLS, ...)`, real `splice(2)`. Ignored by
+/// default and gated on kernel capability; the hosted kTLS live gate runs it
+/// with `FERRUM_KTLS_LIVE_REQUIRED=1` so an unavailable capability fails
+/// instead of quietly skipping.
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_live_kernel_tests;
+/// TLS control-record classification and the `SOL_TLS` `recvmsg`/`sendmsg`
+/// ancillary contract used by the kTLS splice relay (issue #3619). The
+/// classification half is platform-independent so it can be tested anywhere;
+/// the syscall wrappers are Linux-only.
+#[allow(dead_code)] // Several code points/helpers are exercised only by tests.
+pub mod ktls_record;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
@@ -79,11 +110,11 @@ use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -109,6 +140,10 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::svid_source_watch::{
+    GATEWAY_SVID_FILE_POLL_INTERVAL, GatewaySvidPublishFn, GatewaySvidSourceSet,
+    GatewaySvidSourceTracker, GatewaySvidWatchConfig, run_gateway_svid_source_rotation_loop,
+};
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
@@ -2282,6 +2317,101 @@ fn inbound_hbone_relay_destination_allowed(
     })
 }
 
+/// Round-robin cursor over an admitted external UDP destination's precomputed
+/// dial endpoints (issue #3263).
+///
+/// One relaxed `fetch_add` per admitted CONNECT — no lock, no allocation, and no
+/// per-destination state that a reload would have to migrate: the endpoint set
+/// itself lives in the `ArcSwap`ped config snapshot, so an apply that changes the
+/// set changes what the very next CONNECT selects, while this cursor only
+/// spreads sessions across whatever set is current.
+static MESH_EGRESS_UDP_ENDPOINT_CURSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve the destination an EgressGateway may dial for a `udp`-marked mesh
+/// CONNECT naming external `host:port` (issue #3263), or `None` when the pair is
+/// not an admitted external UDP egress destination.
+///
+/// The allowlist is materialized ONLY under `EgressGateway` topology, ONLY from
+/// `MESH_EXTERNAL` `ServiceEntry` ports whose protocol is `UDP`, and ONLY when
+/// stream-family egress is enabled — so on every other proxy this is an empty
+/// vector and the lookup denies. Matching is EXACT on the AUTHORITY host (ASCII
+/// case-insensitive; the stored host is already lowercased) and exact on the
+/// service port: wildcard ServiceEntry hosts are refused at materialization, so
+/// no admission is ever decided by a prefix or subnet guess.
+///
+/// The returned `(host, port)` is a DIAL endpoint, which is not the authority: a
+/// `STATIC` ServiceEntry's host resolves to one of its operator-declared
+/// `endpoints[]`, so the gateway never DNS-resolves a STATIC authority. The set
+/// is precomputed and bounded at materialization; selection is a modulo index
+/// over it.
+///
+/// This deliberately does NOT widen [`inbound_hbone_relay_destination_allowed`]:
+/// the byte-stream HBONE relay stays bounded to loopback / slice-known workload
+/// targets. Only the datagram handler consults this second, egress-specific
+/// allowlist.
+fn mesh_egress_udp_destination_dial_endpoint(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<(String, u16)> {
+    let mesh = mesh?;
+    if mesh.egress_udp_destinations.is_empty() {
+        return None;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    let dest = mesh
+        .egress_udp_destinations
+        .iter()
+        .find(|dest| dest.port == port && dest.host.eq_ignore_ascii_case(host))?;
+    if dest.dial_endpoints.is_empty() {
+        // Materialization refuses an endpoint-less admission, so this is
+        // unreachable in practice; fail closed rather than inventing a fallback
+        // that would dial the authority itself.
+        return None;
+    }
+    let index = MESH_EGRESS_UDP_ENDPOINT_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        as usize
+        % dest.dial_endpoints.len();
+    let endpoint = &dest.dial_endpoints[index];
+    Some((endpoint.host.clone(), endpoint.port))
+}
+
+/// Whether `host:port` is a precomputed dial endpoint of an admitted external
+/// UDP egress destination.
+///
+/// This is the live post-route-override guard in `handle_hbone_udp_request`.
+/// Route-miss synthesis already selected an admitted dial endpoint from the
+/// CONNECT authority via [`mesh_egress_udp_destination_dial_endpoint`], but the
+/// synthesized relay proxy inherits the global plugin chain and a `before_proxy`
+/// route-override can rewrite `app_host` / `app_port` before any socket opens.
+/// Re-checking here is therefore necessary and nonredundant — and it MUST match
+/// dial endpoints only, never authority hosts: a `STATIC` ServiceEntry host is
+/// a valid CONNECT authority, but admitting it as an effective socket target
+/// would let `resolve_local_udp_dest` DNS-resolve that hostname and bypass the
+/// operator-declared `endpoints[]` set. Under `DNS`/`NONE` the dial endpoint
+/// *is* the authority host, so those destinations stay usable; a `STATIC`
+/// endpoint-IP authority is usable because that IP is itself a dial endpoint.
+/// The original-authority lookup used at CONNECT synthesis is unchanged.
+fn mesh_egress_udp_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let Some(mesh) = mesh else {
+        return false;
+    };
+    if mesh.egress_udp_destinations.is_empty() {
+        return false;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.egress_udp_destinations.iter().any(|dest| {
+        dest.dial_endpoints
+            .iter()
+            .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
+    })
+}
+
 fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     let Some(inner) = host
         .strip_prefix('[')
@@ -2301,9 +2431,18 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
 /// terminator where no inbound route is materialized. Returns `None` (caller
 /// 404s) when the authority is missing/portless or is not a safe local relay
 /// target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` selects the SECOND, narrower admission source used only by
+/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
+/// naming an external destination the EgressGateway's `ServiceEntry`-derived
+/// allowlist admits relays to that external host over a local `UdpSocket`, with
+/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
+/// relay never consults it, so a bare CONNECT stays bounded to loopback /
+/// slice-known workload targets exactly as before.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    is_udp_connect: bool,
 ) -> Option<Arc<Proxy>> {
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
@@ -2311,12 +2450,22 @@ fn build_inbound_hbone_relay_proxy(
     if host.is_empty() || port == 0 {
         return None;
     }
-    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return None;
+    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+        ));
     }
-    Some(Arc::new(
-        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-    ))
+    if is_udp_connect
+        && let Some((dial_host, dial_port)) =
+            mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
+    {
+        // The relay dials the SELECTED ENDPOINT, not the authority: a STATIC
+        // ServiceEntry host must never be DNS-resolved here.
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(&dial_host, dial_port),
+        ));
+    }
+    None
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -4015,7 +4164,9 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
-    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
+    // `mesh.metrics.*` coordination keys stay on the in-process summary until
+    // built-in observers consume them and external serialization omits them.
+    crate::plugins::utils::metadata_redaction::strip_dedup_internal_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -5684,14 +5835,15 @@ pub struct ProxyState {
     /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
     /// readers.
     pub gateway_svid_bundle: SharedSvidBundle,
-    /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
-    /// override; when a CP snapshot removes them, this restores file trust.
+    /// Latest SVID bundle loaded from configured or runtime sources.
+    /// CP-delivered trust bundles are an override; when a CP snapshot removes
+    /// them, this restores the source-provided trust.
     pub gateway_file_svid_bundle: SharedSvidBundle,
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
     /// Serializes the cold-path gateway SVID writers:
-    /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
+    /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
@@ -5727,9 +5879,9 @@ pub struct ProxyState {
     /// The internal consumer side ([`spawn_backend_svid_rotation_task`]) holds
     /// a `Receiver` and drives `backend_svid_generation` plus pool drains.
     ///
-    /// The gateway SVID file watcher publishes to this sender when
-    /// `FERRUM_GATEWAY_SVID_*` files are configured and a validated reload
-    /// succeeds. Future in-memory producers can also wire in by cloning the
+    /// The gateway SVID source watcher publishes to this sender when
+    /// `FERRUM_GATEWAY_SVID_*` sources are configured and a validated reload
+    /// succeeds. In-memory producers can also wire in by cloning the
     /// sender and handing the clone to `RotationConfig.revision_tx`
     /// ([`crate::identity::rotation::RotationConfig::new`]) or
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
@@ -5947,15 +6099,15 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
     Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
-#[derive(Debug, Clone)]
-struct GatewaySvidFilePaths {
-    cert: PathBuf,
-    key: PathBuf,
-    trust_bundle: PathBuf,
-    expected_spiffe_id: Option<String>,
-}
-
-fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvidFilePaths> {
+/// Collect the configured gateway SVID material sources for the rotation
+/// watcher.
+///
+/// Every supported source form participates — filesystem paths, `file://`,
+/// inline PEM, and provider URIs — because the watcher classifies each source's
+/// own refresh cadence (see [`crate::identity::svid_source_watch`]). Inline PEM
+/// contributes no cadence and stays static until config reload, so a fully
+/// inline triple makes the watcher exit immediately.
+fn gateway_svid_source_set_from_env(env_config: &EnvConfig) -> Option<GatewaySvidSourceSet> {
     let (Some(cert), Some(key), Some(trust_bundle)) = (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
@@ -5963,25 +6115,55 @@ fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ) else {
         return None;
     };
-    let cert_source = CertSource::parse(cert, MaterialKind::Cert);
-    let key_source = CertSource::parse(key, MaterialKind::Key);
-    let trust_bundle_source = CertSource::parse(trust_bundle, MaterialKind::CaBundle);
 
-    let (Some(cert), Some(key), Some(trust_bundle)) = (
-        cert_source.as_file_path(),
-        key_source.as_file_path(),
-        trust_bundle_source.as_file_path(),
-    ) else {
-        info!("Gateway SVID source includes non-file material; file rotation watcher disabled");
-        return None;
-    };
+    Some(GatewaySvidSourceSet::new(
+        cert.to_string(),
+        key.to_string(),
+        trust_bundle.to_string(),
+        env_config.gateway_spiffe_id.clone(),
+    ))
+}
 
-    Some(GatewaySvidFilePaths {
-        cert,
-        key,
-        trust_bundle,
-        expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
-    })
+/// Build the gateway SVID source set and prime its rotation-comparison
+/// baseline.
+///
+/// Runs in `ProxyState::new` **before** [`load_gateway_svid_bundle`], not
+/// inside the spawned watcher task. `tokio::spawn` only queues the task: it
+/// does not run until the caller yields to the runtime, which is after the
+/// remainder of gateway startup (TLS policy, listener binds, DNS warmup) and,
+/// for an embedded `ProxyState`, potentially much later. A source rewritten in
+/// that window would be adopted *as* the watcher's baseline, so the rotation
+/// would never be observed and the gateway would keep using the pre-rotation
+/// identity until the material changed again.
+///
+/// Priming ahead of the bundle load also keeps the failure direction safe: the
+/// baseline is taken from material at or before what the live slot ends up
+/// holding, so a startup-window change costs one redundant rotation instead of
+/// a silently stale identity.
+///
+/// A prime that cannot read every source is *not* necessarily fatal: the bundle
+/// load that follows re-reads the sources, so a transiently unavailable one can
+/// have recovered in between and construction succeeds with a live bundle this
+/// tracker never fingerprinted. `GatewaySvidSourceTracker::prime` latches a
+/// forced first publish for exactly that case, so the first complete
+/// fingerprint set is reloaded and published rather than adopted as a silent
+/// baseline.
+fn prime_gateway_svid_rotation_baseline(
+    env_config: &EnvConfig,
+) -> Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)> {
+    let sources = gateway_svid_source_set_from_env(env_config)?;
+    let provider_interval = Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1));
+    let mut tracker =
+        GatewaySvidSourceTracker::new(&sources, GATEWAY_SVID_FILE_POLL_INTERVAL, provider_interval);
+    if tracker.is_watchable() {
+        // An unreadable source leaves the baseline unset. If the bundle load
+        // immediately after this also fails, construction fails and nothing
+        // downstream runs; if it succeeds because the source recovered in
+        // between, the latched forced first publish makes the watcher's first
+        // complete read reload and publish instead of baselining silently.
+        tracker.prime(std::time::Instant::now());
+    }
+    Some((sources, tracker))
 }
 
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
@@ -6145,135 +6327,6 @@ fn push_tls_material_source(
     if seen.insert((kind, source.pool_key_component())) {
         sources.push(
             crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
-        );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileFingerprint {
-    cert: GatewaySvidFileStamp,
-    key: GatewaySvidFileStamp,
-    trust_bundle: GatewaySvidFileStamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileStamp {
-    len: u64,
-    modified_nanos: Option<u128>,
-}
-
-fn gateway_svid_file_stamp(path: &Path) -> Result<GatewaySvidFileStamp, anyhow::Error> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("failed to stat {}: {}", path.display(), e))?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    Ok(GatewaySvidFileStamp {
-        len: metadata.len(),
-        modified_nanos,
-    })
-}
-
-fn gateway_svid_file_fingerprint(
-    paths: &GatewaySvidFilePaths,
-) -> Result<GatewaySvidFileFingerprint, anyhow::Error> {
-    Ok(GatewaySvidFileFingerprint {
-        cert: gateway_svid_file_stamp(&paths.cert)?,
-        key: gateway_svid_file_stamp(&paths.key)?,
-        trust_bundle: gateway_svid_file_stamp(&paths.trust_bundle)?,
-    })
-}
-
-async fn run_gateway_svid_file_rotation_loop(
-    state: ProxyState,
-    paths: GatewaySvidFilePaths,
-    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-) {
-    const GATEWAY_SVID_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-    let mut last_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Gateway SVID file watcher could not read startup fingerprint; continuing and will retry"
-            );
-            None
-        }
-    };
-    let mut interval = tokio::time::interval(GATEWAY_SVID_FILE_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-            return;
-        }
-
-        if let Some(shutdown) = shutdown_rx.as_mut() {
-            tokio::select! {
-                _ = interval.tick() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            interval.tick().await;
-        }
-
-        let next_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Gateway SVID file watcher could not inspect SVID files; keeping current backend identity"
-                );
-                continue;
-            }
-        };
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            continue;
-        }
-
-        let bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
-            &paths.cert,
-            &paths.key,
-            &paths.trust_bundle,
-            paths.expected_spiffe_id.as_deref(),
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    cert_path = %paths.cert.display(),
-                    key_path = %paths.key.display(),
-                    trust_bundle_path = %paths.trust_bundle.display(),
-                    "Gateway SVID files changed but reload failed; keeping current backend identity"
-                );
-                // Record the failing fingerprint so we don't re-warn every
-                // poll while the bad state is stable. The next genuine
-                // change (good or different-bad) will compare unequal and
-                // re-attempt the load.
-                last_fingerprint = Some(next_fingerprint);
-                continue;
-            }
-        };
-
-        let spiffe_id = bundle.spiffe_id.to_string();
-        state.install_gateway_file_svid_bundle(bundle);
-        state
-            .backend_svid_rotation_tx
-            .send_modify(|revision| *revision = revision.saturating_add(1));
-        let revision = *state.backend_svid_rotation_tx.borrow();
-        last_fingerprint = Some(next_fingerprint);
-        info!(
-            spiffe_id = %spiffe_id,
-            svid_revision = revision,
-            "Gateway SVID files reloaded; backend SVID rotation published"
         );
     }
 }
@@ -6466,13 +6519,13 @@ impl ProxyState {
 
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
-    /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
+    /// If the gateway already has a source-loaded SVID, rebuild the SVID bundle
     /// with the new trust material so TLS builders see the update through the
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
     ///
     /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. The gateway SVID file watcher can also swap
+    /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
     /// the SVID bundle, so all gateway SVID slot writes are serialized by
     /// `gateway_svid_update_lock`.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
@@ -6490,7 +6543,7 @@ impl ProxyState {
         }
     }
 
-    /// Clear CP-delivered trust bundles and restore the latest file-loaded SVID.
+    /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
     pub fn clear_gateway_trust_bundles(&self) {
         let _guard = self
             .gateway_svid_update_lock
@@ -6525,7 +6578,7 @@ impl ProxyState {
 
     /// Force a gateway SVID reload from the currently configured sources.
     ///
-    /// This is the admin-triggered equivalent of the file watcher path. It
+    /// This is the admin-triggered equivalent of the source watcher path. It
     /// accepts any source form supported by `load_svid_bundle_from_sources`
     /// (file path, inline PEM, typed URI), preserves any CP-delivered trust
     /// override, and publishes a backend SVID generation bump so backend pools
@@ -6862,15 +6915,48 @@ impl ProxyState {
         )
     }
 
-    fn start_gateway_svid_file_rotation_task(
+    /// Start the gateway SVID source rotation watcher.
+    ///
+    /// Covers every configured SVID source form: file paths keep the historical
+    /// 1s cadence, provider URIs are re-fetched on
+    /// `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (or their own `?poll=`), and a
+    /// fully inline-PEM triple makes the watcher exit at once. The publish
+    /// closure is the same pipeline `POST /admin/tls/rotate/svid` drives:
+    /// install the validated bundle into the SVID slot (preserving any
+    /// CP-delivered trust override), then bump the backend SVID generation so
+    /// pool keys, pool drains, and health probes observe one coherent update.
+    ///
+    /// `primed` carries the source set together with the baseline
+    /// [`prime_gateway_svid_rotation_baseline`] already established, so the
+    /// watcher compares against material read at startup rather than against
+    /// whatever the sources hold when the runtime first schedules this task.
+    fn start_gateway_svid_rotation_task(
         &self,
+        primed: Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)>,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let paths = gateway_svid_file_paths_from_env(&self.env_config)?;
+        let (sources, tracker) = primed?;
         let state = self.clone();
-        Some(tokio::spawn(run_gateway_svid_file_rotation_loop(
-            state,
-            paths,
+        let provider_interval =
+            Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1));
+        let publish: GatewaySvidPublishFn = Box::new(move |bundle| {
+            // Slot first, then the generation bump the backend pools, pool
+            // keys, and health probes key off — never the other way round.
+            state.install_gateway_file_svid_bundle(bundle);
+            state
+                .backend_svid_rotation_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            *state.backend_svid_rotation_tx.borrow()
+        });
+        let config = GatewaySvidWatchConfig {
+            sources,
+            file_interval: GATEWAY_SVID_FILE_POLL_INTERVAL,
+            provider_interval,
+            tracker: Some(tracker),
+            publish,
+        };
+        Some(tokio::spawn(run_gateway_svid_source_rotation_loop(
+            config,
             shutdown_rx,
         )))
     }
@@ -7089,6 +7175,10 @@ impl ProxyState {
             ),
         );
         let env_config_arc = Arc::new(env_config.clone());
+        // Baseline the rotation watcher *before* the initial bundle load; see
+        // `prime_gateway_svid_rotation_baseline`. Doing it inside the spawned
+        // task would swallow any source change made during startup.
+        let gateway_svid_rotation = prime_gateway_svid_rotation_baseline(&env_config_arc);
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         inject_gateway_workload_metrics_if_svid(
             &mut config,
@@ -7535,8 +7625,9 @@ impl ProxyState {
                 ),
             ),
         };
+        let svid_shutdown_rx = health_check_restart_rx.clone();
         if let Some(handle) =
-            state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
+            state.start_gateway_svid_rotation_task(gateway_svid_rotation, svid_shutdown_rx)
         {
             health_check_handles.push(handle);
         }
@@ -15879,6 +15970,29 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_bound_listener_and_mesh_direction(
+        listener, state, shutdown, tls_config, None,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_bound_listener`] with an explicit mesh traffic
+/// direction stamped on every accepted connection.
+///
+/// Mesh listeners are normally bound by `modes::mesh`, which owns the direction
+/// per listener descriptor. This variant exists so an out-of-process-free test
+/// harness can drive the direction-gated inbound paths — the transparent HBONE
+/// relay synthesis and the datagram-over-mesh UDP relay — over a pre-bound
+/// socket with a static mTLS `ServerConfig`, instead of standing up a full mesh
+/// runtime. It adds no behavior of its own: `None` is exactly the existing
+/// entry point.
+pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> Result<(), anyhow::Error> {
     let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
@@ -15907,7 +16021,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         },
         conn_semaphore,
         shutdown,
-        None,
+        mesh_direction,
         0,
         SourceIpOverride::none(),
         None,
@@ -24624,10 +24738,17 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
+            // A UDP CONNECT additionally consults the EgressGateway's
+            // ServiceEntry-derived external-destination allowlist (issue #3263),
+            // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+                build_inbound_hbone_relay_proxy(
+                    req.uri().authority(),
+                    epoch.config.mesh.as_deref(),
+                    is_udp_hbone_connect,
+                )
             } else {
                 None
             };
@@ -25953,7 +26074,6 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -25962,7 +26082,8 @@ async fn handle_proxy_request_inner(
     // downstream pool keys, capability-registry lookups, URL construction,
     // and circuit-breaker target keys all derive from the effective
     // destination (pool-poisoning invariant).
-    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    let mut proxy =
+        ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -25978,13 +26099,16 @@ async fn handle_proxy_request_inner(
     // override so finalized-egress plugins can recover the selected backend
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
-    let path = rebase_route_override_path(&mut ctx, path);
+    let mut path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
     // enables true PASSTHROUGH load balancing when the upstream's algorithm is
     // Passthrough; it is ignored for every other algorithm.
-    let selection = backend_dispatch::select_upstream_target(
+    // `selection` stays whole (fields are moved out with `Option::take`) because
+    // `balancer` / `is_fallback` / `sticky_cookie_needed` are read much later,
+    // after the deferred-override rebind below may have replaced it.
+    let mut selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -25992,9 +26116,9 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
+    let mut lb_hash_key = selection.lb_hash_key.take();
+    let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target.take(),
         request_host.as_deref(),
     );
 
@@ -26189,7 +26313,71 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         }
+
+        // A remaining deferred hook may commit a destination only after the
+        // original backend-effective path has passed policy (for example, an
+        // AI federation streaming claim). Rebind every dispatch input before
+        // credentials installed by that hook can reach a backend. Otherwise
+        // the headers can describe the claimed provider while `proxy`, `path`,
+        // and `upstream_target` still point at the pre-claim destination.
+        //
+        // Each rebind is gated on that input actually moving. Re-running
+        // load-balancer selection unconditionally would advance round-robin,
+        // re-read the health snapshot, and re-derive the hash key for every
+        // policy-bound request that never had a deferred override at all,
+        // perturbing target choice, retry rotation, and least-connections
+        // accounting well beyond the destinations this rebind exists to honor.
+        let previous_proxy = Arc::clone(&proxy);
+        proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+        // `apply_route_overrides_with_upstreams` is idempotent: it hands back
+        // the SAME `Arc` when the already-baked proxy reflects every override,
+        // so pointer identity against the retained pre-pass `Arc` is an exact,
+        // allocation-free "a deferred hook committed a new destination" test.
+        let destination_rebound = !Arc::ptr_eq(&previous_proxy, &proxy);
+        if destination_rebound {
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+        }
+        // A deferred hook can also rewrite only the backend path (the Istio
+        // `rewrite.uri` shape) without moving the destination. `path` and
+        // `ctx.path` already carry the rewrite bound before the deferred
+        // passes, so a divergence from the current override is exactly the
+        // case where re-basing changes what is dispatched.
+        let path_rebase_pending = ctx
+            .route_override_path
+            .as_deref()
+            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+        if path_rebase_pending {
+            path = rebase_route_override_path(&mut ctx, path);
+        }
+        if destination_rebound {
+            // Replace the whole selection rather than only the target:
+            // `balancer`, `is_fallback`, and `sticky_cookie_needed` are read
+            // after this point, so same-generation load-balancer accounting,
+            // the unhealthy-fallback warning, and sticky-cookie issuance must
+            // describe the target that is actually dialed.
+            selection = backend_dispatch::select_upstream_target(
+                &proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                ctx.orig_dst,
+            );
+            lb_hash_key = selection.lb_hash_key.take();
+            upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+                selection.target.take(),
+                request_host.as_deref(),
+            );
+        }
     }
+
+    // Capture the backend-visible query only after every deferred before_proxy
+    // pass and the gated destination rebinding above. A remaining deferred hook
+    // (for example `ai_federation` streaming) can commit an empty provider-owned
+    // query boundary while the client wire query still carries normal-backend
+    // material; capturing earlier would leak that stale query into backend URL
+    // construction, retry replay, and cache partitions.
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
@@ -37592,7 +37780,7 @@ fn buffered_collect_retain_failure(
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 ///
 /// The cookie value is the opaque backend-bound token from
-/// [`crate::load_balancer::sticky_session_token`]: a SHA-256 digest over the
+/// [`crate::load_balancer::sticky_session_token`]: an HMAC-SHA-256 tag over the
 /// namespace-qualified upstream identity and the selected target's full sticky
 /// identity (dial `host:port`, per-port policy key, tags, locality, and path
 /// override), never the address itself. It therefore leaks no backend topology,
@@ -37618,19 +37806,32 @@ fn buffered_collect_retain_failure(
 /// backend that did not produce its response, and every retry-capable path can
 /// rotate off the target selection bound.
 ///
-/// The derivation is unkeyed and deterministic, so affinity survives a gateway
-/// restart and is identical across replicas of a horizontally scaled gateway.
+/// The derivation is keyed under a process-local authentication key, so a
+/// client cannot forge a binding from predictable route and endpoint metadata.
+/// Affinity survives a config reload; a gateway restart, or a request that
+/// reaches another replica, treats the cookie as stale and transparently
+/// re-pins the client through ordinary selection.
+///
+/// Minting and resolution therefore agree by construction rather than by
+/// coincidence: this site and the per-upstream binding index
+/// (`LoadBalancer::sticky_token_index`) both derive through the single public
+/// [`crate::load_balancer::sticky_session_token`], over the same
+/// namespace-qualified runtime key and the same CONFIGURED target identity.
+/// Deriving a token here from anything else — a per-request dial clone, or an
+/// upstream id that is not namespace-qualified — would produce a value absent
+/// from the index, so every returning client would miss and be re-issued a
+/// fresh cookie on every response.
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     namespace: &str,
     upstream_id: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
-) -> String {
+) -> Option<String> {
     let value = crate::load_balancer::sticky_session_token(
         &crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id),
         target,
-    );
+    )?;
     let mut cookie = format!("{}={}; Path={}", cookie_name, value, config.path);
     if !config.session_cookie {
         cookie.push_str("; Max-Age=");
@@ -37650,7 +37851,7 @@ pub(crate) fn build_sticky_cookie_header(
         cookie.push_str("; SameSite=");
         cookie.push_str(same_site);
     }
-    cookie
+    Some(cookie)
 }
 
 /// Append the gateway-authored Gateway API session-persistence `Set-Cookie` to
@@ -37728,13 +37929,15 @@ pub(crate) fn inject_sticky_affinity_cookie(
         .as_ref()
         .and_then(|u| u.hash_on_cookie_config.as_ref())
         .unwrap_or(&default_cc);
-    let cookie_val = build_sticky_cookie_header(
+    let Some(cookie_val) = build_sticky_cookie_header(
         cookie_name,
         &proxy.namespace,
         upstream_id,
         identity_target,
         cookie_config,
-    );
+    ) else {
+        return false;
+    };
     headers_mod::append_set_cookie_header(response_headers, cookie_val);
     true
 }
@@ -51109,7 +51312,7 @@ mod tests {
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .rfind("build_inbound_hbone_relay_proxy(")
             .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
         assert!(
             relay_pos < gate_pos,
@@ -52992,11 +53195,116 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
             .expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.backend_host, "fd00:10:244:1::4");
         assert_eq!(relay.backend_port, 8080);
+    }
+
+    #[test]
+    fn mesh_egress_udp_post_override_allows_only_dial_endpoints() {
+        use crate::modes::mesh::config::{
+            MeshConfig, MeshEgressUdpDestination, MeshEgressUdpDialEndpoint,
+        };
+
+        // STATIC host authority + declared endpoint: CONNECT may name the
+        // hostname, but the effective socket target after synthesis/override
+        // must be a dial endpoint. Admitting the hostname here would let
+        // resolve_local_udp_dest DNS-bypass endpoints[].
+        let mesh = MeshConfig {
+            egress_udp_destinations: vec![
+                MeshEgressUdpDestination {
+                    host: "static.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "198.51.100.9".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "dns.external.com".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "dns".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Original-authority lookup is unchanged: STATIC hostname still
+        // selects a declared dial endpoint.
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("static.external.com", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("STATIC.EXTERNAL.COM", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+
+        // Post-override guard: STATIC hostname is NOT a dialable socket target.
+        assert!(
+            !mesh_egress_udp_destination_allowed("static.external.com", 53, Some(&mesh)),
+            "STATIC hostname must not pass the post-override dial-endpoint guard"
+        );
+        // Declared STATIC endpoint IP and DNS/NONE dial targets still pass.
+        assert!(mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "dns.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "DNS.EXTERNAL.COM",
+            53,
+            Some(&mesh)
+        ));
+        // Unrelated host stays denied; empty mesh denies.
+        assert!(!mesh_egress_udp_destination_allowed(
+            "other.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(!mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            None
+        ));
+
+        // Synthesis converts a STATIC authority CONNECT into the dial endpoint
+        // backend — the unmodified happy path that the post-override guard must
+        // still accept.
+        let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+            .expect("STATIC authority must synthesize a dial-endpoint relay");
+        assert_eq!(relay.backend_host, "198.51.100.9");
+        assert_eq!(relay.backend_port, 53);
+        assert!(mesh_egress_udp_destination_allowed(
+            &relay.backend_host,
+            relay.backend_port,
+            Some(&mesh)
+        ));
     }
 
     #[test]

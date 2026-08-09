@@ -1288,6 +1288,23 @@ pub(crate) fn nonce_replay_registry_contains_for_tests(scope_key: &str) -> Resul
     Ok(registry.contains_key(scope_key))
 }
 
+/// Forcibly remove a process replay scope from the registry (test support only).
+///
+/// This is **not** production reclaim. Production
+/// [`prune_retired_nonce_replay_scopes`] never removes poisoned or structurally
+/// inconsistent state; external unit tests that deliberately create such state
+/// must call this helper after asserting fail-closed behavior so parallel
+/// suite siblings cannot exhaust [`MAX_NONCE_REPLAY_SCOPES`].
+///
+/// Returns `Ok(true)` when an entry was removed, `Ok(false)` when absent.
+#[allow(dead_code)]
+pub(crate) fn remove_nonce_replay_scope_for_tests(scope_key: &str) -> Result<bool, String> {
+    let Ok(mut registry) = NONCE_REPLAY_REGISTRY.lock() else {
+        return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
+    };
+    Ok(registry.remove(scope_key).is_some())
+}
+
 #[allow(dead_code)]
 pub(crate) const MAX_NONCE_REPLAY_SCOPES_FOR_TESTS: usize = MAX_NONCE_REPLAY_SCOPES;
 

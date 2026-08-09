@@ -19,12 +19,12 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, OutboundTrafficPolicy, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort,
+    AppProtocol, MeshConfig, MeshEgressUdpDialEndpoint, MeshEndpoint, OutboundTrafficPolicy,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
 };
 use ferrum_edge::modes::mesh::{
-    MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    prepare_gateway_config_for_mesh,
+    MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MeshConfigProtocol, MeshEgressGatewayEndpoint,
+    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
 use serde_json::{Value, json};
 
@@ -68,6 +68,7 @@ fn egress_runtime() -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:15090".parse::<SocketAddr>().unwrap(),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: None,
         workload_svid_cert_path: None,
@@ -508,4 +509,777 @@ fn sidecar_unrepresentable_outbound_traffic_policy_fails_closed() {
             "{policy} must not cost the Sidecar its egress narrowing"
         );
     }
+}
+
+/// UDP ServiceEntry → EgressGateway datagram-over-mesh egress (issue #3263).
+/// A `protocol: UDP` external port materializes a destination ADMISSION rather
+/// than a listener or upstream: `MeshConfig.egress_udp_destinations` is what the
+/// gateway's authenticated mesh CONNECT terminator consults.
+#[test]
+fn se_udp_egress_materializes_relay_destination_not_listener() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP ServiceEntry → EgressGateway datagram-over-mesh destination (#3263)",
+        status = Status::Supported,
+        notes = "#3263: UDP external ports materialize `mesh.egress_udp_destinations`; no UDP/DTLS listener and no upstream, by design.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        !prepared.proxies.iter().any(|p| p.listen_port == Some(53)),
+        "UDP ServiceEntry must not bind an egress listener"
+    );
+    let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+    assert_eq!(
+        mesh.egress_udp_destinations
+            .iter()
+            .map(|destination| (
+                destination.host.as_str(),
+                destination.port,
+                destination.dial_endpoints.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            "dns.external.com",
+            53,
+            vec![MeshEgressUdpDialEndpoint {
+                host: "dns.external.com".to_string(),
+                port: 53,
+            }]
+        )],
+    );
+}
+
+/// Reload/update/delete: the admission set is REBUILT and reassigned on every
+/// apply, so withdrawing the ServiceEntry withdraws the admission and does not
+/// leave a stale destination behind.
+#[test]
+fn se_udp_egress_destinations_are_withdrawn_on_reload() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destination allowlist is rebuilt per apply (#3263)",
+        status = Status::Supported,
+        notes = "#3263: an update that changes the port re-keys the admission; a delete clears it; a non-EgressGateway topology never admits.",
+    );
+    let initial = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(initial.config, &egress_runtime()).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .len(),
+        1
+    );
+
+    // Update: the operator moves the port. The old (host, 53) admission must
+    // not survive alongside the new one.
+    let updated = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 5353, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(updated.config, &egress_runtime()).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .iter()
+            .map(|destination| destination.port)
+            .collect::<Vec<_>>(),
+        vec![5353]
+    );
+
+    // Delete: no ServiceEntry at all leaves an EMPTY allowlist, which denies.
+    let deleted = translate_k8s_objects(
+        &[external_se(
+            "kafka",
+            vec!["kafka.external.com"],
+            9092,
+            "TCP",
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(deleted.config, &egress_runtime()).expect("mesh apply");
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty(),
+        "a withdrawn UDP ServiceEntry must withdraw its admission"
+    );
+}
+
+/// Fail-closed by topology: the same UDP ServiceEntry admits nothing when the
+/// process is not an EgressGateway.
+#[test]
+fn se_udp_egress_destinations_are_empty_off_egress_gateway() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destinations are EgressGateway-only (#3263)",
+        status = Status::Supported,
+        notes = "#3263: a Sidecar/Ambient process never publishes external UDP admissions, so its CONNECT terminator cannot relay to external hosts.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(
+        translation.config,
+        &sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny),
+    )
+    .expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty()
+    );
+}
+
+/// Fail-closed by opt-in: with `FERRUM_MESH_EGRESS_STREAM_ENABLED=false` the UDP
+/// ServiceEntry admits nothing — there is no plaintext-UDP fallback.
+#[test]
+fn se_udp_egress_destinations_require_stream_egress_opt_in() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "UDP egress destinations require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
+        status = Status::Supported,
+        notes = "#3263: the datagram relay rides the same operator opt-in the TCP stream listeners do; off means denied, never plaintext.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let mut runtime = egress_runtime();
+    runtime.egress_stream_enabled = false;
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty()
+    );
+}
+
+// ── STATIC endpoint semantics + source-side producer (issue #3263) ─────────
+
+fn static_udp_service_entry(
+    name: &str,
+    hosts: Vec<impl Into<String>>,
+    port: u16,
+    endpoints: Vec<impl Into<String>>,
+) -> K8sObject {
+    let hosts: Vec<String> = hosts.into_iter().map(Into::into).collect();
+    let endpoints: Vec<String> = endpoints.into_iter().map(Into::into).collect();
+    service_entry(
+        name,
+        json!({
+            "hosts": hosts,
+            "location": "MESH_EXTERNAL",
+            "resolution": "STATIC",
+            "endpoints": endpoints
+                .iter()
+                .map(|address| json!({"address": address}))
+                .collect::<Vec<_>>(),
+            "ports": [{"number": port, "name": "udp", "protocol": "UDP"}]
+        }),
+    )
+}
+
+/// A `Sidecar` source runtime with an explicitly configured, identity-pinned
+/// EgressGateway.
+fn sidecar_source_runtime_with_gateway() -> MeshRuntimeConfig {
+    let mut rt = sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny);
+    rt.egress_gateway = Some(MeshEgressGatewayEndpoint {
+        host: "ferrum-egress.istio-system.svc.cluster.local".to_string(),
+        port: 15090,
+        spiffe_id: "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"
+            .parse()
+            .expect("gateway spiffe id"),
+    });
+    rt
+}
+
+/// A `STATIC` ServiceEntry is dialed at its DECLARED endpoints, never by
+/// resolving the service host: the admitted authority and the dial endpoints are
+/// represented separately.
+#[test]
+fn se_udp_egress_static_authority_dials_declared_endpoints() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "STATIC UDP ServiceEntry dials endpoints[], never the authority host (#3263)",
+        status = Status::Supported,
+        notes = "#3263: authority and dial destination are separate; a STATIC host is never DNS-resolved by the relay, and an endpoint-IP authority dials only that endpoint.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "ntp",
+            vec!["ntp.external.com"],
+            123,
+            vec!["203.0.113.10", "203.0.113.11"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+
+    let host_admission = mesh
+        .egress_udp_destinations
+        .iter()
+        .find(|destination| destination.host == "ntp.external.com")
+        .expect("the service host is admitted as an authority");
+    assert_eq!(
+        host_admission
+            .dial_endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port))
+            .collect::<Vec<_>>(),
+        vec![("203.0.113.10", 123), ("203.0.113.11", 123)],
+        "a STATIC host must dial its declared endpoints, not itself"
+    );
+
+    let endpoint_admission = mesh
+        .egress_udp_destinations
+        .iter()
+        .find(|destination| destination.host == "203.0.113.11")
+        .expect("each endpoint IP is admitted as an authority in its own right");
+    assert_eq!(
+        endpoint_admission
+            .dial_endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port))
+            .collect::<Vec<_>>(),
+        vec![("203.0.113.11", 123)],
+        "an endpoint-IP authority must dial only the endpoint it names"
+    );
+}
+
+/// A `STATIC` ServiceEntry whose endpoints are all unusable admits NOTHING —
+/// falling back to resolving the authority would bypass STATIC semantics.
+#[test]
+fn se_udp_egress_static_without_usable_endpoints_admits_nothing() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "STATIC UDP ServiceEntry with no usable endpoint fails closed (#3263)",
+        status = Status::Supported,
+        notes = "#3263: no dialable endpoint means no admission; the relay never falls back to DNS-resolving a STATIC authority.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "broken",
+            vec!["broken.external.com"],
+            123,
+            vec!["not-an-ip.example"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .egress_udp_destinations
+            .is_empty()
+    );
+}
+
+/// SOURCE side: a Sidecar with a configured EgressGateway materializes a
+/// captured-datagram route per STATIC endpoint plus the identity-pinned upstream
+/// that dials the gateway. Without it the ServiceEntry would stay inert.
+#[test]
+fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP egress to a configured EgressGateway (#3263)",
+        status = Status::Supported,
+        notes = "#3263: a Sidecar/Ambient source materializes a (endpoint IP, port) route whose single upstream target dials the configured gateway over SVID-mTLS, pinned to the gateway SPIFFE id, with the external endpoint as the CONNECT authority.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
+            .expect("mesh apply");
+    let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+
+    let route = mesh
+        .external_udp_egress_routes
+        .first()
+        .expect("one source-side route per STATIC endpoint");
+    assert_eq!(route.dest_ip, "203.0.113.7");
+    assert_eq!(route.port, 514);
+    assert_eq!(route.service_fqdn, "syslog.external.com");
+
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == route.upstream_id)
+        .expect("the route's upstream materialized");
+    let target = upstream
+        .targets
+        .first()
+        .expect("one identity-pinned gateway target");
+    assert_eq!(
+        target.host, "ferrum-egress.istio-system.svc.cluster.local",
+        "the source dials the CONFIGURED gateway, never the external destination"
+    );
+    assert_eq!(
+        target.port, 514,
+        "target.port is the CONNECT authority port (the ServiceEntry service port)"
+    );
+    assert_eq!(
+        target.tags.get("mesh.mtls").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        target.tags.get("mesh.mtls_port").map(String::as_str),
+        Some("15090"),
+        "the gateway's mesh mTLS listener port must be stamped"
+    );
+    assert_eq!(
+        target.tags.get("mesh.spiffe_id").map(String::as_str),
+        Some("spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"),
+        "the gateway identity must be pinned for the outbound handshake"
+    );
+    assert_eq!(
+        target
+            .tags
+            .get("mesh.mtls_authority_host")
+            .map(String::as_str),
+        Some("203.0.113.7"),
+        "the CONNECT authority names the EXTERNAL endpoint the gateway admits"
+    );
+    assert!(
+        !target.tags.contains_key("mesh.hbone"),
+        "the EgressGateway exposes no :15008 HBONE listener"
+    );
+}
+
+/// A large accepted slice must not expand the source-side route/upstream table
+/// without bound. Routes beyond the shared external-UDP cap are omitted
+/// fail-closed, and every retained route still has exactly one gateway
+/// upstream.
+#[test]
+fn se_udp_source_side_routes_respect_total_cap() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP routes have a total materialization cap (#3263)",
+        status = Status::Supported,
+        notes = "#3263: the same fixed bound that limits the gateway allowlist also limits source-side endpoint routes and their synthesized upstreams; excess entries stay unroutable.",
+    );
+    let limit = ferrum_edge::modes::mesh::MAX_EGRESS_UDP_DESTINATIONS;
+    let objects: Vec<K8sObject> = (0..=limit)
+        .map(|index| {
+            let address = format!("198.18.{}.{}", index / 254, index % 254 + 1);
+            static_udp_service_entry(
+                &format!("udp-{index}"),
+                vec![format!("udp-{index}.external.test")],
+                514,
+                vec![address],
+            )
+        })
+        .collect();
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
+            .expect("mesh apply");
+    let routes = &prepared
+        .mesh
+        .as_deref()
+        .expect("mesh block")
+        .external_udp_egress_routes;
+    assert_eq!(routes.len(), limit, "routes beyond the cap must be omitted");
+    let external_upstreams: Vec<_> = prepared
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-"))
+        .collect();
+    assert_eq!(
+        external_upstreams.len(),
+        limit,
+        "the source must not synthesize upstreams beyond the route cap"
+    );
+    assert!(routes.iter().all(|route| {
+        external_upstreams
+            .iter()
+            .any(|upstream| upstream.id == route.upstream_id)
+    }));
+}
+
+/// Fail closed: without an explicitly configured gateway endpoint/identity the
+/// source materializes NO route — captured datagrams are dropped, never
+/// direct-dialed to the external destination.
+#[test]
+fn se_udp_source_side_without_configured_gateway_materializes_nothing() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP egress requires a configured gateway (#3263)",
+        status = Status::Supported,
+        notes = "#3263: no FERRUM_MESH_EGRESS_GATEWAY_ADDR/SPIFFE_ID means no route; Ferrum never guesses a gateway and never direct-dials the external destination.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(
+        translation.config,
+        &sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny),
+    )
+    .expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty()
+    );
+    assert!(
+        !prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-")),
+        "no gateway upstream may materialize without a configured gateway"
+    );
+}
+
+/// Fail closed by the shared opt-in: with `FERRUM_MESH_EGRESS_STREAM_ENABLED=false`
+/// the Sidecar/Ambient source publishes no external UDP routes — matching the
+/// gateway allowlist contract so the two halves cannot disagree.
+#[test]
+fn se_udp_source_side_routes_require_stream_egress_opt_in() {
+    register_feature!(
+        category = CATEGORY,
+        feature =
+            "Source-side external UDP routes require FERRUM_MESH_EGRESS_STREAM_ENABLED (#3263)",
+        status = Status::Supported,
+        notes = "#3263: source and gateway share the stream-egress opt-in; flag-off clears source routes and admits nothing on the gateway, never a black-hole half-pair.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let mut runtime = sidecar_source_runtime_with_gateway();
+
+    // Flag on: STATIC source routes materialize.
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config.clone(), &runtime).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .len(),
+        1,
+        "opt-in on must publish the STATIC source-side route"
+    );
+
+    // Flag off on a subsequent apply must withdraw the prior route set.
+    runtime.egress_stream_enabled = false;
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty(),
+        "flag-off must withdraw source-side external UDP routes"
+    );
+    assert!(
+        !prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id.starts_with("__mesh-out-udp-ext-upstream-")),
+        "flag-off must not leave a source-side external UDP upstream behind"
+    );
+}
+
+/// Fail closed: a `DNS`/`NONE` resolution entry declares no endpoint address, so
+/// a captured datagram (which carries no Host) cannot be attributed to it. It is
+/// refused rather than guessed at.
+#[test]
+fn se_udp_source_side_refuses_non_static_resolution() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP egress requires STATIC resolution (#3263)",
+        status = Status::Supported,
+        notes = "#3263: a UDP datagram carries no Host, so only a declared endpoint address can key a captured datagram; DNS/NONE entries are refused with a field-specific diagnostic.",
+    );
+    let translation = translate_k8s_objects(
+        &[external_se("dns", vec!["dns.external.com"], 53, "UDP")],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
+            .expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty()
+    );
+}
+
+/// Reload/update/delete withdrawal on the SOURCE side: the route set is rebuilt
+/// and reassigned on every apply, so a withdrawn ServiceEntry stops steering
+/// captured datagrams immediately.
+#[test]
+fn se_udp_source_side_routes_are_withdrawn_on_reload() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP routes are rebuilt per apply (#3263)",
+        status = Status::Supported,
+        notes = "#3263: an update re-keys the route; a delete clears it; a topology without a UDP source-capture producer never materializes one.",
+    );
+    let runtime = sidecar_source_runtime_with_gateway();
+    let initial = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(initial.config, &runtime).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .len(),
+        1
+    );
+
+    // Update: the endpoint moves. The old route must not survive beside it.
+    let updated = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.99"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(updated.config, &runtime).expect("mesh apply");
+    assert_eq!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .iter()
+            .map(|route| route.dest_ip.clone())
+            .collect::<Vec<_>>(),
+        vec!["203.0.113.99".to_string()]
+    );
+
+    // Delete: nothing external left ⇒ no routes at all.
+    let deleted = translate_k8s_objects(
+        &[external_se(
+            "kafka",
+            vec!["kafka.external.com"],
+            9092,
+            "TCP",
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared = prepare_gateway_config_for_mesh(deleted.config, &runtime).expect("mesh apply");
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty(),
+        "a withdrawn UDP ServiceEntry must withdraw its source-side route"
+    );
+}
+
+/// Fail closed by topology: an EgressGateway itself never materializes
+/// source-side routes (it terminates them), and neither does a topology with no
+/// UDP source-capture producer.
+#[test]
+fn se_udp_source_side_routes_are_empty_on_non_producer_topologies() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Source-side external UDP routes are producer-topology-only (#3263)",
+        status = Status::Supported,
+        notes = "#3263: only Sidecar/Ambient have a UDP source-capture producer; every other topology materializes no source-side route.",
+    );
+    let translation = translate_k8s_objects(
+        &[static_udp_service_entry(
+            "syslog",
+            vec!["syslog.external.com"],
+            514,
+            vec!["203.0.113.7"],
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let mut runtime = egress_runtime();
+    runtime.egress_gateway = Some(MeshEgressGatewayEndpoint {
+        host: "ferrum-egress.istio-system.svc.cluster.local".to_string(),
+        port: 15090,
+        spiffe_id: "spiffe://cluster.local/ns/istio-system/sa/ferrum-egress"
+            .parse()
+            .expect("gateway spiffe id"),
+    });
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+
+    assert!(
+        prepared
+            .mesh
+            .as_deref()
+            .expect("mesh block")
+            .external_udp_egress_routes
+            .is_empty()
+    );
+}
+
+/// Both halves must refuse the SAME entry shapes, or the source publishes a
+/// route whose CONNECT the gateway is guaranteed to refuse.
+///
+/// A host-less `ServiceEntry` is structurally invalid and is rejected at the
+/// public `prepare_gateway_config_for_mesh` boundary (`hosts must not be empty`)
+/// before either materializer runs. The source-side materializer also refuses
+/// empty `hosts[]` as defense in depth for slice carriers that bypass the
+/// operator-input validator (xDS / native-slice paths).
+#[test]
+fn se_udp_hostless_service_entry_admits_nothing_on_either_half() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "Host-less external UDP ServiceEntry is refused by BOTH halves (#3263)",
+        status = Status::Supported,
+        notes = "#3263: a host-less ServiceEntry is rejected at the public mesh boundary on both runtimes; the source-side materializer also skips empty hosts[] so slice carriers cannot publish a route the gateway would refuse.",
+    );
+    let hostless = || GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            service_entries: vec![ServiceEntry {
+                name: "syslog".to_string(),
+                namespace: "default".to_string(),
+                // No hosts: structurally invalid at the public mesh boundary.
+                hosts: Vec::new(),
+                endpoints: vec![MeshEndpoint {
+                    address: "203.0.113.7".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 514,
+                    protocol: AppProtocol::Udp,
+                    name: Some("udp".to_string()),
+                    target_port: None,
+                }],
+                export_to: vec!["*".to_string()],
+                workload_selector: None,
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+
+    let assert_rejected_at_mesh_boundary = |runtime: &MeshRuntimeConfig, half: &str| {
+        let err = prepare_gateway_config_for_mesh(hostless(), runtime).expect_err(&format!(
+            "{half} half must reject a host-less ServiceEntry at the mesh boundary"
+        ));
+        let err = err.to_string();
+        assert!(
+            err.contains("Mesh configuration validation failed"),
+            "{half} half: expected mesh-boundary validation failure, got {err}"
+        );
+        assert!(
+            err.contains("hosts must not be empty"),
+            "{half} half: expected hosts[] rejection, got {err}"
+        );
+        assert!(
+            err.contains("ServiceEntry"),
+            "{half} half: diagnostic should name the resource kind, got {err}"
+        );
+        assert!(
+            !err.contains("203.0.113.7"),
+            "{half} half: diagnostic must not echo endpoint address payload"
+        );
+        assert!(
+            err.len() < 256,
+            "{half} half: diagnostic must stay bounded, got len {}",
+            err.len()
+        );
+    };
+
+    // Gateway half: public admission rejects before egress UDP materialization.
+    assert_rejected_at_mesh_boundary(&egress_runtime(), "gateway");
+
+    // Source half: the same structural rejection at the public boundary.
+    assert_rejected_at_mesh_boundary(&sidecar_source_runtime_with_gateway(), "source");
 }
