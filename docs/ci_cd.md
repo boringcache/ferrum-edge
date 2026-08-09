@@ -228,15 +228,39 @@ runner allocations.
 
 The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
 runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
-as its first step. On pull requests and merge groups the checker is extracted
-from the base revision when one exists, then self-tested and executed against
-the proposed chart tree. That prevents the step from executing a checker
-replaced by the same pull request; the workflow wiring remains a reviewed pull
-request surface and the required aggregate checks its expected shape. The
+after proving the working-tree `.github/actions/setup-kubernetes-tools` matches
+the trusted revision and installing that pinned Helm binary. The proof runs
+before `uses:` can execute the action: the workflow takes a `git archive`
+tarball of the action directory at the trusted revision (the pull request base,
+the merge-group base, or the checkout itself on `push`/`workflow_dispatch`)
+while `PATH` is still the pristine runner one, and
+`.github/scripts/verify_trusted_local_action.py` decides regular-file,
+no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
+constraints entirely from that manifest, spawning no process of its own.
+Anything it cannot answer fails closed. Keeping the proof in Python rather than
+inline shell also keeps `helm-chart` free of the opaque-inline-shell and Cross
+surfaces that `Trusted Cross Build Policy` freezes per job.
+On pull requests and merge groups the checker is extracted from the base revision when
+one exists, then self-tested and executed against the proposed chart tree. That
+prevents the step from executing a checker replaced by the same pull request and
+prevents a PR-modified local installer from substituting a fake `helm` renderer
+for the authoritative scan; the workflow wiring remains a reviewed pull request
+surface and the required aggregate checks its expected shape. `FERRUM_TRUSTED_HELM`
+pins the scan to the installer output so a later `PATH` prepend cannot swap the
+renderer, and the checker rejects a `helm` path that is a symlink, is not a
+regular file, or is not executable. A separate, clearly non-authoritative step
+then exercises the proposed in-tree checker (self-test + scan) so syntax/render
+behavior at the PR head is hosted-validated before merge without becoming the
+security authority — without it, a checker change would get no hosted execution
+at all on its own pull request. The
 checker rejects Docker/containerd/CRI-O socket mounts, a `runtime.sock` host
 path, or a true/dynamic `privileged` assignment. The scan walks every regular,
 non-symlink chart template, values file, example values file, and chart fragment
-rather than trusting a fixed pair of workload filenames.
+rather than trusting a fixed pair of workload filenames. It also invokes Helm
+and scans the default, node-agent/ambient-enabled, and example-values rendered
+manifests (YAML/YML/JSON, including nested example paths), so helper expansion
+or a path assembled by a Helm expression cannot hide dangerous workload output
+from the gate.
 
 It lives in `Helm Chart` rather than in `CI Plan` or a new standalone job for
 two reasons. First, `Trusted Cross Build Policy` freezes the per-job digest of
