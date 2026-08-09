@@ -2050,7 +2050,10 @@ async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
     .fetch_one(&store.pool())
     .await
     .unwrap();
-    assert!(stored.is_some(), "a present trigger must not be stored as NULL");
+    assert!(
+        stored.is_some(),
+        "a present trigger must not be stored as NULL"
+    );
 
     plugin.trigger = Some(updated.clone());
     plugin.updated_at = chrono::Utc::now();

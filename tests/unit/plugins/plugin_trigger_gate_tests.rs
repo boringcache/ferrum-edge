@@ -281,8 +281,7 @@ async fn protocol_predicates_read_frontend_transport_and_http_flavor() {
 
     let h1 = request_from("GET", "/api", "10.1.2.3", HttpWireTransport::Http1);
 
-    let mut native_grpc =
-        request_from("POST", "/api", "10.1.2.3", HttpWireTransport::Http2);
+    let mut native_grpc = request_from("POST", "/api", "10.1.2.3", HttpWireTransport::Http2);
     set_request_http_flavor_for_test(&mut native_grpc, HttpFlavor::Grpc);
 
     let mut grpc_web = request_from("POST", "/api", "10.1.2.3", HttpWireTransport::Http3);
