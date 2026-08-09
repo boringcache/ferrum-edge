@@ -986,7 +986,7 @@ fn check_rsa_exponent(exponent: &[u8]) -> Result<(), JwtSvidError> {
     for byte in significant {
         value = (value << 8) | u64::from(*byte);
     }
-    if value < MIN_RSA_PUBLIC_EXPONENT || value % 2 == 0 {
+    if value < MIN_RSA_PUBLIC_EXPONENT || value.is_multiple_of(2) {
         return Err(JwtSvidError::InvalidAuthority(
             "JWT authority RSA public exponent must be an odd value of at least 3",
         ));

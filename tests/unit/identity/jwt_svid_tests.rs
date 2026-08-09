@@ -2673,7 +2673,8 @@ mod federated_bounds {
 
         svc.fetch_x509_bundles(workload_request(X509BundlesRequest {}))
             .await
-            .expect_err("the absent federated peer fails the X.509 bundle call");
+            .err()
+            .expect("the absent federated peer fails the X.509 bundle call");
         assert_eq!(
             ca.bundle_calls.load(Ordering::SeqCst),
             2,
