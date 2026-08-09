@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use ferrum_edge::config::types::UpstreamTarget;
 use ferrum_edge::proxy::unix_backend::{
-    MESH_UNIX_SOCKET_H2C_TAG, MESH_UNIX_SOCKET_TAG, UnixBackendError, connect_admitted,
-    dial_unix_h2c_sender, resolve_unix_socket_target, target_is_unix_backend,
+    DEFAULT_UNIX_CONNECT_TIMEOUT_MS, MESH_UNIX_SOCKET_H2C_TAG, MESH_UNIX_SOCKET_TAG,
+    UnixBackendError, connect_admitted, dial_unix_h2c_sender, effective_connect_timeout_ms,
+    resolve_unix_socket_target, target_is_unix_backend,
 };
 use ferrum_edge::util::unix_socket::{UnixSocketPathRejection, admit_socket_for_connect};
 
@@ -101,6 +102,15 @@ fn tagged_target(tags: &[(&str, &str)]) -> UpstreamTarget {
         locality: None,
         path: None,
     }
+}
+
+#[test]
+fn an_unset_unix_connect_timeout_keeps_a_bounded_default() {
+    assert_eq!(
+        effective_connect_timeout_ms(0),
+        DEFAULT_UNIX_CONNECT_TIMEOUT_MS
+    );
+    assert_eq!(effective_connect_timeout_ms(321), 321);
 }
 
 /// Either half of the Unix transport identity reserves the target. A carrier

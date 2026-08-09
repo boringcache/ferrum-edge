@@ -41287,8 +41287,18 @@ async fn proxy_to_backend_mesh_mtls(
     };
     // Bound readiness by the connect budget: a pooled-but-saturated connection
     // (stream-cap reached) must not stall the request indefinitely.
-    let connect_deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms));
+    let readiness_connect_timeout_ms = if unix_socket_path.is_some() {
+        unix_backend::effective_connect_timeout_ms(proxy.backend_connect_timeout_ms)
+    } else {
+        proxy.backend_connect_timeout_ms
+    };
+    let readiness_started_at = tokio::time::Instant::now();
+    let connect_deadline = readiness_started_at
+        .checked_add(Duration::from_millis(readiness_connect_timeout_ms))
+        // The Unix transport promises a bounded establishment path. An
+        // unrepresentable clock duration therefore expires immediately instead
+        // of falling through to the legacy mesh-pool "no deadline" behavior.
+        .or_else(|| unix_socket_path.is_some().then_some(readiness_started_at));
     let ready_deadline = match (client_grpc_deadline_at, connect_deadline) {
         (Some(client), Some(connect)) => Some(client.min(connect)),
         (Some(client), None) => Some(client),
@@ -41328,7 +41338,7 @@ async fn proxy_to_backend_mesh_mtls(
             warn!(
                 proxy_id = %proxy.id,
                 "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
-                proxy.backend_connect_timeout_ms
+                readiness_connect_timeout_ms
             );
             if is_grpc_flavored {
                 if client_grpc_deadline_at

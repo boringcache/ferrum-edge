@@ -295,6 +295,22 @@ pub fn effective_connect_timeout_ms(proxy_connect_timeout_ms: u64) -> u64 {
     }
 }
 
+/// Absolute deadline for one Unix transport establishment budget.
+///
+/// An operator-supplied duration that the platform clock cannot represent must
+/// fail closed rather than silently becoming an unbounded wait. Returning the
+/// effective millisecond value keeps the timeout response aligned with the
+/// default applied when the proxy-level value is zero.
+fn connect_deadline(
+    proxy_connect_timeout_ms: u64,
+) -> Result<(u64, tokio::time::Instant), UnixBackendError> {
+    let timeout_ms = effective_connect_timeout_ms(proxy_connect_timeout_ms);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(timeout_ms))
+        .ok_or(UnixBackendError::ConnectTimeout { timeout_ms })?;
+    Ok((timeout_ms, deadline))
+}
+
 /// HTTP/2 client-connection bounds for an h2c Unix backend.
 ///
 /// Fixed rather than operator-tunable: the peer is a co-located application on
@@ -408,9 +424,9 @@ pub async fn connect_admitted(
     admitted: &AdmittedUnixSocket,
     connect_timeout_ms: u64,
 ) -> Result<tokio::net::UnixStream, UnixBackendError> {
-    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
-    let stream = match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
+    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
+    let stream = match tokio::time::timeout_at(
+        deadline,
         tokio::net::UnixStream::connect(admitted.resolved_path()),
     )
     .await
@@ -502,20 +518,12 @@ pub async fn dial_unix_h2c_sender(
 ) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
-    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
-    let budget = std::time::Duration::from_millis(timeout_ms);
-    // `None` only when the operator's own budget overflows the timer instant,
-    // which is an unbounded budget by their own configuration. This mirrors how
-    // the sender-readiness deadline in `proxy::mod` handles the same overflow.
-    let deadline = tokio::time::Instant::now().checked_add(budget);
+    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
 
     let connect = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids);
-    let stream = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline, connect).await {
-            Ok(result) => result?,
-            Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
-        },
-        None => connect.await?,
+    let stream = match tokio::time::timeout_at(deadline, connect).await {
+        Ok(result) => result?,
+        Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
     };
 
     let settings_received = Arc::new(AtomicBool::new(false));
@@ -530,24 +538,18 @@ pub async fn dial_unix_h2c_sender(
         .max_concurrent_reset_streams(UNIX_H2C_MAX_CONCURRENT_RESET_STREAMS);
 
     let handshake = builder.handshake(io);
-    let handshake_result = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline, handshake).await {
-            Ok(result) => result,
-            Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
-        },
-        None => handshake.await,
+    let handshake_result = match tokio::time::timeout_at(deadline, handshake).await {
+        Ok(result) => result,
+        Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
     };
     let (sender, mut connection) = handshake_result.map_err(UnixBackendError::H2Handshake)?;
 
     // Establishment proper: the peer's own connection preface, on whatever is
     // left of the budget the connect already drew from.
     let establish = await_peer_settings(&mut connection, &settings_received);
-    let established = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline, establish).await {
-            Ok(result) => result,
-            Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
-        },
-        None => establish.await,
+    let established = match tokio::time::timeout_at(deadline, establish).await {
+        Ok(result) => result,
+        Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
     };
     if let Err(failure) = established {
         return Err(match failure {
