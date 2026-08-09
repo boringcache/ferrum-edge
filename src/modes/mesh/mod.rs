@@ -13491,23 +13491,19 @@ async fn start_internal_mesh_svid_source(
     // settings that no runtime path can use. Besides keeping `validate` and
     // startup in agreement, this avoids retaining an otherwise-unused private
     // key in the long-lived CA.
-    let (
-        jwt_signing_key_pem,
-        jwt_retired_key_pems,
-        jwt_key_lifetime_secs,
-        allow_ephemeral_jwt_key,
-    ) = if env_config.mesh_workload_api_enabled {
-        (
-            crate::identity::jwt_signing_key_pem(),
-            crate::identity::jwt_previous_signing_key_pem()
-                .into_iter()
-                .collect(),
-            env_config.mesh_jwt_key_lifetime_seconds,
-            crate::identity::allow_ephemeral_jwt_key(),
-        )
-    } else {
-        (None, Vec::new(), 0, false)
-    };
+    let (jwt_signing_key_pem, jwt_retired_key_pems, jwt_key_lifetime_secs, allow_ephemeral_jwt_key) =
+        if env_config.mesh_workload_api_enabled {
+            (
+                crate::identity::jwt_signing_key_pem(),
+                crate::identity::jwt_previous_signing_key_pem()
+                    .into_iter()
+                    .collect(),
+                env_config.mesh_jwt_key_lifetime_seconds,
+                crate::identity::allow_ephemeral_jwt_key(),
+            )
+        } else {
+            (None, Vec::new(), 0, false)
+        };
     let ca = Arc::new(crate::identity::ca::internal::InternalCa::new(
         crate::identity::ca::internal::InternalCaConfig {
             root_cert_pem: root.root_cert_pem,
