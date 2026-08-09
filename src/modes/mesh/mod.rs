@@ -13485,6 +13485,29 @@ async fn start_internal_mesh_svid_source(
         crate::identity::ca::bootstrap::BootstrapConfig::new(spiffe_id.trust_domain().clone()),
     )
     .map_err(|error| anyhow::anyhow!("internal mesh CA bootstrap failed: {error}"))?;
+    // Keep startup consumption identical to `validate_mesh_jwt_svid_settings`:
+    // the local JWT authority exists only to serve Ferrum's Workload API. A
+    // mesh with that surface disabled must not read, parse, or reject stale JWT
+    // settings that no runtime path can use. Besides keeping `validate` and
+    // startup in agreement, this avoids retaining an otherwise-unused private
+    // key in the long-lived CA.
+    let (
+        jwt_signing_key_pem,
+        jwt_retired_key_pems,
+        jwt_key_lifetime_secs,
+        allow_ephemeral_jwt_key,
+    ) = if env_config.mesh_workload_api_enabled {
+        (
+            crate::identity::jwt_signing_key_pem(),
+            crate::identity::jwt_previous_signing_key_pem()
+                .into_iter()
+                .collect(),
+            env_config.mesh_jwt_key_lifetime_seconds,
+            crate::identity::allow_ephemeral_jwt_key(),
+        )
+    } else {
+        (None, Vec::new(), 0, false)
+    };
     let ca = Arc::new(crate::identity::ca::internal::InternalCa::new(
         crate::identity::ca::internal::InternalCaConfig {
             root_cert_pem: root.root_cert_pem,
@@ -13497,12 +13520,10 @@ async fn start_internal_mesh_svid_source(
             // secret suffixes have already rewritten it) rather than carried on
             // `EnvConfig`, so a private key never lands on a struct whose values
             // are re-rendered onto the `validate` report or startup logs.
-            jwt_signing_key_pem: crate::identity::jwt_signing_key_pem(),
-            jwt_retired_key_pems: crate::identity::jwt_previous_signing_key_pem()
-                .into_iter()
-                .collect(),
-            jwt_key_lifetime_secs: env_config.mesh_jwt_key_lifetime_seconds,
-            allow_ephemeral_jwt_key: crate::identity::allow_ephemeral_jwt_key(),
+            jwt_signing_key_pem,
+            jwt_retired_key_pems,
+            jwt_key_lifetime_secs,
+            allow_ephemeral_jwt_key,
         },
     )?) as crate::identity::ca::SharedCa;
 
