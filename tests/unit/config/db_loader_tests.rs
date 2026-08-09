@@ -14,6 +14,7 @@ use ferrum_edge::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget,
@@ -1980,6 +1981,106 @@ async fn proxy_plugin_query_wrapper_preserves_typed_sqlx_source() {
         DatabaseStore::is_non_transient_init_error(&classified),
         "a retained non-transient schema error must still refuse backup bootstrap: {classified}"
     );
+}
+
+#[tokio::test]
+async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("plugin_trigger_round_trip.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    store
+        .create_proxy(&make_http_proxy("trigger-proxy"))
+        .await
+        .expect("proxy create");
+
+    let initial: PluginTrigger = serde_json::from_value(json!({
+        "when": {"match": {"method": ["POST"]}}
+    }))
+    .unwrap();
+    let updated: PluginTrigger = serde_json::from_value(json!({
+        "when": {"all": [
+            {"match": {"method": ["PUT"]}},
+            {"match": {"path": {"prefix": ["/v2/"]}}}
+        ]}
+    }))
+    .unwrap();
+    let now = chrono::Utc::now();
+    let mut plugin = PluginConfig {
+        id: "triggered-transformer".to_string(),
+        plugin_name: "request_transformer".to_string(),
+        namespace: "ferrum".to_string(),
+        config: json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "x-triggered",
+                "value": "1"
+            }]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("trigger-proxy".to_string()),
+        enabled: true,
+        priority_override: None,
+        trigger: Some(initial.clone()),
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .create_plugin_config(&plugin)
+        .await
+        .expect("triggered plugin create");
+    let created = store
+        .get_plugin_config("ferrum", &plugin.id)
+        .await
+        .unwrap()
+        .expect("created plugin");
+    assert_eq!(created.trigger.as_ref(), Some(&initial));
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT trigger_json FROM plugin_configs WHERE id = ? AND namespace = ?",
+    )
+    .bind(&plugin.id)
+    .bind("ferrum")
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert!(stored.is_some(), "a present trigger must not be stored as NULL");
+
+    plugin.trigger = Some(updated.clone());
+    plugin.updated_at = chrono::Utc::now();
+    assert!(store.update_plugin_config(&plugin).await.unwrap());
+    let full = store.load_full_config("ferrum").await.unwrap();
+    let reloaded = full
+        .plugin_configs
+        .iter()
+        .find(|candidate| candidate.id == plugin.id)
+        .expect("updated plugin in full load");
+    assert_eq!(reloaded.trigger.as_ref(), Some(&updated));
+
+    plugin.trigger = None;
+    plugin.updated_at = chrono::Utc::now();
+    assert!(store.update_plugin_config(&plugin).await.unwrap());
+    let cleared = store
+        .get_plugin_config("ferrum", &plugin.id)
+        .await
+        .unwrap()
+        .expect("cleared plugin");
+    assert!(cleared.trigger.is_none());
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT trigger_json FROM plugin_configs WHERE id = ? AND namespace = ?",
+    )
+    .bind(&plugin.id)
+    .bind("ferrum")
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert!(stored.is_none(), "clearing a trigger must restore SQL NULL");
 }
 
 #[tokio::test]
