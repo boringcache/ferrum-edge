@@ -17366,12 +17366,22 @@ components:
                     required: [type]
                     description: |
                       One of `{"type": "remove"}`,
-                      `{"type": "rename", "new_name": "..."}`, or
-                      `{"type": "set", "value": "..."}`.
+                      `{"type": "rename", "new_name": "..."}`,
+                      `{"type": "set", "value": "..."}` (literal), or
+                      `{"type": "set_expr", "cel": "..."}` /
+                      `{"type": "set_expr", "expression": {...}}` (compiled
+                      Telemetry UPSERT CEL). Expressions are compiled at
+                      construction/reload; the metric hot path evaluates the
+                      precompiled plan only. Supported CEL attributes are the
+                      finalized mesh metric-key peer labels plus
+                      `request.method`, `request.host`, `response.code`, and
+                      `destination.port` stamped before emission. HTTP-only
+                      attributes are rejected for TCP / `ALL_METRICS` selectors.
+                      Diagnostics never echo expression text.
                     properties:
                       type:
                         type: string
-                        enum: [remove, rename, set]
+                        enum: [remove, rename, set, set_expr]
                       new_name:
                         type: string
                         description: Replacement tag name when `type` is `rename`.
@@ -17384,6 +17394,22 @@ components:
                           admission separately enforces at most 256 UTF-8 bytes,
                           so multibyte values may be rejected below 256
                           characters.
+                      cel:
+                        type: string
+                        maxLength: 512
+                        description: |
+                          Bounded CEL source when `type` is `set_expr` and a
+                          compiled `expression` AST is not supplied. Limits:
+                          512 UTF-8 bytes, 32 tokens, nesting depth 8, 24 AST
+                          nodes. Supported forms: attribute reads,
+                          `string(<int attribute>)`, and
+                          `has(<string attribute>) ? <then> : <else>`.
+                      expression:
+                        type: object
+                        description: |
+                          Precompiled CEL AST produced by Telemetry translation
+                          / materialization (`op`: `literal`, `attribute`,
+                          `string_of_int`, `has_then_else`).
               description: Per-metric tag overrides translated from the Istio Telemetry CRD.
             disabled_metrics:
               type: array

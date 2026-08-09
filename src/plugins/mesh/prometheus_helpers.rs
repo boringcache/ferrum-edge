@@ -12,6 +12,10 @@ use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::metric_tag_cel::{
+    MetricTagCelAttr, MetricTagCelContext, MetricTagCelExpr, evaluate_metric_tag_cel,
+    metadata_destination_port, metadata_request_host, metadata_request_method,
+};
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
@@ -1413,7 +1417,8 @@ pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMet
 
 /// Apply the prevalidated, length-prefixed metric override plan emitted by
 /// `workload_metrics` to a finalized mesh key. The compact plan is parsed in
-/// place without JSON parsing, allocation, or a lock on the request-log path.
+/// place without JSON parsing, CEL text reparsing, or a lock on the request-log
+/// path. Expression opcodes evaluate against the metric-phase attribute context.
 pub(crate) fn mesh_request_key_for_family(
     summary: &TransactionSummary,
     base: &MeshRequestKey,
@@ -1423,7 +1428,14 @@ pub(crate) fn mesh_request_key_for_family(
         return base.clone();
     };
     let mut key = base.clone();
-    apply_metric_override_plan(&mut key, plan);
+    let extras = MetricTagCelExtras {
+        request_method: metadata_request_method(&summary.metadata)
+            .or(Some(summary.http_method.as_str()).filter(|value| !value.is_empty())),
+        request_host: metadata_request_host(&summary.metadata),
+        response_code: Some(summary.response_status_code),
+        destination_port: metadata_destination_port(&summary.metadata),
+    };
+    apply_metric_override_plan(&mut key, plan, extras);
     normalize_removed_labels(&mut key);
     key
 }
@@ -1450,7 +1462,19 @@ fn normalize_removed_labels(key: &mut MeshRequestKey) {
     }
 }
 
-fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
+#[derive(Debug, Clone, Copy)]
+struct MetricTagCelExtras<'a> {
+    request_method: Option<&'a str>,
+    request_host: Option<&'a str>,
+    response_code: Option<u16>,
+    destination_port: Option<u16>,
+}
+
+fn apply_metric_override_plan(
+    key: &mut MeshRequestKey,
+    mut plan: &str,
+    extras: MetricTagCelExtras<'_>,
+) {
     while !plan.is_empty() {
         let Some(op) = plan.as_bytes().first().copied() else {
             return;
@@ -1520,10 +1544,137 @@ fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
                 key.removed_labels &= !(1u16 << label.index());
                 plan = rest;
             }
+            b'x' => {
+                let Some((index, after_index)) = take_number_until(plan, b',') else {
+                    return;
+                };
+                let Some((length, body_and_rest)) = take_number_until(after_index, b':') else {
+                    return;
+                };
+                let Some(label) = u8::try_from(index)
+                    .ok()
+                    .and_then(MeshMetricLabel::from_index)
+                else {
+                    return;
+                };
+                let Some(body) = body_and_rest.get(..length) else {
+                    return;
+                };
+                let Some(rest) = body_and_rest.get(length..) else {
+                    return;
+                };
+                let Some(rest) = rest.strip_prefix(';') else {
+                    return;
+                };
+                let Some(expr) = decode_metric_tag_cel_expr(body) else {
+                    return;
+                };
+                let value = {
+                    let live_ctx = MetricTagCelContext {
+                        source_workload: key.source_workload.as_ref(),
+                        source_namespace: key.source_namespace.as_ref(),
+                        source_principal: key.source_principal.as_ref(),
+                        source_app: key.source_app.as_ref(),
+                        source_service: key.source_service.as_ref(),
+                        destination_workload: key.destination_workload.as_ref(),
+                        destination_namespace: key.destination_namespace.as_ref(),
+                        destination_principal: key.destination_principal.as_ref(),
+                        destination_app: key.destination_app.as_ref(),
+                        destination_service: key.destination_service.as_ref(),
+                        request_protocol: key.request_protocol.as_ref(),
+                        response_flags: key.response_flags.as_ref(),
+                        connection_security_policy: key.connection_security_policy.as_ref(),
+                        request_method: extras.request_method,
+                        request_host: extras.request_host,
+                        response_code: extras.response_code.or(Some(key.response_code).filter(|_| {
+                            key.response_code_override.is_none()
+                                && key.removed_labels
+                                    & (1u16 << MeshMetricLabel::ResponseCode.index())
+                                    == 0
+                        })),
+                        destination_port: extras.destination_port,
+                    };
+                    evaluate_metric_tag_cel(&expr, live_ctx)
+                };
+                set_metric_label_value(key, label, intern_label(&value));
+                key.removed_labels &= !(1u16 << label.index());
+                plan = rest;
+            }
             _ => return,
         }
     }
 }
+
+fn decode_metric_tag_cel_expr(mut body: &str) -> Option<MetricTagCelExpr> {
+    let expr = decode_metric_tag_cel_expr_prefix(&mut body)?;
+    if !body.is_empty() {
+        return None;
+    }
+    Some(expr)
+}
+
+fn decode_metric_tag_cel_expr_prefix(body: &mut &str) -> Option<MetricTagCelExpr> {
+    let op = body.as_bytes().first().copied()?;
+    *body = &body[1..];
+    match op {
+        b'L' => {
+            let (length, rest) = take_number_until(body, b':')?;
+            let value = rest.get(..length)?.to_string();
+            *body = rest.get(length..)?;
+            Some(MetricTagCelExpr::Literal { value })
+        }
+        b'A' => {
+            let (id, rest) = take_number_end(body)?;
+            *body = rest;
+            Some(MetricTagCelExpr::Attribute {
+                name: MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?,
+            })
+        }
+        b'I' => {
+            let (id, rest) = take_number_end(body)?;
+            *body = rest;
+            Some(MetricTagCelExpr::StringOfInt {
+                attribute: MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?,
+            })
+        }
+        b'H' => {
+            let (id, after_id) = take_number_until(body, b',')?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            let (then_len, after_then_len) = take_number_until(after_id, b':')?;
+            let then_body = after_then_len.get(..then_len)?;
+            let after_then = after_then_len.get(then_len..)?;
+            let (else_len, after_else_len) = take_number_until(after_then, b':')?;
+            let else_body = after_else_len.get(..else_len)?;
+            let after_else = after_else_len.get(else_len..)?;
+            *body = after_else;
+            let then_expr = decode_metric_tag_cel_expr(then_body)?;
+            let else_expr = decode_metric_tag_cel_expr(else_body)?;
+            Some(MetricTagCelExpr::HasThenElse {
+                attribute,
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn take_number_end(value: &str) -> Option<(usize, &str)> {
+    let mut end = 0usize;
+    for (idx, byte) in value.as_bytes().iter().enumerate() {
+        if byte.is_ascii_digit() {
+            end = idx + 1;
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let number = value.get(..end)?.parse::<usize>().ok()?;
+    Some((number, value.get(end..)?))
+}
+
 
 fn take_number_until(value: &str, delimiter: u8) -> Option<(usize, &str)> {
     let delimiter_index = value
@@ -1759,7 +1910,13 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
         return base.clone();
     };
     let mut key = base.clone();
-    apply_metric_override_plan(&mut key, plan);
+    let extras = MetricTagCelExtras {
+        request_method: metadata_request_method(metadata),
+        request_host: metadata_request_host(metadata),
+        response_code: None,
+        destination_port: metadata_destination_port(metadata),
+    };
+    apply_metric_override_plan(&mut key, plan, extras);
     // TCP families never carry an HTTP response-code dimension. Preserve that
     // fixed schema even when an ALL_METRICS plan contains a response-code
     // UPSERT/rename intended for the HTTP/gRPC families.

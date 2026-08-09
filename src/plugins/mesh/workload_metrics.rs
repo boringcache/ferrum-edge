@@ -15,6 +15,9 @@ use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
+use crate::modes::mesh::metric_tag_cel::{
+    MetricTagCelExpr, parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
+};
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
@@ -62,6 +65,9 @@ const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
 const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
+const MESH_REQUEST_HOST_METADATA: &str = "mesh.request.host";
+const MESH_REQUEST_METHOD_METADATA: &str = "mesh.request.method";
+const MESH_DESTINATION_PORT_METADATA: &str = "mesh.destination.port";
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
     match direction {
@@ -410,6 +416,35 @@ impl WorkloadMetrics {
             "mesh.request_protocol".to_string(),
             request_protocol(ctx, headers).to_string(),
         );
+        if let Some(authority) = ctx.request_authority.as_ref() {
+            if authority.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+                ctx.metadata
+                    .insert(MESH_REQUEST_HOST_METADATA.to_string(), authority.clone());
+            } else {
+                ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+            }
+        } else if let Some(host) = header_value(headers, "host") {
+            if host.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+                ctx.metadata
+                    .insert(MESH_REQUEST_HOST_METADATA.to_string(), host.to_string());
+            } else {
+                ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+            }
+        } else {
+            ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+        }
+        if !ctx.method.is_empty() && ctx.method.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+            ctx.metadata
+                .insert(MESH_REQUEST_METHOD_METADATA.to_string(), ctx.method.clone());
+        } else {
+            ctx.metadata.remove(MESH_REQUEST_METHOD_METADATA);
+        }
+        if let Some(port) = mesh_metric_destination_port(ctx) {
+            ctx.metadata
+                .insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+        } else {
+            ctx.metadata.remove(MESH_DESTINATION_PORT_METADATA);
+        }
         if let Some(direction) = ctx.mesh_direction {
             ctx.metadata.insert(
                 MESH_DIRECTION_METADATA.to_string(),
@@ -1036,6 +1071,15 @@ impl Plugin for WorkloadMetrics {
             "mesh.request_protocol".to_string(),
             request_protocol.to_string(),
         );
+        // Clear HTTP-only CEL attributes on the stream path so a reused
+        // metadata bag cannot leak request.host/method into TCP metrics.
+        metadata.remove(MESH_REQUEST_HOST_METADATA);
+        metadata.remove(MESH_REQUEST_METHOD_METADATA);
+        if let Some(port) = ctx.destination_port.filter(|port| *port != 0) {
+            metadata.insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+        } else {
+            metadata.remove(MESH_DESTINATION_PORT_METADATA);
+        }
         match stamped_direction {
             Some(MeshTrafficDirection::Inbound) => {
                 if let Some(identity) = peer_identity.as_ref() {
@@ -1182,6 +1226,7 @@ enum ParsedTagOperation<'a> {
     Remove,
     Rename(&'a str),
     Set(&'a str),
+    SetExpr(MetricTagCelExpr),
 }
 
 fn parse_tag_operation<'a>(
@@ -1211,6 +1256,28 @@ fn parse_tag_operation<'a>(
             }
             Ok(ParsedTagOperation::Set(value))
         }
+        Some("set_expr") => {
+            if let Some(expression) = operation.get("expression") {
+                let expression: MetricTagCelExpr = serde_json::from_value(expression.clone())
+                    .map_err(|_| {
+                        format!(
+                            "workload_metrics: invalid compiled CEL expression for metric tag '{name}'"
+                        )
+                    })?;
+                validate_metric_tag_cel_expr_named(name, &expression)?;
+                return Ok(ParsedTagOperation::SetExpr(expression));
+            }
+            let cel = operation.get("cel").and_then(Value::as_str).ok_or_else(|| {
+                format!(
+                    "workload_metrics: cel or expression is required for set_expr metric tag '{name}'"
+                )
+            })?;
+            let expression = parse_metric_tag_cel_expression(cel).map_err(|message| {
+                format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}")
+            })?;
+            validate_metric_tag_cel_expr_named(name, &expression)?;
+            Ok(ParsedTagOperation::SetExpr(expression))
+        }
         Some(operation_type) => Err(format!(
             "workload_metrics: unsupported operation '{operation_type}' for metric tag '{name}'"
         )),
@@ -1218,6 +1285,78 @@ fn parse_tag_operation<'a>(
             "workload_metrics: operation type is required for metric tag '{name}'"
         )),
     }
+}
+
+fn validate_metric_tag_cel_expr_named(
+    name: &str,
+    expression: &MetricTagCelExpr,
+) -> Result<(), String> {
+    crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
+        |message| format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}"),
+    )
+}
+
+fn encode_metric_tag_cel_expr(expr: &MetricTagCelExpr, out: &mut String) {
+    match expr {
+        MetricTagCelExpr::Literal { value } => {
+            out.push('L');
+            out.push_str(&value.len().to_string());
+            out.push(':');
+            out.push_str(value);
+        }
+        MetricTagCelExpr::Attribute { name } => {
+            out.push('A');
+            out.push_str(&name.plan_id().to_string());
+        }
+        MetricTagCelExpr::StringOfInt { attribute } => {
+            out.push('I');
+            out.push_str(&attribute.plan_id().to_string());
+        }
+        MetricTagCelExpr::HasThenElse {
+            attribute,
+            then_expr,
+            else_expr,
+        } => {
+            out.push('H');
+            out.push_str(&attribute.plan_id().to_string());
+            out.push(',');
+            let mut then_buf = String::new();
+            encode_metric_tag_cel_expr(then_expr, &mut then_buf);
+            out.push_str(&then_buf.len().to_string());
+            out.push(':');
+            out.push_str(&then_buf);
+            let mut else_buf = String::new();
+            encode_metric_tag_cel_expr(else_expr, &mut else_buf);
+            out.push_str(&else_buf.len().to_string());
+            out.push(':');
+            out.push_str(&else_buf);
+        }
+    }
+}
+
+fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
+    if ctx.mesh_direction == Some(MeshTrafficDirection::Outbound) {
+        return ctx
+            .orig_dst
+            .map(|addr| addr.port())
+            .or(ctx.mesh_outbound_destination_authz_port)
+            .or_else(|| ctx.matched_proxy.as_ref().and_then(|proxy| proxy.listen_port))
+            .filter(|port| *port != 0);
+    }
+    if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound)
+        && let Some(proxy) = ctx.matched_proxy.as_ref()
+        && crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
+    {
+        if let Some(port) = ctx.mesh_inbound_listener_authz_port.filter(|port| *port != 0) {
+            return Some(port);
+        }
+        if proxy.backend_port != 0 {
+            return Some(proxy.backend_port);
+        }
+    }
+    ctx.frontend_listen_port
+        .or_else(|| ctx.matched_proxy.as_ref().and_then(|proxy| proxy.listen_port))
+        .filter(|port| *port != 0)
 }
 
 fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
@@ -1288,7 +1427,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
             };
             let label = MeshMetricLabel::from_config_name(name)
                 .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
-            let encoded = match operation {
+            let encoded = match &operation {
                 ParsedTagOperation::Remove => format!("r{};", label.index()),
                 ParsedTagOperation::Rename(new_name) => {
                     let new_label =
@@ -1302,6 +1441,26 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                     label.index(),
                     value_len = value.len()
                 ),
+                ParsedTagOperation::SetExpr(expression) => {
+                    let includes_tcp = match selector {
+                        MetricSelector::All => true,
+                        MetricSelector::Emitted(family) => family.is_tcp(),
+                    };
+                    validate_metric_tag_cel_for_families(expression, includes_tcp).map_err(
+                        |message| {
+                            format!(
+                                "workload_metrics: metric tag '{name}' CEL expression rejected: {message}"
+                            )
+                        },
+                    )?;
+                    let mut body = String::new();
+                    encode_metric_tag_cel_expr(expression, &mut body);
+                    format!(
+                        "x{},{body_len}:{body};",
+                        label.index(),
+                        body_len = body.len()
+                    )
+                }
             };
             match selector {
                 MetricSelector::All => {
