@@ -522,6 +522,68 @@ fn test_env_config_mesh_mode_missing_grpc_url() {
     );
 }
 
+/// The stock xDS interoperability profile (issue #3317) must be an accepted
+/// `FERRUM_MESH_CONFIG_PROTOCOL` value at the single configuration boundary.
+/// `MeshRuntimeConfig::from_env_config` never runs if `EnvConfig::validate`
+/// already refused the value, so a missing arm here makes the whole profile
+/// unstartable in production while every in-process test still passes.
+#[test]
+fn test_env_config_mesh_mode_stock_xds_requires_the_local_policy_document() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "stock_xds"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_FILE_CONFIG_PATH");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let error = EnvConfig::from_env()
+                .expect_err("stock_xds without its policy document must fail closed");
+            assert!(
+                error.contains("FERRUM_MESH_FILE_CONFIG_PATH"),
+                "stock_xds must be refused for the missing POLICY DOCUMENT, got: {error}"
+            );
+            assert!(
+                !error.contains("Invalid FERRUM_MESH_CONFIG_PROTOCOL"),
+                "stock_xds must be a recognized protocol value, got: {error}"
+            );
+        },
+    );
+}
+
+/// A stock control plane is a third party: `stock_xds` dials
+/// `FERRUM_MESH_STOCK_XDS_URLS` and must never be asked for — or present — the
+/// Ferrum CP/DP credentials.
+#[test]
+fn test_env_config_mesh_mode_stock_xds_needs_no_ferrum_cp_credentials() {
+    // `validate()` only checks that the path is CONFIGURED; the document itself
+    // is read later, by the mesh runtime.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "stock_xds"),
+            ("FERRUM_MESH_FILE_CONFIG_PATH", "/etc/ferrum/mesh.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            // Later mesh validation (CA backend, workload identity) may still
+            // reject this minimal env; what must NOT happen is a refusal for a
+            // Ferrum control-plane URL or secret neither this protocol nor its
+            // client ever consumes.
+            if let Err(error) = EnvConfig::from_env() {
+                assert!(
+                    !error.contains("FERRUM_DP_CP_GRPC_URLS")
+                        && !error.contains("FERRUM_CP_DP_GRPC_JWT_SECRET")
+                        && !error.contains("Invalid FERRUM_MESH_CONFIG_PROTOCOL"),
+                    "stock_xds must not require Ferrum CP/DP credentials, got: {error}"
+                );
+            }
+        },
+    );
+}
+
 #[test]
 fn test_env_config_mesh_mode_missing_jwt_secret() {
     with_env_vars(

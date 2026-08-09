@@ -124,8 +124,9 @@ CI today."
   discovery is independently gated by the two-CP/two-DP Toxiproxy partition suite, including bounded
   last-good retention, expiry, same-generation recovery, and in-flight
   withdrawal retirement.
-- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, HTTP-family
-  `EgressGateway`, `ServiceWaypoint` (GAMMA).
+- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), stock xDS interoperability
+  (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`; discovery-only, policy stays local),
+  `Ambient` HBONE, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
@@ -152,8 +153,15 @@ CI today."
 These are deliberately **not** on the GA path because <~10% of mesh deployments
 need them, or because they are blocked upstream / architecturally:
 
-- **Stock Envoy / third-party Istio xDS interop** — Ferrum xDS is Ferrum-to-Ferrum
-  (security/policy fields ride Ferrum ECDS carriers). Not a drop-in xDS data plane.
+- **Stock Envoy / third-party Istio xDS interop, full data-plane parity** —
+  Ferrum's `xds` protocol is Ferrum-to-Ferrum (security/policy fields ride
+  Ferrum ECDS carriers), so Ferrum is not a drop-in Envoy replacement in an
+  existing xDS fleet. The separate `stock_xds` protocol (issue #3317, **Beta**)
+  does consume standard v3 CDS/EDS/LDS/RDS from a third-party control plane, but
+  for **discovery only**: enforcement policy always comes from the mandatory
+  local `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
+  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
+  `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
   NodeWaypoint eBPF live gate now admits captured IPv6 Service traffic through a
