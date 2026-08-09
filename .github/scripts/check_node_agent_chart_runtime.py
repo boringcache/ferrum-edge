@@ -709,10 +709,26 @@ spec:
                     f"{sorted(discovered)}"
                 )
 
+        # Symlink rejection happens before discovery can report anything, so
+        # each negative fixture gets its OWN root. Planting the symlink inside
+        # `example_root` made every later positive render against that tree
+        # abort on the symlink instead of exercising the render path.
         outside_examples = Path(tmp) / "outside-examples"
         _write(outside_examples / "escape-values.yaml", "nodeAgent:\n  enabled: true\n")
+
+        symlink_dir_root = Path(tmp) / "examples-symlinked-directory"
+        _required_tree(
+            symlink_dir_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        _write(
+            symlink_dir_root / "charts/ferrum-mesh/examples/dev-values.yaml",
+            "nodeAgent:\n  enabled: true\n",
+        )
         example_symlink = (
-            example_root / "charts/ferrum-mesh/examples/symlinked-directory"
+            symlink_dir_root / "charts/ferrum-mesh/examples/symlinked-directory"
         )
         try:
             example_symlink.symlink_to(outside_examples, target_is_directory=True)
@@ -721,11 +737,42 @@ spec:
             pass
         else:
             try:
-                iter_mesh_example_value_files(example_root)
+                iter_mesh_example_value_files(symlink_dir_root)
             except OSError:
                 pass
             else:
                 failures.append("symlinked chart example directory was accepted")
+
+        symlink_file_root = Path(tmp) / "examples-symlinked-file"
+        _required_tree(
+            symlink_file_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        symlinked_values = (
+            symlink_file_root / "charts/ferrum-mesh/examples/escape-values.yaml"
+        )
+        symlinked_values.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            symlinked_values.symlink_to(outside_examples / "escape-values.yaml")
+        except (NotImplementedError, OSError):
+            pass
+        else:
+            try:
+                iter_mesh_example_value_files(symlink_file_root)
+            except OSError:
+                pass
+            else:
+                failures.append("symlinked chart example values file was accepted")
+            try:
+                check_repository(symlink_file_root)
+            except OSError:
+                pass
+            else:
+                failures.append(
+                    "symlinked chart example values file passed the source scan"
+                )
 
         render_root = Path(tmp) / "render-failures"
         _required_tree(

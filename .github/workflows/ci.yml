@@ -2010,131 +2010,44 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Before the local composite action can install Helm for the trusted chart
-      # runtime lint, prove `.github/actions/setup-kubernetes-tools` is exactly
-      # the trusted-base tree on pull_request / merge_group. That keeps renderer
-      # provenance fail-closed: a PR cannot substitute a fake `helm` via a
-      # modified local action and still satisfy this gate. Regular-file,
-      # no-symlink, mode, byte-content, and no-extra-file constraints are all
-      # checked before `uses:` can execute the action.
-      - name: Verify trusted setup-kubernetes-tools
+      # The chart runtime lint renders with the Helm binary this local composite
+      # action installs, so the action is part of that gate's trusted boundary.
+      # Prove it is exactly the trusted revision's tree BEFORE `uses:` can run
+      # it: a pull request must not be able to hand the authoritative scan a
+      # substituted renderer. `git archive` materializes the trusted tree while
+      # `PATH` is still the pristine runner one; the verifier then decides
+      # regular-file, no-symlink, mode, byte-content, and no-extra-file entirely
+      # from that manifest and spawns no process of its own. Extraction mirrors
+      # the chart runtime lint below, including its reviewed-checkout bootstrap.
+      - name: Verify trusted Kubernetes tools installer
         run: |
           set -euo pipefail
-          action_dir=".github/actions/setup-kubernetes-tools"
-          for directory in .github .github/actions "$action_dir"; do
-            if [ -L "$directory" ] || [ ! -d "$directory" ]; then
-              echo "::error file=${directory}::local action path must be an ordinary directory" >&2
+          verifier=.github/scripts/verify_trusted_local_action.py
+          action_dir=.github/actions/setup-kubernetes-tools
+          trusted_ref=HEAD
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin \
+              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            trusted_ref="origin/${BASE_REF}"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
               exit 1
             fi
-          done
-          case "$EVENT_NAME" in
-            pull_request)
-              if [ -z "$BASE_REF" ]; then
-                echo "::error::pull_request base_ref missing" >&2
-                exit 1
-              fi
-              git fetch --no-tags origin \
-                "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-              trusted_ref="origin/${BASE_REF}"
-              ;;
-            merge_group)
-              if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-                echo "::error::merge_group base_sha missing or malformed" >&2
-                exit 1
-              fi
-              if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
-                git fetch --no-tags origin "${MERGE_BASE_SHA}"
-              fi
-              trusted_ref="$MERGE_BASE_SHA"
-              ;;
-            push|workflow_dispatch)
-              echo "Checkout is the trusted revision for ${EVENT_NAME}; ${action_dir} needs no base comparison."
-              exit 0
-              ;;
-            *)
-              echo "::error::unsupported event for trusted k8s-tools materialization: ${EVENT_NAME}" >&2
-              exit 1
-              ;;
-          esac
-
-          listing="$(mktemp)"
-          if ! git ls-tree -r --full-tree "$trusted_ref" -- "$action_dir" > "$listing"; then
-            echo "::error::failed to list ${action_dir} on trusted ref ${trusted_ref}" >&2
-            exit 1
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            trusted_ref="$MERGE_BASE_SHA"
           fi
-          if [ ! -s "$listing" ]; then
-            echo "::error::trusted ref ${trusted_ref} is missing ${action_dir}" >&2
-            exit 1
+          if git cat-file -e "${trusted_ref}:${verifier}" 2>/dev/null; then
+            trusted_verifier="$RUNNER_TEMP/verify-trusted-local-action.py"
+            git show "${trusted_ref}:${verifier}" > "$trusted_verifier"
+            verifier="$trusted_verifier"
           fi
-
-          if ! git diff --no-ext-diff --quiet "$trusted_ref" HEAD -- "$action_dir"; then
-            echo "::error::${action_dir} must match trusted base ${trusted_ref} byte-for-byte before execution" >&2
-            exit 1
-          fi
-
-          expected="$(mktemp)"
-          while IFS=$'\t' read -r meta path; do
-            mode="${meta%% *}"
-            rest="${meta#* }"
-            obj_type="${rest%% *}"
-            if [ "$obj_type" != "blob" ]; then
-              echo "::error file=${path}::trusted ${action_dir} entry must be a blob" >&2
-              exit 1
-            fi
-            if [ "$mode" != "100644" ] && [ "$mode" != "100755" ]; then
-              echo "::error file=${path}::trusted ${action_dir} entry must be a regular non-symlink file" >&2
-              exit 1
-            fi
-            case "$path" in
-              "${action_dir}"|"${action_dir}/"*) ;;
-              *)
-                echo "::error file=${path}::path escapes ${action_dir}" >&2
-                exit 1
-                ;;
-            esac
-            rel="${path#"${action_dir}/"}"
-            if [ -z "$rel" ] || [ "$rel" = "$path" ]; then
-              echo "::error file=${path}::invalid path under ${action_dir}" >&2
-              exit 1
-            fi
-            case "/$rel/" in
-              */../*)
-                echo "::error file=${path}::path must not contain '..'" >&2
-                exit 1
-                ;;
-            esac
-            local_path="${action_dir}/${rel}"
-            if [ -L "$local_path" ] || [ ! -f "$local_path" ]; then
-              echo "::error file=${local_path}::local action input must be a regular file" >&2
-              exit 1
-            fi
-            local_entry="$(git ls-files --stage -- "$path")"
-            local_mode="${local_entry%% *}"
-            if [ "$local_mode" != "$mode" ]; then
-              echo "::error file=${local_path}::local action mode differs from trusted base ${trusted_ref}" >&2
-              exit 1
-            fi
-            if ! cmp -s "$local_path" <(git show "${trusted_ref}:${path}"); then
-              echo "::error file=${local_path}::local action input differs from trusted base ${trusted_ref}" >&2
-              exit 1
-            fi
-            printf '%s\n' "$rel" >> "$expected"
-          done < "$listing"
-
-          # Fail closed on extra files or symlinks beside the trusted blobs.
-          while IFS= read -r -d '' path; do
-            rel="${path#"${action_dir}/"}"
-            if [ ! -f "$path" ] || [ -L "$path" ]; then
-              echo "::error file=${path}::local action input must be a regular non-symlink file" >&2
-              exit 1
-            fi
-            if ! grep -Fxq "$rel" "$expected"; then
-              echo "::error file=${path}::extra file not present on trusted base ${trusted_ref}" >&2
-              exit 1
-            fi
-          done < <(find "$action_dir" -type f -print0; find "$action_dir" -type l -print0)
-
-          echo "Verified ${action_dir} matches trusted base ${trusted_ref}."
+          archive="$RUNNER_TEMP/trusted-setup-kubernetes-tools.tar"
+          git archive --format=tar --output="$archive" "$trusted_ref" -- "$action_dir"
+          python3 -I "$verifier" --self-test
+          python3 -I "$verifier" --action-path "$action_dir" --trusted-archive "$archive"
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -2178,10 +2091,6 @@ jobs:
               checker="$trusted_checker"
             fi
           fi
-          if [ ! -x "$FERRUM_TRUSTED_HELM" ] || [ -L "$FERRUM_TRUSTED_HELM" ]; then
-            echo "::error::FERRUM_TRUSTED_HELM must be the pinned non-symlink helm binary" >&2
-            exit 1
-          fi
           python3 -I "$checker" --self-test
           python3 -I "$checker"
         env:
@@ -2191,21 +2100,14 @@ jobs:
           FERRUM_TRUSTED_HELM: ${{ runner.temp }}/ferrum-k8s-tools/bin/helm
 
       # Non-authoritative: exercise the pull request's proposed checker at HEAD
-      # for syntax, self-tests, and render behavior. The previous step remains
-      # the authoritative trusted-base security gate.
+      # for syntax, self-tests, and render behavior. The trusted-base step above
+      # remains the security authority; without this step a checker change would
+      # get no hosted execution at all on its own pull request.
       - name: Validate proposed chart runtime lint (non-authoritative)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         run: |
           set -euo pipefail
           proposed=.github/scripts/check_node_agent_chart_runtime.py
-          if [ ! -f "$proposed" ] || [ -L "$proposed" ]; then
-            echo "::error::proposed chart runtime checker must be a regular file" >&2
-            exit 1
-          fi
-          if [ ! -x "$FERRUM_TRUSTED_HELM" ] || [ -L "$FERRUM_TRUSTED_HELM" ]; then
-            echo "::error::FERRUM_TRUSTED_HELM must be the pinned non-symlink helm binary" >&2
-            exit 1
-          fi
           python3 -I "$proposed" --self-test
           python3 -I "$proposed"
         env:
