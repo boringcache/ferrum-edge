@@ -631,4 +631,4 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{observe_record_seq, pin_receive_window};
+pub use linux::observe_record_seq;
