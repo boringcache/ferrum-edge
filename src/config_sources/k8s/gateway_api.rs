@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
+use crate::config::types::{
+    BackendScheme, FrontendTlsNamespaceSource, MAX_ID_LENGTH, MAX_TARGET_WEIGHT,
+};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
@@ -93,6 +95,7 @@ struct RouteHostScope {
 enum BackendRefFaultReason {
     InvalidKind,
     BackendNotFound,
+    UnsupportedProtocol,
     RefNotPermitted,
     NoServiceableBackend,
     InvalidBackendTlsPolicy,
@@ -316,9 +319,6 @@ pub(super) fn collect_backend_lb_policy(
             ));
         }
     }
-
-    validate_backend_lb_policy_status_capacity(object, service_targets.len())
-        .map_err(|message| invalid_resource(object, message))?;
 
     if object.spec.get("retryConstraint").is_some() {
         // Unrepresentable retry budgets must not fail open: rejecting the
@@ -806,34 +806,12 @@ const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or X
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 /// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
+///
+/// The spec forbids adding another entry when the shared list is full. This
+/// limit is only an output constraint for the status writer; status owned by
+/// other controllers must not influence translation or session-persistence
+/// projection.
 const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
-
-/// Ensure Ferrum can represent every direct-policy attachment without
-/// overwriting another controller's entry in the shared, 16-item ancestor map.
-/// A policy whose complete status cannot be represented is unimplementable and
-/// must not steer traffic.
-fn validate_backend_lb_policy_status_capacity(
-    object: &K8sObject,
-    desired_ancestor_count: usize,
-) -> Result<(), String> {
-    let foreign_count = object
-        .status
-        .get("ancestors")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
-        .count();
-    let available = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
-    if desired_ancestor_count > available {
-        return Err(format!(
-            "status.ancestors has capacity for {available} Ferrum entries after preserving \
-             {foreign_count} entries owned by other controllers, but this policy requires \
-             {desired_ancestor_count}; the policy is not applied"
-        ));
-    }
-    Ok(())
-}
 
 /// Policies that lose at least one Service target under the same GEP-713 None
 /// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
@@ -1202,7 +1180,6 @@ fn validate_backend_lb_policy_for_status(object: &K8sObject) -> Result<(), Strin
             ));
         }
     }
-    validate_backend_lb_policy_status_capacity(object, service_targets.len())?;
     if object.spec.get("retryConstraint").is_some() {
         return Err(
             "spec.retryConstraint is not supported; Ferrum does not enforce \
@@ -5518,7 +5495,10 @@ fn backend_ref_fault_value_with_percentage(
 ) -> Value {
     let body = match reason {
         BackendRefFaultReason::InvalidKind => "Gateway API backendRef kind is unsupported",
-        BackendRefFaultReason::BackendNotFound => "Gateway API backendRef Service was not found",
+        BackendRefFaultReason::BackendNotFound => "Gateway API backendRef target was not found",
+        BackendRefFaultReason::UnsupportedProtocol => {
+            "Gateway API backendRef target uses an unsupported protocol"
+        }
         BackendRefFaultReason::RefNotPermitted => {
             "Gateway API backendRef is not permitted by ReferenceGrant"
         }
@@ -5705,9 +5685,9 @@ fn route_backends(
         }
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
+        let (backend_kind, backend_namespace) =
             match checked_backend_namespace(object, backend_ref, acc, object.kind.as_str()) {
-                Ok(namespace) => namespace,
+                Ok(resolved) => resolved,
                 Err(error) if error_is_backend_ref_resolution(&error) => {
                     fault_reason.get_or_insert(backend_ref_resolution_reason(&error));
                     invalid_weight = invalid_weight.saturating_add(weight);
@@ -5715,52 +5695,64 @@ fn route_backends(
                 }
                 Err(error) => return Err(error),
             };
-        let backend_port =
-            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
-                if object.kind == "GRPCRoute" {
+        let requested_port =
+            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?;
+        let backend_port = match backend_kind {
+            super::backend_ref::BackendKind::Service => {
+                requested_port.unwrap_or(if object.kind == "GRPCRoute" {
                     50051
                 } else {
                     80
-                },
-            );
-        if acc.has_observed_services()
-            && (!acc.service_exists(&backend_namespace, backend_name)
-                || !acc.service_port_exists(&backend_namespace, backend_name, backend_port))
-        {
+                })
+            }
+            super::backend_ref::BackendKind::ServiceImport => {
+                match super::backend_ref::resolve_service_import_port(
+                    acc,
+                    &backend_namespace,
+                    backend_name,
+                    requested_port,
+                ) {
+                    Ok(port) => port,
+                    Err(super::backend_ref::ServiceImportPortError::BackendNotFound) => {
+                        fault_reason.get_or_insert(BackendRefFaultReason::BackendNotFound);
+                        invalid_weight = invalid_weight.saturating_add(weight);
+                        continue;
+                    }
+                    Err(super::backend_ref::ServiceImportPortError::UnsupportedProtocol) => {
+                        fault_reason.get_or_insert(BackendRefFaultReason::UnsupportedProtocol);
+                        invalid_weight = invalid_weight.saturating_add(weight);
+                        continue;
+                    }
+                }
+            }
+        };
+        if super::backend_ref::backend_target_missing(
+            acc,
+            backend_kind,
+            &backend_namespace,
+            backend_name,
+            backend_port,
+        ) {
             fault_reason.get_or_insert(BackendRefFaultReason::BackendNotFound);
             invalid_weight = invalid_weight.saturating_add(weight);
             continue;
         }
         valid_weight = valid_weight.saturating_add(weight);
-        let endpoint_backends = acc.endpoint_route_backends_for_service(
+        let endpoint_backends = super::backend_ref::materialize_backend(
+            acc,
+            backend_kind,
             &backend_namespace,
             backend_name,
             backend_port,
             weight,
         );
-        if !endpoint_backends.is_empty() {
-            backend_groups.push(RouteBackendGroup {
-                total_weight: weight,
-                expanded_endpoints: endpoint_backends.len() > 1,
-                backends: endpoint_backends,
-            });
-            continue;
-        }
+        // Match historical Service semantics: only multi-address EndpointSlice
+        // expansion triggers weight redistribution across targets.
+        let expanded_endpoints = endpoint_backends.len() > 1;
         backend_groups.push(RouteBackendGroup {
             total_weight: weight,
-            expanded_endpoints: false,
-            backends: vec![RouteBackend {
-                host: service_dns_name(
-                    backend_name,
-                    &backend_namespace,
-                    &acc.options.cluster_domain,
-                ),
-                port: backend_port,
-                weight,
-                service_namespace: Some(backend_namespace.clone()),
-                service_name: Some(backend_name.to_string()),
-                service_port: Some(backend_port),
-            }],
+            expanded_endpoints,
+            backends: endpoint_backends,
         });
     }
     let backends = flatten_route_backend_groups(backend_groups);
@@ -5874,7 +5866,8 @@ fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
 fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
-            message.contains("ReferenceGrant") || message.contains("only core Service")
+            message.contains("ReferenceGrant")
+                || super::backend_ref::message_is_unsupported_backend_kind(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -5883,7 +5876,7 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
 fn backend_ref_resolution_reason(error: &K8sTranslateError) -> BackendRefFaultReason {
     match error {
         K8sTranslateError::InvalidResource { message, .. }
-            if message.contains("only core Service") =>
+            if super::backend_ref::message_is_unsupported_backend_kind(message) =>
         {
             BackendRefFaultReason::InvalidKind
         }
@@ -5900,8 +5893,49 @@ fn l4_route_proxies(
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+    // Cross-namespace TCPRoute/TLSRoute parentRefs use the same listener
+    // AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant authorizes
+    // backendRefs only, not parentRefs. UDPRoute keeps its stricter
+    // same-namespace parent contract.
     ensure_route_parent_refs_allowed(object, acc)?;
-    ensure_l4_parent_refs_are_same_namespace(object)?;
+    if scheme.is_udp() {
+        ensure_l4_parent_refs_are_same_namespace(object)?;
+    }
+
+    let config_namespaces = if scheme.is_udp() {
+        vec![object.metadata.namespace.clone()]
+    } else {
+        route_materialization_namespaces(object, acc)
+    };
+    let mut proxies = Vec::new();
+    for config_namespace in &config_namespaces {
+        if !scheme.is_udp()
+            && route_declares_gateway_parent_ref(object)
+            && route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace))
+                .is_empty()
+        {
+            continue;
+        }
+        let namespace_suffix = (config_namespaces.len() > 1)
+            .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
+        proxies.extend(l4_route_proxies_for_namespace(
+            object,
+            acc,
+            scheme,
+            config_namespace,
+            namespace_suffix.as_deref(),
+        )?);
+    }
+    Ok(proxies)
+}
+
+fn l4_route_proxies_for_namespace(
+    object: &K8sObject,
+    acc: &mut K8sAccumulator,
+    scheme: BackendScheme,
+    config_namespace: &str,
+    route_namespace_suffix: Option<&str>,
+) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let fallback_hosts = l4_route_hosts(object, scheme)?;
     ensure_udp_route_rule_shape(object, scheme)?;
     // A `UDPRoute` never carries hostnames (`l4_route_hosts` rejects the field
@@ -5919,12 +5953,8 @@ fn l4_route_proxies(
         )
     } else {
         (
-            l4_route_listener_bindings_for_namespace(object, acc, Some(&object.metadata.namespace)),
-            route_materialized_parent_ref_keys_for_namespace(
-                object,
-                acc,
-                Some(&object.metadata.namespace),
-            ),
+            l4_route_listener_bindings_for_namespace(object, acc, Some(config_namespace)),
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace)),
         )
     };
 
@@ -6030,19 +6060,34 @@ fn l4_route_proxies(
         };
 
         for (listen_port_index, (listen_port, hosts)) in listen_bindings.iter().enumerate() {
-            let suffix = if listen_bindings.len() == 1 {
+            let base_suffix = if listen_bindings.len() == 1 {
                 rule_suffix.clone()
             } else {
                 format!("{rule_suffix}-{listen_port_index}")
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
+            let suffix = route_namespace_suffix.map_or_else(
+                || base_suffix.clone(),
+                |namespace_suffix| format!("{base_suffix}-{namespace_suffix}"),
+            );
+            let id = if scheme.is_udp() || config_namespace == object.metadata.namespace {
+                resource_id(
                     "gwapi-l4",
                     &object.metadata.namespace,
                     &object.metadata.name,
                     &suffix,
-                ),
-                namespace: object.metadata.namespace.clone(),
+                )
+            } else {
+                gateway_api_l4_proxy_id(
+                    &object.kind,
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                )
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id,
+                // The parent Gateway namespace owns the stream listener.
+                namespace: config_namespace.to_string(),
                 hosts: hosts.clone(),
                 listen_path: None,
                 strip_listen_path: false,
@@ -6063,6 +6108,47 @@ fn l4_route_proxies(
         }
     }
     Ok(proxies)
+}
+
+const GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN: usize = 16;
+const GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN: usize = 2 + GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN;
+
+fn gateway_api_l4_proxy_id(
+    route_kind: &str,
+    namespace: &str,
+    route_name: &str,
+    suffix: &str,
+) -> String {
+    // Cross-namespace routes are materialized in their parent Gateway's
+    // namespace, so distinct route owners can share the proxy keyspace. Keep
+    // the readable legacy id, but bind it to the unambiguous, unsanitized
+    // source identity so dash-join and sanitization collisions cannot replace
+    // another tenant's proxy.
+    let identity = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        route_kind.len(),
+        route_kind,
+        namespace.len(),
+        namespace,
+        route_name.len(),
+        route_name,
+        suffix.len(),
+        suffix
+    );
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    let mut readable = resource_id("gwapi-l4", namespace, route_name, suffix);
+    let readable_budget = MAX_ID_LENGTH - GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN;
+    if readable.len() > readable_budget {
+        let mut end = readable_budget;
+        while end > 0 && !readable.is_char_boundary(end) {
+            end -= 1;
+        }
+        readable.truncate(end);
+    }
+    format!(
+        "{readable}__{}",
+        &digest[..GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN]
+    )
 }
 
 /// UDP listener ports and parentRefs that survive same-listener conflict loss.
@@ -6265,22 +6351,43 @@ fn l4_rule_backends(
     };
     let backend_name = string_field(backend_ref, "name")
         .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-    let backend_namespace =
+    let (backend_kind, backend_namespace) =
         checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
     // Field-specific diagnostics name the route's own kind: an operator
     // reading a UDPRoute condition must not be told about TCPRoute/TLSRoute.
     let backend_port_field = format!("{} backendRefs[].port", object.kind);
-    let Some(raw_backend_port) = backend_ref.get("port").and_then(Value::as_u64) else {
-        return Err(invalid_resource(
-            object,
-            format!("{backend_port_field} is required"),
-        ));
+    let requested_port = optional_port_field(object, backend_ref.get("port"), &backend_port_field)?;
+    let backend_port = match backend_kind {
+        super::backend_ref::BackendKind::Service => requested_port
+            .ok_or_else(|| invalid_resource(object, format!("{backend_port_field} is required")))?,
+        super::backend_ref::BackendKind::ServiceImport => {
+            // Stream routes keep a stable ClusterSet DNS target and never
+            // expand MCS EndpointSlice addresses (that would discard all but
+            // one address). Omitted ports derive only for a single TCP port.
+            super::backend_ref::resolve_service_import_port(
+                acc,
+                &backend_namespace,
+                backend_name,
+                requested_port,
+            )
+            .map_err(|error| {
+                invalid_resource(
+                    object,
+                    super::backend_ref::service_import_port_error_message(
+                        &backend_namespace,
+                        backend_name,
+                        requested_port,
+                        error,
+                    ),
+                )
+            })?
+        }
     };
-    let backend_port = port_from_u64(object, raw_backend_port, &backend_port_field)?;
     Ok(Some(L4RuleBackends {
         fallback_listen_port: backend_port,
         backends: vec![RouteBackend {
-            host: service_dns_name(
+            host: super::backend_ref::backend_dns_name(
+                backend_kind,
                 backend_name,
                 &backend_namespace,
                 &acc.options.cluster_domain,
@@ -6381,7 +6488,11 @@ fn udp_rule_backends(
         // an unauthorized cross-namespace reference or unsupported target.
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
-        let backend_namespace =
+        // Route-kind capability lives in `checked_backend_namespace` /
+        // `classify_backend_kind_for_route`: UDPRoute rejects ServiceImport
+        // (and every other non-Service kind) as InvalidKind before any
+        // ReferenceGrant can authorize it, matching `ResolvedRefs` status.
+        let (_, backend_namespace) =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
         if weight == 0 {
             skipped_zero += 1;
@@ -6535,63 +6646,8 @@ fn checked_backend_namespace(
     backend_ref: &Value,
     acc: &K8sAccumulator,
     from_kind: &str,
-) -> Result<String, K8sTranslateError> {
-    let backend_namespace =
-        string_field(backend_ref, "namespace").unwrap_or(&object.metadata.namespace);
-    let to_group = string_field(backend_ref, "group").unwrap_or_default();
-    let to_kind = string_field(backend_ref, "kind").unwrap_or("Service");
-    validate_supported_backend_ref(object, to_group, to_kind)?;
-
-    if backend_namespace == object.metadata.namespace {
-        return Ok(backend_namespace.to_string());
-    }
-
-    if acc.reference_grant_allows(
-        &object.metadata.namespace,
-        api_group(&object.api_version),
-        from_kind,
-        backend_namespace,
-        to_group,
-        to_kind,
-        string_field(backend_ref, "name"),
-    ) {
-        Ok(backend_namespace.to_string())
-    } else {
-        Err(invalid_resource(
-            object,
-            format!(
-                "{} backendRef to {} in namespace '{}' requires a matching ReferenceGrant",
-                from_kind, to_kind, backend_namespace
-            ),
-        ))
-    }
-}
-
-fn validate_supported_backend_ref(
-    object: &K8sObject,
-    to_group: &str,
-    to_kind: &str,
-) -> Result<(), K8sTranslateError> {
-    if to_group.is_empty() && to_kind == "Service" {
-        return Ok(());
-    }
-
-    Err(invalid_resource(
-        object,
-        format!(
-            "unsupported backendRef target group '{}' kind '{}'; only core Service backendRefs are supported",
-            to_group, to_kind
-        ),
-    ))
-}
-
-fn api_group(api_version: &str) -> &str {
-    // Core Kubernetes API versions such as "v1" have no slash; Gateway API
-    // represents that core group as the empty string in ReferenceGrant fields.
-    api_version
-        .split_once('/')
-        .map(|(group, _version)| group)
-        .unwrap_or_default()
+) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
+    super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind)
 }
 
 fn first_backend_ref<'a>(
@@ -12081,7 +12137,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_route_rejects_cross_namespace_parent_ref_until_l4_parent_materialization_exists() {
+    fn tcp_route_materializes_cross_namespace_parent_ref_when_listener_allows_it() {
         let mut gateway = object(
             "Gateway",
             serde_json::json!({
@@ -12111,16 +12167,18 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(
+        let result = translate_k8s_objects(
             &[gateway, route],
             options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
         )
-        .expect_err("cross-namespace L4 parentRefs should fail closed");
+        .expect("an allowed cross-namespace L4 parentRef should materialize");
 
-        assert!(
-            err.to_string()
-                .contains("cross-namespace parentRefs are not supported")
-        );
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.namespace, "infra");
+        assert_eq!(proxy.listen_port, Some(5432));
+        assert_eq!(proxy.backend_host, "db.default.svc.cluster.local");
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
     }
 
     #[test]
@@ -12448,7 +12506,7 @@ mod tests {
         let result = translate_k8s_objects(&[service, route], options())
             .expect("missing Service port should translate to invalid backend behavior");
 
-        assert_invalid_backend_fault_route(&result, "Gateway API backendRef Service was not found");
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef target was not found");
     }
 
     #[test]
@@ -13487,6 +13545,9 @@ mod tests {
     /// implementation not to add entries once it is full. Foreign controller
     /// ownership therefore wins the capacity budget over Ferrum's desired
     /// entry; forced SSA must never evict a foreign status just to report ours.
+    ///
+    /// Translation / Accepted semantics for a full foreign map are covered in
+    /// `tests/unit/gateway_core/gateway_backend_lb_policy_tests.rs`.
     #[test]
     fn backend_lb_policy_status_does_not_evict_a_full_foreign_ancestor_map() {
         let mut policy = backend_lb_policy(
@@ -13514,20 +13575,18 @@ mod tests {
 
         let status = super::backend_lb_policy_status(&policy, false);
         let ancestors = status["ancestors"].as_array().expect("ancestors array");
-        assert_eq!(ancestors.len(), super::POLICY_ANCESTOR_MAX_ITEMS);
-        assert!(ancestors.iter().all(|entry| {
-            entry["controllerName"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("example.com/controller-"))
-        }));
-
-        let err = translate_k8s_objects(std::slice::from_ref(&policy), options())
-            .expect_err("a policy with no status capacity must not steer traffic");
+        assert_eq!(
+            ancestors.len(),
+            super::POLICY_ANCESTOR_MAX_ITEMS,
+            "Ferrum must never write a seventeenth status ancestor"
+        );
         assert!(
-            err.to_string()
-                .contains("status.ancestors has capacity for 0 Ferrum entries")
-                && err.to_string().contains("policy is not applied"),
-            "got: {err}"
+            ancestors.iter().all(|entry| {
+                entry["controllerName"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("example.com/controller-"))
+            }),
+            "a full foreign ancestor map must leave Ferrum with no status slot"
         );
 
         // Applying a planner-produced document without a fresh live snapshot

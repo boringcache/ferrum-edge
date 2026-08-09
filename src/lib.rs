@@ -2271,6 +2271,57 @@ pub mod _test_support {
         )
     }
 
+    /// Forcibly remove a process replay scope from the shared registry.
+    ///
+    /// External-test isolation only: production prune never removes poisoned or
+    /// structurally inconsistent state. After a unit test has proved that
+    /// fail-closed contract, call this (or drop a
+    /// [`SoapNonceReplayScopeLease`]) so the slot cannot starve parallel
+    /// siblings against the process-global 1024-scope cap.
+    pub fn soap_remove_nonce_replay_scope_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::remove_nonce_replay_scope_for_tests(scope_key)
+    }
+
+    /// RAII lease that force-removes tracked process replay scopes on drop.
+    ///
+    /// Use around tests that deliberately leave non-reclaimable (poisoned /
+    /// inconsistent / live-claim) registry entries, or that temporarily fill
+    /// the shared registry toward [`MAX_NONCE_REPLAY_SCOPES_FOR_TESTS`].
+    pub struct SoapNonceReplayScopeLease {
+        scope_keys: Vec<String>,
+    }
+
+    impl SoapNonceReplayScopeLease {
+        pub fn empty() -> Self {
+            Self {
+                scope_keys: Vec::new(),
+            }
+        }
+
+        pub fn for_plugin_config_ids(plugin_config_ids: &[&str]) -> Self {
+            let mut lease = Self::empty();
+            for plugin_config_id in plugin_config_ids {
+                lease.track_plugin_config_id(plugin_config_id);
+            }
+            lease
+        }
+
+        pub fn track_plugin_config_id(&mut self, plugin_config_id: &str) {
+            let key = soap_nonce_replay_scope_key_for_test(plugin_config_id);
+            if !self.scope_keys.iter().any(|existing| existing == &key) {
+                self.scope_keys.push(key);
+            }
+        }
+    }
+
+    impl Drop for SoapNonceReplayScopeLease {
+        fn drop(&mut self) {
+            for scope_key in self.scope_keys.drain(..) {
+                let _ = soap_remove_nonce_replay_scope_for_test(&scope_key);
+            }
+        }
+    }
+
     /// Build a scoped process-replay plugin and poison its registry mutex.
     pub fn soap_poison_process_replay_scope_for_test(
         config: &serde_json::Value,
@@ -2769,17 +2820,6 @@ pub mod _test_support {
             .and_then(|hv| hv.to_str().ok())
             .map(|s| s.to_string());
         Ok((handshake.stream, proto))
-    }
-
-    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
-    /// for kTLS. Always returns `false`: the public buffered API cannot prove
-    /// that the inbound deframer is empty and record-aligned (issue #2955).
-    /// The shared borrow is part of the contract — external tests use it to
-    /// pin that the refusal leaves every staged application byte readable.
-    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
-        server_conn: &rustls::ServerConnection,
-    ) -> bool {
-        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
     }
 
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
@@ -5386,6 +5426,140 @@ pub mod _test_support {
         crate::proxy::strip_content_length_for_streaming_grpc_deadline(response_headers, deadline);
     }
 
+    /// Terminal request-upload faults the full-duplex native-H3 gRPC relay can
+    /// observe (issue #3283). Mirrors `http3::server::H3GrpcUploadFault` so unit
+    /// tests can pin the signalling / RPC-termination contract without widening
+    /// the runtime API.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum H3GrpcUploadFaultKind {
+        ClientAbort,
+        MalformedTrailers,
+        Oversize,
+        BackendUploadHalted,
+    }
+
+    fn h3_grpc_upload_fault_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> crate::http3::server::H3GrpcUploadFault {
+        match kind {
+            H3GrpcUploadFaultKind::ClientAbort => {
+                crate::http3::server::H3GrpcUploadFault::ClientAbort
+            }
+            H3GrpcUploadFaultKind::MalformedTrailers => {
+                crate::http3::server::H3GrpcUploadFault::MalformedTrailers
+            }
+            H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
+            H3GrpcUploadFaultKind::BackendUploadHalted => {
+                crate::http3::server::H3GrpcUploadFault::BackendUploadHalted
+            }
+        }
+    }
+
+    /// Client-visible `(grpc-status, grpc-message)` for a native-H3 gRPC
+    /// request-upload fault, or `None` when the fault does not end the RPC and
+    /// therefore has no client-visible signalling at all — the type system
+    /// enforces that: only `H3GrpcUploadFault::terminating()` mints the value
+    /// that carries a signal.
+    pub fn h3_grpc_upload_fault_signal_for_test(
+        kind: H3GrpcUploadFaultKind,
+    ) -> Option<(u32, &'static str)> {
+        h3_grpc_upload_fault_for_test(kind)
+            .terminating()
+            .map(|fault| fault.grpc_signal())
+    }
+
+    /// Whether observing this upload fault must END the RPC. A backend that
+    /// stops accepting request DATA after it has everything it needs must NOT.
+    pub fn h3_grpc_upload_fault_terminates_rpc_for_test(kind: H3GrpcUploadFaultKind) -> bool {
+        h3_grpc_upload_fault_for_test(kind).terminating().is_some()
+    }
+
+    /// Return true when publishing `kind` on the shared upload state wakes the
+    /// response relay's terminating-fault wait, and false when the wait stays
+    /// parked (a non-terminating fault). Times out rather than hanging.
+    pub async fn h3_grpc_upload_fault_wakes_relay_for_test(
+        kind: H3GrpcUploadFaultKind,
+        publish_before_wait: bool,
+    ) -> bool {
+        let state = std::sync::Arc::new(crate::http3::server::H3GrpcUploadState::new());
+        let fault = h3_grpc_upload_fault_for_test(kind);
+        if publish_before_wait {
+            state.publish_fault(fault);
+        } else {
+            let publisher = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                publisher.publish_fault(fault);
+            });
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            crate::http3::server::h3_grpc_terminating_upload_fault(&state),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// The first fault latches: a later one never rewrites the RPC's outcome.
+    pub fn h3_grpc_upload_fault_latches_first_for_test(
+        first: H3GrpcUploadFaultKind,
+        second: H3GrpcUploadFaultKind,
+    ) -> H3GrpcUploadFaultKind {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        state.publish_fault(h3_grpc_upload_fault_for_test(first));
+        state.publish_fault(h3_grpc_upload_fault_for_test(second));
+        match state.fault() {
+            Some(crate::http3::server::H3GrpcUploadFault::ClientAbort) => {
+                H3GrpcUploadFaultKind::ClientAbort
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
+                H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
+                H3GrpcUploadFaultKind::Oversize
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
+                H3GrpcUploadFaultKind::BackendUploadHalted
+            }
+            None => unreachable!("a published fault must latch"),
+        }
+    }
+
+    /// Shape of the native-H3 gRPC request upload at the instant the
+    /// response-header wait expires (issue #3283).
+    ///
+    /// Mirrors what the relay can observe on the shared upload state so unit
+    /// tests can pin the attribution contract without a live QUIC backend.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct H3GrpcHeaderWaitScenario {
+        /// The upload reached a clean FIN before the wait expired.
+        pub upload_complete: bool,
+        /// The pump is parked on a backend write / FIN, not on the client.
+        pub blocked_on_backend: bool,
+        /// A latched fault, if any.
+        pub fault: Option<H3GrpcUploadFaultKind>,
+    }
+
+    /// Whether a native-H3 gRPC response-header wait expiry with this shape is
+    /// charged to the BACKEND (a real read timeout that must reach CB / passive
+    /// health / adaptive concurrency / fallback) rather than to a stalled client.
+    pub fn h3_grpc_header_wait_expiry_blames_backend_for_test(
+        scenario: H3GrpcHeaderWaitScenario,
+    ) -> bool {
+        let state = crate::http3::server::H3GrpcUploadState::new();
+        if scenario.upload_complete {
+            state.mark_complete();
+        }
+        state.set_blocked_on_backend(scenario.blocked_on_backend);
+        if let Some(kind) = scenario.fault {
+            state.publish_fault(h3_grpc_upload_fault_for_test(kind));
+        }
+        matches!(
+            crate::http3::server::classify_h3_grpc_header_wait_expiry(&state),
+            crate::http3::server::H3GrpcHeaderWaitExpiry::BackendStalled
+        )
+    }
+
     /// Return true when an indefinitely stalled downstream H3 write is
     /// cancelled by the supplied absolute deadline.
     pub async fn stalled_h3_response_write_expires_for_test(
@@ -7622,15 +7796,70 @@ pub mod _test_support {
             >,
         >,
         resource: kube::api::ApiResource,
+        revision: std::sync::Arc<crate::k8s_controller::revision::K8sConfigRevisionTracker>,
+        metrics: std::sync::Arc<crate::k8s_controller::metrics::ControllerMetrics>,
     }
 
     impl K8sWatchScopeForTest {
+        /// The Kubernetes convergence watermark for this scope set, read at the
+        /// production coherence point (issue #3611): the registered scope set is
+        /// pinned under the `ResourceStoreSet` lock and the watermark is read
+        /// BEFORE any snapshot would be materialized from it.
+        pub async fn revision_watermark(&self) -> Option<u64> {
+            let set = self.store_set.lock().await;
+            let scopes = set.scope_keys();
+            self.revision.converged_watermark(scopes.iter())
+        }
+
+        /// The revision this scope set would stamp on a publication right now,
+        /// including the in-process monotonic floor and the retain-last-good
+        /// behaviour when evidence is incomplete.
+        pub async fn publish_revision(
+            &self,
+        ) -> Option<crate::modes::mesh::revision::MeshConfigRevision> {
+            let watermark = self.revision_watermark().await;
+            self.revision.publish(watermark)
+        }
+
+        /// Tracker counters (withheld advances, unsequenced publications,
+        /// unparsable `resourceVersion` values).
+        pub fn revision_stats(&self) -> crate::k8s_controller::revision::K8sRevisionStats {
+            self.revision.stats()
+        }
+
+        /// Idle/readiness-timeout relists recorded by the production watcher.
+        /// Demand-driven revision-evidence refreshes deliberately do not
+        /// increment this long-standing metric.
+        pub fn watch_idle_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Raise the demand-driven evidence refresh the reconciler publication
+        /// boundary raises when it has to withhold mesh content under a
+        /// sequence it cannot advance (issue #3611). Every subscribed watch
+        /// scope starts a fresh generation, spaced by its own floor interval.
+        pub fn request_evidence_refresh(&self) {
+            self.revision.request_evidence_refresh();
+        }
         /// A `DynamicObject` in this scope's namespace, shaped like one the
         /// reflector would receive.
         pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
             kube::api::DynamicObject::new(name, &self.resource)
                 .within(namespace)
                 .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// [`Self::object`] stamped with a `metadata.resourceVersion`, as every
+        /// object the API server returns is.
+        pub fn object_at(
+            &self,
+            namespace: &str,
+            name: &str,
+            resource_version: &str,
+        ) -> kube::api::DynamicObject {
+            let mut object = self.object(namespace, name);
+            object.metadata.resource_version = Some(resource_version.to_string());
+            object
         }
 
         /// Deliver one watch event on `generation`'s stream. Panics if that
@@ -7697,8 +7926,47 @@ pub mod _test_support {
         generations: usize,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        k8s_watch_scope_with_revision_for_test(
+            group,
+            version,
+            kind,
+            plural,
+            scope,
+            idle_relist_secs,
+            generations,
+            None,
+            Vec::new(),
+            shutdown,
+        )
+    }
+
+    /// [`k8s_watch_scope_for_test`] plus the Kubernetes mesh-config revision
+    /// tracker (issue #3611).
+    ///
+    /// `authority` is the ordering domain the scope publishes under (`None`
+    /// disables publication). `boundaries` scripts the authoritative
+    /// `resourceVersion` boundary each successive watcher generation reads
+    /// immediately before its list — the value a one-item consistent list
+    /// returns in production. Generations past the end of `boundaries` read no
+    /// boundary, which is exactly what a failed or timed-out read yields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_with_revision_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        authority: Option<String>,
+        boundaries: Vec<Option<u64>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
         use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
-        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use crate::k8s_controller::revision::K8sConfigRevisionTracker;
+        use crate::k8s_controller::watcher::{
+            RelistPolicy, WatchBoundaryReader, WatchTarget, run_watcher_generations,
+        };
         use futures_util::{Stream, StreamExt};
         use kube::api::{ApiResource, DynamicObject};
         use kube::runtime::{reflector, watcher};
@@ -7765,13 +8033,27 @@ pub mod _test_support {
             }
         };
 
+        let revision = std::sync::Arc::new(K8sConfigRevisionTracker::new(authority));
+        let queue = std::collections::VecDeque::from(boundaries);
+        let scripted_boundaries = std::sync::Arc::new(std::sync::Mutex::new(queue));
+        let read_boundary: WatchBoundaryReader = Box::new(move || {
+            let next = match scripted_boundaries.lock() {
+                Ok(mut queue) => queue.pop_front().flatten(),
+                Err(poisoned) => poisoned.into_inner().pop_front().flatten(),
+            };
+            Box::pin(std::future::ready(next))
+        });
+
+        let metrics = std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
         let task = run_watcher_generations(
             target,
             initial_writer,
             store_set.clone(),
             change_notifier,
             RelistPolicy::from_idle_secs(idle_relist_secs),
-            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            std::sync::Arc::clone(&metrics),
+            std::sync::Arc::clone(&revision),
+            read_boundary,
             shutdown,
             make_stream,
         );
@@ -7781,6 +8063,8 @@ pub mod _test_support {
                 store_set,
                 senders,
                 resource,
+                revision,
+                metrics,
             },
             task,
         )

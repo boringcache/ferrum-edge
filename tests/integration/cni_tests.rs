@@ -1410,3 +1410,1498 @@ async fn cni_status_kube_dependency_recovers_after_outage() {
     assert_eq!(second, CniRpcResponse::Ok);
     assert_eq!(state.lock().expect("lock").hits, 2);
 }
+
+/// Install / uninstall / rollback lifecycle for the chained CNI artifacts
+/// (issue #3609).
+///
+/// These exercise the host-filesystem side of the plugin rather than the UDS
+/// wire: what the installer writes, what cleanup is and is not willing to
+/// remove, and how the readiness watcher decides between retaining and
+/// rolling back. Every case runs against a temp directory laid out like a
+/// real `/etc/cni/net.d` + `/opt/cni/bin` pair, including a neighbouring
+/// primary CNI config that must survive untouched.
+mod install_lifecycle {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use ferrum_edge::cni::install::{
+        CniArtifactOutcome, CniInstallConfig, CniInstallError, CniOwnership, CniUninstallConfig,
+        CniUninstallReport, FERRUM_MANAGED_BY, OWNERSHIP_MANIFEST_FILE_NAME, install, uninstall,
+    };
+    use ferrum_edge::cni::lifecycle::{
+        CleanupWaitReport, RollbackWatchConfig, RollbackWatchOutcome, clear_stale_ready_marker,
+        ready_marker_present, run_rollback_watch, write_ready_marker,
+    };
+    use serde_json::Value;
+
+    const OWNER: &str = "ferrum/mesh";
+    const PRIMARY_CONF: &str = "10-calico.conflist";
+    const GENERATED_CONF: &str = "00-ferrum.conflist";
+
+    /// A controller-observed all-zero DaemonSet is diagnostic evidence, not
+    /// permission to delete the node-agent: no cleanup pod proved that any
+    /// host's chained CNI configuration was removed.
+    #[test]
+    fn zero_scheduled_cleanup_nodes_never_make_release_deletion_safe() {
+        let nowhere = CleanupWaitReport {
+            desired: 0,
+            ready: 0,
+        };
+        assert!(nowhere.scheduled_nowhere());
+        assert!(!nowhere.release_deletion_is_safe());
+
+        let complete = CleanupWaitReport {
+            desired: 2,
+            ready: 2,
+        };
+        assert!(complete.release_deletion_is_safe());
+    }
+
+    struct Node {
+        _root: tempfile::TempDir,
+        bin_dir: PathBuf,
+        conf_dir: PathBuf,
+        socket_dir: PathBuf,
+        source_binary: PathBuf,
+    }
+
+    impl Node {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("tempdir");
+            let bin_dir = root.path().join("opt-cni-bin");
+            let conf_dir = root.path().join("etc-cni-net-d");
+            let socket_dir = root.path().join("var-run-ferrum");
+            fs::create_dir_all(&bin_dir).expect("bin dir");
+            fs::create_dir_all(&conf_dir).expect("conf dir");
+            fs::write(
+                conf_dir.join(PRIMARY_CONF),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "cniVersion": "1.0.0",
+                    "name": "calico",
+                    "plugins": [{"type": "calico", "ipam": {"type": "calico-ipam"}}]
+                }))
+                .expect("primary json"),
+            )
+            .expect("write primary");
+            let source_binary = root.path().join("image-ferrum-cni");
+            fs::write(&source_binary, b"ferrum-cni v1").expect("write source binary");
+            Self {
+                _root: root,
+                bin_dir,
+                conf_dir,
+                socket_dir,
+                source_binary,
+            }
+        }
+
+        fn install_config(&self, owner: &str, generation: &str) -> CniInstallConfig {
+            CniInstallConfig {
+                host_bin_dir: self.bin_dir.display().to_string(),
+                host_conf_dir: self.conf_dir.display().to_string(),
+                host_socket_dir: self.socket_dir.display().to_string(),
+                conf_file_name: GENERATED_CONF.to_string(),
+                chained_with: "calico".to_string(),
+                socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+                ownership: CniOwnership {
+                    owner: owner.to_string(),
+                    generation: generation.to_string(),
+                },
+            }
+        }
+
+        fn uninstall_config(
+            &self,
+            owner: Option<&str>,
+            generation: Option<&str>,
+        ) -> CniUninstallConfig {
+            CniUninstallConfig {
+                host_bin_dir: self.bin_dir.display().to_string(),
+                host_conf_dir: self.conf_dir.display().to_string(),
+                conf_file_name: GENERATED_CONF.to_string(),
+                expected_owner: owner.map(str::to_string),
+                expected_generation: generation.map(str::to_string),
+            }
+        }
+
+        fn install(&self, owner: &str, generation: &str) -> PathBuf {
+            let config = self.install_config(owner, generation);
+            install(&config, &self.source_binary).expect("install")
+        }
+
+        /// Run cleanup scoped to the release under test, optionally pinned to
+        /// one install generation (the rollback watcher's scope).
+        fn cleanup(&self, generation: Option<&str>) -> CniUninstallReport {
+            let config = self.uninstall_config(Some(OWNER), generation);
+            uninstall(&config).expect("uninstall runs")
+        }
+
+        fn conf_path(&self) -> PathBuf {
+            self.conf_dir.join(GENERATED_CONF)
+        }
+
+        fn binary_path(&self) -> PathBuf {
+            self.bin_dir.join("ferrum-cni")
+        }
+
+        fn manifest_path(&self) -> PathBuf {
+            self.conf_dir.join(OWNERSHIP_MANIFEST_FILE_NAME)
+        }
+
+        fn assert_primary_untouched(&self) {
+            let primary = read_json(&self.conf_dir.join(PRIMARY_CONF));
+            assert_eq!(primary["name"], "calico");
+            assert_eq!(primary["plugins"][0]["type"], "calico");
+            assert_eq!(
+                primary["plugins"].as_array().expect("plugins").len(),
+                1,
+                "the primary CNI config must never be rewritten by install or uninstall"
+            );
+        }
+    }
+
+    fn read_json(path: &Path) -> Value {
+        let bytes = fs::read(path).expect("read json");
+        serde_json::from_slice(&bytes).expect("parse json")
+    }
+
+    #[test]
+    fn install_stamps_ownership_and_uninstall_removes_exactly_those_artifacts() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+
+        let generated = read_json(&node.conf_path());
+        assert_eq!(generated["plugins"][0]["type"], "calico");
+        assert_eq!(generated["plugins"][1]["type"], "ferrum-cni");
+        let ferrum = &generated["plugins"][1]["ferrum"];
+        assert_eq!(ferrum["managedBy"], FERRUM_MANAGED_BY);
+        assert_eq!(ferrum["owner"], "ferrum/mesh");
+        assert_eq!(ferrum["generation"], "gen-1");
+        let manifest = read_json(&node.manifest_path());
+        assert_eq!(manifest["managedBy"], FERRUM_MANAGED_BY);
+        assert_eq!(manifest["owner"], "ferrum/mesh");
+
+        let report = uninstall(&node.uninstall_config(Some("ferrum/mesh"), None))
+            .expect("uninstall should succeed");
+        assert!(report.is_success(), "report: {report:?}");
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert_eq!(report.binary, CniArtifactOutcome::Removed);
+        assert_eq!(report.manifest, CniArtifactOutcome::Removed);
+        assert!(!node.conf_path().exists());
+        assert!(!node.binary_path().exists());
+        assert!(!node.manifest_path().exists());
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn install_and_uninstall_are_both_idempotent() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        // A repeat install (upgrade, pod restart) must converge on one chained
+        // entry rather than appending another.
+        node.install("ferrum/mesh", "gen-2");
+        let generated = read_json(&node.conf_path());
+        assert_eq!(generated["plugins"].as_array().expect("plugins").len(), 2);
+        assert_eq!(generated["plugins"][1]["ferrum"]["generation"], "gen-2");
+
+        let first = node.cleanup(None);
+        assert!(first.is_success());
+        assert_eq!(first.conflist, CniArtifactOutcome::Removed);
+
+        let second = node.cleanup(None);
+        assert!(second.is_success(), "repeat cleanup must stay a success");
+        assert_eq!(second.conflist, CniArtifactOutcome::AlreadyAbsent);
+        assert_eq!(second.binary, CniArtifactOutcome::AlreadyAbsent);
+        assert_eq!(second.manifest, CniArtifactOutcome::AlreadyAbsent);
+    }
+
+    #[test]
+    fn uninstall_retains_a_foreign_conflist_and_reports_failure() {
+        let node = Node::new();
+        // Somebody else's chained config sitting at the configured name: it
+        // references ferrum-cni but carries no ownership marker.
+        fs::write(
+            node.conf_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cniVersion": "1.0.0",
+                "name": "operator-authored",
+                "plugins": [
+                    {"type": "calico"},
+                    {"type": "ferrum-cni", "ferrum": {"socketPath": "/custom.sock"}}
+                ]
+            }))
+            .expect("json"),
+        )
+        .expect("write foreign conflist");
+        fs::write(node.binary_path(), b"operator-provided binary").expect("write binary");
+
+        let report = node.cleanup(None);
+        assert!(
+            !report.is_success(),
+            "an unremovable chain must not report success: {report:?}"
+        );
+        assert!(matches!(
+            report.conflist,
+            CniArtifactOutcome::RetainedForeign(_)
+        ));
+        assert!(
+            node.conf_path().exists() && node.binary_path().exists(),
+            "unowned artifacts must be left exactly as they were"
+        );
+        let still_referenced = CniArtifactOutcome::RetainedDeliberate(
+            "a chained CNI configuration still references the plugin binary",
+        );
+        assert_eq!(
+            report.binary, still_referenced,
+            "the binary must never be removed while a config still chains to it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_refuses_a_symlinked_conflist() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        let real = node.conf_path();
+        let moved = node.conf_dir.join("moved-ferrum.json");
+        fs::rename(&real, &moved).expect("move generated file");
+        std::os::unix::fs::symlink(&moved, &real).expect("symlink");
+
+        let report = node.cleanup(None);
+        assert!(!report.is_success());
+        assert!(matches!(
+            report.conflist,
+            CniArtifactOutcome::RetainedForeign(reason) if reason.contains("symlink")
+        ));
+        assert!(
+            moved.exists(),
+            "a symlink must never be followed to delete its target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_refuses_a_hard_linked_conflist() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        let alias = node.conf_dir.join("alias-ferrum.json");
+        fs::hard_link(node.conf_path(), &alias).expect("hard link");
+
+        let report = node.cleanup(None);
+        assert!(!report.is_success());
+        assert!(matches!(
+            report.conflist,
+            CniArtifactOutcome::RetainedForeign(_)
+        ));
+        assert!(node.conf_path().exists() && alias.exists());
+    }
+
+    #[test]
+    fn uninstall_retains_another_owners_artifacts_and_still_succeeds() {
+        let node = Node::new();
+        node.install("other/release", "gen-1");
+
+        let report = node.cleanup(None);
+        assert!(
+            report.is_success(),
+            "another release's chain is not this release's failure: {report:?}"
+        );
+        assert_eq!(report.conflist, CniArtifactOutcome::RetainedOtherOwner);
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_scoped_to_a_generation_never_removes_a_newer_one() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-2");
+
+        // The rollback watcher of the OLD generation runs late.
+        let report = node.cleanup(Some("gen-1"));
+        assert!(report.is_success());
+        assert_eq!(report.conflist, CniArtifactOutcome::RetainedOtherGeneration);
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+
+        // The current generation's own cleanup still works.
+        let report = node.cleanup(Some("gen-2"));
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+    }
+
+    #[test]
+    fn a_corrupt_ownership_manifest_still_lets_cleanup_lift_the_chain() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        fs::write(node.manifest_path(), b"{ truncated").expect("corrupt manifest");
+
+        let report = node.cleanup(None);
+        assert!(
+            report.is_success(),
+            "the conflist marker alone must be enough to remove the node-wide dependency"
+        );
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "without a manifest the binary's provenance is unproven, so it stays: {report:?}"
+        );
+        assert!(!node.conf_path().exists());
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_retains_a_binary_that_no_longer_matches_the_recorded_digest() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        fs::write(node.binary_path(), b"replaced out of band").expect("replace binary");
+
+        let report = node.cleanup(None);
+        assert!(report.is_success());
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(matches!(
+            report.binary,
+            CniArtifactOutcome::RetainedForeign(_)
+        ));
+        let retained_for_retry = CniArtifactOutcome::RetainedDeliberate(
+            "retained so a later cleanup run can still prove ownership",
+        );
+        assert_eq!(report.manifest, retained_for_retry);
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_rejects_a_conf_file_name_that_escapes_the_directory() {
+        let node = Node::new();
+        let mut config = node.uninstall_config(Some(OWNER), None);
+        config.conf_file_name = "../10-calico.conflist".to_string();
+        let err = uninstall(&config).expect_err("traversal must be refused");
+        assert!(matches!(err, CniInstallError::InvalidFileName { .. }));
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn install_rejects_an_ownership_token_with_hostile_characters() {
+        let node = Node::new();
+        let mut config = node.install_config(OWNER, "gen-1");
+        config.ownership.owner = "ferrum mesh\n".to_string();
+        let err = install(&config, &node.source_binary).expect_err("must be refused");
+        assert!(matches!(err, CniInstallError::InvalidOwnershipToken { .. }));
+    }
+
+    fn watch_config(node: &Node, generation: &str) -> RollbackWatchConfig {
+        let socket_path = node.socket_dir.join("node-agent-cni.sock");
+        RollbackWatchConfig {
+            socket_path: socket_path.display().to_string(),
+            publish_timeout: Duration::from_millis(60),
+            ready_timeout: Duration::from_millis(60),
+            poll_interval: Duration::from_millis(10),
+            uninstall: node.uninstall_config(Some(OWNER), Some(generation)),
+        }
+    }
+
+    #[test]
+    fn rollback_watch_retains_artifacts_once_readiness_is_observed() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        let mut probes = 0;
+        let mut probe = || {
+            probes += 1;
+            probes >= 2
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::Ready);
+        assert!(
+            node.conf_path().exists(),
+            "a node-agent that became ready keeps its CNI chain"
+        );
+    }
+
+    #[test]
+    fn rollback_watch_removes_its_own_generation_when_readiness_never_arrives() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        let mut probe = || false;
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        match outcome {
+            RollbackWatchOutcome::RolledBack(report) => {
+                assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+                assert_eq!(report.binary, CniArtifactOutcome::Removed);
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        assert!(!node.conf_path().exists());
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn rollback_watch_does_not_delete_a_newer_generations_artifacts() {
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-1");
+        // A newer rollout overtakes this pod DURING its readiness budget: the
+        // watcher observed its own generation published, then a newer install
+        // replaced it. It must delete nothing and must not claim it lifted the
+        // node-wide dependency.
+        let mut probes = 0;
+        let mut probe = || {
+            probes += 1;
+            if probes == 2 {
+                node.install("ferrum/mesh", "gen-2");
+            }
+            false
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert!(
+            !outcome.dependency_cleared(),
+            "a superseded run must never report the chain as lifted: {outcome:?}"
+        );
+        match &outcome {
+            RollbackWatchOutcome::Superseded(report) => {
+                assert_eq!(report.conflist, CniArtifactOutcome::RetainedOtherGeneration);
+            }
+            other => panic!("expected a generation-scoped no-op, got {other:?}"),
+        }
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-2",
+            "the newer generation's chain must survive untouched"
+        );
+    }
+
+    #[test]
+    fn rollback_watch_never_starts_its_budget_for_an_install_that_never_published() {
+        // The watcher is a native sidecar: it starts BEFORE the installer. A
+        // budget that started at container start could expire mid-install and
+        // delete state the installer was still publishing. Nothing this
+        // generation owns is on disk, so nothing may be removed — and the
+        // outcome must say "never published", not "rolled back".
+        let node = Node::new();
+        let mut probe = || false;
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::NeverPublished);
+        assert!(!node.conf_path().exists());
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn rollback_watch_ignores_a_conflist_published_by_another_generation() {
+        // Only a NEWER generation ever published here, so this watcher has no
+        // dependency of its own to lift and must not fall through to cleanup.
+        let node = Node::new();
+        node.install("ferrum/mesh", "gen-2");
+        let mut probe = || false;
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::NeverPublished);
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn a_status_probe_before_publication_can_never_disarm_the_rollback() {
+        // The STATUS socket is a node-scoped path that outlives any one
+        // install: a previous node-agent generation (or a socket left behind
+        // by one) can answer `Ok` for a chain THIS generation has not written
+        // yet. Accepting that answer as readiness would return `Ready`, hold
+        // for the lifetime of the pod, and leave the rollback permanently
+        // disarmed while the installer went on to publish. Publication is the
+        // only thing that may end phase 1, so the probe must not be consulted
+        // at all before it.
+        let node = Node::new();
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(
+            outcome,
+            RollbackWatchOutcome::NeverPublished,
+            "an always-ready probe must not turn an install that never published into `Ready`"
+        );
+        assert_eq!(
+            probes, 0,
+            "readiness must not be probed before this generation's conflist is on disk"
+        );
+        assert!(!node.conf_path().exists());
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn a_ready_probe_does_not_adopt_another_generations_published_chain() {
+        // Same fail-open shape, one step further along: a stale STATUS `Ok`
+        // arrives while a DIFFERENT generation owns the chain. This watcher
+        // still published nothing of its own, so it must report exactly that
+        // and leave the other generation's artifacts alone.
+        let node = Node::new();
+        node.install(OWNER, "gen-2");
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::NeverPublished);
+        assert_eq!(probes, 0);
+        assert!(node.conf_path().exists());
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-2",
+            "the other generation's chain must survive untouched"
+        );
+    }
+
+    #[test]
+    fn readiness_observed_after_publication_still_retains_the_chain() {
+        // The other half of the same rule: once THIS generation's conflist is
+        // on disk, a STATUS `Ok` is genuine evidence and must still disarm the
+        // rollback. Phase 1 is a gate on publication, not a delay.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            true
+        };
+        let config = watch_config(&node, "gen-1");
+        let outcome = run_rollback_watch(&config, &mut probe).expect("watch runs");
+        assert_eq!(outcome, RollbackWatchOutcome::Ready);
+        assert_eq!(probes, 1, "phase 2 must probe as soon as it starts");
+        assert!(node.conf_path().exists());
+    }
+
+    #[test]
+    fn a_ready_marker_from_a_previous_container_start_is_retracted() {
+        // /tmp is an emptyDir that survives a container restart, so a marker
+        // published by an earlier run would make the readiness probe pass for
+        // work the CURRENT run has not done. It has to be gone before this
+        // invocation starts.
+        let root = tempfile::tempdir().expect("tempdir");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        let marker = marker.display().to_string();
+        write_ready_marker(&marker).expect("a first run publishes readiness");
+        assert!(ready_marker_present(&marker));
+
+        clear_stale_ready_marker(&marker).expect("a stale marker is retractable");
+        assert!(
+            !ready_marker_present(&marker),
+            "the next run starts un-ready"
+        );
+        // Retracting an absent marker is the state this is trying to reach.
+        clear_stale_ready_marker(&marker).expect("retraction is idempotent");
+
+        write_ready_marker(&marker).expect("this run publishes its own readiness");
+        assert!(ready_marker_present(&marker));
+        assert_eq!(
+            fs::symlink_metadata(&marker).expect("marker stat").len(),
+            b"ferrum-cni cleanup complete\n".len() as u64
+        );
+    }
+
+    #[test]
+    fn a_symlinked_ready_marker_is_refused_and_never_followed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"someone else's file").expect("write victim");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        std::os::unix::fs::symlink(&victim, &marker).expect("plant symlink");
+        let marker_arg = marker.display().to_string();
+
+        // Retraction refuses rather than deleting somebody else's object, and
+        // reports it as an unsafe marker rather than an ordinary IO error.
+        let err = clear_stale_ready_marker(&marker_arg).expect_err("a symlink must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnsafeReadyMarker { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&marker)
+                .expect("symlink stat")
+                .file_type()
+                .is_symlink(),
+            "the planted link must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read(&victim).expect("victim still readable"),
+            b"someone else's file",
+            "the symlink target must never be read, written or removed"
+        );
+
+        // A symlink is not readiness either, so the probe cannot be satisfied
+        // through one even if retraction were bypassed.
+        assert!(!ready_marker_present(&marker_arg));
+
+        // Publishing through the same path replaces the LINK, never its
+        // target: `rename` does not traverse.
+        write_ready_marker(&marker_arg).expect("publish over a planted link");
+        assert!(
+            fs::symlink_metadata(&marker)
+                .expect("marker stat")
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(&victim).expect("victim still readable"),
+            b"someone else's file",
+            "publishing replaces the link, never what it pointed at"
+        );
+    }
+
+    #[test]
+    fn a_non_regular_ready_marker_path_is_refused_without_deletion() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let marker = root.path().join("ferrum-cni-uninstall.ready");
+        fs::create_dir(&marker).expect("plant a directory at the marker path");
+        let marker_arg = marker.display().to_string();
+        let err = clear_stale_ready_marker(&marker_arg).expect_err("a directory must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnsafeReadyMarker { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(marker.is_dir(), "nothing may be removed recursively");
+        assert!(!ready_marker_present(&marker_arg));
+    }
+
+    #[test]
+    fn install_leaves_no_staged_or_temporary_files_behind() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        for dir in [&node.bin_dir, &node.conf_dir] {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let name = entry.expect("entry").file_name();
+                let name = name.to_string_lossy().to_string();
+                assert!(
+                    !name.ends_with(".tmp") && !name.ends_with(".install"),
+                    "install left a staging artifact behind: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_replaced_binary_is_published_by_rename_so_a_running_plugin_keeps_its_inode() {
+        // In-place upgrade semantics: the installed binary is never truncated
+        // or written through. An already-exec'd plugin keeps the old inode,
+        // which is exactly what makes an upgrade safe mid-ADD.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let first = fs::read(node.binary_path()).expect("read binary");
+        let opened = fs::File::open(node.binary_path()).expect("hold the installed inode open");
+
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("new image binary");
+        node.install(OWNER, "gen-2");
+
+        assert_eq!(
+            fs::read(node.binary_path()).expect("read binary"),
+            b"ferrum-cni v2",
+            "the upgrade must publish the new bytes"
+        );
+        let mut held = Vec::new();
+        {
+            use std::io::Read;
+            let mut opened = opened;
+            opened.read_to_end(&mut held).expect("read held inode");
+        }
+        assert_eq!(
+            held, first,
+            "a handle opened before the upgrade must still see the old binary"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_upgrade_does_not_swap_the_installed_binary() {
+        // The routine `helm upgrade` case: identical image, identical bytes.
+        // Skipping the rename means no in-flight plugin can straddle a swap
+        // that never happened.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let before = fs::metadata(node.binary_path()).expect("metadata");
+        node.install(OWNER, "gen-2");
+        let after = fs::metadata(node.binary_path()).expect("metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                before.ino(),
+                after.ino(),
+                "an unchanged upgrade must not replace the installed inode"
+            );
+        }
+        let _ = (before, after);
+        // The chain is still re-stamped with the new generation.
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-2"
+        );
+    }
+
+    #[test]
+    fn uninstall_keeps_the_shared_binary_while_another_config_still_chains_to_it() {
+        // `/opt/cni/bin/ferrum-cni` is shared. Clearing THIS release's chain
+        // says nothing about another Ferrum configuration on the same node,
+        // and removing the executable underneath it would break that release.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        fs::write(
+            node.conf_dir.join("05-other-ferrum.conflist"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cniVersion": "1.0.0",
+                "name": "other",
+                "plugins": [
+                    {"type": "calico"},
+                    {"type": "ferrum-cni", "ferrum": {"socketPath": "/other.sock"}}
+                ]
+            }))
+            .expect("json"),
+        )
+        .expect("write neighbour chain");
+
+        let report = node.cleanup(None);
+        assert!(report.is_success(), "this release's chain still goes");
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedDeliberate(_)),
+            "a still-referenced shared binary must be retained: {report:?}"
+        );
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_keeps_the_shared_binary_when_a_neighbour_cannot_be_read() {
+        // Fail safe: a neighbour that cannot be parsed could be chaining to
+        // the shared binary, so ownership of the executable is unproven.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        fs::write(node.conf_dir.join("05-unparseable.conf"), b"{ truncated")
+            .expect("write unparseable neighbour");
+
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "an unscannable directory must keep the shared binary: {report:?}"
+        );
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_keeps_a_binary_whose_manifest_names_a_different_configuration() {
+        // Manifest evidence is bound to the exact artifact names it claims.
+        // A manifest for some other conflist proves nothing about this one.
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let mut manifest = read_json(&node.manifest_path());
+        manifest["confFileName"] = Value::String("99-somebody-else.conflist".to_string());
+        fs::write(
+            node.manifest_path(),
+            serde_json::to_vec_pretty(&manifest).expect("json"),
+        )
+        .expect("rewrite manifest");
+
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "mis-bound manifest evidence must not authorize removal: {report:?}"
+        );
+        assert!(node.binary_path().exists());
+    }
+
+    #[test]
+    fn uninstall_refuses_an_oversized_conflist_instead_of_buffering_it() {
+        // The read is capped independently of the pre-read length check, so a
+        // hostile or corrupt file cannot be pulled into memory whole.
+        let node = Node::new();
+        let mut bytes = Vec::with_capacity(2 * 1024 * 1024);
+        bytes.extend_from_slice(b"{\"plugins\":[],\"pad\":\"");
+        bytes.resize(2 * 1024 * 1024, b'a');
+        bytes.extend_from_slice(b"\"}");
+        fs::write(node.conf_path(), &bytes).expect("write oversized conflist");
+
+        let report = node.cleanup(None);
+        assert!(!report.is_success());
+        assert!(matches!(
+            report.conflist,
+            CniArtifactOutcome::RetainedForeign(_)
+        ));
+        assert!(node.conf_path().exists());
+    }
+
+    fn assert_no_install_residue(node: &Node) {
+        for dir in [&node.bin_dir, &node.conf_dir] {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let name = entry.expect("entry").file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.ends_with(".tmp") && !name.ends_with(".install"),
+                    "refused install left staging residue: {name}"
+                );
+            }
+        }
+    }
+
+    fn assert_shared_artifacts_unchanged(
+        node: &Node,
+        conf_before: Option<&[u8]>,
+        binary_before: Option<&[u8]>,
+        manifest_before: Option<&[u8]>,
+        primary_before: &[u8],
+    ) {
+        let conf_after = fs::read(node.conf_path()).ok();
+        let binary_after = fs::read(node.binary_path()).ok();
+        let manifest_after = fs::read(node.manifest_path()).ok();
+        let primary_after = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        assert_eq!(conf_after.as_deref(), conf_before);
+        assert_eq!(binary_after.as_deref(), binary_before);
+        assert_eq!(manifest_after.as_deref(), manifest_before);
+        assert_eq!(primary_after, primary_before);
+        assert_no_install_residue(node);
+    }
+
+    fn expect_unsafe_install_target(err: CniInstallError) {
+        assert!(
+            matches!(err, CniInstallError::UnsafeInstallTarget { .. }),
+            "expected UnsafeInstallTarget, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains('{') && !message.contains("secret"),
+            "refusal must not echo hostile contents: {message}"
+        );
+    }
+
+    #[test]
+    fn install_succeeds_when_the_target_conflist_is_absent() {
+        let node = Node::new();
+        assert!(!node.conf_path().exists());
+        node.install(OWNER, "gen-1");
+        assert!(node.conf_path().exists());
+        assert!(node.binary_path().exists());
+        assert!(node.manifest_path().exists());
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["owner"],
+            OWNER
+        );
+        node.assert_primary_untouched();
+        assert_no_install_residue(&node);
+    }
+
+    #[test]
+    fn install_allows_same_owner_generation_upgrade() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("new image");
+        node.install(OWNER, "gen-2");
+        let generated = read_json(&node.conf_path());
+        assert_eq!(generated["plugins"][1]["ferrum"]["owner"], OWNER);
+        assert_eq!(generated["plugins"][1]["ferrum"]["generation"], "gen-2");
+        assert_eq!(
+            fs::read(node.binary_path()).expect("binary"),
+            b"ferrum-cni v2"
+        );
+        assert_eq!(read_json(&node.manifest_path())["generation"], "gen-2");
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn install_refuses_a_different_owners_valid_chain_without_side_effects() {
+        let node = Node::new();
+        node.install("other/release", "gen-1");
+        let conf_before = fs::read(node.conf_path()).expect("conf");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("different owner must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&conf_before),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["owner"],
+            "other/release"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_unmarked_target_without_side_effects() {
+        let node = Node::new();
+        let foreign = serde_json::to_vec_pretty(&serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "operator-authored",
+            "plugins": [
+                {"type": "calico"},
+                {"type": "ferrum-cni", "ferrum": {"socketPath": "/custom.sock"}}
+            ]
+        }))
+        .expect("json");
+        fs::write(node.conf_path(), &foreign).expect("write unmarked");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("unmarked target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(&node, Some(&foreign), None, None, &primary_before);
+    }
+
+    #[test]
+    fn install_refuses_a_same_owner_target_with_an_invalid_marker() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+
+        let mut invalid = read_json(&node.conf_path());
+        invalid["plugins"][1]["ferrum"]
+            .as_object_mut()
+            .expect("ferrum marker object")
+            .remove("generation");
+        let invalid = serde_json::to_vec_pretty(&invalid).expect("invalid marker json");
+        fs::write(node.conf_path(), &invalid).expect("write invalid marker");
+
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("an incomplete same-owner marker must be refused");
+
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&invalid),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_malformed_target_without_side_effects() {
+        let node = Node::new();
+        let malformed = b"{ truncated-hostile-payload";
+        fs::write(node.conf_path(), malformed).expect("write malformed");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("malformed target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(&node, Some(malformed), None, None, &primary_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_symlinked_target_without_side_effects() {
+        let node = Node::new();
+        let victim = node.conf_dir.join("victim.conflist");
+        fs::write(&victim, b"do-not-touch").expect("victim");
+        std::os::unix::fs::symlink(&victim, node.conf_path()).expect("symlink");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+        let victim_before = fs::read(&victim).expect("victim");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("symlink target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(
+            fs::symlink_metadata(node.conf_path())
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the planted symlink must remain"
+        );
+        assert_eq!(fs::read(&victim).expect("victim"), victim_before);
+        assert!(!node.binary_path().exists());
+        assert!(!node.manifest_path().exists());
+        assert_eq!(
+            fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary"),
+            primary_before
+        );
+        assert_no_install_residue(&node);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_non_regular_target_without_side_effects() {
+        let node = Node::new();
+        fs::create_dir(node.conf_path()).expect("plant directory");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("non-regular target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(node.conf_path().is_dir());
+        assert_shared_artifacts_unchanged(&node, None, None, None, &primary_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_hard_linked_target_without_side_effects() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let alias = node.conf_dir.join("alias-ferrum.json");
+        fs::hard_link(node.conf_path(), &alias).expect("hard link");
+        let conf_before = fs::read(node.conf_path()).expect("conf");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("hard-linked target must be refused");
+        expect_unsafe_install_target(err);
+        assert!(alias.exists());
+        assert_shared_artifacts_unchanged(
+            &node,
+            Some(&conf_before),
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-1"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_oversized_target_without_side_effects() {
+        let node = Node::new();
+        let mut bytes = Vec::with_capacity(2 * 1024 * 1024);
+        bytes.extend_from_slice(b"{\"plugins\":[],\"pad\":\"");
+        bytes.resize(2 * 1024 * 1024, b'a');
+        bytes.extend_from_slice(b"\"}");
+        fs::write(node.conf_path(), &bytes).expect("oversized");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("oversized target must be refused");
+        expect_unsafe_install_target(err);
+        assert_shared_artifacts_unchanged(&node, Some(&bytes), None, None, &primary_before);
+    }
+
+    // ---------------------------------------------------------------------
+    // A failed same-owner upgrade must not strand the previous chain.
+    //
+    // The replacement pod's rollback watcher is scoped to the generation the
+    // failed installer never published, so it would time out as
+    // `NeverPublished` and remove nothing — while every pod ADD on the node
+    // still traverses a socket no node-agent is going to serve. The installer
+    // itself therefore lifts the chain it preflighted, on its ordinary error
+    // path, under the same lock.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_failed_install_lifts_the_pre_existing_same_owner_chain() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+
+        // No primary CNI config left to chain to: the upgrade fails during
+        // construction, before it can publish anything of its own.
+        fs::remove_file(node.conf_dir.join(PRIMARY_CONF)).expect("remove primary");
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("new image");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("an install with no primary config must fail");
+        assert!(
+            matches!(err, CniInstallError::PrimaryConfigNotFound { .. }),
+            "expected PrimaryConfigNotFound, got {err:?}"
+        );
+
+        assert!(
+            !node.conf_path().exists(),
+            "a failed same-owner upgrade must lift the chain it found, not strand it"
+        );
+        assert_eq!(
+            fs::read(node.binary_path()).expect("binary"),
+            binary_before,
+            "the shared binary must be untouched by a construction failure"
+        );
+        assert_eq!(
+            fs::read(node.manifest_path()).expect("manifest"),
+            manifest_before,
+            "the manifest is retained so a later cleanup can still prove ownership"
+        );
+        assert_no_install_residue(&node);
+    }
+
+    #[test]
+    fn a_failed_chain_construction_lifts_the_pre_existing_same_owner_chain() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+
+        // A primary that matches `chained_with` but carries an empty plugin
+        // list: found, then rejected while the chain is being built.
+        fs::write(
+            node.conf_dir.join(PRIMARY_CONF),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cniVersion": "1.0.0",
+                "name": "calico",
+                "type": "calico",
+                "plugins": []
+            }))
+            .expect("json"),
+        )
+        .expect("rewrite primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("an empty plugin list must fail chain construction");
+        assert!(
+            matches!(err, CniInstallError::EmptyPluginList { .. }),
+            "expected EmptyPluginList, got {err:?}"
+        );
+        assert!(
+            !node.conf_path().exists(),
+            "a construction failure must not leave gen-1's chain behind"
+        );
+        assert_no_install_residue(&node);
+    }
+
+    #[test]
+    fn a_failed_install_never_lifts_another_owners_chain() {
+        let node = Node::new();
+        node.install("other/release", "gen-1");
+        let conf_before = fs::read(node.conf_path()).expect("conf");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+
+        // Both the preflight and the later construction step would fail; the
+        // recovery must be unreachable either way for a foreign chain.
+        fs::remove_file(node.conf_dir.join(PRIMARY_CONF)).expect("remove primary");
+
+        let err = install(&node.install_config(OWNER, "gen-2"), &node.source_binary)
+            .expect_err("a different owner's chain must be refused");
+        expect_unsafe_install_target(err);
+        assert_eq!(
+            fs::read(node.conf_path()).expect("conf"),
+            conf_before,
+            "a failing install must never remove another owner's chain"
+        );
+        assert_eq!(fs::read(node.binary_path()).expect("binary"), binary_before);
+        assert_eq!(
+            fs::read(node.manifest_path()).expect("manifest"),
+            manifest_before
+        );
+        assert_no_install_residue(&node);
+    }
+
+    /// A rollout that overtakes a failing install must keep its own chain.
+    ///
+    /// The window is real and narrow: the preflight classifies the chain on
+    /// disk, and the recovery runs after the failure. A FIFO source binary
+    /// parks `install` inside the lifecycle lock at exactly that point — after
+    /// the preflight, before anything is published — so the newer generation
+    /// can be published into the same path deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_never_lifts_a_chain_a_newer_generation_published() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Instant;
+
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+
+        let fifo = node.bin_dir.join("blocking-source");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        // SAFETY: `c_path` is a live NUL-terminated path for the whole call and
+        // `mkfifo` only creates a filesystem object at it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let config = node.install_config(OWNER, "gen-2");
+        let fifo_for_thread = fifo.clone();
+        let installer = std::thread::spawn(move || install(&config, &fifo_for_thread).map(|_| ()));
+
+        // The staging sibling appears immediately before the installer blocks
+        // opening the FIFO, and is removed only once that open returns.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !staging_sibling_present(&node.bin_dir) {
+            assert!(Instant::now() < deadline, "installer never reached staging");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A newer generation publishes into the same path. The byte length is
+        // deliberately unchanged, so device/inode/length still match what the
+        // preflight recorded and only the ownership marker distinguishes the
+        // two — the guard under test.
+        let mut newer = read_json(&node.conf_path());
+        newer["plugins"][1]["ferrum"]["generation"] = Value::String("gen-9".to_string());
+        let mut newer_bytes = serde_json::to_vec_pretty(&newer).expect("json");
+        newer_bytes.push(b'\n');
+        fs::write(node.conf_path(), &newer_bytes).expect("publish newer generation");
+
+        // Release the installer: a FIFO is not a regular file, so it fails.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .expect("open fifo writer");
+        drop(writer);
+        let err = installer
+            .join()
+            .expect("installer thread")
+            .expect_err("a FIFO source binary must be refused");
+        assert!(
+            matches!(err, CniInstallError::UnusableSourceBinary { .. }),
+            "expected UnusableSourceBinary, got {err:?}"
+        );
+
+        assert_eq!(
+            fs::read(node.conf_path()).expect("conf"),
+            newer_bytes,
+            "a generation that overtook the run must never be removed by its recovery"
+        );
+        assert_eq!(
+            read_json(&node.conf_path())["plugins"][1]["ferrum"]["generation"],
+            "gen-9"
+        );
+        let _ = fs::remove_file(&fifo);
+        assert_no_install_residue(&node);
+    }
+
+    #[cfg(unix)]
+    fn staging_sibling_present(dir: &Path) -> bool {
+        fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".install"))
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // The shared plugin binary: install owes the same rule cleanup enforces.
+    // ---------------------------------------------------------------------
+
+    /// Install another release's chain under its own conflist name, so the
+    /// node carries a live `ferrum-cni` reference this run does not own.
+    fn install_neighbouring_release(node: &Node) {
+        let mut other = node.install_config("other/release", "gen-1");
+        other.conf_file_name = "05-other-ferrum.conflist".to_string();
+        install(&other, &node.source_binary).expect("neighbouring release installs");
+    }
+
+    #[test]
+    fn install_refuses_to_replace_a_shared_binary_another_config_still_chains_to() {
+        let node = Node::new();
+        install_neighbouring_release(&node);
+        let neighbour = node.conf_dir.join("05-other-ferrum.conflist");
+        let neighbour_before = fs::read(&neighbour).expect("neighbour");
+        let binary_before = fs::read(node.binary_path()).expect("binary");
+        let manifest_before = fs::read(node.manifest_path()).expect("manifest");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("different image bytes");
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("a live shared binary must not be swapped out from under a chain");
+        let message = err.to_string();
+        assert!(
+            matches!(err, CniInstallError::SharedBinaryInUse { .. }),
+            "expected SharedBinaryInUse, got {err:?}"
+        );
+        assert!(
+            message.contains("still references the ferrum-cni plugin"),
+            "unexpected diagnostic: {message}"
+        );
+        assert!(
+            !message.contains('{'),
+            "refusal must not echo file contents: {message}"
+        );
+
+        assert_shared_artifacts_unchanged(
+            &node,
+            None,
+            Some(&binary_before),
+            Some(&manifest_before),
+            &primary_before,
+        );
+        assert_eq!(
+            fs::read(&neighbour).expect("neighbour"),
+            neighbour_before,
+            "the neighbouring release's chain is never touched"
+        );
+    }
+
+    #[test]
+    fn install_reuses_a_shared_binary_whose_bytes_are_already_identical() {
+        let node = Node::new();
+        install_neighbouring_release(&node);
+        let neighbour = node.conf_dir.join("05-other-ferrum.conflist");
+        let neighbour_before = fs::read(&neighbour).expect("neighbour");
+        let binary_before = fs::metadata(node.binary_path()).expect("binary metadata");
+
+        // Same image, same bytes: nothing is replaced, so the shared-binary
+        // rule has nothing to protect and the install proceeds.
+        install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect("byte-identical reuse must be allowed");
+
+        assert!(node.conf_path().exists(), "the chain is published");
+        let binary_after = fs::metadata(node.binary_path()).expect("binary metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                binary_before.ino(),
+                binary_after.ino(),
+                "reuse must not swap the shared inode"
+            );
+        }
+        let _ = (binary_before, binary_after);
+        assert_eq!(
+            fs::read(&neighbour).expect("neighbour"),
+            neighbour_before,
+            "the neighbouring release's chain is never touched"
+        );
+        assert_eq!(
+            read_json(&node.manifest_path())["binaryOwned"],
+            false,
+            "content equality with another owner's binary is not ownership evidence"
+        );
+        node.assert_primary_untouched();
+    }
+
+    #[test]
+    fn install_refuses_to_replace_a_shared_binary_when_the_directory_cannot_be_scanned() {
+        let node = Node::new();
+        fs::write(node.binary_path(), b"ferrum-cni v1").expect("plant installed binary");
+        fs::write(node.conf_dir.join("05-unparseable.conf"), b"{ truncated")
+            .expect("write unparseable neighbour");
+        let primary_before = fs::read(node.conf_dir.join(PRIMARY_CONF)).expect("primary");
+
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("different image bytes");
+        let err = install(&node.install_config(OWNER, "gen-1"), &node.source_binary)
+            .expect_err("an unscannable directory must fail safe");
+        let message = err.to_string();
+        assert!(
+            matches!(err, CniInstallError::SharedBinaryInUse { .. }),
+            "expected SharedBinaryInUse, got {err:?}"
+        );
+        assert!(
+            message.contains("could not be scanned"),
+            "unexpected diagnostic: {message}"
+        );
+        assert_shared_artifacts_unchanged(
+            &node,
+            None,
+            Some(&b"ferrum-cni v1"[..]),
+            None,
+            &primary_before,
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `previousBinarySha256` is an attestation, not an observation.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_byte_identical_unattested_binary_is_reused_but_never_claimed() {
+        let node = Node::new();
+        let bytes = fs::read(&node.source_binary).expect("source binary");
+        fs::write(node.binary_path(), &bytes).expect("plant operator binary");
+        let before = fs::metadata(node.binary_path()).expect("operator binary metadata");
+
+        node.install(OWNER, "gen-1");
+        let manifest = read_json(&node.manifest_path());
+        assert_eq!(
+            manifest["binaryOwned"], false,
+            "reusing identical bytes must not claim an inode Ferrum never published"
+        );
+        let after = fs::metadata(node.binary_path()).expect("reused binary metadata");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                before.ino(),
+                after.ino(),
+                "identical bytes should be reused"
+            );
+        }
+        let _ = (before, after);
+
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "an unattested identical binary must be retained: {report:?}"
+        );
+        assert_eq!(
+            fs::read(node.binary_path()).expect("retained operator binary"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn an_unproved_pre_existing_binary_is_never_made_removable_by_observation() {
+        let node = Node::new();
+        // Something this installer has never proved it owns already occupies
+        // the shared plugin path.
+        fs::write(node.binary_path(), b"operator-owned plugin").expect("plant foreign binary");
+
+        node.install(OWNER, "gen-1");
+        assert_eq!(
+            read_json(&node.manifest_path())["previousBinarySha256"],
+            Value::Null,
+            "hashing a pre-existing binary must not authorize deleting it"
+        );
+
+        // The crash window the field exists for: the manifest is published and
+        // the rename never happened, so the pre-existing bytes are what a
+        // later cleanup finds.
+        fs::write(node.binary_path(), b"operator-owned plugin").expect("restore foreign binary");
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert!(
+            matches!(report.binary, CniArtifactOutcome::RetainedForeign(_)),
+            "an unattested binary must be retained: {report:?}"
+        );
+        assert!(
+            report.is_success(),
+            "retaining an unreferenced binary must not fail chain cleanup"
+        );
+        assert_eq!(
+            fs::read(node.binary_path()).expect("binary"),
+            b"operator-owned plugin",
+            "the operator's binary must survive untouched"
+        );
+    }
+
+    #[test]
+    fn a_same_owner_upgrade_carries_forward_only_an_attested_previous_digest() {
+        let node = Node::new();
+        node.install(OWNER, "gen-1");
+        let first_manifest = read_json(&node.manifest_path());
+        let first_digest = first_manifest["binarySha256"].clone();
+        assert_eq!(
+            first_manifest["previousBinarySha256"],
+            Value::Null,
+            "a first install has nothing attested to carry forward"
+        );
+
+        fs::write(&node.source_binary, b"ferrum-cni v2").expect("new image");
+        node.install(OWNER, "gen-2");
+        let second_manifest = read_json(&node.manifest_path());
+        assert_eq!(
+            second_manifest["previousBinarySha256"], first_digest,
+            "a prior same-owner manifest attesting the installed digest IS ownership evidence"
+        );
+        assert_ne!(second_manifest["binarySha256"], first_digest);
+
+        // The crash-recovery property the field exists for still holds: if the
+        // rename never landed, the attested previous bytes are still ours.
+        fs::write(node.binary_path(), b"ferrum-cni v1").expect("restore pre-rename bytes");
+        let report = node.cleanup(None);
+        assert_eq!(report.conflist, CniArtifactOutcome::Removed);
+        assert_eq!(
+            report.binary,
+            CniArtifactOutcome::Removed,
+            "an attested previous digest still authorizes removal: {report:?}"
+        );
+    }
+}

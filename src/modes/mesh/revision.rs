@@ -26,6 +26,26 @@
 //!   treats as authoritative). It is NOT a process-local counter and NOT a
 //!   clock, so it survives CP restarts and is identical on every replica.
 //!
+//! # Ordering domains
+//!
+//! Two sequence spaces exist, and they are never comparable with each other:
+//!
+//! * the **change-log domain** — a DB-backed CP, authority
+//!   `FERRUM_MESH_CONFIG_AUTHORITY_ID` (default `db`), sequence
+//!   `config_changes.sequence`;
+//! * the **Kubernetes domain** — a CP running the CRD controller, authority
+//!   [`KUBERNETES_AUTHORITY_DOMAIN`] (optionally qualified, see
+//!   [`kubernetes_authority`]), sequence a Kubernetes `resourceVersion`
+//!   convergence watermark derived in [`crate::k8s_controller::revision`]
+//!   (issue #3611).
+//!
+//! The domain is carried in the authority string itself, so the existing
+//! `Incomparable` arm already keeps the two apart on the data plane. The control
+//! plane enforces the same split at both ends: `k8s` is a reserved authority a
+//! DB CP is refused at startup, and a change-log cursor may only reach a
+//! revision through [`MeshConfigRevision::advance_change_log_sequence`], which
+//! refuses a Kubernetes-domain revision.
+//!
 //! # Comparison contract
 //!
 //! [`MeshConfigRevision::compare`] is the single source of truth:
@@ -40,15 +60,52 @@
 //! | same authority  | `seq <  accept` | [`MeshRevisionOrder::Older`] |
 //! | other authority | any             | [`MeshRevisionOrder::Incomparable`] |
 //!
-//! `Newer` and `Same` install. `Same` MUST install: reconnecting to the same CP
-//! replays that CP's initial slice at the unchanged revision, and quarantining
-//! it would break every ordinary reconnect. `Older`, `Unversioned`, and
-//! `Incomparable` are quarantined — the previously accepted slice keeps serving.
-//! A *present* ill-formed candidate is refused by [`MeshRevisionGate::admit`]
-//! (and by centralized `MeshConfigUpdate` validation) before Bootstrap can
-//! install it; [`MeshConfigRevision::compare`] still excludes ill-formed values
-//! from the ordering table so a poisoned accepted watermark cannot lock the
-//! data plane.
+//! `Newer` and `Same` install. `Same` MUST install — but ONLY for byte-identical
+//! semantic content; see the content-binding section below. Reconnecting to the
+//! same CP replays that CP's initial slice at the unchanged revision, and
+//! quarantining that would break every ordinary reconnect. `Older`,
+//! `Unversioned`, and `Incomparable` are quarantined — the previously accepted
+//! slice keeps serving. A *present* ill-formed candidate is refused by
+//! [`MeshRevisionGate::admit`] (and by centralized `MeshConfigUpdate`
+//! validation) before Bootstrap can install it;
+//! [`MeshConfigRevision::compare`] still excludes ill-formed values from the
+//! ordering table so a poisoned accepted watermark cannot lock the data plane.
+//!
+//! # Content binding at an equal revision (issue #3611)
+//!
+//! A scalar revision only orders snapshots if the producer guarantees that one
+//! `(authority, sequence)` names exactly one config content. A Kubernetes
+//! controller CP's published sequence is the MINIMUM per-scope convergence
+//! watermark, while the latest-only reflector snapshot it materializes may
+//! already contain later changes from another scope (or may keep evolving while
+//! incomplete evidence pins the floor). Replica A at scope watermarks
+//! `[110, 100]` and replica B at `[100, 100]` therefore both compute sequence
+//! `100`, and A's snapshot carries the change made at `110` while B's does not.
+//! The Kubernetes publication boundary therefore binds mesh content to the
+//! accepted scalar before broadcast: equal revision + divergent mesh retains the
+//! previously accepted mesh. Installing every `Same` at the data plane without
+//! that producer bind (or across replicas that accepted different content at the
+//! same minimum) would let a data plane that accepted A fail over to B and
+//! silently install the OLDER content at the SAME sequence — the exact rollback
+//! this module exists to prevent.
+//!
+//! So the gate binds a stable, deterministic semantic CONTENT IDENTITY
+//! ([`MeshRevisionContentIdentity`]) to every accepted and applied revision, and
+//! a `Same` candidate installs only when its identity matches the one already
+//! bound to that revision. Divergent content at an equal revision is quarantined
+//! as [`MeshRevisionRejectReason::DivergentContent`], which is evidence that the
+//! producer's scalar revision is insufficient or inconsistent for its ordering
+//! domain — not a transient condition to retry into. A candidate whose identity
+//! could not be computed at all is quarantined as
+//! [`MeshRevisionRejectReason::UnidentifiedContent`]: an unprovable binding
+//! fails closed. Both quarantines terminate the stream like every other revision
+//! rejection, so multi-CP failover moves off the inconsistent producer.
+//!
+//! The comparison happens INSIDE the gate mutex, in the same critical section as
+//! admission, so there is no window in which a caller could observe the bound
+//! identity and then admit against a changed one. No raw content, digest, or
+//! payload fragment ever leaves the gate: the identity is compared, never
+//! rendered.
 //!
 //! # Candidate lifecycle (received → applied, or rolled back)
 //!
@@ -63,6 +120,11 @@
 //!   updates still orders correctly while an earlier one is mid-apply.
 //! * `applied` — the revision of the slice the proxy runtime last ACCEPTED.
 //!   This is the authoritative last-good generation and the rollback target.
+//!
+//! Each slot stores its revision and its bound content identity together, and
+//! every transition moves the PAIR: a rollback restores the applied revision
+//! together with the identity that revision was applied with, so the equal-
+//! revision check can never be evaluated against a stale identity.
 //!
 //! [`MeshRevisionGate::commit_applied`] advances `applied` when the runtime
 //! accepts a candidate (including a content-no-op replay at the same revision).
@@ -119,6 +181,58 @@ pub const DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS: u64 = 300;
 /// store, because the ordering domain is the STORE, not the process.
 pub const DEFAULT_CONFIG_AUTHORITY_ID: &str = "db";
 
+/// Reserved ordering-domain name for a Kubernetes-controller control plane
+/// (issue #3611).
+///
+/// A Kubernetes-controller CP sequences from the Kubernetes API server's
+/// `resourceVersion` space — etcd's cluster-global revision counter — while a
+/// DB-backed CP sequences from its store's `config_changes` change log. The two
+/// number spaces are unrelated: `config_changes.sequence` starts near zero and
+/// counts writes, an etcd revision starts high and counts *every* cluster
+/// mutation. Comparing them would silently order an unrelated pair of snapshots,
+/// so the domains must never share an authority string.
+///
+/// The separation is structural rather than advisory: a Kubernetes CP's
+/// authority is always this name (optionally qualified, see
+/// [`kubernetes_authority`]), a DB CP is refused at startup if it claims the
+/// reserved name, and every change-log advance runs through
+/// [`MeshConfigRevision::advance_change_log_sequence`], which refuses to touch a
+/// Kubernetes-domain revision.
+pub const KUBERNETES_AUTHORITY_DOMAIN: &str = "k8s";
+
+/// Separator between [`KUBERNETES_AUTHORITY_DOMAIN`] and an operator-supplied
+/// qualifier. Chosen because it cannot appear in a Kubernetes cluster name and
+/// makes the domain visible in every diagnostic that renders an authority.
+pub const KUBERNETES_AUTHORITY_SEPARATOR: char = ':';
+
+/// Build the authority a Kubernetes-controller CP advertises.
+///
+/// `qualifier` is `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID`; empty means "the
+/// cluster this CP watches", which is the common single-cluster case, so the
+/// authority is the bare reserved domain. A qualifier is how an operator names a
+/// NEW ordering domain after an etcd restore-from-backup (the one event that can
+/// rewind `resourceVersion` inside a cluster) or distinguishes two clusters
+/// whose CPs a single data plane lists in `FERRUM_DP_CP_GRPC_URLS`.
+pub fn kubernetes_authority(qualifier: &str) -> String {
+    if qualifier.is_empty() {
+        return KUBERNETES_AUTHORITY_DOMAIN.to_string();
+    }
+    format!("{KUBERNETES_AUTHORITY_DOMAIN}{KUBERNETES_AUTHORITY_SEPARATOR}{qualifier}")
+}
+
+/// Whether `authority` names the reserved Kubernetes ordering domain.
+///
+/// Matches the bare domain and any qualified form. Deliberately NOT a plain
+/// `starts_with("k8s")`: an operator authority id of `k8sconfig` is a distinct
+/// domain and must stay one.
+pub fn is_kubernetes_authority(authority: &str) -> bool {
+    match authority.strip_prefix(KUBERNETES_AUTHORITY_DOMAIN) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(KUBERNETES_AUTHORITY_SEPARATOR),
+        None => false,
+    }
+}
+
 /// Authoritative, replica-shared mesh config revision.
 ///
 /// Carried on [`crate::modes::mesh::slice::MeshSlice::revision`], duplicated on
@@ -167,6 +281,35 @@ impl MeshConfigRevision {
             && !self.authority.chars().any(char::is_control)
     }
 
+    /// Whether this revision belongs to the reserved Kubernetes ordering
+    /// domain (issue #3611). See [`KUBERNETES_AUTHORITY_DOMAIN`].
+    pub fn is_kubernetes_authority(&self) -> bool {
+        is_kubernetes_authority(&self.authority)
+    }
+
+    /// Advance this revision from a durable `config_changes` cursor, returning
+    /// whether it moved.
+    ///
+    /// The single seam through which a SQL/Mongo change-log cursor may touch a
+    /// published revision. It is a NO-OP for a Kubernetes-domain revision: a
+    /// change-log cursor is not comparable with a Kubernetes `resourceVersion`,
+    /// and folding one into the other with `max` would either be silently inert
+    /// (the usual case, because etcd revisions dwarf change-log sequences) or —
+    /// on a freshly bootstrapped cluster — advertise a Kubernetes snapshot as
+    /// newer on the strength of an unrelated database write. Both are wrong;
+    /// refusing is the only honest option.
+    ///
+    /// `max` (rather than assignment) is retained for the change-log domain so a
+    /// peer that sent no cursor (`0`) cannot move a per-stream base backwards.
+    pub fn advance_change_log_sequence(&mut self, cursor: u64) -> bool {
+        if self.is_kubernetes_authority() {
+            return false;
+        }
+        let advanced = cursor > self.sequence;
+        self.sequence = self.sequence.max(cursor);
+        advanced
+    }
+
     /// Order `candidate` against `accepted`. See the module contract table.
     ///
     /// Ill-formed revisions are excluded from the ordering table (treated as
@@ -187,6 +330,43 @@ impl MeshConfigRevision {
             std::cmp::Ordering::Greater => MeshRevisionOrder::Newer,
             std::cmp::Ordering::Equal => MeshRevisionOrder::Same,
             std::cmp::Ordering::Less => MeshRevisionOrder::Older,
+        }
+    }
+}
+
+/// Stable semantic identity of the CONTENT a candidate would install, bound to
+/// its `(authority, sequence)` by the freshness gate (issue #3611).
+///
+/// Producers compute this from the exact content that will become live —
+/// [`crate::grpc::mesh_slice_drift::slice_content_digest`] for a `MeshSlice`
+/// (which clears the observability-only `version` and the ordering-only
+/// `revision` and canonicalizes the JSON, so two semantically identical slices
+/// always agree), and the post-validation endpoint set for remote-cluster
+/// discovery.
+///
+/// The digest is compared, never rendered: it never reaches a log line, a
+/// metric label, or an admin surface, so binding content identity discloses
+/// nothing about the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshRevisionContentIdentity {
+    /// Deterministic digest of the content that will be installed.
+    Digest([u8; 32]),
+    /// The identity could not be computed (e.g. the content failed to
+    /// canonicalize). The binding is unprovable, so the gate fails closed
+    /// rather than installing content it cannot pin to a revision.
+    Unavailable,
+}
+
+impl MeshRevisionContentIdentity {
+    /// Bind a computed digest.
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self::Digest(digest)
+    }
+
+    const fn digest(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Digest(digest) => Some(digest),
+            Self::Unavailable => None,
         }
     }
 }
@@ -233,6 +413,17 @@ pub enum MeshRevisionRejectReason {
     /// silently downgraded to "absent" and must never bootstrap — that would
     /// contradict the fail-closed malformed-revision boundary (issue #2473).
     MalformedRevision,
+    /// The candidate is at the SAME `(authority, sequence)` as the accepted
+    /// revision but carries DIFFERENT content (issue #3611). Installing it
+    /// would roll the data plane back to another producer's older view at an
+    /// equal sequence, so it is quarantined. This is evidence that the
+    /// producer's scalar revision is insufficient or inconsistent for its
+    /// ordering domain.
+    DivergentContent,
+    /// No content identity could be computed for a revisioned candidate, so
+    /// the equal-revision binding is unprovable. Fails closed rather than
+    /// installing content that cannot be pinned to its revision.
+    UnidentifiedContent,
 }
 
 impl MeshRevisionRejectReason {
@@ -242,6 +433,8 @@ impl MeshRevisionRejectReason {
             Self::IncomparableAuthority => "incomparable_authority",
             Self::MissingRevision => "missing_revision",
             Self::MalformedRevision => "malformed_revision",
+            Self::DivergentContent => "divergent_content",
+            Self::UnidentifiedContent => "unidentified_content",
         }
     }
 
@@ -363,9 +556,17 @@ struct GateState {
     /// Highest revision admitted into the RECEIVED slot. Ordering baseline for
     /// [`MeshRevisionGate::admit`]. Raw CP value — exact comparisons need it.
     accepted: Option<MeshConfigRevision>,
+    /// Content identity bound to `accepted`. Moves with it on every transition
+    /// so an equal-revision candidate is always compared against the identity
+    /// of the content actually holding that revision. `None` only before the
+    /// first admission and after an operator reset.
+    accepted_content: Option<[u8; 32]>,
     /// Revision the proxy runtime last accepted. Rollback target when a
     /// received candidate is refused by the runtime. Raw CP value.
     applied: Option<MeshConfigRevision>,
+    /// Content identity bound to `applied`, restored together with `applied`
+    /// when a rollback returns the accepted slot to the last-good generation.
+    applied_content: Option<[u8; 32]>,
     quarantined: Option<MeshRevisionQuarantine>,
     /// Foreign authority under observation for adoption, with the instant it
     /// was first seen. Reset whenever a slice is accepted or a DIFFERENT
@@ -399,9 +600,14 @@ pub struct MeshRevisionGate {
 /// Capability captured before a received slice enters the asynchronous proxy
 /// apply path. A reset invalidates every outstanding token by advancing the
 /// gate epoch.
+///
+/// The token carries the content identity the accepted revision was admitted
+/// with, so the commit that finalizes the `applied` slot binds the SAME pair the
+/// gate admitted rather than whatever the caller recomputes later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MeshRevisionApplyToken {
     epoch: u64,
+    content: [u8; 32],
 }
 
 impl Default for MeshRevisionGate {
@@ -452,6 +658,8 @@ impl MeshRevisionGate {
         state.quarantined = None;
         state.foreign_watch = None;
         state.applied = None;
+        state.applied_content = None;
+        state.accepted_content = None;
         state.accepted.take().as_ref().map(sanitized_revision)
     }
 
@@ -462,17 +670,27 @@ impl MeshRevisionGate {
     /// N apply that began before N+1 arrived may still become the serving
     /// generation while N+1 waits. An operator reset advances the epoch and
     /// invalidates both, preventing either completion from undoing the reset.
+    ///
+    /// `content` must be the identity of the content this apply will install.
+    /// The token is minted only when BOTH the revision and the identity still
+    /// match the accepted slot, so a candidate whose content diverges from the
+    /// one that was admitted at this revision can never reach a commit.
     pub(crate) fn begin_apply(
         &self,
         candidate: Option<&MeshConfigRevision>,
+        content: MeshRevisionContentIdentity,
     ) -> Option<MeshRevisionApplyToken> {
         let candidate = candidate.filter(|revision| revision.is_well_formed());
+        let content = content.digest()?;
         let state = self.lock_state();
         if state.accepted.as_ref() != candidate {
             return None;
         }
+        if state.accepted_content != Some(content) {
+            return None;
+        }
         let epoch = state.accepted_epoch?;
-        Some(MeshRevisionApplyToken { epoch })
+        Some(MeshRevisionApplyToken { epoch, content })
     }
 
     /// Commit the watermark for a slice the proxy runtime ACCEPTED.
@@ -485,17 +703,26 @@ impl MeshRevisionGate {
     /// applied while a newer candidate is already received), so the two slots
     /// can never disagree in the direction that would quarantine the
     /// generation actually serving. A reset invalidates the captured token.
+    ///
+    /// `content` must be the same identity the token was minted for; a mismatch
+    /// means the caller is committing content other than the one the gate
+    /// admitted, which is refused rather than bound to the applied slot.
     pub(crate) fn commit_applied(
         &self,
         revision: Option<&MeshConfigRevision>,
+        content: MeshRevisionContentIdentity,
         token: MeshRevisionApplyToken,
     ) -> bool {
         let revision = revision.filter(|revision| revision.is_well_formed());
+        if content.digest() != Some(token.content) {
+            return false;
+        }
         let mut state = self.lock_state();
         if token.epoch != state.reset_epoch {
             return false;
         }
         state.applied = revision.cloned();
+        state.applied_content = Some(token.content);
         let raise_accepted = match revision {
             Some(candidate) => matches!(
                 MeshConfigRevision::compare(state.accepted.as_ref(), Some(candidate)),
@@ -505,6 +732,7 @@ impl MeshRevisionGate {
         };
         if raise_accepted {
             state.accepted = revision.cloned();
+            state.accepted_content = Some(token.content);
             state.accepted_epoch = Some(token.epoch);
         }
         true
@@ -519,18 +747,30 @@ impl MeshRevisionGate {
     /// Rolls back ONLY when `candidate` is still the accepted watermark, using
     /// exact `(authority, sequence)` equality: if a newer candidate was
     /// received while this one was mid-apply, that newer candidate owns the
-    /// watermark and a late rejection must not disturb it. Returns whether a
-    /// rollback happened.
-    pub fn rollback_rejected(&self, candidate: Option<&MeshConfigRevision>) -> bool {
+    /// watermark and a late rejection must not disturb it. The bound content
+    /// identity is part of that equality: a rejection of one content at a
+    /// revision must not roll back an equal-revision candidate carrying
+    /// different content that has since taken the accepted slot. Returns
+    /// whether a rollback happened.
+    pub fn rollback_rejected(
+        &self,
+        candidate: Option<&MeshConfigRevision>,
+        content: MeshRevisionContentIdentity,
+    ) -> bool {
         let candidate = candidate.filter(|revision| revision.is_well_formed());
+        let content = content.digest();
         let mut state = self.lock_state();
         if state.accepted.as_ref() != candidate {
             return false;
         }
-        if state.accepted == state.applied {
+        if state.accepted_content != content {
+            return false;
+        }
+        if state.accepted == state.applied && state.accepted_content == state.applied_content {
             return false;
         }
         let restored = state.applied.clone();
+        let restored_content = state.applied_content;
         let (rejected_authority, rejected_sequence) = match candidate {
             Some(revision) => (diagnostic_value(&revision.authority), revision.sequence),
             None => ("<absent>".to_string(), 0),
@@ -540,6 +780,7 @@ impl MeshRevisionGate {
             None => ("<none>".to_string(), 0),
         };
         state.accepted = restored;
+        state.accepted_content = restored_content;
         drop(state);
 
         tracing::warn!(
@@ -561,14 +802,21 @@ impl MeshRevisionGate {
     /// [`Self::rollback_rejected`], which finalize the watermark once that
     /// second gate has ruled.
     ///
+    /// `content` is the semantic identity of the content this candidate would
+    /// install. It is bound to the accepted revision here, and an equal-revision
+    /// candidate is admitted only when its identity matches the bound one — the
+    /// comparison and the binding happen in the SAME critical section, so no
+    /// caller-side check can be raced (issue #3611).
+    ///
     /// `now` is injected so the adoption grace period is deterministic in
     /// tests. Runs to completion BEFORE any `ArcSwap` replacement.
     pub fn admit(
         &self,
         candidate: Option<&MeshConfigRevision>,
+        content: MeshRevisionContentIdentity,
         now: DateTime<Utc>,
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
-        self.admit_at(candidate, now, Instant::now())
+        self.admit_at(candidate, content, now, Instant::now())
     }
 
     /// Admission with an explicit monotonic observation instant.
@@ -583,6 +831,7 @@ impl MeshRevisionGate {
     pub fn admit_at(
         &self,
         candidate: Option<&MeshConfigRevision>,
+        content: MeshRevisionContentIdentity,
         now: DateTime<Utc>,
         monotonic_now: Instant,
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
@@ -597,8 +846,27 @@ impl MeshRevisionGate {
         let malformed = candidate.is_some_and(|revision| !revision.is_well_formed());
         let order = MeshConfigRevision::compare(state.accepted.as_ref(), candidate);
 
-        if order.installs() && !malformed {
+        // Content binding (issue #3611). A revisioned candidate whose identity
+        // could not be computed cannot be pinned to its revision, so it is
+        // refused; and an equal-revision candidate installs only when its
+        // identity matches the one already bound to that revision, which is what
+        // stops a producer whose scalar revision is not content-unique (a
+        // Kubernetes CP publishing the MINIMUM per-scope watermark) from
+        // replacing accepted content with an older peer's view at the same
+        // sequence. Both decisions are made under this same lock as the
+        // admission itself, so no caller can observe the binding and then race
+        // an install against a changed one.
+        let content_digest = content.digest();
+        let unidentified =
+            !malformed && content_digest.is_none() && candidate.is_some_and(|r| r.is_well_formed());
+        let divergent = !malformed
+            && !unidentified
+            && order == MeshRevisionOrder::Same
+            && state.accepted_content != content_digest;
+
+        if order.installs() && !malformed && !unidentified && !divergent {
             state.accepted = candidate.filter(|r| r.is_well_formed()).cloned();
+            state.accepted_content = content_digest;
             let epoch = state.reset_epoch;
             state.accepted_epoch = Some(epoch);
             state.quarantined = None;
@@ -611,6 +879,7 @@ impl MeshRevisionGate {
         // no-permanent-lockout path for CP state loss / deliberate source reset.
         // Never adopt an ill-formed authority.
         if !malformed
+            && !unidentified
             && order == MeshRevisionOrder::Incomparable
             && adopt_secs > 0
             && let Some(candidate) = candidate
@@ -629,6 +898,7 @@ impl MeshRevisionGate {
             if observed_secs >= adopt_secs {
                 state.adopted_total = state.adopted_total.saturating_add(1);
                 state.accepted = Some(candidate.clone());
+                state.accepted_content = content_digest;
                 let epoch = state.reset_epoch;
                 state.accepted_epoch = Some(epoch);
                 state.quarantined = None;
@@ -643,20 +913,25 @@ impl MeshRevisionGate {
                 );
                 return Ok(MeshRevisionOrder::Incomparable);
             }
-        } else if order != MeshRevisionOrder::Incomparable || malformed {
+        } else if order != MeshRevisionOrder::Incomparable || malformed || unidentified {
             state.foreign_watch = None;
         }
 
         let reason = if malformed {
             MeshRevisionRejectReason::MalformedRevision
+        } else if unidentified {
+            MeshRevisionRejectReason::UnidentifiedContent
+        } else if divergent {
+            MeshRevisionRejectReason::DivergentContent
         } else {
             match order {
                 MeshRevisionOrder::Older => MeshRevisionRejectReason::StaleRevision,
                 MeshRevisionOrder::Incomparable => MeshRevisionRejectReason::IncomparableAuthority,
                 MeshRevisionOrder::Unversioned => MeshRevisionRejectReason::MissingRevision,
-                // `installs()` returned false (or malformed short-circuited it),
-                // so Bootstrap/Newer/Same are unreachable here; mapping them to
-                // the stale reason keeps the match total without a panic.
+                // `installs()` returned false (or malformed / unidentified /
+                // divergent short-circuited it), so Bootstrap/Newer/Same are
+                // unreachable here; mapping them to the stale reason keeps the
+                // match total without a panic.
                 MeshRevisionOrder::Bootstrap
                 | MeshRevisionOrder::Newer
                 | MeshRevisionOrder::Same => MeshRevisionRejectReason::StaleRevision,
@@ -714,8 +989,8 @@ impl MeshRevisionGate {
             accepted_authority = %accepted_authority,
             accepted_sequence,
             consecutive,
-            "Quarantined a mesh slice that is not newer than the accepted config revision; \
-             keeping the last-good slice"
+            "Quarantined a mesh slice that is not newer than — or does not carry the same \
+             content as — the accepted config revision; keeping the last-good slice"
         );
         Err(MeshRevisionRejection { reason, detail })
     }

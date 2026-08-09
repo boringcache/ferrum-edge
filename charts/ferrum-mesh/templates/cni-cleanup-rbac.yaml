@@ -1,0 +1,92 @@
+{{- /*
+  Durable identity and RBAC for the CNI cleanup hook (issue #3609).
+
+  These are ORDINARY release resources, deliberately NOT hook resources.
+
+  Helm's hook lifecycle is why. Within one hook phase, hooks run in weight
+  order, and on Helm 3.19+ and Helm v4 a later hook's FAILURE also deletes
+  every earlier hook that carries `hook-delete-policy: hook-succeeded` —
+  `execHook` in `pkg/action/hooks.go` calls
+  `deleteHooksByPolicy(executingHooks[0:i], HookSucceeded, ...)` on the
+  failure path. (Helm 3.18 and older delete only the failing hook, by its
+  `hook-failed` policy; this chart is written for the stricter newer
+  behaviour so it is correct on both.) If the cleanup identity and RBAC were
+  hook resources with that policy, a wait-Job failure would take them with
+  it: the retry would then have to recreate the ServiceAccounts before any
+  cleanup pod could even be admitted, and the failed DaemonSet's pods would
+  be running against a ServiceAccount that no longer existed.
+
+  As release resources they are created at install time and removed by the
+  normal `helm uninstall` sweep, which runs only AFTER the pre-delete phase
+  has succeeded. So they are present for the first attempt, still present
+  after a failed attempt, and gone once the release is really deleted.
+
+  Least privilege is unchanged:
+  * the cleanup pods do pure host-filesystem work and get NO API access at
+    all — no Role, no binding, and their token is not mounted;
+  * the wait Job gets exactly the verbs it needs on exactly one object, by
+    name: `get` its status to know when every node finished, and `delete` it
+    once they have. No list, no watch, no unnamed or wildcard access.
+*/ -}}
+{{- $cni := .Values.nodeAgent.cni }}
+{{- $uninstall := dict "enabled" false }}
+{{- if and $cni $cni.uninstall }}{{ $uninstall = $cni.uninstall }}{{ end }}
+{{- if and .Values.nodeAgent.enabled $cni $cni.enabled $uninstall.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-mesh-cni-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup
+    app.kubernetes.io/instance: {{ .Release.Name }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  # The narrowest grant that can answer "did cleanup finish on every node"
+  # and then retire the DaemonSet: read and delete exactly one object, by
+  # name, in this namespace. No list, no watch (neither can be restricted by
+  # resourceNames), no create, no update.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["ferrum-mesh-cni-cleanup"]
+    verbs: ["get", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets/status"]
+    resourceNames: ["ferrum-mesh-cni-cleanup"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-mesh-cni-cleanup-wait
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-cni-cleanup-wait
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-mesh-cni-cleanup-wait
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-mesh-cni-cleanup-wait
+    namespace: {{ .Release.Namespace }}
+{{- end }}

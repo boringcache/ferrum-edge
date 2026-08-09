@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Stream, TryStreamExt};
-use kube::api::{ApiResource, DynamicObject};
+use kube::api::{ApiResource, DynamicObject, ListParams};
 use kube::discovery;
 use kube::runtime::reflector;
 use kube::runtime::watcher;
@@ -12,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use super::metrics::ControllerMetrics;
 use super::resource_store::{CrdResourceStore, ResourceChangeNotifier, ResourceStoreSet};
+use super::revision::{K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version};
 use super::{ControllerTaskRegistry, REPROBE_WATCHER_LABEL};
 
 pub struct CrdSpec {
@@ -240,6 +243,15 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         version: "v1alpha1",
         kind: "XBackendTrafficPolicy",
         plural: "xbackendtrafficpolicies",
+        namespaced: true,
+    },
+    // GEP-1748 Extended: MCS ServiceImport as a Gateway API backendRef target.
+    // Discovery skips cleanly when the MCS CRD is not installed.
+    CrdSpec {
+        group: "multicluster.x-k8s.io",
+        version: "v1alpha1",
+        kind: "ServiceImport",
+        plural: "serviceimports",
         namespaced: true,
     },
 ];
@@ -561,6 +573,89 @@ impl RelistPolicy {
 /// generation is ever started).
 const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wall-clock ceiling on one authoritative-boundary read (issue #3611).
+///
+/// The read gates the start of a watcher generation, so an API server that
+/// never answers must not hold the scope's watcher hostage. A timed-out read
+/// yields no boundary, which only *understates* that generation's convergence.
+const BOUNDARY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimum spacing between demand-driven evidence refreshes of ONE scope
+/// (issue #3611).
+///
+/// The reconciler publication boundary asks for a refresh whenever it had to
+/// withhold changed mesh content under a sequence it could not advance
+/// ([`super::revision::K8sConfigRevisionTracker::request_evidence_refresh`]).
+/// Honouring every request immediately would let a churning cluster relist
+/// every scope on every change, so each scope serves at most one refresh per
+/// this interval, measured from the start of its current generation. Five
+/// seconds keeps mesh propagation prompt (the alternative was waiting out a
+/// whole `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window, which is 300 s by default)
+/// while capping the extra API-server load at one relist sweep per interval,
+/// and only while mesh content is actually being withheld.
+const REVISION_EVIDENCE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Reads the authoritative `resourceVersion` boundary for one watch scope.
+///
+/// Invoked once per watcher generation, immediately BEFORE the generation's own
+/// list is issued. See [`super::revision`] for why a *pre-list* read is a sound
+/// lower bound and a post-list read is not.
+pub(crate) type WatchBoundaryReader =
+    Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Option<u64>> + Send>> + Send>;
+
+/// One-item consistent list whose `ListMeta.resourceVersion` is the boundary.
+///
+/// `limit: 1` keeps the read tiny; the selectors mirror the watcher's own
+/// config so the request is identical in scope (and therefore in RBAC) to the
+/// list it precedes. `resource_version` and `version_match` are deliberately
+/// unset: that is the `MostRecent` semantic kube-rs's `watcher` defaults to, so
+/// the value returned here is a quorum read at the current cluster revision and
+/// is necessarily ≤ the revision of the generation's own list.
+fn boundary_list_params(config: &watcher::Config) -> ListParams {
+    ListParams {
+        label_selector: config.label_selector.clone(),
+        field_selector: config.field_selector.clone(),
+        limit: Some(1),
+        ..ListParams::default()
+    }
+}
+
+/// Build the boundary reader for one scope's `Api`.
+fn scope_boundary_reader(api: Api<DynamicObject>, config: &watcher::Config) -> WatchBoundaryReader {
+    let params = boundary_list_params(config);
+    Box::new(move || {
+        let api = api.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            match tokio::time::timeout(BOUNDARY_READ_TIMEOUT, api.list(&params)).await {
+                Ok(Ok(list)) => list
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .and_then(parse_resource_version),
+                Ok(Err(error)) => {
+                    debug!(
+                        error = %error,
+                        "Authoritative resourceVersion boundary read failed; this watch \
+                         generation will establish its convergence evidence from listed objects \
+                         and watch events only"
+                    );
+                    None
+                }
+                Err(_) => {
+                    debug!(
+                        timeout_secs = BOUNDARY_READ_TIMEOUT.as_secs(),
+                        "Authoritative resourceVersion boundary read timed out; this watch \
+                         generation will establish its convergence evidence from listed objects \
+                         and watch events only"
+                    );
+                    None
+                }
+            }
+        })
+    })
+}
+
 /// One random seed per controller process, folded into every scope's jitter.
 ///
 /// Without it the offset would be a pure function of the watched triple, so
@@ -653,6 +748,8 @@ pub(crate) async fn run_watcher_generations<S, F>(
     change_notifier: ResourceChangeNotifier,
     policy: RelistPolicy,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
+    mut read_boundary: WatchBoundaryReader,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut make_stream: F,
 ) where
@@ -665,6 +762,13 @@ pub(crate) async fn run_watcher_generations<S, F>(
         &target.scope,
         policy.idle_window,
     );
+    let scope_key: K8sWatchScopeKey =
+        super::revision::watch_scope_key(&target.api_version, &target.kind, &target.scope);
+    // Demand-driven evidence refresh (issue #3611). Mark the current value seen
+    // so only requests raised from now on trigger a generation: the first one
+    // this watcher will ever start already takes a fresh boundary read.
+    let mut refresh_requests = revision.subscribe_evidence_refresh();
+    refresh_requests.mark_unchanged();
     let mut initial_writer = Some(initial_writer);
 
     loop {
@@ -684,18 +788,61 @@ pub(crate) async fn run_watcher_generations<S, F>(
             }
         };
 
+        // Capture the authoritative boundary BEFORE the generation's own list
+        // is issued (issue #3611). kube-rs surfaces neither the list revision
+        // nor watch bookmarks, and its list defaults to `MostRecent` (a quorum
+        // read at the current cluster revision), so a revision read here is
+        // necessarily at or below the revision this generation's store will be
+        // coherent as of. The boundary is only adopted at `InitDone`, when that
+        // store actually holds the listed content.
+        let boundary = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    debug!(
+                        kind = %target.kind,
+                        scope = %target.scope,
+                        "Watcher shutting down"
+                    );
+                    return;
+                }
+                // Not a shutdown: skip this generation's boundary rather than
+                // re-racing it. No boundary only understates convergence.
+                None
+            }
+            boundary = read_boundary() => boundary,
+        };
+        revision.begin_generation(&scope_key, boundary);
+
         let stream = make_stream(writer);
         tokio::pin!(stream);
 
         let generation_start = tokio::time::Instant::now();
         let mut last_event = generation_start;
+        let mut refresh_requested = false;
 
         loop {
-            let deadline = match pending.as_ref() {
+            let idle_deadline = match pending.as_ref() {
                 Some(_) => Some(generation_start + policy.readiness_timeout),
                 None => policy
                     .idle_window
                     .map(|window| last_event + window + jitter),
+            };
+            // A refresh request is satisfied by any COMPLETED generation, so a
+            // replacement already listing needs no second trigger — it will
+            // adopt a boundary read taken after the request was raised.
+            let refresh_deadline = (refresh_requested && pending.is_none())
+                .then(|| generation_start + REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+            // Preserve the reason as well as the earliest deadline. An armed
+            // refresh can coexist with an earlier idle deadline; classifying
+            // that wake-up from `refresh_requested` alone would both mislabel
+            // the log and inflate the long-standing `watch_idle_relists`
+            // metric with demand-driven refreshes.
+            let (deadline, relist_for_evidence_refresh) = match (idle_deadline, refresh_deadline) {
+                (Some(idle), Some(refresh)) if refresh <= idle => (Some(refresh), true),
+                (Some(idle), Some(_)) | (Some(idle), None) => (Some(idle), false),
+                (None, Some(refresh)) => (Some(refresh), true),
+                (None, None) => (None, false),
             };
 
             tokio::select! {
@@ -711,9 +858,11 @@ pub(crate) async fn run_watcher_generations<S, F>(
                     }
                 }
                 _ = sleep_until_or_pending(deadline) => {
-                    metrics
-                        .watch_idle_relists
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !relist_for_evidence_refresh {
+                        metrics
+                            .watch_idle_relists
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if pending.is_some() {
                         warn!(
                             kind = %target.kind,
@@ -722,6 +871,16 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             timeout_secs = policy.readiness_timeout.as_secs_f64(),
                             "Replacement {} did not finish its initial list in time; \
                              retrying (the previous store keeps serving meanwhile)",
+                            target.watcher_label
+                        );
+                    } else if relist_for_evidence_refresh {
+                        debug!(
+                            kind = %target.kind,
+                            api_version = %target.api_version,
+                            scope = %target.scope,
+                            "{} rebuilding its reflector from an authoritative list because \
+                             mesh config publication is withholding content under a revision \
+                             this scope cannot advance",
                             target.watcher_label
                         );
                     } else {
@@ -736,11 +895,31 @@ pub(crate) async fn run_watcher_generations<S, F>(
                     }
                     break;
                 }
+                // The reconciler is withholding changed mesh content because
+                // the authoritative sequence cannot advance (issue #3611).
+                // Arm a bounded relist rather than acting immediately, so a
+                // churning cluster cannot turn per-change requests into a
+                // per-change list storm. Disabled once armed: further requests
+                // coalesce into the generation this one already schedules.
+                _ = refresh_requests.changed(), if !refresh_requested => {
+                    refresh_requested = true;
+                }
                 item = stream.try_next() => {
                     match item {
                         Ok(Some(event)) => {
                             last_event = tokio::time::Instant::now();
+                            // Convergence evidence for the revision watermark
+                            // (issue #3611). Listed objects are buffered until
+                            // the matching `InitDone` because the reflector
+                            // publishes an initial list to its store atomically
+                            // there — and, for a replacement generation, that is
+                            // also when the store becomes the registered one.
+                            let listing = pending.is_some();
+                            record_watch_evidence(&revision, &scope_key, &event, listing);
                             let Some(store) = pending.take() else {
+                                if matches!(event, watcher::Event::InitDone) {
+                                    revision.commit_list(&scope_key);
+                                }
                                 change_notifier.notify_change();
                                 continue;
                             };
@@ -753,15 +932,20 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             }
                             let replaced = {
                                 let mut set = store_set.lock().await;
-                                if set.replace_store_for_scope(Arc::clone(&store)) {
-                                    true
-                                } else {
-                                    // The scope was deregistered while this
-                                    // generation was listing. Re-register rather
-                                    // than leave the watcher feeding a store the
-                                    // reconciler cannot see.
-                                    set.add_store(store)
-                                }
+                                let replaced = set
+                                    .replace_or_add_store_for_scope_without_notify(store);
+                                // Commit the generation's revision evidence while
+                                // holding the SAME store-set lock that protects the
+                                // replacement. Reconciliation reads in this order
+                                // too (store set -> revision tracker), so it can see
+                                // neither the new store with the old watermark nor
+                                // the new watermark with the old store. Notify only
+                                // after the pair is coherent; a quiet relisted scope
+                                // may never produce another event to repair a missed
+                                // publication (issue #3611).
+                                revision.commit_list(&scope_key);
+                                set.notify_change();
+                                replaced
                             };
                             debug!(
                                 kind = %target.kind,
@@ -781,14 +965,21 @@ pub(crate) async fn run_watcher_generations<S, F>(
                                  removing stale store so reprobe will restart",
                                 target.watcher_label
                             );
-                            let removed = store_set
-                                .lock()
-                                .await
-                                .remove_store_for_scope(
+                            let removed = {
+                                let mut set = store_set.lock().await;
+                                let removed = set.remove_store_for_scope(
                                     &target.api_version,
                                     &target.kind,
                                     &target.scope,
                                 );
+                                // Keep deregistration and evidence removal ordered
+                                // under the store-set lock. Otherwise a reprobe can
+                                // register and begin the replacement scope between
+                                // these operations, only for this old generation to
+                                // erase the new evidence afterward.
+                                revision.forget_scope(&scope_key);
+                                removed
+                            };
                             if !removed {
                                 debug!(
                                     kind = %target.kind,
@@ -814,6 +1005,36 @@ pub(crate) async fn run_watcher_generations<S, F>(
     }
 }
 
+/// Record one watch event's `resourceVersion` as convergence evidence.
+///
+/// `generation_pending` is true while a make-before-break replacement is still
+/// listing: its store is not the registered one, so nothing it delivers may
+/// advance the live watermark until its `InitDone` swaps it in.
+///
+/// A `Delete` carries the object stamped with the *deletion* revision, which is
+/// why a withdrawal advances the watermark here instead of lowering it — the
+/// failure mode that rules out ordering on live object metadata.
+fn record_watch_evidence(
+    revision: &K8sConfigRevisionTracker,
+    scope: &K8sWatchScopeKey,
+    event: &watcher::Event<DynamicObject>,
+    generation_pending: bool,
+) {
+    let (object, buffered) = match event {
+        watcher::Event::InitApply(object) => (object, true),
+        watcher::Event::Apply(object) | watcher::Event::Delete(object) => {
+            (object, generation_pending)
+        }
+        watcher::Event::Init | watcher::Event::InitDone => return,
+    };
+    let resource_version = object.metadata.resource_version.as_deref();
+    if buffered {
+        revision.observe_listed(scope, resource_version);
+    } else {
+        revision.observe_applied(scope, resource_version);
+    }
+}
+
 /// Start every selected CRD and core-resource watcher, registering each one
 /// with `registry` so the control plane owns it (#3220).
 ///
@@ -836,6 +1057,7 @@ pub(crate) async fn start_crd_watchers(
     gateway_api_data_plane_service_namespace: Option<String>,
     relist_policy: RelistPolicy,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     registry: &ControllerTaskRegistry,
     task_label: &str,
@@ -942,6 +1164,7 @@ pub(crate) async fn start_crd_watchers(
                 resource: ar.clone(),
                 watcher_label: "CRD watcher",
             };
+            let read_boundary = scope_boundary_reader(api.clone(), &watcher_config);
             let watcher_task = run_watcher_generations(
                 target,
                 writer,
@@ -949,6 +1172,8 @@ pub(crate) async fn start_crd_watchers(
                 change_notifier,
                 relist_policy,
                 Arc::clone(&metrics),
+                Arc::clone(&revision),
+                read_boundary,
                 shutdown.clone(),
                 move |writer| {
                     reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
@@ -1086,6 +1311,7 @@ pub(crate) async fn start_crd_watchers(
                     resource: ar.clone(),
                     watcher_label: "K8s core watcher",
                 };
+                let read_boundary = scope_boundary_reader(api.clone(), &watcher_config);
                 let watcher_task = run_watcher_generations(
                     target,
                     writer,
@@ -1093,6 +1319,8 @@ pub(crate) async fn start_crd_watchers(
                     change_notifier,
                     relist_policy,
                     Arc::clone(&metrics),
+                    Arc::clone(&revision),
+                    read_boundary,
                     shutdown.clone(),
                     move |writer| {
                         reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
@@ -1161,6 +1389,7 @@ pub(crate) fn spawn_crd_reprobe_task(
     gateway_api_data_plane_service_namespace: Option<String>,
     relist_policy: RelistPolicy,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
     registry: &Arc<ControllerTaskRegistry>,
@@ -1201,6 +1430,7 @@ pub(crate) fn spawn_crd_reprobe_task(
                         gateway_api_data_plane_service_namespace.clone(),
                         relist_policy,
                         Arc::clone(&metrics),
+                        Arc::clone(&revision),
                         watcher_shutdown.clone(),
                         &registry,
                         REPROBE_WATCHER_LABEL,
@@ -1505,6 +1735,13 @@ mod tests {
             resource.kind == "XBackendTrafficPolicy"
                 && resource.group == "gateway.networking.x-k8s.io"
                 && resource.version == "v1alpha1"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "ServiceImport"
+                && resource.group == "multicluster.x-k8s.io"
+                && resource.version == "v1alpha1"
+                && resource.plural == "serviceimports"
                 && resource.namespaced
         }));
     }

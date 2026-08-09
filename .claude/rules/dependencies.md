@@ -6,8 +6,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `reqwest 0.13.3`, `h3 0.0.8` (three
-  patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`, and
-  `dimpl 0.6.1`.
+  patches), `h3-quinn 0.0.10`, `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`,
+  and `dimpl 0.6.1`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -97,3 +97,10 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Tungstenite/tokio-tungstenite fragment accounting + incomplete-message bounds
   (GHSA-qq94-2gv2-phh6): vendored `--lib fragment` / `--lib incomplete_message`
   and `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
+- h3-quinn `stop_sending` during an in-flight read (issue #3283): the vendored
+  shape contract in `tests/unit/gateway_core/http3_server_dispatch_tests.rs`
+  (`h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read`)
+  plus the two upload-pump graceful-halt contracts in the same file. Both H3
+  request-upload pumps rely on it to emit `STOP_SENDING(H3_NO_ERROR)` after
+  cancelling a frontend receive mid-poll; without the patch that call is a
+  process abort and skipping it downgrades the wire signal to `STOP_SENDING(0)`.

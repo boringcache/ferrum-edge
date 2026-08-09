@@ -1485,6 +1485,7 @@ async fn run_udp_egress_session(
                 dial_plan.expected_peer.as_ref(),
                 dial_plan.expected_trust_domain.as_ref(),
                 dial_plan.sni_override,
+                source_identity,
             )
             .await
         {
