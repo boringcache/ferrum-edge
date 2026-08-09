@@ -417,7 +417,9 @@ fn listenerset_hostname_conflict_marks_loser_not_materialized() {
             "allowedRoutes": { "namespaces": { "from": "Same" } }
         }]),
     );
-    newer.metadata.creation_timestamp = Some("2024-01-02T00:00:00Z".to_string());
+    // A malformed/file-sourced object without a trustworthy API-server
+    // timestamp must not preempt a proven older ListenerSet and steal traffic.
+    newer.metadata.creation_timestamp = Some("not-a-timestamp".to_string());
 
     let objects = vec![
         gateway_class(),

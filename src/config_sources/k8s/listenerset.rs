@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use chrono::DateTime;
 use serde_json::Value;
 
 use super::gateway_api::{
@@ -591,12 +592,17 @@ fn parse_parent_gateway_ref(
 }
 
 fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, String), u64> {
-    let mut entries: Vec<(&K8sObject, &str, &str)> = objects
+    let mut entries: Vec<_> = objects
         .iter()
         .filter(|object| object.kind == "ListenerSet")
         .map(|object| {
             (
                 *object,
+                object
+                    .metadata
+                    .creation_timestamp
+                    .as_deref()
+                    .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok()),
                 object.metadata.namespace.as_str(),
                 object.metadata.name.as_str(),
             )
@@ -604,20 +610,22 @@ fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, Str
         .collect();
     entries.sort_by(|left, right| {
         (
-            left.0.metadata.creation_timestamp.as_deref().unwrap_or(""),
-            left.1,
+            left.1.is_none(),
+            left.1.as_ref(),
             left.2,
+            left.3,
         )
             .cmp(&(
-                right.0.metadata.creation_timestamp.as_deref().unwrap_or(""),
-                right.1,
+                right.1.is_none(),
+                right.1.as_ref(),
                 right.2,
+                right.3,
             ))
     });
     entries
         .into_iter()
         .enumerate()
-        .map(|(index, (_, namespace, name))| {
+        .map(|(index, (_, _, namespace, name))| {
             ((namespace.to_string(), name.to_string()), index as u64)
         })
         .collect()
