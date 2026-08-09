@@ -99,7 +99,6 @@ use crate::modes::mesh::node_waypoint_observability::{
 };
 use crate::proxy::ktls_confidentiality::{
     KtlsConfidentialityPolicy, KtlsDirection, KtlsSessionLimits, observe_record_seq,
-    pin_receive_window,
 };
 use crate::socket_opts::ktls;
 
@@ -256,27 +255,12 @@ pub(crate) async fn try_ktls_accept(
         return KtlsAcceptOutcome::Declined(stream);
     }
 
-    // AES-GCM's finite confidentiality limit is only enforceable against a
-    // receive window the kernel will not silently enlarge. Pin and read that
-    // window while the peeked ClientHello is still the only TLS input we have
-    // observed. If either syscall fails, the ordinary buffered rustls accept
-    // can continue on the unconsumed stream. Pin whenever AES is one of the
-    // selectable offers, even if ChaCha20 is also present, because rustls may
-    // choose either suite.
-    let stable_receive_ceiling = if facts.requires_receive_window_pin() {
-        match pin_receive_window(stream.as_raw_fd()) {
-            Ok(ceiling) => ceiling,
-            Err(e) => {
-                debug!(
-                    peer = %peer.ip(),
-                    "kTLS: receive window could not be pinned ({e}), retaining the userspace rustls relay"
-                );
-                return KtlsAcceptOutcome::Declined(stream);
-            }
-        }
-    } else {
-        0
-    };
+    // Finite-limit AES-GCM suites are deliberately excluded above. Linux does
+    // not expose a race-free bound for data admitted before SO_RCVBUF is
+    // pinned: FIONREAD omits out-of-order skbs, so it cannot prove the receive
+    // record budget. ChaCha20-Poly1305 has no finite confidentiality limit and
+    // therefore needs neither a pinned window nor a receive ceiling.
+    let stable_receive_ceiling = 0;
 
     let mut conn = match UnbufferedServerConnection::new(config.clone()) {
         Ok(conn) => conn,
@@ -365,9 +349,9 @@ pub(crate) async fn try_ktls_accept(
              report record sequence numbers",
         ));
     }
-    // The pre-handshake ClientHello gate pins the receive window whenever an
-    // AES-GCM suite is selectable. Restate that invariant against the suite
-    // rustls actually chose before consuming the session.
+    // The pre-handshake ClientHello gate excludes every finite-limit suite.
+    // Restate that invariant against the suite rustls actually chose before
+    // consuming the session.
     if limits.requires_enforcement() && stable_receive_ceiling == 0 {
         record_frontend_tls_failure(record_mesh_mtls_metric, "error");
         return KtlsAcceptOutcome::Failed(io::Error::other(
@@ -728,13 +712,12 @@ fn cipher_kernel_available(cipher: ktls::KtlsCipher) -> bool {
 
 /// Whether a cipher may be offered to the handoff at all.
 ///
-/// Installability is necessary but not sufficient: a suite with a finite
-/// confidentiality limit also needs the kernel to expose its live record
-/// sequence number, since that counter is the only thing that can enforce the
-/// limit after rustls stops tracking messages. Requiring it *here* — from the
-/// peeked ClientHello, before `UnbufferedServerConnection` reads a byte — is
-/// what makes the refusal a clean fall-back to the buffered rustls relay
-/// rather than a dropped connection.
+/// Installability is necessary but not sufficient. A suite with a finite
+/// confidentiality limit also needs a sound upper bound on records already in
+/// the receive queue. Linux's `FIONREAD` omits out-of-order skbs, so no such
+/// bound is available when `SO_RCVBUF` is pinned after accept. Refuse those
+/// suites here, before `UnbufferedServerConnection` reads a byte, so the
+/// connection cleanly falls back to the buffered rustls relay.
 ///
 /// ChaCha20-Poly1305 carries `confidentiality_limit: u64::MAX` in both pinned
 /// providers, so it is deliberately *not* subject to the sequence-number
@@ -743,7 +726,7 @@ fn cipher_handoff_usable(cipher: ktls::KtlsCipher) -> bool {
     if !cipher_kernel_available(cipher) {
         return false;
     }
-    !cipher_has_confidentiality_limit(cipher) || ktls::is_ktls_record_seq_observable(cipher)
+    !cipher_has_confidentiality_limit(cipher)
 }
 
 /// Whether the TLS 1.2 suites that map to `cipher` carry a finite
