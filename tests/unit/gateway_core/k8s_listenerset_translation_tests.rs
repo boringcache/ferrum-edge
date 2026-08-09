@@ -9,11 +9,12 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::k8s_controller::reconciler::merge_k8s_translation;
 use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, plan_gateway_api_status_updates,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 const WATCHER_SRC: &str = include_str!("../../../src/k8s_controller/watcher.rs");
 const RBAC_SRC: &str =
@@ -218,7 +219,10 @@ fn listenerset_attaches_and_materializes_http_route() {
     assert!(
         translation.config.proxies.iter().any(|proxy| {
             proxy.hosts.iter().any(|host| host == "extra.example.com")
-                && proxy.listen_path.contains("via-set")
+                && proxy
+                    .listen_path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("via-set"))
         }),
         "HTTPRoute parentRef to ListenerSet must materialize a proxy: {:?}",
         translation.config.proxies
@@ -380,7 +384,10 @@ fn listenerset_hostname_conflict_marks_loser_not_materialized() {
                 .hosts
                 .iter()
                 .any(|host| host == "conflict.example.com")
-                && proxy.listen_path.contains("newer")
+                && proxy
+                    .listen_path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("newer"))
         }),
         "conflicted ListenerSet must not materialize route traffic"
     );
@@ -634,14 +641,21 @@ fn listenerset_section_name_and_allowed_routes_gates() {
     ];
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
     assert!(translation.config.proxies.iter().any(|proxy| {
-        proxy.hosts.iter().any(|host| host == "a.example.com") && proxy.listen_path.contains("/a")
+        proxy.hosts.iter().any(|host| host == "a.example.com")
+            && proxy
+                .listen_path
+                .as_deref()
+                .is_some_and(|path| path.contains("/a"))
     }));
     assert!(
         !translation
             .config
             .proxies
             .iter()
-            .any(|proxy| proxy.listen_path.contains("missing")),
+            .any(|proxy| proxy
+                .listen_path
+                .as_deref()
+                .is_some_and(|path| path.contains("missing"))),
         "unknown sectionName must fail closed"
     );
 }
@@ -682,6 +696,19 @@ fn listenerset_update_and_delete_withdraw_materialization() {
             .iter()
             .any(|proxy| { proxy.hosts.iter().any(|host| host == "extra.example.com") })
     );
+    let managed = BTreeSet::from(["default".to_string()]);
+    let active = merge_k8s_translation(
+        &ferrum_edge::config::types::GatewayConfig::default(),
+        &first.config,
+        &managed,
+    );
+    assert!(
+        active
+            .proxies
+            .iter()
+            .any(|proxy| proxy.hosts.iter().any(|host| host == "extra.example.com")),
+        "initial ListenerSet overlay must be published"
+    );
 
     // Tighten allowedListeners to None and retranslate — ListenerSet withdraws.
     let mut tightened = base.clone();
@@ -717,6 +744,14 @@ fn listenerset_update_and_delete_withdraw_materialization() {
             .any(|proxy| { proxy.hosts.iter().any(|host| host == "extra.example.com") }),
         "deleting ListenerSet must withdraw materialization"
     );
+    let after_delete = merge_k8s_translation(&active, &third.config, &managed);
+    assert!(
+        !after_delete
+            .proxies
+            .iter()
+            .any(|proxy| proxy.hosts.iter().any(|host| host == "extra.example.com")),
+        "reconciliation must remove the previously published ListenerSet proxy after deletion"
+    );
 }
 
 #[test]
@@ -738,27 +773,24 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
     let without_grant = vec![
         gateway_class(),
         http_gateway("edge", Some("All")),
-        {
-            let mut ls = listenerset(
-                "tls-set",
-                "edge",
-                json!([{
-                    "name": "https",
-                    "port": 443,
-                    "protocol": "HTTPS",
-                    "hostname": "secure.example.com",
-                    "allowedRoutes": { "namespaces": { "from": "Same" } },
-                    "tls": {
-                        "mode": "Terminate",
-                        "certificateRefs": [{
-                            "name": "cert",
-                            "namespace": "certs"
-                        }]
-                    }
-                }]),
-            );
-            ls
-        },
+        listenerset(
+            "tls-set",
+            "edge",
+            json!([{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "secure.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } },
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{
+                        "name": "cert",
+                        "namespace": "certs"
+                    }]
+                }
+            }]),
+        ),
         secret.clone(),
     ];
     let translation = translate_k8s_objects(&without_grant, options()).expect("translate");

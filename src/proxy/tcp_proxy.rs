@@ -483,6 +483,18 @@ pub fn disconnect_cause_for_failure(
     }
 }
 
+/// Whether an attributed relay failure occurred on the client socket and must
+/// therefore remain neutral for backend circuit-breaker accounting.
+#[inline]
+#[doc(hidden)]
+pub fn relay_failure_is_client_facing(failure: &StreamFirstFailure) -> bool {
+    matches!(
+        (failure.0, failure.2),
+        (Direction::ClientToBackend, Some(StreamIoSide::Read))
+            | (Direction::BackendToClient, Some(StreamIoSide::Write))
+    )
+}
+
 /// Map a pre-copy error class (no bytes flowed, direction unknown) to a
 /// `DisconnectCause`. Backend-facing failure classes (DNS lookup, connect,
 /// port exhaustion, pool errors) map to `BackendError` so `stream_disconnects`
@@ -2869,11 +2881,23 @@ async fn handle_tcp_connection_inner(
             .await?;
         }
 
+        // Resolve outbound PROXY framing before breaker admission — matching the
+        // terminating TCP path. Client/config identity failures must fail closed
+        // without claiming a half-open probe or charging backend health.
+        let outbound_proxy_v2_header = resolve_outbound_proxy_v2_header(
+            params.backend_proxy_protocol,
+            stream_ctx,
+            client_local_addr,
+        )?;
+
         // Circuit breaker check — reject before DNS resolution or backend
         // connect if the passthrough target is open. This mirrors the
         // terminating TCP path; passthrough still records backend outcomes
         // below, so it must also honor breaker admission and preserve the
         // half-open probe flag for the matching record_success/failure call.
+        // Keep the admitted Arc so post-admission PROXY write failures settle
+        // the exact selected breaker rather than a get_or_create miss/transient.
+        let mut admitted_cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>> = None;
         if let Some(ref cb_config) = cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
                 &cb_info.namespace,
@@ -2881,8 +2905,9 @@ async fn handle_tcp_connection_inner(
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
             ) {
-                Ok((_cb, is_half_open_probe)) => {
+                Ok((cb, is_half_open_probe)) => {
                     cb_info.is_half_open_probe = is_half_open_probe;
+                    admitted_cb = Some(cb);
                 }
                 Err(_) => {
                     warn!(
@@ -3058,12 +3083,18 @@ async fn handle_tcp_connection_inner(
         // Outbound PROXY v2 must precede every relayed byte — including the
         // client's encrypted ClientHello on the splice/kTLS-free passthrough
         // fast path — so write it before handing the sockets to the kernel.
-        if let Some(header) = resolve_outbound_proxy_v2_header(
-            params.backend_proxy_protocol,
-            stream_ctx,
-            client_local_addr,
-        )? {
-            write_outbound_proxy_v2_header(&mut backend_stream, &header).await?;
+        // Resolution already ran pre-admission; only the post-connect write can
+        // still fail here, and that I/O failure must release the admitted probe
+        // on the already-selected breaker (once) before we return.
+        if let Some(ref header) = outbound_proxy_v2_header {
+            write_outbound_proxy_v2_header(&mut backend_stream, header)
+                .await
+                .inspect_err(|_| {
+                    record_admitted_cb_proxy_v2_write_failure(
+                        admitted_cb.as_deref(),
+                        cb_info.is_half_open_probe,
+                    );
+                })?;
         }
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
@@ -3135,10 +3166,12 @@ async fn handle_tcp_connection_inner(
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
             );
-            if copy_result.first_failure.is_some() {
-                cb.record_failure(502, true, cb_info.is_half_open_probe);
-            } else {
-                cb.record_success(cb_info.is_half_open_probe);
+            match copy_result.first_failure.as_ref() {
+                Some(failure) if relay_failure_is_client_facing(failure) => {
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
+                Some(_) => cb.record_failure(502, true, cb_info.is_half_open_probe),
+                None => cb.record_success(cb_info.is_half_open_probe),
             }
         }
 
@@ -3963,10 +3996,12 @@ async fn handle_tcp_connection_inner(
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
         );
-        if copy_result.first_failure.is_some() {
-            cb.record_failure(502, true, current_cb_info.is_half_open_probe);
-        } else {
-            cb.record_success(current_cb_info.is_half_open_probe);
+        match copy_result.first_failure.as_ref() {
+            Some(failure) if relay_failure_is_client_facing(failure) => {
+                cb.record_neutral(current_cb_info.is_half_open_probe);
+            }
+            Some(_) => cb.record_failure(502, true, current_cb_info.is_half_open_probe),
+            None => cb.record_success(current_cb_info.is_half_open_probe),
         }
     }
 
@@ -5940,6 +5975,244 @@ async fn write_outbound_proxy_v2_header(
         anyhow::anyhow!("failed flushing outbound PROXY protocol v2 header to backend: {e}")
     })?;
     Ok(())
+}
+
+/// Settle a post-admission outbound PROXY v2 *write* failure on the breaker that
+/// already admitted this request.
+///
+/// Must use the admitted Arc (not `get_or_create`): under cache pressure a fresh
+/// lookup can return a transient breaker that does not hold the half-open probe
+/// slot, leaving the real lane wedged. Write I/O is a backend connection-class
+/// failure (`connection_error = true`); client/config resolution errors are
+/// handled pre-admission and never reach this helper.
+fn record_admitted_cb_proxy_v2_write_failure(
+    admitted_cb: Option<&crate::circuit_breaker::CircuitBreaker>,
+    is_half_open_probe: bool,
+) {
+    if let Some(cb) = admitted_cb {
+        cb.record_failure(502, true, is_half_open_probe);
+    }
+}
+
+#[cfg(test)]
+mod outbound_proxy_v2_passthrough_cb_tests {
+    //! Passthrough PROXY v2 + circuit-breaker settlement: resolve before
+    //! admission, write-failure releases the admitted probe on the selected
+    //! breaker, and a successful resolve/write leaves the probe held for the
+    //! later relay outcome (no double-record).
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{
+        record_admitted_cb_proxy_v2_write_failure, resolve_outbound_proxy_v2_header,
+        write_outbound_proxy_v2_header,
+    };
+    use crate::circuit_breaker::CircuitBreaker;
+    use crate::config::types::{BackendProxyProtocol, BackendScheme, CircuitBreakerConfig};
+    use crate::consumer_index::ConsumerIndex;
+    use crate::plugins::StreamConnectionContext;
+    use crate::proxy::proxy_protocol::encode_v2_proxy_header;
+
+    fn stream_ctx(
+        client_ip: &str,
+        client_port: u16,
+        dst: Option<SocketAddr>,
+    ) -> StreamConnectionContext {
+        let mut ctx = StreamConnectionContext::new(
+            client_ip.to_string(),
+            client_ip.to_string(),
+            "proxy".to_string(),
+            None,
+            443,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        ctx.client_port = client_port;
+        if let Some(dst) = dst {
+            ctx.destination_ip = Some(dst.ip());
+            ctx.destination_port = Some(dst.port());
+        }
+        ctx
+    }
+
+    fn probe_breaker() -> Arc<CircuitBreaker> {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        };
+        Arc::new(CircuitBreaker::new(config))
+    }
+
+    #[test]
+    fn resolve_disabled_returns_none_without_error() {
+        let ctx = stream_ctx("10.0.0.1", 12345, None);
+        let header = resolve_outbound_proxy_v2_header(None, &ctx, None)
+            .expect("disabled PROXY must resolve to Ok(None)");
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn resolve_success_builds_v2_header() {
+        let dst: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let local: SocketAddr = "10.0.0.9:8443".parse().unwrap();
+        let ctx = stream_ctx("10.0.0.1", 12345, Some(dst));
+        let header =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &ctx, Some(local))
+                .expect("valid identity must resolve")
+                .expect("V2 enabled must produce a header");
+        assert!(
+            header.starts_with(b"\r\n\r\n\x00\r\nQUIT\n"),
+            "header must carry the PROXY v2 signature"
+        );
+    }
+
+    #[test]
+    fn resolve_failure_is_client_config_error() {
+        let ctx = stream_ctx("not-an-ip", 12345, None);
+        let err = resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &ctx, None)
+            .expect_err("invalid client_ip must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("client_ip"),
+            "resolution failure must name the client identity gap: {msg}"
+        );
+
+        let unset_port = stream_ctx("10.0.0.1", 0, Some("10.0.0.2:443".parse().unwrap()));
+        let err =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &unset_port, None)
+                .expect_err("unset client_port must fail closed");
+        assert!(
+            err.to_string().contains("client_port"),
+            "port failure must be classified as client/config: {err}"
+        );
+
+        let missing_dst = stream_ctx("10.0.0.1", 12345, None);
+        let err =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &missing_dst, None)
+                .expect_err("missing destination must fail closed");
+        assert!(
+            err.to_string().contains("destination address"),
+            "destination failure must be classified as client/config: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_failure_releases_admitted_half_open_probe_exactly_once() {
+        let admitted = probe_breaker();
+        // Trip open, then admit the single half-open probe.
+        admitted.record_failure(502, true, false);
+        assert_eq!(admitted.state_name(), "open");
+        let is_probe = admitted.can_execute().expect("probe admission");
+        assert!(is_probe);
+        assert_eq!(admitted.half_open_in_flight(), 1);
+
+        // Accept then abortively close so the PROXY write hits a reset/closed peer.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            sock.set_zero_linger().expect("abortive close");
+            drop(sock);
+        });
+        let mut backend = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        peer.await.expect("peer");
+        // Give the RST a moment to land before writing.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let header = encode_v2_proxy_header(
+            "10.0.0.1:12345".parse().unwrap(),
+            "10.0.0.2:443".parse().unwrap(),
+        );
+        let write_err = write_outbound_proxy_v2_header(&mut backend, &header)
+            .await
+            .expect_err("closed peer must fail the PROXY write");
+        assert!(
+            write_err.to_string().contains("PROXY protocol v2 header"),
+            "write failure must be I/O-classified: {write_err}"
+        );
+
+        record_admitted_cb_proxy_v2_write_failure(Some(admitted.as_ref()), is_probe);
+        assert_eq!(
+            admitted.half_open_in_flight(),
+            0,
+            "write failure must release the admitted probe slot"
+        );
+        assert_eq!(admitted.state_name(), "open");
+        // Settling again must not use is_half_open_probe=true (that would be a
+        // double-record). A non-probe failure leaves the slot at zero so the
+        // next OPEN→HALF_OPEN cycle can admit.
+        record_admitted_cb_proxy_v2_write_failure(Some(admitted.as_ref()), false);
+        assert_eq!(admitted.half_open_in_flight(), 0);
+        assert!(
+            admitted.can_execute().is_ok(),
+            "next half-open cycle must admit a fresh probe after exact release"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_success_does_not_settle_breaker() {
+        let admitted = probe_breaker();
+        admitted.record_failure(502, true, false);
+        let is_probe = admitted.can_execute().expect("probe admission");
+        assert!(is_probe);
+        assert_eq!(admitted.half_open_in_flight(), 1);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let peer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 64];
+            let n = sock.read(&mut buf).await.expect("read");
+            received_task.lock().await.extend_from_slice(&buf[..n]);
+            // Hold the socket open until the writer finishes.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let dst: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let ctx = stream_ctx("10.0.0.1", 12345, Some(dst));
+        let header = resolve_outbound_proxy_v2_header(
+            Some(BackendProxyProtocol::V2),
+            &ctx,
+            Some("10.0.0.9:8443".parse().unwrap()),
+        )
+        .expect("resolve")
+        .expect("header");
+
+        let mut backend = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        write_outbound_proxy_v2_header(&mut backend, &header)
+            .await
+            .expect("write must succeed");
+        // Drop our write half so the peer read can finish cleanly.
+        let _ = backend.shutdown().await;
+        peer.await.expect("peer");
+
+        assert!(
+            !received.lock().await.is_empty(),
+            "backend must observe the PROXY v2 bytes"
+        );
+        assert_eq!(
+            admitted.half_open_in_flight(),
+            1,
+            "successful write must not settle the probe — relay records the outcome once"
+        );
+        // Production success path records success once after relay.
+        admitted.record_success(is_probe);
+        assert_eq!(admitted.half_open_in_flight(), 0);
+        assert_eq!(admitted.state_name(), "closed");
+    }
 }
 
 /// How long to wait for the opposite direction to drain after the first half

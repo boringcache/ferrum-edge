@@ -2480,9 +2480,16 @@ pub struct Proxy {
     /// of this setting.
     #[serde(default)]
     pub response_body_mode: ResponseBodyMode,
-    /// Port the gateway listens on for this TCP/UDP proxy.
-    /// Required when backend_scheme is Tcp/Tcps/Udp/Dtls.
-    /// Not used for HTTP-based protocols.
+    /// Listen-port identity for this proxy.
+    ///
+    /// - Stream family (`tcp`/`tcps`/`udp`/`dtls`): **required**. The proxy
+    ///   binds this port and routes by it (not by path).
+    /// - HTTP family: **optional**. When set, the proxy is port-scoped — it
+    ///   only matches requests accepted on that frontend port (or the
+    ///   protocol-class remap when a single HTTP/HTTPS listener port is
+    ///   projected onto `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`).
+    ///   When omitted, the proxy remains port-agnostic and matches any
+    ///   HTTP-family frontend (manual / non-Kubernetes default).
     #[serde(default)]
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
@@ -2810,6 +2817,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
+    /// TLS on the frontend.
+    ///
+    /// An HTTP-family proxy whose `(namespace, listen_port)` is in this set
+    /// matches TLS frontends; any other port-scoped HTTP proxy matches
+    /// plaintext frontends. Empty for non-Kubernetes / manually authored
+    /// configs.
+    ///
+    /// The key is **namespace-qualified on purpose**: two namespaces may each
+    /// own a `:443` listener, one terminating and one not, and a bare port set
+    /// would let either one silently reclassify the other's routes. The router
+    /// resolves the class once per candidate at route-table build time, so this
+    /// set is never consulted on the request path.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub http_tls_listen_ports: BTreeSet<(String, u16)>,
     /// Authoritative mesh config revision for this snapshot (issue #2473).
     ///
     /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the
@@ -3153,35 +3175,44 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
 }
 
 impl GatewayConfig {
-    /// Validate that all proxy (host, listen_path) combinations are unique.
+    /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
     /// HTTP-family proxies can conflict in two ways:
-    /// - Path-carrying proxies share a `listen_path` and have overlapping
-    ///   `hosts` (or both use an empty/catch-all host list).
+    /// - Path-carrying proxies share a `listen_path`, the same effective
+    ///   `listen_port` (including both omitted / port-agnostic), and have
+    ///   overlapping `hosts` (or both use an empty/catch-all host list).
     /// - Host-only proxies (`listen_path.is_none()`) share any host with
-    ///   another host-only proxy. Host-only proxies cannot have empty
-    ///   `hosts` — that combination is rejected by `validate_fields_inner`.
+    ///   another host-only proxy on the same effective `listen_port`.
+    ///   Host-only proxies cannot have empty `hosts` — that combination is
+    ///   rejected by `validate_fields_inner`.
+    ///
+    /// Distinct `listen_port` values do not conflict: port-scoped routes are
+    /// independent listeners. A port-agnostic route (`listen_port: None`) does
+    /// not conflict with a port-scoped sibling — at request time the
+    /// port-scoped match wins on that frontend and the agnostic route remains
+    /// the fallback elsewhere.
     ///
     /// Stream proxies are skipped (they route on `listen_port`, not path).
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Split proxies into namespace-scoped buckets: those with an explicit
-        // listen_path and host-only proxies. Only proxies in the same namespace,
-        // the same bucket, AND the same path (for the path bucket) can conflict.
-        let mut by_path: HashMap<(&str, &str), Vec<&Proxy>> = HashMap::new();
-        let mut host_only: HashMap<&str, Vec<&Proxy>> = HashMap::new();
+        // Split proxies into namespace+listen_port-scoped buckets: those with an
+        // explicit listen_path and host-only proxies. Only proxies in the same
+        // namespace, the same listen_port identity, the same bucket, AND the
+        // same path (for the path bucket) can conflict.
+        let mut by_path: HashMap<(&str, Option<u16>, &str), Vec<&Proxy>> = HashMap::new();
+        let mut host_only: HashMap<(&str, Option<u16>), Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
                 Some(path) => by_path
-                    .entry((proxy.namespace.as_str(), path))
+                    .entry((proxy.namespace.as_str(), proxy.listen_port, path))
                     .or_default()
                     .push(proxy),
                 None => host_only
-                    .entry(proxy.namespace.as_str())
+                    .entry((proxy.namespace.as_str(), proxy.listen_port))
                     .or_default()
                     .push(proxy),
             }
@@ -3226,7 +3257,7 @@ impl GatewayConfig {
             add_groups(2, crate::modes::mesh::mesh_ingress_listener_groups(mesh));
         }
 
-        for ((_, path), group) in &by_path {
+        for ((_, _, path), group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -4443,7 +4474,8 @@ impl GatewayConfig {
     /// - Stream proxies must have a `listen_port` in range 1024-65535.
     /// - `listen_port` must be unique across all stream proxies, **unless** all
     ///   proxies sharing the port have `passthrough: true` (SNI-based routing).
-    /// - HTTP proxies must not set `listen_port`.
+    /// - HTTP-family proxies may set `listen_port` as a port-scoped routing
+    ///   identity; those ports do not participate in stream bind sharing.
     /// - Passthrough proxies sharing a port must have non-overlapping `hosts`
     ///   and at most one may have empty `hosts` (catch-all/default).
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
@@ -4474,11 +4506,12 @@ impl GatewayConfig {
                         port_proxies.entry(port).or_default().push(proxy);
                     }
                 }
-            } else if proxy.listen_port.is_some() {
+            } else if let Some(port) = proxy.listen_port
+                && port == 0
+            {
                 errors.push(format!(
-                    "HTTP proxy '{}' (scheme {}) must not set listen_port",
-                    proxy.id,
-                    proxy.scheme_display()
+                    "HTTP proxy '{}' has invalid listen_port {} (must be >= 1)",
+                    proxy.id, port
                 ));
             }
             // stream_proxy_protocol is only valid for TCP/TCP-TLS stream

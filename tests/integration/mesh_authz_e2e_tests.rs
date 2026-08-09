@@ -98,6 +98,7 @@ fn build_mesh_authz_for_workload(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
@@ -1327,6 +1328,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };

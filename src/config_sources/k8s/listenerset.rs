@@ -19,6 +19,7 @@ use super::gateway_api::{
     allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
     listener_is_materializable, listener_protocol_mode_is_supported,
     listener_requires_frontend_tls, namespace_selector_matches, normalize_gateway_hostname,
+    listener_selected_frontend_tls_source,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
@@ -181,7 +182,14 @@ fn collect_one_listenerset(
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
         }
-        let protocol = string_field(listener, "protocol").map(|protocol| protocol.to_string());
+        let protocol = string_field(listener, "protocol")
+            .unwrap_or("HTTP")
+            .to_ascii_uppercase();
+        let frontend_tls_source = if requires_frontend_tls {
+            listener_selected_frontend_tls_source(acc, object, listener)
+        } else {
+            None
+        };
         let materializable = validation_error.is_none()
             && listener_protocol_mode_is_supported(listener)
             && listener_is_materializable(acc, object, listener);
@@ -200,6 +208,7 @@ fn collect_one_listenerset(
             requires_frontend_tls,
             conflict_reason: None,
             parent_gateway: Some((parent.namespace.clone(), parent.name.clone())),
+            frontend_tls_source,
         };
         acc.gateway_api_listener_policies.insert(
             GatewayApiListenerKey {
@@ -253,9 +262,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
         let Some(port) = policy.port else {
             continue;
         };
-        let Some(protocol) = policy.protocol.as_deref() else {
-            continue;
-        };
+        let protocol = policy.protocol.as_str();
         let gateway = match key.parent_kind {
             GatewayApiListenerParentKind::Gateway => (key.namespace.clone(), key.gateway.clone()),
             GatewayApiListenerParentKind::ListenerSet => match &policy.parent_gateway {
@@ -312,11 +319,11 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             // siblings on :443). Marking Gateway-vs-Gateway siblings conflicted
             // here wrongly suppresses routes such as HTTPRouteHTTPSListener's
             // sectionName attachment to `https-with-hostname`.
-            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
-                if candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet {
-                    conflicted.insert(candidate.key.clone(), reason);
-                    continue;
-                }
+            if let Some(reason) = conflict_against_accepted(candidate, &accepted)
+                && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet
+            {
+                conflicted.insert(candidate.key.clone(), reason);
+                continue;
             }
             accepted.push(candidate);
         }
@@ -508,7 +515,7 @@ pub(crate) fn allowed_listeners_permits(
     }
 }
 
-fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulator) {
+pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulator) {
     for status in &mut acc.listenerset_statuses {
         let ns = status.resource.namespace.clone();
         let name = status.resource.name.clone();
@@ -705,6 +712,7 @@ fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, Str
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_listenerset_status(
     acc: &mut K8sAccumulator,
     resource: K8sResourceKey,
