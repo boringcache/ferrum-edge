@@ -990,6 +990,16 @@ fn mesh_inbound_app_port(
         && let Some((id, backend_port)) = matched
         && crate::modes::mesh::is_mesh_inbound_route_id(id)
     {
+        // Synthesized HBONE relays (TCP ambient/Waypoint and UDP EgressGateway)
+        // authorize on the CONNECT authority port stamped by the request
+        // handler. UDP EgressGateway may put a ServiceEntry targetPort into
+        // backend_port for the socket dial; never authorize on that dial port.
+        // Missing stamp fails closed — same rationale as ingress — rather than
+        // falling through to backend_port (which would reintroduce the
+        // targetPort authorization bypass).
+        if id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID {
+            return ingress_listener_authz_port;
+        }
         // Ingress listener routes authorize on the DECLARED listener port, not
         // the `defaultEndpoint` backend port the route forwards to (F6 §6.2
         // security). The handler stamps the listener port for ingress routes;
@@ -2890,6 +2900,83 @@ mod tests {
             ),
             Some(8443),
             "an ingress listener route must authorize on the declared listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_uses_authority_port_for_udp_egress_relay() {
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID, 1053,)),
+                Some(53),
+            ),
+            Some(53),
+            "a targetPort-remapped UDP relay must authorize on the ServiceEntry authority port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_hbone_relay_without_stamped_authority_fails_closed() {
+        // Defensive: a synthesized relay must never authorize on backend_port
+        // when the CONNECT authority port was not stamped. For UDP egress that
+        // backend_port is the remapped targetPort; falling through would let a
+        // DENY on the ServiceEntry port fail open.
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID, 1053,)),
+                None,
+            ),
+            None,
+            "HBONE relay with no stamped authority port must not authorize on the dial port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_ignores_stamped_port_for_non_relay_inbound() {
+        // A forged or leaked stamp must not divert ordinary service-port inbound
+        // authz off the container/backend port.
+        let id = format!("{MESH_INBOUND_PROXY_ID_PREFIX}default-reviews-80");
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((id.as_str(), 8080)),
+                Some(53),
+            ),
+            Some(8080),
+            "non-relay inbound routes must ignore mesh_inbound_listener_authz_port"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_denies_targetport_as_policy_port_for_udp_relay() {
+        // End-to-end through the public destination-port helper: a DENY scoped
+        // to ServiceEntry port 53 must see 53, never dial port 1053.
+        let proxy = crate::modes::mesh::mesh_inbound_hbone_relay_proxy("198.51.100.9", 1053);
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some(&proxy),
+                Some(53),
+                None,
+                None,
+                Some(15008),
+            ),
+            Some(53),
+            "UDP egress relay destination.port must be the stamped authority port"
+        );
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some(&proxy),
+                None,
+                None,
+                None,
+                Some(15008),
+            ),
+            Some(15008),
+            "missing authority stamp must fail closed to the listener port, not the dial port"
         );
     }
 
