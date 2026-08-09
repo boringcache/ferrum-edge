@@ -496,7 +496,7 @@ pub fn ec_point_on_named_curve(
         return EcPointCheck::Unavailable;
     };
     let peer = backend::agreement::UnparsedPublicKey::new(algorithm, point);
-    match backend::agreement::agree_ephemeral(private, &peer, (), |_shared_secret| Ok::<(), ()>(()))
+    match backend::agreement::agree_ephemeral(private, peer, (), |_shared_secret| Ok::<(), ()>(()))
     {
         Ok(()) => EcPointCheck::OnCurve,
         Err(()) => EcPointCheck::Invalid,
