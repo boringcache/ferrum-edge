@@ -212,9 +212,27 @@ fn host_udp_guard_drops_exactly_the_capture_scope_from_prerouting() {
         .expect("valid guard");
 
     assert!(script.starts_with("set -e"), "{script}");
+    // The guard must drop EXACTLY the scope capture would take: the same ingress
+    // interface and the same configured destination scope, differing only in the
+    // target. Deriving the expected match from the capture plan keeps the two
+    // generators pinned together instead of restating one of them here.
+    let capture = IptablesPlan::host_udp_for_config(&host_config(), &ifaces(&["vetha"]))
+        .expect("valid host plan");
+    let tproxy = capture
+        .v4_commands
+        .iter()
+        .find(|cmd| cmd.contains("-j TPROXY"))
+        .expect("capture rule");
+    let scope = tproxy
+        .split_once("-i vetha ")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once(" -j "))
+        .map(|(scope, _)| scope)
+        .expect("interface-scoped capture rule");
     assert!(
-        script.contains("-i vetha -p udp -j DROP"),
-        "the guard must drop the same interface-scoped scope capture would take: {script}"
+        script.contains(&format!("-i vetha {scope} -j DROP")),
+        "the guard must drop the same interface-scoped scope capture would take ({scope}): \
+         {script}"
     );
     assert!(
         script.contains("FERRUM_MESH_UDP_HOST_GUARD_A")

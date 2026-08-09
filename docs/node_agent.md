@@ -360,6 +360,15 @@ until the producer publishes `<registry_dir>/.udp-ready/<pod_uid>`, and it still
 installs no UDP rules of its own. What changes is where the rules and the socket
 live.
 
+The producer also drives the same **gate-close handshake** the pod-netns producer
+uses when a pod stops being captured: it persists
+`<registry_dir>/.udp-ack-required/<pod_uid>`, retracts `.udp-ready`, and keeps the
+pod's host capture rule in place behind a DROP guard until the node-agent
+publishes `<registry_dir>/.udp-not-ready/<pod_uid>`. Retracting readiness does not
+close the BPF gate synchronously, so removing the rule first would let that pod's
+UDP egress leave the node in plaintext for as long as the node-agent took to
+notice.
+
 Direction is discriminated by INGRESS INTERFACE — `mangle PREROUTING -i <the
 pod's host-side interface>` — which is exact in the host namespace: a pod's egress
 is the only traffic entering there on that pod's own interface, pod-destined

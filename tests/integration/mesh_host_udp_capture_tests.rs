@@ -9,8 +9,9 @@
 //!   address is one that pod is registered to use. Anything else is dropped.
 //! * **Lifecycle** — every failure keeps the datapath either on the previous
 //!   correct ruleset or behind a fail-closed DROP guard; a pod is never marked
-//!   ready before its capture is genuinely live, and readiness is retracted
-//!   before its rules are removed.
+//!   ready before its capture is genuinely live, its rules survive until the
+//!   node-agent acknowledges closing its BPF gate, and a capture loop that dies
+//!   is restarted instead of black-holing the node.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -28,6 +29,7 @@ use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, P
 
 const POD_A_UID: &str = "11111111-1111-4111-8111-111111111111";
 const POD_B_UID: &str = "22222222-2222-4222-8222-222222222222";
+const POD_C_UID: &str = "33333333-3333-4333-8333-333333333333";
 
 fn identity(uid: &str, sa: &str) -> UdpSourceIdentity {
     let principal =
@@ -276,7 +278,7 @@ fn planner_orders_rules_deterministically_and_detects_attribution_changes() {
     // change, so reconciliation is a no-op.
     let same = plan_host_udp_bindings(&[b.clone(), a.clone()], &resolved);
     assert!(!same.rules_differ_from(&state));
-    assert!(!same.identity_changed_from(&state));
+    assert!(!same.requires_listener_restart_from(&state));
 
     // A pod recycled onto the same interface IS an attribution change: sessions
     // admitted under the old evidence must not keep relaying.
@@ -285,11 +287,38 @@ fn planner_orders_rules_deterministically_and_detects_attribution_changes() {
     recycled.insert(b.pod_uid.clone(), iface("vetha", 11));
     let mut renamed_b = b.clone();
     renamed_b.source_ips.ipv4 = Some("10.244.1.99".parse().unwrap());
-    let changed = plan_host_udp_bindings(&[a, renamed_b], &recycled);
+    let changed = plan_host_udp_bindings(&[a.clone(), renamed_b], &recycled);
     assert!(!changed.rules_differ_from(&state), "same interface set");
     assert!(
-        changed.identity_changed_from(&state),
+        changed.requires_listener_restart_from(&state),
         "a changed source-address set behind the same interface must restart the listener"
+    );
+
+    // Withdrawing a binding must restart the listener too: per-datagram
+    // authorization stops new traffic, but a session admitted earlier still
+    // holds the removed pod's identity and its transparent reply socket, so a
+    // one-way return stream could keep reaching a removed (or recycled) address.
+    let removed = plan_host_udp_bindings(&[a.clone()], &resolved);
+    assert!(
+        removed.requires_listener_restart_from(&state),
+        "removing a captured pod must cancel the sessions admitted under its evidence"
+    );
+    let refused = plan_host_udp_bindings(&[a.clone(), b.clone()], &HashMap::new());
+    assert!(
+        refused.requires_listener_restart_from(&state),
+        "a pod that became refused is a withdrawal, not an unchanged binding"
+    );
+
+    // A pure addition is not: the pods that stayed keep exactly the evidence
+    // they were admitted under, so their live sessions must not be disturbed.
+    let c = target(POD_C_UID, "c", Some("10.244.1.7"));
+    let mut grown = resolved.clone();
+    grown.insert(c.pod_uid.clone(), iface("vethm", 13));
+    let added = plan_host_udp_bindings(&[a, b, c], &grown);
+    assert!(added.rules_differ_from(&state), "the ruleset does change");
+    assert!(
+        !added.requires_listener_restart_from(&state),
+        "adding a pod must not tear down every other pod's live sessions"
     );
 }
 
@@ -318,6 +347,9 @@ struct FakeBackendState {
     interfaces: HashMap<String, ResolvedInterface>,
     fail_install_capture: bool,
     fail_release_guard: bool,
+    /// The next `start_listener` hands back a capture loop that returns on its
+    /// own, standing in for a socket error or a panicked task.
+    listener_exits: bool,
     listeners: usize,
 }
 
@@ -349,6 +381,10 @@ impl FakeBackend {
 
     fn listeners(&self) -> usize {
         self.inner.lock().unwrap().listeners
+    }
+
+    fn set_listener_exits(&self, exits: bool) {
+        self.inner.lock().unwrap().listener_exits = exits;
     }
 }
 
@@ -399,9 +435,31 @@ impl HostUdpCaptureBackend for FakeBackend {
         _index: Arc<HostUdpIdentityIndex>,
     ) -> Result<HostUdpListenerHandle, String> {
         self.record("start_listener");
-        self.inner.lock().unwrap().listeners += 1;
-        let (tx, _rx) = tokio::sync::watch::channel(false);
-        Ok(HostUdpListenerHandle::detached(tx))
+        let exits = {
+            let mut state = self.inner.lock().unwrap();
+            state.listeners += 1;
+            state.listener_exits
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        // A real capture loop runs until it is stopped, so the fake spawns a
+        // task that does the same — otherwise the manager could never tell a
+        // live loop from one that died.
+        let task = tokio::spawn(async move {
+            if exits {
+                return;
+            }
+            let _ = rx.changed().await;
+        });
+        Ok(HostUdpListenerHandle::new(tx, task))
+    }
+}
+
+/// Let a spawned capture-loop task reach its exit so the manager's supervision
+/// can observe it. The fake's loop finishes on its first poll, so one scheduler
+/// turn is enough; the bounded loop keeps the test from depending on that.
+async fn settle_listener_tasks() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -541,10 +599,22 @@ async fn pod_enrollment_and_removal_rebuild_the_ruleset() {
     source.set(vec![b]);
     let state = manager.reconcile_once().await;
     assert_eq!(state.ifaces(), vec!["vethb".to_string()]);
+    let calls = backend.calls();
     assert!(
-        backend.calls().contains(&"capture:vethb".to_string()),
-        "the removed pod's rule must disappear from the rebuilt chain: {:?}",
-        backend.calls()
+        calls.contains(&"capture:vethb".to_string()),
+        "the removed pod's rule must disappear from the rebuilt chain: {calls:?}"
+    );
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("guard:vetha,vethb"),
+        "the removed pod's interface must stay inside the DROP guard while its rule is \
+         rebuilt away: {calls:?}"
+    );
+    assert_eq!(
+        backend.listeners(),
+        2,
+        "removing a pod must restart the shared listener; a session admitted under its \
+         evidence still holds its identity and its transparent reply socket"
     );
 }
 
@@ -552,12 +622,14 @@ async fn pod_enrollment_and_removal_rebuild_the_ruleset() {
 async fn readiness_marker_is_published_only_after_capture_is_live_and_retracted_on_removal() {
     let registry = tempfile::tempdir().expect("tempdir");
     let ready_dir = registry.path().join(".udp-ready");
+    let ack_dir = registry.path().join(".udp-not-ready");
     let source = Arc::new(FakeSource::default());
     let a = target(POD_A_UID, "a", Some("10.244.1.5"));
     source.set(vec![a.clone()]);
     let backend = FakeBackend::default();
     backend.set_interface(POD_A_UID, "vetha", 11);
-    let mut manager = manager(source.clone(), backend.clone(), Some(ready_dir.clone()));
+    let mut manager = manager(source.clone(), backend.clone(), Some(ready_dir.clone()))
+        .with_gate_close_timeout(Duration::from_millis(50));
 
     manager.reconcile_once().await;
     assert!(
@@ -570,6 +642,206 @@ async fn readiness_marker_is_published_only_after_capture_is_live_and_retracted_
     assert!(
         !ready_dir.join(POD_A_UID).is_file(),
         "readiness must be retracted when a pod stops being captured"
+    );
+    assert!(
+        registry
+            .path()
+            .join(".udp-ack-required")
+            .join(POD_A_UID)
+            .is_file(),
+        "retraction alone does not close the node-agent's BPF gate, so the durable handshake \
+         must be requested for the pod that left"
+    );
+
+    // The acknowledgement arrives, so the pod may finally be retired.
+    std::fs::create_dir_all(&ack_dir).expect("ack dir");
+    std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
+    backend.reset_calls();
+    manager.reconcile_once().await;
+    assert!(
+        !registry
+            .path()
+            .join(".udp-ack-required")
+            .join(POD_A_UID)
+            .is_file(),
+        "an acknowledged gate close clears its own durable requirement"
+    );
+    let calls = backend.calls();
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("guard:vetha"),
+        "the departing pod stays guarded across the transition that removes its rules: \
+         {calls:?}"
+    );
+    assert!(
+        calls.contains(&"teardown_capture".to_string())
+            && calls.last().map(String::as_str) == Some("release_guard"),
+        "with nothing left to capture the chain contents go and the guard is released: \
+         {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledged() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_dir = registry.path().join(".udp-not-ready");
+    let source = Arc::new(FakeSource::default());
+    let a = target(POD_A_UID, "a", Some("10.244.1.5"));
+    let b = target(POD_B_UID, "b", Some("10.244.1.6"));
+    source.set(vec![a.clone(), b.clone()]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    backend.set_interface(POD_B_UID, "vethb", 12);
+    let mut manager = manager(source.clone(), backend.clone(), Some(ready_dir.clone()))
+        .with_gate_close_timeout(Duration::from_millis(50));
+
+    manager.reconcile_once().await;
+    assert!(ready_dir.join(POD_A_UID).is_file());
+    backend.reset_calls();
+
+    // Pod A leaves and the node-agent never acknowledges closing its gate. Its
+    // rule must NOT be rebuilt away: the old rule plus an open BPF gate is
+    // capture, while no rule plus an open BPF gate is plaintext egress.
+    source.set(vec![b.clone()]);
+    let state = manager.reconcile_once().await;
+    assert_eq!(state.ifaces(), vec!["vethb".to_string()]);
+    let calls = backend.calls();
+    assert_eq!(
+        calls,
+        vec!["guard:vetha,vethb".to_string()],
+        "an unacknowledged gate close installs the union guard and touches nothing else: \
+         {calls:?}"
+    );
+
+    // Retrying keeps the same posture and must not re-issue the request, which
+    // would delete an acknowledgement that has since landed.
+    backend.reset_calls();
+    manager.reconcile_once().await;
+    assert_eq!(
+        backend.calls(),
+        vec!["guard:vetha,vethb".to_string()],
+        "a retry stays fail-closed rather than removing the departing pod's rule"
+    );
+
+    std::fs::create_dir_all(&ack_dir).expect("ack dir");
+    std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
+    backend.reset_calls();
+    manager.reconcile_once().await;
+    let calls = backend.calls();
+    assert!(
+        calls.contains(&"capture:vethb".to_string()),
+        "once the gate close is acknowledged the chain is rebuilt without the departed pod: \
+         {calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("release_guard"),
+        "and only then does the guard come down: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pod_returning_before_its_gate_close_is_acknowledged_is_republished() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let source = Arc::new(FakeSource::default());
+    let a = target(POD_A_UID, "a", Some("10.244.1.5"));
+    source.set(vec![a.clone()]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(source.clone(), backend.clone(), Some(ready_dir.clone()))
+        .with_gate_close_timeout(Duration::from_millis(50));
+
+    manager.reconcile_once().await;
+    source.set(Vec::new());
+    manager.reconcile_once().await;
+    assert!(!ready_dir.join(POD_A_UID).is_file());
+
+    // A registry flap must not wedge the node waiting for an acknowledgement the
+    // node-agent has no reason to send.
+    source.set(vec![a]);
+    manager.reconcile_once().await;
+    assert!(
+        ready_dir.join(POD_A_UID).is_file(),
+        "a pod that re-entered capture is readied again by the ordinary apply path"
+    );
+    assert!(
+        !registry
+            .path()
+            .join(".udp-ack-required")
+            .join(POD_A_UID)
+            .is_file(),
+        "and its abandoned handshake requirement is cancelled, not left to block later polls"
+    );
+}
+
+#[tokio::test]
+async fn an_unexpectedly_exited_capture_loop_is_guarded_and_restarted() {
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    backend.set_listener_exits(true);
+    let mut manager = manager(source, backend.clone(), None);
+
+    manager.reconcile_once().await;
+    assert_eq!(backend.listeners(), 1);
+    settle_listener_tasks().await;
+
+    // Nothing about the registry changed, so without supervision this poll would
+    // short-circuit and the node would keep steering enrolled egress into a
+    // socket nobody reads.
+    backend.set_listener_exits(false);
+    backend.reset_calls();
+    manager.reconcile_once().await;
+    assert_eq!(
+        backend.calls(),
+        vec![
+            "guard:vetha".to_string(),
+            "capture:vetha".to_string(),
+            "start_listener".to_string(),
+            "release_guard".to_string(),
+        ],
+        "a dead capture loop is restarted through the normal guarded apply path"
+    );
+    assert_eq!(backend.listeners(), 2);
+
+    // The restarted loop is live, so the next poll is a no-op again.
+    settle_listener_tasks().await;
+    backend.reset_calls();
+    manager.reconcile_once().await;
+    assert!(
+        backend.calls().is_empty(),
+        "a running capture loop must not be mistaken for a dead one: {:?}",
+        backend.calls()
+    );
+}
+
+#[tokio::test]
+async fn an_operator_requested_shutdown_is_never_turned_into_a_restart() {
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let manager = manager(source, backend.clone(), None);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move { manager.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = shutdown_tx.send(true);
+    handle.await.expect("manager exits");
+
+    assert_eq!(
+        backend.listeners(),
+        1,
+        "stopping the listener on shutdown must not look like an unexpected exit: {:?}",
+        backend.calls()
+    );
+    assert!(
+        backend.calls().contains(&"teardown_all".to_string()),
+        "shutdown removes host state instead of restarting capture: {:?}",
+        backend.calls()
     );
 }
 
@@ -637,18 +909,37 @@ async fn shutdown_tears_everything_down_once_the_gate_close_is_acknowledged() {
     source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
     let backend = FakeBackend::default();
     backend.set_interface(POD_A_UID, "vetha", 11);
-    let mut manager = manager(source, backend.clone(), Some(ready_dir));
+    let mut manager = manager(source, backend.clone(), Some(ready_dir))
+        .with_gate_close_timeout(Duration::from_secs(5));
     manager.reconcile_once().await;
     backend.reset_calls();
 
-    std::fs::create_dir_all(&ack_dir).expect("ack dir");
-    std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
+    // A PRE-EXISTING acknowledgement is deliberately not enough: requesting the
+    // close deletes any stale `.udp-not-ready` marker so it can never authorize a
+    // new handoff. Only the node-agent republishing it after readiness was
+    // retracted proves this generation's gates are shut.
+    let stale_ack_dir = ack_dir.clone();
+    std::fs::create_dir_all(&stale_ack_dir).expect("ack dir");
+    std::fs::write(stale_ack_dir.join(POD_A_UID), b"").expect("stale ack marker");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::create_dir_all(&ack_dir).expect("ack dir");
+        std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
+    });
 
     manager.shutdown().await;
     assert!(
         backend.calls().contains(&"teardown_all".to_string()),
         "an acknowledged shutdown removes every Ferrum-owned host object: {:?}",
         backend.calls()
+    );
+    assert!(
+        !registry
+            .path()
+            .join(".udp-ack-required")
+            .join(POD_A_UID)
+            .is_file(),
+        "and clears the durable requirement it raised"
     );
 }
 

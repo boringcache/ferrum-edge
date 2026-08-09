@@ -2967,6 +2967,29 @@ egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
 the node-agent to acknowledge that its BPF gates closed, and only then removes
 everything; without the acknowledgement it retains the DROP guard.
 
+**A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
+`.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,
+so a pod that is removed or becomes refused keeps its capture rule until the
+node-agent publishes the matching `.udp-not-ready` acknowledgement — the same
+durable `.udp-ack-required` handshake shutdown and the pod-netns cleanup manager
+use. Until then the guard installed for the rebuild covers the **union** of the
+interfaces the new generation captures and the interfaces of every pod still
+owing an acknowledgement, so the departing pod's egress is dropped rather than
+released in plaintext; a failed persistence or an acknowledgement timeout keeps
+that posture and retries on the next poll. A pod that re-enters capture before
+its acknowledgement arrives cancels the handshake and is readied again by the
+ordinary apply path. Withdrawing (or re-attributing) a binding also **restarts
+the shared capture listener** before the new evidence generation goes live: a
+session admitted earlier still holds the old workload identity and its
+transparent reply socket, so a one-way return stream would otherwise keep
+reaching a removed — or recycled — pod address until it idled out. A pure
+addition is not disruptive and leaves live sessions alone. The capture loop is
+supervised on every reconcile: one that exits on its own (a socket error, a
+panicked task) is detected, the datapath is guarded, stale evidence is cleared,
+and the loop is restarted through the normal guarded apply path instead of the
+node black-holing captured traffic while readiness stays published. An
+operator-requested shutdown is never mistaken for such an exit.
+
 **Placement migration.** This path reaps only host-namespace state. Rules a
 previous per-pod-netns generation installed live inside each pod's namespace and
 are destroyed with it, so switching placement on a running node leaves
