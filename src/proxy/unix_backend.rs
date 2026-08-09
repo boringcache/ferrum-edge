@@ -6,7 +6,7 @@
 //! the HTTP dispatch path recognizes and dials with
 //! [`tokio::net::UnixStream`] instead of TCP.
 //!
-//! Three properties are load-bearing and must not be relaxed:
+//! Four properties are load-bearing and must not be relaxed:
 //!
 //! 1. **The tag is a fail-closed transport marker, never a hint.** A target
 //!    carrying it is dialed over a Unix stream or the request is REFUSED — the
@@ -34,12 +34,27 @@
 //!    h2c carries native gRPC over the socket with full request/response
 //!    streaming, deadlines, cancellation, and trailers, because it reuses the
 //!    sidecar mesh-mTLS dispatch body (see [`dial_unix_h2c_sender`]).
+//! 4. **Establishment is bounded, and it is the PEER's preface that ends it.**
+//!    hyper's h2c `handshake()` writes the client connection preface and never
+//!    reads, so it resolves against a peer that accepted the socket and then
+//!    went silent. [`dial_unix_h2c_sender`] therefore waits for the peer's own
+//!    initial `SETTINGS` frame (see `crate::proxy::h2c_preface`) and runs
+//!    admission, connect, handshake, and that wait inside ONE end-to-end
+//!    `backend_connect_timeout_ms` budget, so a wedged local app cannot pin a
+//!    request task that the caller supplied no deadline for.
 //!
 //! Both tags live in the reserved `mesh.` namespace that
 //! `strip_reserved_mesh_tags` removes from every operator/workload label copy,
 //! so a hand-authored pod label can never forge them.
 
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
+
 use crate::config::types::UpstreamTarget;
+#[cfg(unix)]
+use crate::proxy::h2c_preface::{H2cPrefaceFailure, H2cPrefaceIo, await_peer_settings};
 #[cfg(unix)]
 use crate::util::unix_socket::AdmittedUnixSocket;
 use crate::util::unix_socket::{UnixSocketPathRejection, admit_configured_path};
@@ -102,10 +117,22 @@ pub enum UnixBackendError {
     /// a reason to silently retry as HTTP/1.1 (that would deliver a request the
     /// declared protocol says the app cannot parse).
     H2Handshake(hyper::Error),
-    /// The socket accepted the connection but did not complete the h2c client
-    /// handshake inside the effective connect budget. Without this bound an
-    /// allowed local peer could withhold SETTINGS and pin a request task
-    /// indefinitely when the client supplied no gRPC deadline.
+    /// The h2c connection ended before it became usable: the peer closed it
+    /// without ever completing its own HTTP/2 connection preface, or hyper
+    /// ended it on the very poll that validated that preface. Either way no
+    /// request could be issued on it and none was.
+    H2ConnectionClosed,
+    /// The socket accepted the connection but the h2c connection did not become
+    /// usable inside the effective connect budget — hyper's client handshake and
+    /// the peer's own initial SETTINGS frame (RFC 9113 §3.4) must BOTH land
+    /// inside it.
+    ///
+    /// The peer half is what this bound is for. `handshake()` only writes the
+    /// CLIENT preface and never reads, so it completes against a socket whose
+    /// peer is silent; without waiting for the peer's preface, an allowed local
+    /// app that accepts and then wedges would pin the request task for as long
+    /// as the caller's own deadline allows — which is forever when the client
+    /// supplied no gRPC deadline and no backend read timeout is configured.
     H2HandshakeTimeout { timeout_ms: u64 },
     /// The build target has no Unix-domain sockets (Windows). Sidecar mesh
     /// deployments are Linux-only, so this is unreachable in practice; it
@@ -140,6 +167,10 @@ impl std::fmt::Display for UnixBackendError {
             Self::H2Handshake(err) => {
                 write!(f, "unix backend h2c handshake failed: {err}")
             }
+            Self::H2ConnectionClosed => write!(
+                f,
+                "unix backend h2c connection closed before it became usable"
+            ),
             Self::H2HandshakeTimeout { timeout_ms } => write!(
                 f,
                 "unix backend h2c handshake timed out after {timeout_ms}ms"
@@ -168,9 +199,10 @@ impl UnixBackendError {
     ///   application must not be ejected because an attacker raced its socket —
     ///   and they are not retried, because a retry would repeat the dial into
     ///   the same substituted object;
-    /// * a failed or timed-out connect — or a refused h2c handshake — IS
-    ///   evidence the local app is down, wedged, or not speaking its declared
-    ///   protocol, so those keep the ordinary connect-phase classes.
+    /// * a failed or timed-out connect — or an h2c connection that errored,
+    ///   hung up, or never became usable inside the budget — IS evidence the
+    ///   local app is down, wedged, or not speaking its declared protocol, so
+    ///   those keep the ordinary connect-phase classes.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
             Self::InadmissiblePath(_)
@@ -180,11 +212,14 @@ impl UnixBackendError {
             | Self::SocketIdentityChanged => crate::retry::ErrorClass::DispatchPolicyRejected,
             Self::Connect(_) => crate::retry::ErrorClass::ConnectionRefused,
             Self::ConnectTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
-            // The handshake completes before any request frame is written, so
-            // this is PRE-wire and replay-safe, but it IS evidence about the app
-            // (it is not speaking the protocol its listener declared) — the same
-            // posture the pooled transports give a failed connection setup.
-            Self::H2Handshake(_) => crate::retry::ErrorClass::ConnectionPoolError,
+            // Establishment completes before any request frame is written, so
+            // these are PRE-wire and replay-safe, but they ARE evidence about
+            // the app (it is not speaking the protocol its listener declared, or
+            // it hung up before it could) — the same posture the pooled
+            // transports give a failed connection setup.
+            Self::H2Handshake(_) | Self::H2ConnectionClosed => {
+                crate::retry::ErrorClass::ConnectionPoolError
+            }
             Self::H2HandshakeTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
         }
     }
@@ -446,6 +481,18 @@ pub async fn dial_unix_backend(
 /// terminal-trailer forwarding are the SAME code on both transports and cannot
 /// drift apart. The connection is 1:1 (not pooled) and its driver task ends
 /// with the request, exactly like the mesh WebSocket / raw-TCP dials.
+///
+/// The sender is returned only once the peer has proved it speaks HTTP/2 on
+/// this socket. hyper's `handshake()` writes the CLIENT connection preface and
+/// never reads, so it resolves against a peer that accepted the socket and then
+/// said nothing; establishment is therefore the peer's own initial SETTINGS
+/// frame, observed by `crate::proxy::h2c_preface`. Admission, the connect, the
+/// client handshake, and that observation all share ONE end-to-end budget —
+/// [`effective_connect_timeout_ms`] captured before the connect — so a slow
+/// connect cannot re-arm a fresh budget for the preface, and a peer that accepts
+/// but never becomes usable cannot pin the request task past it. No request byte
+/// is written before any of this: the caller does not hold the sender until this
+/// returns.
 #[cfg(unix)]
 pub async fn dial_unix_h2c_sender(
     path: &str,
@@ -455,7 +502,17 @@ pub async fn dial_unix_h2c_sender(
 ) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
+    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    // `None` only when the operator's own budget overflows the timer instant,
+    // which is an unbounded budget by their own configuration. This mirrors how
+    // the sender-readiness deadline in `proxy::mod` handles the same overflow.
+    let deadline = tokio::time::Instant::now().checked_add(budget);
+
     let stream = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
+
+    let settings_received = Arc::new(AtomicBool::new(false));
+    let io = TokioIo::new(H2cPrefaceIo::new(stream, Arc::clone(&settings_received)));
 
     let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
     builder
@@ -465,17 +522,35 @@ pub async fn dial_unix_h2c_sender(
         .max_frame_size(UNIX_H2C_MAX_FRAME_SIZE)
         .max_concurrent_reset_streams(UNIX_H2C_MAX_CONCURRENT_RESET_STREAMS);
 
-    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
-    let (sender, connection) = match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        builder.handshake(TokioIo::new(stream)),
-    )
-    .await
-    {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(err)) => return Err(UnixBackendError::H2Handshake(err)),
-        Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
+    let handshake = builder.handshake(io);
+    let handshake_result = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, handshake).await {
+            Ok(result) => result,
+            Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
+        },
+        None => handshake.await,
     };
+    let (sender, mut connection) = handshake_result.map_err(UnixBackendError::H2Handshake)?;
+
+    // Establishment proper: the peer's own connection preface, on whatever is
+    // left of the budget the connect already drew from.
+    let establish = await_peer_settings(&mut connection, &settings_received);
+    let established = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, establish).await {
+            Ok(result) => result,
+            Err(_) => return Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }),
+        },
+        None => establish.await,
+    };
+    if let Err(failure) = established {
+        return Err(match failure {
+            H2cPrefaceFailure::Connection(err) => UnixBackendError::H2Handshake(err),
+            H2cPrefaceFailure::ClosedBeforeSettings | H2cPrefaceFailure::ClosedAfterSettings => {
+                UnixBackendError::H2ConnectionClosed
+            }
+        });
+    }
+
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("unix_backend: h2c connection closed: {}", e);

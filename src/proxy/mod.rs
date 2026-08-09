@@ -41,6 +41,10 @@ pub mod client_ip;
 pub mod deferred_log;
 pub mod gateway_listener;
 pub mod grpc_proxy;
+/// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
+/// Hyper's client handshake proves only the client half, so both h2c transports
+/// — the pooled gRPC path and the Unix-socket path — establish through here.
+pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;

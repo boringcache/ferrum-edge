@@ -242,32 +242,96 @@ async fn an_unlinked_socket_is_refused_rather_than_dialed_blind() {
 }
 
 /// An admitted peer may accept the Unix connection and then never speak h2c.
-/// The transport must bound the HTTP/2 SETTINGS handshake even when the client
-/// supplied no gRPC deadline, otherwise that peer can pin the request task
-/// indefinitely before normal sender-readiness timeouts are installed.
+///
+/// Hyper's `handshake()` writes only the CLIENT preface and never reads, so it
+/// completes against this peer; establishment is the PEER's initial SETTINGS
+/// frame, and the connect budget has to bound waiting for it. Without that bound
+/// the sender would be handed to dispatch and the request would park on a
+/// response that never comes — forever, when the client supplied no gRPC
+/// deadline and no backend read timeout is configured.
+///
+/// The wall-clock assertions are the contract: the dial must actually spend the
+/// budget (not refuse early for some unrelated reason) and must not wait on the
+/// peer, which holds the connection open far longer than the budget.
 #[tokio::test]
 async fn a_stalled_h2c_handshake_is_bounded_by_the_connect_budget() {
+    const BUDGET_MS: u64 = 200;
+
     let temp = tempfile::TempDir::new().expect("temp dir");
     let root = canonical_root(&temp);
     let path = root.join("stalled-h2c.sock");
     let listener = tokio::net::UnixListener::bind(&path).expect("bind h2c socket");
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept h2c connection");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
         drop(stream);
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = dial_unix_h2c_sender(
+        path.to_str().expect("utf-8 socket path"),
+        BUDGET_MS,
+        &roots(&root),
+        &[],
+    )
+    .await;
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }) => {
+            assert_eq!(timeout_ms, BUDGET_MS);
+        }
+        Err(other) => panic!("expected a bounded h2c handshake timeout, got {other:?}"),
+        Ok(_) => panic!("a peer that withholds its SETTINGS preface must not establish h2c"),
+    }
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "the dial must spend the connect budget waiting for the peer preface, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the dial must not outlive the connect budget, took {elapsed:?}"
+    );
+    peer.abort();
+}
+
+/// The establishment gate is not a blanket refusal. A peer that DOES send its
+/// RFC 9113 §3.4 connection preface — a well-formed initial SETTINGS frame on
+/// stream 0 — is accepted, and the sender comes back inside the budget.
+///
+/// Without this the timeout contract above would also be satisfied by a
+/// transport that never establishes anything at all.
+#[tokio::test]
+async fn a_peer_that_sends_its_settings_preface_establishes_the_h2c_dial() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = canonical_root(&temp);
+    let path = root.join("live-h2c.sock");
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind h2c socket");
+    let peer = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept h2c connection");
+        // The server connection preface: an empty SETTINGS frame. 9-byte header,
+        // 24-bit length 0, type 0x4, no flags, stream identifier 0.
+        stream
+            .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+            .await
+            .expect("write the server SETTINGS preface");
+        stream.flush().await.expect("flush the server preface");
+        // Keep draining so the client's own preface and SETTINGS ACK cannot
+        // stall against a full socket buffer while the dial completes.
+        let mut sink = [0u8; 1024];
+        while stream.read(&mut sink).await.unwrap_or(0) > 0 {}
     });
 
     let outcome = dial_unix_h2c_sender(
         path.to_str().expect("utf-8 socket path"),
-        50,
+        5_000,
         &roots(&root),
         &[],
     )
     .await;
     match outcome {
-        Err(UnixBackendError::H2HandshakeTimeout { timeout_ms }) => assert_eq!(timeout_ms, 50),
-        Err(other) => panic!("expected a bounded h2c handshake timeout, got {other:?}"),
-        Ok(_) => panic!("a peer that withholds SETTINGS must not complete the h2c handshake"),
+        Ok(_sender) => {}
+        Err(err) => panic!("an established h2c peer must be accepted, got {err:?}"),
     }
     peer.abort();
 }

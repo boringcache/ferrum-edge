@@ -528,20 +528,20 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
 
 #[test]
 fn h2c_settings_observer_preserves_vectored_writes() {
-    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let source = include_str!("../../../src/proxy/h2c_preface.rs");
     let start = source
-        .find("impl AsyncWrite for H2cSettingsIo")
-        .expect("H2cSettingsIo AsyncWrite implementation not found");
+        .find("impl<T: AsyncWrite + Unpin> AsyncWrite for H2cPrefaceIo<T>")
+        .expect("H2cPrefaceIo AsyncWrite implementation not found");
     let implementation = &source[start..];
     let end = implementation
-        .find("\n}\n\n/// Canonical terminal message")
-        .expect("H2cSettingsIo AsyncWrite implementation end not found");
+        .find("\n}\n\n/// Why an h2c connection")
+        .expect("H2cPrefaceIo AsyncWrite implementation end not found");
     let implementation = &implementation[..end];
 
     assert!(
         implementation.contains("fn poll_write_vectored(")
             && implementation.contains(".poll_write_vectored(cx, bufs)"),
-        "the lifetime h2c wrapper must forward TcpStream scatter/gather writes"
+        "the lifetime h2c wrapper must forward inner-transport scatter/gather writes"
     );
     assert!(
         implementation.contains("fn is_write_vectored(&self)")
@@ -562,6 +562,19 @@ fn h2c_settings_observer_preserves_vectored_writes() {
             && source.contains("Pin::new(&mut *conn).poll(cx)"),
         "Hyper must receive one post-observation poll so a protocol error wins the readiness race"
     );
+
+    // Both h2c transports must establish through the shared observer: hyper's
+    // client handshake proves only the client half, so a second, private
+    // implementation is exactly the drift this guard exists to prevent.
+    for consumer in [
+        include_str!("../../../src/proxy/grpc_proxy.rs"),
+        include_str!("../../../src/proxy/unix_backend.rs"),
+    ] {
+        assert!(
+            consumer.contains("await_peer_settings("),
+            "every h2c transport must gate its sender on the observed peer preface"
+        );
+    }
 }
 
 #[test]
