@@ -739,7 +739,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 107 test-file filters visible to the grep-based coverage
+    # below keeps every test-file filter visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -795,6 +795,7 @@ jobs:
               integration::ai_transcript_audit_grpc_reload_tests
               integration::api_chargeback_sink_tests
               integration::gateway_allowed_routes_selector_tests
+              integration::gateway_api_backend_ref_kinds_tests
               integration::gateway_api_backend_tls_policy_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
@@ -865,6 +866,7 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
+              integration::port_aware_route_traffic_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_mutation_decode_fail_closed_tests
@@ -1111,7 +1113,9 @@ jobs:
               functional_credential_rotation_test
               functional_file_mode_test
               functional_gateway_backend_tls_policy_test
+              functional_gateway_service_import_test
               functional_host_only_routing_test
+              functional_port_aware_routes_test
               functional_migrate_mode_test
               functional_protocol_validation_test
               functional_regex_routing_test
