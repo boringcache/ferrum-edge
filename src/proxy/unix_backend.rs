@@ -105,6 +105,7 @@ pub enum UnixBackendError {
     /// deployments are Linux-only, so this is unreachable in practice; it
     /// exists so the non-Unix build refuses the dispatch rather than silently
     /// dropping the transport gate.
+    #[cfg_attr(unix, allow(dead_code))]
     PlatformUnsupported,
 }
 

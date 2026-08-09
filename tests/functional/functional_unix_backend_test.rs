@@ -162,19 +162,18 @@ async fn wait_for_body(
     mut ready: impl FnMut(u16, &str) -> bool,
 ) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last = String::from("no request issued yet");
     loop {
-        match client.get(url).send().await {
+        let last = match client.get(url).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if ready(status, &body) {
                     return body;
                 }
-                last = format!("status={status} body={body:?}");
+                format!("status={status} body={body:?}")
             }
-            Err(err) => last = format!("request error: {err}"),
-        }
+            Err(err) => format!("request error: {err}"),
+        };
         if Instant::now() >= deadline {
             panic!("{context}: behavior did not appear; last observation: {last}");
         }
