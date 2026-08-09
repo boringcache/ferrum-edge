@@ -5928,9 +5928,10 @@ fn l4_route_proxies(
         )
     };
 
-    // Fail closed when there is no attached Gateway listener. UDPRoute is a
-    // Gateway API-only resource, so unlike the legacy TCPRoute/TLSRoute input
-    // shape it must never use its backend port as an implicit public listener.
+    // Suppress listener materialization when there is no attached Gateway
+    // listener. UDPRoute is a Gateway API-only resource, so unlike the legacy
+    // TCPRoute/TLSRoute input shape it must never use its backend port as an
+    // implicit public listener.
     //
     // `materialized_listener_bindings` is the set of concrete listener ports
     // that survived every gate: Gateway identity, `sectionName`/`port`
@@ -5947,9 +5948,13 @@ fn l4_route_proxies(
     // For UDPRoute this set is additionally filtered by same-listener conflict
     // losers: a route that lost ownership of every declared listener opens
     // nothing and creates no upstream, so duplicate OS binds cannot race.
-    if materialized_listener_bindings.is_empty()
-        && (scheme.is_udp() || l4_route_declares_parent_ref(object, scheme))
-    {
+    //
+    // Suppression must not bypass hostile-input validation, ReferenceGrant
+    // enforcement, backend-kind/port checks, or rule-level warnings: still run
+    // `l4_rule_backends` for every rule, then skip proxy/upstream creation.
+    let suppress_listener_materialization = materialized_listener_bindings.is_empty()
+        && (scheme.is_udp() || l4_route_declares_parent_ref(object, scheme));
+    if suppress_listener_materialization {
         if scheme.is_udp()
             && acc
                 .gateway_api_conflict_losers
@@ -5972,7 +5977,6 @@ fn l4_route_proxies(
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
         }
-        return Ok(Vec::new());
     }
 
     let mut proxies = Vec::new();
@@ -5987,6 +5991,10 @@ fn l4_route_proxies(
         let Some(resolved) = l4_rule_backends(object, rule, acc, scheme)? else {
             continue;
         };
+
+        if suppress_listener_materialization {
+            continue;
+        }
 
         let listen_bindings = if materialized_listener_bindings.is_empty() {
             vec![(resolved.fallback_listen_port, fallback_hosts.clone())]
