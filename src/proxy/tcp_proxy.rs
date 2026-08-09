@@ -6000,7 +6000,11 @@ mod outbound_proxy_v2_passthrough_cb_tests {
     use crate::plugins::StreamConnectionContext;
     use crate::proxy::proxy_protocol::encode_v2_proxy_header;
 
-    fn stream_ctx(client_ip: &str, client_port: u16, dst: Option<SocketAddr>) -> StreamConnectionContext {
+    fn stream_ctx(
+        client_ip: &str,
+        client_port: u16,
+        dst: Option<SocketAddr>,
+    ) -> StreamConnectionContext {
         let mut ctx = StreamConnectionContext::new(
             client_ip.to_string(),
             client_ip.to_string(),
@@ -6043,13 +6047,10 @@ mod outbound_proxy_v2_passthrough_cb_tests {
         let dst: SocketAddr = "10.0.0.2:443".parse().unwrap();
         let local: SocketAddr = "10.0.0.9:8443".parse().unwrap();
         let ctx = stream_ctx("10.0.0.1", 12345, Some(dst));
-        let header = resolve_outbound_proxy_v2_header(
-            Some(BackendProxyProtocol::V2),
-            &ctx,
-            Some(local),
-        )
-        .expect("valid identity must resolve")
-        .expect("V2 enabled must produce a header");
+        let header =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &ctx, Some(local))
+                .expect("valid identity must resolve")
+                .expect("V2 enabled must produce a header");
         assert!(
             header.starts_with(b"\r\n\r\n\x00\r\nQUIT\n"),
             "header must carry the PROXY v2 signature"
@@ -6068,24 +6069,18 @@ mod outbound_proxy_v2_passthrough_cb_tests {
         );
 
         let unset_port = stream_ctx("10.0.0.1", 0, Some("10.0.0.2:443".parse().unwrap()));
-        let err = resolve_outbound_proxy_v2_header(
-            Some(BackendProxyProtocol::V2),
-            &unset_port,
-            None,
-        )
-        .expect_err("unset client_port must fail closed");
+        let err =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &unset_port, None)
+                .expect_err("unset client_port must fail closed");
         assert!(
             err.to_string().contains("client_port"),
             "port failure must be classified as client/config: {err}"
         );
 
         let missing_dst = stream_ctx("10.0.0.1", 12345, None);
-        let err = resolve_outbound_proxy_v2_header(
-            Some(BackendProxyProtocol::V2),
-            &missing_dst,
-            None,
-        )
-        .expect_err("missing destination must fail closed");
+        let err =
+            resolve_outbound_proxy_v2_header(Some(BackendProxyProtocol::V2), &missing_dst, None)
+                .expect_err("missing destination must fail closed");
         assert!(
             err.to_string().contains("destination address"),
             "destination failure must be classified as client/config: {err}"
