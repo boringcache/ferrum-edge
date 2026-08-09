@@ -9254,6 +9254,10 @@ impl ProxyState {
         new_config: &GatewayConfig,
     ) -> Vec<Upstream> {
         fn content_eq(a: &Upstream, b: &Upstream) -> bool {
+            // Authored target tags (mesh.mtls / mesh.hbone / SPIFFE pins / …) are
+            // ordinary serialized fields, but compare them explicitly here so a
+            // same-timestamp tag-only rewrite cannot depend solely on HashMap
+            // serde round-tripping to rebuild the LB / request epoch (#3284).
             let skipped_fields_equal = a.resolved_subset_tls == b.resolved_subset_tls
                 && a.dispatch_port_override_fallback == b.dispatch_port_override_fallback
                 && a.targets.len() == b.targets.len()
@@ -9262,6 +9266,7 @@ impl ProxyState {
                     .zip(&b.targets)
                     .all(|(a_target, b_target)| {
                         a_target.service_port_policy_key == b_target.service_port_policy_key
+                            && a_target.tags == b_target.tags
                     });
             if !skipped_fields_equal {
                 return false;
