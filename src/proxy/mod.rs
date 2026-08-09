@@ -24722,6 +24722,17 @@ async fn handle_proxy_request_inner(
             };
             match hbone_relay {
                 Some(relay_proxy) => {
+                    // Datagram egress may dial a ServiceEntry targetPort that
+                    // differs from the client-visible CONNECT authority port.
+                    // Preserve that authority port for mesh authorization;
+                    // the synthesized proxy's backend_port remains the actual
+                    // socket dial port used by the UDP relay.
+                    if is_udp_hbone_connect {
+                        ctx.mesh_inbound_listener_authz_port = req
+                            .uri()
+                            .authority()
+                            .and_then(|authority| authority.port_u16());
+                    }
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();

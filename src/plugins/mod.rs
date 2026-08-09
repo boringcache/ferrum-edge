@@ -3108,9 +3108,11 @@ pub struct RequestContext {
     /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
     pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
-    /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
-    /// the request handler from `select_mesh_inbound_port_route` when the matched
-    /// route is an ingress group. `mesh_authz` uses this so an
+    /// or synthesized UDP EgressGateway relay. For ingress (F6 §6.2), this is
+    /// the operator-declared LISTENER port (e.g. `8443`), stamped by the request
+    /// handler from `select_mesh_inbound_port_route`. For UDP egress this is the
+    /// ServiceEntry port from the CONNECT authority, kept separate from a
+    /// targetPort-remapped socket dial port. `mesh_authz` uses this so an
     /// `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
     /// listener port matches — the route forwards to a different
     /// `defaultEndpoint` backend port, and authorizing on that backend port

@@ -957,6 +957,15 @@ fn mesh_inbound_app_port(
         && let Some((id, backend_port)) = matched
         && crate::modes::mesh::is_mesh_inbound_route_id(id)
     {
+        // A synthesized UDP EgressGateway relay keeps the selected targetPort
+        // in backend_port for the eventual socket dial. AuthorizationPolicy,
+        // however, is scoped to the ServiceEntry port named by the CONNECT
+        // authority, which the request handler stamps here before plugins run.
+        if id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            && ingress_listener_authz_port.is_some()
+        {
+            return ingress_listener_authz_port;
+        }
         // Ingress listener routes authorize on the DECLARED listener port, not
         // the `defaultEndpoint` backend port the route forwards to (F6 §6.2
         // security). The handler stamps the listener port for ingress routes;
@@ -2835,6 +2844,19 @@ mod tests {
             ),
             Some(8443),
             "an ingress listener route must authorize on the declared listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_uses_authority_port_for_udp_egress_relay() {
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID, 1053,)),
+                Some(53),
+            ),
+            Some(53),
+            "a targetPort-remapped UDP relay must authorize on the ServiceEntry authority port"
         );
     }
 
