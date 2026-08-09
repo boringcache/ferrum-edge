@@ -1582,9 +1582,7 @@ fn apply_metric_override_plan(
                         destination_service: attribution.destination_service.as_ref(),
                         request_protocol: attribution.request_protocol.as_ref(),
                         response_flags: attribution.response_flags.as_ref(),
-                        connection_security_policy: attribution
-                            .connection_security_policy
-                            .as_ref(),
+                        connection_security_policy: attribution.connection_security_policy.as_ref(),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
                         response_code: extras.response_code.or((attribution
@@ -1615,10 +1613,7 @@ fn apply_metric_override_plan(
 /// the complete plan (including the unselected ternary branch); the second
 /// evaluates only the selected branch and allocates only the final sanitized
 /// label value.
-fn evaluate_compact_metric_tag_cel(
-    body: &str,
-    ctx: MetricTagCelContext<'_>,
-) -> Option<String> {
+fn evaluate_compact_metric_tag_cel(body: &str, ctx: MetricTagCelContext<'_>) -> Option<String> {
     if !compact_metric_tag_cel_is_valid(body) {
         return None;
     }
@@ -1632,11 +1627,7 @@ fn compact_metric_tag_cel_is_valid(body: &str) -> bool {
     compact_metric_tag_cel_is_valid_at_depth(body, 0, &mut nodes)
 }
 
-fn compact_metric_tag_cel_is_valid_at_depth(
-    body: &str,
-    depth: usize,
-    nodes: &mut usize,
-) -> bool {
+fn compact_metric_tag_cel_is_valid_at_depth(body: &str, depth: usize, nodes: &mut usize) -> bool {
     let mut remaining = body;
     skip_compact_metric_tag_cel_prefix(&mut remaining, depth, nodes).is_some()
         && remaining.is_empty()
@@ -1678,9 +1669,7 @@ fn skip_compact_metric_tag_cel_prefix(
             *body = after_else;
             compact_metric_tag_cel_is_valid_at_depth(then_body, depth + 1, nodes)
                 .then_some(())
-                .filter(|()| {
-                    compact_metric_tag_cel_is_valid_at_depth(else_body, depth + 1, nodes)
-                })
+                .filter(|()| compact_metric_tag_cel_is_valid_at_depth(else_body, depth + 1, nodes))
         }
         _ => None,
     }

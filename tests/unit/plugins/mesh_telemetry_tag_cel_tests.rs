@@ -167,7 +167,10 @@ async fn cel_reads_original_attribution_not_prior_label_mutations() {
         .expect("mesh request counter")
         .to_string();
 
-    assert!(counter.contains(r#"source_workload="overridden""#), "{counter}");
+    assert!(
+        counter.contains(r#"source_workload="overridden""#),
+        "{counter}"
+    );
     assert!(
         counter.contains(r#"destination_service="frontend""#),
         "CEL must read the original source.workload attribution: {counter}"
