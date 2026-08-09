@@ -1483,12 +1483,16 @@ pub struct EnvConfig {
     /// clamp or ignore this value.
     pub mesh_cert_ttl_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
-    /// `xds` consumes Envoy-compatible ADS; `file` loads a localized mesh
-    /// config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control plane).
+    /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
+    /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
+    /// plane); `stock_xds` consumes standard v3 CDS/EDS/LDS/RDS from a stock
+    /// Envoy / third-party Istio control plane for discovery only, with the
+    /// enforcement posture supplied by `FERRUM_MESH_FILE_CONFIG_PATH`.
     pub mesh_config_protocol: String,
     /// Path to the localized mesh config document (YAML/JSON) consumed when
-    /// `mesh_config_protocol` is `file`. The document carries only the `mesh`
-    /// section of a gateway config; reloaded on SIGHUP (Unix).
+    /// `mesh_config_protocol` is `file` (the whole slice) or `stock_xds` (the
+    /// mandatory policy half). The document carries only the `mesh` section of
+    /// a gateway config; reloaded on SIGHUP (Unix).
     pub mesh_file_config_path: Option<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -5311,35 +5315,38 @@ impl EnvConfig {
                 // Validate the protocol value before the per-protocol CP
                 // requirements so a typo'd FERRUM_MESH_CONFIG_PROTOCOL fails
                 // with the protocol error, not a misleading missing-CP-URL one.
-                match self
-                    .mesh_config_protocol
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "native" | "xds" | "file" => {}
+                let normalized_mesh_protocol =
+                    self.mesh_config_protocol.trim().to_ascii_lowercase();
+                match normalized_mesh_protocol.as_str() {
+                    "native" | "xds" | "file" | "stock_xds" | "stock-xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
-                             Expected: native, xds, or file",
+                             Expected: native, xds, file, or stock_xds",
                             crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
-                // The localized `file` protocol has no control plane: the CP
-                // URL and CP/DP JWT secret are not required (nor consumed).
+                // The localized `file` protocol has no control plane, and
+                // `stock_xds` dials a THIRD-PARTY ADS server named by
+                // `FERRUM_MESH_STOCK_XDS_URLS` — neither consumes the Ferrum
+                // CP URL or the CP/DP JWT secret, and `stock_xds` must never
+                // present a Ferrum-minted CP/DP JWT to a stock control plane.
+                // Both require the local mesh document instead (`file` for the
+                // whole slice, `stock_xds` for the mandatory policy half).
                 // Native/xDS keep both hard requirements, including the
                 // minimum secret length the env macro used to enforce when
                 // `required_for` still listed "mesh".
-                let file_protocol = self
-                    .mesh_config_protocol
-                    .trim()
-                    .eq_ignore_ascii_case("file");
-                if file_protocol {
+                let local_document_protocol = matches!(
+                    normalized_mesh_protocol.as_str(),
+                    "file" | "stock_xds" | "stock-xds"
+                );
+                if local_document_protocol {
                     if self.mesh_file_config_path.is_none() {
-                        return Err("FERRUM_MESH_FILE_CONFIG_PATH is required when \
-                             FERRUM_MESH_CONFIG_PROTOCOL=file"
-                            .into());
+                        return Err(format!(
+                            "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                             FERRUM_MESH_CONFIG_PROTOCOL={normalized_mesh_protocol}"
+                        ));
                     }
                 } else {
                     if self.dp_cp_grpc_urls.is_empty() {

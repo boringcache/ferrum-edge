@@ -188,8 +188,35 @@ pub mod refusal {
     pub const SDS_SECRET_REFUSED: &str = "sds_secret_refused";
 }
 
-/// One refused stock resource. Carries no payload bytes and no attacker-chosen
-/// value beyond the resource name the CP itself assigned, so it is safe to log.
+/// Render a control-plane-supplied value for a log line: control characters
+/// stripped (no log-line forgery) and truncated.
+///
+/// A resource name, an extension key, and a filter name are all chosen by the
+/// control plane and bounded only by [`StockXdsLimits::max_resource_bytes`] —
+/// up to a mebibyte of arbitrary text per default bound. They are diagnostics,
+/// never comparison keys, so bounding them here costs nothing: the accumulator
+/// keeps every raw value it actually matches on.
+pub fn diagnostic_value(value: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut rendered = String::with_capacity(value.len().min(MAX_CHARS) + 12);
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= MAX_CHARS {
+            truncated = true;
+            break;
+        }
+        rendered.push(if ch.is_control() { '.' } else { ch });
+    }
+    if truncated {
+        rendered.push_str("(truncated)");
+    }
+    rendered
+}
+
+/// One refused stock resource. Both string fields are rendered through
+/// [`diagnostic_value`] at construction, so a refusal carries no payload bytes
+/// and no unbounded or control-character-bearing control-plane value, and is
+/// safe to log verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StockRefusal {
     /// Short xDS type label (`cds` / `eds` / `lds` / `rds`).
@@ -209,11 +236,13 @@ impl StockRefusal {
         reason: &'static str,
         detail: impl Into<String>,
     ) -> Self {
+        let resource: String = resource.into();
+        let detail: String = detail.into();
         Self {
             type_label,
-            resource: resource.into(),
+            resource: diagnostic_value(&resource),
             reason,
-            detail: detail.into(),
+            detail: diagnostic_value(&detail),
         }
     }
 }
@@ -363,10 +392,15 @@ pub struct StockDiscovery {
 
 /// State-of-the-world accumulator for the stock profile.
 ///
-/// Each type URL is replaced wholesale by its latest response — that is what
-/// makes deletion work: a cluster absent from a new CDS response disappears
-/// from the next built slice, and its endpoints become unreachable rather than
-/// stale. Per-type versions are tracked independently because a stock CP does
+/// CDS and LDS are the two types a SotW server must send as COMPLETE state, so
+/// they are replaced wholesale — that is what makes deletion work: a cluster
+/// absent from a new CDS response disappears from the next built slice, and its
+/// endpoints become unreachable rather than stale. EDS and RDS are subscribed
+/// by name and a response for them may carry only a subset of the subscription
+/// (istiod pushes just the assignments a change touched), so those are MERGED
+/// and pruned against the current subscription set instead — an omitted
+/// assignment must never be read as "this service has no endpoints".
+/// Per-type versions are tracked independently because a stock CP does
 /// NOT share one `version_info` across types (unlike the Ferrum CP, whose
 /// coherence gate protects its ECDS security carriers; there are no security
 /// carriers here to skew against).
@@ -412,16 +446,20 @@ impl StockXdsAccumulator {
         version: &str,
     ) -> Result<(), String> {
         let limits = self.limits;
+        // Every diagnostic below is echoed back to the control plane in
+        // `error_detail` AND logged locally, so the control-plane-supplied
+        // halves go through `diagnostic_value` first.
+        let safe_url = diagnostic_value(type_url);
         let label = stock_type_label(type_url)
-            .ok_or_else(|| format!("unsupported xDS type_url '{type_url}' on the stock profile"))?;
+            .ok_or_else(|| format!("unsupported xDS type_url '{safe_url}' on the stock profile"))?;
         if version.trim().is_empty() {
             return Err(format!(
-                "xDS response for type_url '{type_url}' has empty version_info"
+                "xDS response for type_url '{safe_url}' has empty version_info"
             ));
         }
         if resources.len() > limits.max_resources_per_type {
             return Err(format!(
-                "xDS response for type_url '{type_url}' carries {} resources, over the \
+                "xDS response for type_url '{safe_url}' carries {} resources, over the \
                  configured stock-profile bound of {}",
                 resources.len(),
                 limits.max_resources_per_type
@@ -430,13 +468,13 @@ impl StockXdsAccumulator {
         for (resource_type_url, bytes) in resources {
             if !resource_type_url.is_empty() && resource_type_url != type_url {
                 return Err(format!(
-                    "resource type_url '{resource_type_url}' does not match response type_url \
-                     '{type_url}'"
+                    "resource type_url '{}' does not match response type_url '{safe_url}'",
+                    diagnostic_value(resource_type_url)
                 ));
             }
             if bytes.len() > limits.max_resource_bytes {
                 return Err(format!(
-                    "xDS resource for type_url '{type_url}' is {} bytes, over the configured \
+                    "xDS resource for type_url '{safe_url}' is {} bytes, over the configured \
                      stock-profile bound of {}",
                     bytes.len(),
                     limits.max_resource_bytes
@@ -454,7 +492,10 @@ impl StockXdsAccumulator {
                         .map_err(|e| format!("failed to decode Cluster resource: {e}"))?;
                     let name = non_empty_name(&decoded.name, "Cluster")?;
                     if !seen.insert(name.clone()) {
-                        return Err(format!("duplicate Cluster resource name '{name}'"));
+                        return Err(format!(
+                            "duplicate Cluster resource name '{}'",
+                            diagnostic_value(&name)
+                        ));
                     }
                     match classify_cluster(&decoded, &name, &limits) {
                         Ok(Some((cluster, cluster_refusals))) => {
@@ -466,9 +507,21 @@ impl StockXdsAccumulator {
                     }
                 }
                 self.clusters = clusters;
+                // CDS *is* complete state, so it is what actually deletes an
+                // endpoint assignment: an assignment no accepted cluster
+                // references any more can never be reached again.
+                self.prune_unsubscribed_endpoints();
             }
             EDS_TYPE_URL => {
-                let mut endpoints = BTreeMap::new();
+                // Only CDS and LDS responses are complete state under SotW.
+                // An EDS response may legitimately carry a SUBSET of the
+                // subscribed assignments — istiod skips recomputing a cluster
+                // its push did not touch — and an omitted assignment is NOT a
+                // deletion. Replacing the map wholesale would blackhole every
+                // service an ordinary endpoint update did not mention, so the
+                // response is MERGED and deletion comes from the subscription
+                // set instead (see `prune_unsubscribed_endpoints`).
+                let mut endpoints = self.endpoints.clone();
                 let mut seen = BTreeSet::new();
                 for (_, bytes) in resources {
                     let decoded =
@@ -478,7 +531,8 @@ impl StockXdsAccumulator {
                     let name = non_empty_name(&decoded.cluster_name, "ClusterLoadAssignment")?;
                     if !seen.insert(name.clone()) {
                         return Err(format!(
-                            "duplicate ClusterLoadAssignment resource name '{name}'"
+                            "duplicate ClusterLoadAssignment resource name '{}'",
+                            diagnostic_value(&name)
                         ));
                     }
                     match collect_endpoints(&decoded, &name, &limits, "eds") {
@@ -497,6 +551,7 @@ impl StockXdsAccumulator {
                     }
                 }
                 self.endpoints = endpoints;
+                self.prune_unsubscribed_endpoints();
             }
             LDS_TYPE_URL => {
                 let mut listeners = Vec::new();
@@ -507,7 +562,10 @@ impl StockXdsAccumulator {
                         .map_err(|e| format!("failed to decode Listener resource: {e}"))?;
                     let name = non_empty_name(&decoded.name, "Listener")?;
                     if !seen.insert(name.clone()) {
-                        return Err(format!("duplicate Listener resource name '{name}'"));
+                        return Err(format!(
+                            "duplicate Listener resource name '{}'",
+                            diagnostic_value(&name)
+                        ));
                     }
                     match classify_listener(&decoded, &name, &limits) {
                         Ok(Some(accepted)) => {
@@ -528,16 +586,18 @@ impl StockXdsAccumulator {
                 self.route_configs
                     .retain(|name, _| !name.starts_with(INLINE_ROUTE_PREFIX));
                 self.route_configs.extend(inline_routes);
+                // LDS is complete state, so it is what deletes a CP-delivered
+                // route configuration: one no accepted listener references any
+                // more is unreachable.
+                self.prune_unsubscribed_route_configs();
             }
             RDS_TYPE_URL => {
-                // Preserve inline (listener-owned) route configs; RDS only
-                // replaces the CP-delivered ones.
-                let mut route_configs: BTreeMap<String, StockRouteConfig> = self
-                    .route_configs
-                    .iter()
-                    .filter(|(name, _)| name.starts_with(INLINE_ROUTE_PREFIX))
-                    .map(|(name, config)| (name.clone(), config.clone()))
-                    .collect();
+                // Same SotW rule as EDS: an RDS response may carry a SUBSET of
+                // the subscribed route configurations, and an omitted one is
+                // not a deletion. Merge into what is already held (inline,
+                // listener-owned configs included — RDS never replaces those).
+                let mut route_configs: BTreeMap<String, StockRouteConfig> =
+                    self.route_configs.clone();
                 let mut seen = BTreeSet::new();
                 for (_, bytes) in resources {
                     let decoded =
@@ -547,13 +607,15 @@ impl StockXdsAccumulator {
                     let name = non_empty_name(&decoded.name, "RouteConfiguration")?;
                     if !seen.insert(name.clone()) {
                         return Err(format!(
-                            "duplicate RouteConfiguration resource name '{name}'"
+                            "duplicate RouteConfiguration resource name '{}'",
+                            diagnostic_value(&name)
                         ));
                     }
                     if name.starts_with(INLINE_ROUTE_PREFIX) {
                         return Err(format!(
-                            "RouteConfiguration name '{name}' uses the reserved inline-route \
-                             prefix '{INLINE_ROUTE_PREFIX}'"
+                            "RouteConfiguration name '{}' uses the reserved inline-route \
+                             prefix '{INLINE_ROUTE_PREFIX}'",
+                            diagnostic_value(&name)
                         ));
                     }
                     match classify_route_configuration(&decoded, &name, &limits) {
@@ -565,10 +627,12 @@ impl StockXdsAccumulator {
                     }
                 }
                 self.route_configs = route_configs;
+                self.prune_unsubscribed_route_configs();
             }
             other => {
                 return Err(format!(
-                    "unsupported xDS type_url '{other}' on the stock profile"
+                    "unsupported xDS type_url '{}' on the stock profile",
+                    diagnostic_value(other)
                 ));
             }
         }
@@ -576,6 +640,25 @@ impl StockXdsAccumulator {
         self.versions.insert(label, version.to_string());
         self.refusals.insert(label, refusals);
         Ok(())
+    }
+
+    /// Drop endpoint assignments no accepted cluster references any more.
+    ///
+    /// This is what makes EDS deletion work now that responses are merged
+    /// rather than replaced: the *subscription set* is authoritative for which
+    /// assignments still matter, not the contents of the latest response.
+    fn prune_unsubscribed_endpoints(&mut self) {
+        let subscribed: BTreeSet<String> = self.eds_subscriptions().into_iter().collect();
+        self.endpoints.retain(|name, _| subscribed.contains(name));
+    }
+
+    /// Drop CP-delivered route configurations no accepted listener references
+    /// any more. Inline (listener-owned) configs are rebuilt by LDS itself and
+    /// are exempt.
+    fn prune_unsubscribed_route_configs(&mut self) {
+        let subscribed: BTreeSet<String> = self.rds_subscriptions().into_iter().collect();
+        self.route_configs
+            .retain(|name, _| name.starts_with(INLINE_ROUTE_PREFIX) || subscribed.contains(name));
     }
 
     /// EDS resource names the accepted clusters depend on, deduplicated and

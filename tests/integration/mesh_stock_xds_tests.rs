@@ -15,8 +15,12 @@
 //! * the EDS subscription is dependency-ordered by resource NAME rather than
 //!   wildcarded,
 //! * a structurally invalid response is NACKed with an `error_detail` and the
-//!   previously installed slice keeps serving (last-good), and
-//! * a state-of-the-world CDS response that drops a cluster deletes it.
+//!   previously installed slice keeps serving (last-good),
+//! * a state-of-the-world CDS response that drops a cluster deletes it,
+//! * a PARTIAL EDS push (the by-name types may carry a subset) leaves the
+//!   assignments it did not mention dialable, and
+//! * a reconnect re-subscribes with an empty nonce and the last ACCEPTED
+//!   version, never the NACKed one.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -90,6 +94,12 @@ struct ScriptedAdsServer {
     recorder: AdsRecorder,
     /// Per-type queue of scripted responses.
     script: Arc<Mutex<HashMap<String, Vec<ScriptedResponse>>>>,
+    /// When set, the server closes the response stream as soon as it sees a
+    /// request carrying an `error_detail`. Dropping the response sender ends
+    /// the RPC cleanly, which is exactly the reconnect path the client takes
+    /// after a control plane hangs up — and the only way to observe what the
+    /// FIRST request on a fresh stream asserts.
+    close_on_nack: bool,
 }
 
 #[tonic::async_trait]
@@ -108,16 +118,23 @@ impl AggregatedDiscoveryService for ScriptedAdsServer {
         let mut inbound = request.into_inner();
         let recorder = self.recorder.clone();
         let script = self.script.clone();
+        let close_on_nack = self.close_on_nack;
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
             while let Ok(Some(discovery_request)) = inbound.message().await {
                 let type_url = discovery_request.type_url.clone();
+                let nacked = discovery_request.error_detail.is_some();
                 recorder
                     .requests
                     .lock()
                     .expect("recorder mutex")
                     .push(discovery_request);
+                if close_on_nack && nacked {
+                    // Dropping `tx` completes the response stream, so the
+                    // client observes a clean stream end and reconnects.
+                    return;
+                }
                 // Every inbound request — initial subscription, subscription
                 // update, ACK, or NACK — releases the next queued response for
                 // that type. The queue is finite, so the exchange terminates.
@@ -261,6 +278,13 @@ struct StockHarness {
 
 impl StockHarness {
     async fn start(script: HashMap<String, Vec<ScriptedResponse>>) -> Self {
+        Self::start_with(script, false).await
+    }
+
+    async fn start_with(
+        script: HashMap<String, Vec<ScriptedResponse>>,
+        close_on_nack: bool,
+    ) -> Self {
         let policy_dir = tempfile::tempdir().expect("temp dir");
         let policy_path = policy_dir.path().join("mesh-policy.yaml");
         std::fs::write(&policy_path, POLICY_DOCUMENT).expect("write policy document");
@@ -272,6 +296,7 @@ impl StockHarness {
         let server = ScriptedAdsServer {
             recorder: recorder.clone(),
             script: script.clone(),
+            close_on_nack,
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -547,6 +572,106 @@ async fn stock_invalid_response_is_nacked_and_the_last_good_slice_keeps_serving(
         .collect();
     names.sort_unstable();
     assert_eq!(names, vec!["ratings", "reviews"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_partial_eds_push_keeps_the_untouched_clusters_dialable() {
+    // EDS is subscribed BY NAME, so a state-of-the-world response for it may
+    // legitimately carry only the assignments a push touched — istiod skips
+    // recomputing a cluster its update did not change. Treating the omission as
+    // a deletion would blackhole every other service in the mesh.
+    let mut script = converged_script();
+    script
+        .get_mut(EDS_TYPE_URL)
+        .expect("EDS queue")
+        .push(ScriptedResponse {
+            type_url: EDS_TYPE_URL.to_string(),
+            version: "eds-v2".to_string(),
+            nonce: "eds-n2".to_string(),
+            resources: vec![any_resource(
+                EDS_TYPE_URL,
+                &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080),
+            )],
+        });
+
+    let harness = StockHarness::start(script).await;
+    let slice = harness
+        .wait_for_slice("partial EDS push applied", |slice| {
+            let addresses: Vec<&str> = slice
+                .workloads
+                .iter()
+                .flat_map(|workload| workload.addresses.iter().map(String::as_str))
+                .collect();
+            addresses.contains(&"10.1.2.9") && addresses.contains(&"10.1.2.4")
+        })
+        .await;
+
+    let mut addresses: Vec<String> = slice
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.4".to_string(), "10.1.2.9".to_string()],
+        "the pushed assignment is replaced; the untouched one keeps its endpoint"
+    );
+    assert_eq!(slice.services.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_reconnect_after_a_nack_reasserts_the_accepted_version_with_no_nonce() {
+    // xDS nonces are stream-scoped and a NACKed version was never accepted, so
+    // the first request on a fresh stream must carry an EMPTY response_nonce
+    // and the last ACCEPTED version. Re-asserting the rejected version would
+    // let a version-comparing control plane withhold the resource it already
+    // sent, wedging the data plane permanently unconverged.
+    let mut script = converged_script();
+    script
+        .get_mut(CDS_TYPE_URL)
+        .expect("CDS queue")
+        .push(ScriptedResponse {
+            type_url: CDS_TYPE_URL.to_string(),
+            version: "cds-v2".to_string(),
+            nonce: "cds-n2".to_string(),
+            resources: vec![
+                any_resource(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, REVIEWS_SAN)),
+                any_resource(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, REVIEWS_SAN)),
+            ],
+        });
+    let harness = StockHarness::start_with(script, true).await;
+
+    // `Node` rides only the FIRST request per type on a stream, so the second
+    // node-bearing CDS request is the subscription that opened the new stream.
+    let resubscribe = {
+        let mut found = None;
+        for _ in 0..250 {
+            let with_node: Vec<DiscoveryRequest> = harness
+                .recorder
+                .for_type(CDS_TYPE_URL)
+                .into_iter()
+                .filter(|request| request.node.is_some())
+                .collect();
+            if with_node.len() >= 2 {
+                found = Some(with_node[1].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found.expect("the client reconnects and re-subscribes")
+    };
+
+    assert!(
+        resubscribe.response_nonce.is_empty(),
+        "a nonce from a previous stream is expired; a new stream must start clean, got '{}'",
+        resubscribe.response_nonce
+    );
+    assert_eq!(
+        resubscribe.version_info, "cds-v1",
+        "the re-subscription asserts the last ACCEPTED version, never the NACKed one"
+    );
+    assert!(resubscribe.error_detail.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

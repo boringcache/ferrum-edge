@@ -248,9 +248,11 @@ fn stock_dependency_ordering_and_deletion_follow_state_of_the_world() {
         feature = "Dependency-ordered EDS/RDS subscription + SotW deletion",
         status = Status::Supported,
         notes = "EDS is subscribed by the accepted clusters' resource names and RDS by the \
-                 accepted listeners' route-config names, rather than wildcarded. A cluster \
-                 absent from a new state-of-the-world CDS response is deleted, taking its \
-                 endpoints with it.",
+                 accepted listeners' route-config names, rather than wildcarded. CDS and LDS are \
+                 the complete-state types: a cluster absent from a new state-of-the-world CDS \
+                 response is deleted, taking its endpoints with it. EDS/RDS responses may be \
+                 partial, so they are merged and pruned against the subscription set instead — \
+                 an omitted assignment is not a deletion.",
     );
     let mut accumulator = converged();
     assert_eq!(

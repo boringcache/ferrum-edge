@@ -436,14 +436,31 @@ Ferrum will not dial a peer whose identity the control plane did not assert.
 **Protocol behaviour.** State-of-the-world ADS with per-type nonces, ACK/NACK
 carrying a field-specific `error_detail`, dependency-ordered subscriptions (EDS
 follows the accepted CDS clusters by resource name, RDS follows the accepted LDS
-listeners), wholesale per-type replacement so deletions propagate, a 25 ms
-debounce capped at 500 ms before a make-before-break `install_slice`, a
+listeners), a 25 ms debounce capped at 500 ms before a
+make-before-break `install_slice`, a
 five-consecutive-NACK circuit breaker, jittered 1–30 s backoff, and multi-server
 failover. There is deliberately **no** cross-type version-coherence gate: a
 stock CP versions each type independently and carries no Ferrum security
 carriers a skew could leave stale. Warming waits for CDS, and for EDS only when
 some accepted cluster actually needs it. Convergence is visible on the
 JWT-gated `GET /mesh/config-drift`.
+
+**Deletion follows the SotW rule for each type, not the response contents.**
+`Cluster` and `Listener` are the two types a state-of-the-world server must send
+as complete state, so those responses replace what is held and a resource absent
+from one is deleted. `ClusterLoadAssignment` and `RouteConfiguration` are
+subscribed by name and a response for them may legitimately carry only the
+subset a push touched (istiod skips recomputing a cluster its update did not
+change), so those responses are **merged**, and an assignment or route
+configuration is dropped only once no accepted cluster/listener references it
+any more. Reading an omitted assignment as "this service has no endpoints" would
+blackhole every service an ordinary endpoint update did not mention.
+
+On reconnect the client re-subscribes with an **empty** `response_nonce` (nonces
+are stream-scoped) and with the last version it actually ACCEPTED — a NACKed
+version is never re-asserted, so a control plane that suppresses a resource
+whose version the client already claims cannot leave the data plane
+unconverged.
 
 **Two failure outcomes, and the difference matters.** A *structural* error —
 bytes that are not a well-formed resource of the announced type, an empty or

@@ -27,13 +27,15 @@
 //!
 //! State-of-the-world ADS with per-type nonces, ACK/NACK with field-specific
 //! error details, dependency-ordered subscriptions (EDS follows the accepted
-//! CDS clusters, RDS follows the accepted LDS listeners), wholesale per-type
-//! replacement so deletions propagate, debounced make-before-break publication
-//! through `MeshRuntimeState::install_slice`, a consecutive-NACK circuit
-//! breaker, jittered backoff, and multi-server failover. Unlike the Ferrum
-//! profile there is no cross-type version-coherence gate: a stock CP versions
-//! each type independently and carries no Ferrum security carriers that a skew
-//! could leave stale.
+//! CDS clusters, RDS follows the accepted LDS listeners), wholesale replacement
+//! of the complete-state types (CDS/LDS) with subscription-pruned merging for
+//! the by-name types (EDS/RDS, whose responses may be partial) so deletions
+//! propagate without a partial push blackholing untouched services, debounced
+//! make-before-break publication through `MeshRuntimeState::install_slice`, a
+//! consecutive-NACK circuit breaker, jittered backoff, and multi-server
+//! failover. Unlike the Ferrum profile there is no cross-type
+//! version-coherence gate: a stock CP versions each type independently and
+//! carries no Ferrum security carriers that a skew could leave stale.
 //!
 //! Ferrum NEVER mints a Ferrum CP/DP JWT for a stock control plane. The only
 //! credential it will present is an externally issued bearer token the operator
@@ -67,7 +69,8 @@ use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryS
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
 use crate::xds::stock::{
-    StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits, refuse_stock_secret,
+    StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits, diagnostic_value,
+    refuse_stock_secret,
 };
 use crate::xds::translator::{
     CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
@@ -210,9 +213,23 @@ impl StockSubscriptionState {
         }
     }
 
-    fn reset_processed_nonces(&mut self) {
+    /// Reset every stream-scoped field for a fresh ADS stream.
+    ///
+    /// xDS nonces are scoped to ONE stream, so the first request on a new
+    /// stream must carry an EMPTY `response_nonce` — replaying the previous
+    /// stream's nonce is an expired-nonce signal a control plane may drop the
+    /// request on. The received-version slot is rewound to the last version
+    /// this client actually ACCEPTED for the same reason `build_request` uses
+    /// it: a response that was NACKed must never be re-asserted as the client's
+    /// state, or a version-comparing control plane will withhold the resource
+    /// it already sent and the data plane never converges.
+    fn reset_for_new_stream(&mut self) {
         for subscription in self.subscriptions.values_mut() {
             subscription.last_processed_nonce = None;
+            subscription.last_received_nonce = None;
+            subscription
+                .last_received_version
+                .clone_from(&subscription.last_acked_version);
             subscription.node_sent = false;
         }
     }
@@ -252,14 +269,13 @@ impl StockSubscriptionState {
     ) -> DiscoveryRequest {
         let include_node = self.take_node(type_url);
         let subscription = self.subscriptions.entry(type_url.to_string()).or_default();
-        // A NACK must re-assert the last version the client actually accepted,
-        // while an ACK asserts the version just received.
-        let version_info = if error.is_some() {
-            subscription.last_acked_version.clone()
-        } else {
-            subscription.last_received_version.clone()
-        }
-        .unwrap_or_default();
+        // `version_info` is ALWAYS the last version this client actually
+        // accepted — for an ACK, for a NACK, and for a plain subscription
+        // update alike. The ACK path advances `last_acked_version` *before*
+        // building its request (see `handle_stock_response`), so an ACK still
+        // asserts the version it just accepted, while a NACK and any later
+        // subscription change keep re-asserting the last good one.
+        let version_info = subscription.last_acked_version.clone().unwrap_or_default();
         DiscoveryRequest {
             version_info,
             node: include_node.then(|| node_for(config)),
@@ -624,7 +640,7 @@ async fn run_stock_ads_stream(
         .into_inner();
 
     // Nonces are stream-scoped, and every new stream must re-send `Node`.
-    stream_state.subscriptions.reset_processed_nonces();
+    stream_state.subscriptions.reset_for_new_stream();
 
     for type_url in STOCK_INITIAL_TYPE_URL_ORDER {
         let subscribe = stream_state
@@ -797,8 +813,14 @@ async fn handle_stock_response(
     // security-relevant event, and Ferrum refuses it WITHOUT decoding the key
     // fields or logging any payload.
     if !is_stock_type_url(&type_url) {
+        // `type_url` is a control-plane-supplied string bounded only by the
+        // gRPC message size, and it lands in both a log line and the
+        // `error_detail` echoed back, so it is rendered before either use.
+        let safe_url = diagnostic_value(&type_url);
         let message = if type_url == SDS_TYPE_URL {
-            for resource in &response.resources {
+            // Bounded exactly like `log_refusals`: one volunteered SDS response
+            // must not be able to amplify into an unbounded burst of log lines.
+            for resource in response.resources.iter().take(STOCK_REFUSAL_LOG_LIMIT) {
                 let refusal = refuse_stock_secret(&resource.value);
                 warn!(
                     node_id = %config.node_id,
@@ -810,12 +832,19 @@ async fn handle_stock_response(
                      ingests control-plane-delivered key or trust material"
                 );
             }
+            if response.resources.len() > STOCK_REFUSAL_LOG_LIMIT {
+                warn!(
+                    node_id = %config.node_id,
+                    suppressed = response.resources.len() - STOCK_REFUSAL_LOG_LIMIT,
+                    "Additional refused SDS secrets suppressed by the per-response log bound"
+                );
+            }
             format!(
-                "type_url '{type_url}' is not consumed by the Ferrum stock xDS profile; workload \
+                "type_url '{safe_url}' is not consumed by the Ferrum stock xDS profile; workload \
                  identity and trust anchors come from Ferrum's own SPIFFE configuration"
             )
         } else {
-            format!("type_url '{type_url}' is not subscribed by the Ferrum stock xDS profile")
+            format!("type_url '{safe_url}' is not subscribed by the Ferrum stock xDS profile")
         };
         let mut nack = stream_state
             .subscriptions
@@ -824,7 +853,7 @@ async fn handle_stock_response(
         send_request(tx, nack).await?;
         warn!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = %safe_url,
             "NACKed an unsupported xDS type on the stock profile"
         );
         return Ok(StockResponseOutcome::Nacked);
@@ -902,11 +931,15 @@ async fn handle_stock_response(
         return Ok(StockResponseOutcome::Nacked);
     }
 
+    // Advance the accepted version BEFORE building the ACK: `build_request`
+    // always asserts the last accepted version, so this is what makes the ACK
+    // carry the version it just applied while a later NACK or subscription
+    // update still re-asserts the last good one.
+    stream_state.subscriptions.mark_acked(&type_url);
     let ack = stream_state
         .subscriptions
         .build_request(&type_url, config, None);
     send_request(tx, ack).await?;
-    stream_state.subscriptions.mark_acked(&type_url);
     stream_state.subscriptions.mark_processed(&type_url);
     stream_state.breaker.record_ack(&type_url);
 

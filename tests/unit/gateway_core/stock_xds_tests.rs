@@ -538,6 +538,234 @@ fn stock_removed_endpoints_leave_the_service_without_dialable_workloads() {
 }
 
 #[test]
+fn stock_partial_eds_response_keeps_the_assignments_it_did_not_mention() {
+    // Only CDS/LDS are complete state under SotW. istiod pushes EDS for just
+    // the clusters a change touched ("Cluster was not updated, skip
+    // recomputing"), so an omitted assignment is NOT a deletion — reading it as
+    // one would blackhole every service the update never mentioned.
+    const RATINGS_CLUSTER: &str = "outbound|9080||ratings.default.svc.cluster.local";
+    const RATINGS_SAN: &str = "spiffe://cluster.local/ns/default/sa/bookinfo-ratings";
+
+    let mut accumulator = StockXdsAccumulator::default();
+    accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[
+                any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN])),
+                any(CDS_TYPE_URL, &eds_cluster(RATINGS_CLUSTER, &[RATINGS_SAN])),
+            ],
+            "cds-1",
+        )
+        .expect("CDS applies");
+    accumulator
+        .apply_sotw(
+            EDS_TYPE_URL,
+            &[
+                any(
+                    EDS_TYPE_URL,
+                    &cla(REVIEWS_CLUSTER, vec![lb_endpoint("10.1.2.3", 9080, 1)]),
+                ),
+                any(
+                    EDS_TYPE_URL,
+                    &cla(RATINGS_CLUSTER, vec![lb_endpoint("10.1.2.4", 9080, 1)]),
+                ),
+            ],
+            "eds-1",
+        )
+        .expect("EDS applies");
+
+    // A partial push naming only `reviews`.
+    accumulator
+        .apply_sotw(
+            EDS_TYPE_URL,
+            &[any(
+                EDS_TYPE_URL,
+                &cla(REVIEWS_CLUSTER, vec![lb_endpoint("10.1.2.9", 9080, 1)]),
+            )],
+            "eds-2",
+        )
+        .expect("partial EDS applies");
+
+    let mut addresses: Vec<String> = accumulator
+        .discovery()
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.4".to_string(), "10.1.2.9".to_string()],
+        "the untouched cluster keeps its endpoints; only the pushed one is replaced"
+    );
+}
+
+#[test]
+fn stock_withdrawing_a_cluster_still_deletes_its_merged_endpoints() {
+    // Merging EDS must not make deletion inert: CDS is the complete-state type,
+    // so an assignment no accepted cluster references any more is pruned.
+    let mut accumulator = converged_accumulator();
+    assert_eq!(accumulator.discovery().workloads.len(), 1);
+
+    accumulator
+        .apply_sotw(CDS_TYPE_URL, &[], "cds-2")
+        .expect("empty CDS applies");
+    assert!(accumulator.eds_subscriptions().is_empty());
+    assert!(
+        accumulator.discovery().workloads.is_empty(),
+        "the withdrawn cluster's merged endpoints must not survive as a stale route"
+    );
+
+    // Re-advertising the same cluster must not resurrect the pruned assignment.
+    accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
+            "cds-3",
+        )
+        .expect("CDS re-applies");
+    assert!(
+        accumulator.discovery().workloads.is_empty(),
+        "endpoints come back only when the control plane re-sends the assignment"
+    );
+}
+
+#[test]
+fn stock_partial_rds_response_keeps_the_route_configs_it_did_not_mention() {
+    let mut accumulator = converged_accumulator();
+    accumulator
+        .apply_sotw(
+            LDS_TYPE_URL,
+            &[
+                any(
+                    LDS_TYPE_URL,
+                    &hcm_listener(
+                        "10.96.0.5_9080",
+                        "10.96.0.5",
+                        9080,
+                        "9080",
+                        &["envoy.filters.http.router"],
+                    ),
+                ),
+                any(
+                    LDS_TYPE_URL,
+                    &hcm_listener(
+                        "10.96.0.6_8080",
+                        "10.96.0.6",
+                        8080,
+                        "8080",
+                        &["envoy.filters.http.router"],
+                    ),
+                ),
+            ],
+            "lds-2",
+        )
+        .expect("LDS applies");
+    accumulator
+        .apply_sotw(
+            RDS_TYPE_URL,
+            &[
+                any(
+                    RDS_TYPE_URL,
+                    &route_config("9080", &["10.96.0.5:9080"], REVIEWS_CLUSTER),
+                ),
+                any(
+                    RDS_TYPE_URL,
+                    &route_config("8080", &["10.96.0.6:8080"], REVIEWS_CLUSTER),
+                ),
+            ],
+            "rds-2",
+        )
+        .expect("RDS applies");
+    assert_eq!(accumulator.route_configs().len(), 2);
+
+    // A partial push naming only `9080`.
+    accumulator
+        .apply_sotw(
+            RDS_TYPE_URL,
+            &[any(
+                RDS_TYPE_URL,
+                &route_config("9080", &["10.96.0.5:9080"], REVIEWS_CLUSTER),
+            )],
+            "rds-3",
+        )
+        .expect("partial RDS applies");
+    let mut names: Vec<&str> = accumulator
+        .route_configs()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["8080", "9080"],
+        "an omitted RouteConfiguration is not a deletion on a by-name subscription"
+    );
+
+    // Withdrawing the listener that referenced it IS the deletion.
+    accumulator
+        .apply_sotw(
+            LDS_TYPE_URL,
+            &[any(
+                LDS_TYPE_URL,
+                &hcm_listener(
+                    "10.96.0.5_9080",
+                    "10.96.0.5",
+                    9080,
+                    "9080",
+                    &["envoy.filters.http.router"],
+                ),
+            )],
+            "lds-3",
+        )
+        .expect("LDS applies");
+    let names: Vec<&str> = accumulator
+        .route_configs()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["9080"],
+        "a route configuration no accepted listener references any more is pruned"
+    );
+}
+
+#[test]
+fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
+    // Resource names are control-plane-chosen and bounded only by
+    // `max_resource_bytes`, and they land verbatim in operator log lines.
+    let hostile = format!(
+        "outbound|9080||{}\nWARN forged-log-line\r.example.com",
+        "a".repeat(4096)
+    );
+    let mut cluster = eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]);
+    cluster.name = hostile;
+    let accumulator = cds_with(cluster);
+
+    let refusals = accumulator.refusals();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the hostile cluster name is refused exactly once: {refusals:?}"
+    );
+    let refusal = &refusals[0];
+    assert!(
+        refusal.resource.chars().count() <= 200,
+        "a refusal diagnostic must be length-bounded, got {} chars",
+        refusal.resource.chars().count()
+    );
+    assert!(
+        !refusal.resource.chars().any(char::is_control),
+        "a refusal diagnostic must not carry control characters (log-line forgery)"
+    );
+    assert!(refusal.resource.ends_with("(truncated)"));
+}
+
+#[test]
 fn stock_unhealthy_and_draining_endpoints_are_excluded() {
     let mut accumulator = StockXdsAccumulator::default();
     accumulator
