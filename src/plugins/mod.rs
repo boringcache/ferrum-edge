@@ -1829,18 +1829,17 @@ pub enum ResponsePresentationPolicy {
     /// equivalent configuration derive the same value, so a retained
     /// representation can be proven compatible anywhere.
     Static([u8; 32]),
-    /// The client-visible rewrite is derived from live runtime state — data
-    /// this gateway refreshes from upstream on its own schedule, per session,
-    /// after the plugin was constructed — so no digest computed at construction
-    /// describes it, and no digest of *any* fixed size could without persisting
-    /// the runtime state itself.
+    /// The client-visible rewrite depends on state a construction-time digest
+    /// and the finalized-replay partition do not prove. This includes live data
+    /// the gateway refreshes after construction and a per-request execution
+    /// trigger whose pristine inputs are not all bound by replay keys.
     ///
     /// A proxy carrying such a plugin has no provable presentation policy at
     /// all: the per-proxy fold collapses to `None` and every consumer that
     /// would retain a finalized representation must fail closed. Config
-    /// admission rejects the composition outright
-    /// (`request_deduplication::validate_composition`); this variant is the
-    /// runtime backstop for the paths that only warn.
+    /// admission rejects known intrinsically dynamic compositions outright
+    /// (`request_deduplication::validate_composition`); this variant is also the
+    /// runtime fail-closed path for request-dependent wrapper policy.
     Dynamic,
 }
 

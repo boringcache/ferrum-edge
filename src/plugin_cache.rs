@@ -782,6 +782,15 @@ pub(crate) fn validate_plugin_security_composition(
 ///   does have a context while the others keep applying would half-apply the
 ///   trigger: the same instance would own the header on one response and not on
 ///   the next. Refused instead.
+/// * **Fixed request/response body ceilings.** These limits are folded into the
+///   per-proxy/protocol request view and enforced by the core collectors before
+///   a per-instance hook can evaluate a trigger. Accepting a trigger would make
+///   a skipped instance keep enforcing its limit.
+/// * **Contextless response-trailer declarations.** Named/prefixed/unbounded
+///   trailer ownership is likewise folded per generation and consumed on paths
+///   that do not call back into the instance with a request context. The
+///   request-conditional unbounded variant is safe because its predicate is
+///   evaluated through the wrapped plugin for each request.
 /// * **An identity-reading trigger on an authentication plugin.** `authenticate`
 ///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
@@ -824,6 +833,26 @@ fn trigger_composition_error(
     if plugin.is_initial_response_header_policy() {
         return Some(
             "the plugin owns the initial response-header policy, which is re-asserted without a request context and whose declared header names are published per generation, so a trigger could only be half-applied",
+        );
+    }
+    if plugin.enforced_request_body_limit().is_some() {
+        return Some(
+            "the plugin publishes a fixed per-proxy request-body ceiling that the proxy core enforces before a per-request trigger can be evaluated",
+        );
+    }
+    if plugin.enforced_response_body_limit().is_some() {
+        return Some(
+            "the plugin publishes a fixed per-proxy response-body ceiling that the proxy core enforces outside the per-request plugin hook chain",
+        );
+    }
+    if matches!(
+        plugin.response_trailer_policy(),
+        crate::plugins::ResponseTrailerPolicy::Names(_)
+            | crate::plugins::ResponseTrailerPolicy::NamesAndPrefixes { .. }
+            | crate::plugins::ResponseTrailerPolicy::Unbounded
+    ) {
+        return Some(
+            "the plugin publishes contextless response-trailer ownership into the per-generation policy; use a plugin whose trailer policy is absent or request-conditional",
         );
     }
     if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
@@ -1618,7 +1647,12 @@ impl Plugin for PluginInstanceWrapper {
             .enforces_final_request_body_policy(ctx, headers, body)
     }
     fn needs_final_request_body_context(&self) -> bool {
-        self.inner.needs_final_request_body_context()
+        // Context-free transform/final hooks cannot evaluate this wrapper's
+        // trigger. Force the production dispatcher onto the context-aware
+        // compatibility methods whenever a trigger exists; those methods gate
+        // first and then delegate to an inner context-free implementation when
+        // necessary. Priority-only wrappers preserve the inner capability.
+        self.trigger.is_some() || self.inner.needs_final_request_body_context()
     }
     fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         self.inner
@@ -1670,7 +1704,19 @@ impl Plugin for PluginInstanceWrapper {
     /// edit, and a `Dynamic` contribution would stop poisoning the fold — both
     /// exactly the replays `ResponsePolicyProvenance` exists to retire.
     fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
-        self.inner.response_presentation_policy()
+        match (
+            self.trigger.as_ref(),
+            self.inner.response_presentation_policy(),
+        ) {
+            // A trigger makes a static transform request-dependent. Finalized
+            // response-cache and dedup replays skip presentation transforms,
+            // while their keys do not bind every pristine trigger input (for
+            // example frontend SNI/protocol or a header removed before cache
+            // lookup). Mark the whole proxy policy unprovable so both replay
+            // consumers fail closed instead of crossing a trigger decision.
+            (Some(_), Some(_)) => Some(ResponsePresentationPolicy::Dynamic),
+            (_, policy) => policy,
+        }
     }
     fn applies_response_transport_encoding(&self) -> bool {
         self.inner.applies_response_transport_encoding()
@@ -4276,10 +4322,11 @@ pub struct PluginPhaseData {
     ///
     /// `None` when any enrolled instance reported
     /// `ResponsePresentationPolicy::Dynamic` — its client-visible rewrite comes
-    /// from live runtime state that no construction-time digest describes, so
-    /// this proxy has no provable presentation policy and every replay consumer
-    /// must fail closed. Folding the remaining static members would produce a
-    /// digest that matches while an undescribed transform silently changes.
+    /// from live or per-request state the construction-time digest and replay
+    /// partition do not prove, so this proxy has no provable presentation policy
+    /// and every replay consumer must fail closed. Folding the remaining static
+    /// members would produce a digest that matches while an undescribed
+    /// transform silently changes.
     pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 

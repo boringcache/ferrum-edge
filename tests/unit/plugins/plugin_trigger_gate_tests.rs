@@ -14,13 +14,14 @@ use chrono::Utc;
 use ferrum_edge::_test_support::{
     attach_stream_trigger_decisions_for_test, set_request_wire_protocol_for_test,
 };
-use ferrum_edge::PluginCache;
+use ferrum_edge::{PluginCache, PluginCapabilities};
 use ferrum_edge::config::types::{
     BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    StreamTransactionSummary,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -528,6 +529,105 @@ async fn a_capability_predicate_fails_closed_to_running_before_any_decision_exis
     assert!(plugin.should_buffer_request_body(&unresolved));
 }
 
+#[tokio::test]
+async fn a_trigger_forces_context_aware_dispatch_for_contextless_request_body_hooks() {
+    let rewrite = with_trigger(
+        make_plugin_config_with_json(
+            "rewrite",
+            "request_transformer",
+            json!({"rules": [{
+                "operation": "add", "target": "body", "key": "gated", "value": "yes"
+            }]}),
+            PluginScope::Proxy,
+            Some("api"),
+        ),
+        json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
+    );
+    let cache = PluginCache::new(&config(
+        vec![make_proxy("api", "/api", vec!["rewrite"])],
+        vec![rewrite],
+    ))
+    .expect("triggered request transformer publishes");
+    let capabilities = cache.get_capabilities(NS, "api", ProxyProtocol::Http);
+    assert!(
+        capabilities.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
+        "a trigger needs RequestContext even when the inner body hook uses the compatibility API"
+    );
+    let plugins = cache.get_plugins_for_protocol(NS, "api", ProxyProtocol::Http);
+    let plugin = plugins.first().expect("one published instance");
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let mut running = request("POST", "/api/orders/42");
+    plugin.on_request_received(&mut running).await;
+    let transformed = plugin
+        .transform_request_body_with_context(
+            &mut running,
+            br#"{}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("matching trigger runs the inner contextless transform");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&transformed).expect("transformed JSON"),
+        json!({"gated": "yes"})
+    );
+
+    let mut skipped = request("POST", "/api/health");
+    plugin.on_request_received(&mut skipped).await;
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut skipped,
+                br#"{}"#,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "the context-aware wrapper must suppress a contextless inner body transform on skip"
+    );
+}
+
+#[test]
+fn a_triggered_response_presentation_policy_disables_finalized_replay() {
+    let a2a = make_plugin_config_with_json(
+        "a2a",
+        "a2a_gateway",
+        json!({"discovery": {"public_base_url": "https://agents.example.com"}}),
+        PluginScope::Proxy,
+        Some("api"),
+    );
+    let plain = config(
+        vec![make_proxy("api", "/api", vec!["a2a"])],
+        vec![a2a.clone()],
+    );
+    assert!(
+        PluginCache::new(&plain)
+            .expect("static presentation policy publishes")
+            .request_view(NS, "api", ProxyProtocol::Http)
+            .response_presentation_policy_digest()
+            .is_some(),
+        "a configured public base is normally a provable static presentation policy"
+    );
+
+    let triggered = config(
+        vec![make_proxy("api", "/api", vec!["a2a"])],
+        vec![with_trigger(
+            a2a,
+            json!({"when": {"match": {"sni": {"exact": ["agents.example.com"]}}}}),
+        )],
+    );
+    assert!(
+        PluginCache::new(&triggered)
+            .expect("triggered presentation plugin publishes fail closed")
+            .request_view(NS, "api", ProxyProtocol::Http)
+            .response_presentation_policy_digest()
+            .is_none(),
+        "a finalized replay key does not prove the per-request trigger decision"
+    );
+}
+
 fn html_response_headers() -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), "text/html".to_string())])
 }
@@ -557,12 +657,18 @@ fn release_votes(
 #[tokio::test]
 async fn a_skipped_instance_contributes_no_response_body_release_decision() {
     let gated = with_trigger(
-        builtin("compress", "compression", "api"),
+        make_plugin_config_with_json(
+            "validate",
+            "body_validator",
+            json!({"response_required_fields": ["approved"]}),
+            PluginScope::Proxy,
+            Some("api"),
+        ),
         json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
     );
     let plugins = published(
         &config(
-            vec![make_proxy("api", "/api", vec!["compress"])],
+            vec![make_proxy("api", "/api", vec!["validate"])],
             vec![gated],
         ),
         "api",
@@ -570,20 +676,21 @@ async fn a_skipped_instance_contributes_no_response_body_release_decision() {
     let plugin = plugins.first().expect("one published instance");
     let headers = html_response_headers();
 
-    // `compression` overrides votes 2, 3 and 5; votes 1 and 4 fall through to
-    // the trait default. Three of the five therefore flip between the admitted
-    // and skipped runs, which is what makes the gate observable.
     let mut running = request("GET", "/api/orders/42");
     plugin.on_request_received(&mut running).await;
     assert!(
         !running
             .metadata
-            .contains_key("plugin_trigger.compress.skipped")
+            .contains_key("plugin_trigger.validate.skipped")
     );
-    assert_eq!(
+    assert!(
+        plugin.should_buffer_response_body(&running),
+        "an admitted response validator still requests its configured body"
+    );
+    assert_ne!(
         release_votes(plugin, &running, &headers),
-        [false, false, true, false, true],
-        "an admitted instance answers for itself"
+        [true; 5],
+        "an admitted instance contributes its own release decisions"
     );
 
     let mut skipped = request("GET", "/api/health");
@@ -591,7 +698,7 @@ async fn a_skipped_instance_contributes_no_response_body_release_decision() {
     assert_eq!(
         skipped
             .metadata
-            .get("plugin_trigger.compress.skipped")
+            .get("plugin_trigger.validate.skipped")
             .map(String::as_str),
         Some("true")
     );
@@ -1136,6 +1243,45 @@ fn a_trigger_on_an_initial_response_header_policy_plugin_is_refused() {
         "{error}"
     );
     assert!(error.contains("initial response-header policy"), "{error}");
+}
+
+#[test]
+fn a_trigger_on_a_fixed_core_body_ceiling_is_refused() {
+    for plugin_name in ["request_size_limiting", "response_size_limiting"] {
+        let cfg = config(
+            vec![make_proxy("api", "/api", vec!["limit"])],
+            vec![with_trigger(
+                builtin("limit", plugin_name, "api"),
+                json!({"when": {"match": {"path": {"prefix": ["/api/uploads"]}}}}),
+            )],
+        );
+        let error = publication_error(&cfg);
+        assert!(
+            error.contains("cannot carry an execution trigger"),
+            "{plugin_name}: {error}"
+        );
+        assert!(
+            error.contains("fixed per-proxy") && error.contains("body ceiling"),
+            "{plugin_name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_trigger_on_a_contextless_response_trailer_policy_is_refused() {
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["rewrite"])],
+        vec![with_trigger(
+            builtin("rewrite", "response_transformer", "api"),
+            json!({"when": {"match": {"path": {"prefix": ["/api/public"]}}}}),
+        )],
+    );
+    let error = publication_error(&cfg);
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
+    assert!(error.contains("response-trailer ownership"), "{error}");
 }
 
 /// A stream-only plugin can never reach the HTTP pipeline, and an identity

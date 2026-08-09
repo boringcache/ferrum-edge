@@ -154,12 +154,14 @@ An absent `trigger` preserves today's behavior exactly.
 
 ```yaml
 plugin_configs:
-  - id: waf-external-only
-    plugin_name: request_size_limiting
+  - id: mark-external-only
+    plugin_name: request_transformer
     scope: proxy
     proxy_id: orders-api
     enabled: true
-    config: { max_body_size: 1048576 }
+    config:
+      rules:
+        - { operation: add, target: header, key: x-external, value: "true" }
     trigger:
       when:
         not:
@@ -177,11 +179,15 @@ instance makes no external call, takes no lease, and retains no state.
 Some surfaces cannot be gated coherently and are refused at publication rather
 than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
 contextless initial response-header policy (`security_headers`), an identity
-predicate on an authentication plugin, and an identity predicate on a
-stream-only plugin. An identity predicate (`consumer` / `auth_method` /
+predicate on an authentication plugin, an identity predicate on a stream-only
+plugin, fixed core request/response body ceilings, and contextless
+response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
 `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
-both families it governs the HTTP half only.
+both families it governs the HTTP half only. A triggered response-presentation
+transform makes finalized response-cache/dedup replay provenance unprovable;
+those replay consumers fail closed rather than reuse bytes across two trigger
+decisions.
 
 See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
 for the full predicate table, the deterministic absent/multi-value/case rules,

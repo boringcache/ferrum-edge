@@ -8694,6 +8694,11 @@ components:
         A trigger is evaluated at most once per request per instance and the
         outcome is memoized, so every phase of that instance agrees even after a
         later plugin rewrites the path, headers, or query.
+
+        Plugins that publish fixed core body ceilings or contextless initial-
+        header/response-trailer policy are rejected rather than half-gated. A
+        trigger on a response-presentation transform also makes finalized cache
+        or dedup replay provenance unprovable, so replay consumers fail closed.
       properties:
         when:
           $ref: "#/components/schemas/PluginTriggerNode"

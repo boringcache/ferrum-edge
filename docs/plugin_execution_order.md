@@ -1161,12 +1161,14 @@ selection, mesh routing, or a plugin's own business-policy matchers (for example
 
 ```yaml
 plugin_configs:
-  - id: audit-writes-only
-    plugin_name: http_logging
+  - id: mark-writes-only
+    plugin_name: request_transformer
     scope: proxy
     proxy_id: orders-api
     enabled: true
-    config: { endpoint: "https://logs.internal/ingest" }
+    config:
+      rules:
+        - { operation: add, target: header, key: x-write, value: "true" }
     trigger:
       when:
         all:
@@ -1303,6 +1305,15 @@ request, and gating them would make plugin-cache composition admission depend on
 request data. Scope merge, protocol filtering, instance identity, priority
 override, and lifecycle order are all unchanged.
 
+A response-presentation contribution is different: finalized response-cache and
+request-deduplication replays deliberately skip those transforms. Once such an
+instance has a trigger, its effective presentation is request-dependent and the
+replay keys do not prove every pristine trigger input (for example frontend SNI
+or wire protocol). The plugin cache therefore marks that proxy's presentation
+policy **unprovable**. Response caching stores and replays nothing, and request
+deduplication refuses to retain or replay a representation, rather than crossing
+a trigger decision.
+
 ### Phases outside the trigger boundary (fail-closed)
 
 `on_ws_frame`, `on_ws_reassembly_frames`, `on_ws_disconnect`, and
@@ -1322,6 +1333,15 @@ assembly, and the names it declares are folded into a per-generation list the H3
 cross-protocol bridge carries. Gating only the one call site that has a context
 would leave the same instance owning the header on one response and not on the
 next, so a trigger on such a plugin is rejected outright.
+
+Fixed core request/response body ceilings are also refused. They are folded into
+the per-proxy/protocol request view and enforced by collectors outside the
+instance hook chain, so a false trigger could not remove them. The same rule
+applies to contextless response-trailer declarations (`Names`,
+`NamesAndPrefixes`, or `Unbounded`), which are folded per generation and applied
+without asking the instance again. `RequestConditionalUnbounded` remains
+supported because its per-request predicate is evaluated through the triggered
+wrapper.
 
 The `log` phase (12) receives only a `TransactionSummary` and is likewise not
 gated; a triggered logger still emits its record for a request whose earlier
