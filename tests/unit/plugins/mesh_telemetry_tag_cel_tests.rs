@@ -208,6 +208,8 @@ fn rejects_unsupported_malformed_and_costly_cel() {
 #[tokio::test]
 async fn tag_override_reload_update_and_delete_change_emitted_labels() {
     let first = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "labels": {"app": "frontend"},
         "metrics": {
             "tag_overrides": [{
                 "metric": "REQUEST_COUNT",
@@ -218,6 +220,8 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
     }))
     .expect("first generation");
     let updated = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "labels": {"app": "frontend"},
         "metrics": {
             "tag_overrides": [{
                 "metric": "REQUEST_COUNT",
@@ -227,8 +231,12 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
         }
     }))
     .expect("updated generation");
-    let deleted =
-        WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": []}})).expect("deleted");
+    let deleted = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "labels": {"app": "frontend"},
+        "metrics": {"tag_overrides": []}
+    }))
+    .expect("deleted");
 
     async fn emit(plugin: &WorkloadMetrics) -> String {
         let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
