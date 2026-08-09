@@ -15270,7 +15270,12 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.mtls_port", peer_a.port.to_string()),
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
-    h3_mesh_reload(&mut gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
+    h3_mesh_reload(
+        &mut gateway,
+        config_for(&corrupted_tags, 3),
+        &corrupted_tags,
+    )
+    .await;
     let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
