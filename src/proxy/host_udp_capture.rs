@@ -439,7 +439,7 @@ impl HostUdpIdentityIndex {
 
     /// Per-datagram admission check: one lock-free snapshot load, one hash lookup,
     /// one address comparison, and one `Arc` retain for the authorized binding.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[allow(dead_code)] // Library test seam; the binary uses `authorized_binding` directly.
     pub fn authorize(
         &self,
         ingress_ifindex: Option<u32>,
@@ -474,7 +474,7 @@ impl HostUdpIdentityIndex {
     }
 
     /// Resolve attested evidence from one authorization snapshot.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[allow(dead_code)] // Library test seam; the binary retains the authorized binding instead.
     pub fn identity_for(
         &self,
         ingress_ifindex: Option<u32>,
