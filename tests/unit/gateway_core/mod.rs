@@ -39,6 +39,7 @@ mod http3_selected_target_policy_tests;
 mod http3_server_dispatch_tests;
 mod http3_websocket_tests;
 mod json_dup_keys_tests;
+mod k8s_listenerset_translation_tests;
 mod k8s_status_planning_tests;
 mod k8s_status_snapshot_tests;
 mod k8s_udproute_translation_tests;

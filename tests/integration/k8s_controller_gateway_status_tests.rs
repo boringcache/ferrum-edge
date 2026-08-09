@@ -2,7 +2,8 @@
 //! materialization records.
 
 use ferrum_edge::config_sources::k8s::{
-    GatewayApiListenerKey, K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, K8sMetadata, K8sObject,
+    K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -1627,6 +1628,7 @@ fn effective_different_credentials_across_namespaces_refuse_both_effective_claim
             .listener_conflicts
             .contains_key(&GatewayApiListenerKey {
                 namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
                 gateway: "edge-a".to_string(),
                 listener: "https".to_string(),
             }),
@@ -1638,6 +1640,7 @@ fn effective_different_credentials_across_namespaces_refuse_both_effective_claim
             .listener_conflicts
             .contains_key(&GatewayApiListenerKey {
                 namespace: "other".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
                 gateway: "other-edge".to_string(),
                 listener: "https".to_string(),
             }),
@@ -1649,6 +1652,7 @@ fn effective_different_credentials_across_namespaces_refuse_both_effective_claim
             .listener_conflicts
             .contains_key(&GatewayApiListenerKey {
                 namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
                 gateway: "edge-b".to_string(),
                 listener: "https".to_string(),
             }),
@@ -1897,8 +1901,8 @@ fn same_slot_listener_ambiguity_reports_both_routes_conflicted_in_status() {
         assert_eq!(
             refused,
             vec![
-                "route-a on default/edge-a#http".to_string(),
-                "route-b on default/edge-b#http".to_string(),
+                "route-a on Gateway/default/edge-a#http".to_string(),
+                "route-b on Gateway/default/edge-b#http".to_string(),
             ],
             "both claims must be refused, each named by its exact listener"
         );
