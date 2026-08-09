@@ -419,7 +419,14 @@ pub async fn peek_client_hello_sni(
 
     let mut buf = vec![0u8; initial_peek_capacity()];
 
-    let deadline = tokio::time::Instant::now() + d;
+    let now = tokio::time::Instant::now();
+    let deadline = match now.checked_add(d) {
+        Some(deadline) => deadline,
+        // Internal callers can supply a Duration directly. Keep that boundary
+        // panic-free and fail closed if the requested Instant is not
+        // representable instead of accidentally disabling the timeout.
+        None => now,
+    };
     let mut have = 0usize;
     loop {
         match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {

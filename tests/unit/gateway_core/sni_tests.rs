@@ -1727,6 +1727,30 @@ async fn peek_reports_timeout_for_a_silent_peer() {
 }
 
 #[tokio::test]
+async fn peek_unrepresentable_timeout_fails_closed_without_panicking() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::MAX)).await
+    });
+
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), accept_task)
+        .await
+        .expect("an unrepresentable deadline must fail immediately")
+        .expect("accept task");
+
+    assert_eq!(
+        outcome,
+        ClientHelloSni::Indeterminate(SniPeekFailure::Timeout)
+    );
+}
+
+#[tokio::test]
 async fn peek_reports_oversized_when_the_hello_exceeds_the_hard_bound() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
