@@ -771,6 +771,31 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
+### Mesh UDP capture is a separate datapath
+
+Everything above describes a **configured** UDP proxy: an operator-declared
+`listen_port`, an explicit backend, and sessions keyed by client source address.
+Service-mesh UDP capture is a different entry point into the same session,
+relay, overload, and idle-expiry machinery — there is no `listen_port` because
+datagrams arrive transparently, and the destination is recovered per datagram
+from the `IP_RECVORIGDSTADDR` cmsg (netfilter `TPROXY` delivers without rewriting
+it, which is why capture cannot use the TCP `REDIRECT` model).
+
+Captured sessions are keyed by `(client, original destination)` rather than by
+client alone, and Ambient offers two capture **placements** with identical
+downstream behaviour:
+
+- **Per-pod-netns producer** (default) — rules and socket inside each enrolled
+  pod's network namespace.
+- **Host-network capture** (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true`,
+  issue #3288) — one transparent socket in the mesh proxy's own namespace, with
+  `mangle PREROUTING` rules scoped per enrolled pod's host-side interface and each
+  datagram attributed to a pod by that interface plus its registered source
+  address.
+
+See [mesh.md](mesh.md) → "UDP TPROXY capture" and "Host-network UDP capture" for
+the capture rules, identity model, and fail-closed contract.
+
 ## Kubernetes Gateway API (`TCPRoute` / `UDPRoute`)
 
 Stream proxies can also be produced by the Kubernetes controller instead of

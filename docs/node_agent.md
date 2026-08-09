@@ -345,10 +345,40 @@ listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
 netns and `SYS_ADMIN`/`SYS_PTRACE` for `setns(CLONE_NEWNET)` — plus **`NET_ADMIN`**
 to install the in-netns `iptables`/`ip` TPROXY rules and to bind the
 `IP_TRANSPARENT` capture and reply sockets, and `iptables`/`ip6tables`/`ip`/`sh`
-present in the proxy image. The proxy's own (host) network namespace is never
-given UDP TPROXY rules — the host-netns iptables fallback emits none (there is no
-host-netns-safe direction discriminator); the rules live **only** inside each pod
-netns.
+present in the proxy image. Its rules live **only** inside each pod netns; the
+node-agent's own host-netns iptables fallback emits none (there is no
+host-netns-safe `addrtype` direction discriminator, and the node-agent has no UDP
+listener to serve them).
+
+### Host-network UDP capture placement (issue #3288)
+
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on the **ambient proxy** (with
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`) moves UDP source-capture into the proxy's
+own network namespace instead. The **node-agent's role is unchanged**: it still
+publishes the per-pod registry and still keeps each pod's BPF UDP gate closed
+until the producer publishes `<registry_dir>/.udp-ready/<pod_uid>`, and it still
+installs no UDP rules of its own. What changes is where the rules and the socket
+live.
+
+Direction is discriminated by INGRESS INTERFACE — `mangle PREROUTING -i <the
+pod's host-side interface>` — which is exact in the host namespace: a pod's egress
+is the only traffic entering there on that pod's own interface, pod-destined
+traffic arrives on the node uplink, and the node's own traffic is locally
+generated and traverses `OUTPUT` only. **No `mangle OUTPUT` chain is installed at
+all**, so node traffic cannot be captured. Each datagram is attributed to a pod by
+its ingress interface index plus its registry-published source address; anything
+not attributable to exactly one enrolled pod is dropped rather than relayed under
+an absent or neighbouring identity, and two pods resolving to one interface are
+both refused.
+
+This placement enters no namespace, so it needs `NET_ADMIN` and the capture tools
+but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart narrows the ambient
+DaemonSet's capabilities accordingly. It keeps the registry hostPath and the
+read-only host cgroup mount (the enrolled-pod set and interface resolution use
+them), and falls back to the host route table keyed on the registry-published pod
+IP when host `/proc` is not shared. It requires a CNI that gives each pod its own
+host-side interface. Full behaviour, ownership, and the placement-migration
+constraint are in [`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

@@ -2290,14 +2290,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   netns), where pod IPs are **FORWARDED, not `LOCAL`**, so inbound UDP to a pod
   would match the OUTBOUND chain's `! --dst-type LOCAL` discriminator and be
   mis-captured as egress. There is no host-netns-safe `addrtype`-style
-  discriminator without per-pod IP knowledge the iptables fallback does not carry,
-  so the **node-agent's host-netns iptables fallback emits NO UDP TPROXY rules**
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family`) and
-  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **Node-agent
-  host-netns UDP capture is unsupported in this stage**, and **eBPF does not cover
-  UDP either** — the eBPF capture programs are `connect()`-cgroup-hooked and
-  TCP-only (no UDP hooks; see the node-waypoint UDP/DTLS limitation above). UDP
-  capture lives in the **injector's pod-netns path** (its iptables init container
+  discriminator, so the **node-agent's host-netns iptables fallback emits NO UDP
+  TPROXY rules** (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family`) and logs the limitation when
+  `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. The node-agent has no UDP listener
+  either, and rules without a socket are a black hole, so it stays out of the UDP
+  datapath entirely; **eBPF does not cover UDP** — the eBPF capture programs are
+  `connect()`-cgroup-hooked and TCP-only (no UDP hooks; see the node-waypoint
+  UDP/DTLS limitation above). What DOES capture UDP in the host namespace is the
+  mesh proxy's **host-network UDP capture path**
+  (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`, issue #3288), which replaces the
+  `addrtype` split with an **ingress-interface** split — see "Host-network UDP
+  capture" below. UDP capture otherwise lives in the **injector's pod-netns path**
+  (its iptables init container
   runs in the pod netns, where the pod IP is `LOCAL` so the direction split holds);
   node-agent / node-waypoint UDP capture is a **future stage**.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
@@ -2355,14 +2360,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `FERRUM_MESH_CAPTURE_UDP_PORT`, and `FERRUM_MESH_TPROXY_MARK` from the **same**
   injector config that drives the init container's TPROXY rules (these are not in
   `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env). The
-  **node-agent / ambient host-netns** path still installs no UDP TPROXY rules
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family` —
-  the `--dst-type LOCAL` direction split is unsafe in the host netns). Ambient's
-  UDP source-capture instead rides the **per-pod-netns producer** (#2013, see the
-  end-to-end status bullet under Stages 3–4): it installs the UDP TPROXY rules and
-  binds the transparent sockets INSIDE each enrolled pod's netns via `setns`, so
-  the host-netns "no UDP rules" invariant is **preserved** while Ambient still
-  captures UDP. eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
+  **pod-netns rule generator** still installs no UDP TPROXY rules for
+  `host_netns` (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family` — the `--dst-type LOCAL` direction split is
+  unsafe in the host netns). Ambient's UDP source-capture rides one of two
+  placements, both consuming the same relay/session machinery:
+
+  * **Per-pod-netns producer** (#2013, the default; see the end-to-end status
+    bullet under Stages 3–4): installs the UDP TPROXY rules and binds the
+    transparent sockets INSIDE each enrolled pod's netns via `setns`.
+  * **Host-network capture** (#3288, `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true`;
+    see "Host-network UDP capture" below): installs interface-scoped rules and one
+    transparent socket in the proxy's own namespace, entering no pod namespace.
+
+  eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
   malformed settings:** on a capture-relay
   runtime (Ambient or Sidecar), when the flag is set but a UDP capture var is
   malformed, mesh startup aborts (`serve_mesh_runtime` validates the env before
@@ -2885,6 +2896,84 @@ nodeAgent:
 ```
 
 Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` for kernel-backcompat on 5.7.x and for every `node_waypoint` deployment's pod-netns `setns()`/veth discovery. Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`, `hostPID: true`. See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
+
+### Host-network UDP capture (issue #3288)
+
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` (default `false`, requires
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true` and `FERRUM_MESH_TOPOLOGY=ambient`) moves
+Ambient's UDP source-capture from each pod's network namespace into the mesh
+proxy's own. Setting it without the capture switch is a **startup error**, not a
+silent no-op. It captures the same traffic and feeds the same session, relay,
+overload, and return-path machinery as the per-pod-netns producer — only the
+placement differs.
+
+**Why the host namespace needed a different mechanism.** The pod-netns generator
+splits inbound from outbound with `-m addrtype --dst-type LOCAL`, which is only
+true inside a pod. In the host namespace pod IPs are forwarded, not local, so
+inbound-to-pod UDP would match the outbound chain's `! --dst-type LOCAL` and be
+mis-captured. The host path therefore does not use `addrtype` at all.
+
+**The discriminator is the ingress interface.** In `mangle PREROUTING`, every
+capture rule carries `-i <that pod's host-side interface>`:
+
+| Traffic | Where it appears in the host namespace | Captured? |
+|---|---|---|
+| An enrolled pod's egress | `PREROUTING` on **that pod's** interface | **Yes** — this is the whole capture set |
+| Traffic destined for a pod | `PREROUTING` on the **node uplink**, then forwarded | No — never matches a pod interface |
+| The node's own traffic (kubelet, CNI, DNS, `hostNetwork` pods, the proxy's own relay egress) | `OUTPUT` only | No — **the host path installs no `mangle OUTPUT` chain at all** |
+
+That last row is structural, not a filter: there is no OUTPUT chain, no `-j MARK`,
+and no loopback reinjection loop, so node traffic cannot be captured even by
+misconfiguration.
+
+**Per-datagram identity.** One transparent socket serves every enrolled pod, so
+evidence is resolved per datagram from two kernel-provided facts — the original
+destination (`IP_RECVORIGDSTADDR`, un-rewritten by TPROXY) and the ingress
+interface index (`IP_PKTINFO`/`IPV6_PKTINFO`, a fatal `setsockopt` for this path).
+The interface index must map to exactly one enrolled pod **and** the datagram's
+source address must be one that pod published in the registry. Neither fact comes
+from the datagram payload, so forging a source address does not change which
+interface a packet entered on. A datagram failing either check is dropped; the
+path never falls back to an unattested or mesh-wide identity.
+
+**Requires per-pod host interfaces.** Two enrolled pods resolving to one interface
+(a shared-bridge CNI, or a stale registry entry on a recycled veth) make
+attribution ambiguous, so **both** are refused — first-wins would be a
+cross-tenant identity bug. Refused pods are not captured and their readiness
+marker is withheld, so the node-agent's tc guard keeps their UDP egress closed
+rather than letting it bypass the mesh. A pod is also refused when it has no
+attested SPIFFE identity, no published address, an unresolvable interface, or a
+name this path will not place in an `iptables -i` argument (notably a `+` suffix,
+which would be a prefix wildcard).
+
+**Privileges.** `NET_ADMIN` plus `iproute2`/`iptables` in the image — but **not**
+`hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no namespace is entered. The
+chart narrows those capabilities automatically when this placement is selected.
+The registry hostPath and read-only host cgroup mount stay (the enrolled-pod set
+and interface resolution use them); interface resolution falls back to the host
+route table keyed on the registry-published pod IP when `/proc` is not shared.
+
+**Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
+guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
+priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
+node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
+the other's state. Startup reaps the previous generation before installing
+anything; a deployment that is **not** using this placement reaps host state
+unconditionally, so a switched-away node cannot keep a jump into a chain no socket
+serves. Reconciliation rebuilds the chain's contents behind a scope-exact DROP
+guard while the `PREROUTING` jump stays constant; guard install, capture install,
+socket bind, or guard release failing all leave the node dropping enrolled UDP
+egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
+the node-agent to acknowledge that its BPF gates closed, and only then removes
+everything; without the acknowledgement it retains the DROP guard.
+
+**Placement migration.** This path reaps only host-namespace state. Rules a
+previous per-pod-netns generation installed live inside each pod's namespace and
+are destroyed with it, so switching placement on a running node leaves
+already-running pods diverting UDP to a socket that no longer exists there —
+fail-closed (dropped), but not captured. Roll the workloads, or do one
+transitional rollout with UDP capture disabled so the pod-netns cleanup manager
+reaps them first.
 
 ### Ambient UDP upgrade notes
 

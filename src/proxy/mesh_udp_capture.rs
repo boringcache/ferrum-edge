@@ -298,6 +298,58 @@ impl ReplySocketFactory for PodNetnsReplySocketFactory {
     }
 }
 
+/// Where a captured datagram's source evidence comes from.
+///
+/// The two capture placements differ in exactly this: a pod-netns (or Sidecar)
+/// socket serves ONE workload, so its evidence is fixed for the socket's whole
+/// lifetime; the host-namespace socket (issue #3288) serves every enrolled pod on
+/// the node, so evidence has to be derived per datagram from kernel-reported
+/// facts. Everything downstream — session keying, DoS bounds, the relay, the
+/// return path — is identical.
+#[cfg(target_os = "linux")]
+pub(crate) enum CapturedSourceEvidence {
+    /// Fixed per producer. `None` keeps the mesh-wide authorization posture for
+    /// the Sidecar listener and for old/malformed registry entries.
+    Fixed(Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>),
+    /// Resolved per datagram from the ingress interface index plus the source
+    /// address, both kernel-provided. Fails closed: a datagram that cannot be
+    /// attributed to exactly one enrolled pod is dropped, never relayed under an
+    /// absent or neighbouring identity.
+    HostIngress(std::sync::Arc<super::host_udp_capture::HostUdpIdentityIndex>),
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedSourceEvidence {
+    /// Per-datagram admission. Deliberately clone-free so the `Fixed` arm costs
+    /// nothing on the receive path and the `HostIngress` arm costs one lock-free
+    /// snapshot load plus a hash lookup.
+    fn authorize(
+        &self,
+        ingress_ifindex: Option<u32>,
+        client: SocketAddr,
+    ) -> Result<(), &'static str> {
+        match self {
+            Self::Fixed(_) => Ok(()),
+            Self::HostIngress(index) => index
+                .authorize(ingress_ifindex, client.ip())
+                .map_err(super::host_udp_capture::HostUdpDatagramRefusal::as_str),
+        }
+    }
+
+    /// Evidence for an already-authorized datagram, resolved only when a session
+    /// is admitted so the `Arc` clone stays off the refresh path.
+    fn identity_for(
+        &self,
+        ingress_ifindex: Option<u32>,
+        client: SocketAddr,
+    ) -> Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>> {
+        match self {
+            Self::Fixed(identity) => identity.clone(),
+            Self::HostIngress(index) => index.identity_for(ingress_ifindex, client.ip()),
+        }
+    }
+}
+
 /// Bind the transparent UDP capture socket on `addr` in the CURRENT network
 /// namespace, preferring the dual-stack `[::]` bind and falling back to the v4
 /// wildcard only when IPv6 is genuinely unavailable. Returns the bound std
@@ -307,6 +359,25 @@ impl ReplySocketFactory for PodNetnsReplySocketFactory {
 #[cfg(target_os = "linux")]
 pub(crate) fn bind_mesh_udp_capture_socket(
     addr: SocketAddr,
+) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
+    bind_mesh_udp_capture_socket_with_pktinfo(addr, false)
+}
+
+/// As [`bind_mesh_udp_capture_socket`], additionally requesting the ingress
+/// interface cmsg (`IP_PKTINFO` / `IPV6_RECVPKTINFO`) when `require_pktinfo` is
+/// set.
+///
+/// The host-namespace capture socket (issue #3288) attributes each datagram to a
+/// pod BY that interface index, so the option is FATAL there: a socket that
+/// cannot report the ingress interface could only deliver unattributable
+/// datagrams, and the correct response is to refuse the bind rather than to run a
+/// capture path whose identity checks would refuse every datagram. The
+/// pod-netns/Sidecar placements pass `false` — their evidence is fixed per
+/// socket, so they neither need the cmsg nor should pay to parse it.
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_mesh_udp_capture_socket_with_pktinfo(
+    addr: SocketAddr,
+    require_pktinfo: bool,
 ) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
@@ -366,6 +437,37 @@ pub(crate) fn bind_mesh_udp_capture_socket(
                 ));
             }
 
+            if require_pktinfo {
+                // IP(v6)_PKTINFO surfaces the INGRESS interface index per
+                // datagram, which is the host-namespace placement's identity key.
+                // Both families are requested (the dual-stack socket sees v4 and
+                // v6 datagrams) and at least one must succeed for the family this
+                // socket actually binds; a kernel that supports neither cannot
+                // attribute anything, so refuse the bind instead of coming up as
+                // a capture path that drops every datagram.
+                let v4_pktinfo = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
+                let v6_pktinfo = match bind_addr.ip() {
+                    IpAddr::V4(_) => false,
+                    IpAddr::V6(_) => crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok(),
+                };
+                let sufficient = match bind_addr.ip() {
+                    IpAddr::V4(_) => v4_pktinfo,
+                    // A dual-stack `[::]` socket needs BOTH: the v6 option covers
+                    // native IPv6 datagrams and the v4 option covers the
+                    // v4-mapped ones, and an unattributable family would be
+                    // dropped wholesale at the identity check.
+                    IpAddr::V6(_) => v4_pktinfo && v6_pktinfo,
+                };
+                if !sufficient {
+                    return Err(anyhow::anyhow!(
+                        "mesh UDP capture: IP_PKTINFO/IPV6_RECVPKTINFO setsockopt failed \
+                         (v4={v4_pktinfo}, v6={v6_pktinfo}); the host-network capture path \
+                         attributes each datagram by its ingress interface and cannot run \
+                         without it"
+                    ));
+                }
+            }
+
             socket.bind(&bind_addr.into())?;
             Ok((socket.into(), v4_origdst, v6_origdst))
         };
@@ -403,10 +505,10 @@ pub(crate) struct MeshUdpCaptureRuntime {
     pub recvmmsg_batch_size: usize,
     pub session_shard_amount: usize,
     pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
-    /// Per-pod evidence fixed by the Ambient capture manager. `None` for the
-    /// Sidecar current-netns listener and for old/malformed registry entries;
-    /// those sessions retain the mesh-wide authorization posture.
-    pub source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
+    /// Where each captured datagram's source evidence comes from: fixed per
+    /// producer for the pod-netns/Sidecar placements, or resolved per datagram
+    /// from the ingress interface for the host-network placement.
+    pub source_identity: CapturedSourceEvidence,
     /// Builds each session's transparent reply socket in the SAME netns as the
     /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
@@ -446,7 +548,7 @@ pub async fn start_mesh_udp_capture_listener(
             recvmmsg_batch_size,
             session_shard_amount,
             session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
-            source_identity: None,
+            source_identity: CapturedSourceEvidence::Fixed(None),
             reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
         },
         shutdown,
@@ -577,6 +679,12 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                             for i in 0..n {
                                 let (data, client) = recv_batch.datagram(i);
                                 let orig_dst = recv_batch.orig_dst(i);
+                                // Ingress interface index from the IP(v6)_PKTINFO
+                                // cmsg. `None` for placements that did not enable
+                                // pktinfo (pod-netns / Sidecar), which is fine —
+                                // their evidence is fixed and ignores it.
+                                let ingress_ifindex =
+                                    recv_batch.local_addr(i).map(|local| local.ifindex);
                                 let gro = recv_batch.gro_segment_size(i);
                                 // GRO may coalesce many datagrams into one buffer;
                                 // frame EACH segment separately (a coalesced
@@ -590,8 +698,9 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                                 &state,
                                                 client,
                                                 orig_dst,
+                                                ingress_ifindex,
                                                 chunk,
-                                                source_identity.as_ref(),
+                                                &source_identity,
                                                 &reply_socket_factory,
                                                 &session_stop_rx,
                                                 &mut session_tasks,
@@ -605,8 +714,9 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                             &state,
                                             client,
                                             orig_dst,
+                                            ingress_ifindex,
                                             data,
-                                            source_identity.as_ref(),
+                                            &source_identity,
                                             &reply_socket_factory,
                                             &session_stop_rx,
                                             &mut session_tasks,
@@ -766,8 +876,9 @@ fn handle_captured_datagram(
     state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
+    ingress_ifindex: Option<u32>,
     data: &[u8],
-    source_identity: Option<&std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
+    source_identity: &CapturedSourceEvidence,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
     session_shutdown: &watch::Receiver<bool>,
     session_tasks: &mut tokio::task::JoinSet<()>,
@@ -779,6 +890,26 @@ fn handle_captured_datagram(
     // orig-dst family on the reply path AND keys the session consistently (codex
     // r2 P1). Genuine IPv6 clients are unchanged.
     let client = canonicalize_socket_addr(client);
+
+    // Source attribution runs BEFORE routing, keying, or slot reservation, and on
+    // EVERY datagram — not only at admission. On the host-network capture socket
+    // one workload's unenrollment or a spoofed source must stop being relayed
+    // immediately, not when the session happens to idle out; and a refused
+    // datagram must never reserve a session slot, so an unattributable flood
+    // cannot evict attributable flows. The `Fixed` placements short-circuit to
+    // `Ok(())` with no work.
+    if let Err(reason) = source_identity.authorize(ingress_ifindex, client) {
+        debug!(
+            client = %client,
+            // `0` is the kernel's "unspecified interface" value, so it doubles as
+            // the absent-cmsg marker without logging an `Option`.
+            ingress_ifindex = ingress_ifindex.unwrap_or(0),
+            reason,
+            "Mesh UDP capture: dropping datagram whose source could not be attributed to an \
+             enrolled workload"
+        );
+        return false;
+    }
 
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
@@ -856,7 +987,7 @@ fn handle_captured_datagram(
                 queued_bytes,
                 outcome_signal,
                 epoch,
-                source_identity.cloned(),
+                source_identity.identity_for(ingress_ifindex, client),
                 reply_factory.clone(),
                 session_shutdown.clone(),
                 session_tasks,

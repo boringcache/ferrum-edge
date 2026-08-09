@@ -84,6 +84,7 @@ mod mesh_ew_egress_e2e_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
 mod mesh_hbone_tests;
+mod mesh_host_udp_capture_tests;
 mod mesh_k8s_pod_discovery_tests;
 mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;

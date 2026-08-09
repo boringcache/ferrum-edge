@@ -34,6 +34,26 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
+{{- /* Host-network UDP capture placement (issue #3288). The proxy already runs
+       in the host network namespace, so this placement installs its
+       interface-scoped mangle rules and binds its transparent socket there —
+       it needs NET_ADMIN (always granted below) but NOT the setns privilege set
+       (hostPID + SYS_ADMIN + SYS_PTRACE) the per-pod-netns producer requires.
+       Same strict `true`/`1` predicate as the capture switch. */ -}}
+{{- $ambientUdpHostNetns := false -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED" -}}
+{{- $ambientUdpHostNetns = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED")))) (list "true" "1") -}}
+{{- end -}}
+{{- /* Mirror the Rust fail-closed gate (`udp_capture_settings_from_env`): the
+       host placement is a choice of WHERE UDP capture runs, not a second feature
+       switch, so enabling it alone would render privileges and a registry mount
+       for a producer that never starts. */ -}}
+{{- if and $ambientUdpHostNetns (not $ambientUdpCaptureEnabled) -}}
+{{- fail "ambient FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_CAPTURE_UDP_ENABLED=true" -}}
+{{- end -}}
+{{- if and $ambientUdpHostNetns (ne $ambientTopology "ambient") -}}
+{{- fail "ambient FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient" -}}
+{{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,
        even when captureMode=iptables. The node-agent must then hit the Rust
@@ -52,10 +72,21 @@
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires nodeAgent.captureMode=ebpf so the node-agent enrolls pods and publishes the registry" -}}
 {{- end -}}
 {{- end -}}
-{{- /* In-netns capture (NodeWaypoint TCP, the Ambient UDP producer, or its
-       disabled stale-rule cleanup) requires the shared registry, host
-       cgroup/proc, tools-capable image, and setns caps. */ -}}
+{{- /* Registry + host cgroup + tools-capable image: needed by NodeWaypoint TCP,
+       BOTH Ambient UDP placements, and the disabled stale-rule cleanup. The host
+       placement uses the registry for the enrolled-pod set and the cgroup mount
+       to resolve each pod's host-side interface. */ -}}
 {{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
+{{- /* setns privileges (hostPID + SYS_ADMIN + SYS_PTRACE) are needed ONLY by the
+       placements that enter another namespace: NodeWaypoint's in-netns TCP
+       listeners and the per-pod-netns UDP producer. The host-network UDP
+       placement deliberately does not, which is most of its value — it captures
+       UDP on clusters that will not grant those capabilities. Keeping the gate
+       narrow means enabling it does not silently widen the DaemonSet's
+       privileges. Note the disabled-cleanup manager still enters pod netns to
+       reap predecessor rules, so the lifecycle term keeps them when UDP capture
+       is off. */ -}}
+{{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (not $ambientUdpHostNetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -141,7 +172,7 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
-      {{- if $ambientInNetnsCapture }}
+      {{- if $ambientSetnsCapture }}
       hostPID: true
       {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
@@ -163,10 +194,13 @@ spec:
                 {{- end }}
                 - NET_ADMIN
                 - NET_RAW
-                {{- if $ambientInNetnsCapture }}
+                {{- if $ambientSetnsCapture }}
                 {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
-                       shared by the NodeWaypoint TCP path and the Ambient UDP
-                       producer. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */}}
+                       shared by the NodeWaypoint TCP path and the per-pod-netns
+                       Ambient UDP producer. The host-network UDP placement enters
+                       no other namespace and so is deliberately excluded — it runs
+                       on NET_ADMIN alone. BPF/PERFMON stay NodeWaypoint-only (no
+                       eBPF here). */}}
                 - SYS_ADMIN
                 - SYS_PTRACE
                 {{- end }}
