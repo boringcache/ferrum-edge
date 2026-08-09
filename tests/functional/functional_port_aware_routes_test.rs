@@ -232,6 +232,11 @@ plugin_configs: []
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        // These helpers connect to the loopback socket while routing by an
+        // explicit Host header. HTTP/2 would also send the loopback URI as
+        // `:authority`, correctly tripping Ferrum's authority-conflict guard;
+        // this test is about listener TLS classification, so keep it on H1.
+        .http1_only()
         .build()
         .expect("build TLS client");
 
