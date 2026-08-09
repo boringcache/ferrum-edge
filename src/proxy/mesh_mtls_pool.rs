@@ -904,6 +904,12 @@ impl MeshMtlsConnectionPool {
     /// byte-relaying to a TCP backend. The returned [`H2ConnectTunnel`] carries
     /// length-delimited datagrams, NOT a raw byte stream.
     ///
+    /// `source_identity` is the Ambient per-pod capture evidence (principal +
+    /// pod UID) when the producer enrolled an attested workload. Sidecar /
+    /// default callers pass `None` and keep the gateway-SVID principal baggage.
+    /// Destination authorization still applies the existing trusted-assertor /
+    /// trust-domain gates before treating either assertion as authoritative.
+    ///
     /// Like [`Self::open_connect_tunnel`] each UDP session gets its OWN
     /// mesh-mTLS H2 connection carrying exactly ONE CONNECT stream (1:1, dropped
     /// when the session ends), NOT multiplexed over the pooled
@@ -935,17 +941,7 @@ impl MeshMtlsConnectionPool {
         // identity-less (parity with `open_connect_tunnel` and `get_sender`).
         // This also drives the rotation/retired-fingerprint bookkeeping.
         let _ = self.current_svid_fingerprint_cached()?;
-        // Ambient capture supplies workload + pod evidence. Sidecar capture has
-        // no asserted workload override, so its own SVID remains the source.
-        // The authenticated peer at the destination still validates either
-        // assertion before using it for authorization.
-        let baggage = if let Some(source) = source_identity {
-            crate::modes::mesh::hbone::baggage_header_for_udp_source(source)
-        } else {
-            let snapshot = self.gateway_svid.load_full();
-            let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
-            crate::modes::mesh::hbone::baggage_header_for_source(&bundle.spiffe_id)
-        };
+        let baggage = datagram_tunnel_baggage(&self.gateway_svid, source_identity)?;
         let pool_config = self.pool_config.for_proxy(proxy);
         // Per-port DestinationRule overrides are resolved for the destination's
         // APP port (`target_port`, the DR keying port), not the transport
@@ -1640,6 +1636,28 @@ fn write_mesh_mtls_pool_key(
     write_pool_config_key(buf, pool_config);
 }
 
+/// Build CONNECT baggage for a mesh-mTLS datagram tunnel.
+///
+/// Ambient capture supplies workload + pod evidence. Sidecar / default callers
+/// pass `None`, so the gateway SVID principal remains the source. Destination
+/// authorization still validates either assertion through the shared trusted
+/// assertor / trust-domain gates before using it.
+fn datagram_tunnel_baggage(
+    gateway_svid: &SharedSvidBundle,
+    source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
+) -> Result<String, HbonePoolError> {
+    if let Some(source) = source_identity {
+        return Ok(crate::modes::mesh::hbone::baggage_header_for_udp_source(
+            source,
+        ));
+    }
+    let snapshot = gateway_svid.load_full();
+    let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
+    Ok(crate::modes::mesh::hbone::baggage_header_for_source(
+        &bundle.spiffe_id,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1905,6 +1923,107 @@ mod tests {
             Err(other) => panic!("expected NoSvid, got {other:?}"),
             Ok(_) => panic!("a missing gateway SVID must fail the datagram dial closed"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_datagram_tunnel_fails_closed_without_svid_even_with_asserted_source() {
+        // Ambient evidence cannot skip the gateway-SVID dial gate: the tunnel
+        // still presents this proxy's client certificate.
+        let pool = MeshMtlsConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "10.0.0.1",
+            "backend_port": 8080,
+        }))
+        .expect("minimal proxy");
+        let peer = test_peer();
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+        match pool
+            .open_datagram_tunnel(
+                &proxy,
+                "10.0.0.1",
+                "10.0.0.1",
+                53,
+                53,
+                ISTIO_SIDECAR_INBOUND_PORT,
+                Some(&peer),
+                None,
+                None,
+                Some(&asserted),
+            )
+            .await
+        {
+            Err(HbonePoolError::NoSvid) => {}
+            Err(other) => panic!("expected NoSvid, got {other:?}"),
+            Ok(_) => panic!("asserted Ambient identity must not bypass a missing gateway SVID"),
+        }
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_propagates_ambient_principal_and_pod_uid() {
+        let gateway = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle(b"gateway-leaf")))));
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+
+        let header = datagram_tunnel_baggage(&gateway, Some(&asserted)).expect("baggage");
+        let identity = crate::modes::mesh::hbone::HboneIdentity::from_baggage_header(&header);
+
+        assert_eq!(identity.source_principal, Some(asserted.principal.clone()));
+        assert_eq!(
+            identity.source_pod_uid,
+            crate::modes::mesh::node_waypoint::parse_pod_uid(&asserted.pod_uid).ok()
+        );
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_falls_back_to_gateway_svid_without_asserted_source() {
+        let gateway_bundle = svid_bundle(b"gateway-leaf");
+        let gateway_id = gateway_bundle.spiffe_id.clone();
+        let gateway = Arc::new(ArcSwap::new(Arc::new(Some(gateway_bundle))));
+
+        let header = datagram_tunnel_baggage(&gateway, None).expect("gateway baggage");
+        let identity = crate::modes::mesh::hbone::HboneIdentity::from_baggage_header(&header);
+
+        assert_eq!(identity.source_principal, Some(gateway_id));
+        assert!(
+            identity.source_pod_uid.is_none(),
+            "Sidecar/default fallback must not invent a pod UID"
+        );
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_fails_closed_without_svid_when_unasserted() {
+        let gateway = Arc::new(ArcSwap::new(Arc::new(None)));
+        match datagram_tunnel_baggage(&gateway, None) {
+            Err(HbonePoolError::NoSvid) => {}
+            Err(other) => panic!("expected NoSvid, got {other:?}"),
+            Ok(_) => panic!("missing gateway SVID must fail closed for unasserted baggage"),
+        }
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_rejects_malformed_pod_uid_at_construction() {
+        // Capture managers never stamp malformed evidence: `UdpSourceIdentity::new`
+        // fails closed so open_datagram_tunnel never sees a forgeable/malformed UID.
+        assert!(
+            crate::modes::mesh::hbone::UdpSourceIdentity::new(
+                SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+                "not-a-uid",
+            )
+            .is_none(),
+            "malformed pod UID must be rejected before CONNECT baggage is built"
+        );
     }
 
     #[test]
