@@ -14,6 +14,10 @@ pub mod conformance;
 pub mod nonce;
 pub mod server;
 pub mod snapshot;
+/// Issue #3317: the stock Envoy / third-party Istio interoperability profile.
+/// Kept strictly separate from [`carrier`] / [`translator`], which implement
+/// the Ferrum-private xDS profile.
+pub mod stock;
 pub mod translator;
 
 pub mod proto {
@@ -37,6 +41,16 @@ pub mod runtime_proto {
     tonic::include_proto!("envoy.service.runtime.v3");
 }
 
+pub mod stock_proto {
+    //! Issue #3317: decode-only projections of the upstream Envoy v3 resource
+    //! messages consumed by the stock interoperability profile. These are
+    //! NEVER encoded — Ferrum's own CP keeps emitting the Ferrum-private
+    //! resources declared in [`super::proto`]. See
+    //! `proto/envoy/stock/v3/stock_xds.proto` for the field-number provenance
+    //! and the "declared means consumed or refused" invariant.
+    tonic::include_proto!("ferrum.stockxds.v3");
+}
+
 // Public re-exports are used by library consumers/tests even when the binary
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
@@ -56,6 +70,11 @@ pub use carrier::{
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;
+#[allow(unused_imports)]
+pub use stock::{
+    STOCK_REQUIRED_TYPE_URLS, STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal, StockXdsAccumulator,
+    StockXdsLimits, parse_istio_cluster_name, parse_kubernetes_service_host, refuse_stock_secret,
+};
 #[allow(unused_imports)]
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]

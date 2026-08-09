@@ -23,7 +23,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,6 +61,7 @@ use crate::modes::mesh::config::{
     destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
+use crate::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
@@ -312,10 +313,21 @@ impl MeshTopology {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshConfigProtocol {
     Native,
+    /// **Ferrum-private** xDS ADS: a Ferrum CP talking to a Ferrum DP. Resource
+    /// names are Ferrum-shaped and every security/policy field rides a
+    /// `ferrum.config.extension.v3.*` ECDS carrier. Not stock-Envoy
+    /// interoperable — see [`Self::StockXds`].
     Xds,
     /// Localized file source: the mesh slice is built DP-side from a local
     /// YAML/JSON document (`FERRUM_MESH_FILE_CONFIG_PATH`), no control plane.
     File,
+    /// **Stock Envoy / third-party Istio** xDS ADS (issue #3317): standard v3
+    /// CDS/EDS/LDS/RDS from a non-Ferrum control plane, consumed for service
+    /// and endpoint DISCOVERY only. The enforcement posture comes from the
+    /// local mesh policy document at `FERRUM_MESH_FILE_CONFIG_PATH`, which is
+    /// mandatory for this protocol. Deliberately a distinct protocol name so
+    /// the Ferrum-private profile above keeps its exact meaning.
+    StockXds,
 }
 
 impl MeshConfigProtocol {
@@ -324,8 +336,10 @@ impl MeshConfigProtocol {
             "native" => Ok(Self::Native),
             "xds" => Ok(Self::Xds),
             "file" => Ok(Self::File),
+            "stock_xds" | "stock-xds" => Ok(Self::StockXds),
             other => Err(format!(
-                "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. Expected: native, xds, or file",
+                "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. Expected: native, xds, file, or \
+                 stock_xds",
                 crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
             )),
         }
@@ -336,13 +350,24 @@ impl MeshConfigProtocol {
             Self::Native => "native",
             Self::Xds => "xds",
             Self::File => "file",
+            Self::StockXds => "stock_xds",
         }
     }
 
-    /// Whether this protocol consumes config from a control plane over gRPC
-    /// (and therefore needs CP URLs, the CP/DP JWT secret, and gRPC TLS).
+    /// Whether this protocol consumes config from a **Ferrum** control plane
+    /// over gRPC (and therefore needs `FERRUM_DP_CP_GRPC_URLS`, the CP/DP JWT
+    /// secret, and the CP/DP gRPC TLS material).
+    ///
+    /// `StockXds` is deliberately excluded: it dials a third-party server named
+    /// by `FERRUM_MESH_STOCK_XDS_URLS` and must never present a Ferrum-minted
+    /// CP/DP JWT to it.
     fn requires_control_plane(self) -> bool {
         matches!(self, Self::Native | Self::Xds)
+    }
+
+    /// Whether this protocol requires the local mesh policy document.
+    fn requires_local_policy_document(self) -> bool {
+        matches!(self, Self::File | Self::StockXds)
     }
 }
 
@@ -373,9 +398,31 @@ pub struct MeshRuntimeConfig {
     pub cp_urls: Vec<String>,
     pub config_protocol: MeshConfigProtocol,
     /// Localized mesh config document consumed when `config_protocol` is
-    /// [`MeshConfigProtocol::File`]. Required for that protocol, `None`
-    /// otherwise. Sourced from `FERRUM_MESH_FILE_CONFIG_PATH`.
+    /// [`MeshConfigProtocol::File`] (the whole slice) or
+    /// [`MeshConfigProtocol::StockXds`] (the policy half only). Required for
+    /// both, `None` otherwise. Sourced from `FERRUM_MESH_FILE_CONFIG_PATH`.
     pub file_config_path: Option<String>,
+    /// Third-party ADS endpoints for [`MeshConfigProtocol::StockXds`], in
+    /// failover order (`FERRUM_MESH_STOCK_XDS_URLS`). Deliberately separate
+    /// from `cp_urls` so a Ferrum CP URL is never dialed as a stock server and
+    /// a stock server never receives Ferrum CP/DP credentials.
+    pub stock_xds_urls: Vec<String>,
+    /// `DiscoveryRequest.node.id` presented to a stock control plane
+    /// (`FERRUM_MESH_STOCK_XDS_NODE_ID`). Istio derives the whole proxy config
+    /// from this, so Ferrum passes the operator's value through verbatim rather
+    /// than reusing `FERRUM_MESH_NODE_ID`, whose default is a bare hostname.
+    pub stock_xds_node_id: Option<String>,
+    /// Flat `key=value` metadata encoded into `Node.metadata` as a
+    /// `google.protobuf.Struct` (`FERRUM_MESH_STOCK_XDS_NODE_METADATA`).
+    pub stock_xds_node_metadata: BTreeMap<String, String>,
+    /// File holding an externally issued bearer token presented to the stock
+    /// control plane (`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`), typically a
+    /// projected Kubernetes service-account token. `None` sends no
+    /// `authorization` metadata.
+    pub stock_xds_token_file: Option<String>,
+    /// Bounds applied to every stock xDS response before anything reaches the
+    /// typed mesh model.
+    pub stock_xds_limits: crate::xds::stock::StockXdsLimits,
     pub topology: MeshTopology,
     pub inbound_listen_addr: SocketAddr,
     pub outbound_listen_addr: SocketAddr,
@@ -563,11 +610,50 @@ impl MeshRuntimeConfig {
             .mesh_file_config_path
             .clone()
             .filter(|value| !value.trim().is_empty());
-        if config_protocol == MeshConfigProtocol::File && file_config_path.is_none() {
-            return Err(
-                "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
-                    .into(),
-            );
+        if config_protocol.requires_local_policy_document() && file_config_path.is_none() {
+            return Err(format!(
+                "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL={}",
+                config_protocol.as_str()
+            ));
+        }
+
+        // ── stock xDS interoperability profile (issue #3317) ──
+        let stock_xds_urls: Vec<String> = resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_URLS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let stock_xds_node_id = resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_NODE_ID")
+            .filter(|value| !value.trim().is_empty());
+        let stock_xds_token_file = resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_TOKEN_FILE")
+            .filter(|value| !value.trim().is_empty());
+        let stock_xds_node_metadata = parse_stock_xds_node_metadata(
+            resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_NODE_METADATA").as_deref(),
+        )?;
+        let stock_xds_limits = parse_stock_xds_limits()?;
+        if config_protocol == MeshConfigProtocol::StockXds {
+            if stock_xds_urls.is_empty() {
+                return Err(
+                    "FERRUM_MESH_STOCK_XDS_URLS is required when \
+                     FERRUM_MESH_CONFIG_PROTOCOL=stock_xds (the third-party ADS endpoints; \
+                     FERRUM_DP_CP_GRPC_URLS is deliberately NOT reused so a Ferrum control plane \
+                     is never dialed as a stock server)"
+                        .into(),
+                );
+            }
+            if stock_xds_node_id.is_none() {
+                return Err(
+                    "FERRUM_MESH_STOCK_XDS_NODE_ID is required when \
+                     FERRUM_MESH_CONFIG_PROTOCOL=stock_xds (a stock control plane derives the \
+                     proxy's whole configuration from DiscoveryRequest.node.id, so Ferrum will \
+                     not guess it from the hostname default of FERRUM_MESH_NODE_ID)"
+                        .into(),
+                );
+            }
         }
 
         let node_id = resolve_ferrum_var("FERRUM_MESH_NODE_ID")
@@ -757,6 +843,11 @@ impl MeshRuntimeConfig {
             cp_urls,
             config_protocol,
             file_config_path,
+            stock_xds_urls,
+            stock_xds_node_id,
+            stock_xds_node_metadata,
+            stock_xds_token_file,
+            stock_xds_limits,
             topology,
             inbound_listen_addr,
             outbound_listen_addr,
@@ -811,6 +902,29 @@ impl MeshRuntimeConfig {
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
             primary_retry_secs: self.xds_primary_retry_secs,
+        }
+    }
+
+    /// Settings for the stock (third-party) ADS consumer. Only meaningful when
+    /// `config_protocol == MeshConfigProtocol::StockXds`; the required fields
+    /// were validated in [`Self::from_env_config`].
+    fn stock_xds_client_config(&self) -> StockXdsClientConfig {
+        StockXdsClientConfig {
+            xds_urls: self.stock_xds_urls.clone(),
+            // Validated as present for this protocol; the fallback keeps the
+            // accessor total rather than introducing an unwrap.
+            node_id: self
+                .stock_xds_node_id
+                .clone()
+                .unwrap_or_else(|| self.node_id.clone()),
+            cluster: self.xds_node_cluster.clone(),
+            namespace: self.namespace.clone(),
+            node_metadata: self.stock_xds_node_metadata.clone(),
+            token_file: self.stock_xds_token_file.clone(),
+            stream_channel_capacity: self.xds_stream_channel_capacity,
+            primary_retry_secs: self.xds_primary_retry_secs,
+            connect_timeout_seconds: self.xds_connect_timeout_seconds,
+            limits: self.stock_xds_limits,
         }
     }
 
@@ -11291,6 +11405,75 @@ pub async fn run(
             mesh_slice_version = %initial_version,
             "Mesh mode initialized localized file config source (SIGHUP reloads)"
         );
+    } else if runtime.config_protocol == MeshConfigProtocol::StockXds {
+        // Issue #3317. Two authorities, deliberately split: the local policy
+        // document supplies the enforcement posture, the third-party ADS server
+        // supplies discovery. The policy half is fail-closed at startup exactly
+        // like `file` mode; the discovery half converges on the stream, so the
+        // first slice arrives through `wait_for_initial_mesh_config` below.
+        let policy_path = runtime.file_config_path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                 FERRUM_MESH_CONFIG_PROTOCOL=stock_xds"
+            )
+        })?;
+        let baseline = config_consumer::stock_xds_client::load_stock_policy_baseline(
+            std::path::Path::new(&policy_path),
+        )
+        .with_context(|| {
+            format!("failed to load the stock xDS mesh policy document from '{policy_path}'")
+        })?;
+        let baseline = Arc::new(baseline);
+        let (policy_tx, policy_rx) = tokio::sync::watch::channel(baseline.clone());
+
+        // The stock server is a third party: reuse only the transport TLS
+        // material, never the Ferrum CP/DP JWT machinery.
+        let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.stock_xds_urls, "Mesh")?;
+        let stock_tls_reload_handle = crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
+            Arc::new(env_config.clone()),
+            Arc::new(runtime.stock_xds_urls.clone()),
+            "Mesh",
+            Some(shutdown_tx.subscribe()),
+        );
+        let grpc_tls_reload = stock_tls_reload_handle.map(|handle| {
+            let reload = DpGrpcTlsReload {
+                env_config: Arc::new(env_config.clone()),
+                label: "Mesh",
+                revision_rx: handle.revision_rx,
+            };
+            background_handles.push(handle.watcher_handle);
+            reload
+        });
+
+        let stock_config = runtime.stock_xds_client_config();
+        background_handles.push(tokio::spawn(
+            config_consumer::stock_xds_client::start_stock_policy_watcher_with_shutdown(
+                policy_path.clone(),
+                policy_tx,
+                shutdown_tx.subscribe(),
+            ),
+        ));
+        background_handles.push(tokio::spawn(
+            config_consumer::stock_xds_client::start_stock_xds_client_with_shutdown(
+                stock_config,
+                baseline,
+                runtime.mesh_slice_request(),
+                mesh_state.clone(),
+                shutdown_tx.subscribe(),
+                grpc_tls,
+                grpc_tls_reload,
+                policy_rx,
+            ),
+        ));
+        info!(
+            node_id = %runtime.node_id,
+            namespace = %runtime.namespace,
+            stock_xds_urls = runtime.stock_xds_urls.len(),
+            policy_path = %policy_path,
+            has_first_slice = mesh_state.has_first_slice(),
+            "Mesh mode initialized stock xDS interoperability consumer (third-party control \
+             plane supplies discovery only; enforcement policy stays local)"
+        );
     } else {
         // Advisory GHSA-3f2j-wwqw-grmg: a mesh node with
         // `FERRUM_DP_CP_GRPC_TOKEN_FILE` presents an externally issued token
@@ -11418,7 +11601,10 @@ fn ensure_runtime_config_protocol_supported(
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
     match runtime.config_protocol {
-        MeshConfigProtocol::Native | MeshConfigProtocol::Xds | MeshConfigProtocol::File => Ok(()),
+        MeshConfigProtocol::Native
+        | MeshConfigProtocol::Xds
+        | MeshConfigProtocol::File
+        | MeshConfigProtocol::StockXds => Ok(()),
     }
 }
 
@@ -16140,6 +16326,11 @@ pub mod startup_rollback_test_seams {
             cp_urls: vec!["http://127.0.0.1:1".to_string()],
             config_protocol: MeshConfigProtocol::Native,
             file_config_path: None,
+            stock_xds_urls: Vec::new(),
+            stock_xds_node_id: None,
+            stock_xds_node_metadata: BTreeMap::new(),
+            stock_xds_token_file: None,
+            stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -16677,6 +16868,89 @@ fn parse_workload_labels(
         }
     }
     Ok(labels)
+}
+
+/// Parse `FERRUM_MESH_STOCK_XDS_NODE_METADATA` (`key=value,key=value`) into the
+/// flat string map encoded onto `DiscoveryRequest.node.metadata`.
+///
+/// Only flat string values are accepted. A stock control plane keys much of its
+/// per-proxy configuration off node metadata, so the value is operator-authored
+/// and never echoed on a parse failure.
+fn parse_stock_xds_node_metadata(raw: Option<&str>) -> Result<BTreeMap<String, String>, String> {
+    let mut metadata = BTreeMap::new();
+    let Some(raw) = raw else {
+        return Ok(metadata);
+    };
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            format!(
+                "FERRUM_MESH_STOCK_XDS_NODE_METADATA entry {} must be in 'key=value' form",
+                crate::secrets::quoted_env_value("FERRUM_MESH_STOCK_XDS_NODE_METADATA", entry)
+            )
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!(
+                "FERRUM_MESH_STOCK_XDS_NODE_METADATA entry {} has an empty key",
+                crate::secrets::quoted_env_value("FERRUM_MESH_STOCK_XDS_NODE_METADATA", entry)
+            ));
+        }
+        if metadata
+            .insert(key.to_string(), value.trim().to_string())
+            .is_some()
+        {
+            return Err(format!(
+                "FERRUM_MESH_STOCK_XDS_NODE_METADATA contains duplicate key {}",
+                crate::secrets::quoted_env_value("FERRUM_MESH_STOCK_XDS_NODE_METADATA", key)
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+/// Resolve the stock xDS resource bounds from their env overrides.
+///
+/// These are the fail-closed ceilings applied to every control-plane response
+/// before anything reaches the typed mesh model, so `0` is refused outright
+/// rather than treated as "unlimited".
+fn parse_stock_xds_limits() -> Result<crate::xds::stock::StockXdsLimits, String> {
+    let mut limits = crate::xds::stock::StockXdsLimits::default();
+    for (key, slot) in [
+        (
+            "FERRUM_MESH_STOCK_XDS_MAX_RESOURCES",
+            &mut limits.max_resources_per_type,
+        ),
+        (
+            "FERRUM_MESH_STOCK_XDS_MAX_RESOURCE_BYTES",
+            &mut limits.max_resource_bytes,
+        ),
+        (
+            "FERRUM_MESH_STOCK_XDS_MAX_ENDPOINTS",
+            &mut limits.max_endpoints_per_cluster,
+        ),
+    ] {
+        let Some(raw) = resolve_ferrum_var(key).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let parsed = raw.trim().parse::<usize>().map_err(|e| {
+            format!(
+                "{key} must be a positive integer (got {}): {e}",
+                crate::secrets::quoted_env_value(key, raw.trim())
+            )
+        })?;
+        if parsed == 0 {
+            return Err(format!(
+                "{key} must be greater than 0 (a stock xDS bound of 0 would disable the \
+                 fail-closed ceiling, not lift it)"
+            ));
+        }
+        *slot = parsed;
+    }
+    Ok(limits)
 }
 
 fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
@@ -17462,6 +17736,11 @@ mod tests {
             cp_urls: vec!["http://127.0.0.1:1".to_string()],
             config_protocol: MeshConfigProtocol::Native,
             file_config_path: None,
+            stock_xds_urls: Vec::new(),
+            stock_xds_node_id: None,
+            stock_xds_node_metadata: BTreeMap::new(),
+            stock_xds_token_file: None,
+            stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -17577,6 +17856,11 @@ mod tests {
             cp_urls: vec!["http://127.0.0.1:1".to_string()],
             config_protocol: MeshConfigProtocol::Native,
             file_config_path: None,
+            stock_xds_urls: Vec::new(),
+            stock_xds_node_id: None,
+            stock_xds_node_metadata: BTreeMap::new(),
+            stock_xds_token_file: None,
+            stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),

@@ -829,6 +829,7 @@ jobs:
               integration::mesh_authz_e2e_tests
               integration::mesh_authz_negative_match_tests
               integration::mesh_service_waypoint_tests
+              integration::mesh_stock_xds_tests
               integration::mesh_ew_egress_e2e_tests
               integration::mesh_destination_rule_tls_tests
               integration::mesh_destination_rule_locality_lb_tests

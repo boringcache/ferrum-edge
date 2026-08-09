@@ -97,6 +97,7 @@ mod udp_reply_stop_tests;
 mod waf_websocket_message_tests;
 mod websocket_auth_tests;
 mod websocket_auto_pong_tests;
+mod stock_xds_tests;
 mod websocket_backend_tests;
 mod websocket_connection_limit_tests;
 mod websocket_drain_accounting_tests;
