@@ -108,6 +108,10 @@ pub struct WorkloadApiService {
     /// Lifetime requested for minted JWT-SVIDs. The signing authority clamps
     /// this down to its own ceiling; it can never raise it.
     jwt_svid_ttl_secs: u64,
+    /// Listener-owned shutdown signal. Streaming RPC producers observe this so
+    /// tonic's graceful server shutdown is not held open forever by the
+    /// deliberately long-lived Workload API streams.
+    service_shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl WorkloadApiService {
@@ -126,6 +130,7 @@ impl WorkloadApiService {
             rotation_signal: Arc::new(tx),
             federated_trust_domains: Vec::new(),
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
+            service_shutdown: None,
         }
     }
 
@@ -144,6 +149,7 @@ impl WorkloadApiService {
             rotation_signal,
             federated_trust_domains: Vec::new(),
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
+            service_shutdown: None,
         }
     }
 
@@ -196,6 +202,19 @@ impl WorkloadApiService {
     /// overlap guarantees remains verifiable.
     pub fn with_jwt_svid_ttl_secs(mut self, ttl_secs: u64) -> Self {
         self.jwt_svid_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Attach the listener lifecycle to every streaming RPC producer.
+    ///
+    /// `serve_with_incoming_shutdown` stops accepting new work but waits for
+    /// existing response streams to finish. Workload API streams are designed
+    /// to remain open across rotations, so without this second signal a normal
+    /// process shutdown can wait forever for a connected workload. Ending each
+    /// producer drops its response sender, lets tonic finish the RPC, and keeps
+    /// shutdown graceful rather than aborting the transport task.
+    pub fn with_service_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.service_shutdown = Some(shutdown);
         self
     }
 
@@ -255,6 +274,7 @@ impl WorkloadApiService {
     async fn wait_for_rotation_or_stream_close<T>(
         rx: &mut watch::Receiver<u64>,
         tx: &LatestWinsSender<T>,
+        service_shutdown: &mut Option<watch::Receiver<bool>>,
     ) -> bool {
         tokio::select! {
             changed = rx.changed() => {
@@ -269,6 +289,21 @@ impl WorkloadApiService {
                 true
             }
             _ = tx.closed() => false,
+            _ = Self::wait_for_service_shutdown(service_shutdown) => false,
+        }
+    }
+
+    /// Wait for listener shutdown when this service is listener-owned, or stay
+    /// pending for services constructed directly in tests and other callers.
+    async fn wait_for_service_shutdown(shutdown: &mut Option<watch::Receiver<bool>>) {
+        let Some(shutdown) = shutdown.as_mut() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -640,6 +675,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let attestors = self.attestors.clone();
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
+        let mut service_shutdown = self.service_shutdown.clone();
 
         let (tx, out_rx) = latest_wins::channel();
         if !tx.publish(Ok(initial)) {
@@ -650,7 +686,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
+                if !Self::wait_for_rotation_or_stream_close(
+                    &mut rx,
+                    &tx,
+                    &mut service_shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 // Appendix A §6: validate the pending response — ensure the
@@ -715,6 +757,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let td = self.trust_domain.clone();
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
+        let mut service_shutdown = self.service_shutdown.clone();
 
         let (tx, out_rx) = latest_wins::channel();
         if !tx.publish(Ok(initial)) {
@@ -725,7 +768,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
+                if !Self::wait_for_rotation_or_stream_close(
+                    &mut rx,
+                    &tx,
+                    &mut service_shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 match Self::build_x509_bundles_response_static(&ca, &td, &federated_trust_domains)
@@ -831,6 +880,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let td = self.trust_domain.clone();
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
+        let mut service_shutdown = self.service_shutdown.clone();
 
         let (tx, out_rx) = latest_wins::channel();
         if !tx.publish(Ok(initial)) {
@@ -841,7 +891,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
+                if !Self::wait_for_rotation_or_stream_close(
+                    &mut rx,
+                    &tx,
+                    &mut service_shutdown,
+                )
+                .await
+                {
                     return;
                 }
                 match Self::build_jwt_bundles_response_static(&ca, &td, &federated_trust_domains)

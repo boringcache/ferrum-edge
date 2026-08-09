@@ -483,9 +483,10 @@ pub async fn serve_workload_api(
     let path = config.socket_path.clone();
     refuse_live_or_clear_stale_socket(&path).await?;
 
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let service = service.with_service_shutdown(shutdown_tx.subscribe());
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
 
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (terminated_tx, terminated_rx) = watch::channel(false);
     // Built here rather than inside the spawned task so the receiver is moved
     // into exactly one future and its mutability is unambiguous.

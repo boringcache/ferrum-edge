@@ -231,7 +231,9 @@ impl Harness {
 
     async fn shutdown(self) -> PathBuf {
         let path = self.path.clone();
-        self.listener.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.listener.shutdown())
+            .await
+            .expect("Workload API shutdown must not wait on a long-lived response stream");
         path
     }
 }
