@@ -1910,12 +1910,7 @@ fn udp_route_proxy_ids_do_not_collide_with_a_same_named_tcp_route() {
         json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
     );
     let udp = udp_route("dns", attached_rule("edge", "dns", "coredns", 5353));
-    let objects = [
-        gateway_class(),
-        udp_gateway("edge", "dns", 15353),
-        tcp,
-        udp,
-    ];
+    let objects = [gateway_class(), udp_gateway("edge", "dns", 15353), tcp, udp];
 
     let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
