@@ -24,9 +24,10 @@
 //! observation flag end establishment while the same polls keep driving Hyper.
 //!
 //! The wait itself is deliberately unbounded here — the caller owns the bound,
-//! because the two callers derive it differently (a per-candidate share of the
+//! because each caller derives it differently (a per-candidate share of the
 //! connect budget for pooled TCP, the remainder of one end-to-end connect budget
-//! for a Unix socket).
+//! for a Unix socket, and the whole-acquisition deadline the Ambient HBONE gRPC
+//! transport wraps around its nested HTTP/2 client).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -199,7 +200,9 @@ impl std::fmt::Display for H2cPrefaceFailure {
 /// runs inside `dns::connect_candidates`, whose per-candidate share of
 /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
 /// address. The Unix h2c transport bounds it with whatever remains of its one
-/// end-to-end connect budget.
+/// end-to-end connect budget. The Ambient HBONE gRPC transport bounds it with
+/// the whole-acquisition deadline `GrpcDispatchTransport::get_sender` wraps
+/// around its nested HTTP/2 client (issue #3284).
 pub(crate) async fn await_peer_settings<C>(
     conn: &mut C,
     settings_received: &AtomicBool,

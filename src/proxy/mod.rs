@@ -848,7 +848,10 @@ const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 pub(crate) const FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KiB
 pub(crate) const FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
 pub(crate) const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 default)
-const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
+// Reserved, validation-safe ID for the gateway-injected instance. Keep this
+// deliberately unlike a normal operator-selected ID: the injector treats it
+// as managed state and may replace its contents on SVID rotation/reload.
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "ferrum-internal-gateway-workload-metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
     "source.",
@@ -9478,6 +9481,10 @@ impl ProxyState {
         new_config: &GatewayConfig,
     ) -> Vec<Upstream> {
         fn content_eq(a: &Upstream, b: &Upstream) -> bool {
+            // Authored target tags (mesh.mtls / mesh.hbone / SPIFFE pins / …) are
+            // ordinary serialized fields, but compare them explicitly here so a
+            // same-timestamp tag-only rewrite cannot depend solely on HashMap
+            // serde round-tripping to rebuild the LB / request epoch (#3284).
             let skipped_fields_equal = a.resolved_subset_tls == b.resolved_subset_tls
                 && a.dispatch_port_override_fallback == b.dispatch_port_override_fallback
                 && a.targets.len() == b.targets.len()
@@ -9486,6 +9493,7 @@ impl ProxyState {
                     .zip(&b.targets)
                     .all(|(a_target, b_target)| {
                         a_target.service_port_policy_key == b_target.service_port_policy_key
+                            && a_target.tags == b_target.tags
                     });
             if !skipped_fields_equal {
                 return false;
@@ -11181,7 +11189,8 @@ impl ProxyState {
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
     /// identity or credential state triggers one of them — most visibly a DP
-    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// with a gateway SVID, where the injected
+    /// `ferrum-internal-gateway-workload-metrics`
     /// plugin config exists only on the applied side.
     ///
     /// The ConfigSync older-cross-source identical-payload exception
@@ -27505,21 +27514,18 @@ async fn handle_proxy_request_inner(
         // needs `&mut ctx` and may publish backend header overlay entries.
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
-        // branch cannot dispatch over its secured transport (issue #2003):
-        //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
-        //     `mesh.mtls`): the dial host is a remote-pod / scoped synthetic
-        //     identity that is NOT directly routable, and the dial has no
-        //     east-west gateway dial-host override, no destination-FQDN SNI
-        //     override, and no trust-domain-scoped verification. gRPC over
-        //     cross-cluster HBONE / mesh-mTLS is a documented follow-up
-        //     (HTTP-first), mirroring the WebSocket cross-cluster guards.
-        //   * Same-cluster Ambient `mesh.hbone` targets: the HBONE inner
-        //     protocol is HTTP/1.1 over a byte tunnel, which cannot carry the
-        //     HTTP/2 trailers gRPC requires — an explicit non-goal (see the
-        //     out-of-scope list in docs/mesh_supported_matrix.md), fail
-        //     closed rather than silently corrupt.
-        //   * `MeshMtls` is normally unreachable here (the fall-through above
-        //     routes it down the generic mesh path) — refuse defensively.
+        // direct-pool branch cannot dispatch over its secured transport
+        // (issue #2003):
+        //   * Sidecar `mesh.mtls` targets, same-cluster and cross-cluster,
+        //     normally fall through above to the generic trailer-preserving
+        //     mesh-mTLS path. Refuse defensively if either reaches this branch.
+        //   * Ambient `mesh.hbone` targets remain unsupported on this H1/H2
+        //     frontend because its generic HBONE path runs HTTP/1.1 inside the
+        //     CONNECT tunnel and cannot carry gRPC trailers. The H3 bridge uses
+        //     a separate nested-HTTP/2 transport for these targets (#3284).
+        //   * Malformed cross-cluster targets fail closed because the secured
+        //     east-west dial cannot be materialized without its transport,
+        //     destination-FQDN SNI override, and trust-domain scope.
         // Refuse cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
         // connection-level failure) before any backend dial / circuit-breaker
         // charge — NEVER a direct plaintext dial that would bypass the mesh
@@ -27527,9 +27533,14 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+                // The generic HTTP-family mesh path this frontend falls through
+                // to runs an HTTP/1.1 client inside the HBONE byte tunnel, so it
+                // cannot carry `grpc-status` trailers. (The H3 bridge does not
+                // use that path — it runs a nested HTTP/2 client over the same
+                // tunnel; see `GrpcDispatchTransport`, issue #3284.)
+                grpc_proxy::GrpcMeshDispatch::HboneCrossCluster => Some(
                     "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
                     "gRPC over cross-cluster east-west routing requires a destination SNI \
@@ -27538,9 +27549,9 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
-                grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
+                grpc_proxy::GrpcMeshDispatch::Hbone => Some(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 // `MeshMtlsCrossCluster` normally falls through to the generic
                 // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
@@ -28104,7 +28115,14 @@ async fn handle_proxy_request_inner(
                 crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
-                &state.grpc_pool,
+                // Direct-dial only, and provably so: this branch is entered
+                // only for `grpc_uses_native_dispatch`, whose mesh screen above
+                // refuses every non-`Direct` class before dispatch, and a
+                // `mesh.mtls` target is routed onto the generic mesh-mTLS path
+                // by `grpc_mesh_dispatch_falls_through` before that. The H3
+                // bridge is the surface that materializes the mesh transports
+                // (issues #2003, #3284).
+                &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                 &state.dns_cache,
                 owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
@@ -28372,7 +28390,11 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
-                            &state.grpc_pool,
+                            // Direct-dial only, for the same reason as the
+                            // split-path call above: the native-gRPC mesh screen
+                            // refuses every non-`Direct` class and `MeshMtls`
+                            // never reaches this branch (issues #2003, #3284).
+                            &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                             &state.dns_cache,
                             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
@@ -28852,7 +28874,10 @@ async fn handle_proxy_request_inner(
                     crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
-                    &state.grpc_pool,
+                    // Direct-dial only: the loop re-screens every rotated
+                    // target above and refuses a mesh-tagged one before it can
+                    // reach this call (issue #2003).
+                    &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
@@ -38502,6 +38527,54 @@ fn mesh_mtls_request_authority(preserved_host: &str, service_port: u16) -> Strin
     format!("{host}:{service_port}")
 }
 
+/// Resolve the request `:authority` a Sidecar mesh-mTLS dispatch presents to the
+/// peer sidecar's inbound listener.
+///
+/// `:authority` is the routing key on the peer: its materialized inbound route
+/// matches the SERVICE host. Precedence, highest first:
+///
+/// 1. `mesh.mtls_authority_host` — stamped only by `sidecar`-topology mesh
+///    service discovery (the gateway-to-mesh bridge). A north-south gateway's
+///    client `Host` is a public hostname the peer would 404, and the
+///    no-preserve fallback is the pod dial address (same 404).
+/// 2. A preserved, non-empty client `Host` when `preserve_host_header` is on.
+/// 3. The dial authority (peer pod + app port), matching the HBONE inner
+///    request's Host fallback.
+///
+/// For a MULTI-PORT destination the materializer stamped the owning service
+/// port (`mesh.mtls_authority_port`) on the target and the authority is
+/// rewritten to `<host>:<service_port>` — the peer's inbound `:15006` dials are
+/// direct (never NATed, no orig-dst), so the authority port is the only channel
+/// that tells its per-port inbound siblings apart. Single-port destinations
+/// carry no port tag and keep the host-only / client authority byte-for-byte.
+///
+/// Shared by the generic HTTP-family mesh-mTLS dispatch and the gRPC mesh
+/// transport (issue #3284) so the two cannot drift on peer route selection.
+pub(crate) fn mesh_mtls_dispatch_authority<'a>(
+    target: &'a UpstreamTarget,
+    preserve_host_header: bool,
+    client_host: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => std::borrow::Cow::Owned(format!("{service_host}:{service_port}")),
+            None => std::borrow::Cow::Borrowed(service_host),
+        };
+    }
+    if preserve_host_header && let Some(host) = client_host.filter(|host| !host.is_empty()) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => {
+                std::borrow::Cow::Owned(mesh_mtls_request_authority(host, service_port))
+            }
+            None => std::borrow::Cow::Borrowed(host),
+        };
+    }
+    std::borrow::Cow::Owned(hbone_pool::authority_for_host_port(
+        &target.host,
+        target.port,
+    ))
+}
+
 /// Normalize a Host/authority value for host-based routing.
 ///
 /// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
@@ -41435,46 +41508,19 @@ async fn proxy_to_backend_mesh_mtls(
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-    // `:authority` is the routing key on the peer: its materialized inbound
-    // route matches the SERVICE host. A `sidecar`-topology mesh-SD target
-    // (gateway-to-mesh bridge) carries that service host as a tag
-    // (`mesh.mtls_authority_host`) and it takes precedence over BOTH branches
-    // below — a north-south gateway's client Host is a public hostname the
-    // peer would 404, and the no-preserve fallback is the pod dial address
-    // (same 404). Otherwise a preserved client Host wins; without
-    // preservation fall back to the dial authority (peer pod + app port),
-    // matching the HBONE inner request's Host fallback. For a MULTI-PORT
-    // destination the materializer stamped the owning service port on the
-    // target, and the authority is rewritten to `<host>:<service_port>` —
-    // the peer's inbound `:15006` dials are direct (never NATed, no
-    // orig-dst), so the authority port is the only channel that tells its
-    // per-port inbound siblings apart. The original client Host still rides
-    // `x-forwarded-host` below. Single-port destinations carry no port tag
-    // and keep the host-only / client authority byte-for-byte.
-    let authority_owned;
-    let authority =
-        if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
-            match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                Some(service_port) => {
-                    authority_owned = format!("{service_host}:{service_port}");
-                    authority_owned.as_str()
-                }
-                None => service_host,
-            }
-        } else if proxy.preserve_host_header
-            && let Some(host) = headers.get("host")
-            && !host.is_empty()
-        {
-            if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                authority_owned = mesh_mtls_request_authority(host, service_port);
-                authority_owned.as_str()
-            } else {
-                host.as_str()
-            }
-        } else {
-            authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
-            authority_owned.as_str()
-        };
+    // `:authority` is the routing key on the peer. Precedence, the multi-port
+    // service-port rewrite, and the dial-authority fallback all live in the
+    // shared resolver so the gRPC mesh transport cannot drift from this path
+    // (see `mesh_mtls_dispatch_authority`). The original client Host still
+    // rides `x-forwarded-host` below. A Unix-socket dispatch reuses this hop
+    // and carries no mesh authority tag, so it lands on the preserved client
+    // Host or the target's placeholder dial authority — exactly as before.
+    let authority_resolved = mesh_mtls_dispatch_authority(
+        target,
+        proxy.preserve_host_header,
+        headers.get("host").map(String::as_str),
+    );
+    let authority = authority_resolved.as_ref();
     // `:scheme` must describe the actual hop: `https` for the SVID-mTLS session,
     // `http` for a plaintext h2c Unix socket. An `https` scheme on the socket
     // would make the co-located app build absolute URLs / redirects claiming a
@@ -41547,7 +41593,7 @@ async fn proxy_to_backend_mesh_mtls(
             } else {
                 body
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body))
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -41558,7 +41604,9 @@ async fn proxy_to_backend_mesh_mtls(
             parts.headers = headers;
             (
                 parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
+                    body, trailers,
+                )),
             )
         }
     };

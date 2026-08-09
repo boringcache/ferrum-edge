@@ -8,6 +8,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Dispatch model](#dispatch-model)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
+  - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
 - [Buffering policy](#buffering-policy)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
@@ -174,6 +175,70 @@ Flow:
 9. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
 
 **Early-response cancellation**: the Plain streaming-request path drives the H3 recv reader and `reqwest::send()` concurrently via `tokio::select!`. The native-gRPC H3-to-H2 path instead gives the recv half to a pump task and relays the H2 response concurrently on the send half; every bounded DATA/trailer channel send and the trailer read races a shutdown notification. For recognized gRPC-Web, the absolute RPC deadline is the first biased arm, so a withheld upload or response headers cannot retain the backend request, admission permit, or half-open probe. A backend final response before the client finishes uploading (auth reject, early 413, completed bidi response, etc.) therefore stops the appropriate reader/pump — no stranded task on `recv_data()`, `recv_trailers()`, or a full channel.
+
+### Mesh transport dispatch for the H3→gRPC bridge
+
+The bridge does **not** always dial `target.host:target.port` directly. Before
+reading the request body or dialing, both `dispatch_grpc` (buffered/retryable)
+and `dispatch_grpc_streaming` (channel-backed) resolve the LB-selected target
+through `grpc_proxy::GrpcDispatchTransport::for_target`, which materializes
+exactly one transport and never falls back to a direct dial for a mesh-tagged
+target:
+
+| Selected target | Transport | Notes |
+|---|---|---|
+| No mesh tag | `state.grpc_pool` (direct h2c / TLS) | Unchanged behavior. |
+| `mesh.mtls`, same-cluster | `state.mesh_mtls_pool` (SVID-mTLS HTTP/2) | Destination identity pinned from `mesh.spiffe_id`. |
+| `mesh.mtls`, cross-cluster | same pool, east-west branch | East-west gateway dial + destination-FQDN SNI override (`mesh.eastwest_sni`) + trust-domain-scoped verification (`mesh.trust_domain`). |
+| `mesh.hbone`, same-cluster | nested HTTP/2 over `state.hbone_pool`'s CONNECT byte tunnel | Materialized mesh targets pin the destination identity. An operator-supplied target that deliberately omits the optional peer tag retains HBONE's existing **any-federated** verification — the peer SVID must chain to *some* trust domain present in this gateway's own bundle, but is NOT narrowed to one, so it is strictly weaker than the trust-domain-scoped verification the two cross-cluster rows describe; a present but invalid tag fails closed. The peer's HBONE relay byte-copies the tunnel to the app socket, so the inner connection is ordinary h2c. |
+| `mesh.hbone`, cross-cluster | same, over the cross-cluster dial | Remote east-west gateway (`mesh.hbone_dial_host` / `mesh.hbone_port`), SNI override, trust-domain scope; the CONNECT authority is the real remote pod from `mesh.hbone_authority_host`. |
+
+Both mesh transports are HTTP/2 end to end, so gRPC framing, `grpc-status` /
+`grpc-message` trailers, flow control, `grpc-timeout` deadline propagation, and
+client cancellation behave exactly as they do on the direct gRPC pool. The
+shared `GrpcBody` is handed through unchanged, so the channel-backed streaming
+path still commits request DATA incrementally and a peer can answer before the
+H3 client half-closes (true bidirectional streaming).
+
+HBONE sender acquisition, including the inner HTTP/2 handshake after CONNECT,
+is bounded by the destination policy port's effective backend connect timeout.
+The successful CONNECT only proves the destination's relay reached the app
+socket, and the nested connection is cleartext (no ALPN), so the sender is
+admitted only once the app's **own** HTTP/2 connection preface — a complete,
+structurally valid initial SETTINGS frame — has been observed. This is the same
+admission the direct-dial h2c gRPC pool applies, and it gives the two failure
+shapes their honest classifications: an app that answers the nested preface with
+something other than HTTP/2 is a distinct h2c-handshake failure (not an outer
+TLS/mesh failure), and a relayed app that accepts TCP but never sends settings
+cannot retain the RPC indefinitely when the client supplied no `grpc-timeout` —
+it is refused by that connect budget. The outer HBONE hop is SVID-authenticated,
+while the nested application connection is h2c and carries `:scheme: http`; the
+gateway does not misrepresent the tunnel's outer TLS as end-to-end TLS to the
+application.
+
+Everything undispatchable **fails closed** with a Trailers-Only gRPC
+`UNAVAILABLE`, before any dial:
+
+- a cross-cluster target with no mesh transport tag;
+- a cross-cluster `mesh.mtls` target missing its SNI override or trust domain;
+- a corrupted target declaring **both** `mesh.mtls` and `mesh.hbone` (the
+  topologies are mutually exclusive, so picking either hop would be a guess);
+- any target whose pinned `mesh.spiffe_id`, HBONE dial host, or CONNECT
+  authority host tag is present but unusable.
+
+Refusal messages name the failed contract and never echo the target's SPIFFE
+ID, SNI, trust domain, or dial address.
+
+Retry rotation re-resolves the transport **per attempt**: rotating onto a
+mesh-tagged target re-dials over that target's own dial plan (never the previous
+target's session), and rotating onto an undispatchable one fails closed. The
+half-open circuit-breaker probe slot a refusal consumes is released.
+
+The H3→HTTP plain bridge, plain requests selected for the native H3 backend
+pool, and the H3 WebSocket bridge are unchanged and still refuse **any**
+mesh-tagged target before dialing: plain HTTP gets a 502 with
+`gateway-error-reason`, and the WebSocket bridge refuses the upgrade with the
+same 502 shape.
 
 ## Buffering policy
 

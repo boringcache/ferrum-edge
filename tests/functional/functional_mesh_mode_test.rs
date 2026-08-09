@@ -64,6 +64,8 @@ use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
 
 use crate::common::{TestGateway, ensure_gateway_built};
+use crate::scaffolding::certs::TestCa;
+use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
@@ -14285,4 +14287,1887 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
     );
 
     kill_child(&mut child);
+}
+
+// ── Live H3 → authenticated mesh-transport gRPC datapath (issue #3284) ───────
+//
+// The LIVE keystone for H3-to-gRPC mesh dispatch. Every test below drives a real
+// `ferrum-edge` subprocess with a QUIC/HTTP-3 frontend, a real SPIFFE SVID
+// loaded from files, real file-mode routing + upstream selection, and real
+// authenticated mesh listeners in this test process. Nothing here calls
+// `proxy_grpc_request_core`, `GrpcDispatchTransport`, or any other in-process
+// helper, and nothing asserts on source text: the only input is a native gRPC
+// RPC over QUIC, and the only outputs are what the mesh peer observed on the
+// wire and what the H3 client received back.
+//
+// The lower-level transport coverage lives in
+// `tests/integration/mesh_grpc_transport_tests.rs`; it is deliberately NOT a
+// substitute for these, because it does not exercise the H3 frontend where the
+// traffic behavior actually changes.
+
+/// The gateway's own workload identity in these tests.
+const H3_MESH_GATEWAY_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/h3-gateway";
+/// The destination workload identity a same-cluster target PINS.
+const H3_MESH_PEER_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/h3-peer";
+/// A SECOND destination identity, for retry rotation and reload re-targeting.
+const H3_MESH_PEER_B_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/h3-peer-b";
+/// The service FQDN a Sidecar peer's materialized inbound route matches.
+const H3_MESH_SERVICE_AUTHORITY: &str = "h3-peer.ferrum.svc.cluster.local";
+/// The destination service FQDN a CROSS-CLUSTER dial must present as SNI.
+const H3_MESH_EASTWEST_SNI: &str = "h3-remote.ferrum.svc.cluster.local";
+/// The gRPC method every test calls, under the proxy's `/mesh` listen path.
+const H3_MESH_RPC_PATH: &str = "/mesh/h3.mesh.Echo/Call";
+/// The path the peer must observe after `strip_listen_path`.
+const H3_MESH_BACKEND_PATH: &str = "/h3.mesh.Echo/Call";
+
+/// A declared APPLICATION port for a Sidecar target, reserved and then RELEASED
+/// so nothing in this process can bind it.
+///
+/// The mesh-mTLS transport dials `mesh.mtls_port`, never this port, so an
+/// authority assertion that names it proves the authority/dial-port split rather
+/// than a coincidence — and once the mesh transport is WITHDRAWN, a dial to it
+/// must find nothing listening. A fixed constant could not promise either, since
+/// an unrelated process on the runner might hold it.
+async fn h3_mesh_declared_app_port() -> u16 {
+    reserve_unique_mesh_port().await
+}
+
+/// What a mesh peer observed for ONE accepted gRPC stream.
+#[derive(Clone, Debug)]
+struct H3MeshObservedRpc {
+    scheme: String,
+    authority: String,
+    path: String,
+    te: Option<String>,
+    content_type: Option<String>,
+    grpc_timeout: Option<String>,
+    body: Vec<u8>,
+    /// The DER of every client certificate the peer VERIFIED. Empty for an app
+    /// behind an HBONE relay, which sees plaintext h2c inside the tunnel.
+    client_cert_der: Vec<Vec<u8>>,
+    /// The request stream ended with an HTTP/2 error rather than END_STREAM —
+    /// the shape a client cancellation must propagate as.
+    request_reset: bool,
+}
+
+impl H3MeshObservedRpc {
+    /// Whether the client certificate chain this peer verified carries `id` as a
+    /// SPIFFE URI SAN. Matched as an exact ASCII byte run in the raw DER (a URI
+    /// SAN stores its value verbatim), so it is proof the gateway presented THAT
+    /// workload SVID rather than merely completing some TLS handshake.
+    fn presented_client_spiffe(&self, id: &str) -> bool {
+        self.client_cert_der
+            .iter()
+            .any(|der| der.windows(id.len()).any(|w| w == id.as_bytes()))
+    }
+}
+
+/// How a mesh gRPC peer answers each RPC it serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum H3MeshPeerBehavior {
+    /// Drain the request body, then answer HEADERS + DATA (echoing the request
+    /// bytes) + real HTTP/2 TRAILERS.
+    EchoAfterUpload,
+    /// Answer HEADERS + DATA as soon as the FIRST request DATA frame lands — the
+    /// bidirectional shape that deadlocks if the gateway buffers the H3 upload —
+    /// then keep reading until the client half-closes or resets.
+    RespondOnFirstRequestFrame,
+    /// Observe the request and never answer, so the client `grpc-timeout`
+    /// deadline is what ends the call.
+    NeverRespond,
+}
+
+/// The response DATA a `RespondOnFirstRequestFrame` peer sends before the client
+/// has half-closed.
+const H3_MESH_EARLY_RESPONSE: &[u8] = b"early";
+
+/// A live mesh listener under test, plus everything it observed. The accept loop
+/// holds its own `Arc` clones of the observation slots, so a test can keep
+/// reading them while the listener is still serving.
+struct H3MeshPeer {
+    /// The port the gateway is told to DIAL (`mesh.mtls_port` / `mesh.hbone_port`).
+    port: u16,
+    rpcs: Arc<Mutex<Vec<Arc<Mutex<H3MeshObservedRpc>>>>>,
+    /// Every ClientHello SNI seen, in order. `None` is an absent SNI extension
+    /// (what an IP-literal dial with no override produces).
+    snis: Arc<Mutex<Vec<Option<String>>>>,
+    /// TCP accepts, so a fail-closed refusal can be proven to have dialed
+    /// NOTHING rather than merely to have failed late.
+    accepts: Arc<AtomicUsize>,
+    /// CONNECT `:authority` values an HBONE relay admitted.
+    connects: Arc<Mutex<Vec<String>>>,
+}
+
+impl H3MeshPeer {
+    fn observed_rpcs(&self) -> Vec<H3MeshObservedRpc> {
+        self.rpcs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|rpc| {
+                rpc.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn observed_snis(&self) -> Vec<Option<String>> {
+        self.snis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn observed_connects(&self) -> Vec<String> {
+        self.connects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn accept_count(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
+    /// The first gRPC stream this peer observed on the tested method, waiting up
+    /// to `timeout`. Filtering on the method path discards any unrelated
+    /// startup/capability connection so a datapath assertion cannot be satisfied
+    /// by preflight.
+    async fn wait_for_rpc(&self, timeout: Duration) -> H3MeshObservedRpc {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(rpc) = self
+                .observed_rpcs()
+                .into_iter()
+                .find(|rpc| rpc.path == H3_MESH_BACKEND_PATH)
+            {
+                return rpc;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mesh peer on :{} never observed a gRPC stream for {H3_MESH_BACKEND_PATH}",
+                self.port
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until the observed RPC on the tested method reports a reset request
+    /// stream, which is how a client cancellation reaches the peer.
+    async fn wait_for_request_reset(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .observed_rpcs()
+                .iter()
+                .any(|rpc| rpc.path == H3_MESH_BACKEND_PATH && rpc.request_reset)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mesh peer on :{} never observed the cancelled request stream reset",
+                self.port
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A rustls server-cert resolver presenting ONE certified SVID and recording the
+/// ClientHello SNI of every handshake.
+///
+/// The SNI is the only channel that can prove a CROSS-CLUSTER dial applied
+/// `mesh.eastwest_sni` rather than naming the east-west gateway it actually
+/// connected to, so the mesh fixtures resolve their cert through this instead of
+/// `with_single_cert`.
+struct H3MeshSniResolver {
+    certified: Arc<rustls::sign::CertifiedKey>,
+    snis: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl std::fmt::Debug for H3MeshSniResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3MeshSniResolver").finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for H3MeshSniResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.snis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(client_hello.server_name().map(str::to_owned));
+        Some(Arc::clone(&self.certified))
+    }
+}
+
+/// An h2-ALPN mTLS server config presenting `svid` and requiring a client
+/// certificate chained to the shared mesh CA — the peer half of the SVID-mTLS
+/// hop, with SNI recording attached.
+fn h3_mesh_server_config(
+    svid: &GeneratedGatewaySvid,
+    snis: Arc<Mutex<Vec<Option<String>>>>,
+) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh peer trust bundle");
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+        roots.add(cert).expect("add mesh peer client root");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("build mesh peer client verifier");
+    let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh peer SVID");
+    let key_pem = std::fs::read(&svid.key_path).expect("read mesh peer key");
+    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .expect("parse mesh peer key")
+        .expect("mesh peer key present");
+    let signing_key =
+        ferrum_edge::fips::any_supported_signing_key(&key).expect("mesh peer signing key");
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key));
+    let resolver = Arc::new(H3MeshSniResolver { certified, snis });
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(config)
+}
+
+/// One header value as a `String`, so the observed record can be built before the
+/// request body is taken.
+fn h3_mesh_header(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Answer response HEADERS + one DATA frame, leaving the stream open for the
+/// terminal TRAILERS.
+fn h3_mesh_send_response_head(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    body: &[u8],
+) -> Option<h2::SendStream<Bytes>> {
+    let response = hyper::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .body(())
+        .expect("build mesh peer gRPC response");
+    let mut send = respond.send_response(response, false).ok()?;
+    send.send_data(Bytes::copy_from_slice(body), false).ok()?;
+    Some(send)
+}
+
+/// Serve gRPC RPCs over an already-established byte stream, recording what each
+/// one carried.
+///
+/// Generic over the transport so the Sidecar peer drives it over a terminated
+/// SVID-mTLS socket and the Ambient app drives it over the plaintext h2c socket
+/// behind the HBONE relay — the same server code, so a difference in the
+/// assertions can only come from the transport under test.
+///
+/// Per-stream handling is SPAWNED: `h2::server::Connection::accept` is the
+/// connection's only I/O driver, so awaiting a request body inline would stop
+/// driving the connection and the body would never arrive.
+async fn h3_mesh_serve_grpc<T>(
+    io: T,
+    behavior: H3MeshPeerBehavior,
+    client_cert_der: Vec<Vec<u8>>,
+    rpcs: Arc<Mutex<Vec<Arc<Mutex<H3MeshObservedRpc>>>>>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Ok(mut connection) = h2::server::handshake(io).await else {
+        return;
+    };
+    while let Some(accepted) = connection.accept().await {
+        let Ok((request, respond)) = accepted else {
+            return;
+        };
+        let rpcs = Arc::clone(&rpcs);
+        let client_cert_der = client_cert_der.clone();
+        tokio::spawn(async move {
+            h3_mesh_serve_one_rpc(request, respond, behavior, client_cert_der, rpcs).await;
+        });
+    }
+}
+
+/// Observe and answer exactly ONE accepted gRPC stream per
+/// [`H3MeshPeerBehavior`].
+async fn h3_mesh_serve_one_rpc(
+    request: hyper::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    behavior: H3MeshPeerBehavior,
+    client_cert_der: Vec<Vec<u8>>,
+    rpcs: Arc<Mutex<Vec<Arc<Mutex<H3MeshObservedRpc>>>>>,
+) {
+    let headers = request.headers().clone();
+    let uri = request.uri().clone();
+    let mut recv = request.into_body();
+    let record = Arc::new(Mutex::new(H3MeshObservedRpc {
+        scheme: uri.scheme_str().unwrap_or_default().to_string(),
+        authority: uri
+            .authority()
+            .map(|authority| authority.to_string())
+            .unwrap_or_default(),
+        path: uri.path().to_string(),
+        te: h3_mesh_header(&headers, "te"),
+        content_type: h3_mesh_header(&headers, "content-type"),
+        grpc_timeout: h3_mesh_header(&headers, "grpc-timeout"),
+        body: Vec::new(),
+        client_cert_der,
+        request_reset: false,
+    }));
+    rpcs.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::clone(&record));
+
+    if behavior == H3MeshPeerBehavior::NeverRespond {
+        // Observe, then hold the stream open WITHOUT answering and without
+        // dropping `respond` — dropping it would RST_STREAM, which the gateway
+        // would classify as a connection failure instead of letting the client
+        // deadline fire.
+        h3_mesh_drain_request(&mut recv, &record).await;
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let mut send = if behavior == H3MeshPeerBehavior::RespondOnFirstRequestFrame {
+        // Wait for exactly one request DATA frame — proof the gateway committed
+        // the H3 upload incrementally instead of buffering it — then answer while
+        // the client is still sending.
+        let Some(Ok(first)) = recv.data().await else {
+            return;
+        };
+        let _ = recv.flow_control().release_capacity(first.len());
+        record
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .body
+            .extend_from_slice(&first);
+        let Some(send) = h3_mesh_send_response_head(&mut respond, H3_MESH_EARLY_RESPONSE) else {
+            return;
+        };
+        h3_mesh_drain_request(&mut recv, &record).await;
+        send
+    } else {
+        h3_mesh_drain_request(&mut recv, &record).await;
+        let echo = record
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .body
+            .clone();
+        let Some(send) = h3_mesh_send_response_head(&mut respond, &echo) else {
+            return;
+        };
+        send
+    };
+
+    let request_reset = record
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .request_reset;
+    if request_reset {
+        // A reset request stream has no terminal status to deliver.
+        return;
+    }
+    let mut trailers = hyper::HeaderMap::new();
+    trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
+    trailers.insert(
+        "grpc-message",
+        hyper::header::HeaderValue::from_static("ok"),
+    );
+    trailers.insert(
+        "x-mesh-peer-trailer",
+        hyper::header::HeaderValue::from_static("real-http2-trailer"),
+    );
+    let _ = send.send_trailers(trailers);
+}
+
+/// Read the request body to END_STREAM, accumulating it, and mark the record when
+/// the stream ends with an HTTP/2 error instead (a propagated cancellation).
+async fn h3_mesh_drain_request(recv: &mut h2::RecvStream, record: &Arc<Mutex<H3MeshObservedRpc>>) {
+    while let Some(chunk) = recv.data().await {
+        match chunk {
+            Ok(chunk) => {
+                let _ = recv.flow_control().release_capacity(chunk.len());
+                record
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .body
+                    .extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                record
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .request_reset = true;
+                return;
+            }
+        }
+    }
+}
+
+/// A real SVID-mTLS HTTP/2 gRPC listener: the Sidecar peer's inbound
+/// (`:15006`-style) listener.
+async fn start_h3_mesh_mtls_peer(
+    svid: &GeneratedGatewaySvid,
+    behavior: H3MeshPeerBehavior,
+) -> H3MeshPeer {
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh mTLS peer");
+    let port = listener.local_addr().expect("mesh mTLS peer addr").port();
+    let snis: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let rpcs: Arc<Mutex<Vec<Arc<Mutex<H3MeshObservedRpc>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let config = h3_mesh_server_config(svid, Arc::clone(&snis));
+    let peer = H3MeshPeer {
+        port,
+        rpcs: Arc::clone(&rpcs),
+        snis,
+        accepts: Arc::clone(&accepts),
+        connects: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let _ = tcp.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let rpcs = Arc::clone(&rpcs);
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let client_cert_der = tls
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|chain| chain.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                h3_mesh_serve_grpc(tls, behavior, client_cert_der, rpcs).await;
+            });
+        }
+    });
+
+    peer
+}
+
+/// A plaintext h2c gRPC app — the destination workload behind an Ambient HBONE
+/// relay. The relay byte-copies the tunnel into this socket, so the gateway's
+/// NESTED HTTP/2 client has to negotiate and frame end to end.
+async fn start_h3_mesh_h2c_app(behavior: H3MeshPeerBehavior) -> H3MeshPeer {
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh h2c app");
+    let port = listener.local_addr().expect("h2c app addr").port();
+    let rpcs: Arc<Mutex<Vec<Arc<Mutex<H3MeshObservedRpc>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let peer = H3MeshPeer {
+        port,
+        rpcs: Arc::clone(&rpcs),
+        snis: Arc::new(Mutex::new(Vec::new())),
+        accepts: Arc::clone(&accepts),
+        connects: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let _ = tcp.set_nodelay(true);
+            let rpcs = Arc::clone(&rpcs);
+            tokio::spawn(async move {
+                h3_mesh_serve_grpc(tcp, behavior, Vec::new(), rpcs).await;
+            });
+        }
+    });
+
+    peer
+}
+
+/// A real Ambient HBONE listener: SVID-mTLS + HTTP/2, admitting bare CONNECTs
+/// and byte-copying each to its CONNECT `:authority` — exactly what the
+/// destination-side transparent relay does, so the inner HTTP/2 gRPC connection
+/// the gateway runs is genuinely tunnelled.
+async fn start_h3_mesh_hbone_relay(svid: &GeneratedGatewaySvid) -> H3MeshPeer {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh HBONE relay");
+    let port = listener.local_addr().expect("HBONE relay addr").port();
+    let snis: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let connects: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let config = h3_mesh_server_config(svid, Arc::clone(&snis));
+    let peer = H3MeshPeer {
+        port,
+        rpcs: Arc::new(Mutex::new(Vec::new())),
+        snis,
+        accepts: Arc::clone(&accepts),
+        connects: Arc::clone(&connects),
+    };
+
+    tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let _ = tcp.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let connects = Arc::clone(&connects);
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut connection) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                while let Some(accepted) = connection.accept().await {
+                    let Ok((request, mut respond)) = accepted else {
+                        return;
+                    };
+                    if request.method() != hyper::Method::CONNECT {
+                        return;
+                    }
+                    let authority = request.uri().to_string();
+                    connects
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(authority.clone());
+                    // A real relay only dials what its open-relay guard admits;
+                    // this fixture stays on loopback for the same reason.
+                    if !authority.starts_with("127.0.0.1:") {
+                        return;
+                    }
+                    let Ok(app) = TcpStream::connect(authority.as_str()).await else {
+                        return;
+                    };
+                    let _ = app.set_nodelay(true);
+                    let mut recv = request.into_body();
+                    let response = hyper::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("build HBONE CONNECT response");
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        return;
+                    };
+                    let (mut app_read, mut app_write) = tokio::io::split(app);
+                    tokio::spawn(async move {
+                        while let Some(chunk) = recv.data().await {
+                            let Ok(chunk) = chunk else { break };
+                            let _ = recv.flow_control().release_capacity(chunk.len());
+                            if app_write.write_all(&chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = app_write.shutdown().await;
+                    });
+                    tokio::spawn(async move {
+                        // The fixture's frames are small (gRPC control frames and
+                        // a few-byte message), so they always fit the default
+                        // HTTP/2 window and need no explicit capacity
+                        // reservation — the same simplification the HBONE pool
+                        // echo relays make.
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            match app_read.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => {
+                                    let chunk = Bytes::copy_from_slice(&buf[..read]);
+                                    if send.send_data(chunk, false).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    peer
+}
+
+/// A mesh listener that ACCEPTS and immediately closes, so a dial to it fails
+/// PRE-WIRE — before any HTTP/2 request can be written — and is therefore
+/// retry-eligible, while still RECORDING that it was dialed.
+///
+/// That recording is what makes retry rotation provable from outside the
+/// gateway: if this peer's accept count is non-zero and the RPC nevertheless
+/// succeeded, the attempt must have rotated onto the other target and
+/// re-resolved ITS dial plan.
+async fn start_h3_mesh_dead_peer() -> H3MeshPeer {
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh dead peer");
+    let port = listener.local_addr().expect("dead peer addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let peer = H3MeshPeer {
+        port,
+        rpcs: Arc::new(Mutex::new(Vec::new())),
+        snis: Arc::new(Mutex::new(Vec::new())),
+        accepts: Arc::clone(&accepts),
+        connects: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            drop(tcp);
+        }
+    });
+
+    peer
+}
+
+/// N gateway/peer SVID file-sets minted under ONE shared mesh CA, so every
+/// identity in a topology mutually verifies through the same trust bundle.
+/// [`generate_two_gateway_svids`] generalized to an arbitrary identity count.
+fn generate_shared_ca_mesh_svid_set(
+    dir: &std::path::Path,
+    spiffe_ids: &[&str],
+) -> Vec<GeneratedGatewaySvid> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("mesh ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("mesh ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("mesh ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let trust_bundle_path = dir.join("h3-mesh-ca.pem");
+    std::fs::write(&trust_bundle_path, &ca_pem).expect("write mesh trust bundle");
+    let bundle = trust_bundle_path
+        .to_str()
+        .expect("bundle path is UTF-8")
+        .to_string();
+
+    spiffe_ids
+        .iter()
+        .enumerate()
+        .map(|(index, spiffe)| {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+            let mut params = CertificateParams::default();
+            params.distinguished_name = DistinguishedName::new();
+            let id = SpiffeId::new(*spiffe).expect("valid SPIFFE ID");
+            params
+                .subject_alt_names
+                .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+            params.is_ca = IsCa::ExplicitNoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ];
+            params.not_before = not_before;
+            params.not_after = not_after;
+            let cert = params.signed_by(&key, &issuer).expect("leaf cert");
+
+            let cert_path = dir.join(format!("h3-mesh-{index}.crt"));
+            let key_path = dir.join(format!("h3-mesh-{index}.key"));
+            std::fs::write(&cert_path, cert.pem()).expect("write mesh SVID cert");
+            std::fs::write(&key_path, key.serialize_pem()).expect("write mesh SVID key");
+            GeneratedGatewaySvid {
+                cert_path: cert_path.to_str().expect("path is UTF-8").to_string(),
+                key_path: key_path.to_str().expect("path is UTF-8").to_string(),
+                trust_bundle_path: bundle.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Frontend TLS material for the gateway's QUIC/HTTP-3 listener.
+struct H3MeshFrontendCerts {
+    cert_path: String,
+    key_path: String,
+    _dir: TempDir,
+}
+
+fn h3_mesh_frontend_certs() -> H3MeshFrontendCerts {
+    let dir = TempDir::new().expect("h3 frontend cert tempdir");
+    let ca = TestCa::new("h3-mesh-grpc-gw").expect("frontend ca");
+    let (cert, key) = ca.valid().expect("frontend leaf");
+    let cert_path = dir.path().join("frontend.crt");
+    let key_path = dir.path().join("frontend.key");
+    std::fs::write(&cert_path, &cert).expect("write frontend cert");
+    std::fs::write(&key_path, &key).expect("write frontend key");
+    H3MeshFrontendCerts {
+        cert_path: cert_path.to_str().expect("path is UTF-8").to_string(),
+        key_path: key_path.to_str().expect("path is UTF-8").to_string(),
+        _dir: dir,
+    }
+}
+
+/// One upstream-target YAML block (indented for `upstreams[].targets`) carrying
+/// `tags` verbatim, so a test declares the exact mesh metadata the runtime
+/// transport materialization has to consume — no in-process target construction.
+fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String {
+    let mut block = String::new();
+    block.push_str(&format!("      - host: \"{host}\"\n"));
+    block.push_str(&format!("        port: {port}\n"));
+    if !tags.is_empty() {
+        block.push_str("        tags:\n");
+        for (key, value) in tags {
+            block.push_str(&format!("          {key}: \"{value}\"\n"));
+        }
+    }
+    block
+}
+
+/// The upstream id every H3 mesh gRPC config declares. Shared with
+/// `h3_mesh_reload`, which polls the admin projection of THIS upstream to prove a
+/// SIGHUP reload has been applied.
+const H3_MESH_UPSTREAM_ID: &str = "h3-mesh-grpc-upstream";
+
+/// File-mode YAML for ONE gRPC-serving proxy whose upstream carries the supplied
+/// target blocks. `dead_backend_port` is the proxy's own (unlistened) backend, so
+/// only a mesh dispatch can reach anything at all.
+fn h3_mesh_grpc_config(dead_backend_port: u16, targets: &str, retry: bool) -> String {
+    h3_mesh_grpc_config_with_generation(dead_backend_port, targets, retry, 0)
+}
+
+/// Like [`h3_mesh_grpc_config`], but stamps an advancing `updated_at` on the
+/// proxy and upstream so file-mode `ConfigDelta` sees a real modification even
+/// when only mesh target tags change (host/port stay fixed across reloads).
+fn h3_mesh_grpc_config_with_generation(
+    dead_backend_port: u16,
+    targets: &str,
+    retry: bool,
+    generation: u32,
+) -> String {
+    let retry_block = if retry {
+        "    retry:\n      max_retries: 1\n      retryable_status_codes: []\n      \
+         retryable_methods: [\"POST\"]\n      retry_on_connect_failure: true\n      \
+         backoff: !fixed\n        delay_ms: 50\n"
+    } else {
+        ""
+    };
+    // Bound to one minute of unique stamps — the reload test only needs a few
+    // generations, and ConfigDelta keys modifications on `updated_at !=`.
+    let stamp = format!("2026-08-08T00:00:{generation:02}Z");
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "h3-mesh-grpc"
+    listen_path: "/mesh"
+    strip_listen_path: true
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {dead_backend_port}
+    upstream_id: "{H3_MESH_UPSTREAM_ID}"
+    backend_connect_timeout_ms: 3000
+    backend_read_timeout_ms: 8000
+    backend_write_timeout_ms: 8000
+    updated_at: "{stamp}"
+{retry_block}upstreams:
+  - id: "{H3_MESH_UPSTREAM_ID}"
+    algorithm: round_robin
+    updated_at: "{stamp}"
+    targets:
+{targets}consumers: []
+plugin_configs: []
+"#
+    )
+}
+
+/// Spawn a file-mode gateway with a QUIC/HTTP-3 frontend and a real SPIFFE SVID
+/// loaded from files. Returns the gateway plus the HTTPS/QUIC port to drive.
+///
+/// `reserved_ports` are ports this test's fixtures already own, so the harness's
+/// own admin/proxy allocation cannot land on one of them.
+async fn spawn_h3_mesh_gateway(
+    config_yaml: String,
+    svid: &GeneratedGatewaySvid,
+    frontend: &H3MeshFrontendCerts,
+    reserved_ports: &[u16],
+) -> (TestGateway, u16) {
+    let https_port = reserve_unique_mesh_port().await;
+    let mut builder = TestGateway::builder()
+        .mode_file(config_yaml)
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", frontend.cert_path.clone())
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", frontend.key_path.clone())
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        // gRPC always rides the cross-protocol bridge, never the native-H3
+        // backend pool, so the capability warmup probe has nothing to prove and
+        // would only add an unrelated dial to the fixtures.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_GATEWAY_SVID_CERT_PATH", svid.cert_path.clone())
+        .env("FERRUM_GATEWAY_SVID_KEY_PATH", svid.key_path.clone())
+        .env(
+            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+            svid.trust_bundle_path.clone(),
+        );
+    for port in reserved_ports {
+        builder = builder.reserve_listener_port(*port);
+    }
+    let gateway = builder.spawn().await.expect("spawn H3 mesh gRPC gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("H3 mesh gRPC gateway proxy port");
+    (gateway, https_port)
+}
+
+/// What the H3 client received for one RPC.
+struct H3MeshRpcResult {
+    status: http::StatusCode,
+    headers: hyper::HeaderMap,
+    body: Bytes,
+    trailers: hyper::HeaderMap,
+}
+
+impl H3MeshRpcResult {
+    /// The terminal `grpc-status`, from the trailers when the call reached the
+    /// peer and from the response headers on a Trailers-Only gateway refusal.
+    fn grpc_status(&self) -> Option<String> {
+        h3_mesh_header(&self.trailers, "grpc-status")
+            .or_else(|| h3_mesh_header(&self.headers, "grpc-status"))
+    }
+
+    fn grpc_message(&self) -> Option<String> {
+        h3_mesh_header(&self.trailers, "grpc-message")
+            .or_else(|| h3_mesh_header(&self.headers, "grpc-message"))
+    }
+}
+
+/// Open the H3 gRPC stream, retrying only the QUIC HANDSHAKE so the test does not
+/// race the frontend listener coming up. The RPC itself is driven exactly once —
+/// an authoritative protocol/security observation must never be retried.
+async fn h3_mesh_open_stream(
+    client: &Http3Client,
+    url: &str,
+    metadata: &[(&str, &str)],
+) -> Http3GrpcStream {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match client.open_grpc_stream_with_headers(url, metadata).await {
+            Ok(stream) => return stream,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 gRPC stream never opened for {url}: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+/// A length-prefixed gRPC message (1-byte flag + 4-byte BE length + payload).
+fn h3_mesh_grpc_message(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(payload.len() + 5);
+    framed.push(0);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// One complete unary gRPC RPC over the gateway's QUIC/HTTP-3 frontend.
+async fn h3_mesh_unary_rpc(
+    https_port: u16,
+    payload: &[u8],
+    metadata: &[(&str, &str)],
+) -> H3MeshRpcResult {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_RPC_PATH}");
+    let mut stream = h3_mesh_open_stream(&client, &url, metadata).await;
+    stream
+        .send_message(payload)
+        .await
+        .expect("send H3 gRPC request message");
+    stream.finish().await.expect("half-close H3 gRPC request");
+    let (status, headers) = stream
+        .recv_response()
+        .await
+        .expect("H3 gRPC response headers");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("H3 gRPC response body and trailers");
+    H3MeshRpcResult {
+        status,
+        headers,
+        body,
+        trailers,
+    }
+}
+
+/// The same-cluster Sidecar `mesh.mtls` target tags: the peer's inbound mTLS
+/// listener is dialed, the destination workload identity is PINNED, and the
+/// request `:authority` is the destination SERVICE the peer routes on.
+fn h3_mesh_mtls_tags(peer_port: u16, pinned_peer: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("mesh.mtls", "true".to_string()),
+        ("mesh.mtls_port", peer_port.to_string()),
+        ("mesh.spiffe_id", pinned_peer.to_string()),
+        (
+            "mesh.mtls_authority_host",
+            H3_MESH_SERVICE_AUTHORITY.to_string(),
+        ),
+    ]
+}
+
+/// The same-cluster Ambient `mesh.hbone` target tags: the peer's HBONE listener
+/// is dialed and the destination workload identity is PINNED. `target.port` is
+/// the REAL app port, because that is what the destination relay CONNECTs to.
+fn h3_mesh_hbone_tags(relay_port: u16, pinned_peer: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("mesh.hbone", "true".to_string()),
+        ("mesh.hbone_port", relay_port.to_string()),
+        ("mesh.spiffe_id", pinned_peer.to_string()),
+    ]
+}
+
+// ── 1. Same-cluster Sidecar mesh mTLS ───────────────────────────────────────
+
+/// A native gRPC RPC over the H3 frontend reaches a same-cluster Sidecar peer
+/// over its authenticated SVID-mTLS hop, and the whole gRPC contract survives:
+/// the peer sees THIS gateway's client SVID (so the hop was authenticated, not a
+/// plaintext dial), the request `:authority` is the destination SERVICE rather
+/// than the `:15006`-style dial port, `te: trailers` and the native content type
+/// are intact, request DATA arrives byte-for-byte, and `grpc-status` /
+/// `grpc-message` come back as REAL HTTP/2 trailers relayed onto H3 trailers.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    let identities = TempDir::new().expect("h3 mesh mtls identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_peer(&svids[1], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    let payload = h3_mesh_grpc_message(b"h3-sidecar-mtls");
+    let result = h3_mesh_unary_rpc(https_port, b"h3-sidecar-mtls", &[]).await;
+
+    assert_eq!(result.status.as_u16(), 200, "gRPC rides on HTTP 200");
+    assert_eq!(
+        result.grpc_status().as_deref(),
+        Some("0"),
+        "the mesh-mTLS RPC must succeed: {:?} / {:?}",
+        result.headers,
+        result.trailers
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "grpc-status").as_deref(),
+        Some("0"),
+        "the terminal status must arrive as REAL H3 trailers, not response headers"
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "x-mesh-peer-trailer").as_deref(),
+        Some("real-http2-trailer"),
+        "the peer's non-gRPC trailer must be relayed too"
+    );
+    assert_eq!(
+        result.body.as_ref(),
+        payload.as_slice(),
+        "the peer's response DATA must relay byte-for-byte onto H3"
+    );
+
+    let observed = peer.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(
+        observed.scheme, "https",
+        "the Sidecar mTLS request is HTTPS"
+    );
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "the peer must have verified THIS gateway's client SVID (authenticated \
+         hop, never a plaintext dial)"
+    );
+    assert_eq!(
+        observed.authority, H3_MESH_SERVICE_AUTHORITY,
+        "the request :authority must be the destination SERVICE the peer routes \
+         on, not the dial address"
+    );
+    assert!(
+        !observed.authority.contains(&peer.port.to_string()),
+        "the :authority must never name the inbound mTLS DIAL port"
+    );
+    assert_eq!(observed.path, H3_MESH_BACKEND_PATH);
+    assert_eq!(observed.te.as_deref(), Some("trailers"));
+    assert_eq!(observed.content_type.as_deref(), Some("application/grpc"));
+    assert_eq!(
+        observed.body, payload,
+        "the H3 request DATA must reach the peer byte-for-byte"
+    );
+
+    gateway.shutdown();
+}
+
+// ── 2. Cross-cluster Sidecar mesh mTLS (east-west) ───────────────────────────
+
+/// A native gRPC RPC over the H3 frontend reaches a CROSS-CLUSTER Sidecar
+/// destination through its east-west gateway: the ClientHello carries the
+/// destination-FQDN SNI override (`mesh.eastwest_sni`) rather than the gateway
+/// address actually connected to, verification is scoped to the remote trust
+/// domain with NO pod pinning, and real response trailers still arrive.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
+    let identities = TempDir::new().expect("h3 xc mtls identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    // The remote east-west gateway terminates the same SVID-mTLS hop.
+    let eastwest = start_h3_mesh_mtls_peer(&svids[1], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    // The HTTP-family cross-cluster Sidecar target's identity IS the gateway dial
+    // endpoint; the destination rides the SNI override + authority host.
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        eastwest.port,
+        &[
+            ("mesh.mtls", "true".to_string()),
+            ("mesh.mtls_port", eastwest.port.to_string()),
+            ("mesh.cross_cluster", "true".to_string()),
+            ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
+            ("mesh.trust_domain", "cluster.local".to_string()),
+            ("mesh.mtls_authority_host", H3_MESH_EASTWEST_SNI.to_string()),
+        ],
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, eastwest.port],
+    )
+    .await;
+
+    let payload = h3_mesh_grpc_message(b"h3-xc-mtls");
+    let result = h3_mesh_unary_rpc(https_port, b"h3-xc-mtls", &[]).await;
+
+    assert_eq!(
+        result.grpc_status().as_deref(),
+        Some("0"),
+        "the cross-cluster mesh-mTLS RPC must succeed: {:?} / {:?}",
+        result.headers,
+        result.trailers
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "grpc-status").as_deref(),
+        Some("0"),
+        "the terminal status must arrive as REAL H3 trailers"
+    );
+    assert_eq!(result.body.as_ref(), payload.as_slice());
+
+    let observed = eastwest.wait_for_rpc(Duration::from_secs(10)).await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "the east-west hop must be authenticated with this gateway's SVID"
+    );
+    assert_eq!(
+        observed.authority, H3_MESH_EASTWEST_SNI,
+        "the inner request authority must name the destination service"
+    );
+    let snis = eastwest.observed_snis();
+    assert!(
+        snis.iter()
+            .any(|sni| sni.as_deref() == Some(H3_MESH_EASTWEST_SNI)),
+        "the east-west ClientHello must carry the destination-FQDN SNI override, \
+         not the gateway address dialed; observed {snis:?}"
+    );
+
+    gateway.shutdown();
+}
+
+// ── 3. Same-cluster Ambient HBONE (nested HTTP/2 in the CONNECT tunnel) ──────
+
+/// A native gRPC RPC over the H3 frontend reaches a same-cluster Ambient
+/// destination through an authenticated HBONE CONNECT: the relay verifies THIS
+/// gateway's SVID, the CONNECT `:authority` names the real destination app
+/// address, and the NESTED HTTP/2 connection inside the byte tunnel carries
+/// DATA and real `grpc-status` TRAILERS end to end — the exact framing the old
+/// HTTP/1.1-inside-HBONE dispatch could not.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
+    let identities = TempDir::new().expect("h3 hbone identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let app = start_h3_mesh_h2c_app(H3MeshPeerBehavior::EchoAfterUpload).await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        app.port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, app.port],
+    )
+    .await;
+
+    let payload = h3_mesh_grpc_message(b"h3-ambient-hbone");
+    let result = h3_mesh_unary_rpc(https_port, b"h3-ambient-hbone", &[]).await;
+
+    assert_eq!(
+        result.grpc_status().as_deref(),
+        Some("0"),
+        "the Ambient HBONE RPC must succeed: {:?} / {:?}",
+        result.headers,
+        result.trailers
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "grpc-status").as_deref(),
+        Some("0"),
+        "gRPC trailers must survive the nested HTTP/2 connection inside the tunnel"
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "x-mesh-peer-trailer").as_deref(),
+        Some("real-http2-trailer")
+    );
+    assert_eq!(result.body.as_ref(), payload.as_slice());
+
+    let connects = relay.observed_connects();
+    assert!(
+        connects
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{}", app.port)),
+        "the CONNECT :authority must name the real destination app address; \
+         observed {connects:?}"
+    );
+
+    let observed = app.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(
+        observed.scheme, "http",
+        "the inner Ambient application hop is h2c, not end-to-end HTTPS"
+    );
+    assert_eq!(observed.path, H3_MESH_BACKEND_PATH);
+    assert_eq!(observed.te.as_deref(), Some("trailers"));
+    assert_eq!(observed.content_type.as_deref(), Some("application/grpc"));
+    assert_eq!(observed.body, payload);
+    assert_eq!(
+        observed.authority,
+        format!("127.0.0.1:{}", app.port),
+        "the inner request authority must be the destination's own app address"
+    );
+
+    gateway.shutdown();
+}
+
+// ── 4. Cross-cluster Ambient HBONE (east-west gateway) ──────────────────────
+
+/// A native gRPC RPC over the H3 frontend reaches a CROSS-CLUSTER Ambient
+/// destination through the remote east-west gateway. `target.host` is the scoped
+/// SYNTHETIC identity the cross-cluster materializer stamps — never dialable —
+/// so a successful RPC proves the dial used `mesh.hbone_dial_host`, and the
+/// ClientHello must carry the destination-FQDN SNI override with
+/// trust-domain-scoped verification instead of a pinned pod SPIFFE.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
+    let identities = TempDir::new().expect("h3 xc hbone identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let app = start_h3_mesh_h2c_app(H3MeshPeerBehavior::EchoAfterUpload).await;
+    let eastwest = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        // Scoped synthetic identity, exactly as the cross-cluster materializer
+        // stamps it: it must never be dialed or used as an authority.
+        "mesh-xc-h3|h3-remote.ferrum.svc.cluster.local",
+        app.port,
+        &[
+            ("mesh.hbone", "true".to_string()),
+            ("mesh.cross_cluster", "true".to_string()),
+            ("mesh.hbone_dial_host", "127.0.0.1".to_string()),
+            ("mesh.hbone_port", eastwest.port.to_string()),
+            ("mesh.hbone_authority_host", "127.0.0.1".to_string()),
+            ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
+            ("mesh.trust_domain", "cluster.local".to_string()),
+        ],
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, eastwest.port, app.port],
+    )
+    .await;
+
+    let payload = h3_mesh_grpc_message(b"h3-xc-hbone");
+    let result = h3_mesh_unary_rpc(https_port, b"h3-xc-hbone", &[]).await;
+
+    assert_eq!(
+        result.grpc_status().as_deref(),
+        Some("0"),
+        "the cross-cluster Ambient HBONE RPC must succeed: {:?} / {:?}",
+        result.headers,
+        result.trailers
+    );
+    assert_eq!(
+        h3_mesh_header(&result.trailers, "grpc-status").as_deref(),
+        Some("0"),
+        "gRPC trailers must survive the cross-cluster nested HTTP/2 tunnel"
+    );
+    assert_eq!(result.body.as_ref(), payload.as_slice());
+
+    let snis = eastwest.observed_snis();
+    assert!(
+        snis.iter()
+            .any(|sni| sni.as_deref() == Some(H3_MESH_EASTWEST_SNI)),
+        "the east-west ClientHello must carry the destination-FQDN SNI override; \
+         observed {snis:?}"
+    );
+    let connects = eastwest.observed_connects();
+    assert!(
+        connects
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{}", app.port)),
+        "the CONNECT :authority must name the destination app address from \
+         mesh.hbone_authority_host, never the synthetic target host; observed \
+         {connects:?}"
+    );
+
+    let observed = app.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(
+        observed.scheme, "http",
+        "cross-cluster Ambient still terminates in a plaintext h2c app request"
+    );
+    assert_eq!(observed.body, payload);
+
+    gateway.shutdown();
+}
+
+// ── 5. Streaming + cancellation over a mesh transport ───────────────────────
+
+/// True client-streaming / bidirectional gRPC survives the mesh transport: the
+/// Ambient peer answers after the FIRST request DATA frame — proof the gateway
+/// committed the H3 upload incrementally instead of buffering it — and a client
+/// cancellation then propagates through the nested HTTP/2 connection as a reset
+/// request stream rather than being absorbed by the gateway.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
+    let identities = TempDir::new().expect("h3 hbone streaming identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let app = start_h3_mesh_h2c_app(H3MeshPeerBehavior::RespondOnFirstRequestFrame).await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        app.port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    // No retry and no body plugins, so the H3 frontend takes the STREAMING
+    // request bridge rather than draining the upload first.
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, app.port],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_RPC_PATH}");
+    let mut stream = h3_mesh_open_stream(&client, &url, &[]).await;
+    stream
+        .send_message(b"h3-stream-first")
+        .await
+        .expect("send first H3 gRPC message");
+
+    // The response must arrive BEFORE the client half-closes: the mesh transport
+    // has to be genuinely full-duplex, not request-then-response.
+    let (status, _headers) = stream
+        .recv_response()
+        .await
+        .expect("response head before half-close");
+    assert_eq!(status.as_u16(), 200);
+    let first_chunk = stream
+        .recv_data()
+        .await
+        .expect("response DATA before half-close");
+    assert_eq!(
+        first_chunk.as_deref(),
+        Some(H3_MESH_EARLY_RESPONSE),
+        "the peer's pre-half-close DATA must reach the H3 client"
+    );
+
+    let observed = app.wait_for_rpc(Duration::from_secs(10)).await;
+    assert_eq!(observed.path, H3_MESH_BACKEND_PATH);
+    assert_eq!(
+        observed.body,
+        h3_mesh_grpc_message(b"h3-stream-first"),
+        "the first H3 DATA frame must have been committed incrementally"
+    );
+
+    // Cancel the upload direction while the RPC is live. It must reach the peer
+    // as a reset request stream through the tunnel.
+    stream.cancel_request_upload();
+    app.wait_for_request_reset(Duration::from_secs(15)).await;
+
+    gateway.shutdown();
+}
+
+// ── 6. Deadline propagation over a mesh transport ───────────────────────────
+
+/// A client `grpc-timeout` is propagated onto the mesh transport and enforced by
+/// the gateway: the Sidecar peer observes an outbound `grpc-timeout` on the
+/// authenticated hop, and when it never answers the H3 client gets
+/// DEADLINE_EXCEEDED (4) rather than hanging or receiving a connection error.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
+    let identities = TempDir::new().expect("h3 mesh deadline identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_peer(&svids[1], H3MeshPeerBehavior::NeverRespond).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    let result = h3_mesh_unary_rpc(https_port, b"h3-deadline", &[("grpc-timeout", "700m")]).await;
+
+    assert_eq!(
+        result.grpc_status().as_deref(),
+        Some("4"),
+        "an unanswered mesh RPC must end as DEADLINE_EXCEEDED, not a connection \
+         error: {:?} / {:?}",
+        result.headers,
+        result.trailers
+    );
+
+    let observed = peer.wait_for_rpc(Duration::from_secs(10)).await;
+    assert!(
+        observed
+            .grpc_timeout
+            .as_deref()
+            .is_some_and(|timeout| !timeout.is_empty()),
+        "the peer must have received a grpc-timeout on the mesh hop: {observed:?}"
+    );
+
+    gateway.shutdown();
+}
+
+// ── 7. Fail-closed refusal for unmaterializable mesh metadata ───────────────
+
+/// Every malformed / unmaterializable mesh transport shape is refused BEFORE any
+/// dial, with a fixed metadata-free client message: a corrupt identity pin, a
+/// cross-cluster target missing its SNI override, a cross-cluster target missing
+/// its remote trust domain, a cross-cluster target with no transport tag at all,
+/// and a corrupted target declaring BOTH mesh transports. In every case the H3
+/// client gets gRPC UNAVAILABLE (14), the peer's listener is never dialed, and
+/// the refusal text leaks no SPIFFE ID, SNI name, or trust domain.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
+    let identities = TempDir::new().expect("h3 mesh refusal identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    // A REACHABLE peer, so a refusal can only come from the transport gate and
+    // never from an unreachable address.
+    let peer = start_h3_mesh_mtls_peer(&svids[1], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let cases: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+        (
+            "corrupt sidecar identity pin",
+            vec![
+                ("mesh.mtls", "true".to_string()),
+                ("mesh.mtls_port", peer.port.to_string()),
+                ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
+            ],
+        ),
+        (
+            "cross-cluster sidecar missing the SNI override",
+            vec![
+                ("mesh.mtls", "true".to_string()),
+                ("mesh.mtls_port", peer.port.to_string()),
+                ("mesh.cross_cluster", "true".to_string()),
+                ("mesh.trust_domain", "cluster.local".to_string()),
+            ],
+        ),
+        (
+            "cross-cluster sidecar missing the remote trust domain",
+            vec![
+                ("mesh.mtls", "true".to_string()),
+                ("mesh.mtls_port", peer.port.to_string()),
+                ("mesh.cross_cluster", "true".to_string()),
+                ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
+            ],
+        ),
+        (
+            "cross-cluster with no mesh transport tag",
+            vec![
+                ("mesh.cross_cluster", "true".to_string()),
+                ("mesh.trust_domain", "cluster.local".to_string()),
+                ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
+            ],
+        ),
+        (
+            "both mesh transports declared on one target",
+            vec![
+                ("mesh.mtls", "true".to_string()),
+                ("mesh.mtls_port", peer.port.to_string()),
+                ("mesh.hbone", "true".to_string()),
+                ("mesh.hbone_port", peer.port.to_string()),
+                ("mesh.spiffe_id", H3_MESH_PEER_SPIFFE.to_string()),
+            ],
+        ),
+    ];
+
+    // The mesh metadata a refusal must never echo to a client.
+    let secrets = [
+        H3_MESH_PEER_SPIFFE,
+        H3_MESH_EASTWEST_SNI,
+        "cluster.local",
+        "not-a-spiffe-id",
+    ];
+
+    for (label, tags) in cases {
+        let dead_backend_port = reserve_unique_mesh_port().await;
+        let targets = h3_mesh_target_yaml("127.0.0.1", declared_app_port, &tags);
+        let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+            h3_mesh_grpc_config(dead_backend_port, &targets, false),
+            &svids[0],
+            &frontend,
+            &[dead_backend_port, peer.port, declared_app_port],
+        )
+        .await;
+
+        let accepts_before = peer.accept_count();
+        let result = h3_mesh_unary_rpc(https_port, b"h3-refused", &[]).await;
+
+        assert_eq!(
+            result.grpc_status().as_deref(),
+            Some("14"),
+            "{label}: an unmaterializable mesh transport must fail closed with \
+             gRPC UNAVAILABLE: {:?} / {:?}",
+            result.headers,
+            result.trailers
+        );
+        assert!(
+            result.body.is_empty(),
+            "{label}: a pre-dial refusal must carry no response body"
+        );
+        assert_eq!(
+            peer.accept_count(),
+            accepts_before,
+            "{label}: the refusal must happen BEFORE any dial to the peer"
+        );
+        let message = result.grpc_message().unwrap_or_default();
+        for secret in secrets {
+            assert!(
+                !message.contains(secret),
+                "{label}: the refusal message must not leak mesh identity \
+                 metadata ({secret:?}): {message:?}"
+            );
+        }
+
+        gateway.shutdown();
+    }
+}
+
+// ── 8. Retry rotation re-resolves the rotated target's transport ────────────
+
+/// Retry rotation re-resolves the transport PER ATTEMPT.
+///
+/// Two mesh-mTLS targets with DIFFERENT pinned workload identities and different
+/// dial ports. The first target's peer accepts and immediately closes, so its
+/// attempt fails PRE-WIRE and is retry-eligible; the rotation must land on the
+/// SECOND target and dial over ITS OWN plan (a different pinned peer on a
+/// different port). The dead peer's ACCEPT COUNT is what makes the rotation
+/// provable from outside the gateway: it proves that target was really dialed,
+/// so a successful RPC can only mean the attempt rotated and re-resolved. A
+/// rotated attempt reusing the first target's dial plan would fail the second
+/// peer's identity pin, and refusing a mesh-tagged rotation — which this bridge
+/// did before #3284 — would fail closed with UNAVAILABLE.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
+    let identities = TempDir::new().expect("h3 mesh rotation identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[
+            H3_MESH_GATEWAY_SPIFFE,
+            H3_MESH_PEER_SPIFFE,
+            H3_MESH_PEER_B_SPIFFE,
+        ],
+    );
+    let dead_peer = start_h3_mesh_dead_peer().await;
+    let live_peer = start_h3_mesh_mtls_peer(&svids[2], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let mut targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(dead_peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    targets.push_str(&h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(live_peer.port, H3_MESH_PEER_B_SPIFFE),
+    ));
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_grpc_config(dead_backend_port, &targets, true),
+        &svids[0],
+        &frontend,
+        &[
+            dead_backend_port,
+            dead_peer.port,
+            live_peer.port,
+            declared_app_port,
+        ],
+    )
+    .await;
+
+    // Round-robin can start either target, so drive three RPCs and require EVERY
+    // one to succeed. Each RPC is still driven exactly once — no observation is
+    // retried; the loop widens coverage, it does not re-roll a verdict.
+    let payload = h3_mesh_grpc_message(b"h3-rotation");
+    for attempt in 1..=3 {
+        let result = h3_mesh_unary_rpc(https_port, b"h3-rotation", &[]).await;
+        assert_eq!(
+            result.grpc_status().as_deref(),
+            Some("0"),
+            "RPC {attempt}: a retry rotation onto a mesh-tagged target must \
+             re-resolve ITS transport and succeed, never fail closed: {:?} / {:?}",
+            result.headers,
+            result.trailers
+        );
+        assert_eq!(
+            result.body.as_ref(),
+            payload.as_slice(),
+            "RPC {attempt}: the rotated mesh attempt must relay the peer's DATA"
+        );
+        assert_eq!(
+            h3_mesh_header(&result.trailers, "grpc-status").as_deref(),
+            Some("0"),
+            "RPC {attempt}: the rotated mesh attempt must relay REAL trailers"
+        );
+    }
+    assert!(
+        dead_peer.accept_count() > 0,
+        "the first mesh target must really have been dialed, so a successful RPC \
+         proves the attempt rotated onto the second target's own dial plan"
+    );
+
+    let observed = live_peer.wait_for_rpc(Duration::from_secs(10)).await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "the rotated attempt must still be an authenticated mesh hop"
+    );
+    assert_eq!(observed.body, payload);
+
+    gateway.shutdown();
+}
+
+// ── 9. Configuration update / reload / withdrawal ──────────────────────────
+
+/// The live transport follows configuration TRANSITIONS, not just first-start
+/// construction. One gateway process is driven through three SIGHUP file-mode
+/// reloads:
+///
+/// 1. the mesh target is RE-POINTED at a second peer with a different pinned
+///    workload identity — the RPC must move to that peer over its own dial plan;
+/// 2. the mesh transport tags are WITHDRAWN, leaving an untagged target — the
+///    RPC must stop reaching the mesh listener entirely;
+/// 3. the mesh target is restored but its identity pin is CORRUPTED — the RPC
+///    must fail closed with UNAVAILABLE and dial nothing.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
+    let identities = TempDir::new().expect("h3 mesh reload identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[
+            H3_MESH_GATEWAY_SPIFFE,
+            H3_MESH_PEER_SPIFFE,
+            H3_MESH_PEER_B_SPIFFE,
+        ],
+    );
+    let peer_a = start_h3_mesh_mtls_peer(&svids[1], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let peer_b = start_h3_mesh_mtls_peer(&svids[2], H3MeshPeerBehavior::EchoAfterUpload).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let config_for = |tags: &[(&'static str, String)], generation: u32| {
+        let targets = h3_mesh_target_yaml("127.0.0.1", declared_app_port, tags);
+        h3_mesh_grpc_config_with_generation(dead_backend_port, &targets, false, generation)
+    };
+
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        config_for(&h3_mesh_mtls_tags(peer_a.port, H3_MESH_PEER_SPIFFE), 0),
+        &svids[0],
+        &frontend,
+        &[
+            dead_backend_port,
+            peer_a.port,
+            peer_b.port,
+            declared_app_port,
+        ],
+    )
+    .await;
+
+    let payload = h3_mesh_grpc_message(b"h3-reload");
+    let first = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    assert_eq!(
+        first.grpc_status().as_deref(),
+        Some("0"),
+        "the initial mesh target must serve the RPC: {:?}",
+        first.headers
+    );
+    peer_a.wait_for_rpc(Duration::from_secs(10)).await;
+
+    // 1. UPDATE: re-point the mesh target at peer B (different pinned identity).
+    let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
+    h3_mesh_reload(&mut gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
+    let retargeted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    assert_eq!(
+        retargeted.grpc_status().as_deref(),
+        Some("0"),
+        "the re-pointed mesh target must serve the RPC after reload: {:?}",
+        retargeted.headers
+    );
+    assert_eq!(retargeted.body.as_ref(), payload.as_slice());
+    let observed_b = peer_b.wait_for_rpc(Duration::from_secs(10)).await;
+    assert!(
+        observed_b.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "the re-pointed hop must still be authenticated"
+    );
+
+    // 2. WITHDRAWAL: drop the mesh transport tags entirely. The target becomes an
+    //    ordinary direct-dial one, so the mesh listener must stop being reached.
+    let peer_b_accepts = peer_b.accept_count();
+    h3_mesh_reload(&mut gateway, config_for(&[], 2), &[]).await;
+    let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    assert_ne!(
+        withdrawn.grpc_status().as_deref(),
+        Some("0"),
+        "with the mesh transport withdrawn, the declared app port is not \
+         listening, so the RPC must not succeed: {:?} / {:?}",
+        withdrawn.headers,
+        withdrawn.trailers
+    );
+    assert_eq!(
+        peer_b.accept_count(),
+        peer_b_accepts,
+        "a withdrawn mesh transport must never keep dialing the peer's mesh \
+         listener"
+    );
+
+    // 3. CORRUPTED UPDATE: restore the mesh transport with an unusable identity
+    //    pin. It must fail closed, not fall back to a direct dial.
+    let peer_a_accepts = peer_a.accept_count();
+    let corrupted_tags = [
+        ("mesh.mtls", "true".to_string()),
+        ("mesh.mtls_port", peer_a.port.to_string()),
+        ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
+    ];
+    h3_mesh_reload(
+        &mut gateway,
+        config_for(&corrupted_tags, 3),
+        &corrupted_tags,
+    )
+    .await;
+    let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    assert_eq!(
+        corrupted.grpc_status().as_deref(),
+        Some("14"),
+        "a reload onto an unmaterializable identity must fail closed with \
+         UNAVAILABLE: {:?} / {:?}",
+        corrupted.headers,
+        corrupted.trailers
+    );
+    assert_eq!(
+        peer_a.accept_count(),
+        peer_a_accepts,
+        "the fail-closed reload must not dial the peer"
+    );
+
+    gateway.shutdown();
+}
+
+/// Rewrite the running file-mode gateway's config, SIGHUP it, and WAIT until the
+/// gateway's OWN read-only admin projection proves the new upstream targets are
+/// the live ones.
+///
+/// A fixed sleep is not proof: on a loaded hosted runner the reload can land
+/// after it, and the very next RPC then exercises the PREVIOUS target — which
+/// reads as "the re-pointed peer was never dialed" instead of "the reload had
+/// not landed yet". Polling the applied config observes convergence directly and
+/// spends no datapath RPC, so each step's authoritative protocol / fail-closed
+/// observation is still made exactly once, against a known-converged gateway.
+/// The child is polled between probes so a gateway that died on the reload fails
+/// as itself rather than being waited out for the whole window.
+///
+/// Publish via write-temp → rename (the file loader's stability contract) and
+/// assert `kill -HUP` succeeded — discarding the signal status previously hid
+/// delivery failures behind a 20s admin-poll timeout.
+async fn h3_mesh_reload(
+    gateway: &mut TestGateway,
+    config_yaml: String,
+    expected_tags: &[(&'static str, String)],
+) {
+    let config_path = gateway
+        .config_path
+        .as_ref()
+        .expect("file-mode harness must populate config_path")
+        .clone();
+    let tmp_path = config_path.with_extension("yaml.tmp");
+    std::fs::write(&tmp_path, &config_yaml).expect("stage H3 mesh config rewrite");
+    std::fs::rename(&tmp_path, &config_path).expect("atomically publish H3 mesh config rewrite");
+    #[cfg(unix)]
+    {
+        let pid = gateway.pid().expect("gateway still running");
+        let signal = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .output()
+            .expect("invoke kill -HUP for H3 mesh reload");
+        assert!(
+            signal.status.success(),
+            "kill -HUP {pid} failed with status {}; stderr={}",
+            signal.status,
+            String::from_utf8_lossy(&signal.stderr)
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_yaml;
+        panic!("H3 mesh file-mode SIGHUP reload requires Unix");
+    }
+
+    let expected: serde_json::Map<String, serde_json::Value> = expected_tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), serde_json::Value::String(value.clone())))
+        .collect();
+    let url = gateway.admin_url(&format!("/upstreams/{H3_MESH_UPSTREAM_ID}"));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("admin client");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let last = match client
+            .get(&url)
+            .header("Authorization", gateway.auth_header())
+            .send()
+            .await
+        {
+            Ok(response) => match response.json::<serde_json::Value>().await {
+                Ok(upstream) => {
+                    let tags = upstream
+                        .get("targets")
+                        .and_then(|targets| targets.as_array())
+                        .and_then(|targets| targets.first())
+                        .and_then(|target| target.get("tags"))
+                        .and_then(|tags| tags.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    if tags == expected {
+                        return;
+                    }
+                    format!("live target tags {tags:?}")
+                }
+                Err(error) => format!("unreadable admin response: {error}"),
+            },
+            Err(error) => format!("admin request failed: {error}"),
+        };
+        let logs = gateway.diagnostic_captured_output();
+        assert!(
+            gateway.is_running(),
+            "the gateway died while reloading the H3 mesh config ({last})\n\
+             --- captured gateway output ---\n{logs}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the SIGHUP reload never applied the expected mesh target tags \
+             {expected:?} ({last})\n--- captured gateway output ---\n{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
