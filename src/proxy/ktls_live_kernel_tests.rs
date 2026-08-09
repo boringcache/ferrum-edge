@@ -136,9 +136,7 @@ fn live_crypto_provider_for(suite: rustls::CipherSuite) -> Arc<rustls::crypto::C
 
 /// Provider for the production handoff proof: TLS 1.2 ChaCha20-Poly1305 only.
 fn live_chacha_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    live_crypto_provider_for(
-        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-    )
+    live_crypto_provider_for(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
 }
 
 /// Provider for the AES refusal proof: TLS 1.2 AES-128-GCM only.
@@ -149,9 +147,7 @@ fn live_aes128_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// Frontend `ServerConfig` for `provider`: TLS 1.2 only, self-signed ECDSA
 /// leaf, kTLS secret extraction enabled exactly as
 /// `enable_secret_extraction_for_ktls` does in production.
-fn live_server_config_with(
-    provider: Arc<rustls::crypto::CryptoProvider>,
-) -> Arc<ServerConfig> {
+fn live_server_config_with(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<ServerConfig> {
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("generate an ECDSA P-256 key pair");
     let params = rcgen::CertificateParams::new(vec![LIVE_SNI.to_string()])
@@ -227,9 +223,7 @@ async fn assert_aes_gcm_offer_is_refused_with_socket_untouched() {
 
     let client = tokio::spawn(async move {
         let connector = live_connector_with(live_aes128_provider());
-        let tcp = TcpStream::connect(addr)
-            .await
-            .expect("AES client connects");
+        let tcp = TcpStream::connect(addr).await.expect("AES client connects");
         let mut tls = connector
             .connect(live_server_name(), tcp)
             .await
@@ -247,17 +241,16 @@ async fn assert_aes_gcm_offer_is_refused_with_socket_untouched() {
     let (stream, peer) = listener.accept().await.expect("AES frontend accept");
     let budget = Duration::from_secs(HANDSHAKE_SECS);
     let deadline = Some(tokio::time::Instant::now() + budget);
-    let declined = match try_ktls_accept(stream, &aes_config, deadline, HANDSHAKE_SECS, &peer, false)
-        .await
-    {
-        KtlsAcceptOutcome::Declined(stream) => stream,
-        KtlsAcceptOutcome::Installed(_) => {
-            panic!("AES-GCM must never reach kTLS install under the production gate")
-        }
-        KtlsAcceptOutcome::Failed(e) => {
-            panic!("AES-GCM refusal must be a clean Declined, not Failed: {e}")
-        }
-    };
+    let declined =
+        match try_ktls_accept(stream, &aes_config, deadline, HANDSHAKE_SECS, &peer, false).await {
+            KtlsAcceptOutcome::Declined(stream) => stream,
+            KtlsAcceptOutcome::Installed(_) => {
+                panic!("AES-GCM must never reach kTLS install under the production gate")
+            }
+            KtlsAcceptOutcome::Failed(e) => {
+                panic!("AES-GCM refusal must be a clean Declined, not Failed: {e}")
+            }
+        };
 
     let mut tls = acceptor
         .accept(declined)
