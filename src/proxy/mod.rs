@@ -35364,10 +35364,9 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let resolved_ip = if unix_target.is_some() {
-        None
-    } else if dispatch_hbone
-        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
+    let resolved_ip = if unix_target.is_some()
+        || (dispatch_hbone
+            && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target))
     {
         None
     } else {
