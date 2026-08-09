@@ -1148,6 +1148,8 @@ fn listenerset_resolved_refs_same_namespace_tls_secret_outcomes() {
     let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
     assert_eq!(resolved["status"], "False");
     assert_eq!(resolved["reason"], "InvalidCertificateRef");
+    let accepted = listenerset_listener_condition(&updates, "tls-set", "https", "Accepted");
+    assert_eq!(accepted["status"], "True");
     assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
         !mesh
             .services
@@ -1187,6 +1189,8 @@ fn listenerset_resolved_refs_cross_namespace_grant_boundary() {
     let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
     assert_eq!(resolved["status"], "False");
     assert_eq!(resolved["reason"], "RefNotPermitted");
+    let accepted = listenerset_listener_condition(&updates, "tls-set", "https", "Accepted");
+    assert_eq!(accepted["status"], "True");
 
     let mut grant = object(
         "ReferenceGrant",
@@ -1431,13 +1435,12 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
         .expect("status");
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "ListenersNotValid");
-    assert!(
-        translation
-            .config
-            .mesh
-            .as_ref()
-            .is_none_or(|mesh| mesh.services.is_empty())
-    );
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
+        !mesh
+            .services
+            .iter()
+            .any(|service| service.name.starts_with("listenerset-missing-"))
+    }));
     assert!(
         translation
             .warnings

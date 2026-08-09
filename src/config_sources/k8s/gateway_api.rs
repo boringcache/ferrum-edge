@@ -1438,12 +1438,13 @@ pub(super) fn collect_gateway_listener_policy(
         } else {
             None
         };
-        let materializable = validation_error.is_none()
-            && listener_protocol_mode_is_supported(listener)
-            && listener_is_materializable(acc, object, listener);
+        let spec_accepted =
+            validation_error.is_none() && listener_protocol_mode_is_supported(listener);
+        let materializable = spec_accepted && listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
             namespaces,
             validation_error,
+            spec_accepted,
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
             protocol: string_field(listener, "protocol")

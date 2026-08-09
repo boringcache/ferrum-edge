@@ -237,16 +237,17 @@ fn collect_one_listenerset(
         } else {
             None
         };
-        let materializable = validation_error.is_none()
+        let spec_accepted = validation_error.is_none()
             && !protocol.is_empty()
-            && listener_protocol_mode_is_supported(listener)
-            && listener_is_materializable(acc, object, listener);
-        if materializable {
+            && listener_protocol_mode_is_supported(listener);
+        let materializable = spec_accepted && listener_is_materializable(acc, object, listener);
+        if spec_accepted {
             saw_valid_listener = true;
         }
         let policy = GatewayApiListenerPolicy {
             namespaces,
             validation_error,
+            spec_accepted,
             hostname: string_field(listener, "hostname")
                 .filter(|hostname| !hostname.is_empty())
                 .map(normalize_gateway_hostname),
@@ -536,6 +537,8 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
         let name = status.resource.name.clone();
         let mut any_materializable = false;
         let mut any_conflicted = false;
+        let mut any_spec_accepted = false;
+        let mut any_unconflicted_spec_accepted = false;
         let mut saw_listener = false;
         let mut listener_conflicts = Vec::new();
         for (key, policy) in &acc.gateway_api_listener_policies {
@@ -546,6 +549,12 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
                 continue;
             }
             saw_listener = true;
+            if policy.spec_accepted {
+                any_spec_accepted = true;
+                if policy.conflict_reason.is_none() {
+                    any_unconflicted_spec_accepted = true;
+                }
+            }
             if let Some(reason) = policy.conflict_reason {
                 any_conflicted = true;
                 listener_conflicts.push((key.listener.clone(), reason.to_string()));
@@ -568,25 +577,12 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
             status.accepted_message = ferrum_listenerset_status_message(
                 "Ferrum accepted this ListenerSet on the parent Gateway",
             );
-        } else if any_conflicted {
+        } else if any_conflicted && any_spec_accepted && !any_unconflicted_spec_accepted {
             status.attached = false;
             status.accepted = false;
             status.accepted_reason = "ListenersNotValid".to_string();
             status.accepted_message = ferrum_listenerset_status_message(
                 "Every ListenerSet listener conflicted with a higher-precedence listener",
-            );
-            status.programmed = false;
-            status.programmed_reason = "ListenersNotValid".to_string();
-            status.programmed_message = status.accepted_message.clone();
-            status.programmed_listeners.clear();
-        } else if saw_listener {
-            // Indexed listeners exist but none are materializable (shape /
-            // TLS / protocol failures). Keep fail-closed with no traffic.
-            status.attached = false;
-            status.accepted = false;
-            status.accepted_reason = "ListenersNotValid".to_string();
-            status.accepted_message = ferrum_listenerset_status_message(
-                "Every ListenerSet listener was invalid or unsupported",
             );
             status.programmed = false;
             status.programmed_reason = "ListenersNotValid".to_string();

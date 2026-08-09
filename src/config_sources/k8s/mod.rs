@@ -808,6 +808,9 @@ pub(crate) enum GatewayApiNamespaceSelectorOperator {
 pub(crate) struct GatewayApiListenerPolicy {
     pub namespaces: GatewayApiAllowedRoutesNamespaces,
     pub validation_error: Option<GatewayApiListenerValidationError>,
+    /// The listener's bounded shape is valid and its protocol/mode is supported,
+    /// independently of whether certificate references currently resolve.
+    pub spec_accepted: bool,
     pub hostname: Option<String>,
     pub port: Option<u64>,
     /// Upper-cased `spec.listeners[].protocol` (`HTTP`, `HTTPS`, `TLS`, …).
