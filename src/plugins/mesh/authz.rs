@@ -53,17 +53,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyAction, PolicyScope, WaypointAttachment, is_mesh_condition_ip_key,
-    is_supported_mesh_condition_key, mesh_condition_has_values,
+    MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyAction, PolicyScope, WaypointAttachment,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
     policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    resolve_target_port, validate_mesh_condition_ip_block, workload_selector_matches,
+    resolve_target_port, validate_mesh_condition, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
-    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
-    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
-    normalize_mesh_policy_header_names,
+    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest,
+    evaluate_mesh_authorization, evaluate_mesh_authorization_policies, istio_source_principal,
+    mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
@@ -176,8 +175,11 @@ struct ConditionAttributeKeys {
     any: bool,
     source_principal: bool,
     source_namespace: bool,
+    source_service_account: bool,
+    source_trust_domain: bool,
     source_ip: bool,
     remote_ip: bool,
+    destination_ip: bool,
     request_auth_principal: bool,
     request_auth_presenter: bool,
     request_auth_audiences: bool,
@@ -189,19 +191,41 @@ struct ConditionAttributeKeys {
     claim_keys: std::collections::BTreeSet<String>,
 }
 
-// A condition on an attribute key the gateway does not source (or sources only
-// for one protocol, e.g. `request.headers[...]` on a stream) is intentionally
-// left out of the materialized map. The evaluator then treats it as absent,
-// which is the correct, fail-closed posture: a `values` condition on a missing
-// attribute never matches, and a `not_values`-only condition on a missing
-// attribute passes (Istio `not_rule` semantics). We never silently treat an
-// unknown key as a positive match.
+/// Resolved network/address facts for HTTP `when:` attribute materialization.
+///
+/// Bundled (Copy values only) so [`MeshAuthz::build_http_condition_attributes`]
+/// stays under clippy's argument cap without hot-path allocation or clones.
+/// Only keys flagged in [`ConditionAttributeKeys`] are written into the map.
+#[derive(Debug, Clone, Copy)]
+struct HttpConditionNetworkAttrs {
+    port: Option<u16>,
+    source_ip: Option<std::net::IpAddr>,
+    remote_ip: Option<std::net::IpAddr>,
+    destination_ip: Option<std::net::IpAddr>,
+}
+
+// An attribute the gateway can source but that is genuinely absent for THIS
+// request (a header the client did not send, an SNI-less plaintext connection)
+// is simply left out of the materialized map, and the evaluator applies Istio's
+// ordinary values / notValues rules to it.
+//
+// "This path can never source the attribute" is a different fact and is NOT
+// expressed by omission — it is carried on `MeshAuthzRequest` as
+// `protocol` / typed transport IP evidence and resolved by
+// `crate::modes::mesh::policy::condition_kind_is_sourceable`, which fails closed
+// (an ALLOW/AUDIT rule cannot match; a DENY rule ignores the field and still
+// matches). Encoding it as a missing attribute instead would let an
+// `experimental.envoy.filters.*` or HTTP-only `notValues` condition satisfy an
+// ALLOW rule on a raw TCP connection.
 
 // ── Istio `when:` attribute key constants ────────────────────────────────
 const ATTR_SOURCE_PRINCIPAL: &str = "source.principal";
 const ATTR_SOURCE_NAMESPACE: &str = "source.namespace";
+const ATTR_SOURCE_SERVICE_ACCOUNT: &str = "source.serviceAccount";
+const ATTR_SOURCE_TRUST_DOMAIN: &str = "source.trustDomain";
 const ATTR_SOURCE_IP: &str = "source.ip";
 const ATTR_REMOTE_IP: &str = "remote.ip";
+const ATTR_DESTINATION_IP: &str = "destination.ip";
 const ATTR_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
 const ATTR_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
 const ATTR_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
@@ -387,8 +411,11 @@ impl ConditionAttributeKeys {
         match key {
             ATTR_SOURCE_PRINCIPAL => self.source_principal = true,
             ATTR_SOURCE_NAMESPACE => self.source_namespace = true,
+            ATTR_SOURCE_SERVICE_ACCOUNT => self.source_service_account = true,
+            ATTR_SOURCE_TRUST_DOMAIN => self.source_trust_domain = true,
             ATTR_SOURCE_IP => self.source_ip = true,
             ATTR_REMOTE_IP => self.remote_ip = true,
+            ATTR_DESTINATION_IP => self.destination_ip = true,
             ATTR_REQUEST_AUTH_PRINCIPAL => self.request_auth_principal = true,
             ATTR_REQUEST_AUTH_PRESENTER => self.request_auth_presenter = true,
             ATTR_REQUEST_AUTH_AUDIENCES => self.request_auth_audiences = true,
@@ -400,9 +427,15 @@ impl ConditionAttributeKeys {
                 } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
                     self.claim_keys.insert(key.to_string());
                 }
-                // Other keys (unsourced or unknown) are deliberately not
-                // tracked; the evaluator treats them as absent (see note on
-                // `ConditionAttributeKeys`).
+                // Anything left is an `experimental.envoy.filters.*` key or a
+                // key config validation rejects. Neither has an attribute to
+                // materialize, and the evaluator resolves BOTH as
+                // UNSOURCEABLE via
+                // `crate::modes::mesh::policy::condition_kind_is_sourceable`
+                // (DENY still matches, ALLOW/AUDIT never matches) — not as a
+                // merely absent attribute. Do not "fix" a miss here by adding
+                // an omission-means-absent branch; see the note above
+                // `ATTR_SOURCE_PRINCIPAL`.
             }
         }
     }
@@ -859,6 +892,32 @@ fn http_header_attribute(
     materialized_lowercased: &BTreeMap<String, String>,
     name: &str,
 ) -> Option<String> {
+    // Envoy header matchers can address the HTTP pseudo-headers Istio itself
+    // uses in generated authorization filters. Hyper does not expose those as
+    // ordinary HeaderMap entries, so source them from the canonical typed
+    // request facts instead of treating a valid policy as an absent header.
+    if name.eq_ignore_ascii_case(":authority") {
+        return ctx
+            .request_authority
+            .clone()
+            .or_else(|| ctx.headers.get("host").cloned())
+            .or_else(|| ctx.raw_header_get("host").map(str::to_string));
+    }
+    if name.eq_ignore_ascii_case(":method") {
+        return Some(ctx.method.clone());
+    }
+    if name.eq_ignore_ascii_case(":path") {
+        return Some(ctx.path.clone());
+    }
+    if name.eq_ignore_ascii_case(":scheme") {
+        let scheme = if ctx.request_is_secure {
+            "https"
+        } else {
+            "http"
+        };
+        return Some(scheme.to_string());
+    }
+
     let lower = name.to_ascii_lowercase();
     if let Some(value) = materialized_lowercased.get(&lower) {
         return Some(value.clone());
@@ -936,6 +995,31 @@ fn mesh_authz_destination_port(
     )
     .or(frontend_listen_port)
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
+}
+
+/// Resolve Istio's `destination.ip` for an HTTP-family request.
+///
+/// A captured pre-NAT original destination (`SO_ORIGINAL_DST` on a mesh
+/// outbound capture listener, or the node-waypoint eBPF resolver record) is the
+/// authoritative answer when present: for captured egress it names the service
+/// VIP / pod the client actually dialled, which is what Istio matches, while
+/// the socket's own local address would be the interception listener. Otherwise
+/// the connection's local address applies — for inbound that is the receiving
+/// pod IP.
+///
+/// Both inputs are transport facts read by the accept path. Nothing here is
+/// derived from a request header, so a client cannot choose which
+/// destination-scoped rule it is judged by. `None` means the path observed
+/// neither, and the evaluator fails the condition closed.
+#[inline]
+fn mesh_authz_destination_ip(
+    orig_dst: Option<std::net::SocketAddr>,
+    connection_destination_ip: Option<std::net::IpAddr>,
+) -> Option<std::net::IpAddr> {
+    orig_dst
+        .map(|addr| addr.ip())
+        .or(connection_destination_ip)
+        .map(crate::util::client_identity::canonical_ip)
 }
 
 fn mesh_authz_authorization_path(path: &str) -> String {
@@ -1355,15 +1439,13 @@ impl MeshAuthz {
         keys: &ConditionAttributeKeys,
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
-        port: Option<u16>,
-        source_ips: (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
+        network: HttpConditionNetworkAttrs,
         headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         if !keys.any {
             return attributes;
         }
-        let (source_ip, remote_ip) = source_ips;
         if keys.source_principal
             && let Some(principal) = source_principal
         {
@@ -1378,6 +1460,26 @@ impl MeshAuthz {
             attributes.insert(
                 ATTR_SOURCE_NAMESPACE.to_string(),
                 namespace.to_string().into(),
+            );
+        }
+        if keys.source_service_account
+            && let (Some(namespace), Some(service_account)) = (
+                source_principal.and_then(|principal| principal.namespace()),
+                source_principal.and_then(|principal| principal.service_account()),
+            )
+        {
+            let mut value = String::with_capacity(namespace.len() + service_account.len() + 1);
+            value.push_str(namespace);
+            value.push('/');
+            value.push_str(service_account);
+            attributes.insert(ATTR_SOURCE_SERVICE_ACCOUNT.to_string(), value.into());
+        }
+        if keys.source_trust_domain
+            && let Some(trust_domain) = source_principal.map(|principal| principal.trust_domain())
+        {
+            attributes.insert(
+                ATTR_SOURCE_TRUST_DOMAIN.to_string(),
+                trust_domain.as_str().to_string().into(),
             );
         }
         if keys.request_auth_principal
@@ -1401,7 +1503,7 @@ impl MeshAuthz {
             );
         }
         if keys.destination_port
-            && let Some(port) = port
+            && let Some(port) = network.port
         {
             attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
         }
@@ -1414,14 +1516,24 @@ impl MeshAuthz {
         // is the direct downstream peer, while `remote.ip` is the trusted
         // forwarded/original client IP when one was resolved.
         if keys.source_ip
-            && let Some(ip) = source_ip
+            && let Some(ip) = network.source_ip
         {
             attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
         }
         if keys.remote_ip
-            && let Some(ip) = remote_ip
+            && let Some(ip) = network.remote_ip
         {
             attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
+        }
+        // `destination.ip` — the pre-NAT captured original destination when the
+        // listener observed one, else the connection's own local address.
+        // Never derived from a forwarded header: Istio's `destination.ip` is a
+        // connection property, and a client-settable one would let a caller
+        // pick which destination-scoped rule it is judged by.
+        if keys.destination_ip
+            && let Some(ip) = network.destination_ip
+        {
+            attributes.insert(ATTR_DESTINATION_IP.to_string(), ip.to_string().into());
         }
         for header_key in &keys.header_keys {
             if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
@@ -1440,17 +1552,20 @@ impl MeshAuthz {
         attributes
     }
 
-    /// Build the Istio `when:` attribute map for a stream (TCP/UDP)
-    /// connection. Only source identity, destination port, connection SNI,
-    /// and IP attributes are available on a stream — HTTP headers and JWT
-    /// claims are HTTP-only and are intentionally absent so a `when:`
-    /// condition on them fails closed (Istio values-check requires presence).
+    /// Build the Istio `when:` attribute map for a stream (TCP/UDP/DTLS)
+    /// connection. Only source identity, destination address/port, connection
+    /// SNI, and source/remote IP are available on a stream — HTTP headers and
+    /// JWT claims are HTTP-only. Their absence here is not modelled as a
+    /// missing attribute: the request is tagged [`MeshAuthzProtocol::L4`], so
+    /// the evaluator applies Istio's explicit non-HTTP-port semantics instead
+    /// (ALLOW/AUDIT never matches, DENY ignores the field).
     fn build_stream_condition_attributes(
         &self,
         ctx: &StreamConnectionContext,
         source_principal: Option<&SpiffeId>,
         source_ip: Option<std::net::IpAddr>,
         remote_ip: Option<std::net::IpAddr>,
+        destination_ip: Option<std::net::IpAddr>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         let keys = &self.condition_keys;
@@ -1473,10 +1588,34 @@ impl MeshAuthz {
                 namespace.to_string().into(),
             );
         }
+        if keys.source_service_account
+            && let (Some(namespace), Some(service_account)) = (
+                source_principal.and_then(|principal| principal.namespace()),
+                source_principal.and_then(|principal| principal.service_account()),
+            )
+        {
+            let mut value = String::with_capacity(namespace.len() + service_account.len() + 1);
+            value.push_str(namespace);
+            value.push('/');
+            value.push_str(service_account);
+            attributes.insert(ATTR_SOURCE_SERVICE_ACCOUNT.to_string(), value.into());
+        }
+        if keys.source_trust_domain
+            && let Some(trust_domain) = source_principal.map(|principal| principal.trust_domain())
+        {
+            attributes.insert(
+                ATTR_SOURCE_TRUST_DOMAIN.to_string(),
+                trust_domain.as_str().to_string().into(),
+            );
+        }
         if keys.destination_port {
             attributes.insert(
                 ATTR_DESTINATION_PORT.to_string(),
-                ctx.listen_port.to_string().into(),
+                ctx.connection_destination_port
+                    .or(ctx.destination_port)
+                    .unwrap_or(ctx.listen_port)
+                    .to_string()
+                    .into(),
             );
         }
         if keys.connection_sni
@@ -1497,6 +1636,16 @@ impl MeshAuthz {
             && let Some(ip) = remote_ip
         {
             attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
+        }
+        // `destination.ip` — the transport-observed connection destination,
+        // preferring trusted original-destination evidence when capture or
+        // PROXY metadata supplies it. Never inferred from application data.
+        // `None` on paths with no such evidence (UDP/DTLS sessions today),
+        // where the evaluator's unsourceable branch fails closed.
+        if keys.destination_ip
+            && let Some(ip) = destination_ip
+        {
+            attributes.insert(ATTR_DESTINATION_IP.to_string(), ip.to_string().into());
         }
         attributes
     }
@@ -2066,6 +2215,7 @@ impl Plugin for MeshAuthz {
         // the gateway-resolved client IP after XFF / real-IP resolution.
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
+        let destination_ip = mesh_authz_destination_ip(ctx.orig_dst, ctx.destination_ip);
         // Istio `when:` attributes. Built from the resolved authz principal
         // (post-baggage rewrite) plus request metadata/headers, and only for
         // the keys some loaded policy references (`condition_keys`). Without
@@ -2080,8 +2230,12 @@ impl Plugin for MeshAuthz {
             condition_keys,
             ctx,
             source_principal.as_ref(),
-            port,
-            (source_ip, remote_ip),
+            HttpConditionNetworkAttrs {
+                port,
+                source_ip,
+                remote_ip,
+                destination_ip,
+            },
             &headers,
         );
         let request = MeshAuthzRequest {
@@ -2095,6 +2249,11 @@ impl Plugin for MeshAuthz {
             attributes,
             source_ip,
             remote_ip,
+            destination_ip,
+            // HTTP-family request (HTTP/1.1, H2, H3, gRPC, gRPC-Web, WebSocket
+            // upgrade, and HTTP relayed inside an HBONE CONNECT): every
+            // documented `when:` attribute family is sourceable here.
+            protocol: MeshAuthzProtocol::Http,
         };
         // GAP-2M.4: per-pod scoping for node-waypoint topology.
         //
@@ -2436,18 +2595,37 @@ impl Plugin for MeshAuthz {
         // similarly separated via XFF / real-IP resolution.
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
+        let destination_ip =
+            mesh_authz_destination_ip(None, ctx.connection_destination_ip.or(ctx.destination_ip));
+        // Transparent stream listeners bind a fixed interception port while the
+        // trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
+        // destination. Both operation `ports` and `when: destination.port` must
+        // judge that original port or a port-scoped DENY can fail open.
+        let destination_port = ctx
+            .connection_destination_port
+            .or(ctx.destination_port)
+            .unwrap_or(ctx.listen_port);
         let attributes = self.build_stream_condition_attributes(
             ctx,
             source_principal.as_ref(),
             source_ip,
             remote_ip,
+            destination_ip,
         );
         let request = MeshAuthzRequest {
             source_principal,
-            port: Some(ctx.listen_port),
+            port: Some(destination_port),
             attributes,
             source_ip,
             remote_ip,
+            // Trusted original destination or connection-local transport fact;
+            // `None` where the path has no such evidence, which the evaluator
+            // treats as unsourceable (fail closed) rather than absent.
+            destination_ip,
+            // Raw TCP, TLS passthrough, UDP, DTLS, and mesh CONNECT byte /
+            // datagram relays all arrive here. Istio's non-HTTP-port semantics
+            // for HTTP-only `when:` keys apply.
+            protocol: MeshAuthzProtocol::L4,
             ..MeshAuthzRequest::default()
         };
         let decision = if self.per_pod_policy_scoping {
@@ -2626,64 +2804,45 @@ enum BaggageOutcome {
     NoBaggageOrNonHbone,
 }
 
+/// Fail-closed construction gate for every `when:` condition the plugin is
+/// asked to enforce.
+///
+/// `mesh_authz` is built directly from a slice that may arrive over xDS /
+/// MeshSubscribe / file config, i.e. from surfaces that did not necessarily run
+/// the Kubernetes translator, so it re-runs the same shared
+/// [`validate_mesh_condition`] contract rather than trusting its input. A
+/// malformed condition rejects the plugin instance — a condition that can never
+/// match is fail-open for a DENY.
 fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
     for policy in policies {
         for (rule_idx, rule) in policy.rules.iter().enumerate() {
+            if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
+                return Err(format!(
+                    "mesh_authz: policy '{}'/{} rule {} has more than \
+                     {MAX_MESH_RULE_CONDITIONS} when conditions",
+                    policy.namespace, policy.name, rule_idx
+                ));
+            }
             // Source negation IP blocks are pre-validated at ParsedCidr
-            // parse/deserialization time. Only condition IP blocks (stored
-            // as strings) need runtime validation here.
+            // parse/deserialization time. Condition keys and values (stored as
+            // strings) are validated here.
             for (condition_idx, condition) in rule.when.iter().enumerate() {
-                if !is_supported_mesh_condition_key(&condition.key) {
+                if let Err(issues) = validate_mesh_condition(condition)
+                    && let Some(issue) = issues.first()
+                {
                     return Err(format!(
-                        "mesh_authz: unsupported condition key in policy '{}'/{} rule {} when {}: '{}'",
-                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
-                    ));
-                }
-                if !mesh_condition_has_values(condition) {
-                    return Err(format!(
-                        "mesh_authz: condition in policy '{}'/{} rule {} when {} key '{}' must set values or notValues",
-                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
-                    ));
-                }
-                if is_mesh_condition_ip_key(&condition.key) {
-                    validate_condition_ip_blocks(
-                        policy,
+                        "mesh_authz: invalid condition in policy '{}'/{} rule {} when {} key '{}' {}: {}",
+                        policy.namespace,
+                        policy.name,
                         rule_idx,
                         condition_idx,
-                        &condition.key,
-                        "values",
-                        &condition.values,
-                    )?;
-                    validate_condition_ip_blocks(
-                        policy,
-                        rule_idx,
-                        condition_idx,
-                        &condition.key,
-                        "notValues",
-                        &condition.not_values,
-                    )?;
+                        condition.key,
+                        issue.istio_path(),
+                        issue.reason
+                    ));
                 }
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_condition_ip_blocks(
-    policy: &MeshPolicy,
-    rule_idx: usize,
-    condition_idx: usize,
-    key: &str,
-    field: &str,
-    blocks: &[String],
-) -> Result<(), String> {
-    for block in blocks {
-        validate_mesh_condition_ip_block(block).map_err(|reason| {
-            format!(
-                "mesh_authz: invalid condition IP block in policy '{}'/{} rule {} when {} key '{}' field {}: '{}' is invalid: {}",
-                policy.namespace, policy.name, rule_idx, condition_idx, key, field, block, reason
-            )
-        })?;
     }
     Ok(())
 }

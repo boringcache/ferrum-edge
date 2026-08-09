@@ -163,6 +163,19 @@ need them, or because they are blocked upstream / architecturally:
   external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
   `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
+- **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is
+  accepted and the surrounding policy installs (rejecting it would drop the whole
+  policy, which is fail-OPEN for a DENY), but Ferrum has no Envoy filter chain to
+  source the dynamic metadata from, so the condition is permanently
+  **unsourceable**: a DENY rule ignores the field and still matches, while an
+  ALLOW/AUDIT rule can never match. Every other documented Istio condition key is
+  evaluated — see [`docs/mesh.md` → Condition
+  keys](mesh.md#condition-keys) for the per-protocol matrix.
+- **`when: destination.ip` on UDP / DTLS** — no UDP capture path records an
+  original destination, so there is no trusted destination evidence for a
+  datagram session. The condition is unsourceable there and fails closed the same
+  way (DENY still applies, ALLOW/AUDIT cannot match). HTTP-family, raw TCP, TLS
+  passthrough, and captured mesh inbound all carry it.
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
   NodeWaypoint eBPF live gate now admits captured IPv6 Service traffic through a
   pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice now has a

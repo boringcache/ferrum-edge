@@ -695,6 +695,12 @@ pub async fn start_http3_listener_with_signal(
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
+    // A specific bind address is the destination IP of every connection this
+    // endpoint accepts; a wildcard bind falls back to the per-connection QUIC
+    // local address. Mirrors the TCP accept loop's `frontend_bound_ip`.
+    let frontend_destination_ip = bound_addr
+        .map(|addr| addr.ip())
+        .filter(|ip| !ip.is_unspecified());
     info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
@@ -778,6 +784,7 @@ pub async fn start_http3_listener_with_signal(
                                 state,
                                 handshake_timeout,
                                 frontend_listen_port,
+                                frontend_destination_ip,
                                 client_auth_configured,
                             )
                             .await
@@ -953,6 +960,7 @@ async fn handle_h3_connection(
     state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
+    frontend_destination_ip: Option<std::net::IpAddr>,
     client_auth_configured: bool,
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
@@ -1069,6 +1077,21 @@ async fn handle_h3_connection(
     };
 
     let remote_addr = connection.remote_address();
+    // Istio `destination.ip` input. A listener bound to a specific address
+    // answers for every connection (resolved once at listener start); a
+    // wildcard bind has no single answer, so ask QUIC for the local address
+    // this connection was actually delivered to. Read once per connection, not
+    // per request stream, and never derived from anything the peer sends.
+    let frontend_destination_ip = frontend_destination_ip
+        .or_else(|| {
+            // Only `mesh_authz` consumes this, and it exists solely in mesh
+            // mode; `Connection::local_ip()` takes the connection state lock,
+            // so a non-mesh listener must not pay for it.
+            (state.env_config.mode == crate::config::env_config::OperatingMode::Mesh)
+                .then(|| connection.local_ip())
+                .flatten()
+        })
+        .map(crate::util::client_identity::canonical_ip);
     debug!(
         "HTTP/3 connection established from {}",
         crate::util::client_identity::canonical_socket_addr(remote_addr)
@@ -1206,6 +1229,7 @@ async fn handle_h3_connection(
                                 canonical_peer,
                                 &socket_ip,
                                 frontend_listen_port,
+                                frontend_destination_ip,
                                 frontend_sni_hostname,
                                 cert,
                                 chain,
@@ -1281,6 +1305,7 @@ async fn handle_h3_request(
     remote_addr: SocketAddr,
     socket_ip: &str,
     frontend_listen_port: Option<u16>,
+    frontend_destination_ip: Option<std::net::IpAddr>,
     frontend_sni_hostname: Option<String>,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
@@ -1452,6 +1477,10 @@ async fn handle_h3_request(
     // the H3 request. Fall back to the configured HTTPS port only if Quinn
     // cannot report the bound local address.
     ctx.frontend_listen_port = frontend_listen_port.or(Some(state.env_config.proxy_https_port));
+    // Istio `destination.ip` input, resolved once per QUIC connection. H3 has
+    // no `SO_ORIGINAL_DST` equivalent, so this is always the local address the
+    // datagram was delivered to.
+    ctx.destination_ip = frontend_destination_ip;
     ctx.frontend_sni_hostname = frontend_sni_hostname;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
