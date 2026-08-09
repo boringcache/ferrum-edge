@@ -725,8 +725,18 @@ fn final_header_decision_recorded(ctx: &RequestContext) -> bool {
 
 #[tokio::test]
 async fn the_final_response_header_phase_is_forwarded_and_gated() {
+    // Keep this instance trigger-compatible: the default cache config owns the
+    // contextless `x-cache-status` trailer name and is correctly refused by
+    // publication. Disabling that optional header leaves the per-request final
+    // response-header hook intact, which is the phase this test exercises.
     let gated = with_trigger(
-        builtin("cache", "response_caching", "api"),
+        make_plugin_config_with_json(
+            "cache",
+            "response_caching",
+            json!({"ttl_seconds": 60, "add_cache_status_header": false}),
+            PluginScope::Proxy,
+            Some("api"),
+        ),
         json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
     );
     let plugins = published(
