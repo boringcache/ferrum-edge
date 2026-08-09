@@ -892,6 +892,28 @@ fn http_header_attribute(
     materialized_lowercased: &BTreeMap<String, String>,
     name: &str,
 ) -> Option<String> {
+    // Envoy header matchers can address the HTTP pseudo-headers Istio itself
+    // uses in generated authorization filters. Hyper does not expose those as
+    // ordinary HeaderMap entries, so source them from the canonical typed
+    // request facts instead of treating a valid policy as an absent header.
+    if name.eq_ignore_ascii_case(":authority") {
+        return ctx
+            .request_authority
+            .clone()
+            .or_else(|| ctx.headers.get("host").cloned())
+            .or_else(|| ctx.raw_header_get("host").map(str::to_string));
+    }
+    if name.eq_ignore_ascii_case(":method") {
+        return Some(ctx.method.clone());
+    }
+    if name.eq_ignore_ascii_case(":path") {
+        return Some(ctx.path.clone());
+    }
+    if name.eq_ignore_ascii_case(":scheme") {
+        let scheme = if ctx.request_is_secure { "https" } else { "http" };
+        return Some(scheme.to_string());
+    }
+
     let lower = name.to_ascii_lowercase();
     if let Some(value) = materialized_lowercased.get(&lower) {
         return Some(value.clone());
@@ -1585,7 +1607,8 @@ impl MeshAuthz {
         if keys.destination_port {
             attributes.insert(
                 ATTR_DESTINATION_PORT.to_string(),
-                ctx.destination_port
+                ctx.connection_destination_port
+                    .or(ctx.destination_port)
                     .unwrap_or(ctx.listen_port)
                     .to_string()
                     .into(),
@@ -1610,12 +1633,11 @@ impl MeshAuthz {
         {
             attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
         }
-        // `destination.ip` — a trusted PROXY-protocol tuple, `SO_ORIGINAL_DST`,
-        // or node-waypoint capture metadata (see
-        // `StreamConnectionContext::destination_ip`). Never inferred from the
-        // peer's application data. `None` on paths with no such evidence
-        // (UDP/DTLS sessions today), where the evaluator's unsourceable branch
-        // fails closed rather than quietly not matching.
+        // `destination.ip` — the transport-observed connection destination,
+        // preferring trusted original-destination evidence when capture or
+        // PROXY metadata supplies it. Never inferred from application data.
+        // `None` on paths with no such evidence (UDP/DTLS sessions today),
+        // where the evaluator's unsourceable branch fails closed.
         if keys.destination_ip
             && let Some(ip) = destination_ip
         {
@@ -2569,12 +2591,18 @@ impl Plugin for MeshAuthz {
         // similarly separated via XFF / real-IP resolution.
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
-        let destination_ip = mesh_authz_destination_ip(None, ctx.destination_ip);
+        let destination_ip = mesh_authz_destination_ip(
+            None,
+            ctx.connection_destination_ip.or(ctx.destination_ip),
+        );
         // Transparent stream listeners bind a fixed interception port while the
         // trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
         // destination. Both operation `ports` and `when: destination.port` must
         // judge that original port or a port-scoped DENY can fail open.
-        let destination_port = ctx.destination_port.unwrap_or(ctx.listen_port);
+        let destination_port = ctx
+            .connection_destination_port
+            .or(ctx.destination_port)
+            .unwrap_or(ctx.listen_port);
         let attributes = self.build_stream_condition_attributes(
             ctx,
             source_principal.as_ref(),
@@ -2588,7 +2616,7 @@ impl Plugin for MeshAuthz {
             attributes,
             source_ip,
             remote_ip,
-            // Trusted PROXY tuple / `SO_ORIGINAL_DST` / capture metadata only;
+            // Trusted original destination or connection-local transport fact;
             // `None` where the path has no such evidence, which the evaluator
             // treats as unsourceable (fail closed) rather than absent.
             destination_ip,

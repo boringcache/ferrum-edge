@@ -857,7 +857,8 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
                  and the mesh_authz construction gate. It rejects empty/oversized/control-char \
                  keys and values, non-numeric destination.port values, malformed IP CIDRs, and \
                  collections over 64 when[] entries per rule or 256 values per list — each with \
-                 a field-specific diagnostic.",
+                 a field-specific diagnostic — while preserving Istio's loose dynamic map-key \
+                 framing for request headers and JWT claims.",
     );
 
     let port = condition_translation_error("destination.port", json!(["http"]));
@@ -904,22 +905,27 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "the oversized-key diagnostic must not echo the operator-supplied key: {long}"
     );
 
-    let whitespace = condition_translation_error("request.headers[x env]", json!(["x"]));
-    assert!(
-        whitespace.contains("rules[].when[0].key") && whitespace.contains("whitespace"),
-        "a whitespace-bearing condition key must fail closed: {whitespace}"
-    );
-
-    for malformed_key in [
+    // Istio's validateMapKey uses only the first `[` and final `]` as map-key
+    // framing and requires a non-empty interior. It does not validate dynamic
+    // header names or claim paths here. Ferrum must admit the same shapes so
+    // one unusual condition cannot discard unrelated rules in the policy.
+    for istio_admitted_map_key in [
+        "request.headers[:authority]",
+        "request.headers[x env]",
         "request.headers[x-team][nested]",
         "request.headers[x:invalid]",
         "request.auth.claims[realm_access[roles]",
         "request.auth.claims[realm_access][]",
     ] {
-        let message = condition_translation_error(malformed_key, json!(["x"]));
-        assert!(
-            message.contains("rules[].when[0].key") && message.contains("unsupported"),
-            "a structurally malformed condition key must fail closed: {message}"
+        let policy = condition_policy(
+            "DENY",
+            istio_admitted_map_key,
+            json!(["x"]),
+            Value::Null,
+        );
+        assert_eq!(
+            policy.rules[0].when[0].key, istio_admitted_map_key,
+            "Istio-admitted dynamic map key must survive translation"
         );
     }
 

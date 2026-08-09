@@ -1817,22 +1817,28 @@ async fn run_tcp_accept_loop(
                             .plugin_cache
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
-                    // A trusted inbound PROXY tuple is the earliest
-                    // authoritative destination. Otherwise prefer the complete
-                    // kernel/capture socket address, then fall back to the
-                    // accepted socket's local address for an ordinary direct
-                    // listener. Dropping the port would mis-advertise fixed
-                    // capture listeners (for example :15001) as the
-                    // application's original destination.
-                    let authoritative_destination = forwarded_dst
+                    // Keep trusted original-destination routing evidence
+                    // separate from the connection-local fact mesh authz needs.
+                    // A direct listener's bind address is authoritative for
+                    // Istio `destination.ip`, but it must never satisfy a
+                    // VirtualService `destinationSubnets` predicate whose
+                    // contract requires capture/PROXY original-destination
+                    // evidence.
+                    let trusted_original_destination = forwarded_dst
                         .or(node_waypoint_orig_dst)
                         .or_else(|| crate::socket_opts::original_dst(&stream))
+                        .map(crate::util::client_identity::canonical_socket_addr);
+                    let connection_destination = trusted_original_destination
                         .or_else(|| stream.local_addr().ok())
                         .map(crate::util::client_identity::canonical_socket_addr);
                     stream_ctx.destination_ip =
-                        authoritative_destination.map(|addr| addr.ip());
+                        trusted_original_destination.map(|addr| addr.ip());
                     stream_ctx.destination_port =
-                        authoritative_destination.map(|addr| addr.port());
+                        trusted_original_destination.map(|addr| addr.port());
+                    stream_ctx.connection_destination_ip =
+                        connection_destination.map(|addr| addr.ip());
+                    stream_ctx.connection_destination_port =
+                        connection_destination.map(|addr| addr.port());
                     // Gateway binding is process/listener configuration — never
                     // inferred from wire data. EnvConfig supplies `mesh` only
                     // for mesh Sidecar topology; every other default is no

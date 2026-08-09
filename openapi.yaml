@@ -16505,6 +16505,11 @@ components:
         `request.auth.claims[...]` string or string-list values including
         nested claim leaf paths, `request.headers[...]`, and
         `experimental.envoy.filters.<filter>[<key>]`.
+        Dynamic header/claim keys follow Istio's loose map-key framing: the
+        first `[` and final `]` delimit a non-empty interior without a separate
+        HTTP-header-name parse. Known HTTP pseudo-headers (`:authority`,
+        `:method`, `:path`, `:scheme`) are sourced from typed request facts;
+        unusual admitted interiors that cannot materialize remain absent.
         Values follow Istio's string-matcher grammar (`*` presence,
         `<prefix>*`, `*<suffix>`, otherwise exact — a mid-string `*` is literal
         text) for every key EXCEPT the ones Istio compiles differently:
@@ -16514,7 +16519,8 @@ components:
         resolved against the declaring policy's namespace and a `*` is rejected;
         and `source.namespace` treats every `*` as an arbitrary substring at any
         position, including mid-string and repeated stars. Keys outside the
-        documented set — and malformed keys/values, non-numeric
+        documented prefixes — and empty/oversized/control-character keys or
+        malformed values, non-numeric
         `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
         with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
         repeated/mid-string `*`, and collections over 64 `when[]` entries per
@@ -16532,7 +16538,10 @@ components:
         ignores the field and still matches, while an ALLOW or AUDIT rule can
         never match. `destination.ip` is sourced only from the captured pre-NAT
         original destination or the connection's local address, never from a
-        client-settable header.
+        client-settable header. That mesh-authz connection fact is separate
+        from VirtualService L4 `destinationSubnets`, which accepts only trusted
+        PROXY/capture original-destination evidence and never an ordinary
+        listener's bind/local address.
         Negative identity matchers reject only when the source/JWT identity
         is present and matches an excluded pattern; absent identities satisfy
         the negative matcher so DENY policies such as `notPrincipals: ["*"]`

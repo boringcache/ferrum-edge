@@ -7248,6 +7248,21 @@ pub struct StreamConnectionContext {
     /// from `listen_port` because transparent capture listeners commonly bind
     /// a fixed interception port that is not the connection's original port.
     pub destination_port: Option<u16>,
+    /// Destination IP of the accepted transport connection. This prefers the
+    /// same trusted original-destination evidence as [`Self::destination_ip`]
+    /// and otherwise falls back to the accepted socket's local address.
+    ///
+    /// Mesh authorization uses this connection fact for Istio
+    /// `destination.ip`. L4 `stream_match.destination_subnets` deliberately
+    /// does not: routing may use only [`Self::destination_ip`], so an ordinary
+    /// listener's bind address cannot masquerade as captured original-
+    /// destination evidence.
+    pub connection_destination_ip: Option<std::net::IpAddr>,
+    /// TCP port paired with [`Self::connection_destination_ip`]. For a direct
+    /// listener this is the accepted socket's local port; for capture and
+    /// trusted PROXY paths it is the original destination port. Mesh authz uses
+    /// it ahead of `listen_port`, while L4 route selection ignores it.
+    pub connection_destination_port: Option<u16>,
     /// Listener-configured gateway binding for VirtualService L4 `gateways`
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
@@ -7297,6 +7312,8 @@ impl StreamConnectionContext {
             first_bytes_kind: None,
             destination_ip: None,
             destination_port: None,
+            connection_destination_ip: None,
+            connection_destination_port: None,
             trusted_gateway_ref: None,
             // Callers that know the peer/forwarded port (TCP accept path) set
             // this after construction; UDP/DTLS leave it at 0.

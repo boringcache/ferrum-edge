@@ -38,6 +38,9 @@ use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{
     JwtAuthAttributeValue, Plugin, PluginResult, RequestContext, StreamConnectionContext,
 };
+use ferrum_edge::proxy::stream_match::{
+    StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -387,6 +390,64 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
         plugin.authorize(&mut blocked_ctx).await,
         PluginResult::Reject { .. }
     ));
+}
+
+#[tokio::test]
+async fn condition_match_on_http_pseudo_headers_uses_typed_request_facts() {
+    let allow_pseudo_headers = MeshPolicy {
+        name: "allow-pseudo-headers".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![
+                ConditionMatch {
+                    key: "request.headers[:authority]".to_string(),
+                    values: vec!["api.example.com:8443".to_string()],
+                    not_values: Vec::new(),
+                },
+                ConditionMatch {
+                    key: "request.headers[:method]".to_string(),
+                    values: vec!["GET".to_string()],
+                    not_values: Vec::new(),
+                },
+                ConditionMatch {
+                    key: "request.headers[:path]".to_string(),
+                    values: vec!["/v1/items".to_string()],
+                    not_values: Vec::new(),
+                },
+                ConditionMatch {
+                    key: "request.headers[:scheme]".to_string(),
+                    values: vec!["https".to_string()],
+                    not_values: Vec::new(),
+                },
+            ],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_pseudo_headers]);
+
+    let mut matching = ctx_with_principal("GET", "/v1/items", Some(CLIENT_SPIFFE));
+    matching.request_authority = Some("api.example.com:8443".to_string());
+    matching.request_is_secure = true;
+    assert!(matches!(
+        plugin.authorize(&mut matching).await,
+        PluginResult::Continue
+    ));
+
+    matching.request_authority = Some("other.example.com:8443".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut matching).await,
+            PluginResult::Reject { .. }
+        ),
+        "a typed pseudo-header mismatch must not satisfy an ALLOW condition"
+    );
 }
 
 #[tokio::test]
@@ -2186,10 +2247,12 @@ async fn condition_source_and_remote_ip_fail_closed_without_typed_evidence() {
     }
 }
 
-/// The L4 stream path sources `destination.ip` from the trusted PROXY tuple /
-/// `SO_ORIGINAL_DST` / capture metadata the accept path stamped.
+/// The L4 stream path sources `destination.ip` from the connection destination
+/// fact. Capture/PROXY original-destination evidence wins, while an ordinary
+/// TCP listener may use its accepted socket's local address for authz without
+/// publishing that address as L4 route-selection evidence.
 #[tokio::test]
-async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
+async fn stream_condition_match_on_destination_ip_uses_connection_destination() {
     let deny_vip = condition_policy(
         "deny-vip",
         PolicyAction::Deny,
@@ -2200,7 +2263,11 @@ async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
     let plugin = build_mesh_authz_for_workload(&[], vec![deny_vip]);
 
     let mut inside = inbound_stream_ctx(6379, CLIENT_SPIFFE);
-    inside.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    inside.connection_destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(
+        inside.destination_ip.is_none(),
+        "mesh authz connection evidence must not require stream_match evidence"
+    );
     assert!(
         matches!(
             plugin.on_stream_connect(&mut inside).await,
@@ -2210,7 +2277,7 @@ async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
     );
 
     let mut outside = inbound_stream_ctx(6379, CLIENT_SPIFFE);
-    outside.destination_ip = Some("192.168.1.5".parse().expect("ip"));
+    outside.connection_destination_ip = Some("192.168.1.5".parse().expect("ip"));
     assert!(matches!(
         plugin.on_stream_connect(&mut outside).await,
         PluginResult::Continue
@@ -2219,6 +2286,7 @@ async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
     // UDP/DTLS sessions carry no destination evidence today.
     let mut unknown = inbound_stream_ctx(6379, CLIENT_SPIFFE);
     unknown.destination_ip = None;
+    unknown.connection_destination_ip = None;
     assert!(
         matches!(
             plugin.on_stream_connect(&mut unknown).await,
@@ -2226,6 +2294,32 @@ async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
         ),
         "a stream with no destination evidence must not disarm the DENY"
     );
+}
+
+#[test]
+fn direct_listener_destination_is_not_original_destination_route_evidence() {
+    let mut stream = inbound_stream_ctx(15432, CLIENT_SPIFFE);
+    stream.connection_destination_ip = Some("127.0.0.1".parse().expect("ip"));
+    let matcher = StreamMatchCriteria {
+        arms: vec![StreamMatchArm {
+            destination_subnets: vec!["127.0.0.0/8".to_string()],
+            ..Default::default()
+        }],
+    }
+    .compile()
+    .expect("matcher");
+
+    assert!(stream.destination_ip.is_none());
+    assert!(!matcher.matches(&StreamMatchEvidence {
+        destination_ip: stream.destination_ip,
+        ..Default::default()
+    }));
+
+    stream.destination_ip = Some("127.0.0.1".parse().expect("ip"));
+    assert!(matcher.matches(&StreamMatchEvidence {
+        destination_ip: stream.destination_ip,
+        ..Default::default()
+    }));
 }
 
 /// Istio's non-HTTP-port semantics on the live stream path: a DENY ignores an

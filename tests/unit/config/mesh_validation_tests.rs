@@ -3367,15 +3367,6 @@ fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
         ),
         (
             ConditionMatch {
-                key: "request.headers[x env]".into(),
-                values: vec!["x".into()],
-                not_values: Vec::new(),
-            },
-            "rules[0].when[0].key",
-            "whitespace",
-        ),
-        (
-            ConditionMatch {
                 key: "connection.sni".into(),
                 values: vec![String::new()],
                 not_values: Vec::new(),
@@ -3450,4 +3441,34 @@ fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
             .any(|e| e.contains("rules[0].when must have at most 64 entries")),
         "an unbounded when[] list must fail closed, got: {errors:?}"
     );
+}
+
+/// Istio validates dynamic `when:` map keys by their first `[` and final `]`
+/// only. Native/file admission must preserve the same loose framing instead of
+/// rejecting a policy shape the Kubernetes source accepts.
+#[test]
+fn mesh_policy_admits_istio_dynamic_map_key_shapes() {
+    for key in [
+        "request.headers[:authority]",
+        "request.headers[x env]",
+        "request.headers[x-team][nested]",
+        "request.headers[x:invalid]",
+        "request.auth.claims[realm_access[roles]",
+        "request.auth.claims[realm_access][]",
+    ] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: key.into(),
+            values: vec!["x".into()],
+            not_values: Vec::new(),
+        });
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors.is_empty(),
+            "Istio-admitted dynamic map key '{key}' must validate: {errors:?}"
+        );
+    }
 }

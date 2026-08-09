@@ -86,7 +86,8 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // The captured app/container port (== `orig_dst.port()`, the loopback
     // backend port) is the L4 authorization destination, NOT the shared
     // `:15006` capture-listener port. `mesh_authz`'s stream path reads
-    // `ctx.listen_port`, so stamping the app port here lets a port-scoped
+    // the connection destination fields (with `listen_port` as a compatibility
+    // fallback), so stamping the app port here lets a port-scoped
     // AuthorizationPolicy DENY on the real service port be enforced.
     let app_port = proxy.backend_port;
     // Single captured-inbound client-identity boundary (GHSA-vjwj-657f-5w9g).
@@ -257,6 +258,8 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     let canonical_orig_dst = crate::util::client_identity::canonical_socket_addr(orig_dst);
     stream_ctx.destination_ip = Some(canonical_orig_dst.ip());
     stream_ctx.destination_port = Some(canonical_orig_dst.port());
+    stream_ctx.connection_destination_ip = Some(canonical_orig_dst.ip());
+    stream_ctx.connection_destination_port = Some(canonical_orig_dst.port());
     // Captured plaintext Sidecar inbound is, by direction, inbound mesh
     // traffic — so `mesh_authz` treats `listen_port` as the inbound
     // destination port (parity with the materialized HTTP inbound path).

@@ -969,19 +969,15 @@ pub fn validate_mesh_condition(
             "must be at most {MAX_MESH_CONDITION_KEY_LEN} UTF-8 bytes"
         ))]);
     }
-    if condition
-        .key
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace())
-    {
+    if condition.key.chars().any(char::is_control) {
         return Err(vec![MeshConditionIssue::key(
-            "must not contain whitespace or control characters",
+            "must not contain control characters",
         )]);
     }
     let Some(kind) = classify_mesh_condition_key(&condition.key) else {
         // Safe to echo: the checks above already bounded the key to
-        // `MAX_MESH_CONDITION_KEY_LEN` printable, whitespace-free UTF-8 bytes,
-        // and operators cannot fix the policy without seeing which key failed.
+        // `MAX_MESH_CONDITION_KEY_LEN` printable UTF-8 bytes, and operators
+        // cannot fix the policy without seeing which key failed.
         return Err(vec![MeshConditionIssue::key(format!(
             "'{}' is unsupported (expected one of source.principal, source.namespace, \
              source.serviceAccount, source.trustDomain, source.ip, remote.ip, destination.ip, \
@@ -1204,28 +1200,24 @@ fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
     let name = key
         .strip_prefix(CONDITION_REQUEST_HEADERS_PREFIX)?
         .strip_suffix(']')?;
-    // Header conditions have exactly one bracket pair. Accepting nested or
-    // unmatched brackets would admit a key no HTTP request can materialize,
-    // which can silently disarm a DENY condition.
-    (!name.is_empty()
-        && !name.contains('[')
-        && !name.contains(']')
-        && http::header::HeaderName::from_bytes(name.as_bytes()).is_ok())
-    .then_some(name)
+    // Match Istio's validateMapKey shape exactly: the fixed first `[` and the
+    // final `]` delimit one non-empty map key. Istio deliberately does not
+    // validate the interior as an HTTP HeaderName here. Rejecting a shape it
+    // admits drops the entire AuthorizationPolicy, including unrelated DENY
+    // rules. Known pseudo-headers are sourced from typed request facts at
+    // runtime; other names that HTTP cannot carry simply remain absent.
+    (!name.is_empty()).then_some(name)
 }
 
 fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
     let path = key
         .strip_prefix(CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)?
         .strip_suffix(']')?;
-    // Nested JWT claims use Istio's exact `a][b` encoding. Each segment must be
-    // non-empty and bracket-free so malformed shapes cannot masquerade as a
-    // documented condition key that the validated-claim store can never source.
-    (!path.is_empty()
-        && path
-            .split("][")
-            .all(|segment| !segment.is_empty() && !segment.contains('[') && !segment.contains(']')))
-    .then_some(path)
+    // Istio applies the same loose map-key framing here. Well-formed nested
+    // paths use `a][b` and match the flattened validated-claim store; unusual
+    // admitted interiors that no validated claim can materialize stay absent
+    // without causing the whole policy to be discarded.
+    (!path.is_empty()).then_some(path)
 }
 
 /// Abstraction over per-workload label maps.
