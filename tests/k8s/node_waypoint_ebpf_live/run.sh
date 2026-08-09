@@ -1532,6 +1532,24 @@ sys.exit(1)
 PY
 }
 
+node_waypoint_identity_has_policy_scope() {
+  local identities_file="$1"
+  local uid="$2"
+  python3 - "$identities_file" "$uid" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+
+uid = sys.argv[2]
+for identity in data.get("identities") or []:
+    if identity.get("pod_uid") == uid:
+        sys.exit(0 if identity.get("has_policy_scope") is True else 1)
+sys.exit(1)
+PY
+}
+
 summarize_orig_dst4_records_for_uid() {
   local node="$1"
   local uid="$2"
@@ -2279,15 +2297,16 @@ try_wait_for_node_waypoint_admission() {
     curl_code="$(tail -n 1 "$curl_out" 2>/dev/null || true)"
 
     # The in-netns identity registry can become visible before the newly
-    # received mesh slice has finished rebuilding the request router. Do not
-    # declare admission ready on that half-converged state: Ferrum returns its
-    # route-miss 404 there, and the immediately following traffic assertion
-    # would race the rebuild. Every caller of this readiness helper targets a
-    # fixture path whose converged outcome is either the allowed 200 or the
-    # AuthorizationPolicy 403, so require one of those live outcomes in
-    # addition to the exact pod UID.
+    # received mesh slice has installed the exact pod UID's policy scope and
+    # rebuilt the request router. Do not declare admission ready on either
+    # half-converged state: the identity endpoint reports has_policy_scope=false
+    # while authz correctly returns its fail-closed scope_missing 403, and the
+    # router can return a transient route-miss 404. Every caller of this helper
+    # targets a scoped-policy fixture, so require the exact UID's live scope plus
+    # the converged 200 or policy 403 before the following traffic assertion.
     if fetch_node_waypoint_identities_for_node "$node" "$identities_file" &&
       node_waypoint_identities_include_uid "$identities_file" "$uid" &&
+      node_waypoint_identity_has_policy_scope "$identities_file" "$uid" &&
       [[ "$curl_status" -eq 0 ]] &&
       [[ "$curl_code" == "200" || "$curl_code" == "403" ]]; then
       return
