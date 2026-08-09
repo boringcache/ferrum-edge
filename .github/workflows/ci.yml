@@ -2014,13 +2014,60 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The chart runtime lint renders with the Helm binary this local composite
+      # action installs, so the action is part of that gate's trusted boundary.
+      # Prove it is exactly the trusted revision's tree BEFORE `uses:` can run
+      # it: a pull request must not be able to hand the authoritative scan a
+      # substituted renderer. `git archive` materializes the trusted tree while
+      # `PATH` is still the pristine runner one; the verifier then decides
+      # regular-file, no-symlink, mode, byte-content, and no-extra-file entirely
+      # from that manifest and spawns no process of its own. Extraction mirrors
+      # the chart runtime lint below, including its reviewed-checkout bootstrap.
+      - name: Verify trusted Kubernetes tools installer
+        run: |
+          set -euo pipefail
+          verifier=.github/scripts/verify_trusted_local_action.py
+          action_dir=.github/actions/setup-kubernetes-tools
+          trusted_ref=HEAD
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin \
+              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            trusted_ref="origin/${BASE_REF}"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            trusted_ref="$MERGE_BASE_SHA"
+          fi
+          if git cat-file -e "${trusted_ref}:${verifier}" 2>/dev/null; then
+            trusted_verifier="$RUNNER_TEMP/verify-trusted-local-action.py"
+            git show "${trusted_ref}:${verifier}" > "$trusted_verifier"
+            verifier="$trusted_verifier"
+          fi
+          archive="$RUNNER_TEMP/trusted-setup-kubernetes-tools.tar"
+          git archive --format=tar --output="$archive" "$trusted_ref" -- "$action_dir"
+          python3 -I "$verifier" --self-test
+          python3 -I "$verifier" --action-path "$action_dir" --trusted-archive "$archive"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
       # Trusted-base chart runtime lint: reject container-runtime socket mounts /
       # host storage and privileged: true on node-agent/ambient chart surfaces.
       # Extract the checker from the base branch on pull_request / merge_group so
       # this step cannot be made to execute the proposed checker. The workflow
       # wiring remains a reviewed PR surface and is checked by the required CI
       # aggregate. Bootstrap from the reviewed checkout only when the base has no
-      # checker yet.
+      # checker yet. Pin FERRUM_TRUSTED_HELM to the installer output so PATH
+      # cannot substitute a fake renderer for the authoritative scan.
       - name: Check node-agent chart runtime mounts
         run: |
           set -euo pipefail
@@ -2054,9 +2101,21 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          FERRUM_TRUSTED_HELM: ${{ runner.temp }}/ferrum-k8s-tools/bin/helm
 
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-kubernetes-tools
+      # Non-authoritative: exercise the pull request's proposed checker at HEAD
+      # for syntax, self-tests, and render behavior. The trusted-base step above
+      # remains the security authority; without this step a checker change would
+      # get no hosted execution at all on its own pull request.
+      - name: Validate proposed chart runtime lint (non-authoritative)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: |
+          set -euo pipefail
+          proposed=.github/scripts/check_node_agent_chart_runtime.py
+          python3 -I "$proposed" --self-test
+          python3 -I "$proposed"
+        env:
+          FERRUM_TRUSTED_HELM: ${{ runner.temp }}/ferrum-k8s-tools/bin/helm
 
       - name: Install Prometheus rule validator
         run: |
