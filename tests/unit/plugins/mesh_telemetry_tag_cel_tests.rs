@@ -14,45 +14,29 @@ use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use serde_json::json;
 
 fn mesh_identity_metadata(mut metadata: HashMap<String, String>) -> HashMap<String, String> {
-    metadata
-        .entry("mesh.source.workload".into())
-        .or_insert_with(|| "frontend".into());
-    metadata
-        .entry("mesh.source.namespace".into())
-        .or_insert_with(|| "default".into());
-    metadata
-        .entry("mesh.source.principal".into())
-        .or_insert_with(|| "spiffe://cluster.local/ns/default/sa/frontend".into());
-    metadata
-        .entry("mesh.source.app".into())
-        .or_insert_with(|| "frontend".into());
-    metadata
-        .entry("mesh.source.service".into())
-        .or_insert_with(|| "frontend".into());
-    metadata
-        .entry("mesh.destination.workload".into())
-        .or_insert_with(|| "backend".into());
-    metadata
-        .entry("mesh.destination.namespace".into())
-        .or_insert_with(|| "default".into());
-    metadata
-        .entry("mesh.destination.principal".into())
-        .or_insert_with(|| "spiffe://cluster.local/ns/default/sa/backend".into());
-    metadata
-        .entry("mesh.destination.app".into())
-        .or_insert_with(|| "backend".into());
-    metadata
-        .entry("mesh.destination.service".into())
-        .or_insert_with(|| "backend".into());
-    metadata
-        .entry("mesh.request_protocol".into())
-        .or_insert_with(|| "http".into());
-    metadata
-        .entry("mesh.response_flags".into())
-        .or_insert_with(|| "-".into());
-    metadata
-        .entry("mesh.connection_security_policy".into())
-        .or_insert_with(|| "mutual_tls".into());
+    for (key, value) in [
+        ("mesh.source.workload", "frontend"),
+        ("mesh.source.namespace", "default"),
+        (
+            "mesh.source.principal",
+            "spiffe://cluster.local/ns/default/sa/frontend",
+        ),
+        ("mesh.source.app", "frontend"),
+        ("mesh.source.service", "frontend"),
+        ("mesh.destination.workload", "backend"),
+        ("mesh.destination.namespace", "default"),
+        (
+            "mesh.destination.principal",
+            "spiffe://cluster.local/ns/default/sa/backend",
+        ),
+        ("mesh.destination.app", "backend"),
+        ("mesh.destination.service", "backend"),
+        ("mesh.request_protocol", "http"),
+        ("mesh.response_flags", "-"),
+        ("mesh.connection_security_policy", "mutual_tls"),
+    ] {
+        metadata.insert(key.into(), value.into());
+    }
     metadata
 }
 
