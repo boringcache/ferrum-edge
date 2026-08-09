@@ -4563,20 +4563,17 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // SIDECAR only (#2013): the CURRENT-netns capture listener
+        // SIDECAR and Ambient host placement (#2013/#3288): the CURRENT-netns
+        // capture listener
         // (`MeshRuntimeConfig::udp_capture_listener()`) binds this port in the
         // sidecar's own (pod) netns, so a UDP/DTLS stream proxy or ServiceEntry
         // declaring the same listen port would race that bind at startup —
-        // reserve it. AMBIENT no longer binds a host-netns listener: its
-        // per-pod-netns UDP producer (`NetnsUdpCaptureManager`) binds the capture
-        // socket INSIDE each enrolled pod's netns, so the mesh proxy's OWN (host)
-        // netns leaves this port free and reserving it here would wrongly reject a
-        // valid host-netns UDP/DTLS stream proxy on it. So gate the reservation on
-        // the SAME condition `udp_capture_listener()` now uses: Sidecar emits the
-        // listener; Ambient/other return `None`. UNSET `FERRUM_MESH_TOPOLOGY`
-        // defaults to `sidecar` in `MeshRuntimeConfig::from_env_config` (which
-        // binds the listener), so treat unset as `sidecar` here too, or a UDP/DTLS
-        // stream proxy on it would pass validation then race the sidecar's bind.
+        // reserve it. Ambient's default per-pod-netns producer binds inside each
+        // enrolled pod and leaves the host port free, but the opt-in host-netns
+        // placement binds the shared capture socket in the mesh proxy's own
+        // namespace and therefore needs the same reservation. UNSET
+        // `FERRUM_MESH_TOPOLOGY` defaults to `sidecar` in
+        // `MeshRuntimeConfig::from_env_config`, so treat unset as sidecar here too.
         // MESH MODE ONLY (codex r2): `reserved_gateway_ports()` is shared by
         // file/database/CP/DP validation, where no mesh capture listener ever binds
         // (`MeshRuntimeConfig::listener_plan()` runs only in mesh mode). Reserving
@@ -4590,7 +4587,9 @@ impl EnvConfig {
             && let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && udp_capture_topology.eq_ignore_ascii_case("sidecar")
+            && (udp_capture_topology.eq_ignore_ascii_case("sidecar")
+                || (udp_capture_topology.eq_ignore_ascii_case("ambient")
+                    && udp.udp_host_netns_enabled))
         {
             ports.insert(udp.udp_outbound_port);
         }

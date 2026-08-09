@@ -11851,6 +11851,31 @@ fn prepare_mesh_runtime_before_owner(
     ))
 }
 
+/// Delay only the incoming Ambient UDP producer until stale host readiness can
+/// no longer be retracted. Unrelated mesh/admin listeners continue startup while
+/// the predecessor datapath stays installed and fail-closed.
+async fn await_host_udp_retraction(
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(mut ready) = ready else {
+        return !*shutdown.borrow();
+    };
+    loop {
+        if *shutdown.borrow() {
+            return false;
+        }
+        tokio::select! {
+            result = &mut ready => return result.is_ok(),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 /// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
 /// via [`MeshStartupOwner::fail_with`] so spawned tasks/netns managers drain.
 #[allow(clippy::too_many_arguments)]
@@ -12048,9 +12073,8 @@ async fn arm_mesh_runtime_startup(
         // chain no socket serves — captured egress diverted into a black hole with
         // no remaining code path to clean it up.
         //
-        // The reap is SEQUENCED behind the durable readiness handshake, and it is
-        // awaited here rather than spawned, for two reasons that both concern the
-        // producer started below:
+        // The reap is SEQUENCED behind the durable readiness handshake for two
+        // reasons that both concern the producer started below:
         //
         // * the node-agent still holds a BPF UDP gate open for every pod the
         //   previous host generation readied, so removing that generation's rules
@@ -12060,21 +12084,25 @@ async fn arm_mesh_runtime_startup(
         //   starts publishing readiness of its own, so the two never fight over
         //   the shared `.udp-ready` markers.
         //
-        // Only the waiting and the reap itself continue in the background, and a
-        // pod the incoming producer readies settles the recovery rather than
-        // deadlocking it.
+        // One bounded recovery pass runs here. If discovery/retraction cannot
+        // complete, only the incoming UDP producer waits on its returned barrier;
+        // unrelated mesh/admin listeners continue startup. Once retraction is
+        // complete, the incoming producer may safely republish readiness while
+        // stale host-state reaping continues in the background.
+        let mut host_udp_retraction_ready = None;
         if !settings.udp_host_netns_enabled {
             let host_ready_dir =
                 std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
                     .join(".udp-ready");
-            if let Some(handle) =
+            let recovery =
                 crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
                     Some(host_ready_dir),
                     std::time::Duration::from_secs(2),
                     shutdown_tx.subscribe(),
                 )
-                .await
-            {
+                .await;
+            host_udp_retraction_ready = recovery.retraction_ready;
+            if let Some(handle) = recovery.retry_task {
                 owner.push_mesh_background(handle);
             }
         }
@@ -12207,7 +12235,14 @@ async fn arm_mesh_runtime_startup(
                         capture_port = settings.udp_outbound_port,
                         "Ambient per-pod-netns UDP capture producer enabled"
                     );
+                    let retraction_ready = host_udp_retraction_ready.take();
                     owner.push_mesh_background(tokio::spawn(async move {
+                        let mut manager_shutdown = manager_shutdown;
+                        if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown)
+                            .await
+                        {
+                            return;
+                        }
                         manager.run(manager_shutdown).await;
                     }));
                 }
@@ -12231,7 +12266,12 @@ async fn arm_mesh_runtime_startup(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
                 "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
             );
+            let retraction_ready = host_udp_retraction_ready.take();
             owner.push_mesh_background(tokio::spawn(async move {
+                let mut manager_shutdown = manager_shutdown;
+                if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await {
+                    return;
+                }
                 manager.run(manager_shutdown).await;
             }));
         }

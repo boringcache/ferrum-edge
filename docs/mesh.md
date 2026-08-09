@@ -2682,10 +2682,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   a lock-free atomic count so a spoofed-source flood never walks every DashMap
   shard), an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the
   recvmmsg batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`); GRO-coalesced reads are
-  framed **per segment**, not as one superblock. When capture is enabled the
-  capture port is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream
-  proxy or ServiceEntry declaring the same listen port is rejected at validation
-  rather than racing the capture listener at startup. The listener carries
+  framed **per segment**, not as one superblock. When the mesh proxy itself binds
+  the capture port (Sidecar, or Ambient with the host-netns placement), that port
+  is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream proxy or
+  ServiceEntry declaring the same listen port is rejected at validation rather
+  than racing the capture listener at startup. Ambient's default per-pod-netns
+  placement binds inside each pod and therefore does not reserve the host port.
+  The listener carries
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. With the flag off there is no
@@ -3231,10 +3234,15 @@ a marker that exists again was published by the incoming per-pod-netns producer,
 which publishes only once it is capturing that pod inside its namespace — its
 egress no longer reaches the host namespace at all. Without that clause the two
 halves of a placement switch would deadlock, each waiting on the other. On a node
-whose placement is now the pod-netns producer, mesh startup runs the same
-recovery — awaited, and **before** that producer starts — so the retraction can
-never fight it over the shared markers. If the handshake cannot complete, startup
-stays fail-closed and retries rather than serving.
+whose placement is now the pod-netns producer, mesh startup runs one bounded
+recovery pass before returning to unrelated listener startup. If safe retraction
+is still incomplete, recovery continues in the background and only the incoming
+UDP producer waits on that boundary, so it cannot fight recovery over the shared
+markers; admin, HBONE, and other proxy listeners still start. Until the boundary
+resolves, predecessor rules remain installed and enrolled UDP stays fail-closed.
+Stale-state reaping can continue after the incoming producer starts because
+discovery/retraction is then frozen, and republished readiness is the
+acknowledgement that settles a placement switch.
 
 **A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
 `.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,

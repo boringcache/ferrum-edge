@@ -1011,8 +1011,8 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
@@ -1131,6 +1131,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             && !self.guard_active
             && !gate_close_pending
         {
+            // Readiness publication is a durable, fallible filesystem effect.
+            // Retry missing markers on every otherwise-idle poll without
+            // rebuilding a healthy rules/listener generation.
+            self.publish_readiness_markers(&desired);
             return &self.last_desired;
         }
 
@@ -1354,12 +1358,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
 
         // 9. Only now is each captured pod's egress genuinely going through the
         //    mesh, so publish its readiness marker and open the BPF gate.
-        if let Some(ready_dir) = self.ready_dir.clone() {
-            for binding in &desired.bindings {
-                super::netns_udp_capture::write_udp_ready_marker(&ready_dir, &binding.pod_uid);
-            }
-        }
-        self.published_ready = desired.bound_ifaces();
+        self.publish_readiness_markers(&desired);
         // Every retirement this pass owed is acknowledged (step 3 returned
         // otherwise), so the protective scope narrows back to what is captured.
         self.guard_scope = ifaces;
@@ -1370,6 +1369,32 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             "Host UDP capture reconciled"
         );
         self.applied = Some(desired);
+    }
+
+    /// Publish readiness only for pods whose marker write actually succeeded.
+    /// Failed writes remain absent from `published_ready`, so the idle reconcile
+    /// path retries them instead of permanently leaving the node-agent's BPF UDP
+    /// gate closed. An already-published entry is retained if its marker later
+    /// disappears: the node-agent may already have opened that gate, so shutdown
+    /// and withdrawal must still discharge the close handshake.
+    fn publish_readiness_markers(&mut self, desired: &HostUdpDesiredState) {
+        let Some(ready_dir) = self.ready_dir.clone() else {
+            self.published_ready.extend(desired.bound_ifaces());
+            return;
+        };
+        for binding in &desired.bindings {
+            if let Some(iface) = self.published_ready.get_mut(&binding.pod_uid) {
+                // The marker already opened this pod's gate, but its dedicated
+                // veth may have been recreated. Keep the guard/withdrawal scope
+                // aligned with the current evidence generation.
+                iface.clone_from(&binding.iface);
+                continue;
+            }
+            if super::netns_udp_capture::write_udp_ready_marker(&ready_dir, &binding.pod_uid) {
+                self.published_ready
+                    .insert(binding.pod_uid.clone(), binding.iface.clone());
+            }
+        }
     }
 
     /// The interface set the fail-closed guard must cover for one transition:
@@ -1905,44 +1930,55 @@ fn reap_stale_host_udp_state() -> Result<(), String> {
 /// owns any more, so reaping the host rules first would leave that pod's egress
 /// neither captured nor gated.
 ///
-/// Ordering matters and is the caller's responsibility: run this BEFORE starting
-/// the incoming producer. The retraction happens exactly once, in the first
-/// (awaited) pass, so it can never fight a per-pod-netns producer that has begun
-/// publishing readiness of its own — and once that producer does republish, the
-/// pod settles (see [`HostUdpStaleGenerationRecovery`]), so the two halves of a
-/// placement switch cannot deadlock.
+/// Ordering matters and is the caller's responsibility: do not start the
+/// incoming producer until the returned retraction boundary is open. The first
+/// pass is awaited and bounded; if retraction cannot finish in that pass, the
+/// returned barrier keeps the producer out while retries continue in the
+/// background. Once the boundary opens, discovery is frozen and recovery can no
+/// longer retract a per-pod-netns producer's newly published readiness. A pod
+/// that producer republishes then settles the pending acknowledgement (see
+/// [`HostUdpStaleGenerationRecovery`]), so the two halves of a placement switch
+/// cannot deadlock.
 ///
-/// Returns a retry task when the first pass could not complete; until it does,
-/// the predecessor's objects stay installed, which drops enrolled UDP rather
-/// than releasing it.
+/// Outcome of one bounded stale-host-state startup pass.
+pub struct HostUdpStaleRecovery {
+    /// Resolves when an incoming UDP producer can publish readiness without the
+    /// recovery retracting it. `None` means that boundary is already safe.
+    pub retraction_ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Retries unfinished retraction and stale-state reaping until success or
+    /// shutdown. `None` means the first pass completed everything.
+    pub retry_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Returns a bounded startup outcome. If marker discovery or close-request
+/// persistence cannot complete, the caller may continue bringing up unrelated
+/// mesh listeners while delaying only the incoming UDP producer on
+/// `retraction_ready`. Until that barrier resolves, predecessor objects stay
+/// installed and enrolled UDP remains fail-closed.
 pub async fn recover_and_reap_stale_host_udp_state(
     ready_dir: Option<PathBuf>,
     retry_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> HostUdpStaleRecovery {
     let mut recovery = HostUdpStaleGenerationRecovery::new(ready_dir);
-    loop {
-        if recover_and_reap_once(&mut recovery).await {
-            return None;
-        }
-        if recovery.retraction_complete() {
-            break;
-        }
-        // Do not start the incoming per-pod producer while discovery can still
-        // rescan or a failed close request still owns an old readiness marker.
-        // Either state would let the recovery retract the incoming producer's
-        // marker and turn the shared durable handshake into a race. Holding this
-        // startup boundary is fail-closed; predecessor rules remain installed.
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return None;
-                }
-            }
-            _ = tokio::time::sleep(retry_interval) => {}
-        }
+    // Exactly one bounded pass belongs to synchronous startup. Repeating this
+    // loop here could wedge every mesh/admin listener forever on an unreadable or
+    // oversized marker directory even when UDP capture is disabled.
+    if recover_and_reap_once(&mut recovery).await {
+        return HostUdpStaleRecovery {
+            retraction_ready: None,
+            retry_task: None,
+        };
     }
-    Some(tokio::spawn(async move {
+
+    let (retraction_tx, retraction_ready) = if recovery.retraction_complete() {
+        (None, None)
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    };
+    let retry_task = tokio::spawn(async move {
+        let mut retraction_tx = retraction_tx;
         let mut ticker = tokio::time::interval(retry_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The immediate first tick is the attempt the caller already awaited.
@@ -1955,13 +1991,23 @@ pub async fn recover_and_reap_stale_host_udp_state(
                     }
                 }
                 _ = ticker.tick() => {
-                    if recover_and_reap_once(&mut recovery).await {
+                    let reaped = recover_and_reap_once(&mut recovery).await;
+                    if recovery.retraction_complete()
+                        && let Some(tx) = retraction_tx.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                    if reaped {
                         return;
                     }
                 }
             }
         }
-    }))
+    });
+    HostUdpStaleRecovery {
+        retraction_ready,
+        retry_task: Some(retry_task),
+    }
 }
 
 async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) -> bool {

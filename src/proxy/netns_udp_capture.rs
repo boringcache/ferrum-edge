@@ -332,20 +332,22 @@ pub(crate) fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf
     Some(dir.join(pod_uid))
 }
 
-pub(crate) fn write_udp_ready_marker(dir: &Path, pod_uid: &str) {
+pub(crate) fn write_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
-        return;
+        return false;
     };
     if path.is_file() {
-        return;
+        return true;
     }
     if let Err(error) = std::fs::create_dir_all(dir) {
         warn!(pod_uid, dir = %dir.display(), %error, "Failed to create Ambient UDP readiness marker dir");
-        return;
+        return false;
     }
     if let Err(error) = std::fs::write(&path, b"") {
         warn!(pod_uid, path = %path.display(), %error, "Failed to publish Ambient UDP readiness marker");
+        return false;
     }
+    true
 }
 
 pub(crate) fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
@@ -925,14 +927,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                             let _ = remove_udp_ready_marker(dir, uid);
                         }
                         for uid in pod_uids.difference(&active.pod_uids) {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                     active.pod_uids = pod_uids;
                     active.target = target.clone();
                     if let Some(dir) = &self.ready_dir {
                         for uid in &active.pod_uids {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                 }
@@ -1088,7 +1090,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     );
                     if let Some(dir) = &self.ready_dir {
                         for uid in &pod_uids {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                 }

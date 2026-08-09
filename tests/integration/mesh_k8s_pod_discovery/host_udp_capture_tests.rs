@@ -27,7 +27,7 @@ use ferrum_edge::modes::mesh::hbone::UdpSourceIdentity;
 use ferrum_edge::proxy::host_udp_capture::{
     HostUdpCaptureBackend, HostUdpCaptureManager, HostUdpDatagramRefusal, HostUdpIdentityIndex,
     HostUdpListenerHandle, HostUdpPodBinding, HostUdpRefusal, HostUdpStaleGenerationRecovery,
-    ResolvedInterface, plan_host_udp_bindings,
+    ResolvedInterface, plan_host_udp_bindings, recover_and_reap_stale_host_udp_state,
 };
 use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
 
@@ -756,6 +756,61 @@ async fn readiness_marker_is_published_only_after_capture_is_live_and_retracted_
 }
 
 #[tokio::test]
+async fn a_failed_readiness_marker_write_is_retried_without_rebuilding_capture() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    // A plain file where the marker directory belongs makes the first
+    // publication fail after the datapath becomes live.
+    std::fs::write(&ready_dir, b"").expect("blocking file");
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(source, backend.clone(), Some(ready_dir.clone()));
+
+    manager.reconcile_once().await;
+    assert!(!ready_dir.join(POD_A_UID).is_file());
+    std::fs::remove_file(&ready_dir).expect("remove blocker");
+    backend.reset_calls();
+
+    manager.reconcile_once().await;
+    assert!(
+        ready_dir.join(POD_A_UID).is_file(),
+        "an otherwise-idle reconcile must retry the missing readiness marker"
+    );
+    assert!(
+        backend.calls().is_empty(),
+        "retrying a filesystem publication must not churn healthy rules or the listener: {:?}",
+        backend.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_recreated_veth_moves_the_readiness_withdrawal_scope() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(source.clone(), backend.clone(), Some(ready_dir));
+
+    manager.reconcile_once().await;
+    backend.set_interface(POD_A_UID, "vethz", 12);
+    manager.reconcile_once().await;
+    backend.reset_calls();
+
+    source.set(Vec::new());
+    manager.reconcile_once().await;
+    assert_eq!(
+        backend.calls(),
+        vec!["guard:vethz".to_string()],
+        "a later withdrawal must guard the current veth generation, not the interface on which \
+         this pod first published readiness"
+    );
+}
+
+#[tokio::test]
 async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledged() {
     let registry = tempfile::tempdir().expect("tempdir");
     let ready_dir = registry.path().join(".udp-ready");
@@ -1304,6 +1359,52 @@ async fn a_node_agent_that_never_acknowledges_leaves_the_previous_generation_ins
         !ready_dir.join(POD_A_UID).is_file(),
         "readiness stays retracted, so the node-agent keeps closing rather than reopening the gate"
     );
+}
+
+#[tokio::test]
+async fn a_closed_shutdown_channel_stops_the_host_manager() {
+    let source = Arc::new(FakeSource::default());
+    let backend = FakeBackend::default();
+    let manager = manager(source, backend.clone(), None);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    drop(shutdown_tx);
+
+    tokio::time::timeout(Duration::from_secs(1), manager.run(shutdown_rx))
+        .await
+        .expect("a closed watch channel must stop the manager instead of busy-spinning");
+    assert!(
+        backend.calls().is_empty(),
+        "shutdown before startup recovery owns no predecessor teardown: {:?}",
+        backend.calls()
+    );
+}
+
+#[tokio::test]
+async fn unreadable_stale_markers_defer_udp_recovery_without_blocking_mesh_startup() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    std::fs::write(&ready_dir, b"").expect("blocking file");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let recovery = tokio::time::timeout(
+        Duration::from_secs(1),
+        recover_and_reap_stale_host_udp_state(
+            Some(ready_dir),
+            Duration::from_secs(60),
+            shutdown_rx,
+        ),
+    )
+    .await
+    .expect("one unreadable-directory pass must return control to mesh startup");
+    assert!(
+        recovery.retraction_ready.is_some(),
+        "only the incoming UDP producer should wait for safe retraction"
+    );
+    let retry_task = recovery
+        .retry_task
+        .expect("recovery continues in the background");
+    let _ = shutdown_tx.send(true);
+    retry_task.await.expect("retry task exits on shutdown");
 }
 
 #[tokio::test]
