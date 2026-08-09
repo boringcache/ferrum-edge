@@ -260,10 +260,7 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
             malformed_gateway,
             malformed,
         ],
-        options().with_source_namespaces(vec![
-            "default".to_string(),
-            "extension-ns".to_string(),
-        ]),
+        options().with_source_namespaces(vec!["default".to_string(), "extension-ns".to_string()]),
     )
     .expect("translate strict allowedListeners selectors");
     assert!(
@@ -1101,10 +1098,8 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
         tls_secret("gateway-cert", "gateway-ns"),
         tls_secret("listenerset-cert", "extension-ns"),
     ];
-    let opts = options().with_source_namespaces(vec![
-        "gateway-ns".to_string(),
-        "extension-ns".to_string(),
-    ]);
+    let opts = options()
+        .with_source_namespaces(vec!["gateway-ns".to_string(), "extension-ns".to_string()]);
     let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
 
     assert_eq!(translation.config.frontend_tls_namespace_sources.len(), 1);
@@ -1121,22 +1116,20 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
         "the parent Gateway must retain the physical TLS serving slot"
     );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
-        mesh.services.iter().any(|service| {
-            service.namespace == "gateway-ns" && service.name == "edge-https"
-        }) && !mesh.services.iter().any(|service| {
-            service.namespace == "extension-ns"
-                && service.name == "listenerset-extra-https-extra"
-        })
+        mesh.services
+            .iter()
+            .any(|service| service.namespace == "gateway-ns" && service.name == "edge-https")
+            && !mesh.services.iter().any(|service| {
+                service.namespace == "extension-ns"
+                    && service.name == "listenerset-extra-https-extra"
+            })
     }));
 
-    let updates =
-        plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
+    let updates = plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
     let gateway_update = updates
         .iter()
         .find(|update| {
-            update.kind == "Gateway"
-                && update.namespace == "gateway-ns"
-                && update.name == "edge"
+            update.kind == "Gateway" && update.namespace == "gateway-ns" && update.name == "edge"
         })
         .expect("Gateway status update");
     let gateway_listener = gateway_update.status["listeners"]

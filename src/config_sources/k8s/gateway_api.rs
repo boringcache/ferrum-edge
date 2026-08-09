@@ -1492,8 +1492,7 @@ struct GatewayFrontendTlsNamespaceSlotPlan {
 }
 
 type GatewayFrontendTlsParent = (GatewayApiListenerParentKind, String, String);
-type GatewayFrontendTlsCredentials =
-    BTreeMap<GatewayFrontendTlsParent, BTreeSet<(String, String)>>;
+type GatewayFrontendTlsCredentials = BTreeMap<GatewayFrontendTlsParent, BTreeSet<(String, String)>>;
 
 /// Physical frontend-TLS serving is scoped to the attached Gateway namespace.
 /// A cross-namespace ListenerSet keeps its own namespace in its listener key
@@ -1542,19 +1541,14 @@ fn plan_gateway_frontend_tls_namespace_slots(
         credentials_by_gateway
             .entry(slot_namespace)
             .or_default()
-            .entry((
-                key.parent_kind,
-                key.namespace.clone(),
-                key.gateway.clone(),
-            ))
+            .entry((key.parent_kind, key.namespace.clone(), key.gateway.clone()))
             .or_default()
             .insert(source);
     }
 
     let mut plan = GatewayFrontendTlsNamespaceSlotPlan::default();
     for (namespace, gateways) in credentials_by_gateway {
-        let mut candidates: BTreeMap<GatewayFrontendTlsParent, (String, String)> =
-            BTreeMap::new();
+        let mut candidates: BTreeMap<GatewayFrontendTlsParent, (String, String)> = BTreeMap::new();
         for (parent, sources) in gateways {
             if sources.len() != 1 {
                 plan.multi_cert_parents.insert(parent);
