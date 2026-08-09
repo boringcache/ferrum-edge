@@ -896,7 +896,7 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
     let long_key = format!("request.headers[{}]", "a".repeat(300));
     let long = condition_translation_error(&long_key, json!(["x"]));
     assert!(
-        long.contains("rules[].when[0].key") && long.contains("at most 256 characters"),
+        long.contains("rules[].when[0].key") && long.contains("at most 256 UTF-8 bytes"),
         "an oversized condition key must fail closed: {long}"
     );
     assert!(
