@@ -248,6 +248,15 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
     // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
     stream_ctx.sni_hostname = sni_hostname;
+    // The captured pre-NAT original destination IS the authoritative L4
+    // destination for this relay — the accepted socket's own local address is
+    // the shared `:15006` capture listener. `mesh_authz` reads these for
+    // Istio's `destination.ip` condition; without them a `destination.ip`
+    // condition on captured Sidecar/NodeWaypoint inbound would have no
+    // evidence and fail closed.
+    let canonical_orig_dst = crate::util::client_identity::canonical_socket_addr(orig_dst);
+    stream_ctx.destination_ip = Some(canonical_orig_dst.ip());
+    stream_ctx.destination_port = Some(canonical_orig_dst.port());
     // Captured plaintext Sidecar inbound is, by direction, inbound mesh
     // traffic — so `mesh_authz` treats `listen_port` as the inbound
     // destination port (parity with the materialized HTTP inbound path).

@@ -1809,3 +1809,373 @@ fn _construct_mesh_config_with_explicit_root_ns() -> MeshConfig {
         ..MeshConfig::default()
     }
 }
+
+// ── Istio `when: destination.ip` and protocol-correct condition semantics ──
+// Issue #3236.
+
+/// Build a mesh-wide policy carrying a single `when[]` condition.
+fn condition_policy(
+    name: &str,
+    action: PolicyAction,
+    key: &str,
+    values: Vec<&str>,
+    not_values: Vec<&str>,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: key.to_string(),
+                values: values.into_iter().map(str::to_string).collect(),
+                not_values: not_values.into_iter().map(str::to_string).collect(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// The HTTP request path materializes `destination.ip` from the connection's
+/// observed destination and CIDR-matches it. Nothing client-settable feeds it.
+#[tokio::test]
+async fn condition_match_on_destination_ip_uses_connection_destination() {
+    let deny_vip = condition_policy(
+        "deny-vip",
+        PolicyAction::Deny,
+        "destination.ip",
+        vec!["10.96.0.0/12"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_vip]);
+
+    let mut inside = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    inside.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(
+        matches!(
+            plugin.authorize(&mut inside).await,
+            PluginResult::Reject { .. }
+        ),
+        "a DENY gated on destination.ip must fire for a destination inside the CIDR"
+    );
+
+    let mut outside = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    outside.destination_ip = Some("192.168.1.5".parse().expect("ip"));
+    assert!(matches!(
+        plugin.authorize(&mut outside).await,
+        PluginResult::Continue
+    ));
+
+    // A `Host` header naming the VIP must not be able to select the rule: only
+    // the transport-observed destination counts.
+    let mut spoofed = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    spoofed.destination_ip = Some("192.168.1.5".parse().expect("ip"));
+    spoofed
+        .headers
+        .insert("host".to_string(), "10.96.4.7".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut spoofed).await,
+            PluginResult::Continue
+        ),
+        "destination.ip must never be derived from a client-supplied header"
+    );
+
+    // No destination evidence at all: the DENY must not be disarmed.
+    let mut unknown = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    unknown.destination_ip = None;
+    assert!(
+        matches!(
+            plugin.authorize(&mut unknown).await,
+            PluginResult::Reject { .. }
+        ),
+        "missing destination evidence is unsourceable, so the DENY stays armed"
+    );
+}
+
+/// A captured pre-NAT original destination wins over the socket's local
+/// address: on a capture listener the socket address is the interception port,
+/// not the address the client dialled.
+#[tokio::test]
+async fn condition_destination_ip_prefers_captured_original_destination() {
+    let deny_vip = condition_policy(
+        "deny-vip",
+        PolicyAction::Deny,
+        "destination.ip",
+        vec!["10.96.0.0/12"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_vip]);
+
+    let mut captured = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    captured.destination_ip = Some("127.0.0.1".parse().expect("ip"));
+    captured.orig_dst = Some("10.96.4.7:9080".parse().expect("socket addr"));
+    assert!(
+        matches!(
+            plugin.authorize(&mut captured).await,
+            PluginResult::Reject { .. }
+        ),
+        "the captured original destination must win over the interception socket address"
+    );
+}
+
+/// An ALLOW gated on `destination.ip` cannot match without destination
+/// evidence — access is never granted on an attribute the path cannot read.
+#[tokio::test]
+async fn condition_allow_on_destination_ip_fails_closed_without_evidence() {
+    let allow_vip = condition_policy(
+        "allow-vip",
+        PolicyAction::Allow,
+        "destination.ip",
+        vec!["10.96.0.0/12"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_vip]);
+
+    let mut known = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    known.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(matches!(
+        plugin.authorize(&mut known).await,
+        PluginResult::Continue
+    ));
+
+    let mut unknown = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    unknown.destination_ip = None;
+    assert!(
+        matches!(
+            plugin.authorize(&mut unknown).await,
+            PluginResult::Reject { .. }
+        ),
+        "an ALLOW gated on an unobservable destination.ip must never match"
+    );
+}
+
+/// The L4 stream path sources `destination.ip` from the trusted PROXY tuple /
+/// `SO_ORIGINAL_DST` / capture metadata the accept path stamped.
+#[tokio::test]
+async fn stream_condition_match_on_destination_ip_uses_captured_destination() {
+    let deny_vip = condition_policy(
+        "deny-vip",
+        PolicyAction::Deny,
+        "destination.ip",
+        vec!["10.96.0.0/12"],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_vip]);
+
+    let mut inside = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    inside.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut inside).await,
+            PluginResult::Reject { .. }
+        ),
+        "a DENY gated on destination.ip must fire for a captured stream destination"
+    );
+
+    let mut outside = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    outside.destination_ip = Some("192.168.1.5".parse().expect("ip"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut outside).await,
+        PluginResult::Continue
+    ));
+
+    // UDP/DTLS sessions carry no destination evidence today.
+    let mut unknown = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    unknown.destination_ip = None;
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut unknown).await,
+            PluginResult::Reject { .. }
+        ),
+        "a stream with no destination evidence must not disarm the DENY"
+    );
+}
+
+/// Istio's non-HTTP-port semantics on the live stream path: a DENY ignores an
+/// HTTP-only `when` field and still matches, while an ALLOW gated on one can
+/// never match — including a `notValues`-only condition, which on HTTP would be
+/// satisfied by the absent attribute.
+#[tokio::test]
+async fn stream_http_only_conditions_follow_istio_non_http_port_semantics() {
+    let deny_header = condition_policy(
+        "deny-header",
+        PolicyAction::Deny,
+        "request.headers[x-team]",
+        vec!["blocked"],
+        Vec::new(),
+    );
+    let deny_plugin = build_mesh_authz_for_workload(&[], vec![deny_header.clone()]);
+    let mut stream = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            deny_plugin.on_stream_connect(&mut stream).await,
+            PluginResult::Reject { .. }
+        ),
+        "a raw TCP connection carries no HTTP headers, so the DENY stays armed"
+    );
+
+    // The same policy on HTTP evaluates the header normally.
+    let http_plugin = build_mesh_authz_for_workload(&[], vec![deny_header]);
+    let mut without_header = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            http_plugin.authorize(&mut without_header).await,
+            PluginResult::Continue
+        ),
+        "on HTTP the header is sourceable and absent, so the values check fails"
+    );
+    let mut with_header = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    with_header
+        .headers
+        .insert("x-team".to_string(), "blocked".to_string());
+    assert!(matches!(
+        http_plugin.authorize(&mut with_header).await,
+        PluginResult::Reject { .. }
+    ));
+
+    let allow_not_header = condition_policy(
+        "allow-not-header",
+        PolicyAction::Allow,
+        "request.headers[x-team]",
+        Vec::new(),
+        vec!["blocked"],
+    );
+    let allow_plugin = build_mesh_authz_for_workload(&[], vec![allow_not_header]);
+    let mut stream = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            allow_plugin.on_stream_connect(&mut stream).await,
+            PluginResult::Reject { .. }
+        ),
+        "a notValues-only HTTP-only ALLOW condition must not grant a raw TCP connection"
+    );
+}
+
+/// `experimental.envoy.filters.*` installs (dropping it would be fail-open for
+/// a DENY) but can never be sourced, on either protocol family.
+#[tokio::test]
+async fn condition_experimental_envoy_filter_key_installs_and_fails_closed() {
+    let key = "experimental.envoy.filters.network.mysql_proxy[db.table]";
+
+    let deny = condition_policy(
+        "deny-experimental",
+        PolicyAction::Deny,
+        key,
+        vec!["books"],
+        Vec::new(),
+    );
+    let deny_plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+    let mut http = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        deny_plugin.authorize(&mut http).await,
+        PluginResult::Reject { .. }
+    ));
+    let mut stream = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(matches!(
+        deny_plugin.on_stream_connect(&mut stream).await,
+        PluginResult::Reject { .. }
+    ));
+
+    let allow = condition_policy(
+        "allow-experimental",
+        PolicyAction::Allow,
+        key,
+        Vec::new(),
+        vec!["books"],
+    );
+    let allow_plugin = build_mesh_authz_for_workload(&[], vec![allow]);
+    let mut http = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            allow_plugin.authorize(&mut http).await,
+            PluginResult::Reject { .. }
+        ),
+        "an ALLOW gated on an unsourceable experimental key must never match"
+    );
+}
+
+/// A malformed condition rejects the plugin instance at construction, so a
+/// never-matching DENY can never be installed by a config source that skipped
+/// the Kubernetes translator (xDS / MeshSubscribe / file).
+#[test]
+fn mesh_authz_construction_rejects_malformed_conditions() {
+    for (key, values, expected) in [
+        ("destination.ip", vec!["10.0.0.0/40"], "values[0]"),
+        ("destination.port", vec!["http"], "values[0]"),
+        ("destination.labels[app]", vec!["payments"], "key"),
+        ("connection.sni", vec![""], "values[0]"),
+    ] {
+        let policy = condition_policy("bad", PolicyAction::Deny, key, values, Vec::new());
+        let error = MeshAuthz::new(&json!({"mesh_policies": [policy]}))
+            .err()
+            .unwrap_or_else(|| panic!("malformed condition '{key}' must reject the plugin"));
+        assert!(
+            error.contains(expected) && error.contains("invalid condition"),
+            "expected a field-specific '{expected}' diagnostic for '{key}', got: {error}"
+        );
+    }
+}
+
+/// Reload/update/delete: a rebuilt plugin instance reflects the new condition
+/// set. The old policy's condition must stop applying, and a newly added one
+/// must take effect immediately — not only on first start.
+#[tokio::test]
+async fn condition_set_follows_policy_reload_update_and_delete() {
+    let deny_vip_a = condition_policy(
+        "deny-vip",
+        PolicyAction::Deny,
+        "destination.ip",
+        vec!["10.96.0.0/12"],
+        Vec::new(),
+    );
+    let first = build_mesh_authz_for_workload(&[], vec![deny_vip_a]);
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    ctx.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(matches!(
+        first.authorize(&mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // UPDATE: same policy name, different CIDR. The old block stops matching
+    // and the new one starts.
+    let deny_vip_b = condition_policy(
+        "deny-vip",
+        PolicyAction::Deny,
+        "destination.ip",
+        vec!["172.16.0.0/12"],
+        Vec::new(),
+    );
+    let updated = build_mesh_authz_for_workload(&[], vec![deny_vip_b]);
+    let mut old_target = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    old_target.destination_ip = Some("10.96.4.7".parse().expect("ip"));
+    assert!(
+        matches!(
+            updated.authorize(&mut old_target).await,
+            PluginResult::Continue
+        ),
+        "the withdrawn CIDR must stop matching after the policy update"
+    );
+    let mut new_target = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    new_target.destination_ip = Some("172.16.9.9".parse().expect("ip"));
+    assert!(matches!(
+        updated.authorize(&mut new_target).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // DELETE: no policies at all — the condition-key index is empty again and
+    // the request is admitted.
+    let deleted = build_mesh_authz_for_workload(&[], Vec::new());
+    let mut ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    ctx.destination_ip = Some("172.16.9.9".parse().expect("ip"));
+    assert!(matches!(
+        deleted.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+}

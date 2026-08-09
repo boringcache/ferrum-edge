@@ -20,7 +20,8 @@ use ferrum_edge::modes::mesh::config::{
     MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
 };
 use ferrum_edge::modes::mesh::policy::{
-    MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization_policies,
+    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest,
+    evaluate_mesh_authorization_policies,
 };
 use serde_json::{Value, json};
 
@@ -558,4 +559,457 @@ fn authz_target_refs_namespace_and_kind_boundaries_fail_closed() {
             .contains("ServiceEntry attachments are not supported yet"),
         "diagnostic must scope the refusal to ServiceEntry: {err}"
     );
+}
+
+// ── AuthorizationPolicy `when:` condition keys (issue #3236) ───────────────
+
+/// Build a mesh-wide policy carrying a single `when[]` condition, translated
+/// from the Istio CRD shape so the test covers the translator as well as the
+/// evaluator.
+fn condition_policy(action: &str, key: &str, values: Value, not_values: Value) -> MeshPolicy {
+    let mut condition = serde_json::Map::new();
+    condition.insert("key".to_string(), Value::String(key.to_string()));
+    if !matches!(&values, Value::Null) {
+        condition.insert("values".to_string(), values);
+    }
+    if !matches!(&not_values, Value::Null) {
+        condition.insert("notValues".to_string(), not_values);
+    }
+    translated(json!({
+        "action": action,
+        "rules": [{"when": [Value::Object(condition)]}]
+    }))
+}
+
+fn condition_translation_error(key: &str, values: Value) -> String {
+    translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{"when": [{"key": key, "values": values}]}]
+        }))],
+        options(),
+    )
+    .expect_err("malformed when condition must fail closed")
+    .to_string()
+}
+
+/// Every key in Istio's conditions reference translates. This is the coverage
+/// claim of issue #3236: a valid Istio policy using any documented key must
+/// install, not be rejected into oblivion (which is fail-OPEN for a DENY).
+#[test]
+fn authz_translates_the_complete_documented_condition_key_set() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "complete AuthorizationPolicy when-condition key set",
+        status = Status::Supported,
+        notes = "Every key documented at istio.io/docs/reference/config/security/conditions \
+                 translates, including destination.ip, nested request.auth.claims[a][b], and \
+                 experimental.envoy.filters.<filter>[<key>]. Keys outside the documented set \
+                 are still rejected with a field-specific diagnostic.",
+    );
+
+    let documented: &[(&str, Value)] = &[
+        ("source.principal", json!(["cluster.local/ns/default/sa/web"])),
+        ("source.namespace", json!(["default"])),
+        ("source.ip", json!(["10.1.2.3", "10.2.0.0/16"])),
+        ("remote.ip", json!(["203.0.113.0/24"])),
+        ("destination.ip", json!(["10.96.0.0/12"])),
+        ("destination.port", json!(["80", "443"])),
+        ("connection.sni", json!(["www.example.com"])),
+        ("request.auth.principal", json!(["issuer.example.com/sub"])),
+        ("request.auth.audiences", json!(["example.com"])),
+        ("request.auth.presenter", json!(["123.example.com"])),
+        ("request.auth.claims[iss]", json!(["issuer.example.com"])),
+        ("request.auth.claims[realm_access][roles]", json!(["admin"])),
+        ("request.headers[user-agent]", json!(["Mozilla/*"])),
+        ("experimental.envoy.filters.network.mysql_proxy[db.table]", json!(["books"])),
+    ];
+
+    for (key, values) in documented {
+        let policy = condition_policy("DENY", key, values.clone(), Value::Null);
+        assert_eq!(
+            policy.rules.len(),
+            1,
+            "documented condition key '{key}' must translate to exactly one rule"
+        );
+        assert_eq!(
+            policy.rules[0].when[0].key,
+            *key,
+            "documented condition key '{key}' must be preserved verbatim"
+        );
+    }
+}
+
+/// Istio's `destination.ip` is CIDR-matched against a transport-observed
+/// destination. Missing destination evidence is unsourceable, not absent, so it
+/// fails closed in both directions.
+#[test]
+fn authz_destination_ip_condition_matches_cidr_and_fails_closed_without_evidence() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when: destination.ip (CIDR, fail-closed without evidence)",
+        status = Status::Supported,
+        notes = "destination.ip is CIDR-matched against the captured pre-NAT original \
+                 destination or the connection's local address. It is never derived from a \
+                 client-settable header. With no destination evidence (UDP/DTLS today) a DENY \
+                 still applies and an ALLOW can never match.",
+    );
+
+    let deny = condition_policy(
+        "DENY",
+        "destination.ip",
+        json!(["10.96.0.0/12"]),
+        Value::Null,
+    );
+
+    let inside = destination_ip_request("10.96.4.7");
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny), &inside),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+
+    let outside = destination_ip_request("192.168.1.5");
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny), &outside),
+        MeshAuthzDecision::Allow
+    );
+
+    // No transport evidence at all: the DENY must not be disarmed.
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny),
+            &MeshAuthzRequest::default()
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+
+    let allow = condition_policy(
+        "ALLOW",
+        "destination.ip",
+        json!(["10.96.0.0/12"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&allow),
+            &MeshAuthzRequest::default()
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        },
+        "an ALLOW gated on an unobservable destination.ip must never match"
+    );
+}
+
+fn destination_ip_request(ip: &str) -> MeshAuthzRequest {
+    let parsed: std::net::IpAddr = ip.parse().expect("test destination ip");
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert(
+        "destination.ip".to_string(),
+        MeshAuthzAttribute::Scalar(ip.to_string()),
+    );
+    MeshAuthzRequest {
+        attributes,
+        destination_ip: Some(parsed),
+        protocol: MeshAuthzProtocol::Http,
+        ..MeshAuthzRequest::default()
+    }
+}
+
+/// Istio's documented non-HTTP-port behavior: HTTP-only `when` fields are
+/// ignored by a DENY rule (which still matches) and make an ALLOW rule never
+/// match. On HTTP the same key is sourceable and follows ordinary semantics.
+#[test]
+fn authz_http_only_condition_keys_follow_istio_non_http_port_semantics() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "HTTP-only when keys on non-HTTP ports",
+        status = Status::Supported,
+        notes = "On a TCP/UDP/DTLS connection an HTTP-only key (request.headers[...], \
+                 request.auth.*) is unsourceable: DENY ignores the field and still matches, \
+                 ALLOW/AUDIT can never match — including a notValues-only condition, which \
+                 would otherwise be satisfied by the absent-attribute rule and grant every raw \
+                 connection. On HTTP the key is sourceable and an absent attribute simply \
+                 fails the values check.",
+    );
+
+    let deny = condition_policy(
+        "DENY",
+        "request.auth.claims[role]",
+        json!(["admin"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny),
+            &MeshAuthzRequest::default()
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        },
+        "a raw L4 connection cannot carry JWT claims, so the DENY stays armed"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny), &http_request()),
+        MeshAuthzDecision::Allow,
+        "on HTTP the claim is sourceable and absent, so the values check fails"
+    );
+
+    let allow_not_values = condition_policy(
+        "ALLOW",
+        "request.headers[x-env]",
+        Value::Null,
+        json!(["blocked"]),
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&allow_not_values),
+            &MeshAuthzRequest::default()
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        },
+        "a notValues-only HTTP-only ALLOW condition must not grant a raw L4 connection"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&allow_not_values),
+            &http_request()
+        ),
+        MeshAuthzDecision::Allow,
+        "on HTTP an absent attribute satisfies a notValues-only condition (Istio not_rule)"
+    );
+}
+
+fn http_request() -> MeshAuthzRequest {
+    MeshAuthzRequest {
+        protocol: MeshAuthzProtocol::Http,
+        ..MeshAuthzRequest::default()
+    }
+}
+
+/// `experimental.envoy.filters.*` is documented by Istio but backed by Envoy
+/// dynamic metadata Ferrum has no equivalent for. The policy still installs;
+/// the condition is permanently unsourceable.
+#[test]
+fn authz_experimental_envoy_filter_condition_installs_and_fails_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when: experimental.envoy.filters.<filter>[<key>]",
+        status = Status::OutOfScope,
+        maturity = Maturity::Experimental,
+        notes = "Accepted at translation so the surrounding AuthorizationPolicy still installs \
+                 (rejecting it drops the whole policy, which is fail-OPEN for a DENY), but \
+                 Ferrum has no Envoy filter chain to source the metadata from. The condition is \
+                 permanently unsourceable: DENY ignores the field and still matches, ALLOW/AUDIT \
+                 can never match. A malformed experimental key with no bracketed metadata name \
+                 is rejected outright.",
+    );
+
+    let key = "experimental.envoy.filters.network.mysql_proxy[db.table]";
+    let deny = condition_policy("DENY", key, json!(["books"]), Value::Null);
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny), &http_request()),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+
+    let allow = condition_policy("ALLOW", key, Value::Null, json!(["books"]));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&allow), &http_request()),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        }
+    );
+
+    let message = condition_translation_error(
+        "experimental.envoy.filters.network.mysql_proxy",
+        json!(["books"]),
+    );
+    assert!(
+        message.contains("rules[].when[0].key") && message.contains("unsupported"),
+        "a bare experimental key with no bracketed metadata name must fail closed: {message}"
+    );
+}
+
+/// Field-specific, fail-closed rejection of malformed condition values and of
+/// the bounds that keep an externally supplied policy from growing unbounded
+/// per-request matching work.
+#[test]
+fn authz_rejects_malformed_and_unbounded_when_conditions() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when-condition validation and bounds",
+        status = Status::Supported,
+        notes = "One shared validator backs the Kubernetes translator, MeshConfig validation, \
+                 and the mesh_authz construction gate. It rejects empty/oversized/control-char \
+                 keys and values, non-numeric destination.port values, malformed IP CIDRs, and \
+                 collections over 64 when[] entries per rule or 256 values per list — each with \
+                 a field-specific diagnostic.",
+    );
+
+    let port = condition_translation_error("destination.port", json!(["http"]));
+    assert!(
+        port.contains("rules[].when[0].values[0]")
+            && port.contains("must be a numeric port in 0..=65535"),
+        "non-numeric destination.port must fail closed with a field-specific diagnostic: {port}"
+    );
+
+    let out_of_range = condition_translation_error("destination.port", json!(["70000"]));
+    assert!(
+        out_of_range.contains("rules[].when[0].values[0]"),
+        "out-of-range destination.port must fail closed: {out_of_range}"
+    );
+
+    let bad_cidr = condition_translation_error("destination.ip", json!(["10.0.0.0/40"]));
+    assert!(
+        bad_cidr.contains("rules[].when[0].values[0]") && bad_cidr.contains("prefix length"),
+        "malformed destination.ip CIDR must fail closed: {bad_cidr}"
+    );
+
+    let empty_value = condition_translation_error("connection.sni", json!([""]));
+    assert!(
+        empty_value.contains("rules[].when[0].values[0]")
+            && empty_value.contains("must not be empty"),
+        "an empty condition value can never match and must fail closed: {empty_value}"
+    );
+
+    let control_char = condition_translation_error("connection.sni", json!(["ok\u{7}bad"]));
+    assert!(
+        control_char.contains("rules[].when[0].values[0]")
+            && control_char.contains("control characters"),
+        "a control character in a condition value must fail closed: {control_char}"
+    );
+
+    let long_key = format!("request.headers[{}]", "a".repeat(300));
+    let long = condition_translation_error(&long_key, json!(["x"]));
+    assert!(
+        long.contains("rules[].when[0].key") && long.contains("at most 256 characters"),
+        "an oversized condition key must fail closed: {long}"
+    );
+    assert!(
+        !long.contains(&"a".repeat(300)),
+        "the oversized-key diagnostic must not echo the operator-supplied key: {long}"
+    );
+
+    let whitespace = condition_translation_error("request.headers[x env]", json!(["x"]));
+    assert!(
+        whitespace.contains("rules[].when[0].key") && whitespace.contains("whitespace"),
+        "a whitespace-bearing condition key must fail closed: {whitespace}"
+    );
+
+    let too_many_values: Vec<String> = (0..300).map(|index| format!("v{index}")).collect();
+    let values_message = condition_translation_error("connection.sni", json!(too_many_values));
+    assert!(
+        values_message.contains("rules[].when[0].values")
+            && values_message.contains("at most 256 entries"),
+        "an unbounded values list must fail closed: {values_message}"
+    );
+
+    let too_many_conditions: Vec<Value> = (0..100)
+        .map(|index| json!({"key": format!("request.headers[x-{index}]"), "values": ["v"]}))
+        .collect();
+    let conditions_message = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{"when": too_many_conditions}]
+        }))],
+        options(),
+    )
+    .expect_err("an unbounded when[] list must fail closed")
+    .to_string();
+    assert!(
+        conditions_message.contains("rules[].when supports at most 64 entries"),
+        "an unbounded when[] list must fail closed with a bound diagnostic: {conditions_message}"
+    );
+}
+
+/// Istio's `StringMatcherWithPrefix` grammar, verbatim: `*` is presence, a
+/// trailing `*` is a prefix match, a leading `*` is a suffix match, and a
+/// mid-string `*` is an exact match on the literal text.
+#[test]
+fn authz_condition_values_follow_istio_string_matcher_grammar() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "when-condition value grammar (presence / prefix / suffix / exact)",
+        status = Status::Supported,
+        notes = "Matches Istio's matcher.StringMatcherWithPrefix: '*' presence, '<prefix>*' \
+                 prefix, '*<suffix>' suffix, anything else exact — including a mid-string '*', \
+                 which Istio also treats as a literal exact match.",
+    );
+
+    let deny_prefix = condition_policy(
+        "DENY",
+        "request.headers[user-agent]",
+        json!(["BadBot/*"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_prefix),
+            &header_request("user-agent", "BadBot/1.0")
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+
+    let deny_suffix = condition_policy(
+        "DENY",
+        "request.headers[user-agent]",
+        json!(["*-canary"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_suffix),
+            &header_request("user-agent", "client-canary")
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        }
+    );
+
+    let deny_middle = condition_policy(
+        "DENY",
+        "request.headers[x-env]",
+        json!(["pr*d"]),
+        Value::Null,
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_middle),
+            &header_request("x-env", "prod")
+        ),
+        MeshAuthzDecision::Allow,
+        "a mid-string '*' is a literal exact match, so it must not match 'prod'"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(
+            std::slice::from_ref(&deny_middle),
+            &header_request("x-env", "pr*d")
+        ),
+        MeshAuthzDecision::Deny {
+            policy: "authz-under-test".to_string()
+        },
+        "a mid-string '*' must exact-match the literal text"
+    );
+}
+
+fn header_request(name: &str, value: &str) -> MeshAuthzRequest {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert(
+        format!("request.headers[{name}]"),
+        MeshAuthzAttribute::Scalar(value.to_string()),
+    );
+    MeshAuthzRequest {
+        attributes,
+        protocol: MeshAuthzProtocol::Http,
+        ..MeshAuthzRequest::default()
+    }
 }

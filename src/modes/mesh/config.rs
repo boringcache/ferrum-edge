@@ -697,7 +697,11 @@ pub struct ConditionMatch {
     pub not_values: Vec<String>,
 }
 
-// Istio `AuthorizationPolicy.when` keys whose attributes Ferrum can source.
+// Istio `AuthorizationPolicy.when` keys. Every key documented at
+// https://istio.io/latest/docs/reference/config/security/conditions/ is
+// represented here; keys whose authoritative input Ferrum cannot observe are
+// still admitted but classified so the evaluator can apply explicit
+// fail-closed semantics instead of silently dropping the whole policy.
 const CONDITION_SOURCE_PRINCIPAL: &str = "source.principal";
 const CONDITION_SOURCE_NAMESPACE: &str = "source.namespace";
 const CONDITION_SOURCE_IP: &str = "source.ip";
@@ -705,45 +709,339 @@ const CONDITION_REMOTE_IP: &str = "remote.ip";
 const CONDITION_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
 const CONDITION_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
 const CONDITION_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
+const CONDITION_DESTINATION_IP: &str = "destination.ip";
 const CONDITION_DESTINATION_PORT: &str = "destination.port";
 const CONDITION_CONNECTION_SNI: &str = "connection.sni";
 const CONDITION_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
 const CONDITION_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+/// Istio's experimental Envoy-filter attribute namespace
+/// (`experimental.envoy.filters.<filter.name>[<metadata key>]`). Istio compiles
+/// these into Envoy dynamic-metadata matchers; Ferrum has no Envoy filter
+/// chain, so the attribute is never observable on any path.
+const CONDITION_EXPERIMENTAL_ENVOY_FILTER_PREFIX: &str = "experimental.envoy.filters.";
 
-/// Returns `true` when an AuthorizationPolicy `when[].key` can be materialized
-/// by Ferrum. Unknown keys are rejected at config/translation time because
-/// otherwise a DENY condition on an absent, unsupported attribute silently
-/// fails open.
-pub fn is_supported_mesh_condition_key(key: &str) -> bool {
+/// Upper bound on an operator-supplied `when[].key`. Istio's own keys are far
+/// shorter; the cap keeps a hostile CRD from parking unbounded strings in the
+/// per-proxy condition-key index that the request path walks.
+pub const MAX_MESH_CONDITION_KEY_LEN: usize = 256;
+/// Upper bound on one `when[].values` / `when[].notValues` entry.
+pub const MAX_MESH_CONDITION_VALUE_LEN: usize = 512;
+/// Upper bound on the number of entries in one `when[].values` or
+/// `when[].notValues` list. Each entry is walked linearly per request, so the
+/// cap bounds request-path work as well as memory.
+pub const MAX_MESH_CONDITION_VALUES: usize = 256;
+/// Upper bound on `when[]` entries in a single rule. Conditions are conjunctive
+/// and walked in order on every matching request.
+pub const MAX_MESH_RULE_CONDITIONS: usize = 64;
+
+/// Typed classification of an Istio `AuthorizationPolicy` `when[].key`.
+///
+/// The evaluator needs three separable facts about a key that a bare string
+/// cannot carry: how its values are compared (CIDR containment vs Istio string
+/// match), which protocol contexts can source it, and whether Ferrum can source
+/// it at all. Keeping the classification typed is what lets a documented key
+/// Ferrum cannot observe be *admitted* (so the surrounding policy still
+/// installs and still governs traffic) while its condition is evaluated
+/// fail-closed, rather than the whole resource being rejected — which drops the
+/// policy entirely and is fail-OPEN for a DENY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeshConditionKeyKind {
+    /// `source.principal` — peer SPIFFE identity in Istio's scheme-less form.
+    SourcePrincipal,
+    /// `source.namespace` — namespace segment of the peer SPIFFE identity.
+    SourceNamespace,
+    /// `source.ip` — immediate downstream socket peer. CIDR-valued.
+    SourceIp,
+    /// `remote.ip` — forwarded/original client IP. CIDR-valued.
+    RemoteIp,
+    /// `destination.ip` — authoritative connection destination. CIDR-valued.
+    DestinationIp,
+    /// `destination.port` — numeric-valued (0..=65535).
+    DestinationPort,
+    /// `connection.sni` — frontend TLS/QUIC/DTLS SNI.
+    ConnectionSni,
+    /// `request.auth.principal` — validated-JWT `iss/sub`. HTTP-family only.
+    RequestAuthPrincipal,
+    /// `request.auth.presenter` — validated-JWT `azp`. HTTP-family only.
+    RequestAuthPresenter,
+    /// `request.auth.audiences` — validated-JWT `aud`. HTTP-family only.
+    RequestAuthAudiences,
+    /// `request.auth.claims[<name>]` (and Istio's nested
+    /// `request.auth.claims[<name>][<nested>]`). HTTP-family only.
+    RequestAuthClaim,
+    /// `request.headers[<name>]`. HTTP-family only.
+    RequestHeader,
+    /// `experimental.envoy.filters.<filter>[<key>]`. Documented by Istio but
+    /// backed by Envoy dynamic metadata Ferrum has no equivalent for, so it is
+    /// never sourceable on any protocol.
+    ExperimentalEnvoyFilter,
+}
+
+impl MeshConditionKeyKind {
+    /// `true` when `values` / `notValues` for this key are CIDR blocks rather
+    /// than Istio string-match patterns.
+    #[inline]
+    pub const fn is_ip_valued(self) -> bool {
+        matches!(self, Self::SourceIp | Self::RemoteIp | Self::DestinationIp)
+    }
+}
+
+/// Classify an Istio `when[].key`, or `None` when the key is not a documented
+/// Istio condition key (or is structurally malformed, e.g. an empty bracketed
+/// name). `None` is always a hard config/translation rejection.
+pub fn classify_mesh_condition_key(key: &str) -> Option<MeshConditionKeyKind> {
     match key {
-        CONDITION_SOURCE_PRINCIPAL
-        | CONDITION_SOURCE_NAMESPACE
-        | CONDITION_SOURCE_IP
-        | CONDITION_REMOTE_IP
-        | CONDITION_REQUEST_AUTH_PRINCIPAL
-        | CONDITION_REQUEST_AUTH_PRESENTER
-        | CONDITION_REQUEST_AUTH_AUDIENCES
-        | CONDITION_DESTINATION_PORT
-        | CONDITION_CONNECTION_SNI => true,
+        CONDITION_SOURCE_PRINCIPAL => Some(MeshConditionKeyKind::SourcePrincipal),
+        CONDITION_SOURCE_NAMESPACE => Some(MeshConditionKeyKind::SourceNamespace),
+        CONDITION_SOURCE_IP => Some(MeshConditionKeyKind::SourceIp),
+        CONDITION_REMOTE_IP => Some(MeshConditionKeyKind::RemoteIp),
+        CONDITION_DESTINATION_IP => Some(MeshConditionKeyKind::DestinationIp),
+        CONDITION_DESTINATION_PORT => Some(MeshConditionKeyKind::DestinationPort),
+        CONDITION_CONNECTION_SNI => Some(MeshConditionKeyKind::ConnectionSni),
+        CONDITION_REQUEST_AUTH_PRINCIPAL => Some(MeshConditionKeyKind::RequestAuthPrincipal),
+        CONDITION_REQUEST_AUTH_PRESENTER => Some(MeshConditionKeyKind::RequestAuthPresenter),
+        CONDITION_REQUEST_AUTH_AUDIENCES => Some(MeshConditionKeyKind::RequestAuthAudiences),
         _ => {
-            bracketed_mesh_condition_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some()
-                || bracketed_mesh_condition_name(key, CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)
-                    .is_some()
+            if bracketed_mesh_condition_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some() {
+                Some(MeshConditionKeyKind::RequestHeader)
+            } else if bracketed_mesh_condition_name(key, CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)
+                .is_some()
+            {
+                Some(MeshConditionKeyKind::RequestAuthClaim)
+            } else if experimental_envoy_filter_metadata_key(key).is_some() {
+                Some(MeshConditionKeyKind::ExperimentalEnvoyFilter)
+            } else {
+                None
+            }
         }
     }
 }
 
-pub fn is_mesh_condition_ip_key(key: &str) -> bool {
-    matches!(key, CONDITION_SOURCE_IP | CONDITION_REMOTE_IP)
+/// Split `experimental.envoy.filters.<filter>[<key>]` into its filter name and
+/// metadata key. Returns `None` unless both are present and non-empty — Istio
+/// requires the bracketed metadata key, and a bare `experimental.envoy.filters.x`
+/// would otherwise be admitted as an attribute nothing can ever populate.
+fn experimental_envoy_filter_metadata_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix(CONDITION_EXPERIMENTAL_ENVOY_FILTER_PREFIX)?;
+    let (filter, metadata) = rest.split_once('[')?;
+    let metadata = metadata.strip_suffix(']')?;
+    if filter.is_empty() || metadata.is_empty() || metadata.contains('[') {
+        return None;
+    }
+    Some((filter, metadata))
 }
 
 pub fn mesh_condition_has_values(condition: &ConditionMatch) -> bool {
     !condition.values.is_empty() || !condition.not_values.is_empty()
 }
 
-/// Validate the CIDR/bare-IP syntax used by `source.ip` / `remote.ip` condition
-/// values. Malformed entries would never match at runtime, which is fail-open
-/// for DENY policies.
+/// Which sub-field of a `when[]` entry a diagnostic is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshConditionField {
+    Key,
+    Values,
+    NotValues,
+}
+
+impl MeshConditionField {
+    /// Istio CRD spelling, used verbatim in Kubernetes translation diagnostics.
+    pub const fn istio_name(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Values => "values",
+            Self::NotValues => "notValues",
+        }
+    }
+
+    /// Ferrum `MeshPolicy` (snake_case) spelling, used in file/native config
+    /// validation diagnostics.
+    pub const fn mesh_name(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Values => "values",
+            Self::NotValues => "not_values",
+        }
+    }
+}
+
+/// One field-specific `when[]` diagnostic. Callers own the path prefix
+/// (`rules[].when[i]` vs `MeshPolicy 'x'.rules[i].when[j]`) so the same
+/// validation produces the right wording on every configuration surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshConditionIssue {
+    pub field: MeshConditionField,
+    /// Index within `values` / `notValues` when the issue is value-specific.
+    pub index: Option<usize>,
+    /// Operator-facing reason. Never echoes an operator-supplied value except
+    /// for IP blocks, whose exact text is required to fix the CIDR.
+    pub reason: String,
+}
+
+impl MeshConditionIssue {
+    fn key(reason: impl Into<String>) -> Self {
+        Self {
+            field: MeshConditionField::Key,
+            index: None,
+            reason: reason.into(),
+        }
+    }
+
+    fn value(field: MeshConditionField, index: usize, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            index: Some(index),
+            reason: reason.into(),
+        }
+    }
+
+    /// `values[3]` / `key` — the sub-path a caller appends to its own prefix.
+    pub fn istio_path(&self) -> String {
+        match self.index {
+            Some(index) => format!("{}[{index}]", self.field.istio_name()),
+            None => self.field.istio_name().to_string(),
+        }
+    }
+
+    /// Same as [`Self::istio_path`] with the Ferrum `MeshPolicy` field spelling.
+    pub fn mesh_path(&self) -> String {
+        match self.index {
+            Some(index) => format!("{}[{index}]", self.field.mesh_name()),
+            None => self.field.mesh_name().to_string(),
+        }
+    }
+
+    /// Reason text with the Ferrum `MeshPolicy` field spelling. Reasons are
+    /// authored once in Istio CRD spelling; this is the single normalization
+    /// point so the two surfaces cannot drift.
+    pub fn mesh_reason(&self) -> std::borrow::Cow<'_, str> {
+        if self.reason.contains("notValues") {
+            std::borrow::Cow::Owned(self.reason.replace("notValues", "not_values"))
+        } else {
+            std::borrow::Cow::Borrowed(self.reason.as_str())
+        }
+    }
+}
+
+/// Validate one `when[]` entry: key shape, per-kind value syntax, and the
+/// bounds that keep an externally supplied policy from growing unbounded
+/// request-path work.
+///
+/// Returns every issue found (callers surface all of them) plus the classified
+/// key on success. A malformed key short-circuits value validation because the
+/// value grammar depends on the key kind.
+pub fn validate_mesh_condition(
+    condition: &ConditionMatch,
+) -> Result<MeshConditionKeyKind, Vec<MeshConditionIssue>> {
+    let mut issues = Vec::new();
+
+    if condition.key.is_empty() {
+        return Err(vec![MeshConditionIssue::key("must not be empty")]);
+    }
+    if condition.key.len() > MAX_MESH_CONDITION_KEY_LEN {
+        return Err(vec![MeshConditionIssue::key(format!(
+            "must be at most {MAX_MESH_CONDITION_KEY_LEN} characters"
+        ))]);
+    }
+    if condition
+        .key
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(vec![MeshConditionIssue::key(
+            "must not contain whitespace or control characters",
+        )]);
+    }
+    let Some(kind) = classify_mesh_condition_key(&condition.key) else {
+        // Safe to echo: the checks above already bounded the key to
+        // `MAX_MESH_CONDITION_KEY_LEN` printable, whitespace-free characters,
+        // and operators cannot fix the policy without seeing which key failed.
+        return Err(vec![MeshConditionIssue::key(format!(
+            "'{}' is unsupported (expected one of source.principal, source.namespace, \
+             source.ip, remote.ip, destination.ip, destination.port, connection.sni, \
+             request.auth.principal, request.auth.presenter, request.auth.audiences, \
+             request.auth.claims[<name>], request.headers[<name>], or \
+             experimental.envoy.filters.<filter>[<key>])",
+            condition.key
+        ))]);
+    };
+
+    if !mesh_condition_has_values(condition) {
+        issues.push(MeshConditionIssue::key("must set values or notValues"));
+    }
+
+    for (field, values) in [
+        (MeshConditionField::Values, &condition.values),
+        (MeshConditionField::NotValues, &condition.not_values),
+    ] {
+        if values.len() > MAX_MESH_CONDITION_VALUES {
+            issues.push(MeshConditionIssue {
+                field,
+                index: None,
+                reason: format!("must have at most {MAX_MESH_CONDITION_VALUES} entries"),
+            });
+        }
+        for (index, value) in values.iter().take(MAX_MESH_CONDITION_VALUES).enumerate() {
+            if value.is_empty() {
+                issues.push(MeshConditionIssue::value(field, index, "must not be empty"));
+                continue;
+            }
+            if value.len() > MAX_MESH_CONDITION_VALUE_LEN {
+                issues.push(MeshConditionIssue::value(
+                    field,
+                    index,
+                    format!("must be at most {MAX_MESH_CONDITION_VALUE_LEN} characters"),
+                ));
+                continue;
+            }
+            if value.chars().any(char::is_control) {
+                issues.push(MeshConditionIssue::value(
+                    field,
+                    index,
+                    "must not contain control characters",
+                ));
+                continue;
+            }
+            match kind {
+                MeshConditionKeyKind::SourceIp
+                | MeshConditionKeyKind::RemoteIp
+                | MeshConditionKeyKind::DestinationIp => {
+                    if let Err(reason) = validate_mesh_condition_ip_block(value) {
+                        issues.push(MeshConditionIssue::value(field, index, reason));
+                    }
+                }
+                MeshConditionKeyKind::DestinationPort => {
+                    // Istio validates port conditions with a strict numeric
+                    // parse; a wildcard or non-numeric value can never match a
+                    // port, which is fail-open for a DENY.
+                    if value.parse::<u16>().is_err() {
+                        issues.push(MeshConditionIssue::value(
+                            field,
+                            index,
+                            "must be a numeric port in 0..=65535",
+                        ));
+                    }
+                }
+                _ => {
+                    // Istio string-match values are exact / `*` (presence) /
+                    // `<prefix>*` / `*<suffix>`; anything else — including a
+                    // mid-string `*` — is an exact match on the literal text.
+                    // The evaluator implements that grammar verbatim, so there
+                    // is nothing further to reject here.
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(kind)
+    } else {
+        Err(issues)
+    }
+}
+
+/// Validate the CIDR/bare-IP syntax used by `source.ip` / `remote.ip` /
+/// `destination.ip` condition values. Malformed entries would never match at
+/// runtime, which is fail-open for DENY policies.
 pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
     let trimmed = cidr.trim();
     if trimmed.is_empty() {
@@ -4140,38 +4438,25 @@ fn validate_mesh_config_internal(
                     }
                 }
             }
-            for (j, condition) in rule.when.iter().enumerate() {
-                if !is_supported_mesh_condition_key(&condition.key) {
-                    errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' is unsupported",
-                        policy.name, i, j, condition.key
-                    ));
-                    continue;
-                }
-                if !mesh_condition_has_values(condition) {
-                    errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' must set values or not_values",
-                        policy.name, i, j, condition.key
-                    ));
-                    continue;
-                }
-                if is_mesh_condition_ip_key(&condition.key) {
-                    validate_mesh_condition_ip_values(
-                        policy,
-                        i,
-                        j,
-                        "values",
-                        &condition.values,
-                        &mut errors,
-                    );
-                    validate_mesh_condition_ip_values(
-                        policy,
-                        i,
-                        j,
-                        "not_values",
-                        &condition.not_values,
-                        &mut errors,
-                    );
+            if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
+                errors.push(format!(
+                    "MeshPolicy '{}'.rules[{}].when must have at most \
+                     {MAX_MESH_RULE_CONDITIONS} entries",
+                    policy.name, i
+                ));
+            }
+            for (j, condition) in rule.when.iter().take(MAX_MESH_RULE_CONDITIONS).enumerate() {
+                if let Err(issues) = validate_mesh_condition(condition) {
+                    for issue in issues {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].when[{}].{} {}",
+                            policy.name,
+                            i,
+                            j,
+                            issue.mesh_path(),
+                            issue.mesh_reason()
+                        ));
+                    }
                 }
             }
         }
@@ -5095,24 +5380,6 @@ fn validate_dr_connection_pool(
         errors.push(format!(
             "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
         ));
-    }
-}
-
-fn validate_mesh_condition_ip_values(
-    policy: &MeshPolicy,
-    rule_index: usize,
-    condition_index: usize,
-    field: &str,
-    blocks: &[String],
-    errors: &mut Vec<String>,
-) {
-    for (block_index, block) in blocks.iter().enumerate() {
-        if let Err(error) = validate_mesh_condition_ip_block(block) {
-            errors.push(format!(
-                "MeshPolicy '{}'.rules[{}].when[{}].{}[{}] '{}': {}",
-                policy.name, rule_index, condition_index, field, block_index, block, error
-            ));
-        }
     }
 }
 

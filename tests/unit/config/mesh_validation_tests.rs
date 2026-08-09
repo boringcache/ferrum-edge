@@ -3029,3 +3029,209 @@ fn mesh_config_validate_accepts_failover_priority_only() {
         mesh.validate()
     );
 }
+
+/// Issue #3236: `destination.ip` is a documented Istio condition key and its
+/// values are CIDR blocks, so malformed entries must be rejected on the native
+/// `MeshConfig` surface too — a CIDR that can never match is fail-open for a
+/// DENY.
+#[test]
+fn mesh_policy_validates_destination_ip_when_condition_cidrs() {
+    let mut valid = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    valid.rules[0].when.push(ConditionMatch {
+        key: "destination.ip".into(),
+        values: vec!["10.96.0.0/12".into()],
+        not_values: vec!["10.96.5.5".into()],
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[valid], &[], &[], &[], None).is_empty(),
+        "a well-formed destination.ip condition must validate"
+    );
+
+    let mut malformed = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    malformed.rules[0].when.push(ConditionMatch {
+        key: "destination.ip".into(),
+        values: Vec::new(),
+        not_values: vec!["10.0.0.0/40".into()],
+    });
+    let errors = validate_mesh_config(&[], &[], &[malformed], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].not_values[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected a field-specific destination.ip notValues error, got: {errors:?}"
+    );
+}
+
+/// Istio validates `destination.port` conditions with a strict numeric parse.
+/// A non-numeric or out-of-range value could never match a port, which is
+/// fail-open for a DENY.
+#[test]
+fn mesh_policy_rejects_non_numeric_destination_port_when_condition() {
+    for value in ["http", "70000", "8*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "destination.port".into(),
+            values: vec![value.into()],
+            not_values: Vec::new(),
+        });
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].when[0].values[0]")
+                    && e.contains("must be a numeric port in 0..=65535")
+            }),
+            "expected a numeric-port diagnostic for '{value}', got: {errors:?}"
+        );
+    }
+}
+
+/// `experimental.envoy.filters.<filter>[<key>]` is a documented Istio key, so
+/// the policy must install (dropping it is fail-OPEN for a DENY). A bare
+/// experimental key with no bracketed metadata name is still rejected.
+#[test]
+fn mesh_policy_admits_experimental_envoy_filter_key_and_rejects_the_bare_form() {
+    let mut admitted = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    admitted.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy[db.table]".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[admitted], &[], &[], &[], None).is_empty(),
+        "a documented experimental condition key must not reject the policy"
+    );
+
+    let mut bare = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    bare.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[bare], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("rules[0].when[0].key") && e.contains("unsupported")),
+        "a bare experimental key with no bracketed metadata name must fail closed, got: {errors:?}"
+    );
+}
+
+/// Hostile / unbounded condition input is rejected with field-specific
+/// diagnostics, and an oversized key is never echoed back into logs or
+/// Kubernetes status.
+#[test]
+fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
+    let oversized_key = format!("request.headers[{}]", "a".repeat(400));
+    let cases: Vec<(ConditionMatch, &str, &str)> = vec![
+        (
+            ConditionMatch {
+                key: oversized_key.clone(),
+                values: vec!["x".into()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].key",
+            "at most 256 characters",
+        ),
+        (
+            ConditionMatch {
+                key: "request.headers[x env]".into(),
+                values: vec!["x".into()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].key",
+            "whitespace",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec![String::new()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "must not be empty",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec!["a\u{7}b".into()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "control characters",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec!["a".repeat(600)],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "at most 512 characters",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: (0..300).map(|index| format!("v{index}")).collect(),
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values",
+            "at most 256 entries",
+        ),
+    ];
+
+    for (condition, path, reason) in cases {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(condition.clone());
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains(path) && e.contains(reason)),
+            "expected '{path}' / '{reason}' for key '{}', got: {errors:?}",
+            condition.key
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains(&"a".repeat(400))),
+            "an oversized condition key must never be echoed back, got: {errors:?}"
+        );
+    }
+
+    let mut too_many = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_many.rules[0].when = (0..100)
+        .map(|index| ConditionMatch {
+            key: format!("request.headers[x-{index}]"),
+            values: vec!["v".into()],
+            not_values: Vec::new(),
+        })
+        .collect();
+    let errors = validate_mesh_config(&[], &[], &[too_many], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("rules[0].when must have at most 64 entries")),
+        "an unbounded when[] list must fail closed, got: {errors:?}"
+    );
+}

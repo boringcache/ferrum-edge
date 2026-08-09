@@ -3101,6 +3101,21 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Local (destination) IP of the frontend connection this request arrived
+    /// on, stamped once at accept from the listener's bound address or the
+    /// accepted socket's own local address. For a mesh sidecar this is the
+    /// receiving pod IP; behind a wildcard bind it is the address the kernel
+    /// actually delivered the connection to.
+    ///
+    /// `mesh_authz` uses it for Istio's `destination.ip` condition, preferring
+    /// [`Self::orig_dst`] when the listener captured a pre-NAT original
+    /// destination. It is a transport fact only — never derived from
+    /// `Host`, `X-Forwarded-*`, or any other client-settable input, because a
+    /// client that could choose it would choose which destination-scoped
+    /// AuthorizationPolicy rule judges it. `None` when the accept path could
+    /// not resolve one; `mesh_authz` then fails a `destination.ip` condition
+    /// closed rather than treating the attribute as absent.
+    pub destination_ip: Option<std::net::IpAddr>,
     /// Mesh outbound service port selected by the router after host/path
     /// routing and optional original-destination disambiguation. Used by
     /// `mesh_authz` for Istio `destination.port` when an outbound request has
@@ -3308,6 +3323,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            destination_ip: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             finalized_request_egress_dispatched: false,
@@ -4454,6 +4470,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            destination_ip: self.destination_ip,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             // The finalized-request-egress phase always runs against the REAL

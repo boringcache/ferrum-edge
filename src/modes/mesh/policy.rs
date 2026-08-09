@@ -13,10 +13,40 @@ use std::net::IpAddr;
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
-    ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
-    SourceNegationMatch, normalize_mesh_policy_header_map,
+    ConditionMatch, MeshConditionKeyKind, MeshPolicy, MeshRule, PolicyAction, PrincipalMatch,
+    RequestMatch, SourceNegationMatch, classify_mesh_condition_key,
+    normalize_mesh_policy_header_map,
 };
 use crate::modes::mesh::slice::MeshSlice;
+
+/// Protocol family of the evaluation context.
+///
+/// Istio gives "the attribute is absent" and "this protocol can never carry the
+/// attribute" *different* semantics, so the evaluator must be able to tell them
+/// apart. On a non-HTTP port Istio ignores HTTP-only `when` fields for `DENY`
+/// (the rule still matches on its remaining constraints) and makes an `ALLOW`
+/// rule that uses them never match. On HTTP the same key simply resolves to an
+/// absent attribute and follows the ordinary values / notValues rules.
+///
+/// Defaults to [`MeshAuthzProtocol::L4`] — the restrictive side — so a caller
+/// that forgets to set it cannot accidentally widen HTTP-only conditions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MeshAuthzProtocol {
+    /// HTTP-family request: HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web,
+    /// WebSocket upgrades, and HTTP relayed inside a mesh/HBONE CONNECT.
+    /// Every documented attribute family is sourceable.
+    Http,
+    /// Layer-4 connection or session: raw TCP, TLS passthrough, UDP, and DTLS
+    /// — everything authorized through `Plugin::on_stream_connect`, which has
+    /// no HTTP header map and no validated-JWT context at all. HTTP-family
+    /// attributes (`request.headers[...]`, `request.auth.*`) cannot be sourced.
+    ///
+    /// A mesh / HBONE CONNECT relay is deliberately NOT in this variant: it is
+    /// authorized on the request path, where Ferrum has parsed the CONNECT's
+    /// own header map and can genuinely source `request.headers[...]` from it.
+    #[default]
+    L4,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeshAuthzRequest {
@@ -38,6 +68,20 @@ pub struct MeshAuthzRequest {
     /// `remoteIpBlocks` / `notRemoteIpBlocks` matchers. `None` when no
     /// trusted forwarded address was resolved.
     pub remote_ip: Option<std::net::IpAddr>,
+    /// Authoritative destination IP of the connection this request/session
+    /// arrived on (`destination.ip`) — the pre-NAT original destination when
+    /// the listener captured one, otherwise the connection's local address.
+    /// Never inferred from client-supplied headers or application data.
+    ///
+    /// `None` means the path could not observe one, which is NOT the same as
+    /// "the connection had no destination": a `destination.ip` condition then
+    /// takes the unsourceable branch in [`matches_conditions`] and fails
+    /// closed instead of quietly not matching.
+    pub destination_ip: Option<std::net::IpAddr>,
+    /// Protocol family this request is being authorized on. Decides whether
+    /// HTTP-family `when` attributes are sourceable at all — see
+    /// [`MeshAuthzProtocol`].
+    pub protocol: MeshAuthzProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,13 +617,22 @@ fn matches_conditions(
         if match_.values.is_empty() && match_.not_values.is_empty() {
             return false;
         }
-        let value = request.attributes.get(&match_.key);
-        if value.is_none()
-            && action == PolicyAction::Deny
-            && condition_key_is_http_only(&match_.key)
-        {
-            return true;
+        // Istio semantics for an attribute this path can never observe (an
+        // HTTP-only key on a TCP/UDP port, or a documented key Ferrum has no
+        // input for at all). Both directions are fail-closed:
+        //   * DENY  — the field is ignored, so the rule still matches on its
+        //     remaining constraints. An unevaluable condition must never
+        //     disarm a DENY.
+        //   * ALLOW / AUDIT — the rule can never match. Access is never
+        //     granted (or audited as granted) on an attribute we cannot read.
+        // This is deliberately NOT the same as an attribute that is merely
+        // absent on a path that can source it (e.g. a header the client did
+        // not send), which follows the ordinary values / notValues rules
+        // below exactly as Istio compiles them.
+        if !condition_key_is_sourceable(&match_.key, request) {
+            return action == PolicyAction::Deny;
         }
+        let value = request.attributes.get(&match_.key);
         if !match_.values.is_empty()
             && !value.is_some_and(|value| {
                 match_
@@ -623,38 +676,58 @@ fn condition_scalar_value_matches(key: &str, candidate: &str, value: &str) -> bo
 }
 
 fn condition_key_is_ip(key: &str) -> bool {
-    matches!(key, "source.ip" | "remote.ip")
+    classify_mesh_condition_key(key).is_some_and(MeshConditionKeyKind::is_ip_valued)
 }
 
-fn condition_key_is_http_only(key: &str) -> bool {
-    key.starts_with("request.headers[")
-        || key == "request.auth.principal"
-        || key == "request.auth.presenter"
-        || key == "request.auth.audiences"
-        || key.starts_with("request.auth.claims[")
+/// Can this evaluation context observe the attribute named by `key`?
+///
+/// Separate from "is the attribute present": see the fail-closed branch in
+/// [`matches_conditions`]. An unclassifiable key is treated as unsourceable —
+/// config validation and Kubernetes translation both reject those before they
+/// can reach a live policy, so this is a defence-in-depth default, not a path
+/// operators can reach.
+fn condition_key_is_sourceable(key: &str, request: &MeshAuthzRequest) -> bool {
+    let Some(kind) = classify_mesh_condition_key(key) else {
+        return false;
+    };
+    match kind {
+        // No Envoy filter chain exists in Ferrum, so the dynamic metadata
+        // Istio matches here is never populated on any protocol.
+        MeshConditionKeyKind::ExperimentalEnvoyFilter => false,
+        // Istio marks these "HTTP only".
+        MeshConditionKeyKind::RequestHeader
+        | MeshConditionKeyKind::RequestAuthPrincipal
+        | MeshConditionKeyKind::RequestAuthPresenter
+        | MeshConditionKeyKind::RequestAuthAudiences
+        | MeshConditionKeyKind::RequestAuthClaim => request.protocol == MeshAuthzProtocol::Http,
+        // Every connection has a destination address, so an unresolved one is
+        // missing evidence rather than a genuinely absent attribute (a UDP or
+        // DTLS session with no captured original destination, for example).
+        MeshConditionKeyKind::DestinationIp => request.destination_ip.is_some(),
+        MeshConditionKeyKind::SourcePrincipal
+        | MeshConditionKeyKind::SourceNamespace
+        | MeshConditionKeyKind::SourceIp
+        | MeshConditionKeyKind::RemoteIp
+        | MeshConditionKeyKind::DestinationPort
+        | MeshConditionKeyKind::ConnectionSni => true,
+    }
 }
 
+/// Istio's `when[]` value grammar, matching `matcher.StringMatcherWithPrefix`:
+/// `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is
+/// a suffix match, and everything else — including a mid-string `*` — is an
+/// exact match on the literal text.
 fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return !value.is_empty();
     }
-    if !pattern.contains('*') {
-        return pattern == value;
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
     }
-    let star_count = pattern.bytes().filter(|byte| *byte == b'*').count();
-    if star_count == 1 {
-        if let Some(prefix) = pattern.strip_suffix('*')
-            && !prefix.is_empty()
-        {
-            return value.starts_with(prefix);
-        }
-        if let Some(suffix) = pattern.strip_prefix('*')
-            && !suffix.is_empty()
-        {
-            return value.ends_with(suffix);
-        }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return value.ends_with(suffix);
     }
-    false
+    pattern == value
 }
 
 fn extract_namespace(spiffe_id: &str) -> Option<&str> {
@@ -879,6 +952,20 @@ mod tests {
     fn request(source: &str) -> MeshAuthzRequest {
         MeshAuthzRequest {
             source_principal: Some(SpiffeId::new(source).expect("valid spiffe id")),
+            ..MeshAuthzRequest::default()
+        }
+    }
+
+    /// An HTTP-family evaluation context carrying `attributes`.
+    ///
+    /// `MeshAuthzRequest::default()` is deliberately [`MeshAuthzProtocol::L4`]
+    /// — the fail-closed side, so a caller that forgets to declare the protocol
+    /// cannot widen HTTP-only `when:` conditions onto a raw connection. Tests
+    /// that model an HTTP request therefore have to say so explicitly.
+    fn http_request(attributes: BTreeMap<String, MeshAuthzAttribute>) -> MeshAuthzRequest {
+        MeshAuthzRequest {
+            attributes,
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         }
     }
@@ -2382,13 +2469,7 @@ mod tests {
             "us-east-1".into(),
         );
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_east,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_east)),
             MeshAuthzDecision::Allow
         );
 
@@ -2398,13 +2479,7 @@ mod tests {
             "eu-west-1".into(),
         );
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_west,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_west)),
             MeshAuthzDecision::Allow
         );
 
@@ -2414,13 +2489,7 @@ mod tests {
             "ap-south-1".into(),
         );
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_other,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_other)),
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }
@@ -2453,13 +2522,7 @@ mod tests {
             "BadBot/1.0".into(),
         );
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs)),
             MeshAuthzDecision::Deny {
                 policy: "deny-badbot".to_string()
             }
@@ -2489,34 +2552,25 @@ mod tests {
         let mut empty = BTreeMap::new();
         empty.insert("request.headers[x-env]".to_string(), "".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: empty,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(empty)),
             MeshAuthzDecision::Allow
         );
 
         let mut present = BTreeMap::new();
         present.insert("request.headers[x-env]".to_string(), "prod".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: present,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(present)),
             MeshAuthzDecision::Deny {
                 policy: "deny-present-env".to_string()
             }
         );
     }
 
+    /// Istio's `StringMatcherWithPrefix` only treats a leading or trailing `*`
+    /// as a wildcard; a mid-string `*` is an exact match on the literal text.
+    /// `pr*d` therefore does not match `prod`.
     #[test]
-    fn condition_values_reject_middle_globs() {
+    fn condition_values_treat_middle_globs_as_literal_text() {
         let slice = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "deny-middle-glob".to_string(),
@@ -2538,13 +2592,7 @@ mod tests {
         let mut attrs = BTreeMap::new();
         attrs.insert("request.headers[x-env]".to_string(), "prod".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs)),
             MeshAuthzDecision::Allow
         );
     }
@@ -2572,13 +2620,7 @@ mod tests {
         let mut attrs = BTreeMap::new();
         attrs.insert("source.ip".to_string(), "10.2.3.4".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs)),
             MeshAuthzDecision::Deny {
                 policy: "deny-private-source-ip".to_string()
             }
@@ -2611,13 +2653,7 @@ mod tests {
             MeshAuthzAttribute::StringList(vec!["dev".to_string(), "ops".to_string()]),
         );
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs)),
             MeshAuthzDecision::Allow
         );
     }
@@ -2645,13 +2681,7 @@ mod tests {
         let mut attrs = BTreeMap::new();
         attrs.insert("request.auth.claims[groups]".to_string(), "dev,ops".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs)),
             MeshAuthzDecision::Allow
         );
     }
@@ -2686,13 +2716,7 @@ mod tests {
         let mut attrs_internal = BTreeMap::new();
         attrs_internal.insert("source.namespace".to_string(), "internal".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_internal,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_internal)),
             MeshAuthzDecision::Allow
         );
 
@@ -2700,13 +2724,7 @@ mod tests {
         let mut attrs_external = BTreeMap::new();
         attrs_external.insert("source.namespace".to_string(), "external".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_external,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_external)),
             MeshAuthzDecision::Deny {
                 policy: "deny-internal".to_string()
             }
@@ -2726,7 +2744,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: vec![ConditionMatch {
-                        key: "env".to_string(),
+                        key: "request.headers[x-env]".to_string(),
                         values: vec!["prod".to_string(), "staging".to_string(), "dev".to_string()],
                         not_values: vec!["staging".to_string()],
                     }],
@@ -2742,29 +2760,17 @@ mod tests {
 
         // "prod" is in values, not in not_values: match.
         let mut attrs_prod = BTreeMap::new();
-        attrs_prod.insert("env".to_string(), "prod".into());
+        attrs_prod.insert("request.headers[x-env]".to_string(), "prod".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_prod,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_prod)),
             MeshAuthzDecision::Allow
         );
 
         // "staging" is in both: not_values blocks it.
         let mut attrs_staging = BTreeMap::new();
-        attrs_staging.insert("env".to_string(), "staging".into());
+        attrs_staging.insert("request.headers[x-env]".to_string(), "staging".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_staging,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_staging)),
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }
@@ -2784,7 +2790,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: vec![ConditionMatch {
-                        key: "some.key".to_string(),
+                        key: "request.headers[x-required]".to_string(),
                         values: vec!["required".to_string()],
                         not_values: Vec::new(),
                     }],
@@ -2800,21 +2806,19 @@ mod tests {
 
         // No attributes at all.
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: BTreeMap::new(),
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(BTreeMap::new())),
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }
         );
     }
 
+    /// Istio's non-HTTP-port rule: a DENY rule using an HTTP-only `when:` key
+    /// against L4 traffic ignores that field and still matches. On an HTTP
+    /// request the same key is sourceable, so an absent claim simply fails the
+    /// `values` check and the DENY does not fire.
     #[test]
-    fn deny_condition_missing_http_only_attribute_matches() {
+    fn deny_condition_http_only_attribute_is_ignored_on_l4_but_evaluated_on_http() {
         let slice = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "deny-admin-jwt".to_string(),
@@ -2837,34 +2841,24 @@ mod tests {
             evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
             MeshAuthzDecision::Deny {
                 policy: "deny-admin-jwt".to_string()
-            }
+            },
+            "a raw TCP/UDP connection cannot carry JWT claims, so the DENY must \
+             not be disarmed by the unevaluable condition"
         );
-    }
-
-    #[test]
-    fn deny_condition_missing_presenter_attribute_matches() {
-        let slice = MeshSlice {
-            mesh_policies: vec![MeshPolicy {
-                name: "deny-presenter".to_string(),
-                namespace: "default".to_string(),
-                scope: PolicyScope::MeshWide,
-                rules: vec![MeshRule {
-                    when: vec![ConditionMatch {
-                        key: "request.auth.presenter".to_string(),
-                        values: vec!["client-app".to_string()],
-                        not_values: Vec::new(),
-                    }],
-                    action: PolicyAction::Deny,
-                    ..MeshRule::default()
-                }],
-            }],
-            ..MeshSlice::default()
-        };
 
         assert_eq!(
-            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            evaluate_mesh_authorization(&slice, &http_request(BTreeMap::new())),
+            MeshAuthzDecision::Allow,
+            "on HTTP the claim is sourceable and simply absent, so the values \
+             check fails and the DENY does not fire (Istio semantics)"
+        );
+
+        let mut admin = BTreeMap::new();
+        admin.insert("request.auth.claims[role]".to_string(), "admin".into());
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &http_request(admin)),
             MeshAuthzDecision::Deny {
-                policy: "deny-presenter".to_string()
+                policy: "deny-admin-jwt".to_string()
             }
         );
     }
@@ -2931,13 +2925,7 @@ mod tests {
         // Key absent: not_values has nothing to match, condition passes, the
         // ALLOW rule matches.
         assert_eq!(
-            evaluate_mesh_authorization(
-                &allow_unless_blocked,
-                &MeshAuthzRequest {
-                    attributes: BTreeMap::new(),
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&allow_unless_blocked, &http_request(BTreeMap::new())),
             MeshAuthzDecision::Allow
         );
 
@@ -2947,13 +2935,7 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("request.headers[x-env]".to_string(), "blocked".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &allow_unless_blocked,
-                &MeshAuthzRequest {
-                    attributes: blocked,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&allow_unless_blocked, &http_request(blocked)),
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }
@@ -2973,12 +2955,12 @@ mod tests {
                     to: Vec::new(),
                     when: vec![
                         ConditionMatch {
-                            key: "env".to_string(),
+                            key: "request.headers[x-env]".to_string(),
                             values: vec!["prod".to_string()],
                             not_values: Vec::new(),
                         },
                         ConditionMatch {
-                            key: "region".to_string(),
+                            key: "request.headers[x-region]".to_string(),
                             values: vec!["us-east-1".to_string()],
                             not_values: Vec::new(),
                         },
@@ -2995,31 +2977,19 @@ mod tests {
 
         // Both conditions met.
         let mut attrs_both = BTreeMap::new();
-        attrs_both.insert("env".to_string(), "prod".into());
-        attrs_both.insert("region".to_string(), "us-east-1".into());
+        attrs_both.insert("request.headers[x-env]".to_string(), "prod".into());
+        attrs_both.insert("request.headers[x-region]".to_string(), "us-east-1".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_both,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_both)),
             MeshAuthzDecision::Allow
         );
 
         // Only one condition met.
         let mut attrs_one = BTreeMap::new();
-        attrs_one.insert("env".to_string(), "prod".into());
-        attrs_one.insert("region".to_string(), "eu-west-1".into());
+        attrs_one.insert("request.headers[x-env]".to_string(), "prod".into());
+        attrs_one.insert("request.headers[x-region]".to_string(), "eu-west-1".into());
         assert_eq!(
-            evaluate_mesh_authorization(
-                &slice,
-                &MeshAuthzRequest {
-                    attributes: attrs_one,
-                    ..MeshAuthzRequest::default()
-                }
-            ),
+            evaluate_mesh_authorization(&slice, &http_request(attrs_one)),
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }

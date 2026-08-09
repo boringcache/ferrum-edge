@@ -6001,6 +6001,12 @@ struct RequestConnectionMetadata {
     /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
+    /// Connection-local (destination) IP resolved at accept: the captured
+    /// pre-NAT original destination when there is one, else the listener's
+    /// specific bind address, else the accepted socket's local address.
+    /// Stamped onto `RequestContext::destination_ip` for Istio's
+    /// `destination.ip` condition. Never derived from request headers.
+    destination_ip: Option<std::net::IpAddr>,
     /// Captured inbound app port actually used for accept-time mesh TLS policy
     /// selection, after applying any Sidecar ingress listener-to-app alias.
     /// `None` for direct dials and non-mesh listeners.
@@ -11093,6 +11099,7 @@ async fn handle_connection(
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
+    destination_ip: Option<std::net::IpAddr>,
     mesh_inbound_pre_handshake_app_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
@@ -11148,6 +11155,7 @@ async fn handle_connection(
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
             orig_dst,
+            destination_ip,
             mesh_inbound_pre_handshake_app_port,
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
@@ -16658,6 +16666,8 @@ struct TlsConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// See [`RequestConnectionMetadata::orig_dst`].
     orig_dst: Option<SocketAddr>,
+    /// See [`RequestConnectionMetadata::destination_ip`].
+    destination_ip: Option<std::net::IpAddr>,
     /// See [`RequestConnectionMetadata::mesh_inbound_pre_handshake_app_port`].
     mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
@@ -16951,7 +16961,20 @@ async fn run_accept_loop(
     source_ip_override: SourceIpOverride,
     node_waypoint_expected_pod_uid: Option<[u8; 16]>,
 ) {
-    let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
+    let frontend_bound_addr = listener.local_addr().ok();
+    let frontend_listen_port = frontend_bound_addr.map(|addr| addr.port());
+    // A listener bound to a specific address is the destination IP of every
+    // connection it accepts, so resolve it once here instead of calling
+    // `getsockname()` per connection. A wildcard bind (`0.0.0.0` / `::`) has no
+    // single answer and falls back to the accepted socket's local address.
+    let frontend_bound_ip = frontend_bound_addr
+        .map(|addr| addr.ip())
+        .filter(|ip| !ip.is_unspecified());
+    // `destination.ip` is only consumed by `mesh_authz`, which exists solely in
+    // mesh mode. Outside it, skip the wildcard-bind `getsockname()` fallback
+    // entirely so a non-mesh gateway's accept loop is byte-for-byte unchanged.
+    let resolve_connection_destination_ip = frontend_bound_ip.is_none()
+        && state.env_config.mode == crate::config::env_config::OperatingMode::Mesh;
     // Count consecutive accept() failures to back off a busy-loop. Under fd
     // exhaustion (EMFILE/ENFILE) accept() fails WITHOUT consuming the pending
     // connection or clearing the socket's read-readiness, so the next accept()
@@ -17081,6 +17104,25 @@ async fn run_accept_loop(
                         } else {
                             None
                         };
+                        // Istio `destination.ip` input for this connection. A
+                        // captured original destination wins when present (it
+                        // is the address the client actually dialled, whereas
+                        // the socket's local address would be the interception
+                        // listener); otherwise it is the connection's own local
+                        // address. A specific bind IP answers for every
+                        // connection and was resolved once above the loop, so
+                        // only a wildcard-bound mesh listener pays a
+                        // per-connection `getsockname()` — never a per-request
+                        // cost, and never anything a client sends.
+                        let connection_destination_ip = orig_dst
+                            .map(|addr| addr.ip())
+                            .or(frontend_bound_ip)
+                            .or_else(|| {
+                                resolve_connection_destination_ip
+                                    .then(|| stream.local_addr().ok().map(|addr| addr.ip()))
+                                    .flatten()
+                            })
+                            .map(crate::util::client_identity::canonical_ip);
                         let tls_selection = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
                         // frontend reload slot, MeshInbound peer-auth slot)
@@ -17310,6 +17352,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    destination_ip: connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
                                 };
                                 handle_tls_connection(
@@ -17331,6 +17374,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
                                 )
                                 .await
@@ -17483,6 +17527,7 @@ async fn handle_tls_connection(
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
             orig_dst: tls_connection_metadata.orig_dst,
+            destination_ip: tls_connection_metadata.destination_ip,
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
@@ -24008,6 +24053,7 @@ async fn handle_proxy_request_inner(
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.orig_dst = connection_metadata.orig_dst;
+    ctx.destination_ip = connection_metadata.destination_ip;
     let mesh_inbound_pre_handshake_app_port =
         connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
