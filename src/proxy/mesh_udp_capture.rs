@@ -2839,18 +2839,24 @@ mod live_netns_tests {
         let table = crate::capture::TPROXY_HOST_ROUTE_TABLE;
         let prio = crate::capture::TPROXY_HOST_ROUTE_RULE_PRIORITY;
         let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        // Pin the host peer's locally administered MAC before bringing it up.
+        // Rtnetlink makes the veth usable before its sysfs entry is guaranteed
+        // visible, so reading `/sys/class/net/vethhost/address` immediately
+        // after `ip link add` made hosted setup race kernel sysfs publication.
+        // The scenario still validates the production sysfs lookup after the
+        // setup child reaches its steady-state sleep.
         let script = format!(
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
              command -v ip >/dev/null 2>&1 || exit 97; \
              ip link set lo up 2>/dev/null || true; \
              ip link add pod0 type veth peer name vethhost || exit 98; \
+             ip link set vethhost address 02:00:00:00:00:01 || exit 98; \
              ip link set pod0 up || exit 98; \
              ip link set vethhost up || exit 98; \
              ip address add 10.0.0.2/32 dev pod0 || exit 98; \
              printf '1\n' > /proc/sys/net/ipv4/conf/vethhost/accept_local || exit 98; \
-             host_mac=$(cat /sys/class/net/vethhost/address) || exit 98; \
-             ip neigh add {REMOTE_DST} lladdr \"$host_mac\" dev pod0 nud permanent || exit 98; \
+             ip neigh add {REMOTE_DST} lladdr 02:00:00:00:00:01 dev pod0 nud permanent || exit 98; \
              ip route add {REMOTE_DST}/32 dev pod0 src 10.0.0.2 || exit 98; \
              ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 98; \
              ip route add local 0.0.0.0/0 dev lo table {table} || exit 98; \
