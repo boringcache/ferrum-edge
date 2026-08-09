@@ -1210,6 +1210,51 @@ async fn a_handshake_that_cannot_be_persisted_never_reaps_the_previous_generatio
 }
 
 #[tokio::test]
+async fn an_incomplete_retraction_cannot_release_startup_to_the_incoming_producer() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    write_marker(&ready_dir, POD_A_UID);
+    // Block persistence exactly as a permissions/I/O failure would. Recovery
+    // must retain both the marker and the startup boundary.
+    let blocker = registry.path().join(".udp-ack-required");
+    std::fs::write(&blocker, b"").expect("blocking file");
+    let mut recovery = HostUdpStaleGenerationRecovery::new(Some(ready_dir.clone()));
+
+    assert!(!recovery.poll_once(RECOVERY_WAIT).await);
+    assert!(ready_dir.join(POD_A_UID).is_file());
+    assert!(
+        !recovery.retraction_complete(),
+        "the incoming producer must not start while recovery can still retract its readiness"
+    );
+
+    std::fs::remove_file(&blocker).expect("remove blocker");
+    assert!(!recovery.poll_once(RECOVERY_WAIT).await);
+    assert!(
+        recovery.retraction_complete(),
+        "once discovery is complete and every close request is durably persisted, the incoming \
+         producer may start while acknowledgement continues in the background"
+    );
+    assert!(!ready_dir.join(POD_A_UID).is_file());
+}
+
+#[tokio::test]
+async fn an_unreadable_marker_directory_keeps_the_retraction_boundary_closed() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    // A plain file makes read_dir fail. Treating that as an empty directory
+    // would authorize teardown without knowing whether a gate is still open.
+    std::fs::write(&ready_dir, b"").expect("blocking file");
+    let mut recovery = HostUdpStaleGenerationRecovery::new(Some(ready_dir.clone()));
+
+    assert!(!recovery.poll_once(RECOVERY_WAIT).await);
+    assert!(!recovery.retraction_complete());
+
+    std::fs::remove_file(&ready_dir).expect("remove blocker");
+    assert!(recovery.poll_once(RECOVERY_WAIT).await);
+    assert!(recovery.retraction_complete());
+}
+
+#[tokio::test]
 async fn a_failed_stale_state_reap_is_retried_rather_than_logged_once() {
     // No durable obligation: this is about the reap itself. A failure that was
     // only logged would leave a socketless capture path black-holing the node

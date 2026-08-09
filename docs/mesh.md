@@ -3023,8 +3023,9 @@ while the path claimed dual-stack support. IPv6 resolution is fail-closed in the
 same way the rest of the path is: only `RTF_UP` routes with a non-zero prefix
 participate (never the `::/0` default, which would attribute a pod to the node
 uplink), the longest matching prefix wins, two different devices tying at that
-prefix resolve to nothing rather than to a guess, and an oversized or malformed
-table refuses instead of answering from what it could read.
+prefix resolve to nothing rather than to a guess, an oversized table refuses
+instead of answering from a truncated view, and malformed rows are ignored
+unless a valid, unambiguous match remains.
 
 **Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
 guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`

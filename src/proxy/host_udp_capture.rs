@@ -634,6 +634,7 @@ pub struct HostUdpStaleGenerationRecovery {
     scan_truncated: bool,
     announced: bool,
     last_warned: Option<Instant>,
+    last_reap_warned: Option<Instant>,
 }
 
 impl HostUdpStaleGenerationRecovery {
@@ -646,12 +647,25 @@ impl HostUdpStaleGenerationRecovery {
             scan_truncated: false,
             announced: false,
             last_warned: None,
+            last_reap_warned: None,
         }
     }
 
     /// Pods whose gate is not yet provably closed.
     pub fn outstanding(&self) -> usize {
         self.pending_request.len() + self.awaiting.len()
+    }
+
+    /// Whether the previous generation's marker set was read completely and
+    /// every discovered close request was durably persisted and retracted.
+    ///
+    /// Once this is true an incoming producer may start: recovery no longer
+    /// scans `.udp-ready`, so it cannot mistake that producer's newly published
+    /// markers for predecessor state. Acknowledgements and stale-rule teardown
+    /// may still be pending and can continue in the background.
+    pub fn retraction_complete(&self) -> bool {
+        self.ready_dir.is_none()
+            || (self.discovery_complete && self.pending_request.is_empty())
     }
 
     /// Run one bounded pass. `true` means every durable obligation the previous
@@ -814,6 +828,18 @@ impl HostUdpStaleGenerationRecovery {
              leak) and recovery is retried"
         );
     }
+
+    fn should_warn_reap_failure(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_reap_warned
+            .is_some_and(|last| now.duration_since(last) < STALE_RECOVERY_WARN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_reap_warned = Some(now);
+        true
+    }
 }
 
 /// Whether a producer OTHER than this recovery has published readiness for the
@@ -840,7 +866,11 @@ fn read_handshake_marker_uids(dir: &Path) -> Result<(Vec<String>, bool), std::io
     let mut uids: Vec<String> = Vec::new();
     let mut truncated = false;
     let mut scanned = 0usize;
-    for entry in entries.flatten() {
+    for entry in entries {
+        // A per-entry read error may conceal a Ferrum marker. Ignoring it would
+        // let the scan declare itself complete and authorize stale-rule removal
+        // while the corresponding BPF gate may still be open.
+        let entry = entry?;
         // EVERY entry counts, not just the accepted ones: the directory is
         // written by another process, so the work a scan can be made to do has
         // to be bounded by what is present, not by what turns out to be valid.
@@ -855,7 +885,9 @@ fn read_handshake_marker_uids(dir: &Path) -> Result<(Vec<String>, bool), std::io
         if super::netns_udp_capture::udp_ready_marker_path(dir, &pod_uid).is_none() {
             continue;
         }
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        // The same fail-closed rule applies to the type lookup: a stat failure
+        // cannot be treated as proof that the entry is not a marker.
+        if !entry.file_type()?.is_file() {
             continue;
         }
         uids.push(pod_uid);
@@ -1016,11 +1048,13 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             return false;
         }
         if let Err(error) = self.backend.teardown_all() {
-            warn!(
-                %error,
-                "Host UDP capture: could not reap the previous generation's host capture state; \
-                 retaining it and retrying before anything is applied"
-            );
+            if self.recovery.should_warn_reap_failure() {
+                warn!(
+                    %error,
+                    "Host UDP capture: could not reap the previous generation's host capture \
+                     state; retaining it and retrying before anything is applied"
+                );
+            }
             return false;
         }
         self.startup_recovery_pending = false;
@@ -1851,8 +1885,26 @@ pub async fn recover_and_reap_stale_host_udp_state(
     mut shutdown: watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut recovery = HostUdpStaleGenerationRecovery::new(ready_dir);
-    if recover_and_reap_once(&mut recovery).await {
-        return None;
+    loop {
+        if recover_and_reap_once(&mut recovery).await {
+            return None;
+        }
+        if recovery.retraction_complete() {
+            break;
+        }
+        // Do not start the incoming per-pod producer while discovery can still
+        // rescan or a failed close request still owns an old readiness marker.
+        // Either state would let the recovery retract the incoming producer's
+        // marker and turn the shared durable handshake into a race. Holding this
+        // startup boundary is fail-closed; predecessor rules remain installed.
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
+            _ = tokio::time::sleep(retry_interval) => {}
+        }
     }
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(retry_interval);
@@ -1861,8 +1913,8 @@ pub async fn recover_and_reap_stale_host_udp_state(
         ticker.tick().await;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         return;
                     }
                 }
@@ -1887,10 +1939,13 @@ async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) ->
             // `PREROUTING` jump into a socketless chain black-holes every
             // enrolled pod's UDP on this node until something removes it, and
             // after this point nothing else would.
-            warn!(
-                %error,
-                "Host UDP capture: stale host-namespace UDP state reap did not complete; retrying"
-            );
+            if recovery.should_warn_reap_failure() {
+                warn!(
+                    %error,
+                    "Host UDP capture: stale host-namespace UDP state reap did not complete; \
+                     retrying"
+                );
+            }
             false
         }
     }
