@@ -766,6 +766,23 @@ fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
 }
 
 #[test]
+fn stock_observability_versions_are_bounded_and_free_of_control_characters() {
+    let hostile_version = format!("{}\nWARN forged-log-line\r", "v".repeat(4096));
+    let mut accumulator = StockXdsAccumulator::default();
+    accumulator
+        .apply_sotw(CDS_TYPE_URL, &[], &hostile_version)
+        .expect("opaque version applies");
+
+    let version = accumulator
+        .per_type_versions()
+        .remove("cds")
+        .expect("CDS version");
+    assert!(version.chars().count() <= 200, "{version}");
+    assert!(!version.chars().any(char::is_control), "{version}");
+    assert!(version.ends_with("(truncated)"), "{version}");
+}
+
+#[test]
 fn stock_unhealthy_and_draining_endpoints_are_excluded() {
     let mut accumulator = StockXdsAccumulator::default();
     accumulator

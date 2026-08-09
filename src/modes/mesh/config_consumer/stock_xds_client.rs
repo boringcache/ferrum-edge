@@ -862,8 +862,8 @@ async fn handle_stock_response(
     debug!(
         node_id = %config.node_id,
         type_url = %type_url,
-        version = %response.version_info,
-        nonce = %response.nonce,
+        version = %diagnostic_value(&response.version_info),
+        nonce = %diagnostic_value(&response.nonce),
         resources = response.resources.len(),
         "Received stock xDS ADS response"
     );

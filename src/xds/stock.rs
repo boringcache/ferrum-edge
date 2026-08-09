@@ -638,7 +638,11 @@ impl StockXdsAccumulator {
             }
         }
 
-        self.versions.insert(label, version.to_string());
+        // Versions are opaque protocol tokens. The stream state retains the
+        // raw value needed for ACK/NACK, but the accumulator uses versions only
+        // for diagnostics and slice observability, so never retain an
+        // unbounded/control-character-bearing control-plane value here.
+        self.versions.insert(label, diagnostic_value(version));
         self.refusals.insert(label, refusals);
         Ok(())
     }
