@@ -175,8 +175,24 @@ run_blackbox() {
     return 1
   fi
 
+  local route_accepted=""
+  local route_programmed=""
+  for _ in $(seq 1 45); do
+    route_accepted="$(condition_status httproute ferrum-blackbox-listenerset Accepted)"
+    route_programmed="$(condition_status httproute ferrum-blackbox-listenerset Programmed)"
+    if [ "$route_accepted" = "True" ] && [ "$route_programmed" = "True" ]; then
+      break
+    fi
+    sleep 2
+  done
+  if [ "$route_accepted" != "True" ] || [ "$route_programmed" != "True" ]; then
+    echo "ListenerSet HTTPRoute Accepted='${route_accepted}' Programmed='${route_programmed}'" >&2
+    return 1
+  fi
+
   wait_for_status "200" "attach" | tee -a "$report"
   echo "ListenerSet HTTPRoute parentRef served ${LISTENERSET_HOST}${LISTENERSET_PATH}" >> "$report"
+  echo "ListenerSet HTTPRoute parent status Accepted=True/Programmed=True" >> "$report"
   echo "Gateway attachedListenerSets=1" >> "$report"
 
   local denied=""
