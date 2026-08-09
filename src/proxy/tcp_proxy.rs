@@ -2026,6 +2026,9 @@ async fn run_tcp_accept_loop(
                             namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
+                            // Carry the connect-time execution-trigger outcomes so
+                            // a skipped instance stays skipped at disconnect.
+                            plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
                             proxy_name,
                             client_ip,
                             consumer_username,

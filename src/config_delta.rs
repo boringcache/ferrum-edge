@@ -580,6 +580,7 @@ mod tests {
             proxy_id: proxy_id.map(str::to_string),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: updated_at,
             updated_at,

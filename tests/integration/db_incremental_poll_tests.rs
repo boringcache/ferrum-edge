@@ -76,6 +76,7 @@ fn test_plugin_config(id: &str) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

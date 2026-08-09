@@ -74,6 +74,7 @@ fn mesh_route_plugin_config(config: serde_json::Value) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
