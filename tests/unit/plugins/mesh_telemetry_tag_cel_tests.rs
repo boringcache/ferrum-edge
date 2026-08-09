@@ -355,3 +355,275 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
         "{deleted_line}"
     );
 }
+
+#[tokio::test]
+async fn mesh_series_budget_caps_cel_cardinality_and_keeps_admitted_keys_updating() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set_expr", "cel": "request.host"}
+            }]
+        }
+    }))
+    .expect("cel host override");
+
+    let registry = MetricsRegistry::new();
+    registry.set_mesh_series_budget_per_family_for_test(4);
+
+    async fn emit_host(plugin: &WorkloadMetrics, registry: &MetricsRegistry, host: &str) {
+        let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+        ctx.request_authority = Some(host.into());
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        let summary = TransactionSummary {
+            http_method: "GET".into(),
+            response_status_code: 200,
+            metadata: mesh_identity_metadata(ctx.metadata),
+            ..TransactionSummary::default()
+        };
+        registry.record(&summary);
+    }
+
+    for i in 0..12 {
+        emit_host(&workload_metrics, &registry, &format!("host-{i}.example")).await;
+    }
+
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_COUNT"),
+        Some(4),
+        "live series must stop at the exact budget"
+    );
+    assert_eq!(registry.mesh_request_counter.len(), 4);
+    let overflow = registry
+        .mesh_series_overflow_for_test("REQUEST_COUNT")
+        .expect("request_count overflow");
+    assert!(overflow >= 8, "expected dropped admissions, got {overflow}");
+
+    // Re-record an already-admitted host; the series must still update.
+    let admitted_host = "host-0.example";
+    let before = registry
+        .mesh_request_counter
+        .iter()
+        .find(|entry| entry.key().source_workload.as_ref() == admitted_host)
+        .map(|entry| entry.value().value.load(std::sync::atomic::Ordering::Relaxed))
+        .expect("admitted host series");
+    emit_host(&workload_metrics, &registry, admitted_host).await;
+    let after = registry
+        .mesh_request_counter
+        .iter()
+        .find(|entry| entry.key().source_workload.as_ref() == admitted_host)
+        .map(|entry| entry.value().value.load(std::sync::atomic::Ordering::Relaxed))
+        .expect("admitted host series after update");
+    assert_eq!(after, before + 1);
+    assert_eq!(registry.mesh_request_counter.len(), 4);
+
+    let rendered = registry.render_uncached();
+    let overflow_lines: Vec<_> = rendered
+        .lines()
+        .filter(|line| line.starts_with("ferrum_mesh_metric_series_overflow_total{"))
+        .collect();
+    assert!(
+        !overflow_lines.is_empty(),
+        "overflow observability must render: {rendered}"
+    );
+    for line in &overflow_lines {
+        assert!(
+            line.contains(r#"family="request_count""#),
+            "overflow labels must be fixed family names only: {line}"
+        );
+        assert!(
+            !line.contains("host-") && !line.contains("example"),
+            "overflow must not echo CEL/host values: {line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set_expr", "cel": "request.host"}
+            }]
+        }
+    }))
+    .expect("cel host override");
+    let registry = MetricsRegistry::new();
+    registry.set_mesh_series_budget_per_family_for_test(2);
+
+    for host in ["a.example", "b.example"] {
+        let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+        ctx.request_authority = Some(host.into());
+        let mut headers = HashMap::new();
+        workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+        registry.record(&TransactionSummary {
+            http_method: "GET".into(),
+            response_status_code: 200,
+            metadata: mesh_identity_metadata(ctx.metadata),
+            ..TransactionSummary::default()
+        });
+    }
+    assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(2));
+
+    // Force every series stale and reclaim the live budget.
+    let evicted = registry.evict_stale(0);
+    assert!(evicted >= 2);
+    assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(0));
+    assert!(registry.mesh_request_counter.is_empty());
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    ctx.request_authority = Some("c.example".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    registry.record(&TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    });
+    assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(1));
+    assert_eq!(registry.mesh_request_counter.len(), 1);
+}
+
+#[tokio::test]
+async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
+    let no_cel = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "labels": {"app": "frontend"}
+    }))
+    .expect("static config");
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "POST".into(), "/pay".into());
+    ctx.request_authority = Some("checkout.default.svc".into());
+    ctx.mesh_outbound_destination_authz_port = Some(8080);
+    ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
+    let mut headers = HashMap::new();
+    no_cel.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        !ctx.metadata.contains_key("mesh.request.host"),
+        "no-CEL config must not stamp request.host"
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.request.method"),
+        "no-CEL config must not stamp request.method"
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.destination.port"),
+        "no-CEL config must not stamp destination.port"
+    );
+
+    let host_only = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set_expr", "cel": "request.host"}
+            }]
+        }
+    }))
+    .expect("host cel");
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "POST".into(), "/pay".into());
+    ctx.request_authority = Some("checkout.default.svc".into());
+    ctx.mesh_outbound_destination_authz_port = Some(8080);
+    ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
+    // Plant stale values that must be cleared when not required.
+    ctx.metadata
+        .insert("mesh.request.method".into(), "STALE".into());
+    ctx.metadata
+        .insert("mesh.destination.port".into(), "9999".into());
+    let mut headers = HashMap::new();
+    host_only.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata.get("mesh.request.host").map(String::as_str),
+        Some("checkout.default.svc")
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.request.method"),
+        "host-only CEL must clear unused method stamp"
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.destination.port"),
+        "host-only CEL must clear unused destination.port stamp"
+    );
+
+    let port_only = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "destination_service",
+                "operation": {"type": "set_expr", "cel": "string(destination.port)"}
+            }]
+        }
+    }))
+    .expect("port cel");
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    ctx.request_authority = Some("reviews.default.svc".into());
+    ctx.mesh_outbound_destination_authz_port = Some(9080);
+    ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
+    ctx.metadata
+        .insert("mesh.request.host".into(), "stale-host".into());
+    let mut headers = HashMap::new();
+    port_only.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.destination.port")
+            .map(String::as_str),
+        Some("9080")
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.request.host"),
+        "port-only CEL must not stamp request.host"
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh.request.method"),
+        "port-only CEL must not stamp request.method"
+    );
+
+    // Stream path: destination.port is stamped only when needed; HTTP-only
+    // keys stay cleared even if previously present.
+    let mut stream = ferrum_edge::plugins::StreamConnectionContext::new(
+        "10.0.0.2".into(),
+        "10.0.0.3".into(),
+        "proxy-1".into(),
+        Some("reviews.catalog.svc.cluster.local".into()),
+        0,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    );
+    stream.destination_port = Some(15001);
+    stream.metadata = Some(HashMap::from([
+        ("mesh.request.host".into(), "leak".into()),
+        ("mesh.request.method".into(), "GET".into()),
+        ("mesh.destination.port".into(), "1".into()),
+    ]));
+    no_cel.on_stream_connect(&mut stream).await;
+    let meta = stream.metadata.as_ref().expect("metadata");
+    assert!(!meta.contains_key("mesh.request.host"));
+    assert!(!meta.contains_key("mesh.request.method"));
+    assert!(
+        !meta.contains_key("mesh.destination.port"),
+        "static stream config must not stamp destination.port"
+    );
+
+    let mut stream = ferrum_edge::plugins::StreamConnectionContext::new(
+        "10.0.0.2".into(),
+        "10.0.0.3".into(),
+        "proxy-1".into(),
+        Some("reviews.catalog.svc.cluster.local".into()),
+        0,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    );
+    stream.destination_port = Some(15001);
+    port_only.on_stream_connect(&mut stream).await;
+    let meta = stream.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        meta.get("mesh.destination.port").map(String::as_str),
+        Some("15001")
+    );
+    assert!(!meta.contains_key("mesh.request.host"));
+    assert!(!meta.contains_key("mesh.request.method"));
+}

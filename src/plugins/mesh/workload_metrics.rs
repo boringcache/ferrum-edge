@@ -16,7 +16,8 @@ use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::metric_tag_cel::{
-    MetricTagCelExpr, parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
+    MetricTagCelExpr, MetricTagCelStampNeeds, parse_metric_tag_cel_expression,
+    validate_metric_tag_cel_for_families,
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
@@ -171,6 +172,8 @@ pub struct WorkloadMetrics {
     custom_header_tags: HashMap<String, String>,
     /// Per-family compact tag-override plans stamped into request metadata.
     tag_override_plans: Vec<(MeshMetricFamily, String)>,
+    /// Immutable CEL attribute stamp requirements derived at construction/reload.
+    cel_stamp_needs: MetricTagCelStampNeeds,
     disabled_metrics_marker: Option<String>,
     custom_trace_attributes_marker: Option<String>,
     /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
@@ -314,6 +317,7 @@ impl WorkloadMetrics {
         resolve_custom_env_tags_with(&mut custom_tags, &custom_env_tags, env_lookup)?;
         let ParsedMetricConfig {
             tag_override_plans,
+            cel_stamp_needs,
             disabled_metrics_marker,
         } = parse_metric_config(config.get("metrics"))?;
         let tracing_providers = parse_tracing_providers(config)?;
@@ -351,6 +355,7 @@ impl WorkloadMetrics {
             custom_tags,
             custom_header_tags,
             tag_override_plans,
+            cel_stamp_needs,
             disabled_metrics_marker,
             custom_trace_attributes_marker,
             tracing_providers,
@@ -416,32 +421,47 @@ impl WorkloadMetrics {
             "mesh.request_protocol".to_string(),
             request_protocol(ctx, headers).to_string(),
         );
-        if let Some(authority) = ctx.request_authority.as_ref() {
-            if authority.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-                ctx.metadata
-                    .insert(MESH_REQUEST_HOST_METADATA.to_string(), authority.clone());
-            } else {
-                ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
-            }
-        } else if let Some(host) = header_value(headers, "host") {
-            if host.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-                ctx.metadata
-                    .insert(MESH_REQUEST_HOST_METADATA.to_string(), host.to_string());
+        // Stamp only attributes required by an active CEL expression. Always
+        // clear unused HTTP-only keys so a reused metadata bag cannot leak
+        // stale host/method values into a later metric emission.
+        if self.cel_stamp_needs.request_host {
+            if let Some(authority) = ctx.request_authority.as_ref() {
+                if authority.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+                    ctx.metadata
+                        .insert(MESH_REQUEST_HOST_METADATA.to_string(), authority.clone());
+                } else {
+                    ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+                }
+            } else if let Some(host) = header_value(headers, "host") {
+                if host.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+                    ctx.metadata
+                        .insert(MESH_REQUEST_HOST_METADATA.to_string(), host.to_string());
+                } else {
+                    ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+                }
             } else {
                 ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
             }
         } else {
             ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
         }
-        if !ctx.method.is_empty() && ctx.method.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-            ctx.metadata
-                .insert(MESH_REQUEST_METHOD_METADATA.to_string(), ctx.method.clone());
+        if self.cel_stamp_needs.request_method {
+            if !ctx.method.is_empty() && ctx.method.len() <= MAX_METRIC_TAG_VALUE_BYTES {
+                ctx.metadata
+                    .insert(MESH_REQUEST_METHOD_METADATA.to_string(), ctx.method.clone());
+            } else {
+                ctx.metadata.remove(MESH_REQUEST_METHOD_METADATA);
+            }
         } else {
             ctx.metadata.remove(MESH_REQUEST_METHOD_METADATA);
         }
-        if let Some(port) = mesh_metric_destination_port(ctx) {
-            ctx.metadata
-                .insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+        if self.cel_stamp_needs.destination_port {
+            if let Some(port) = mesh_metric_destination_port(ctx) {
+                ctx.metadata
+                    .insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+            } else {
+                ctx.metadata.remove(MESH_DESTINATION_PORT_METADATA);
+            }
         } else {
             ctx.metadata.remove(MESH_DESTINATION_PORT_METADATA);
         }
@@ -1075,8 +1095,12 @@ impl Plugin for WorkloadMetrics {
         // metadata bag cannot leak request.host/method into TCP metrics.
         metadata.remove(MESH_REQUEST_HOST_METADATA);
         metadata.remove(MESH_REQUEST_METHOD_METADATA);
-        if let Some(port) = ctx.destination_port.filter(|port| *port != 0) {
-            metadata.insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+        if self.cel_stamp_needs.destination_port {
+            if let Some(port) = ctx.destination_port.filter(|port| *port != 0) {
+                metadata.insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+            } else {
+                metadata.remove(MESH_DESTINATION_PORT_METADATA);
+            }
         } else {
             metadata.remove(MESH_DESTINATION_PORT_METADATA);
         }
@@ -1206,6 +1230,7 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
 
 struct ParsedMetricConfig {
     tag_override_plans: Vec<(MeshMetricFamily, String)>,
+    cel_stamp_needs: MetricTagCelStampNeeds,
     disabled_metrics_marker: Option<String>,
 }
 
@@ -1376,6 +1401,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     let Some(metrics) = value else {
         return Ok(ParsedMetricConfig {
             tag_override_plans: Vec::new(),
+            cel_stamp_needs: MetricTagCelStampNeeds::default(),
             disabled_metrics_marker: None,
         });
     };
@@ -1410,6 +1436,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     }
 
     let mut plans: HashMap<MeshMetricFamily, String> = HashMap::new();
+    let mut cel_stamp_needs = MetricTagCelStampNeeds::default();
     if let Some(value) = object.get("tag_overrides") {
         let overrides = value.as_array().ok_or_else(|| {
             "workload_metrics: metrics.tag_overrides must be an array".to_string()
@@ -1466,6 +1493,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                             )
                         },
                     )?;
+                    cel_stamp_needs.merge(expression.stamp_needs());
                     let mut body = String::new();
                     encode_metric_tag_cel_expr(expression, &mut body);
                     format!(
@@ -1514,6 +1542,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
         .collect();
     Ok(ParsedMetricConfig {
         tag_override_plans,
+        cel_stamp_needs,
         disabled_metrics_marker,
     })
 }

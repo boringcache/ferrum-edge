@@ -180,6 +180,63 @@ impl MetricTagCelAttr {
     }
 }
 
+/// Immutable hot-path stamp requirements derived from compiled CEL at
+/// construction / reload. Request/stream hooks read these flags only — they
+/// never re-parse expressions or take locks to decide which attributes to
+/// materialize into metadata.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MetricTagCelStampNeeds {
+    pub request_host: bool,
+    pub request_method: bool,
+    pub destination_port: bool,
+}
+
+impl MetricTagCelStampNeeds {
+    pub fn merge(&mut self, other: Self) {
+        self.request_host |= other.request_host;
+        self.request_method |= other.request_method;
+        self.destination_port |= other.destination_port;
+    }
+}
+
+impl MetricTagCelExpr {
+    /// Attributes that must be stamped into request/stream metadata before
+    /// metric emission for this expression to observe them.
+    pub fn stamp_needs(&self) -> MetricTagCelStampNeeds {
+        let mut needs = MetricTagCelStampNeeds::default();
+        self.accumulate_stamp_needs(&mut needs);
+        needs
+    }
+
+    fn accumulate_stamp_needs(&self, needs: &mut MetricTagCelStampNeeds) {
+        match self {
+            Self::Literal { .. } => {}
+            Self::Attribute { name } => accumulate_attr_stamp_need(*name, needs),
+            Self::StringOfInt { attribute } => accumulate_attr_stamp_need(*attribute, needs),
+            Self::HasThenElse {
+                attribute,
+                then_expr,
+                else_expr,
+            } => {
+                accumulate_attr_stamp_need(*attribute, needs);
+                then_expr.accumulate_stamp_needs(needs);
+                else_expr.accumulate_stamp_needs(needs);
+            }
+        }
+    }
+}
+
+fn accumulate_attr_stamp_need(attr: MetricTagCelAttr, needs: &mut MetricTagCelStampNeeds) {
+    match attr {
+        MetricTagCelAttr::RequestHost => needs.request_host = true,
+        MetricTagCelAttr::RequestMethod => needs.request_method = true,
+        MetricTagCelAttr::DestinationPort => needs.destination_port = true,
+        // Peer / protocol / flags / security_policy / response.code come from
+        // the finalized mesh key or summary at emission — not stamped metadata.
+        _ => {}
+    }
+}
+
 /// Evaluation inputs available when mesh metric labels are finalized.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricTagCelContext<'a> {

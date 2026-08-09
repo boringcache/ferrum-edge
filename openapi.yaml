@@ -17376,11 +17376,16 @@ components:
                     type: string
                     description: |
                       Metric family targeted by this override. Supported values
-                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
-                      metric names, and `ALL_METRICS`; omitted means all metrics.
-                      Recognized Istio standard families Ferrum does not emit
-                      are accepted and ignored with a bounded construction-time
-                      warning; unknown families remain configuration errors.
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
+                      `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`,
+                      `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
+                      `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
+                      `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*`
+                      metric names, and `ALL_METRICS`; omitted means all
+                      metrics. Recognized Istio standard families Ferrum does
+                      not emit are accepted and ignored with a bounded
+                      construction-time warning; unknown families remain
+                      configuration errors.
                   name:
                     type: string
                     description: |
@@ -17400,9 +17405,16 @@ components:
                       precompiled plan only. Supported CEL attributes are the
                       finalized mesh metric-key peer labels plus
                       `request.method`, `request.host`, `response.code`, and
-                      `destination.port` stamped before emission. HTTP-only
-                      attributes are rejected for TCP / `ALL_METRICS` selectors.
-                      Diagnostics never echo expression text.
+                      `destination.port` stamped before emission when an active
+                      expression requires them. Exact CEL label values are
+                      admitted under a finite per-family live-series budget
+                      (default 10_000 distinct keys); further distinct keys are
+                      dropped and counted on
+                      `ferrum_mesh_metric_series_overflow_total{family}` with
+                      fixed family labels only. Stale TTL eviction releases
+                      capacity. HTTP-only attributes are rejected for TCP /
+                      `ALL_METRICS` selectors. Diagnostics never echo
+                      expression text.
                     properties:
                       type:
                         type: string
@@ -17442,7 +17454,11 @@ components:
                 type: string
               description: |
                 Names of metrics suppressed by this workload. Supported values
-                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
+                `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`,
+                `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
+                `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
+                `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*` metric
                 names, and `ALL_METRICS`. Recognized Istio standard families
                 Ferrum does not emit are accepted and ignored with a bounded
                 construction-time warning; unknown families remain errors.

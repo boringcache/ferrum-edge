@@ -244,6 +244,28 @@ impl MeshMetricFamily {
                 | Self::TcpReceivedBytes
         )
     }
+
+    /// Stable index into per-family live-series budget arrays. Must match
+    /// [`Self::ALL`] order.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::RequestCount => 0,
+            Self::RequestDuration => 1,
+            Self::RequestSize => 2,
+            Self::ResponseSize => 3,
+            Self::TcpOpenedConnections => 4,
+            Self::TcpClosedConnections => 5,
+            Self::TcpSentBytes => 6,
+            Self::TcpReceivedBytes => 7,
+            Self::GrpcRequestMessages => 8,
+            Self::GrpcResponseMessages => 9,
+        }
+    }
+
+    /// Fixed Prometheus `family` label for dynamic-series overflow counters.
+    pub(crate) const fn overflow_family_label(self) -> &'static str {
+        self.disabled_name()
+    }
 }
 
 /// Count complete gRPC length-prefixed messages in a contiguous byte buffer.

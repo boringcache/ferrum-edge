@@ -10,7 +10,7 @@ use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -560,6 +560,32 @@ const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 /// At high RPS this prevents an Arc allocation on every single request.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
+/// Default live-series budget per mesh metric family (`MeshRequestKey` entries
+/// retained in that family's DashMap). Exact CEL UPSERT label values are
+/// admitted until this live count; further distinct keys are dropped and
+/// counted on the fixed-cardinality overflow series. Stale TTL eviction
+/// releases capacity. Sized for large meshes while bounding attacker-controlled
+/// CEL cardinality (`request.host` / custom methods rewritten into labels).
+pub const DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY: usize = 10_000;
+
+/// Exact per-family live-series accounting for mesh RED/TCP/gRPC maps.
+///
+/// Admission uses atomic reservation (never `DashMap::len()`). The overflow
+/// counter is fixed-cardinality (`family` is a closed set of ten names).
+struct MeshFamilySeriesBudget {
+    live: AtomicUsize,
+    overflow_total: AtomicU64,
+}
+
+impl MeshFamilySeriesBudget {
+    fn new() -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            overflow_total: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Metrics registry holding all Prometheus-compatible counters and histograms.
 pub struct MetricsRegistry {
     /// Monotonic epoch for all timestamp calculations (avoids system clock issues).
@@ -738,6 +764,10 @@ pub struct MetricsRegistry {
     /// metric's label set during render so that multiple gateway instances with
     /// different namespaces produce distinct time series.
     namespace_label: std::sync::RwLock<String>,
+    /// Per-family live `MeshRequestKey` series budget (exact atomic accounting).
+    mesh_series_budget_per_family: AtomicUsize,
+    /// Live count + overflow totals for each [`prometheus_helpers::MeshMetricFamily`].
+    mesh_series_budgets: [MeshFamilySeriesBudget; 10],
 }
 
 impl Default for MetricsRegistry {
@@ -816,6 +846,8 @@ impl MetricsRegistry {
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
             namespace_label: std::sync::RwLock::new(String::new()),
+            mesh_series_budget_per_family: AtomicUsize::new(DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY),
+            mesh_series_budgets: std::array::from_fn(|_| MeshFamilySeriesBudget::new()),
         }
     }
 
@@ -942,10 +974,14 @@ impl MetricsRegistry {
             &base,
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
         );
-        self.mesh_tcp_opened_counter
-            .entry(key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        let epoch = self.epoch;
+        self.update_mesh_series(
+            prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
+            &self.mesh_tcp_opened_counter,
+            key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
         self.maybe_invalidate_cache();
     }
 
@@ -975,10 +1011,14 @@ impl MetricsRegistry {
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
             );
-            self.mesh_tcp_closed_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .increment(self.epoch);
+            let epoch = self.epoch;
+            self.update_mesh_series(
+                prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
+                &self.mesh_tcp_closed_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.increment(epoch),
+            );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
@@ -989,13 +1029,18 @@ impl MetricsRegistry {
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
             );
-            self.mesh_tcp_sent_bytes_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
-                // StreamTransactionSummary uses Ferrum's gateway-perspective
-                // names, where bytes_received is backend->client.
-                .add(summary.bytes_received, self.epoch);
+            let epoch = self.epoch;
+            // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
+            // StreamTransactionSummary uses Ferrum's gateway-perspective
+            // names, where bytes_received is backend->client.
+            let bytes = summary.bytes_received;
+            self.update_mesh_series(
+                prometheus_helpers::MeshMetricFamily::TcpSentBytes,
+                &self.mesh_tcp_sent_bytes_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(bytes, epoch),
+            );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
@@ -1006,12 +1051,17 @@ impl MetricsRegistry {
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
             );
-            self.mesh_tcp_received_bytes_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
-                // StreamTransactionSummary.bytes_sent is client->backend.
-                .add(summary.bytes_sent, self.epoch);
+            let epoch = self.epoch;
+            // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
+            // StreamTransactionSummary.bytes_sent is client->backend.
+            let bytes = summary.bytes_sent;
+            self.update_mesh_series(
+                prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
+                &self.mesh_tcp_received_bytes_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(bytes, epoch),
+            );
         }
     }
 
@@ -1596,10 +1646,14 @@ impl MetricsRegistry {
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                 );
-                self.mesh_request_counter
-                    .entry(count_key)
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .increment(self.epoch);
+                let epoch = self.epoch;
+                self.update_mesh_series(
+                    prometheus_helpers::MeshMetricFamily::RequestCount,
+                    &self.mesh_request_counter,
+                    count_key,
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.increment(epoch),
+                );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
@@ -1610,10 +1664,15 @@ impl MetricsRegistry {
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                 );
-                self.mesh_request_duration_buckets
-                    .entry(duration_key)
-                    .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                    .observe(summary.latency_total_ms, self.epoch);
+                let epoch = self.epoch;
+                let latency = summary.latency_total_ms;
+                self.update_mesh_series(
+                    prometheus_helpers::MeshMetricFamily::RequestDuration,
+                    &self.mesh_request_duration_buckets,
+                    duration_key,
+                    || HistogramBuckets::new(epoch),
+                    |buckets| buckets.observe(latency, epoch),
+                );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
@@ -1624,10 +1683,15 @@ impl MetricsRegistry {
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                 );
-                self.mesh_request_bytes_buckets
-                    .entry(size_key)
-                    .or_insert_with(|| HistogramBuckets::new_bytes(self.epoch))
-                    .observe(summary.bytes_sent as f64, self.epoch);
+                let epoch = self.epoch;
+                let bytes = summary.bytes_sent as f64;
+                self.update_mesh_series(
+                    prometheus_helpers::MeshMetricFamily::RequestSize,
+                    &self.mesh_request_bytes_buckets,
+                    size_key,
+                    || HistogramBuckets::new_bytes(epoch),
+                    |buckets| buckets.observe(bytes, epoch),
+                );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
@@ -1641,10 +1705,15 @@ impl MetricsRegistry {
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                 );
-                self.mesh_response_bytes_buckets
-                    .entry(size_key)
-                    .or_insert_with(|| HistogramBuckets::new_bytes(self.epoch))
-                    .observe(summary.bytes_received as f64, self.epoch);
+                let epoch = self.epoch;
+                let bytes = summary.bytes_received as f64;
+                self.update_mesh_series(
+                    prometheus_helpers::MeshMetricFamily::ResponseSize,
+                    &self.mesh_response_bytes_buckets,
+                    size_key,
+                    || HistogramBuckets::new_bytes(epoch),
+                    |buckets| buckets.observe(bytes, epoch),
+                );
             }
             if prometheus_helpers::is_mesh_grpc_protocol(mesh_key.request_protocol.as_ref()) {
                 if summary.grpc_request_messages > 0
@@ -1658,10 +1727,15 @@ impl MetricsRegistry {
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                     );
-                    self.mesh_grpc_request_messages_counter
-                        .entry(key)
-                        .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                        .add(summary.grpc_request_messages, self.epoch);
+                    let epoch = self.epoch;
+                    let messages = summary.grpc_request_messages;
+                    self.update_mesh_series(
+                        prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
+                        &self.mesh_grpc_request_messages_counter,
+                        key,
+                        || TimestampedCounter::new(epoch),
+                        |counter| counter.add(messages, epoch),
+                    );
                 }
                 if summary.grpc_response_messages > 0
                     && !prometheus_helpers::mesh_metric_disabled(
@@ -1674,10 +1748,15 @@ impl MetricsRegistry {
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                     );
-                    self.mesh_grpc_response_messages_counter
-                        .entry(key)
-                        .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                        .add(summary.grpc_response_messages, self.epoch);
+                    let epoch = self.epoch;
+                    let messages = summary.grpc_response_messages;
+                    self.update_mesh_series(
+                        prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
+                        &self.mesh_grpc_response_messages_counter,
+                        key,
+                        || TimestampedCounter::new(epoch),
+                        |counter| counter.add(messages, epoch),
+                    );
                 }
             }
         }
@@ -1696,6 +1775,84 @@ impl MetricsRegistry {
         }
 
         self.maybe_invalidate_cache();
+    }
+
+    /// Lower the per-family mesh series budget for focused cardinality tests.
+    #[doc(hidden)]
+    pub fn set_mesh_series_budget_per_family_for_test(&self, budget: usize) {
+        self.mesh_series_budget_per_family
+            .store(budget.max(1), Ordering::Release);
+    }
+
+    /// Live admitted series for one mesh family (exact reservation count).
+    #[doc(hidden)]
+    pub fn mesh_series_live_for_test(&self, family: &str) -> Option<usize> {
+        prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
+            self.mesh_series_budgets[family.index()]
+                .live
+                .load(Ordering::Acquire)
+        })
+    }
+
+    /// Overflow drops for one mesh family.
+    #[doc(hidden)]
+    pub fn mesh_series_overflow_for_test(&self, family: &str) -> Option<u64> {
+        prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
+            self.mesh_series_budgets[family.index()]
+                .overflow_total
+                .load(Ordering::Relaxed)
+        })
+    }
+
+    fn try_reserve_mesh_series(&self, family: prometheus_helpers::MeshMetricFamily) -> bool {
+        let limit = self.mesh_series_budget_per_family.load(Ordering::Acquire);
+        self.mesh_series_budgets[family.index()]
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_mesh_series(&self, family: prometheus_helpers::MeshMetricFamily) {
+        self.mesh_series_budgets[family.index()]
+            .live
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn record_mesh_series_overflow(&self, family: prometheus_helpers::MeshMetricFamily) {
+        self.mesh_series_budgets[family.index()]
+            .overflow_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Admit or update one mesh family series under the exact live-series budget.
+    ///
+    /// Existing keys always update. A vacant key reserves one slot atomically
+    /// before insert; when the budget is exhausted the update is dropped and
+    /// the fixed-cardinality overflow counter increments.
+    fn update_mesh_series<V, R>(
+        &self,
+        family: prometheus_helpers::MeshMetricFamily,
+        map: &DashMap<MeshRequestKey, V>,
+        key: MeshRequestKey,
+        create: impl FnOnce() -> V,
+        update: impl FnOnce(&V) -> R,
+    ) -> Option<R> {
+        use dashmap::mapref::entry::Entry;
+        match map.entry(key) {
+            Entry::Occupied(entry) => Some(update(entry.get())),
+            Entry::Vacant(entry) => {
+                if !self.try_reserve_mesh_series(family) {
+                    self.record_mesh_series_overflow(family);
+                    return None;
+                }
+                let value = create();
+                let result = update(&value);
+                entry.insert(value);
+                Some(result)
+            }
+        }
     }
 
     /// Invalidate the render cache only if it's older than the configured
@@ -1778,6 +1935,7 @@ impl MetricsRegistry {
         self.mesh_request_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
+                self.release_mesh_series(prometheus_helpers::MeshMetricFamily::RequestCount);
                 evicted += 1;
             }
             keep
@@ -1786,35 +1944,59 @@ impl MetricsRegistry {
         self.mesh_request_duration_buckets.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
+                self.release_mesh_series(prometheus_helpers::MeshMetricFamily::RequestDuration);
                 evicted += 1;
             }
             keep
         });
 
-        for map in [
-            &self.mesh_request_bytes_buckets,
-            &self.mesh_response_bytes_buckets,
-        ] {
-            map.retain(|_, v| {
-                let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
-                if !keep {
-                    evicted += 1;
-                }
-                keep
-            });
-        }
+        self.mesh_request_bytes_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                self.release_mesh_series(prometheus_helpers::MeshMetricFamily::RequestSize);
+                evicted += 1;
+            }
+            keep
+        });
+        self.mesh_response_bytes_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                self.release_mesh_series(prometheus_helpers::MeshMetricFamily::ResponseSize);
+                evicted += 1;
+            }
+            keep
+        });
 
-        for map in [
-            &self.mesh_tcp_opened_counter,
-            &self.mesh_tcp_closed_counter,
-            &self.mesh_tcp_sent_bytes_counter,
-            &self.mesh_tcp_received_bytes_counter,
-            &self.mesh_grpc_request_messages_counter,
-            &self.mesh_grpc_response_messages_counter,
+        for (family, map) in [
+            (
+                prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
+                &self.mesh_tcp_opened_counter,
+            ),
+            (
+                prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
+                &self.mesh_tcp_closed_counter,
+            ),
+            (
+                prometheus_helpers::MeshMetricFamily::TcpSentBytes,
+                &self.mesh_tcp_sent_bytes_counter,
+            ),
+            (
+                prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
+                &self.mesh_tcp_received_bytes_counter,
+            ),
+            (
+                prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
+                &self.mesh_grpc_request_messages_counter,
+            ),
+            (
+                prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
+                &self.mesh_grpc_response_messages_counter,
+            ),
         ] {
             map.retain(|_, v| {
                 let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
                 if !keep {
+                    self.release_mesh_series(family);
                     evicted += 1;
                 }
                 keep
@@ -2384,6 +2566,40 @@ impl MetricsRegistry {
                     "{name}{{{}{}}} {}\n",
                     labels, counter_gateway_ns_label, count
                 ));
+            }
+        }
+
+        let mesh_overflow_total: u64 = self
+            .mesh_series_budgets
+            .iter()
+            .map(|budget| budget.overflow_total.load(Ordering::Relaxed))
+            .sum();
+        if mesh_overflow_total > 0 {
+            output.push_str(
+                "# HELP ferrum_mesh_metric_series_overflow_total Mesh metric series admissions dropped because the per-family live-series budget was exhausted (exact CEL values retained until the budget; overflow has fixed family labels only).\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_metric_series_overflow_total counter\n");
+            for family in prometheus_helpers::MeshMetricFamily::ALL {
+                let count = self.mesh_series_budgets[family.index()]
+                    .overflow_total
+                    .load(Ordering::Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_mesh_metric_series_overflow_total{{family=\"{}\"}} {}\n",
+                        family.overflow_family_label(),
+                        count
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_mesh_metric_series_overflow_total{{family=\"{}\"{}}} {}\n",
+                        family.overflow_family_label(),
+                        gateway_ns_label,
+                        count
+                    ));
+                }
             }
         }
 
