@@ -3147,7 +3147,7 @@ fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
                 not_values: Vec::new(),
             },
             "rules[0].when[0].key",
-            "at most 256 characters",
+            "at most 256 UTF-8 bytes",
         ),
         (
             ConditionMatch {
@@ -3183,7 +3183,7 @@ fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
                 not_values: Vec::new(),
             },
             "rules[0].when[0].values[0]",
-            "at most 512 characters",
+            "at most 512 UTF-8 bytes",
         ),
         (
             ConditionMatch {

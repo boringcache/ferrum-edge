@@ -952,7 +952,7 @@ pub fn validate_mesh_condition(
     }
     if condition.key.len() > MAX_MESH_CONDITION_KEY_LEN {
         return Err(vec![MeshConditionIssue::key(format!(
-            "must be at most {MAX_MESH_CONDITION_KEY_LEN} characters"
+            "must be at most {MAX_MESH_CONDITION_KEY_LEN} UTF-8 bytes"
         ))]);
     }
     if condition
@@ -966,7 +966,7 @@ pub fn validate_mesh_condition(
     }
     let Some(kind) = classify_mesh_condition_key(&condition.key) else {
         // Safe to echo: the checks above already bounded the key to
-        // `MAX_MESH_CONDITION_KEY_LEN` printable, whitespace-free characters,
+        // `MAX_MESH_CONDITION_KEY_LEN` printable, whitespace-free UTF-8 bytes,
         // and operators cannot fix the policy without seeing which key failed.
         return Err(vec![MeshConditionIssue::key(format!(
             "'{}' is unsupported (expected one of source.principal, source.namespace, \
@@ -1003,7 +1003,7 @@ pub fn validate_mesh_condition(
                 issues.push(MeshConditionIssue::value(
                     field,
                     index,
-                    format!("must be at most {MAX_MESH_CONDITION_VALUE_LEN} characters"),
+                    format!("must be at most {MAX_MESH_CONDITION_VALUE_LEN} UTF-8 bytes"),
                 ));
                 continue;
             }
