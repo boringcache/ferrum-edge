@@ -180,6 +180,78 @@ fn listenerset_default_not_allowed() {
 }
 
 #[test]
+fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
+    let mut namespace = object("Namespace", "default", json!({}));
+    namespace.api_version = "v1".to_string();
+    namespace.metadata.namespace.clear();
+    namespace
+        .metadata
+        .labels
+        .insert("team".to_string(), "payments".to_string());
+
+    let mut selected_gateway = http_gateway("selected", None);
+    selected_gateway.spec.as_object_mut().unwrap().insert(
+        "allowedListeners".to_string(),
+        json!({
+            "namespaces": {
+                "from": "Selector",
+                "selector": {"matchLabels": {"team": "payments"}}
+            }
+        }),
+    );
+    let selected = listenerset(
+        "selected-set",
+        "selected",
+        json!([{
+            "name": "http",
+            "port": 8080,
+            "protocol": "HTTP"
+        }]),
+    );
+
+    let mut malformed_gateway = http_gateway("malformed", None);
+    malformed_gateway.spec.as_object_mut().unwrap().insert(
+        "allowedListeners".to_string(),
+        json!({
+            "namespaces": {
+                "from": "Selector",
+                "selector": {"matchLabels": []}
+            }
+        }),
+    );
+    let malformed = listenerset(
+        "malformed-set",
+        "malformed",
+        json!([{
+            "name": "http",
+            "port": 8081,
+            "protocol": "HTTP"
+        }]),
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            namespace,
+            gateway_class(),
+            selected_gateway,
+            selected,
+            malformed_gateway,
+            malformed,
+        ],
+        options(),
+    )
+    .expect("translate strict allowedListeners selectors");
+    assert!(translation.listenerset_statuses.iter().any(|status| {
+        status.resource.name == "selected-set" && status.accepted
+    }));
+    assert!(translation.listenerset_statuses.iter().any(|status| {
+        status.resource.name == "malformed-set"
+            && !status.accepted
+            && status.accepted_reason == "NotAllowed"
+    }));
+}
+
+#[test]
 fn listenerset_attaches_and_materializes_http_route() {
     let objects = vec![
         gateway_class(),

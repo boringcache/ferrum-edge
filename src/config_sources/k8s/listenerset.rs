@@ -19,13 +19,12 @@ use super::gateway_api::{
     allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
     listener_is_materializable, listener_protocol_mode_is_supported,
     listener_requires_frontend_tls, listener_selected_frontend_tls_source,
-    namespace_selector_matches, normalize_gateway_hostname,
+    namespace_selector, namespace_selector_matches, normalize_gateway_hostname,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
-    GatewayApiListenerPolicy, GatewayApiListenerSetStatus, GatewayApiNamespaceSelector,
-    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator, K8sAccumulator,
-    K8sObject, K8sResourceKey, K8sTranslateError, string_field,
+    GatewayApiListenerPolicy, GatewayApiListenerSetStatus, K8sAccumulator, K8sObject,
+    K8sResourceKey, K8sTranslateError, string_field,
 };
 use crate::modes::mesh::config::{MeshService, ServicePort};
 
@@ -465,7 +464,7 @@ pub(crate) fn allowed_listeners_permits(
             let Some(selector) = namespaces.get("selector") else {
                 return false;
             };
-            let Ok(selector) = parse_listener_namespace_selector(selector) else {
+            let Ok(selector) = namespace_selector(selector) else {
                 return false;
             };
             acc.namespace_labels
@@ -588,56 +587,6 @@ fn parse_parent_gateway_ref(
     Ok(ParentGatewayRef {
         namespace: namespace.to_string(),
         name: name.to_string(),
-    })
-}
-
-fn parse_listener_namespace_selector(selector: &Value) -> Result<GatewayApiNamespaceSelector, ()> {
-    let Some(selector) = selector.as_object() else {
-        return Err(());
-    };
-    let mut match_labels = HashMap::new();
-    if let Some(labels) = selector.get("matchLabels").and_then(Value::as_object) {
-        for (key, value) in labels {
-            let Some(value) = value.as_str() else {
-                return Err(());
-            };
-            match_labels.insert(key.clone(), value.to_string());
-        }
-    }
-    let mut match_expressions = Vec::new();
-    if let Some(expressions) = selector.get("matchExpressions").and_then(Value::as_array) {
-        for expression in expressions {
-            let Some(key) = string_field(expression, "key") else {
-                return Err(());
-            };
-            let Some(operator) = string_field(expression, "operator") else {
-                return Err(());
-            };
-            let operator = match operator {
-                "In" => GatewayApiNamespaceSelectorOperator::In,
-                "NotIn" => GatewayApiNamespaceSelectorOperator::NotIn,
-                "Exists" => GatewayApiNamespaceSelectorOperator::Exists,
-                "DoesNotExist" => GatewayApiNamespaceSelectorOperator::DoesNotExist,
-                _ => return Err(()),
-            };
-            let values = expression
-                .get("values")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect();
-            match_expressions.push(GatewayApiNamespaceSelectorExpression {
-                key: key.to_string(),
-                operator,
-                values,
-            });
-        }
-    }
-    Ok(GatewayApiNamespaceSelector {
-        match_labels,
-        match_expressions,
     })
 }
 

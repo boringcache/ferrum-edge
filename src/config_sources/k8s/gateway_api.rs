@@ -2128,7 +2128,7 @@ pub(crate) fn allowed_route_namespaces(
     }
 }
 
-fn namespace_selector(
+pub(crate) fn namespace_selector(
     selector: &Value,
 ) -> Result<GatewayApiNamespaceSelector, GatewayApiListenerValidationError> {
     let Some(selector) = selector.as_object() else {
