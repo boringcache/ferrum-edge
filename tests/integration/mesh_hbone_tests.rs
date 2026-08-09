@@ -821,6 +821,7 @@ fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
@@ -1242,6 +1243,7 @@ fn materialize_source_side_external_udp(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
