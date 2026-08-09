@@ -8,16 +8,19 @@
 //!
 //! Two levels of answer:
 //!
-//! * [`extract_sni_from_tcp_stream`] / [`extract_sni_from_client_hello`] —
-//!   "what hostname, if any?", as an `Option<String>`. Used for logging and by
-//!   callers that have already decided what an absent hostname means.
-//! * [`peek_client_hello_sni`] / [`classify_client_hello`] — the same hostname
-//!   answer plus **why** there wasn't one ([`ClientHelloSni`]). SNI *route
-//!   selection* needs this: a hello that timed out, overran the peek bound,
-//!   ended early, is malformed, or names something unrepresentable must fail
-//!   closed ([`admit_opaque_tls_sni`]) rather than silently inherit the
-//!   listener's catch-all route, which would be a cross-tenant downgrade
-//!   (issue #3264).
+//! * [`peek_client_hello_sni`] / [`classify_client_hello`] validate the complete
+//!   bounded ClientHello, then answer "what hostname, and why not" as
+//!   [`ClientHelloSni`]. [`extract_sni_from_tcp_stream`] is the `Option<String>`
+//!   projection of that same strict result for non-routing consumers.
+//! * [`extract_sni_from_client_hello`] is the shared lenient raw-slice hostname
+//!   parser. Admission invokes it only after strict whole-hello validation; a
+//!   readable early SNI must not hide an oversized or malformed tail.
+//!
+//! SNI *route selection* needs the typed answer: a hello that timed out,
+//! overran the peek bound, ended early, is malformed, or names something
+//! unrepresentable must fail closed ([`admit_opaque_tls_sni`]) rather than
+//! silently inherit the listener's catch-all route, which would be a
+//! cross-tenant downgrade (issue #3264).
 //!
 //! Peeking never consumes: the ClientHello and every other inspected byte stay
 //! queued on the socket and reach the selected backend verbatim.
@@ -579,6 +582,9 @@ pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
 ///
 /// Parses the TLS record layer and handshake message to find the
 /// server_name extension (type 0x0000) per RFC 6066 §3.
+/// This helper is intentionally lenient about bytes after a complete SNI entry;
+/// route admission must use [`classify_client_hello`], which validates the
+/// entire declared ClientHello before invoking this extractor.
 ///
 /// Works for both TLS 1.2 and TLS 1.3 ClientHello messages.
 pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {

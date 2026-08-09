@@ -518,10 +518,10 @@ fn joins_sni_plane(passthrough: bool, scheme: BackendScheme, frontend_tls: bool)
 /// Whether a candidate is a member of its port's `__sni_{port}` group.
 ///
 /// A port that carries ANY passthrough candidate keeps the historical
-/// membership — the passthrough set alone — so a config that mixes shapes on
-/// one port number (which validation rejects, but a CP-pushed DP snapshot is
-/// not revalidated for) groups exactly as it always did. Only a port with no
-/// passthrough candidate at all forms the new opaque-`tcp` SNI group.
+/// membership — the passthrough set alone — so an invalid mixed-shape snapshot
+/// that somehow reaches reconcile despite admission validation groups exactly
+/// as it always did. Only a port with no passthrough candidate at all forms the
+/// new opaque-`tcp` SNI group.
 #[inline]
 fn sni_group_member(
     port_has_passthrough: bool,

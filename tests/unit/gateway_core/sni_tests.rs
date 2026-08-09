@@ -1402,8 +1402,9 @@ fn test_resolve_proxy_exact_beats_wildcard_listed_first() {
 // server_name", "not TLS at all", "hello never finished arriving", and
 // "malformed hello" into one `None`, and SNI route selection sent all four to
 // the listener's catch-all proxy. These tests lock the typed replacement: the
-// hostname answer is unchanged, but the `None` cases are now distinguishable
-// and the indeterminate ones fail closed.
+// a complete valid hostname still routes identically, while incomplete or
+// malformed hellos are now distinguishable and fail closed even if the lenient
+// raw-slice extractor could read an early SNI.
 
 use ferrum_edge::proxy::sni::{
     ClientHelloSni, SniAdmission, SniPeekFailure, SniRefusal, admit_opaque_tls_sni,
@@ -1579,6 +1580,37 @@ fn classify_rejects_duplicate_server_name_extensions() {
         classify_client_hello(&hello),
         ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
         "duplicate SNI extensions are malformed and must never select the first tenant"
+    );
+}
+
+#[test]
+fn classify_rejects_duplicate_host_names_inside_one_server_name_extension() {
+    let first = sni_extension_block("first.example.com");
+    let second = sni_extension_block("second.example.com");
+    let first_entry = &first[6..];
+    let second_entry = &second[6..];
+    let list_len = u16::try_from(first_entry.len() + second_entry.len())
+        .expect("test ServerNameList fits in u16");
+    let extension_len = list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0x0000u16.to_be_bytes());
+    extensions.extend_from_slice(&extension_len.to_be_bytes());
+    extensions.extend_from_slice(&list_len.to_be_bytes());
+    extensions.extend_from_slice(first_entry);
+    extensions.extend_from_slice(second_entry);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("first.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "RFC 6066 permits at most one host_name in a ServerNameList"
     );
 }
 
