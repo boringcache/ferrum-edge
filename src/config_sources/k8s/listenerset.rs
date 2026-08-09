@@ -301,9 +301,17 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             if !candidate.eligible {
                 continue;
             }
+            // ListenerSet merge conflict is only applied to ListenerSet losers.
+            // Parent Gateway listeners stay accepted anchors (and keep their
+            // established co-existence, e.g. HTTPS catch-all + hostname
+            // siblings on :443). Marking Gateway-vs-Gateway siblings conflicted
+            // here wrongly suppresses routes such as HTTPRouteHTTPSListener's
+            // sectionName attachment to `https-with-hostname`.
             if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
-                conflicted.insert(candidate.key.clone(), reason);
-                continue;
+                if candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet {
+                    conflicted.insert(candidate.key.clone(), reason);
+                    continue;
+                }
             }
             accepted.push(candidate);
         }

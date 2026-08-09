@@ -452,6 +452,136 @@ fn listenerset_protocol_conflict_with_gateway_listener() {
     assert_eq!(status.accepted_reason, "ListenersNotValid");
 }
 
+/// Regression for upstream `HTTPRouteHTTPSListener`: a Gateway may declare an
+/// HTTPS catch-all listener alongside hostname-specific HTTPS siblings on the
+/// same port. ListenerSet conflict finalization must not treat those Gateway
+/// siblings as HostnameConflict losers — otherwise a sectionName attachment to
+/// the hostname listener reports Accepted=True/NoRules with no materialization.
+#[test]
+fn gateway_https_catch_all_and_hostname_siblings_stay_materializable() {
+    let mut secret = object(
+        "Secret",
+        "edge-cert",
+        json!({
+            "type": "kubernetes.io/tls",
+            "data": {
+                "tls.crt": "Y2VydA==",
+                "tls.key": "a2V5"
+            }
+        }),
+    );
+    secret.api_version = "v1".to_string();
+
+    let gateway = object(
+        "Gateway",
+        "same-namespace-with-https-listener",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } },
+                    "tls": {
+                        "mode": "Terminate",
+                        "certificateRefs": [{ "name": "edge-cert" }]
+                    }
+                },
+                {
+                    "name": "https-with-hostname",
+                    "port": 443,
+                    "hostname": "second-example.org",
+                    "protocol": "HTTPS",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } },
+                    "tls": {
+                        "mode": "Terminate",
+                        "certificateRefs": [{ "name": "edge-cert" }]
+                    }
+                }
+            ]
+        }),
+    );
+
+    let route_with_hostname = object(
+        "HTTPRoute",
+        "httproute-https-test",
+        json!({
+            "parentRefs": [{ "name": "same-namespace-with-https-listener" }],
+            "hostnames": ["example.org"],
+            "rules": [{
+                "backendRefs": [{ "name": "backend", "port": 8080 }]
+            }]
+        }),
+    );
+    let route_no_hostname = object(
+        "HTTPRoute",
+        "httproute-https-test-no-hostname",
+        json!({
+            "parentRefs": [{
+                "name": "same-namespace-with-https-listener",
+                "sectionName": "https-with-hostname"
+            }],
+            "rules": [{
+                "backendRefs": [{ "name": "backend", "port": 8080 }]
+            }]
+        }),
+    );
+
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        secret,
+        service("backend"),
+        route_with_hostname,
+        route_no_hostname,
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.config.proxies.iter().any(|proxy| {
+            proxy.hosts.iter().any(|host| host == "example.org")
+        }),
+        "catch-all HTTPS listener must still materialize hostname routes"
+    );
+    assert!(
+        translation.config.proxies.iter().any(|proxy| {
+            proxy
+                .hosts
+                .iter()
+                .any(|host| host == "second-example.org")
+        }),
+        "hostname-specific HTTPS sibling must stay materializable for sectionName routes"
+    );
+
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    let no_hostname_update = updates
+        .iter()
+        .find(|update| {
+            update.kind == "HTTPRoute" && update.name == "httproute-https-test-no-hostname"
+        })
+        .expect("no-hostname route status");
+    let conditions = no_hostname_update.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("parent conditions");
+    let accepted = conditions
+        .iter()
+        .find(|condition| condition["type"] == "Accepted")
+        .expect("Accepted");
+    let programmed = conditions
+        .iter()
+        .find(|condition| condition["type"] == "Programmed")
+        .expect("Programmed");
+    assert_eq!(accepted["status"], "True");
+    assert_eq!(
+        accepted["reason"], "Accepted",
+        "must not report NoRules when the HTTPS sectionName listener materializes: {accepted}"
+    );
+    assert_eq!(programmed["status"], "True");
+    assert_eq!(programmed["reason"], "Programmed");
+}
+
 #[test]
 fn listenerset_section_name_and_allowed_routes_gates() {
     let objects = vec![
