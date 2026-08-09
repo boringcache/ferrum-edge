@@ -1437,6 +1437,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         for pod_uid in returning {
             self.clear_gate_close_requirement(&pod_uid);
             self.awaiting_gate_close.remove(&pod_uid);
+            // The close request retracted this marker even though the durable
+            // published record stays until an acknowledgement. Drop that stale
+            // record now so step 9 must write readiness again after the returning
+            // pod's capture path is live.
+            self.published_ready.remove(&pod_uid);
         }
     }
 
