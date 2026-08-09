@@ -11,16 +11,21 @@
 //! `tests/unit/config/plugin_trigger_tests.rs`.
 
 use chrono::Utc;
-use ferrum_edge::_test_support::set_request_wire_protocol_for_test;
+use ferrum_edge::_test_support::{
+    attach_stream_trigger_decisions_for_test, set_request_wire_protocol_for_test,
+};
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
     BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{make_plugin_config_with_json, make_proxy, minimal_plugin_config};
 
@@ -279,6 +284,102 @@ async fn source_cidr_predicates_read_the_gateway_resolved_client_ip() {
     assert!(!run_request(&plugins, &mut external).await.is_empty());
 }
 
+#[tokio::test]
+async fn an_unrepresentable_query_pair_can_never_match_a_replacement_character() {
+    // A lossy percent-decoder turns `%FF` into U+FFFD, so this trigger would
+    // MATCH a hostile byte sequence the client never spelled that way.
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"query": {
+                    "name": "q", "value": {"exact": ["\u{FFFD}"]}
+                }}}}),
+            )],
+        ),
+        "api",
+    );
+
+    let mut invalid = request("GET", "/api");
+    invalid.set_raw_query_string("q=%FF".to_string());
+    assert!(
+        run_request(&plugins, &mut invalid).await.is_empty(),
+        "invalid percent-decoded UTF-8 must not be coerced into a replacement character"
+    );
+
+    // A client that genuinely sends U+FFFD (properly percent-encoded) still
+    // matches, so the rule is about representability, not about the character.
+    let mut genuine = request("GET", "/api");
+    genuine.set_raw_query_string("q=%EF%BF%BD".to_string());
+    assert!(!run_request(&plugins, &mut genuine).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unrepresentable_query_pair_fails_closed_to_running_under_not() {
+    // "run unless the client sent q=<U+FFFD>". Under a lossy decoder `q=%FF`
+    // satisfies the inner leaf, the `not` inverts it, and the instance is
+    // SKIPPED — a hostile byte sequence switching a policy instance off.
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"not": {"match": {"query": {
+                    "name": "q", "value": {"exact": ["\u{FFFD}"]}
+                }}}}}),
+            )],
+        ),
+        "api",
+    );
+
+    let mut invalid = request("GET", "/api");
+    invalid.set_raw_query_string("q=%FF".to_string());
+    assert!(
+        !run_request(&plugins, &mut invalid).await.is_empty(),
+        "an unrepresentable pair must not be able to switch an instance off"
+    );
+    assert!(!invalid.metadata.contains_key("plugin_trigger.stamp.skipped"));
+}
+
+#[tokio::test]
+async fn an_unrepresentable_query_pair_is_skipped_without_aborting_the_scan() {
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"query": {
+                    "name": "q", "value": {"exact": ["ok"]}
+                }}}}),
+            )],
+        ),
+        "api",
+    );
+
+    // The malformed pair comes FIRST; the scan must step over it and still see
+    // the representable `q=ok` behind it.
+    let mut mixed = request("GET", "/api");
+    mixed.set_raw_query_string("%FF=zzz&q=ok".to_string());
+    assert!(!run_request(&plugins, &mut mixed).await.is_empty());
+
+    // An occurrence whose value cannot be represented is not observable at all,
+    // so it satisfies neither a value comparison nor bare presence.
+    let presence = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"query": {"name": "q"}}}}),
+            )],
+        ),
+        "api",
+    );
+    let mut invalid = request("GET", "/api");
+    invalid.set_raw_query_string("q=%FF".to_string());
+    assert!(run_request(&presence, &mut invalid).await.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Decide-once
 // ---------------------------------------------------------------------------
@@ -421,6 +522,144 @@ async fn a_capability_predicate_fails_closed_to_running_before_any_decision_exis
     // report "runs" rather than silently suppressing a guard.
     let unresolved = json_request("POST", "/api/orders");
     assert!(plugin.should_buffer_request_body(&unresolved));
+}
+
+fn html_response_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "text/html".to_string())])
+}
+
+/// The five `should_release_response_body_*` votes, in declaration order:
+/// under_retries, before_content_type_rewrite, for_later_no_transform,
+/// for_simulated_final_headers, for_later_strong_etag.
+fn release_votes(
+    plugin: &Arc<dyn Plugin>,
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> [bool; 5] {
+    [
+        plugin.should_release_response_body_under_retries(ctx, 200, headers),
+        plugin.should_release_response_body_before_content_type_rewrite(ctx, 200, headers),
+        plugin.should_release_response_body_for_later_no_transform(ctx, 200, headers),
+        plugin.should_release_response_body_for_simulated_final_headers(ctx, 200, headers),
+        plugin.should_release_response_body_for_later_strong_etag(ctx, 200, headers),
+    ]
+}
+
+/// The five `should_release_response_body_*` predicates. The proxy folds them
+/// with `all(...)` and only consults an instance that answered
+/// `should_buffer_response_body == true`, so `true` — not `false` — is the
+/// no-contribution answer for a skipped instance: it must neither need the body
+/// retained nor pin the response to the buffered path.
+#[tokio::test]
+async fn a_skipped_instance_contributes_no_response_body_release_decision() {
+    let gated = with_trigger(
+        builtin("compress", "compression", "api"),
+        json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
+    );
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["compress"])],
+            vec![gated],
+        ),
+        "api",
+    );
+    let plugin = plugins.first().expect("one published instance");
+    let headers = html_response_headers();
+
+    // `compression` overrides votes 2, 3 and 5; votes 1 and 4 fall through to
+    // the trait default. Three of the five therefore flip between the admitted
+    // and skipped runs, which is what makes the gate observable.
+    let mut running = request("GET", "/api/orders/42");
+    plugin.on_request_received(&mut running).await;
+    assert!(!running.metadata.contains_key("plugin_trigger.compress.skipped"));
+    assert_eq!(
+        release_votes(plugin, &running, &headers),
+        [false, false, true, false, true],
+        "an admitted instance answers for itself"
+    );
+
+    let mut skipped = request("GET", "/api/health");
+    plugin.on_request_received(&mut skipped).await;
+    assert_eq!(
+        skipped
+            .metadata
+            .get("plugin_trigger.compress.skipped")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !plugin.should_buffer_response_body(&skipped),
+        "a skipped instance never buffers"
+    );
+    assert_eq!(
+        release_votes(plugin, &skipped, &headers),
+        [true; 5],
+        "a skipped instance withholds no release decision"
+    );
+}
+
+/// The header-only half of the response phase. Its trait default is a silent
+/// no-op, so a wrapper that forgets to forward it drops `response_caching`'s
+/// RFC 9111 invalidation and cacheability marking for any instance carrying a
+/// `priority_override` or a trigger.
+fn final_header_decision_recorded(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .keys()
+        .any(|key| key.ends_with("cache_final_header_decision"))
+}
+
+#[tokio::test]
+async fn the_final_response_header_phase_is_forwarded_and_gated() {
+    let gated = with_trigger(
+        builtin("cache", "response_caching", "api"),
+        json!({"when": {"match": {"path": {"prefix": ["/api/orders"]}}}}),
+    );
+    let plugins = published(
+        &config(vec![make_proxy("api", "/api", vec!["cache"])], vec![gated]),
+        "api",
+    );
+    let plugin = plugins.first().expect("one published instance");
+    let headers = html_response_headers();
+
+    let mut running = request("GET", "/api/orders/42");
+    plugin.on_request_received(&mut running).await;
+    plugin.on_final_response_headers(&mut running, 200, &headers);
+    assert!(
+        final_header_decision_recorded(&running),
+        "an admitted instance must still complete its header-only response work"
+    );
+
+    let mut skipped = request("GET", "/api/health");
+    plugin.on_request_received(&mut skipped).await;
+    plugin.on_final_response_headers(&mut skipped, 200, &headers);
+    assert!(
+        !final_header_decision_recorded(&skipped),
+        "a skipped instance must take no final-response-header effect"
+    );
+}
+
+#[tokio::test]
+async fn a_priority_only_wrapper_still_runs_the_final_response_header_phase() {
+    let mut reordered = builtin("cache", "response_caching", "api");
+    reordered.priority_override = Some(3501);
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["cache"])],
+            vec![reordered],
+        ),
+        "api",
+    );
+    let plugin = plugins.first().expect("one published instance");
+    assert_eq!(plugin.priority(), 3501, "the wrapper is the priority-only one");
+
+    let headers = html_response_headers();
+    let mut ctx = request("GET", "/api/orders/42");
+    plugin.on_request_received(&mut ctx).await;
+    plugin.on_final_response_headers(&mut ctx, 200, &headers);
+    assert!(
+        final_header_decision_recorded(&ctx),
+        "a priority override must not silently drop the header-only response phase"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +849,182 @@ async fn stream_triggers_gate_on_network_facts() {
     );
 }
 
+fn stream_summary(client_ip: &str) -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
+        namespace: NS.to_string(),
+        proxy_id: "tcp".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: Some("tcp".to_string()),
+        client_ip: client_ip.to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "127.0.0.1:9000".to_string(),
+        backend_resolved_ip: None,
+        protocol: "tcp".to_string(),
+        listen_port: 19_312,
+        duration_ms: 1.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    }
+}
+
+/// `on_stream_disconnect` receives only a summary, so the connect decision has
+/// to travel with it. If it did not, a skipped instance would still emit its
+/// disconnect record — an asymmetric skip.
+#[tokio::test]
+async fn a_false_stream_trigger_suppresses_connect_and_disconnect_together() {
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind record sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+
+    let gated = with_trigger(
+        make_plugin_config_with_json(
+            "auditlog",
+            "udp_logging",
+            json!({
+                "host": "127.0.0.1",
+                "port": sink_port,
+                "batch_size": 1,
+                "flush_interval_ms": 20,
+                "max_retries": 0
+            }),
+            PluginScope::Proxy,
+            Some("tcp"),
+        ),
+        json!({"when": {"match": {"source_cidr": ["10.0.0.0/8"]}}}),
+    );
+    let plugins = published(
+        &config(
+            vec![stream_proxy(
+                "tcp",
+                BackendScheme::Tcp,
+                19_312,
+                vec!["auditlog"],
+            )],
+            vec![gated],
+        ),
+        "tcp",
+    );
+    let plugin = plugins.first().expect("one published instance");
+
+    // Outside the CIDR the instance is skipped at connect. Its disconnect is
+    // emitted FIRST, so a leaked record would be the first datagram to arrive
+    // and the assertion below would fail deterministically rather than on a
+    // timeout.
+    let mut skipped = stream_ctx("203.0.113.5");
+    assert!(matches!(
+        plugin.on_stream_connect(&mut skipped).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        skipped
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("plugin_trigger.auditlog.skipped"))
+            .map(String::as_str),
+        Some("true")
+    );
+    let mut skipped_summary = stream_summary("203.0.113.5");
+    attach_stream_trigger_decisions_for_test(&mut skipped_summary, &skipped);
+    plugin.on_stream_disconnect(&skipped_summary).await;
+
+    // Inside the CIDR both halves run.
+    let mut admitted = stream_ctx("10.9.9.9");
+    assert!(matches!(
+        plugin.on_stream_connect(&mut admitted).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        admitted
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("plugin_trigger.auditlog.skipped"))
+            .is_none()
+    );
+    let mut admitted_summary = stream_summary("10.9.9.9");
+    attach_stream_trigger_decisions_for_test(&mut admitted_summary, &admitted);
+    plugin.on_stream_disconnect(&admitted_summary).await;
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    let len = tokio::time::timeout(Duration::from_secs(10), sink.recv(&mut buffer))
+        .await
+        .expect("an admitted disconnect record reaches the sink")
+        .expect("receive record");
+    let payload = String::from_utf8_lossy(&buffer[..len]).to_string();
+    assert!(
+        payload.contains("10.9.9.9"),
+        "the admitted connection must still be logged: {payload}"
+    );
+    assert!(
+        !payload.contains("203.0.113.5"),
+        "a skipped instance must emit no disconnect record: {payload}"
+    );
+}
+
+/// A summary carrying no decision (a connection whose chain never reached this
+/// instance's `on_stream_connect`) fails closed to "runs", so a trigger can only
+/// ever remove work.
+#[tokio::test]
+async fn a_disconnect_without_a_recorded_decision_fails_closed_to_running() {
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind record sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+
+    let gated = with_trigger(
+        make_plugin_config_with_json(
+            "auditlog",
+            "udp_logging",
+            json!({
+                "host": "127.0.0.1",
+                "port": sink_port,
+                "batch_size": 1,
+                "flush_interval_ms": 20,
+                "max_retries": 0
+            }),
+            PluginScope::Proxy,
+            Some("tcp"),
+        ),
+        // A predicate this connection would NOT satisfy, so only the missing
+        // decision can admit the hook.
+        json!({"when": {"match": {"source_cidr": ["10.0.0.0/8"]}}}),
+    );
+    let plugins = published(
+        &config(
+            vec![stream_proxy(
+                "tcp",
+                BackendScheme::Tcp,
+                19_312,
+                vec!["auditlog"],
+            )],
+            vec![gated],
+        ),
+        "tcp",
+    );
+    let plugin = plugins.first().expect("one published instance");
+
+    plugin
+        .on_stream_disconnect(&stream_summary("203.0.113.5"))
+        .await;
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    let len = tokio::time::timeout(Duration::from_secs(10), sink.recv(&mut buffer))
+        .await
+        .expect("an undecided disconnect still emits its record")
+        .expect("receive record");
+    assert!(String::from_utf8_lossy(&buffer[..len]).contains("203.0.113.5"));
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed publication refusals
 // ---------------------------------------------------------------------------
@@ -689,6 +1104,152 @@ fn an_identity_predicate_on_an_authentication_plugin_is_refused() {
         "{error}"
     );
     assert!(error.contains("authentication plugin"), "{error}");
+}
+
+/// `security_headers` re-asserts its header set through a CONTEXTLESS hook and
+/// publishes its declared names per generation, so no coherent per-request gate
+/// exists. Refuse rather than half-apply.
+#[test]
+fn a_trigger_on_an_initial_response_header_policy_plugin_is_refused() {
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["sec"])],
+        vec![with_trigger(
+            builtin("sec", "security_headers", "api"),
+            json!({"when": {"match": {"method": ["GET"]}}}),
+        )],
+    );
+    let error = publication_error(&cfg);
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
+    assert!(error.contains("initial response-header policy"), "{error}");
+}
+
+/// A stream-only plugin can never reach the HTTP pipeline, and an identity
+/// predicate never gates a stream connection, so such a trigger could gate
+/// nothing at all. Refuse it rather than accept an inert predicate.
+#[test]
+fn an_identity_predicate_on_a_stream_only_plugin_is_refused() {
+    for predicate in [
+        json!({"consumer": {"presence": "present"}}),
+        json!({"auth_method": ["mtls_auth"]}),
+        json!({"spiffe_id": {"presence": "present"}}),
+    ] {
+        let cfg = config(
+            vec![stream_proxy(
+                "tcp",
+                BackendScheme::Tcp,
+                19_313,
+                vec!["throttle"],
+            )],
+            vec![with_trigger(
+                make_plugin_config_with_json(
+                    "throttle",
+                    "tcp_connection_throttle",
+                    json!({"max_connections_per_key": 1}),
+                    PluginScope::Proxy,
+                    Some("tcp"),
+                ),
+                json!({"when": {"match": predicate}}),
+            )],
+        );
+        let error = publication_error(&cfg);
+        assert!(
+            error.contains("cannot carry an execution trigger"),
+            "{error}"
+        );
+        assert!(error.contains("stream-only plugin"), "{error}");
+    }
+}
+
+/// The same instance keeps working on network facts, so the refusal is scoped to
+/// identity rather than to stream plugins in general.
+#[test]
+fn a_network_predicate_on_a_stream_only_plugin_is_accepted() {
+    let cfg = config(
+        vec![stream_proxy(
+            "tcp",
+            BackendScheme::Tcp,
+            19_314,
+            vec!["throttle"],
+        )],
+        vec![with_trigger(
+            make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("tcp"),
+            ),
+            json!({"when": {"match": {"source_cidr": ["10.0.0.0/8"]}}}),
+        )],
+    );
+    PluginCache::new(&cfg).expect("a network-scoped stream trigger is supported");
+}
+
+/// On a plugin that serves BOTH families the trigger is accepted, and the
+/// identity predicate simply does not gate the stream half: every gated stream
+/// phase is at or before the stream authentication boundary, so the instance
+/// runs and no decision is memoized — which means the disconnect hook runs too.
+#[tokio::test]
+async fn an_identity_predicate_never_gates_a_stream_connection() {
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind record sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+
+    let cfg = config(
+        vec![stream_proxy(
+            "tcp",
+            BackendScheme::Tcp,
+            19_315,
+            vec!["auditlog"],
+        )],
+        vec![with_trigger(
+            make_plugin_config_with_json(
+                "auditlog",
+                "udp_logging",
+                json!({
+                    "host": "127.0.0.1",
+                    "port": sink_port,
+                    "batch_size": 1,
+                    "flush_interval_ms": 20,
+                    "max_retries": 0
+                }),
+                PluginScope::Proxy,
+                Some("tcp"),
+            ),
+            // No stream connection can satisfy this, yet the instance must run.
+            json!({"when": {"match": {"consumer": {"value": {"exact": ["alice"]}}}}}),
+        )],
+    );
+    let plugins = published(&cfg, "tcp");
+    let plugin = plugins.first().expect("one published instance");
+
+    let mut ctx = stream_ctx("203.0.113.5");
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        ctx.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("plugin_trigger.auditlog.skipped"))
+            .is_none(),
+        "an identity predicate must not record a stream skip"
+    );
+
+    let mut summary = stream_summary("203.0.113.5");
+    attach_stream_trigger_decisions_for_test(&mut summary, &ctx);
+    plugin.on_stream_disconnect(&summary).await;
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    let len = tokio::time::timeout(Duration::from_secs(10), sink.recv(&mut buffer))
+        .await
+        .expect("the ungated disconnect still emits its record")
+        .expect("receive record");
+    assert!(String::from_utf8_lossy(&buffer[..len]).contains("203.0.113.5"));
 }
 
 #[test]

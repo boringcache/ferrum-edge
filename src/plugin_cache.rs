@@ -68,22 +68,48 @@ use async_trait::async_trait;
 ///
 /// # What a false trigger suppresses
 ///
-/// Every request/response hook of THAT instance, plus its per-request buffering
-/// and policy-enforcement claims — so a skipped instance performs no external
-/// call, takes no lease, retains no state, and never forces a body buffer of
-/// its own. Static chain-shape declarations (`supported_protocols`,
+/// Every request/response/stream hook of THAT instance, plus its per-request
+/// buffering, release, and policy-enforcement claims — so a skipped instance
+/// performs no external call, takes no lease, retains no state, and never forces
+/// a body buffer of its own. `on_stream_disconnect` is included: the connect
+/// decision travels on the summary in an opaque crate-constructed carrier, so a
+/// false connect trigger suppresses the disconnect hook too.
+///
+/// The response-body RELEASE predicates (`should_release_response_body_*`) are
+/// gated to `true` rather than `false`, because `true` — not `false` — is the
+/// no-contribution answer in the proxy's `all(...)` fold: a skipped instance may
+/// neither need the body retained nor pin the response to the buffered path.
+///
+/// Static chain-shape declarations (`supported_protocols`,
 /// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
 /// gated: they describe the published generation, not one request, and gating
 /// them would make the plugin cache's composition admission depend on request
 /// data.
 ///
+/// # Every hook must be forwarded
+///
+/// This wrapper stands in for the inner plugin at every call site, so a trait
+/// method it does not override silently resolves to the TRAIT DEFAULT for the
+/// wrapped instance — a capability regression that appears only when an operator
+/// sets `priority_override` or a trigger. Adding a `Plugin` hook means adding it
+/// here; `tests/unit/plugins/plugin_trigger_gate_tests.rs` pins the ones whose
+/// default is a silent no-op.
+///
+/// `is_deferred_cors_wrapper` is the one deliberate exception: this wrapper is
+/// not that marker, and claiming it would stop `install_cors_finalizer` from
+/// installing the deferral around a wrapped `cors` instance. The finalizer runs
+/// after this wrapping, so a gated `cors` instance ends up INSIDE
+/// `DeferredCorsPlugin` and its trigger still governs both hooks that wrapper
+/// forwards.
+///
 /// # Phase boundary
 ///
-/// `WS frame`, `UDP datagram`, WS-disconnect, and the `log` phase have no
-/// request context at the point they run, so they cannot be gated coherently.
-/// Plugin-cache admission REFUSES a trigger on an instance that declares those
-/// hooks rather than silently half-applying one; see
-/// `trigger_composition_error`.
+/// `WS frame`, `UDP datagram`, WS-disconnect, the initial response-header
+/// policy, and the `log` phase have no request context at the point they run, so
+/// they cannot be gated coherently. Plugin-cache admission REFUSES a trigger on
+/// an instance that declares the first four rather than silently half-applying
+/// one; the `log` phase is the documented ungated boundary and is forwarded
+/// unconditionally. See `trigger_composition_error`.
 struct PluginInstanceWrapper {
     inner: Arc<dyn Plugin>,
     priority: u16,
@@ -746,10 +772,31 @@ pub(crate) fn validate_plugin_security_composition(
 ///   frames would let a "skipped" WAF stop inspecting the handshake while still
 ///   inspecting — or stop inspecting — the messages. Tracked for a typed
 ///   frame-phase predicate surface in a follow-up.
+/// * **The initial response-header policy.** `apply_initial_response_header_policy`
+///   is a synchronous, contextless re-assertion of a plugin-owned header set
+///   (`security_headers`), invoked from paths that hold no `RequestContext` at
+///   all — the gateway's own error/short-circuit header assembly among them — and
+///   its declared names are folded into a per-generation list the H3
+///   cross-protocol bridge carries. There is nothing to evaluate at those call
+///   sites and nothing per-request in the folded list, so gating the hook that
+///   does have a context while the others keep applying would half-apply the
+///   trigger: the same instance would own the header on one response and not on
+///   the next. Refused instead.
 /// * **An identity-reading trigger on an authentication plugin.** `authenticate`
 ///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
 ///   which makes the effective auth chain order-dependent.
+/// * **An identity-reading trigger on a STREAM-ONLY plugin.** The stream
+///   lifecycle has exactly one gated hook, `on_stream_connect`, and stream
+///   authentication runs inside that same priority-ordered chain, so every gated
+///   stream phase is at or before the stream authentication boundary. An
+///   identity-reading trigger therefore never gates a stream connection
+///   (`PluginTriggerGate::admits_stream` returns "run" without memoizing, the
+///   same rule as `TriggerPhase::PreAuth`), and `spiffe_id` has no authoritative
+///   stream fact at all. On a plugin that also serves HTTP that is a documented
+///   per-protocol limitation and the trigger still governs its HTTP requests. On
+///   a plugin whose protocols are stream-only it could gate nothing whatsoever,
+///   so it is refused rather than accepted as an inert predicate.
 fn trigger_composition_error(
     plugin: &dyn Plugin,
     gate: &PluginTriggerGate,
@@ -774,12 +821,38 @@ fn trigger_composition_error(
             "the plugin runs UDP datagram hooks, which execute without a connection context and therefore cannot be gated by a trigger",
         );
     }
+    if plugin.is_initial_response_header_policy() {
+        return Some(
+            "the plugin owns the initial response-header policy, which is re-asserted without a request context and whose declared header names are published per generation, so a trigger could only be half-applied",
+        );
+    }
     if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
         return Some(
             "an authentication plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`, which its own phase establishes",
         );
     }
+    if gate.reads_authenticated_identity() && is_stream_only_plugin(plugin) {
+        return Some(
+            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: a stream connection's only gated phase is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
+        );
+    }
     None
+}
+
+/// Protocols whose plugin lifecycle is the stream connect/disconnect pair rather
+/// than the HTTP request pipeline. `Udp` covers DTLS, which has no separate
+/// [`ProxyProtocol`] variant.
+const STREAM_PROXY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp, ProxyProtocol::Udp];
+
+/// Whether every protocol this plugin serves is a stream protocol, so it can
+/// never reach the HTTP request pipeline where an identity predicate is
+/// authoritative.
+fn is_stream_only_plugin(plugin: &dyn Plugin) -> bool {
+    let protocols = plugin.supported_protocols();
+    !protocols.is_empty()
+        && protocols
+            .iter()
+            .all(|protocol| STREAM_PROXY_PROTOCOLS.contains(protocol))
 }
 
 /// A correlation header names one trust-domain value. Allowing two instances
@@ -869,6 +942,18 @@ impl Plugin for PluginInstanceWrapper {
     fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
         self.inner.has_proxy_lifecycle_state_for_test(proxy_id)
     }
+    fn has_proxy_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.inner
+            .has_proxy_lifecycle_state_for_generation_for_test(proxy_id, generation)
+    }
+    fn write_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.inner
+            .write_proxy_lifecycle_state_for_test(proxy_id, generation);
+    }
     fn mesh_bpf_metrics_exporter(
         &self,
     ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
@@ -909,6 +994,11 @@ impl Plugin for PluginInstanceWrapper {
         }
         self.inner.authenticate(ctx, consumer_index).await
     }
+    /// Deliberately UNGATED, both of them. Credential-redaction discovery is
+    /// fail-safe work: a skipped instance still knows which query parameters and
+    /// headers of THIS request carry its credentials, and suppressing that would
+    /// let a trigger leak a token into a log line. Gating here could only ever
+    /// add disclosure, which is the one thing a trigger must never do.
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         self.inner.mark_query_credentials_for_redaction(ctx);
     }
@@ -1291,12 +1381,23 @@ impl Plugin for PluginInstanceWrapper {
         }
         self.inner.may_release_response_body_under_retries(ctx)
     }
+    // The five release predicates below answer "may the response body be
+    // released to the streaming path despite this instance?". The proxy folds
+    // them with `all(...)` and only ever asks an instance whose
+    // `should_buffer_response_body` said `true` — which a skipped instance never
+    // does. `true` is therefore the NO-CONTRIBUTION answer here, and the
+    // symmetric counterpart of the `false` those buffering predicates return: a
+    // skipped instance runs no response hook, so it can neither need the body
+    // retained nor pin the response to the buffered path.
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner.should_release_response_body_under_retries(
             ctx,
             response_status,
@@ -1309,6 +1410,9 @@ impl Plugin for PluginInstanceWrapper {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_before_content_type_rewrite(
                 ctx,
@@ -1322,6 +1426,9 @@ impl Plugin for PluginInstanceWrapper {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_later_no_transform(
                 ctx,
@@ -1335,6 +1442,9 @@ impl Plugin for PluginInstanceWrapper {
         response_status: u16,
         final_response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_simulated_final_headers(
                 ctx,
@@ -1348,12 +1458,31 @@ impl Plugin for PluginInstanceWrapper {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_later_strong_etag(
                 ctx,
                 response_status,
                 response_headers,
             )
+    }
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        // Opting a zero-byte synthetic response into the buffered body pipeline
+        // is work this instance requests for itself. A skipped instance requests
+        // none. Must also FORWARD (rather than fall back to the trait default)
+        // so a priority-overridden `openapi_validator` keeps enforcing an empty
+        // representation its contract distinguishes.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
+        self.inner
+            .should_process_empty_synthetic_response_body(ctx, response_status)
     }
     fn should_buffer_response_body_for_content_type(
         &self,
@@ -1374,6 +1503,24 @@ impl Plugin for PluginInstanceWrapper {
             response_status,
             response_headers,
         )
+    }
+    /// Must forward: this is the header-only half of the response phase
+    /// (`response_caching`'s RFC 9111 invalidation and cacheability marking),
+    /// and the trait default is a no-op. Omitting it silently dropped that work
+    /// for any instance an operator gave a `priority_override` — the exact
+    /// side effect `on_final_response_headers` exists to keep on the streaming
+    /// path (GHSA-pwcm-6rh8-f2gh).
+    fn on_final_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
+        self.inner
+            .on_final_response_headers(ctx, response_status, response_headers);
     }
     async fn on_response_body(
         &self,
@@ -1652,6 +1799,17 @@ impl Plugin for PluginInstanceWrapper {
     async fn log(&self, summary: &TransactionSummary) {
         self.inner.log(summary).await;
     }
+    /// Must forward: the trait default degrades to `log()`, so a wrapped mesh
+    /// observability sink would silently lose its precomputed RED key purely
+    /// because the instance carries a `priority_override` or a trigger. The
+    /// `log` phase is the documented ungated boundary, so no gate here.
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        self.inner.log_with_mesh_key(summary, mesh_key).await;
+    }
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
     }
@@ -1680,6 +1838,15 @@ impl Plugin for PluginInstanceWrapper {
         self.inner.on_stream_connect(ctx).await
     }
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        // Symmetry with `on_stream_connect`. The connection's decision travels
+        // on the summary in an opaque crate-constructed carrier, never through
+        // the summary's plugin-writable `metadata` map, so a skipped instance
+        // cannot be re-admitted here by another plugin's metadata write.
+        if let Some(gate) = &self.trigger
+            && !gate.stream_disconnect_decision_or_run(summary)
+        {
+            return;
+        }
         self.inner.on_stream_disconnect(summary).await;
     }
     fn requires_ws_frame_hooks(&self) -> bool {

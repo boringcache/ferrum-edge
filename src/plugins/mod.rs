@@ -7416,6 +7416,17 @@ impl StreamConnectionContext {
         run
     }
 
+    /// Snapshot the connection's execution-trigger decisions for the disconnect
+    /// summary.
+    ///
+    /// `on_stream_disconnect` sees only a [`StreamTransactionSummary`], so this
+    /// is how a connect-time skip reaches it. Every production summary-building
+    /// path must carry it; the carrier is opaque and crate-constructed so a
+    /// plugin cannot author or erase another instance's admission decision.
+    pub(crate) fn plugin_trigger_decisions(&self) -> StreamTriggerDecisions {
+        StreamTriggerDecisions(self.plugin_trigger_decisions.clone())
+    }
+
     /// Return the stable authenticated identity for stream policies. A mapped
     /// Consumer username takes precedence over any external authenticated identity.
     pub fn effective_identity(&self) -> Option<&str> {
@@ -7469,6 +7480,29 @@ impl StreamConnectionContext {
         while let Some(permit) = self.admission_permits.pop() {
             drop(permit);
         }
+    }
+}
+
+/// Opaque carrier for the per-instance execution-trigger decisions taken during
+/// `on_stream_connect`, so `on_stream_disconnect` can agree with them.
+///
+/// Deliberately not constructible with real content outside this crate: the only
+/// public way to make one is [`Default`] (no decisions, which fails closed to
+/// "the instance runs"). The tokens inside are process-local, opaque, and never
+/// serialized, so this can carry an admission authority that a plugin can
+/// neither read as configuration nor forge — unlike the summary's public
+/// `metadata` map.
+#[derive(Debug, Clone, Default)]
+pub struct StreamTriggerDecisions(Vec<(u64, bool)>);
+
+impl StreamTriggerDecisions {
+    /// The decision recorded for `token`, or `None` when this connection never
+    /// evaluated that instance's trigger.
+    pub(crate) fn decision(&self, token: u64) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
     }
 }
 
@@ -7539,6 +7573,17 @@ pub struct StreamTransactionSummary {
     #[doc(hidden)]
     #[serde(skip)]
     pub proxy_lifecycle_generation: Option<u64>,
+    /// Per-instance execution-trigger decisions taken during
+    /// `on_stream_connect`, carried so the wrapped disconnect hook agrees with
+    /// the connect hook. Not serialized, so the log/schema output is unchanged.
+    ///
+    /// The value is opaque: outside this crate the only constructible form is
+    /// the empty [`StreamTriggerDecisions::default()`], which fails closed to
+    /// "the instance runs". A plugin therefore cannot restate, forge, or erase
+    /// another instance's admission decision here.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub plugin_trigger_decisions: StreamTriggerDecisions,
 }
 
 /// Plugin execution priority bands.

@@ -169,9 +169,19 @@ plugin_configs:
 The trigger is a generic layer and never replaces route selection, mesh routing,
 or a plugin's own policy matchers. It is compiled and bounded at config load,
 admin write, and plugin-cache publication — the request path only walks
-precompiled matchers. A false trigger suppresses every hook of that instance,
-including its per-request buffering and enforcement claims, so a skipped
+precompiled matchers. A false trigger suppresses every hook of that instance —
+request, response, and stream connect/disconnect alike — including its
+per-request buffering, body-release, and enforcement claims, so a skipped
 instance makes no external call, takes no lease, and retains no state.
+
+Some surfaces cannot be gated coherently and are refused at publication rather
+than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
+contextless initial response-header policy (`security_headers`), an identity
+predicate on an authentication plugin, and an identity predicate on a
+stream-only plugin. An identity predicate (`consumer` / `auth_method` /
+`spiffe_id`) also never gates a stream connection at all — the one gated stream
+phase is where stream authentication itself runs — so on a plugin that serves
+both families it governs the HTTP half only.
 
 See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
 for the full predicate table, the deterministic absent/multi-value/case rules,

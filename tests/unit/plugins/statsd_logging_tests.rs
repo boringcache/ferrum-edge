@@ -35,6 +35,7 @@ fn default_client() -> PluginHttpClient {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_lifecycle_generation: None,

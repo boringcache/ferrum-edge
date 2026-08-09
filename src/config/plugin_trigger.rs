@@ -361,10 +361,23 @@ pub trait TriggerFacts {
     fn spiffe_id(&self) -> Option<&str>;
     /// Visit every value of the named header (name already ASCII-lowercased).
     /// `visit` returns `false` to stop the scan early.
+    ///
+    /// # Representability rule (all three field surfaces)
+    ///
+    /// A trigger compares text. An occurrence whose name or value is not valid
+    /// UTF-8 — a non-UTF-8 header line, a percent-encoding that decodes to
+    /// invalid UTF-8 — is **not observable** to a trigger: implementations skip
+    /// it rather than transcoding it. Lossy transcoding would let a hostile byte
+    /// sequence be coerced into `U+FFFD` and match a configured replacement
+    /// character, which under `not` flips a security instance's decision. The
+    /// skipped bytes are never copied, reflected, or logged.
     fn for_each_header_value(&self, lower_name: &str, visit: &mut FieldVisitor<'_>);
-    /// Visit every percent-decoded value of the named query parameter.
+    /// Visit every percent-decoded value of the named query parameter. Pairs
+    /// that do not decode to valid UTF-8 are skipped (see
+    /// [`Self::for_each_header_value`]).
     fn for_each_query_value(&self, name: &str, visit: &mut FieldVisitor<'_>);
-    /// Visit every value of the named cookie.
+    /// Visit every value of the named cookie. Cookie lines that are not valid
+    /// UTF-8 are skipped (see [`Self::for_each_header_value`]).
     fn for_each_cookie_value(&self, name: &str, visit: &mut FieldVisitor<'_>);
 }
 
@@ -746,7 +759,11 @@ fn compile_field_match(
     label: &str,
     lowercase_name: bool,
 ) -> Result<CompiledFieldMatch, String> {
-    let name = field.name.trim();
+    // Deliberately NOT trimmed. The strict rule below promises printable ASCII
+    // without whitespace, and silently normalizing `" x-tier "` into `x-tier`
+    // would admit a padded name as another configured field — a difference an
+    // operator reading the config back could not see.
+    let name = field.name.as_str();
     if name.is_empty() {
         return Err(format!("trigger: `{label}.name` must not be empty"));
     }
@@ -1000,11 +1017,13 @@ fn matches_field(field: &CompiledFieldMatch, kind: FieldKind, facts: &dyn Trigge
             };
             if matches_string(matcher, value) {
                 any_matched = true;
-                // `any` can stop at the first match; `all` must keep going.
-                !want_all
+                // `any` is settled by the first match, so it stops; `all` is not
+                // — a later occurrence can still be a miss — so it keeps going.
+                want_all
             } else {
                 all_matched = false;
-                // `all` can stop at the first miss; `any` must keep going.
+                // `all` is settled by the first miss, so it stops; `any` is not
+                // — a later occurrence can still match — so it keeps going.
                 !want_all
             }
         };

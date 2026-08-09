@@ -30,6 +30,31 @@
 //! toward "run" there is the only fail-closed choice — skipping a guard because
 //! its identity input has not been populated yet would widen access.
 //!
+//! A **stream** connection is that rule taken to its conclusion. Its only gated
+//! phase is `on_stream_connect`, and stream authentication (`mtls_auth`) runs
+//! inside that same priority-ordered chain, so every gated stream phase is at or
+//! before the stream authentication boundary and there is no later phase to
+//! defer the real decision to. An identity-reading trigger therefore never gates
+//! a stream connection: [`PluginTriggerGate::admits_stream`] returns "run"
+//! without memoizing, so `on_stream_disconnect` runs too. The same trigger still
+//! gates that instance's HTTP requests normally.
+//!
+//! When an instance is STREAM-ONLY (`supported_protocols()` carry no
+//! HTTP-family protocol), such a trigger could never gate anything at all, so
+//! plugin-cache publication refuses it outright rather than accepting an inert
+//! predicate. `spiffe_id` deserves the loudest note: a stream connection carries
+//! no authoritative peer SPIFFE fact at all (see
+//! [`StreamTriggerFacts::spiffe_id`]).
+//!
+//! # Stream connect / disconnect symmetry
+//!
+//! `on_stream_disconnect` receives only a `StreamTransactionSummary`. The
+//! connect-time decision travels with it in an opaque, non-serialized carrier
+//! (`StreamTransactionSummary::plugin_trigger_decisions`) that only this crate
+//! can populate, so a false connect trigger suppresses the disconnect hook too
+//! and no plugin can forge or erase that authority through the summary's public
+//! `metadata` map.
+//!
 //! # Redaction
 //!
 //! A skip records exactly one bounded metadata pair,
@@ -47,7 +72,7 @@ use crate::config::plugin_trigger::{
     CompiledPluginTrigger, FieldVisitor, PluginTrigger, PluginTriggerProtocol, TriggerFacts,
 };
 use crate::config::types::{BackendScheme, HttpFlavor, HttpWireTransport};
-use crate::plugins::{RequestContext, StreamConnectionContext};
+use crate::plugins::{RequestContext, StreamConnectionContext, StreamTransactionSummary};
 
 /// Process-local token generator. Tokens are opaque and never persisted; they
 /// only have to be unique among the instances a single request can observe.
@@ -126,11 +151,40 @@ impl PluginTriggerGate {
         ctx.plugin_trigger_decision(self.token).unwrap_or(true)
     }
 
+    /// Read the decision this instance took at `on_stream_connect`, carried on
+    /// the disconnect summary.
+    ///
+    /// `on_stream_disconnect` receives only a [`StreamTransactionSummary`], so
+    /// the connect-time outcome travels with it in an opaque, non-serialized,
+    /// crate-constructed carrier rather than through the summary's
+    /// plugin-writable `metadata` map — a plugin must not be able to author or
+    /// erase another instance's admission decision. Fails closed to "runs" when
+    /// the summary carries no decision for this instance (a connection whose
+    /// chain never reached this instance's `on_stream_connect`), so a trigger
+    /// can only ever remove work.
+    pub fn stream_disconnect_decision_or_run(&self, summary: &StreamTransactionSummary) -> bool {
+        summary
+            .plugin_trigger_decisions
+            .decision(self.token)
+            .unwrap_or(true)
+    }
+
     /// Decide whether this instance runs for a stream connection, memoizing the
     /// outcome so `on_stream_connect` and `on_stream_disconnect` agree.
+    ///
+    /// An identity-reading trigger does not gate a stream connection at all: it
+    /// returns `true` without memoizing, so both stream hooks run. This is the
+    /// same rule as [`TriggerPhase::PreAuth`], applied faithfully — every gated
+    /// stream phase is at or before the stream authentication boundary, because
+    /// stream authentication runs inside the one `on_stream_connect` chain.
+    /// There is no later phase to defer the real decision to, so "run" is where
+    /// it stays.
     pub fn admits_stream(&self, ctx: &mut StreamConnectionContext) -> bool {
         if let Some(decision) = ctx.plugin_trigger_decision(self.token) {
             return decision;
+        }
+        if self.compiled.reads_authenticated_identity() {
+            return true;
         }
         let decision = {
             let facts = StreamTriggerFacts::new(ctx);
@@ -310,11 +364,22 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
                 Some((raw_name, raw_value)) => (raw_name, raw_value),
                 None => (pair, ""),
             };
-            let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+            // Decode STRICTLY. `decode_utf8_lossy` would turn an invalid
+            // percent-decoded sequence into `U+FFFD`, so `?q=%FF` could satisfy
+            // a configured `"\u{FFFD}"` value — and beneath `not` that flips a
+            // security instance from "runs" to "skipped". An unrepresentable
+            // pair is simply not observable to a trigger, matching how a
+            // non-UTF-8 header line is skipped. The offending bytes are never
+            // copied, reflected, or logged.
+            let Ok(decoded_name) = percent_decode_str(raw_name).decode_utf8() else {
+                continue;
+            };
             if decoded_name != name {
                 continue;
             }
-            let decoded_value = percent_decode_str(raw_value).decode_utf8_lossy();
+            let Ok(decoded_value) = percent_decode_str(raw_value).decode_utf8() else {
+                continue;
+            };
             if !visit(decoded_value.as_ref()) {
                 return;
             }
@@ -418,6 +483,14 @@ impl TriggerFacts for StreamTriggerFacts<'_> {
         Some(self.ctx.listen_port)
     }
 
+    // The three identity accessors below are faithful reads of whatever a
+    // stream auth plugin has committed SO FAR, and they are unreachable from a
+    // configured trigger: `PluginTriggerGate::admits_stream` never evaluates an
+    // identity-reading predicate on a stream connection, because the one gated
+    // stream phase is also where stream authentication runs. They remain
+    // implemented so the facts view stays a faithful description of the context
+    // rather than a second, divergent definition of stream identity.
+
     fn consumer_identity(&self) -> Option<&str> {
         self.ctx.effective_identity()
     }
@@ -426,6 +499,19 @@ impl TriggerFacts for StreamTriggerFacts<'_> {
         self.ctx.auth_method
     }
 
+    /// Always `None`: a stream connection carries no authoritative peer SPIFFE
+    /// fact.
+    ///
+    /// The peer certificate is on the context, but the SPIFFE ID derived from it
+    /// is produced by a stream plugin and published only into the
+    /// plugin-writable `metadata` map, which must never become a security
+    /// authority. Reading it here would let a plugin author another instance's
+    /// admission decision; answering "absent" for every stream connection would,
+    /// under `not`, silently switch a security instance the wrong way. Neither is
+    /// acceptable, so `spiffe_id` — like every identity predicate — simply does
+    /// not gate a stream connection (`PluginTriggerGate::admits_stream`), and is
+    /// refused outright on a stream-only instance where it could gate nothing at
+    /// all. A configured trigger therefore never reaches this accessor.
     fn spiffe_id(&self) -> Option<&str> {
         None
     }

@@ -619,6 +619,9 @@ async fn emit_disconnect(
         namespace: proxy.namespace.clone(),
         proxy_id: proxy.id.clone(),
         proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
+        // Carry the connect-time execution-trigger outcomes so a skipped
+        // instance stays skipped at disconnect.
+        plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
         proxy_name: proxy.name.clone(),
         client_ip: client_ip.to_string(),
         consumer_username: stream_ctx.effective_identity().map(str::to_owned),

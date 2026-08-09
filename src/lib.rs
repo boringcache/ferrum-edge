@@ -2385,6 +2385,22 @@ pub mod _test_support {
         plugin.schema_type_cache_stats_for_test()
     }
 
+    // ── plugins/trigger ──────────────────────────────────────────────────────
+    /// Project a stream connection's memoized execution-trigger decisions onto
+    /// a disconnect summary, exactly as every production TCP/UDP/DTLS
+    /// disconnect path does.
+    ///
+    /// The carrier is deliberately not constructible with real content outside
+    /// this crate — that is what stops a plugin forging another instance's
+    /// admission decision — so external tests reach the production projection
+    /// through here rather than through a new runtime API.
+    pub fn attach_stream_trigger_decisions_for_test(
+        summary: &mut crate::plugins::StreamTransactionSummary,
+        ctx: &crate::plugins::StreamConnectionContext,
+    ) {
+        summary.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
@@ -2408,6 +2424,7 @@ pub mod _test_support {
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::plugins::StreamTransactionSummary {
         crate::plugins::StreamTransactionSummary {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-proxy".to_string(),
             proxy_lifecycle_generation: None,

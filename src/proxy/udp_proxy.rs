@@ -144,6 +144,11 @@ struct UdpSession {
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Per-instance execution-trigger decisions taken during
+    /// `on_stream_connect`, carried so `on_stream_disconnect` agrees. Opaque and
+    /// immutable for the session's lifetime — unlike `metadata`, no plugin can
+    /// write it.
+    plugin_trigger_decisions: crate::plugins::StreamTriggerDecisions,
     /// Immutable authoritative correlation ownership captured after admission.
     /// Per-datagram hooks mutate only `metadata`; disconnect-summary construction
     /// re-projects this state after cloning that final writable map.
@@ -1140,6 +1145,9 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.session.proxy_lifecycle_generation,
+        // Carry the connect-time execution-trigger outcomes so a skipped
+        // instance stays skipped at disconnect.
+        plugin_trigger_decisions: context.session.plugin_trigger_decisions.clone(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.session.consumer_username.clone(),
@@ -1210,6 +1218,10 @@ struct DtlsDisconnectContext<'a> {
     sni_hostname: Option<String>,
     metadata: &'a std::collections::HashMap<String, String>,
     correlation_ids: &'a CorrelationIdState,
+    /// Per-instance execution-trigger decisions captured from the accepted
+    /// connection's `StreamConnectionContext`, so `on_stream_disconnect` agrees
+    /// with `on_stream_connect`.
+    plugin_trigger_decisions: crate::plugins::StreamTriggerDecisions,
 }
 
 fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
@@ -1220,6 +1232,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.proxy_lifecycle_generation,
+        plugin_trigger_decisions: context.plugin_trigger_decisions,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.consumer_username,
@@ -3243,6 +3256,9 @@ async fn start_dtls_frontend_listener(
                     // Preserve the accepted connection's SNI across the session
                     // so disconnect summaries match `on_stream_connect`.
                     let handler_sni_hostname = stream_ctx.sni_hostname.clone();
+                    // Opaque connect-time execution-trigger outcomes, carried to
+                    // the disconnect summary so a skipped instance stays skipped.
+                    let handler_trigger_decisions = stream_ctx.plugin_trigger_decisions();
                     let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
                         stream_ctx.take_metadata_with_correlation_ids()
                     } else {
@@ -3339,6 +3355,7 @@ async fn start_dtls_frontend_listener(
                             sni_hostname: handler_sni_hostname.clone(),
                             metadata: &merged_metadata,
                             correlation_ids: &handler_correlation_ids,
+                            plugin_trigger_decisions: handler_trigger_decisions,
                         });
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
@@ -4207,6 +4224,7 @@ async fn create_session(
         consumer_username,
         auth_method,
         metadata: std::sync::Mutex::new(metadata),
+        plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
         correlation_ids,
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
@@ -5086,6 +5104,7 @@ mod tests {
 
     fn make_udp_session() -> UdpSession {
         UdpSession {
+            plugin_trigger_decisions: Default::default(),
             backend_socket: None,
             dtls_conn: None,
             last_activity: AtomicU64::new(1_710_000_000_500),
@@ -5283,6 +5302,7 @@ backend_tls_verify_server_cert: false
         let correlation_ids = Default::default();
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
@@ -5349,6 +5369,7 @@ backend_tls_verify_server_cert: false
         let sni = Some("device.example".to_string());
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
@@ -5579,6 +5600,7 @@ backend_tls_verify_server_cert: false
         let correlation_ids = Default::default();
         let metadata = HashMap::new();
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: None,
@@ -5627,6 +5649,7 @@ backend_tls_verify_server_cert: false
         // (disconnected_wall - connected_wall).
         let duration_ms = connected_mono.elapsed().as_millis() as f64;
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Frontend"),
@@ -5675,6 +5698,7 @@ backend_tls_verify_server_cert: false
         let disconnected_wall_forward = connected_wall + chrono::TimeDelta::hours(5);
         let duration_forward = connected_mono.elapsed().as_millis() as f64;
         let forward_summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: None,
@@ -6359,6 +6383,7 @@ backend_tls_verify_server_cert: false
     /// lifecycle without spinning up a UDP listener.
     fn make_udp_session_with_overload(state: &Arc<crate::overload::OverloadState>) -> UdpSession {
         UdpSession {
+            plugin_trigger_decisions: Default::default(),
             backend_socket: None,
             dtls_conn: None,
             last_activity: AtomicU64::new(0),

@@ -333,6 +333,45 @@ fn malformed_cidrs_methods_field_names_and_ports_are_rejected() {
     }
 }
 
+/// A padded field name is REJECTED, never silently normalized into another
+/// configured name. `" x-tier "` and `"x-tier"` are different strings, and the
+/// documented rule is "printable ASCII without whitespace" — trimming would
+/// quietly make an operator's typo address a header they did not write.
+#[test]
+fn field_names_are_not_trimmed_and_padded_names_are_rejected() {
+    for field in ["header", "query", "cookie"] {
+        for name in [
+            " x-tier",
+            "x-tier ",
+            " x-tier ",
+            "\tx-tier",
+            "x-tier\n",
+            "x tier",
+            " ",
+        ] {
+            let error = compile_error(serde_json::json!({
+                "when": {"match": {field: {"name": name}}}
+            }));
+            assert!(
+                error.contains("printable ASCII"),
+                "{field}.name {name:?} should be rejected as non-printable/whitespace, got: {error}"
+            );
+        }
+        // A non-ASCII name — including the replacement character a lossy
+        // decoder would produce — is rejected for the same reason.
+        let error = compile_error(serde_json::json!({
+            "when": {"match": {field: {"name": "\u{FFFD}"}}}
+        }));
+        assert!(error.contains("printable ASCII"), "{field}: {error}");
+
+        // The unpadded name still compiles, so the rejection is about the
+        // padding rather than the name.
+        let _accepted = compile(serde_json::json!({
+            "when": {"match": {field: {"name": "x-tier"}}}
+        }));
+    }
+}
+
 #[test]
 fn plugin_trigger_validate_matches_compilation() {
     let good = parse(serde_json::json!({"when": {"match": {"method": ["GET"]}}}));
@@ -435,11 +474,75 @@ fn repeated_field_occurrences_honor_any_and_all_semantics() {
     );
     assert!(!all.evaluate(&mixed), "all: every occurrence must match");
 
+    // The other order is the one an early-stop bug hides: a MATCHING first
+    // occurrence must not settle `all` and let a later mismatch go unseen.
+    let match_then_miss = Facts::http()
+        .with_header("x-tier", "gold")
+        .with_header("x-tier", "silver");
+    assert!(
+        any.evaluate(&match_then_miss),
+        "any: the first matching occurrence still suffices"
+    );
+    assert!(
+        !all.evaluate(&match_then_miss),
+        "all: a mismatch AFTER a match must still make the predicate false"
+    );
+
+    // Three occurrences, mismatch last, so the scan cannot stop at either end.
+    let trailing_miss = Facts::http()
+        .with_header("x-tier", "gold")
+        .with_header("x-tier", "gold")
+        .with_header("x-tier", "bronze");
+    assert!(any.evaluate(&trailing_miss));
+    assert!(!all.evaluate(&trailing_miss));
+
     let uniform = Facts::http()
         .with_header("x-tier", "gold")
         .with_header("x-tier", "gold");
     assert!(any.evaluate(&uniform));
     assert!(all.evaluate(&uniform));
+
+    // Same rule on the query and cookie surfaces, which use the same scan.
+    let query_all = compile(serde_json::json!({
+        "when": {"match": {"query": {
+            "name": "tier", "value": {"exact": ["gold"]}, "multi_value": "all"
+        }}}
+    }));
+    let query_uniform = Facts::http()
+        .with_query("tier", "gold")
+        .with_query("tier", "gold");
+    let query_match_then_miss = Facts::http()
+        .with_query("tier", "gold")
+        .with_query("tier", "silver");
+    assert!(query_all.evaluate(&query_uniform));
+    assert!(!query_all.evaluate(&query_match_then_miss));
+
+    let cookie_all = compile(serde_json::json!({
+        "when": {"match": {"cookie": {
+            "name": "tier", "value": {"exact": ["gold"]}, "multi_value": "all"
+        }}}
+    }));
+    let cookie_uniform = Facts::http()
+        .with_cookie("tier", "gold")
+        .with_cookie("tier", "gold");
+    let cookie_match_then_miss = Facts::http()
+        .with_cookie("tier", "gold")
+        .with_cookie("tier", "bronze");
+    assert!(cookie_all.evaluate(&cookie_uniform));
+    assert!(!cookie_all.evaluate(&cookie_match_then_miss));
+
+    // `not` over `all` is where the early-stop bug was a security bypass: an
+    // instance meant to run for anything that is NOT uniformly gold must run.
+    let not_all = compile(serde_json::json!({
+        "when": {"not": {"match": {"header": {
+            "name": "x-tier", "value": {"exact": ["gold"]}, "multi_value": "all"
+        }}}}
+    }));
+    assert!(
+        not_all.evaluate(&match_then_miss),
+        "not(all): a mismatch after a match must admit the instance"
+    );
+    assert!(!not_all.evaluate(&uniform));
 
     // `all` over zero occurrences is FALSE, not a vacuous truth.
     assert!(!all.evaluate(&Facts::http()));

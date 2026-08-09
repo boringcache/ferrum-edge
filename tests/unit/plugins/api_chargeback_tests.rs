@@ -127,6 +127,7 @@ fn make_stream_summary(
     bytes_received: u64,
 ) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_lifecycle_generation: None,

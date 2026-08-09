@@ -8827,7 +8827,10 @@ components:
             Authenticated consumer username, falling back to the external
             authenticated identity. Only authoritative after the authentication
             boundary — a trigger using it does not gate hooks at or before
-            `authenticate`, and is rejected outright on an authentication plugin.
+            `authenticate`, never gates a stream connection at all (whose one
+            gated phase, `on_stream_connect`, is also where stream
+            authentication runs), and is rejected outright on an authentication
+            plugin and on a stream-only plugin where it could gate nothing.
           $ref: "#/components/schemas/PluginTriggerIdentityMatch"
         auth_method:
           type: array
@@ -8835,14 +8838,19 @@ components:
           maxItems: 64
           description: >-
             Successful authentication mechanism name (for example `jwt_auth`),
-            compared ASCII-case-insensitively. Post-authentication only.
+            compared ASCII-case-insensitively. Post-authentication only, with
+            the same stream limitation and the same refusals as `consumer`.
           items:
             type: string
             maxLength: 1024
         spiffe_id:
           description: >-
             Peer SPIFFE ID established by mesh/mTLS identity.
-            Post-authentication only.
+            Post-authentication only, with the same stream limitation and the
+            same refusals as `consumer`. A stream connection additionally
+            carries no authoritative, non-forgeable peer SPIFFE fact, so the
+            predicate is never evaluated there rather than silently answering
+            "absent".
           $ref: "#/components/schemas/PluginTriggerIdentityMatch"
     PluginTriggerStringMatch:
       type: object
@@ -8889,9 +8897,17 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+          pattern: "^[!-~]+$"
           description: >-
-            Field name. Header names must be valid HTTP tokens and are matched
+            Field name. Must be printable ASCII with no whitespace; the value is
+            never trimmed, so a padded name is rejected rather than silently
+            normalized into another configured field. Header names must
+            additionally be valid HTTP tokens and are matched
             case-insensitively; query and cookie names are matched exactly.
+            A field occurrence whose name or value is not valid UTF-8 (a
+            non-UTF-8 header line, a percent-encoding that decodes to invalid
+            UTF-8) is not observable to a trigger and is skipped, so it can
+            satisfy neither `presence: present` nor a `value` comparison.
         presence:
           type: string
           enum: [present, absent]

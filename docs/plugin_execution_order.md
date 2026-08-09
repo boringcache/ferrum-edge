@@ -1195,9 +1195,9 @@ Available `match` predicates:
 | `source_cidr` | gateway-resolved client IP | exact address or CIDR; IPv4-mapped IPv6 normalized |
 | `namespace` / `proxy_id` | matched proxy identity | list is an OR |
 | `listen_port` | accepting frontend port | list is an OR |
-| `consumer` | authenticated consumer / external identity | **post-authentication only** |
-| `auth_method` | successful mechanism name | **post-authentication only** |
-| `spiffe_id` | peer SPIFFE ID | **post-authentication only** |
+| `consumer` | authenticated consumer / external identity | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `auth_method` | successful mechanism name | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `spiffe_id` | peer SPIFFE ID | **post-authentication only**; no authoritative stream fact, so it never gates a stream connection; refused on auth and stream-only plugins |
 
 `path`, `host`, `sni`, and every `value` use one of `exact` (list, OR), `prefix`
 (list, OR), or `regex` (implicitly anchored `^(?:…)$`), plus optional
@@ -1213,9 +1213,22 @@ Available `match` predicates:
   connection, so "only run on `/orders`" faithfully means "do not run".
 * **Multi-occurrence.** `multi_value: any` (default) needs one matching
   occurrence; `multi_value: all` needs every occurrence to match and at least one
-  to exist. `presence: absent` cannot be combined with `value`.
+  to exist — a match in the first occurrence never settles `all`, so a mismatch
+  in a later one still makes the predicate false. `presence: absent` cannot be
+  combined with `value`.
 * **Case.** Header names are ASCII-case-insensitive. Query and cookie names, and
   all values, are case-sensitive unless `case_insensitive: true`.
+* **Field names are never trimmed.** `header.name` / `query.name` /
+  `cookie.name` must be printable ASCII with no whitespace. `" x-tier "` is
+  rejected rather than silently normalized into `x-tier`, so a padded name can
+  never quietly address a field the operator did not write.
+* **Unrepresentable occurrences are invisible.** A trigger compares text. A
+  header line that is not valid UTF-8, or a query pair whose percent-decoded
+  name or value is not valid UTF-8, is skipped: it satisfies neither
+  `presence: present` nor a `value` comparison, and the bytes are never copied,
+  reflected, or logged. Lossy transcoding is deliberately not used — it would
+  let `?q=%FF` match a configured `U+FFFD` and, under `not`, switch a security
+  instance off.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
 
@@ -1236,16 +1249,52 @@ real decision. Failing toward "run" there is the only fail-closed choice:
 skipping a guard because its identity input has not been populated yet would
 widen access.
 
+A **stream** connection is that same rule taken to its conclusion.
+`on_stream_connect` is its only gated phase, and stream authentication
+(`mtls_auth`) runs inside that same priority-ordered chain, so every gated stream
+phase is at or before the stream authentication boundary and there is no later
+phase to defer the real decision to. An identity predicate therefore **never
+gates a stream connection**: the instance runs, no decision is memoized, and
+`on_stream_disconnect` runs with it. The same trigger still gates that instance's
+HTTP requests normally. `spiffe_id` has a second, independent reason: a stream
+connection carries no authoritative, non-forgeable peer SPIFFE fact at all — the
+derived value lives only in the plugin-writable metadata map, which must never
+become a security authority — so the predicate is not evaluated there rather than
+silently answering "absent" and, under `not`, admitting or skipping the wrong
+way.
+
+On a **stream-only** plugin (`supported_protocols()` carry no HTTP-family
+protocol — `tcp_connection_throttle`, `udp_rate_limiting`) such a trigger could
+gate nothing whatsoever, so publication **rejects** it instead of accepting an
+inert predicate.
+
+`on_stream_connect` and `on_stream_disconnect` always agree. The connect decision
+travels to the disconnect hook on the `StreamTransactionSummary` in an opaque,
+non-serialized carrier that only the gateway can populate, never through the
+summary's plugin-writable `metadata` map, so no plugin can forge or erase another
+instance's admission. A disconnect summary that carries no decision (a connection
+whose chain never reached that instance's `on_stream_connect`) fails closed to
+"runs".
+
 ### What a false trigger suppresses
 
-Every request and response hook of that instance, plus its per-request buffering
-and policy-enforcement claims — `should_buffer_request_body`,
-`should_buffer_response_body`, `enforces_final_request_body_policy`,
-`enforces_response_body_policy`, `enforces_final_client_visible_response_*`,
-`try_backend_admission`, `response_stream_inspector`, and the finalized-request
-egress dispatch. A skipped instance therefore performs no external call, takes no
-lease or reservation, retains no state, and never forces a body buffer of its
-own. A trigger can only ever *remove* work; it never adds buffering.
+Every request, response, and stream hook of that instance, plus its per-request
+buffering, body-release, and policy-enforcement claims —
+`should_buffer_request_body`, `should_buffer_response_body`,
+`should_release_response_body_*`, `should_process_empty_synthetic_response_body`,
+`enforces_final_request_body_policy`, `enforces_response_body_policy`,
+`enforces_final_client_visible_response_*`, `try_backend_admission`,
+`response_stream_inspector`, `on_final_response_headers`, the finalized-request
+egress dispatch, and `on_stream_connect` / `on_stream_disconnect`. A skipped
+instance therefore performs no external call, takes no lease or reservation,
+retains no state, and never forces a body buffer of its own. A trigger can only
+ever *remove* work; it never adds buffering.
+
+The `should_release_response_body_*` predicates are the one place where a skipped
+instance answers `true` rather than `false`: the proxy folds them with `all(...)`
+and only asks an instance that already said it buffers, so `true` is the
+no-contribution answer. Answering `false` would pin a response to the buffered
+path on account of an instance that runs no response hook at all.
 
 Static chain-shape declarations (`supported_protocols`,
 `requires_request_body_buffering`, `modifies_request_headers`, priority) are
@@ -1265,15 +1314,27 @@ declares those hooks (`requires_ws_frame_hooks`, `observes_ws_frame_decisions`,
 `requires_udp_datagram_hooks`). A typed frame/datagram-phase predicate surface is
 tracked as follow-up work.
 
+The **initial response-header policy** (`is_initial_response_header_policy` —
+`security_headers`) is refused for the same reason. Its
+`apply_initial_response_header_policy` re-assertion runs from paths that hold no
+`RequestContext`, including the gateway's own error/short-circuit header
+assembly, and the names it declares are folded into a per-generation list the H3
+cross-protocol bridge carries. Gating only the one call site that has a context
+would leave the same instance owning the header on one response and not on the
+next, so a trigger on such a plugin is rejected outright.
+
 The `log` phase (12) receives only a `TransactionSummary` and is likewise not
 gated; a triggered logger still emits its record for a request whose earlier
-hooks were skipped. The skip is visible in that record — see below.
+hooks were skipped. The skip is visible in that record — see below. (The stream
+counterpart, `on_stream_disconnect`, *is* gated: it agrees with
+`on_stream_connect` through the carrier described above.)
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
 is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a
 trigger could only read another mechanism's committed identity and would make the
 effective auth chain order-dependent. That composition is rejected at
-publication.
+publication, as is an identity predicate on a **stream-only** plugin (see
+"Decide-once and phase safety" above).
 
 ### Validation and bounds
 
@@ -1281,7 +1342,8 @@ Patterns are compiled once, at config load, admin write, and plugin-cache
 publication — never per request. Rejected fail-closed: unknown fields, a node
 with zero or multiple branches, a `match` leaf with zero or multiple predicates,
 an empty `all`/`any`, `presence: absent` combined with `value`, a malformed or
-oversized regex, a malformed CIDR, a non-token header name, a zero
+oversized regex, a malformed CIDR, a field name that is not printable ASCII
+without whitespace (including a padded one), a non-token header name, a zero
 `listen_port`, and the composition rules above.
 
 | Bound | Limit |
