@@ -1238,7 +1238,13 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
 
     let reduced = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-narrow"])],
-        vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None, None)],
+        vec![cors_config(
+            "cors-narrow",
+            &["GET"],
+            &["X-Test"],
+            None,
+            None,
+        )],
     );
     let reduced_delta = ConfigDelta::compute(&composed, &reduced);
     let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&composed, &reduced);
