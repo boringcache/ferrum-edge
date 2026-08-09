@@ -13752,7 +13752,10 @@ fn build_mesh_workload_api_attestors(
         if entry.is_empty() {
             continue;
         }
-        rules.push(parse_workload_api_unix_identity_rule(entry, trust_domain)?);
+        rules.push(crate::identity::attestation::unix::parse_identity_rule(
+            entry,
+            trust_domain,
+        )?);
     }
     if !rules.is_empty() {
         let attestor = UnixAttestor::new(UnixAttestorConfig {
@@ -13797,73 +13800,6 @@ fn build_mesh_workload_api_attestors(
         );
     }
     Ok(attestors)
-}
-
-/// Parse one `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` entry.
-///
-/// Accepted forms, both binding kernel-attested evidence to exactly one SPIFFE
-/// ID in the local trust domain:
-///
-/// - `uid:<uid>=spiffe://<trust-domain>/<path>`
-/// - `sha256:<hex>=spiffe://<trust-domain>/<path>` (SHA-256 of the peer binary)
-///
-/// Anything else is refused. Diagnostics name the *shape* that was expected and
-/// never echo the operator's value, so a rule that accidentally contains a
-/// credential-looking string is not reflected into startup logs.
-fn parse_workload_api_unix_identity_rule(
-    entry: &str,
-    trust_domain: &crate::identity::TrustDomain,
-) -> Result<crate::identity::attestation::unix::UnixIdentityRule, anyhow::Error> {
-    use crate::identity::attestation::unix::UnixIdentityRule;
-
-    let (selector, spiffe_id) = entry.split_once('=').ok_or_else(|| {
-        anyhow::anyhow!(
-            "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entries must be \
-             'uid:<uid>=<spiffe-id>' or 'sha256:<hex>=<spiffe-id>'"
-        )
-    })?;
-    let spiffe_id = crate::identity::SpiffeId::new(spiffe_id.trim().to_string()).map_err(|_| {
-        anyhow::anyhow!(
-            "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entry does not name a valid SPIFFE ID"
-        )
-    })?;
-    if spiffe_id.trust_domain() != trust_domain {
-        anyhow::bail!(
-            "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entry names a SPIFFE ID outside the \
-             local trust domain '{trust_domain}'"
-        );
-    }
-
-    let selector = selector.trim();
-    if let Some(uid) = selector.strip_prefix("uid:") {
-        let uid: u32 = uid.trim().parse().map_err(|_| {
-            anyhow::anyhow!(
-                "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES 'uid:' selector is not a numeric uid"
-            )
-        })?;
-        return Ok(UnixIdentityRule {
-            require_uid: Some(uid),
-            require_binary_sha256: None,
-            spiffe_id,
-        });
-    }
-    if let Some(digest) = selector.strip_prefix("sha256:") {
-        let digest = digest.trim().to_ascii_lowercase();
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            anyhow::bail!(
-                "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES 'sha256:' selector is not a \
-                 64-character hex digest"
-            );
-        }
-        return Ok(UnixIdentityRule {
-            require_uid: None,
-            require_binary_sha256: Some(digest),
-            spiffe_id,
-        });
-    }
-    anyhow::bail!(
-        "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES selector must start with 'uid:' or 'sha256:'"
-    )
 }
 
 /// Ask the CA's JWT signing authority — when it has one — to rotate if its

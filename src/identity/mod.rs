@@ -101,6 +101,21 @@ pub fn allow_no_ca() -> bool {
         .unwrap_or(false)
 }
 
+/// Canonical read of the `FERRUM_MESH_ALLOW_STATIC_ID` dev opt-in.
+///
+/// This remains a direct environment-only guardrail and is always disabled in
+/// production. Keeping the read here lets configuration validation and the
+/// runtime [`attestation::static_id::StaticAttestor`] agree about whether the
+/// fallback attestor is actually available.
+pub fn allow_static_id() -> bool {
+    if production_mode() {
+        return false;
+    }
+    std::env::var("FERRUM_MESH_ALLOW_STATIC_ID")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Canonical read of the `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` dev opt-in — the
 /// per-posture sibling to `FERRUM_MESH_CA_BOOTSTRAP_DEV` /
 /// `FERRUM_MESH_ALLOW_STATIC_ID` / `FERRUM_MESH_ALLOW_NO_CA`.

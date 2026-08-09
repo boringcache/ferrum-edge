@@ -5433,35 +5433,30 @@ impl EnvConfig {
                 if self.mesh_workload_api_enabled && any_file_workload_identity {
                     return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
                 }
-                if mesh_ca_backend != crate::identity::ca::CaBackend::None
+                let workload_spiffe_id = if mesh_ca_backend
+                    != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
                     let workload_spiffe_id = crate::config::conf_file::resolve_ferrum_var(
                         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     )
-                    .filter(|value| !value.trim().is_empty());
-                    match workload_spiffe_id {
-                        None => {
-                            return Err(
-                                "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
-                                 the issued runtime SVID matches the local mesh workload identity"
-                                    .into(),
-                            );
-                        }
-                        Some(id) => {
-                            // Parse it exactly like startup's
-                            // `configured_mesh_workload_spiffe_id` so `validate`
-                            // and mesh startup agree: a non-SPIFFE value (e.g.
-                            // `not-a-spiffe-id`) must fail here, not silently pass
-                            // settings validation then abort at boot.
-                            crate::identity::SpiffeId::new(id).map_err(|e| {
-                                format!(
-                                    "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
-                                     FERRUM_MESH_CA_BACKEND is enabled: {e}"
-                                )
-                            })?;
-                        }
-                    }
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
+                         the issued runtime SVID matches the local mesh workload identity"
+                            .to_string()
+                    })?;
+                    // Parse it exactly like startup's
+                    // `configured_mesh_workload_spiffe_id` so `validate` and
+                    // mesh startup agree: a non-SPIFFE value must fail here,
+                    // not silently pass settings validation then abort at boot.
+                    let workload_spiffe_id =
+                        crate::identity::SpiffeId::new(workload_spiffe_id).map_err(|e| {
+                            format!(
+                                "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+                                 FERRUM_MESH_CA_BACKEND is enabled: {e}"
+                            )
+                        })?;
                     // Mirror `bootstrap_dev_root`'s refusal so `validate` agrees
                     // with startup: the internal self-signed CA only bootstraps in
                     // non-production with FERRUM_MESH_CA_BOOTSTRAP_DEV=true. Without
@@ -5487,7 +5482,10 @@ impl EnvConfig {
                             );
                         }
                     }
-                }
+                    Some(workload_spiffe_id)
+                } else {
+                    None
+                };
                 if self.mesh_workload_api_enabled {
                     // The backend gate runs FIRST. A backend that cannot serve
                     // this surface at all is the decisive diagnostic; reporting
@@ -5534,6 +5532,44 @@ impl EnvConfig {
                     socket.validate().map_err(|e| {
                         format!("Invalid FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: {e}")
                     })?;
+
+                    // Parse the attestor configuration through the same
+                    // identity-layer parser startup uses. This stays after the
+                    // backend and socket gates so their decisive diagnostics
+                    // retain priority over a malformed mapping rule.
+                    let trust_domain = workload_spiffe_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "internal: enabled Workload API has no parsed workload SPIFFE ID"
+                                .to_string()
+                        })?
+                        .trust_domain();
+                    let mut has_unix_attestor = false;
+                    for raw in &self.mesh_workload_api_unix_identity_rules {
+                        let entry = raw.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        crate::identity::attestation::unix::parse_identity_rule(
+                            entry,
+                            trust_domain,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}"
+                            )
+                        })?;
+                        has_unix_attestor = true;
+                    }
+                    if !has_unix_attestor && !crate::identity::allow_static_id() {
+                        return Err(
+                            "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires at least one attestor: \
+                             set FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES to map peer \
+                             credentials to SPIFFE IDs. For dev/test only, \
+                             FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
+                                .into(),
+                        );
+                    }
                 }
                 // Validate the production-mode flag value loudly — like
                 // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)

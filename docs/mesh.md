@@ -2893,13 +2893,15 @@ The JWT RPCs are reachable only through Ferrum's own in-process Workload API ser
 ```bash
 FERRUM_MESH_WORKLOAD_API_ENABLED=true
 FERRUM_MESH_CA_BACKEND=internal                                       # the only backend that can serve it
+FERRUM_MESH_WORKLOAD_SPIFFE_ID=spiffe://example.org/ns/ferrum/sa/ferrum
+FERRUM_MESH_CA_BOOTSTRAP_DEV=true
 FERRUM_MESH_WORKLOAD_API_SOCKET_PATH=/run/ferrum/workload-api/socket   # parent dir must already exist
 FERRUM_MESH_WORKLOAD_API_SOCKET_MODE=0660
 FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES=uid:1000=spiffe://example.org/ns/default/sa/app
 FERRUM_MESH_JWT_SIGNING_KEY_PEM_FILE=/etc/ferrum/jwt-signing-key.pem
 ```
 
-Startup is fail-closed at every step. The surface requires `FERRUM_MESH_CA_BACKEND=internal` (it mints from the same runtime authority the mesh SVID rotation loop drives), no explicit `FERRUM_GATEWAY_SVID_*` file override (file identity suppresses that authority source), and at least one attestor rule; a socket-contract, permission, or bind failure **fails startup** rather than leaving the surface silently unbound.
+Startup is fail-closed at every step. The surface requires `FERRUM_MESH_CA_BACKEND=internal`, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`, and the dev-only `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` self-signed-root opt-in (it mints from the same runtime authority the mesh SVID rotation loop drives), no explicit `FERRUM_GATEWAY_SVID_*` file override (file identity suppresses that authority source), and at least one attestor rule; a socket-contract, permission, or bind failure **fails startup** rather than leaving the surface silently unbound. Because the internal CA currently has only this dev/test bootstrap and that bootstrap is refused under `FERRUM_MESH_PRODUCTION_MODE=true`, Ferrum's in-process Workload API is currently **dev/test-only and unavailable in production mode**.
 
 The socket is a credential-adjacent surface — whoever can replace it can impersonate the endpoint workloads dial for their identity — so the contract below is validated **before** bind, and each clause is a guarantee Ferrum actually enforces rather than an aspiration:
 
@@ -2932,6 +2934,9 @@ On Kubernetes these are ordinary passthrough env on the mesh chart:
 ambient:
   env:
     FERRUM_MESH_WORKLOAD_API_ENABLED: "true"
+    FERRUM_MESH_CA_BACKEND: internal
+    FERRUM_MESH_WORKLOAD_SPIFFE_ID: spiffe://example.org/ns/ferrum/sa/ferrum
+    FERRUM_MESH_CA_BOOTSTRAP_DEV: "true"
     FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: /run/ferrum/workload-api/socket
     FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: uid:1000=spiffe://example.org/ns/default/sa/app
     FERRUM_MESH_JWT_SIGNING_KEY_PEM_FILE: /var/run/secrets/ferrum/jwt-signing-key.pem
