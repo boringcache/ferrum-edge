@@ -475,6 +475,112 @@ fn service_import_endpoint_slice_expansion_when_pod_discovery_enabled() {
 }
 
 #[test]
+fn named_service_import_port_expands_onto_the_slice_container_port() {
+    // A `ServiceImport` carries no `targetPort`, so the ClusterSet port number
+    // is NOT the pod port: MCS-derived EndpointSlices mirror the exporting
+    // cluster's slices, whose `ports[].port` is the backing container port and
+    // whose `ports[].name` is the ClusterSet port's name. Resolving by number
+    // (or falling back to the ClusterSet number) would dial 10.0.0.10:80 for a
+    // `80 -> http -> 8080` import.
+    let route = http_route(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store",
+            "port": 80
+        }]),
+    );
+    let import = service_import_with_ports(
+        "store",
+        "default",
+        "multicluster.x-k8s.io/v1alpha1",
+        json!([{ "name": "http", "port": 80, "protocol": "TCP" }]),
+    );
+    let mut slice = object(
+        "EndpointSlice",
+        "store-mcs",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({
+            "ports": [{ "name": "http", "port": 8080 }],
+            "endpoints": [{
+                "addresses": ["10.0.0.10"],
+                "conditions": { "ready": true }
+            }]
+        }),
+    );
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+
+    let translation = translate_k8s_objects(
+        &[route, import, slice],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("named ServiceImport port should resolve through the slice port name");
+    assert_eq!(translation.config.proxies[0].backend_host, "10.0.0.10");
+    assert_eq!(translation.config.proxies[0].backend_port, 8080);
+}
+
+#[test]
+fn unmappable_service_import_slice_falls_back_to_clusterset_dns() {
+    // No slice port carries the ClusterSet port's name, so there is no honest
+    // container-port mapping. Skip the slice and keep the stable ClusterSet DNS
+    // target (which the MCS data plane resolves correctly) rather than guessing
+    // a pod port that may serve something else entirely.
+    let route = http_route(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store",
+            "port": 80
+        }]),
+    );
+    let import = service_import_with_ports(
+        "store",
+        "default",
+        "multicluster.x-k8s.io/v1alpha1",
+        json!([
+            { "name": "http", "port": 80, "protocol": "TCP" },
+            { "name": "admin", "port": 9090, "protocol": "TCP" }
+        ]),
+    );
+    let mut slice = object(
+        "EndpointSlice",
+        "store-mcs",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({
+            "ports": [{ "name": "admin", "port": 9091 }],
+            "endpoints": [{
+                "addresses": ["10.0.0.10"],
+                "conditions": { "ready": true }
+            }]
+        }),
+    );
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+
+    let translation = translate_k8s_objects(
+        &[route, import, slice],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("an unmappable MCS slice should still translate");
+    assert_eq!(
+        translation.config.proxies[0].backend_host,
+        "store.default.svc.clusterset.local"
+    );
+    assert_eq!(translation.config.proxies[0].backend_port, 80);
+}
+
+#[test]
 fn service_import_protocol_admission_is_fail_closed_with_status_parity() {
     for protocol in [json!("UDP"), json!("SCTP"), json!(7)] {
         let route = http_route_with_parent(

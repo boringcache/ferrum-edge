@@ -670,12 +670,12 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
-    /// MCS `ServiceImport` port inventory (`namespace → name → port → protocol`)
+    /// MCS `ServiceImport` port inventory (`namespace → name → port → entry`)
     /// for Gateway API `backendRef` resolution (GEP-1748). Presence of a key
     /// means the import was observed; an empty map still counts as existing so
     /// "import present, port unknown" is distinct from "import missing".
     service_import_ports:
-        HashMap<String, HashMap<String, HashMap<u16, backend_ref::ServiceImportPortProtocol>>>,
+        HashMap<String, HashMap<String, HashMap<u16, backend_ref::ServiceImportPort>>>,
     /// Bounded per-Service port metadata (`namespace → service → ports`) that
     /// retains the L4 transport of `spec.ports[].protocol`.
     ///
@@ -826,7 +826,7 @@ impl K8sAccumulator {
         &mut self,
         namespace: String,
         name: String,
-        ports: HashMap<u16, backend_ref::ServiceImportPortProtocol>,
+        ports: HashMap<u16, backend_ref::ServiceImportPort>,
     ) {
         self.service_import_ports
             .entry(namespace)
@@ -838,7 +838,7 @@ impl K8sAccumulator {
         &self,
         namespace: &str,
         name: &str,
-    ) -> Option<&HashMap<u16, backend_ref::ServiceImportPortProtocol>> {
+    ) -> Option<&HashMap<u16, backend_ref::ServiceImportPort>> {
         self.service_import_ports
             .get(namespace)
             .and_then(|imports| imports.get(name))

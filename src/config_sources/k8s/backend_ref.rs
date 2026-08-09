@@ -7,6 +7,7 @@
 //! Resolution and materialization run at reconcile/load time only.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use serde_json::Value;
 
@@ -32,6 +33,21 @@ pub(crate) const SERVICE_IMPORT_CLUSTERSET_DOMAIN: &str = "clusterset.local";
 pub(crate) enum ServiceImportPortProtocol {
     Tcp,
     Unsupported,
+}
+
+/// One collected `ServiceImport.spec.ports[]` entry.
+///
+/// `ServiceImport` deliberately omits `targetPort` (it is not meaningful to a
+/// consumer), so the port *name* is the only mapping from the ClusterSet port
+/// onto the backing container port published by MCS-derived EndpointSlices.
+/// Keep it alongside the protocol or EndpointSlice expansion has nothing to
+/// resolve a named port against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceImportPort {
+    pub(crate) protocol: ServiceImportPortProtocol,
+    /// `None` when the entry is unnamed or two entries for the same port
+    /// number disagree on their name (ambiguous — resolve conservatively).
+    pub(crate) name: Option<String>,
 }
 
 /// Field-specific failure while resolving a `ServiceImport` backend port.
@@ -150,10 +166,19 @@ pub(crate) fn message_is_unsupported_backend_kind(message: &str) -> bool {
     message.contains("unsupported backendRef target group")
 }
 
+/// Deliberately disjoint from [`message_is_unsupported_backend_kind`] and
+/// [`message_is_unsupported_backend_protocol`]: a `"backendRef target"`
+/// substring would also match the unsupported-kind message (`unsupported
+/// backendRef target group …`), and every protocol message names
+/// `backendRef ServiceImport`. Callers map a message to exactly one
+/// `ResolvedRefs` reason, so keep these three predicates non-overlapping
+/// rather than relying on `match` arm order.
 pub(crate) fn message_is_backend_not_found(message: &str) -> bool {
+    if message_is_unsupported_backend_protocol(message) {
+        return false;
+    }
     message.contains("backendRef Service")
         || message.contains("backendRef ServiceImport")
-        || message.contains("backendRef target")
         || (message.contains("backendRef") && message.contains("was not found"))
 }
 
@@ -282,11 +307,11 @@ pub(crate) fn resolve_service_import_port(
 }
 
 fn resolve_service_import_port_entries(
-    ports: &HashMap<u16, ServiceImportPortProtocol>,
+    ports: &HashMap<u16, ServiceImportPort>,
     requested_port: Option<u16>,
 ) -> Result<u16, ServiceImportPortError> {
     if let Some(requested_port) = requested_port {
-        return match ports.get(&requested_port) {
+        return match ports.get(&requested_port).map(|entry| entry.protocol) {
             Some(ServiceImportPortProtocol::Tcp) => Ok(requested_port),
             Some(ServiceImportPortProtocol::Unsupported) => {
                 Err(ServiceImportPortError::UnsupportedProtocol)
@@ -295,8 +320,8 @@ fn resolve_service_import_port_entries(
         };
     }
 
-    let mut tcp_ports = ports.iter().filter_map(|(port, protocol)| {
-        (*protocol == ServiceImportPortProtocol::Tcp).then_some(*port)
+    let mut tcp_ports = ports.iter().filter_map(|(port, entry)| {
+        (entry.protocol == ServiceImportPortProtocol::Tcp).then_some(*port)
     });
     let Some(port) = tcp_ports.next() else {
         return if ports.is_empty() {
@@ -520,32 +545,46 @@ fn resolve_service_import_object_port(
         else {
             continue;
         };
-        record_service_import_port(&mut ports, port, service_import_protocol(entry));
+        record_service_import_port(&mut ports, port, service_import_port_entry(entry));
     }
     resolve_service_import_port_entries(&ports, requested_port)
 }
 
-fn service_import_protocol(port_entry: &Value) -> ServiceImportPortProtocol {
-    match port_entry.get("protocol") {
-        None => ServiceImportPortProtocol::Tcp,
-        Some(Value::String(protocol)) if protocol == "TCP" => ServiceImportPortProtocol::Tcp,
-        Some(_) => ServiceImportPortProtocol::Unsupported,
+fn service_import_port_entry(port_entry: &Value) -> ServiceImportPort {
+    ServiceImportPort {
+        protocol: match port_entry.get("protocol") {
+            None => ServiceImportPortProtocol::Tcp,
+            Some(Value::String(protocol)) if protocol == "TCP" => ServiceImportPortProtocol::Tcp,
+            Some(_) => ServiceImportPortProtocol::Unsupported,
+        },
+        name: string_field(port_entry, "name")
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned),
     }
 }
 
 fn record_service_import_port(
-    ports: &mut HashMap<u16, ServiceImportPortProtocol>,
+    ports: &mut HashMap<u16, ServiceImportPort>,
     port: u16,
-    protocol: ServiceImportPortProtocol,
+    incoming: ServiceImportPort,
 ) {
-    ports
-        .entry(port)
-        .and_modify(|existing| {
-            if *existing != protocol {
-                *existing = ServiceImportPortProtocol::Unsupported;
+    match ports.entry(port) {
+        Entry::Occupied(mut occupied) => {
+            let existing = occupied.get_mut();
+            if existing.protocol != incoming.protocol {
+                existing.protocol = ServiceImportPortProtocol::Unsupported;
             }
-        })
-        .or_insert(protocol);
+            if existing.name != incoming.name {
+                // Two entries for one port number disagreeing on the name give
+                // no unambiguous EndpointSlice mapping; fall back to the
+                // ClusterSet DNS target rather than guessing one.
+                existing.name = None;
+            }
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(incoming);
+        }
+    }
 }
 
 fn object_has_numeric_port(object: &K8sObject, port: u16) -> bool {
@@ -576,7 +615,11 @@ pub(crate) fn collect_service_import(
         };
         // Reuse the same 1..=65535 port gate as Service collection.
         let port = super::port_from_u64(object, raw, "ServiceImport.spec.ports[].port")?;
-        record_service_import_port(&mut port_numbers, port, service_import_protocol(port_entry));
+        record_service_import_port(
+            &mut port_numbers,
+            port,
+            service_import_port_entry(port_entry),
+        );
     }
     acc.record_service_import_ports(
         object.metadata.namespace.clone(),

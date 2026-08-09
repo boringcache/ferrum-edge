@@ -747,6 +747,14 @@ pub(super) fn endpoint_route_backends_for_service_import(
     else {
         return Vec::new();
     };
+    // MCS-derived EndpointSlices mirror the exporting cluster's slices, so
+    // `ports[].port` is the backing container port and `ports[].name` is the
+    // ClusterSet port's name. `ServiceImport` carries no `targetPort`, so the
+    // name is the only mapping available — see `service_import_endpoint_port`.
+    let import_port_name = acc
+        .service_import_port_index(namespace, import_name)
+        .and_then(|ports| ports.get(&service_port))
+        .and_then(|entry| entry.name.as_deref());
 
     let mut seen = BTreeSet::new();
     let mut backends = Vec::new();
@@ -754,14 +762,9 @@ pub(super) fn endpoint_route_backends_for_service_import(
         slice.service_key == service_key
             && slice.backend_kind == EndpointSliceBackendKind::ServiceImport
     }) {
-        // ServiceImport ports are the destination ports published on the
-        // ClusterSet; slice ports carry those same numbers (no targetPort map).
-        let target_port = slice
-            .ports
-            .iter()
-            .find(|port| port.port == Some(service_port))
-            .and_then(|port| port.port)
-            .unwrap_or(service_port);
+        let Some(target_port) = service_import_endpoint_port(import_port_name, slice) else {
+            continue;
+        };
         for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
             for address in &endpoint.addresses {
                 if address.is_empty() {
@@ -781,6 +784,32 @@ pub(super) fn endpoint_route_backends_for_service_import(
         }
     }
     backends
+}
+
+/// Backing container port for one MCS-derived EndpointSlice.
+///
+/// A `ServiceImport` has no `targetPort`, so a *named* ClusterSet port resolves
+/// against the slice's like-named port exactly as a core Service resolves a
+/// named `targetPort`. An unnamed port is single-port by Kubernetes rules, so
+/// the slice's sole port is unambiguous. Anything else returns `None` and the
+/// slice is skipped: with no slice left the backend falls back to the stable
+/// ClusterSet DNS name, which is correct, rather than dialing the ClusterSet
+/// port number directly on a pod IP that may not serve it.
+fn service_import_endpoint_port(
+    import_port_name: Option<&str>,
+    slice: &CoreEndpointSlice,
+) -> Option<u16> {
+    if let Some(name) = import_port_name {
+        return slice
+            .ports
+            .iter()
+            .find(|port| port.name.as_deref() == Some(name))
+            .and_then(|port| port.port);
+    }
+    match slice.ports.as_slice() {
+        [only] => only.port,
+        _ => None,
+    }
 }
 
 fn endpoint_backend_port(
