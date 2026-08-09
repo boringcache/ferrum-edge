@@ -115,6 +115,14 @@ pub enum UnixSocketPathRejection {
     /// marker. A partially stripped transport identity must fail closed rather
     /// than falling through to the target's placeholder TCP address.
     MissingSocketPathTag,
+    /// The primary socket-path marker was present without the explicit wire
+    /// protocol marker. Both halves are required so a carrier that loses the
+    /// h2c selection cannot silently downgrade the backend to HTTP/1.1.
+    MissingWireProtocolTag,
+    /// The explicit wire-protocol marker was present but was not the canonical
+    /// boolean string `"true"` or `"false"`. Refuse rather than guessing which
+    /// protocol the application speaks.
+    InvalidWireProtocolTag,
     /// A Unix transport marker was combined with another reserved `mesh.*`
     /// tag. Mesh transport identities are mutually exclusive; accepting a
     /// mixed carrier would let tag ordering choose a different security
@@ -193,6 +201,12 @@ impl UnixSocketPathRejection {
             Self::TooLong => "unix socket path exceeds the portable sockaddr_un limit",
             Self::MissingSocketPathTag => {
                 "unix socket h2c marker is missing its socket path marker"
+            }
+            Self::MissingWireProtocolTag => {
+                "unix socket path marker is missing its wire protocol marker"
+            }
+            Self::InvalidWireProtocolTag => {
+                "unix socket wire protocol marker is not 'true' or 'false'"
             }
             Self::ConflictingTransportTags => {
                 "unix socket target carries conflicting reserved mesh transport tags"

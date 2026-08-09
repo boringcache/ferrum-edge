@@ -28,10 +28,12 @@
 //!    inode. A socket swapped between check and connect is closed unused.
 //! 3. **The wire protocol is carried, never inferred.**
 //!    [`MESH_UNIX_SOCKET_H2C_TAG`] is resolved at translation from the
-//!    listener's declared `port.protocol`; an absent tag is HTTP/1.1. h2c
-//!    carries native gRPC over the socket with full request/response streaming,
-//!    deadlines, cancellation, and trailers, because it reuses the sidecar
-//!    mesh-mTLS dispatch body (see [`dial_unix_h2c_sender`]).
+//!    listener's declared `port.protocol` and is always the canonical string
+//!    `"true"` or `"false"`. A missing or malformed marker is refused, so a
+//!    partially stripped carrier cannot silently downgrade h2c to HTTP/1.1.
+//!    h2c carries native gRPC over the socket with full request/response
+//!    streaming, deadlines, cancellation, and trailers, because it reuses the
+//!    sidecar mesh-mTLS dispatch body (see [`dial_unix_h2c_sender`]).
 //!
 //! Both tags live in the reserved `mesh.` namespace that
 //! `strip_reserved_mesh_tags` removes from every operator/workload label copy,
@@ -204,6 +206,11 @@ pub fn resolve_unix_socket_target<'a>(
     let Some(path) = target.tags.get(MESH_UNIX_SOCKET_TAG).map(String::as_str) else {
         return Some(Err(UnixSocketPathRejection::MissingSocketPathTag));
     };
+    match target.tags.get(MESH_UNIX_SOCKET_H2C_TAG).map(String::as_str) {
+        Some("true" | "false") => {}
+        Some(_) => return Some(Err(UnixSocketPathRejection::InvalidWireProtocolTag)),
+        None => return Some(Err(UnixSocketPathRejection::MissingWireProtocolTag)),
+    }
     Some(admit_configured_path(path, allowed_roots).map(|()| path))
 }
 
@@ -218,10 +225,10 @@ pub fn target_is_unix_backend(target: &UpstreamTarget) -> bool {
 /// Whether this Unix target speaks h2c prior-knowledge HTTP/2 (and therefore
 /// carries gRPC natively) rather than HTTP/1.1.
 ///
-/// Strict equality against `"true"`: the tag is written by the materializer
-/// only, and anything else is treated as ABSENT, so a corrupted carrier
-/// degrades to the declared-HTTP/1.1 handshake rather than being guessed into
-/// h2c.
+/// Strict equality against `"true"`. Callers must first pass
+/// [`resolve_unix_socket_target`], which rejects a missing, malformed, or
+/// conflicting transport carrier; `"false"` is the only admitted HTTP/1.1
+/// representation.
 #[inline]
 pub fn target_unix_backend_is_h2c(target: &UpstreamTarget) -> bool {
     target

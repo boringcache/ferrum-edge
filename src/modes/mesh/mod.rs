@@ -4811,16 +4811,13 @@ fn mesh_ingress_unix_upstream(
         socket_path.to_string(),
     );
     // The wire protocol is resolved once at translation from the declared
-    // `port.protocol` and carried explicitly. Dispatch NEVER infers it: an
-    // absent tag means HTTP/1.1, which is what an `http` listener declared, so
-    // a stripped tag degrades to the weaker-but-correct protocol rather than
-    // to a guessed h2c handshake the app would reject.
-    if h2c {
-        tags.insert(
-            crate::proxy::unix_backend::MESH_UNIX_SOCKET_H2C_TAG.to_string(),
-            "true".to_string(),
-        );
-    }
+    // `port.protocol` and carried explicitly. Both boolean values are written:
+    // dispatch rejects a missing or malformed marker rather than inferring a
+    // protocol or silently downgrading a partially stripped h2c carrier.
+    tags.insert(
+        crate::proxy::unix_backend::MESH_UNIX_SOCKET_H2C_TAG.to_string(),
+        h2c.to_string(),
+    );
     Upstream {
         id: upstream_id.to_string(),
         name: Some(upstream_id.to_string()),

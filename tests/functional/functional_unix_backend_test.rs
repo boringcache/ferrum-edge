@@ -137,6 +137,7 @@ fn build_config(entries: &[(&str, &str, &str)], placeholder_port: u16) -> String
         weight: 1
         tags:
           mesh.unix_socket: "{socket_path}"
+          mesh.unix_socket_h2c: "false"
 "#
         ));
     }

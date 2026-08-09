@@ -151,6 +151,8 @@ fn every_rejection_reason_is_specific_and_leaks_no_path() {
         UnixSocketPathRejection::ControlCharacter,
         UnixSocketPathRejection::TooLong,
         UnixSocketPathRejection::MissingSocketPathTag,
+        UnixSocketPathRejection::MissingWireProtocolTag,
+        UnixSocketPathRejection::InvalidWireProtocolTag,
         UnixSocketPathRejection::ConflictingTransportTags,
         UnixSocketPathRejection::ContainmentNotConfigured,
         UnixSocketPathRejection::InvalidContainmentRoot,

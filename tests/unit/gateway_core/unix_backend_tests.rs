@@ -116,6 +116,30 @@ fn a_lone_h2c_marker_fails_closed_as_a_malformed_unix_target() {
     );
 }
 
+/// The wire protocol is part of the transport identity, not an optional hint.
+/// Losing it must not turn an h2c backend into an HTTP/1.1 backend.
+#[test]
+fn a_lone_socket_path_marker_fails_closed_without_a_wire_protocol() {
+    let target = tagged_target(&[(MESH_UNIX_SOCKET_TAG, "/run/ferrum/app.sock")]);
+    assert!(target_is_unix_backend(&target));
+    assert_eq!(
+        resolve_unix_socket_target(&target, &["/run/ferrum".to_string()]),
+        Some(Err(UnixSocketPathRejection::MissingWireProtocolTag))
+    );
+}
+
+#[test]
+fn a_malformed_wire_protocol_marker_fails_closed() {
+    let target = tagged_target(&[
+        (MESH_UNIX_SOCKET_TAG, "/run/ferrum/app.sock"),
+        (MESH_UNIX_SOCKET_H2C_TAG, "yes"),
+    ]);
+    assert_eq!(
+        resolve_unix_socket_target(&target, &["/run/ferrum".to_string()]),
+        Some(Err(UnixSocketPathRejection::InvalidWireProtocolTag))
+    );
+}
+
 /// Reserved mesh transport identities are mutually exclusive. In particular,
 /// a carrier must not be able to make call-site ordering choose Unix instead
 /// of an mTLS/HBONE boundary (or vice versa).
@@ -123,6 +147,7 @@ fn a_lone_h2c_marker_fails_closed_as_a_malformed_unix_target() {
 fn mixed_reserved_mesh_transport_tags_are_rejected() {
     let target = tagged_target(&[
         (MESH_UNIX_SOCKET_TAG, "/run/ferrum/app.sock"),
+        (MESH_UNIX_SOCKET_H2C_TAG, "false"),
         ("mesh.mtls", "true"),
     ]);
     assert_eq!(

@@ -1766,7 +1766,7 @@ Every refusal is a pre-wire, gateway-side policy decision: `ErrorClass::Dispatch
 
 #### Protocol matrix
 
-The wire protocol is resolved **once at translation** from the declared `port.protocol` and carried on its own reserved tag (`mesh.unix_socket_h2c`). Dispatch never infers it; an absent tag means HTTP/1.1, which is exactly what an `http` listener declared.
+The wire protocol is resolved **once at translation** from the declared `port.protocol` and carried on its own reserved tag (`mesh.unix_socket_h2c`) as the explicit string `"true"` or `"false"`. Dispatch never infers it: a missing or malformed marker is refused so a partially stripped h2c carrier cannot silently downgrade to HTTP/1.1.
 
 | Declared `port.protocol` | Socket wire protocol | Status |
 |---|---|---|
