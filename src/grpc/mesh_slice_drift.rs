@@ -1081,7 +1081,25 @@ pub fn slice_content_digest(slice: &MeshSlice) -> Result<[u8; 32], MeshSliceDrif
     let mut canonical = slice.clone();
     canonical.version.clear();
     canonical.revision = None;
-    serde_json::to_value(&canonical)
+    canonical_content_digest(&canonical)
+}
+
+/// Canonical semantic digest of any serializable config payload.
+///
+/// The digesting core [`slice_content_digest`] uses, factored out so the mesh
+/// config-revision gate can bind the SAME canonicalization to content that is
+/// not a whole `MeshSlice` — notably the post-validation remote-cluster
+/// endpoint set (issue #3611). Callers that need `MeshSlice` semantics must go
+/// through [`slice_content_digest`], which additionally clears the
+/// observability-only `version` and the ordering-only `revision`.
+///
+/// The error carries no payload data, so a digest failure can be surfaced
+/// without disclosing anything about the content that failed to canonicalize.
+#[doc(hidden)]
+pub fn canonical_content_digest<T: Serialize>(
+    value: &T,
+) -> Result<[u8; 32], MeshSliceDriftAdmitError> {
+    serde_json::to_value(value)
         .map(canonical_json_value)
         .and_then(|value| serde_json::to_vec(&value))
         .map(Sha256::digest)

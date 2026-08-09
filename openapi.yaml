@@ -3290,7 +3290,19 @@ paths:
                                 incomparable_authority,
                                 missing_revision,
                                 malformed_revision,
+                                divergent_content,
+                                unidentified_content,
                               ]
+                            description: |
+                              `divergent_content` means the candidate carried
+                              the SAME `(authority, sequence)` as the accepted
+                              revision but different semantic content, so
+                              installing it would have rolled the mesh back at
+                              an equal sequence. `unidentified_content` means no
+                              content identity could be computed for a
+                              revisioned candidate, so the binding was
+                              unprovable and failed closed. Neither ever renders
+                              a digest or a content fragment.
                           consecutive:
                             type: integer
                             minimum: 1

@@ -7796,15 +7796,70 @@ pub mod _test_support {
             >,
         >,
         resource: kube::api::ApiResource,
+        revision: std::sync::Arc<crate::k8s_controller::revision::K8sConfigRevisionTracker>,
+        metrics: std::sync::Arc<crate::k8s_controller::metrics::ControllerMetrics>,
     }
 
     impl K8sWatchScopeForTest {
+        /// The Kubernetes convergence watermark for this scope set, read at the
+        /// production coherence point (issue #3611): the registered scope set is
+        /// pinned under the `ResourceStoreSet` lock and the watermark is read
+        /// BEFORE any snapshot would be materialized from it.
+        pub async fn revision_watermark(&self) -> Option<u64> {
+            let set = self.store_set.lock().await;
+            let scopes = set.scope_keys();
+            self.revision.converged_watermark(scopes.iter())
+        }
+
+        /// The revision this scope set would stamp on a publication right now,
+        /// including the in-process monotonic floor and the retain-last-good
+        /// behaviour when evidence is incomplete.
+        pub async fn publish_revision(
+            &self,
+        ) -> Option<crate::modes::mesh::revision::MeshConfigRevision> {
+            let watermark = self.revision_watermark().await;
+            self.revision.publish(watermark)
+        }
+
+        /// Tracker counters (withheld advances, unsequenced publications,
+        /// unparsable `resourceVersion` values).
+        pub fn revision_stats(&self) -> crate::k8s_controller::revision::K8sRevisionStats {
+            self.revision.stats()
+        }
+
+        /// Idle/readiness-timeout relists recorded by the production watcher.
+        /// Demand-driven revision-evidence refreshes deliberately do not
+        /// increment this long-standing metric.
+        pub fn watch_idle_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Raise the demand-driven evidence refresh the reconciler publication
+        /// boundary raises when it has to withhold mesh content under a
+        /// sequence it cannot advance (issue #3611). Every subscribed watch
+        /// scope starts a fresh generation, spaced by its own floor interval.
+        pub fn request_evidence_refresh(&self) {
+            self.revision.request_evidence_refresh();
+        }
         /// A `DynamicObject` in this scope's namespace, shaped like one the
         /// reflector would receive.
         pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
             kube::api::DynamicObject::new(name, &self.resource)
                 .within(namespace)
                 .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// [`Self::object`] stamped with a `metadata.resourceVersion`, as every
+        /// object the API server returns is.
+        pub fn object_at(
+            &self,
+            namespace: &str,
+            name: &str,
+            resource_version: &str,
+        ) -> kube::api::DynamicObject {
+            let mut object = self.object(namespace, name);
+            object.metadata.resource_version = Some(resource_version.to_string());
+            object
         }
 
         /// Deliver one watch event on `generation`'s stream. Panics if that
@@ -7871,8 +7926,47 @@ pub mod _test_support {
         generations: usize,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        k8s_watch_scope_with_revision_for_test(
+            group,
+            version,
+            kind,
+            plural,
+            scope,
+            idle_relist_secs,
+            generations,
+            None,
+            Vec::new(),
+            shutdown,
+        )
+    }
+
+    /// [`k8s_watch_scope_for_test`] plus the Kubernetes mesh-config revision
+    /// tracker (issue #3611).
+    ///
+    /// `authority` is the ordering domain the scope publishes under (`None`
+    /// disables publication). `boundaries` scripts the authoritative
+    /// `resourceVersion` boundary each successive watcher generation reads
+    /// immediately before its list — the value a one-item consistent list
+    /// returns in production. Generations past the end of `boundaries` read no
+    /// boundary, which is exactly what a failed or timed-out read yields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_with_revision_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        authority: Option<String>,
+        boundaries: Vec<Option<u64>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
         use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
-        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use crate::k8s_controller::revision::K8sConfigRevisionTracker;
+        use crate::k8s_controller::watcher::{
+            RelistPolicy, WatchBoundaryReader, WatchTarget, run_watcher_generations,
+        };
         use futures_util::{Stream, StreamExt};
         use kube::api::{ApiResource, DynamicObject};
         use kube::runtime::{reflector, watcher};
@@ -7939,13 +8033,27 @@ pub mod _test_support {
             }
         };
 
+        let revision = std::sync::Arc::new(K8sConfigRevisionTracker::new(authority));
+        let queue = std::collections::VecDeque::from(boundaries);
+        let scripted_boundaries = std::sync::Arc::new(std::sync::Mutex::new(queue));
+        let read_boundary: WatchBoundaryReader = Box::new(move || {
+            let next = match scripted_boundaries.lock() {
+                Ok(mut queue) => queue.pop_front().flatten(),
+                Err(poisoned) => poisoned.into_inner().pop_front().flatten(),
+            };
+            Box::pin(std::future::ready(next))
+        });
+
+        let metrics = std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
         let task = run_watcher_generations(
             target,
             initial_writer,
             store_set.clone(),
             change_notifier,
             RelistPolicy::from_idle_secs(idle_relist_secs),
-            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            std::sync::Arc::clone(&metrics),
+            std::sync::Arc::clone(&revision),
+            read_boundary,
             shutdown,
             make_stream,
         );
@@ -7955,6 +8063,8 @@ pub mod _test_support {
                 store_set,
                 senders,
                 resource,
+                revision,
+                metrics,
             },
             task,
         )
