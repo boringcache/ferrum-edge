@@ -5037,8 +5037,11 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
 /// the mesh peer asked for), so an authenticated HBONE CONNECT that matches no
 /// route is relayed through a proxy built on the fly with this id. Carries the
 /// `MESH_INBOUND_PROXY_ID_PREFIX` so `mesh_authz`'s `mesh_inbound_app_port`
-/// reads the relay's `backend_port` (the destination app port) when evaluating
-/// port-scoped policy, exactly as for a materialized sidecar inbound route.
+/// treats it as inbound. Port-scoped policy uses the CONNECT authority port
+/// stamped on `RequestContext::mesh_inbound_listener_authz_port` — not
+/// `backend_port` — because UDP EgressGateway may remap `backend_port` to a
+/// ServiceEntry `targetPort` for dialing while AuthorizationPolicy remains
+/// scoped to the ServiceEntry/authority port.
 pub(crate) const MESH_INBOUND_HBONE_RELAY_PROXY_ID: &str = "__mesh-inbound-hbone-relay";
 
 /// Build the transparent inbound HBONE relay proxy that dials `host:port` — the

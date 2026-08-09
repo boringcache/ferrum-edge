@@ -138,6 +138,63 @@ fn tcp_route_cross_namespace_parent_ref_materializes_in_gateway_namespace() {
 }
 
 #[test]
+fn cross_namespace_l4_route_ids_do_not_collide_in_gateway_namespace() {
+    let victim = object(
+        "TCPRoute",
+        "prod-db",
+        "team",
+        json!({
+            "parentRefs": [{
+                "name": "edge",
+                "namespace": "infra",
+                "sectionName": "tcp"
+            }],
+            "rules": [{"backendRefs": [{"name": "victim-db", "port": 5432}]}]
+        }),
+    );
+    let attacker = object(
+        "TCPRoute",
+        "db",
+        "team-prod",
+        json!({
+            "parentRefs": [{
+                "name": "edge",
+                "namespace": "infra",
+                "sectionName": "tcp"
+            }],
+            "rules": [{"backendRefs": [{"name": "attacker-db", "port": 5432}]}]
+        }),
+    );
+
+    let result = translate_k8s_objects(
+        &[tcp_gateway("All"), victim, attacker],
+        options().with_source_namespaces(vec![
+            "infra".to_string(),
+            "team".to_string(),
+            "team-prod".to_string(),
+        ]),
+    )
+    .expect("colliding readable route identities must both materialize");
+
+    assert_eq!(result.config.proxies.len(), 2);
+    assert_ne!(result.config.proxies[0].id, result.config.proxies[1].id);
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_host == "victim-db.team.svc.cluster.local")
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_host == "attacker-db.team-prod.svc.cluster.local")
+    );
+}
+
+#[test]
 fn weighted_tcp_route_cross_namespace_parent_keeps_first_backend_behavior() {
     let route = object(
         "TCPRoute",
