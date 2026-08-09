@@ -3136,6 +3136,21 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Local (destination) IP of the frontend connection this request arrived
+    /// on, stamped once at accept from the listener's bound address or the
+    /// accepted socket's own local address. For a mesh sidecar this is the
+    /// receiving pod IP; behind a wildcard bind it is the address the kernel
+    /// actually delivered the connection to.
+    ///
+    /// `mesh_authz` uses it for Istio's `destination.ip` condition, preferring
+    /// [`Self::orig_dst`] when the listener captured a pre-NAT original
+    /// destination. It is a transport fact only — never derived from
+    /// `Host`, `X-Forwarded-*`, or any other client-settable input, because a
+    /// client that could choose it would choose which destination-scoped
+    /// AuthorizationPolicy rule judges it. `None` when the accept path could
+    /// not resolve one; `mesh_authz` then fails a `destination.ip` condition
+    /// closed rather than treating the attribute as absent.
+    pub destination_ip: Option<std::net::IpAddr>,
     /// Mesh outbound service port selected by the router after host/path
     /// routing and optional original-destination disambiguation. Used by
     /// `mesh_authz` for Istio `destination.port` when an outbound request has
@@ -3348,6 +3363,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            destination_ip: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             finalized_request_egress_dispatched: false,
@@ -4502,6 +4518,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            destination_ip: self.destination_ip,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             // The finalized-request-egress phase always runs against the REAL
@@ -7328,6 +7345,21 @@ pub struct StreamConnectionContext {
     /// from `listen_port` because transparent capture listeners commonly bind
     /// a fixed interception port that is not the connection's original port.
     pub destination_port: Option<u16>,
+    /// Destination IP of the accepted transport connection. This prefers the
+    /// same trusted original-destination evidence as [`Self::destination_ip`]
+    /// and otherwise falls back to the accepted socket's local address.
+    ///
+    /// Mesh authorization uses this connection fact for Istio
+    /// `destination.ip`. L4 `stream_match.destination_subnets` deliberately
+    /// does not: routing may use only [`Self::destination_ip`], so an ordinary
+    /// listener's bind address cannot masquerade as captured original-
+    /// destination evidence.
+    pub connection_destination_ip: Option<std::net::IpAddr>,
+    /// TCP port paired with [`Self::connection_destination_ip`]. For a direct
+    /// listener this is the accepted socket's local port; for capture and
+    /// trusted PROXY paths it is the original destination port. Mesh authz uses
+    /// it ahead of `listen_port`, while L4 route selection ignores it.
+    pub connection_destination_port: Option<u16>,
     /// Listener-configured gateway binding for VirtualService L4 `gateways`
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
@@ -7389,6 +7421,8 @@ impl StreamConnectionContext {
             first_bytes_kind: None,
             destination_ip: None,
             destination_port: None,
+            connection_destination_ip: None,
+            connection_destination_port: None,
             trusted_gateway_ref: None,
             // Callers that know the peer/forwarded port (TCP accept path) set
             // this after construction; UDP/DTLS leave it at 0.
