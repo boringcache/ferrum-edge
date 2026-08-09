@@ -27163,21 +27163,18 @@ async fn handle_proxy_request_inner(
         // needs `&mut ctx` and may publish backend header overlay entries.
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
-        // branch cannot dispatch over its secured transport (issue #2003):
-        //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
-        //     `mesh.mtls`): the dial host is a remote-pod / scoped synthetic
-        //     identity that is NOT directly routable, and the dial has no
-        //     east-west gateway dial-host override, no destination-FQDN SNI
-        //     override, and no trust-domain-scoped verification. gRPC over
-        //     cross-cluster HBONE / mesh-mTLS is a documented follow-up
-        //     (HTTP-first), mirroring the WebSocket cross-cluster guards.
-        //   * Same-cluster Ambient `mesh.hbone` targets: the HBONE inner
-        //     protocol is HTTP/1.1 over a byte tunnel, which cannot carry the
-        //     HTTP/2 trailers gRPC requires — an explicit non-goal (see the
-        //     out-of-scope list in docs/mesh_supported_matrix.md), fail
-        //     closed rather than silently corrupt.
-        //   * `MeshMtls` is normally unreachable here (the fall-through above
-        //     routes it down the generic mesh path) — refuse defensively.
+        // direct-pool branch cannot dispatch over its secured transport
+        // (issue #2003):
+        //   * Sidecar `mesh.mtls` targets, same-cluster and cross-cluster,
+        //     normally fall through above to the generic trailer-preserving
+        //     mesh-mTLS path. Refuse defensively if either reaches this branch.
+        //   * Ambient `mesh.hbone` targets remain unsupported on this H1/H2
+        //     frontend because its generic HBONE path runs HTTP/1.1 inside the
+        //     CONNECT tunnel and cannot carry gRPC trailers. The H3 bridge uses
+        //     a separate nested-HTTP/2 transport for these targets (#3284).
+        //   * Malformed cross-cluster targets fail closed because the secured
+        //     east-west dial cannot be materialized without its transport,
+        //     destination-FQDN SNI override, and trust-domain scope.
         // Refuse cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
         // connection-level failure) before any backend dial / circuit-breaker
         // charge — NEVER a direct plaintext dial that would bypass the mesh
