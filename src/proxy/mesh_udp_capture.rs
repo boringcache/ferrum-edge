@@ -2826,9 +2826,15 @@ mod live_netns_tests {
             .ok()
     }
 
-    /// Spawn a throwaway host-shaped namespace with both ends of a veth pair in
-    /// that namespace. A locally generated client datagram leaves `pod0`,
-    /// re-enters through its peer `vethhost`, and therefore traverses the same
+    /// Spawn a throwaway host-shaped network + mount namespace with both ends of
+    /// a veth pair in that network namespace. The private sysfs mount is
+    /// load-bearing: a sysfs superblock is bound to the network namespace it was
+    /// mounted from, so the runner's original `/sys` cannot expose a veth created
+    /// after `unshare --net`. The parent reaches this mount through
+    /// `/proc/<pid>/root/sys` when it exercises the production sysfs validator.
+    ///
+    /// A locally generated client datagram leaves `pod0`, re-enters through its
+    /// peer `vethhost`, and therefore traverses the same
     /// `mangle PREROUTING -i <pod host interface>` hook as real pod egress. The
     /// host-network capture rule then TPROXY-delivers it to the production
     /// transparent socket while preserving both the original destination and
@@ -2849,6 +2855,8 @@ mod live_netns_tests {
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
              command -v ip >/dev/null 2>&1 || exit 97; \
+             command -v mount >/dev/null 2>&1 || exit 97; \
+             mount -t sysfs sysfs /sys || exit 98; \
              ip link set lo up 2>/dev/null || true; \
              ip link add pod0 type veth peer name vethhost || exit 98; \
              ip link set vethhost address 02:00:00:00:00:01 || exit 98; \
@@ -2865,7 +2873,15 @@ mod live_netns_tests {
              exec sleep 30"
         );
         Command::new("unshare")
-            .args(["--net", "sh", "-c", &script])
+            .args([
+                "--mount",
+                "--net",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                &script,
+            ])
             .spawn()
             .ok()
     }
@@ -3048,9 +3064,11 @@ mod live_netns_tests {
             return;
         };
 
+        let pid = child.id();
         let mut setup_exit: Option<std::process::ExitStatus> = None;
         let mut setup_status_unknown = false;
-        for _ in 0..40 {
+        let mut setup_ready = false;
+        for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(50));
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -3061,14 +3079,25 @@ mod live_netns_tests {
                     setup_status_unknown = true;
                     break;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // The setup script ends with `exec sleep 30`; seeing that
+                    // executable is an exact readiness signal that the private
+                    // sysfs mount, veth, routes, sysctl, and TPROXY rule all
+                    // completed. Merely seeing the child alive races the setup
+                    // sequence on a loaded host.
+                    setup_ready = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .is_ok_and(|comm| comm.trim() == "sleep");
+                    if setup_ready {
+                        break;
+                    }
+                }
             }
         }
         if let Some(status) = setup_exit {
             if status.code() == Some(98) {
                 panic!(
-                    "host-veth UDP TPROXY setup failed (exit 98): the veth, route, fwmark, or \
-                     interface-scoped TPROXY rule did not install"
+                    "host-veth UDP TPROXY setup failed (exit 98): the private sysfs mount, veth, \
+                     route, fwmark, or interface-scoped TPROXY rule did not install"
                 );
             }
             skip_or_fail(&format!(
@@ -3078,11 +3107,33 @@ mod live_netns_tests {
             return;
         }
         if setup_status_unknown {
+            let _ = child.kill();
+            let _ = child.wait();
             skip_or_fail("could not determine host-veth setup-child status");
             return;
         }
-        let pid = child.id();
+        if !setup_ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            skip_or_fail("host-veth setup did not reach its steady-state readiness marker");
+            return;
+        }
         let _guard = ChildGuard(child);
+
+        // `/proc/<pid>/root` resolves through the child's private mount
+        // namespace, whose `/sys` was mounted after entering its new network
+        // namespace. Reading the runner's own `/sys/class/net` here would always
+        // inspect the original network namespace, even after a thread-level
+        // `setns`, and would make the live validator fail for the wrong reason.
+        let child_sysfs = std::path::PathBuf::from(format!(
+            "/proc/{pid}/root/sys/class/net"
+        ));
+        let expected_ifindex =
+            super::super::host_udp_capture::dedicated_host_ifindex(&child_sysfs, "vethhost")
+                .unwrap_or_else(|error| panic!("validate live host-side veth: {error}"));
+        if super::super::host_udp_capture::dedicated_host_ifindex(&child_sysfs, "lo").is_ok() {
+            panic!("self-linked loopback device passed the dedicated-peer check");
+        }
 
         let observed = std::thread::spawn(move || -> Result<_, String> {
             let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
@@ -3091,14 +3142,6 @@ mod live_netns_tests {
             // thread, which exits without returning to the test runtime.
             if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
-            }
-
-            let sysfs = std::path::Path::new("/sys/class/net");
-            let expected_ifindex =
-                super::super::host_udp_capture::dedicated_host_ifindex(sysfs, "vethhost")
-                    .map_err(|error| format!("validate live host-side veth: {error}"))?;
-            if super::super::host_udp_capture::dedicated_host_ifindex(sysfs, "lo").is_ok() {
-                return Err("self-linked loopback device passed the dedicated-peer check".into());
             }
 
             let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
