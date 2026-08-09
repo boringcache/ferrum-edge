@@ -30835,7 +30835,8 @@ async fn handle_proxy_request_inner(
         };
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
@@ -30895,7 +30896,8 @@ async fn handle_proxy_request_inner(
         let block_reason = "sidecar SVID-mTLS backend transport is not available";
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
