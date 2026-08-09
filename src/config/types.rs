@@ -10,6 +10,7 @@
 //! - **Control character rejection**: Resource IDs, hostnames, and paths reject
 //!   control characters to prevent log injection attacks.
 
+use crate::config::plugin_trigger::PluginTrigger;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -2105,6 +2106,21 @@ pub enum HttpFlavor {
     WebSocket,
 }
 
+/// Client-visible HTTP wire transport that accepted a request.
+///
+/// Independent of [`HttpFlavor`]: an HTTP/2 native-gRPC request is
+/// `Http2` + `HttpFlavor::Grpc`. Stamped once at frontend intake and never
+/// derived from a client-supplied header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpWireTransport {
+    /// HTTP/1.0 or HTTP/1.1 (including TLS).
+    Http1,
+    /// HTTP/2 over TCP (h2 or h2c), including RFC 8441 Extended CONNECT.
+    Http2,
+    /// HTTP/3 over QUIC.
+    Http3,
+}
+
 /// Pre-computed dispatch classification for a proxy. Populated once at
 /// config-load time in `GatewayConfig::resolve_dispatch_kind()` so the
 /// request hot path is a single match on a 1-byte enum instead of a
@@ -2660,6 +2676,20 @@ pub struct PluginConfig {
     /// and you need to control their relative execution order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_override: Option<u16>,
+    /// Optional declarative execution trigger for this one instance.
+    ///
+    /// `None` (the default) preserves the historical behavior exactly: the
+    /// instance runs whenever scope merge, protocol filtering, and priority say
+    /// it should. When set, the compiled predicate tree decides — once per
+    /// request/connection — whether this instance's hooks run at all. Patterns
+    /// are compiled and validated at config load / admin write / plugin-cache
+    /// publication; the request path only walks precompiled matchers.
+    ///
+    /// See [`crate::config::plugin_trigger`] and
+    /// `docs/plugin_execution_order.md` for the phase model and the
+    /// fail-closed composition rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PluginTrigger>,
     /// ID of the `ApiSpec` that created this plugin config via the spec-import admin API.
     /// `None` for hand-crafted plugin configs. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -4276,6 +4306,15 @@ impl GatewayConfig {
                     "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
                     plugin.id
                 ));
+            }
+            // Compile the declarative execution trigger here so a malformed
+            // regex/CIDR/field shape is a config-load error, not a per-request
+            // surprise. Plugin-cache publication compiles it again (and adds the
+            // fail-closed composition rules that need the constructed plugin).
+            if let Some(trigger) = plugin.trigger.as_ref()
+                && let Err(error) = trigger.validate()
+            {
+                errors.push(format!("PluginConfig '{}': {}", plugin.id, error));
             }
             match plugin.scope {
                 PluginScope::Global => {
@@ -8745,6 +8784,15 @@ impl PluginConfig {
         }
         if let Err(e) = validate_string_field("plugin_name", &self.plugin_name, MAX_NAME_LENGTH) {
             errors.push(e);
+        }
+
+        // The execution trigger is a generic per-instance field, so it is
+        // compiled on the admin write path too — an unbounded regex or a
+        // malformed CIDR must be a 400 before storage, never a reload failure.
+        if let Some(trigger) = self.trigger.as_ref()
+            && let Err(error) = trigger.validate()
+        {
+            errors.push(error);
         }
 
         match self.scope {

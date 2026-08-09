@@ -251,6 +251,7 @@ fn test_terminal_grpc_status_is_stable_across_buffered_streamed_h2_h3_and_reject
 async fn test_stdout_logging_stream_disconnect() {
     let plugin = StdoutLogging::new(&json!({})).unwrap();
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_lifecycle_generation: None,

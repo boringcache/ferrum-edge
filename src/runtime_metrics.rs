@@ -1377,6 +1377,7 @@ mod tests {
     fn stream_transaction_without_error_is_noop() {
         let metrics = RuntimeMetrics::new();
         let summary = StreamTransactionSummary {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-a".to_string(),
             proxy_lifecycle_generation: None,

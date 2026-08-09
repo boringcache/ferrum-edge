@@ -13689,6 +13689,7 @@ mod inner {
                 scope: crate::config::types::PluginScope::Proxy,
                 proxy_id: Some("proxy-1".to_string()),
                 priority_override: Some(500),
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
