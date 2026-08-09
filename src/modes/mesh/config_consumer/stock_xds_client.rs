@@ -637,7 +637,11 @@ async fn run_stock_ads_stream(
     // stream so a reconnect does not lose the EDS/RDS names already derived
     // from the retained accumulator.
     for type_url in [EDS_TYPE_URL, RDS_TYPE_URL] {
-        if !stream_state.subscriptions.resource_names(type_url).is_empty() {
+        if !stream_state
+            .subscriptions
+            .resource_names(type_url)
+            .is_empty()
+        {
             let subscribe = stream_state
                 .subscriptions
                 .build_request(type_url, config, None);
@@ -1112,19 +1116,19 @@ pub async fn start_stock_policy_watcher_with_shutdown(
 ) {
     #[cfg(unix)]
     {
-        let mut hangup =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to register SIGHUP handler for the stock xDS mesh policy \
-                         document; it will not reload until restart"
-                    );
-                    wait_for_shutdown(&mut shutdown_rx).await;
-                    return;
-                }
-            };
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to register SIGHUP handler for the stock xDS mesh policy \
+                     document; it will not reload until restart"
+                );
+                wait_for_shutdown(&mut shutdown_rx).await;
+                return;
+            }
+        };
         loop {
             tokio::select! {
                 received = hangup.recv() => {

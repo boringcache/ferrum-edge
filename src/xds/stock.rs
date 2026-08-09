@@ -77,8 +77,7 @@ use super::translator::{CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL};
 /// absent because they are the Ferrum-private carrier transport — accepting
 /// them from a stock CP would let an unrelated control plane author Ferrum
 /// security policy.
-pub const STOCK_XDS_TYPE_URLS: [&str; 4] =
-    [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
+pub const STOCK_XDS_TYPE_URLS: [&str; 4] = [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
 
 /// Types that gate the first mesh slice.
 ///
@@ -290,7 +289,11 @@ enum PortClass {
 
 impl PortClass {
     fn merge(self, other: PortClass) -> PortClass {
-        if self == other { self } else { PortClass::Ambiguous }
+        if self == other {
+            self
+        } else {
+            PortClass::Ambiguous
+        }
     }
 
     fn app_protocol(self) -> AppProtocol {
@@ -326,7 +329,8 @@ impl StockListener {
     /// `Unknown` covers both "no classifiable chain" and "two chains disagreed"
     /// — in either case Ferrum refuses to guess a protocol for the port.
     pub fn app_protocol(&self) -> AppProtocol {
-        self.class.map_or(AppProtocol::Unknown, PortClass::app_protocol)
+        self.class
+            .map_or(AppProtocol::Unknown, PortClass::app_protocol)
     }
 }
 
@@ -467,9 +471,10 @@ impl StockXdsAccumulator {
                 let mut endpoints = BTreeMap::new();
                 let mut seen = BTreeSet::new();
                 for (_, bytes) in resources {
-                    let decoded = sp::ClusterLoadAssignment::decode(bytes.as_slice()).map_err(
-                        |e| format!("failed to decode ClusterLoadAssignment resource: {e}"),
-                    )?;
+                    let decoded =
+                        sp::ClusterLoadAssignment::decode(bytes.as_slice()).map_err(|e| {
+                            format!("failed to decode ClusterLoadAssignment resource: {e}")
+                        })?;
                     let name = non_empty_name(&decoded.cluster_name, "ClusterLoadAssignment")?;
                     if !seen.insert(name.clone()) {
                         return Err(format!(
@@ -535,8 +540,10 @@ impl StockXdsAccumulator {
                     .collect();
                 let mut seen = BTreeSet::new();
                 for (_, bytes) in resources {
-                    let decoded = sp::RouteConfiguration::decode(bytes.as_slice())
-                        .map_err(|e| format!("failed to decode RouteConfiguration resource: {e}"))?;
+                    let decoded =
+                        sp::RouteConfiguration::decode(bytes.as_slice()).map_err(|e| {
+                            format!("failed to decode RouteConfiguration resource: {e}")
+                        })?;
                     let name = non_empty_name(&decoded.name, "RouteConfiguration")?;
                     if !seen.insert(name.clone()) {
                         return Err(format!(
@@ -749,9 +756,8 @@ fn classify_cluster(
     name: &str,
     limits: &StockXdsLimits,
 ) -> Result<Option<(StockCluster, Vec<StockRefusal>)>, StockRefusal> {
-    let refuse = |reason: &'static str, detail: &str| {
-        StockRefusal::new("cds", name, reason, detail)
-    };
+    let refuse =
+        |reason: &'static str, detail: &str| StockRefusal::new("cds", name, reason, detail);
 
     // ── extension-escape closure ──
     for (field, present) in [
@@ -789,7 +795,10 @@ fn classify_cluster(
         // Ferrum materializes its own inbound listeners from the local policy
         // document; an Istio `inbound|...` cluster describes the *peer* proxy's
         // loopback wiring and must never become an outbound route here.
-        return Err(refuse(refusal::INBOUND_CLUSTER_NOT_MAPPED, "name.direction"));
+        return Err(refuse(
+            refusal::INBOUND_CLUSTER_NOT_MAPPED,
+            "name.direction",
+        ));
     }
     if !parsed.subset.is_empty() {
         return Err(refuse(refusal::SUBSET_CLUSTER_UNSUPPORTED, "name.subset"));
@@ -1166,9 +1175,8 @@ fn classify_listener(
     name: &str,
     limits: &StockXdsLimits,
 ) -> Result<Option<AcceptedListener>, StockRefusal> {
-    let refuse = |reason: &'static str, detail: &str| {
-        StockRefusal::new("lds", name, reason, detail)
-    };
+    let refuse =
+        |reason: &'static str, detail: &str| StockRefusal::new("lds", name, reason, detail);
 
     for (field, present) in [
         ("api_listener", !listener.api_listener.is_empty()),
@@ -1285,7 +1293,8 @@ fn classify_listener(
                         &mut refusals,
                     )?;
                     route_config_names.extend(outcome.route_config_names);
-                    class = Some(class.map_or(outcome.class, |current| current.merge(outcome.class)));
+                    class =
+                        Some(class.map_or(outcome.class, |current| current.merge(outcome.class)));
                 }
                 TCP_PROXY_TYPE_URL => {
                     let tcp = sp::TcpProxy::decode(typed.value.as_slice()).map_err(|_| {
@@ -1309,9 +1318,8 @@ fn classify_listener(
                     if !tcp.cluster.is_empty() {
                         tcp_clusters.push(tcp.cluster.clone());
                     }
-                    class = Some(class.map_or(PortClass::Tcp, |current| {
-                        current.merge(PortClass::Tcp)
-                    }));
+                    class =
+                        Some(class.map_or(PortClass::Tcp, |current| current.merge(PortClass::Tcp)));
                 }
                 other if IGNORABLE_NETWORK_FILTERS.contains(&filter.name.as_str()) => {
                     let _ = other;
@@ -1477,9 +1485,8 @@ fn classify_route_configuration(
     name: &str,
     limits: &StockXdsLimits,
 ) -> Result<AcceptedRouteConfig, StockRefusal> {
-    let refuse = |reason: &'static str, detail: &str| {
-        StockRefusal::new("rds", name, reason, detail)
-    };
+    let refuse =
+        |reason: &'static str, detail: &str| StockRefusal::new("rds", name, reason, detail);
 
     for (field, present) in [
         ("vhds", !config.vhds.is_empty()),
@@ -2012,12 +2019,7 @@ pub fn refuse_stock_secret(bytes: &[u8]) -> StockRefusal {
             } else {
                 "secret"
             };
-            StockRefusal::new(
-                "sds",
-                secret.name,
-                refusal::SDS_SECRET_REFUSED,
-                detail,
-            )
+            StockRefusal::new("sds", secret.name, refusal::SDS_SECRET_REFUSED, detail)
         }
         Err(_) => StockRefusal::new(
             "sds",

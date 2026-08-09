@@ -637,22 +637,18 @@ impl MeshRuntimeConfig {
         let stock_xds_limits = parse_stock_xds_limits()?;
         if config_protocol == MeshConfigProtocol::StockXds {
             if stock_xds_urls.is_empty() {
-                return Err(
-                    "FERRUM_MESH_STOCK_XDS_URLS is required when \
+                return Err("FERRUM_MESH_STOCK_XDS_URLS is required when \
                      FERRUM_MESH_CONFIG_PROTOCOL=stock_xds (the third-party ADS endpoints; \
                      FERRUM_DP_CP_GRPC_URLS is deliberately NOT reused so a Ferrum control plane \
                      is never dialed as a stock server)"
-                        .into(),
-                );
+                    .into());
             }
             if stock_xds_node_id.is_none() {
-                return Err(
-                    "FERRUM_MESH_STOCK_XDS_NODE_ID is required when \
+                return Err("FERRUM_MESH_STOCK_XDS_NODE_ID is required when \
                      FERRUM_MESH_CONFIG_PROTOCOL=stock_xds (a stock control plane derives the \
                      proxy's whole configuration from DiscoveryRequest.node.id, so Ferrum will \
                      not guess it from the hostname default of FERRUM_MESH_NODE_ID)"
-                        .into(),
-                );
+                    .into());
             }
         }
 

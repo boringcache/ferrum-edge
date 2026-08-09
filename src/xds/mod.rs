@@ -71,12 +71,13 @@ pub use carrier::{
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;
 #[allow(unused_imports)]
-pub use stock::{
-    STOCK_REQUIRED_TYPE_URLS, STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal, StockXdsAccumulator,
-    StockXdsLimits, parse_istio_cluster_name, parse_kubernetes_service_host, refuse_stock_secret,
-};
-#[allow(unused_imports)]
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
+#[allow(unused_imports)]
+pub use stock::{
+    STOCK_REQUIRED_TYPE_URLS, STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal,
+    StockXdsAccumulator, StockXdsLimits, parse_istio_cluster_name, parse_kubernetes_service_host,
+    refuse_stock_secret,
+};
 #[allow(unused_imports)]
 pub use translator::{
     CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,

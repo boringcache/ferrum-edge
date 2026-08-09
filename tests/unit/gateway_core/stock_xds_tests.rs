@@ -233,7 +233,10 @@ fn converged_accumulator() -> StockXdsAccumulator {
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -380,7 +383,10 @@ fn stock_endpoint_container_port_becomes_the_service_target_port() {
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -417,7 +423,10 @@ fn stock_eds_subscription_follows_the_accepted_clusters() {
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -440,10 +449,7 @@ fn stock_static_only_cluster_set_is_ready_without_eds() {
         name: REVIEWS_CLUSTER.to_string(),
         // DiscoveryType::STATIC
         r#type: 0,
-        load_assignment: Some(cla(
-            REVIEWS_CLUSTER,
-            vec![lb_endpoint("10.1.2.3", 9080, 1)],
-        )),
+        load_assignment: Some(cla(REVIEWS_CLUSTER, vec![lb_endpoint("10.1.2.3", 9080, 1)])),
         transport_socket: Some(tls_socket(&[REVIEWS_SAN])),
         ..Default::default()
     };
@@ -459,7 +465,10 @@ fn stock_static_only_cluster_set_is_ready_without_eds() {
     );
     let discovery = accumulator.discovery();
     assert_eq!(discovery.workloads.len(), 1);
-    assert_eq!(discovery.workloads[0].addresses, vec!["10.1.2.3".to_string()]);
+    assert_eq!(
+        discovery.workloads[0].addresses,
+        vec!["10.1.2.3".to_string()]
+    );
 }
 
 #[test]
@@ -534,7 +543,10 @@ fn stock_unhealthy_and_draining_endpoints_are_excluded() {
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -601,11 +613,17 @@ fn stock_mismatched_resource_type_url_is_a_structural_error() {
     let error = accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(EDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                EDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect_err("a resource must match its response type");
-    assert!(error.contains("does not match response type_url"), "{error}");
+    assert!(
+        error.contains("does not match response type_url"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -635,13 +653,19 @@ fn stock_resource_count_bound_is_a_structural_error() {
                 any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN])),
                 any(
                     CDS_TYPE_URL,
-                    &eds_cluster("outbound|80||other.default.svc.cluster.local", &[REVIEWS_SAN]),
+                    &eds_cluster(
+                        "outbound|80||other.default.svc.cluster.local",
+                        &[REVIEWS_SAN],
+                    ),
                 ),
             ],
             "cds-1",
         )
         .expect_err("an oversized response is refused before it is decoded into the model");
-    assert!(error.contains("over the configured stock-profile bound"), "{error}");
+    assert!(
+        error.contains("over the configured stock-profile bound"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -654,7 +678,10 @@ fn stock_resource_byte_bound_is_a_structural_error() {
     let error = accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect_err("an oversized resource is refused before decode");
@@ -1349,7 +1376,10 @@ fn stock_pipe_and_internal_endpoint_addresses_are_refused() {
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -1380,7 +1410,10 @@ fn stock_pipe_and_internal_endpoint_addresses_are_refused() {
 
     let discovery = accumulator.discovery();
     assert_eq!(discovery.workloads.len(), 1);
-    assert_eq!(discovery.workloads[0].addresses, vec!["10.1.2.3".to_string()]);
+    assert_eq!(
+        discovery.workloads[0].addresses,
+        vec!["10.1.2.3".to_string()]
+    );
     assert!(
         discovery
             .refusals
@@ -1399,7 +1432,10 @@ fn stock_endpoint_bound_refuses_the_assignment_without_keeping_stale_endpoints()
     accumulator
         .apply_sotw(
             CDS_TYPE_URL,
-            &[any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]))],
+            &[any(
+                CDS_TYPE_URL,
+                &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]),
+            )],
             "cds-1",
         )
         .expect("CDS applies");
@@ -1455,8 +1491,8 @@ fn stock_sds_secret_is_refused_and_names_the_key_bearing_field() {
 
 #[test]
 fn stock_profile_never_subscribes_the_ferrum_private_carrier_types() {
-    use ferrum_edge::xds::{ECDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS};
     use ferrum_edge::xds::stock::STOCK_XDS_TYPE_URLS;
+    use ferrum_edge::xds::{ECDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS};
 
     for private_only in [ECDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL] {
         assert!(

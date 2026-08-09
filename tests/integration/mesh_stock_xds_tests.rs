@@ -94,8 +94,9 @@ struct ScriptedAdsServer {
 
 #[tonic::async_trait]
 impl AggregatedDiscoveryService for ScriptedAdsServer {
-    type StreamAggregatedResourcesStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, Status>> + Send>>;
+    type StreamAggregatedResourcesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, Status>> + Send>,
+    >;
     type DeltaAggregatedResourcesStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>,
     >;
@@ -122,15 +123,13 @@ impl AggregatedDiscoveryService for ScriptedAdsServer {
                 // that type. The queue is finite, so the exchange terminates.
                 let next = {
                     let mut script = script.lock().expect("script mutex");
-                    script
-                        .get_mut(&type_url)
-                        .and_then(|queue| {
-                            if queue.is_empty() {
-                                None
-                            } else {
-                                Some(queue.remove(0))
-                            }
-                        })
+                    script.get_mut(&type_url).and_then(|queue| {
+                        if queue.is_empty() {
+                            None
+                        } else {
+                            Some(queue.remove(0))
+                        }
+                    })
                 };
                 if let Some(scripted) = next {
                     let response = DiscoveryResponse {
@@ -155,7 +154,9 @@ impl AggregatedDiscoveryService for ScriptedAdsServer {
         &self,
         _request: Request<Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        Err(Status::unimplemented("delta xDS is not part of this fixture"))
+        Err(Status::unimplemented(
+            "delta xDS is not part of this fixture",
+        ))
     }
 }
 
@@ -328,7 +329,11 @@ impl StockHarness {
     }
 
     /// Poll the installed slice until `predicate` holds, or fail after ~5s.
-    async fn wait_for_slice(&self, label: &str, predicate: impl Fn(&MeshSlice) -> bool) -> MeshSlice {
+    async fn wait_for_slice(
+        &self,
+        label: &str,
+        predicate: impl Fn(&MeshSlice) -> bool,
+    ) -> MeshSlice {
         for _ in 0..250 {
             if let Some(slice) = self.state.snapshot().as_ref().clone()
                 && predicate(&slice)
