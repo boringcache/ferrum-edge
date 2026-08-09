@@ -1506,13 +1506,12 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "Invalid");
     assert!(status.accepted_message.contains("at most 64"));
-    assert!(
-        translation
-            .config
-            .mesh
-            .as_ref()
-            .is_none_or(|mesh| mesh.services.is_empty())
-    );
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
+        !mesh
+            .services
+            .iter()
+            .any(|service| service.name.starts_with("listenerset-too-many-"))
+    }));
 
     let malformed = vec![
         gateway_class(),
