@@ -4,6 +4,7 @@
 //! supported Istio + Gateway API surface into Ferrum's canonical Layer 2 model.
 //! Unsupported resources fail closed when silent translation would be unsafe.
 
+pub(crate) mod backend_ref;
 pub(crate) mod backend_tls_policy;
 mod core;
 mod gateway_api;
@@ -728,6 +729,12 @@ pub(crate) struct K8sAccumulator {
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
     service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
+    /// MCS `ServiceImport` port inventory (`namespace → name → port → entry`)
+    /// for Gateway API `backendRef` resolution (GEP-1748). Presence of a key
+    /// means the import was observed; an empty map still counts as existing so
+    /// "import present, port unknown" is distinct from "import missing".
+    service_import_ports:
+        HashMap<String, HashMap<String, HashMap<u16, backend_ref::ServiceImportPort>>>,
     /// Bounded per-Service port metadata (`namespace → service → ports`) that
     /// retains the L4 transport of `spec.ports[].protocol`.
     ///
@@ -800,6 +807,7 @@ impl K8sAccumulator {
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
             service_ports: HashMap::new(),
+            service_import_ports: HashMap::new(),
             service_port_specs: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
@@ -877,6 +885,28 @@ impl K8sAccumulator {
         !self.service_port_names.is_empty()
     }
 
+    pub(crate) fn record_service_import_ports(
+        &mut self,
+        namespace: String,
+        name: String,
+        ports: HashMap<u16, backend_ref::ServiceImportPort>,
+    ) {
+        self.service_import_ports
+            .entry(namespace)
+            .or_default()
+            .insert(name, ports);
+    }
+
+    pub(crate) fn service_import_port_index(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<&HashMap<u16, backend_ref::ServiceImportPort>> {
+        self.service_import_ports
+            .get(namespace)
+            .and_then(|imports| imports.get(name))
+    }
+
     pub(crate) fn endpoint_route_backends_for_service(
         &self,
         namespace: &str,
@@ -885,6 +915,22 @@ impl K8sAccumulator {
         weight: u32,
     ) -> Vec<RouteBackend> {
         core::endpoint_route_backends_for_service(self, namespace, service, service_port, weight)
+    }
+
+    pub(crate) fn endpoint_route_backends_for_service_import(
+        &self,
+        namespace: &str,
+        name: &str,
+        service_port: u16,
+        weight: u32,
+    ) -> Vec<RouteBackend> {
+        core::endpoint_route_backends_for_service_import(
+            self,
+            namespace,
+            name,
+            service_port,
+            weight,
+        )
     }
 
     pub(crate) fn secret_is_valid_tls_certificate(&self, namespace: &str, name: &str) -> bool {
@@ -1298,6 +1344,12 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
+        } else if backend_ref::is_service_import_object(object) {
+            // GEP-1748: MCS ServiceImport as a Gateway API backendRef target.
+            // EndpointSlices for imports are collected via the core EndpointSlice
+            // path (`multicluster.kubernetes.io/service-name`) when pod discovery
+            // is enabled.
+            backend_ref::collect_service_import(&mut acc, object)?;
         } else if object.kind == "Secret" {
             core::collect(&mut acc, object)?;
         } else if object.kind == "ConfigMap"
@@ -1427,6 +1479,12 @@ where
         // Service objects are consumed by the pre-pass for port-name resolution;
         // they do not produce Ferrum proxies/upstreams directly.
         if object.kind == "Service" {
+            continue;
+        }
+
+        // MCS ServiceImport objects are consumed by the backendRef pre-pass;
+        // they do not materialize as standalone Ferrum resources.
+        if backend_ref::is_service_import_object(object) {
             continue;
         }
 
