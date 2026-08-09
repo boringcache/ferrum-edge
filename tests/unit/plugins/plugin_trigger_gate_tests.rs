@@ -14,7 +14,6 @@ use chrono::Utc;
 use ferrum_edge::_test_support::{
     attach_stream_trigger_decisions_for_test, set_request_wire_protocol_for_test,
 };
-use ferrum_edge::{PluginCache, PluginCapabilities};
 use ferrum_edge::config::types::{
     BackendScheme, DispatchKind, GatewayConfig, HttpWireTransport, PluginConfig, PluginScope, Proxy,
 };
@@ -23,6 +22,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     StreamTransactionSummary,
 };
+use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
