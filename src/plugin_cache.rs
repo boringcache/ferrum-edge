@@ -4031,12 +4031,14 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             // admission can validate the exact trigger and policy shape without
             // turning CP/admin validation into a data-plane file dependency.
             plugin_config.trigger.as_ref().map_or(Ok(None), |trigger| {
-                trigger.validate().and_then(|()| {
-                    crate::plugins::geo_restriction::GeoRestriction::validate_config(
-                        &plugin_config.config,
-                    )
-                })
-                .map(|()| None)
+                trigger
+                    .validate()
+                    .and_then(|()| {
+                        crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                            &plugin_config.config,
+                        )
+                    })
+                    .map(|()| None)
             })
         } else if has_trigger {
             try_create_plugin(

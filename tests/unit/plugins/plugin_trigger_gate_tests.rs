@@ -1050,7 +1050,12 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
     );
     let plugins = published(
         &config(
-            vec![stream_proxy("udp", BackendScheme::Udp, 19_316, vec!["fault"])],
+            vec![stream_proxy(
+                "udp",
+                BackendScheme::Udp,
+                19_316,
+                vec!["fault"],
+            )],
             vec![gated],
         ),
         "udp",
@@ -1579,14 +1584,10 @@ async fn a_non_identity_trigger_removes_an_auth_plugin_from_the_effective_reques
     for plugin in &plugins {
         plugin.on_request_received(&mut private).await;
     }
-    let rejection = run_authentication_phase(
-        AuthMode::Single,
-        &plugins,
-        &mut private,
-        &consumer_index,
-    )
-    .await
-    .expect("the same auth instance still governs its matching path");
+    let rejection =
+        run_authentication_phase(AuthMode::Single, &plugins, &mut private, &consumer_index)
+            .await
+            .expect("the same auth instance still governs its matching path");
     assert_eq!(rejection.0, 401);
 }
 
