@@ -49,6 +49,22 @@ pub fn load_mesh_slice_from_file(
     path: &Path,
     request: MeshSliceRequest,
 ) -> Result<MeshSlice, anyhow::Error> {
+    let mesh = read_mesh_config_document(path)?;
+    let config = normalized_mesh_gateway_config(mesh)?;
+    Ok(MeshSlice::from_gateway_config(&config, request))
+}
+
+/// Parse the mesh document at `path` into its raw (un-normalized, un-validated)
+/// [`crate::modes::mesh::config::MeshConfig`].
+///
+/// Split out of [`load_mesh_slice_from_file`] for the stock xDS
+/// interoperability profile (issue #3317), which needs to substitute the
+/// discovery-owned `services` / `workloads` before normalization and then run
+/// the SAME normalize + validate + project pipeline, so a stock-built slice is
+/// structurally indistinguishable from a file-built one.
+pub fn read_mesh_config_document(
+    path: &Path,
+) -> Result<Box<crate::modes::mesh::config::MeshConfig>, anyhow::Error> {
     if !path.exists() {
         anyhow::bail!("mesh configuration file not found: {}", path.display());
     }
@@ -101,9 +117,19 @@ pub fn load_mesh_slice_from_file(
         );
     }
 
+    Ok(document.mesh)
+}
+
+/// Wrap a mesh section in a [`GatewayConfig`] and run the same normalization +
+/// mesh-field validation the CP-side slice builder applies, so a document this
+/// accepts cannot later be rejected by the slice-apply task for mesh-field
+/// validity.
+pub fn normalized_mesh_gateway_config(
+    mesh: Box<crate::modes::mesh::config::MeshConfig>,
+) -> Result<GatewayConfig, anyhow::Error> {
     let mut config = GatewayConfig {
         version: CURRENT_CONFIG_VERSION.to_string(),
-        mesh: Some(document.mesh),
+        mesh: Some(mesh),
         loaded_at: chrono::Utc::now(),
         ..GatewayConfig::default()
     };
@@ -116,8 +142,7 @@ pub fn load_mesh_slice_from_file(
             mesh_errors.join("; ")
         );
     }
-
-    Ok(MeshSlice::from_gateway_config(&config, request))
+    Ok(config)
 }
 
 /// Wrap a serde error with a pointer at the document contract so an operator

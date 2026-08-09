@@ -128,7 +128,7 @@ proxies:
     backend_port: 443
 ```
 
-**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default.
+**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default. The same routing plane is available on ordinary opaque `tcp` listeners — see [Opaque TLS SNI routing](#opaque-tls-sni-routing).
 
 ```yaml
 proxies:
@@ -166,7 +166,7 @@ proxies:
 - Backend TLS fields (`backend_tls_client_cert_path`, etc.) cannot be set — the proxy does not originate its own TLS
 - Plugins that require decrypted content cannot run; connection-level plugins (IP restriction, rate limiting, logging, throttle) still operate normally
 - SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins (TLS/DTLS passthrough ClientHello peek, TCP TLS termination, and DTLS termination)
-- When sharing a port, all proxies must have `passthrough: true`, hosts must not overlap, and at most one catch-all (empty `hosts`) is allowed
+- When sharing a port, every proxy must agree on `passthrough`, no two proxies may tie inside one routing tier, and at most one catch-all (empty `hosts`) is allowed — see [Conflict rejection](#opaque-tls-sni-routing)
 
 **What's available in passthrough logs:**
 - Client IP/port, backend IP/port
@@ -174,6 +174,81 @@ proxies:
 - Bytes transferred (both directions)
 - Connection duration, timestamps
 - Connection success/failure
+
+### Opaque TLS SNI routing
+
+SNI routing is not limited to `passthrough: true`. Any **opaque** stream listener — one that terminates nothing — can select its backend from the client's TLS `server_name`. A listener is opaque when it is either `passthrough: true` (any stream scheme) or an ordinary `tcp` listener with `frontend_tls: false`; such a listener already relays client bytes verbatim, so the ClientHello reaches the backend untouched.
+
+Declaring `hosts` on an opaque listener turns it into an SNI route. Two ordinary `tcp` proxies may therefore share one port when they are distinguished only by SNI:
+
+```yaml
+proxies:
+  - id: "tenant-a"
+    listen_port: 8443
+    backend_scheme: tcp            # opaque relay; frontend_tls stays false
+    hosts: ["tenant-a.example.com"]
+    backend_host: "a.internal"
+    backend_port: 443
+
+  - id: "tenant-b"
+    listen_port: 8443
+    backend_scheme: tcp
+    hosts: ["*.tenant-b.example.com"]
+    backend_host: "b.internal"
+    backend_port: 443
+
+  # Optional: exactly one default route for hostnames no tier claims.
+  - id: "default-route"
+    listen_port: 8443
+    backend_scheme: tcp
+    hosts: []
+    backend_host: "default.internal"
+    backend_port: 443
+```
+
+**Route precedence** (absolute, not declaration order):
+
+1. **Exact** host match.
+2. **Wildcard** match (`*.example.com` matches any DNS name below `example.com`, but not `example.com` itself).
+3. **Catch-all / default** — the one proxy on the port with empty `hosts`.
+4. No tier matched and no default declared → the connection is closed. No backend is resolved, dialed, health-scored, or circuit-breaker-charged.
+
+Candidates that also carry Istio `stream_match` L4 predicates are evaluated in declaration order (VirtualService first-match-wins) with SNI ANDed onto each rule, instead of the tier ladder.
+
+**Normalization.** Configured `hosts` are validated as lowercase ASCII DNS names with no trailing dot, no port, and no scheme; the wire `server_name` is ASCII-lowercased before comparison. IDNA is an **A-label contract on both sides**: put punycode (`xn--…`) in `hosts`, because a non-ASCII `server_name` is not a representable SNI and a U-label in `hosts` is a config error.
+
+**ClientHello peek bounds.** The peek is non-consuming (`TcpStream::peek`), so every inspected byte still reaches the selected backend — TLS is never terminated, and no byte is rewritten or dropped. A ClientHello fragmented across TCP segments or across TLS records is reassembled. The peek is bounded two ways:
+
+- **Time** — `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (the same deadline that bounds terminating handshakes). `0` disables the clock; the peek then takes a small bounded number of attempts instead.
+- **Bytes** — a hard 16 KiB cap (one maximum TLS record). A hello that has not completed within the cap is refused rather than parsed from a prefix.
+
+**Fail-closed admission.** What the peek concludes decides admission:
+
+| ClientHello peek result | Behavior |
+|---|---|
+| `server_name` present and representable | Route through the precedence ladder above |
+| Complete, well-formed hello with no `server_name` | Route to the default route only; closed if none is declared |
+| Provably **not** TLS (first byte is not a handshake record, or the first handshake message is not a ClientHello) | **Closed**, unless `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK=true` — then routed to the default route |
+| Timed out, exceeded the 16 KiB cap, ended early, malformed, or a `server_name` this gateway cannot represent | **Closed, always** |
+
+The last row is the security boundary: such a connection may have declared *any* tenant's hostname, so quietly sending it to the default route would be a cross-tenant downgrade. `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` deliberately does **not** rescue it — it authorizes only the determinate non-TLS case, for ports intentionally shared with direct plaintext TCP clients.
+
+A port whose candidates declare no `hosts` at all is not SNI-routed and none of this applies: it is a plain relay that accepts every connection. A lone `passthrough: true` listener there still peeks the ClientHello to populate `sni_hostname` for stream lifecycle plugins and logs, but that peek never gates admission; a lone ordinary `tcp` listener does not peek at all.
+
+**Conflict rejection.** Config admission rejects only what the ladder cannot resolve, so a tie inside one tier is an error while a cross-tier pair is not:
+
+| Pair on one port | Verdict |
+|---|---|
+| same exact host twice | rejected — one hostname, two owners |
+| two wildcards that can both match some name (equal, or one nested below the other) | rejected |
+| an exact host and a wildcard that covers it (`api.example.com` + `*.example.com`) | **allowed** — exact wins |
+| a named host and the catch-all | **allowed** — the catch-all is the last tier |
+| two catch-alls | rejected — one default route per port |
+| mixed `passthrough` on one port | rejected — the shared socket is built from one representative before any route is selected |
+
+Candidates that all carry `stream_match` are exempt from the tie rules: their declaration order makes first-match deterministic.
+
+`hosts` on a stream listener that *cannot* read a ClientHello — `frontend_tls: true`, `tcps` (backend TLS origination), or non-passthrough `udp`/`dtls` — is a validation error with a field-specific diagnostic, rather than silently inert config that looks like an admission restriction but is not.
 
 ### Frontend TLS Termination (TCP)
 
@@ -832,7 +907,8 @@ Notes:
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
 | `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `false` | Enables live reload for frontend TCP TLS, admin TLS, and frontend DTLS source changes |
-| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes, and for the opaque-TLS SNI ClientHello peek. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
+| `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` | `false` | Whether an [opaque-TLS SNI listener](#opaque-tls-sni-routing) may send provably non-TLS opening bytes to its declared catch-all route instead of closing the connection. Enable only for a port deliberately shared with direct plaintext TCP clients. Never applies to a ClientHello that timed out, exceeded the 16 KiB peek bound, ended early, was malformed, or named an unrepresentable host — those always fail closed |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
@@ -956,9 +1032,9 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 ## Validation Rules
 
 - `listen_port` is required for stream proxies (1024-65535)
-- `listen_port` must be unique across all stream proxies (checked via database in DB/CP mode, in-memory in file mode)
+- `listen_port` must be unique across stream proxies unless every sharer forms one opaque-TLS SNI listener (homogeneous passthrough or ordinary opaque TCP) or one L4 `stream_match` group
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
-- HTTP proxies must not set `listen_port`
+- `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)

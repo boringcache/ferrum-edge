@@ -86,6 +86,7 @@ mod socket_opts_tests;
 mod spiffe_identity_listener_wiring_tests;
 mod startup_tests;
 mod sticky_session_binding_tests;
+mod stock_xds_tests;
 mod stream_health_check_tests;
 mod stream_listener_tests;
 mod stream_match_tests;
