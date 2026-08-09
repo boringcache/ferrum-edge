@@ -1872,13 +1872,6 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
-    async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_proxy_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error>;
-
     /// Check whether an upstream with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace, so a
     /// proxy in namespace A cannot reference an upstream that actually lives

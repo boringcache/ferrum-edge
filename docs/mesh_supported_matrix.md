@@ -124,8 +124,9 @@ CI today."
   discovery is independently gated by the two-CP/two-DP Toxiproxy partition suite, including bounded
   last-good retention, expiry, same-generation recovery, and in-flight
   withdrawal retirement.
-- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, HTTP-family
-  `EgressGateway`, `ServiceWaypoint` (GAMMA).
+- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), stock xDS interoperability
+  (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`; discovery-only, policy stays local),
+  `Ambient` HBONE, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
@@ -152,8 +153,15 @@ CI today."
 These are deliberately **not** on the GA path because <~10% of mesh deployments
 need them, or because they are blocked upstream / architecturally:
 
-- **Stock Envoy / third-party Istio xDS interop** — Ferrum xDS is Ferrum-to-Ferrum
-  (security/policy fields ride Ferrum ECDS carriers). Not a drop-in xDS data plane.
+- **Stock Envoy / third-party Istio xDS interop, full data-plane parity** —
+  Ferrum's `xds` protocol is Ferrum-to-Ferrum (security/policy fields ride
+  Ferrum ECDS carriers), so Ferrum is not a drop-in Envoy replacement in an
+  existing xDS fleet. The separate `stock_xds` protocol (issue #3317, **Beta**)
+  does consume standard v3 CDS/EDS/LDS/RDS from a third-party control plane, but
+  for **discovery only**: enforcement policy always comes from the mandatory
+  local `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
+  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
+  `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is
   accepted and the surrounding policy installs (rejecting it would drop the whole
@@ -198,10 +206,20 @@ need them, or because they are blocked upstream / architecturally:
   preparation while the policy update still applies to supported TCP/HTTP
   traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
   supported topology for workload-scoped UDP/DTLS authorization.
-- **Ambient native gRPC over HBONE** — explicit non-goal: the Ambient HBONE HTTP
-  path relays an inner HTTP/1.1 byte stream through the CONNECT tunnel, so it has
-  no HTTP/2 trailer path for native gRPC. Use Sidecar mesh-mTLS for native gRPC,
-  or use gRPC-Web pass-through when Ambient transport is required.
+- **Ambient native gRPC over HBONE on the H1/H2 frontend** — the generic
+  HTTP-family HBONE dispatch relays an inner HTTP/1.1 byte stream through the
+  CONNECT tunnel, so it has no HTTP/2 trailer path for native gRPC and refuses
+  such a request pre-dial with gRPC UNAVAILABLE. On that frontend, use Sidecar
+  mesh-mTLS for native gRPC, or gRPC-Web pass-through when Ambient transport is
+  required. **The HTTP/3 frontend is not affected and is Supported** (issue
+  #3284): its gRPC bridge runs a nested `hyper::client::conn::http2` client over
+  the same authenticated HBONE CONNECT byte tunnel — same-cluster (identity
+  pinned) and cross-cluster (remote east-west gateway + destination-FQDN SNI
+  override + trust-domain scope) — so `grpc-status` trailers, flow control,
+  deadlines, and cancellation relay end-to-end. Reusing that transport on the
+  H1/H2 frontend is now mechanically possible and is a residual, not a
+  non-goal — it is untracked and unimplemented, so this row stays here until an
+  issue owns it.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
@@ -233,7 +251,7 @@ ledger unless they change the support contract.
 |---|---|---|
 | Enrolled Ambient destination pod UDP round trip (source-capture → HBONE → destination pod-netns relay; tc-inbound admit + reply socket inside destination pod netns) | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | `docs/mesh.md` UDP TPROXY capture footnote [12] |
 
-Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

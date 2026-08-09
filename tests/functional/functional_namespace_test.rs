@@ -4,9 +4,9 @@
 //! supported database backend with the `X-Ferrum-Namespace` header, covering:
 //!
 //! - namespace-scoped CRUD for proxies / consumers / upstreams
-//! - per-namespace uniqueness constraints (listen_path, listen_port, name,
-//!   username, custom_id) — same value allowed across namespaces, denied
-//!   within one
+//! - per-namespace uniqueness constraints (listen_path, name, username,
+//!   custom_id) and stream-listener group admission — the same port is allowed
+//!   across namespaces, while an invalid duplicate group is denied within one
 //! - `X-Ferrum-Namespace` header defaulting to `ferrum`
 //! - invalid namespace header rejection
 //! - `GET /namespaces` returning the full set as a paginated envelope,
@@ -504,7 +504,7 @@ async fn run_namespace_suite(backend: Backend) {
         "duplicate proxy name within same namespace must be rejected"
     );
 
-    // --- stream listen_port uniqueness ----------------------------------
+    // --- stream listener-group namespace isolation -----------------------
     let shared_port = ephemeral_port().await;
     let resp = admin_request(
         &client,
@@ -545,7 +545,7 @@ async fn run_namespace_suite(backend: Backend) {
     assert_eq!(
         dup.status().as_u16(),
         409,
-        "duplicate listen_port within same namespace must be rejected"
+        "an invalid same-namespace listener group must be rejected"
     );
 
     // --- consumer identity uniqueness -----------------------------------
