@@ -980,6 +980,9 @@ fn listenerset_service_cannot_program_same_named_gateway() {
 
 #[test]
 fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
+    // Watch both namespaces so the certs Secret/ReferenceGrant are collected;
+    // otherwise fail-closed looks identical to a missing grant.
+    let opts = options().with_source_namespaces(vec!["default".to_string(), "certs".to_string()]);
     let secret = tls_secret("cert", "certs");
 
     let without_grant = vec![
@@ -1005,9 +1008,9 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
         ),
         secret.clone(),
     ];
-    let translation = translate_k8s_objects(&without_grant, options()).expect("translate");
+    let translation = translate_k8s_objects(&without_grant, opts.clone()).expect("translate");
     // Without a ListenerSet-scoped ReferenceGrant the HTTPS listener is not
-    // materializable.
+    // materializable even when the Secret is observed.
     assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
         !mesh
             .services
@@ -1035,7 +1038,7 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
     grant.metadata.namespace = "certs".to_string();
     let mut with_grant = without_grant;
     with_grant.push(grant);
-    let translation = translate_k8s_objects(&with_grant, options()).expect("translate with grant");
+    let translation = translate_k8s_objects(&with_grant, opts).expect("translate with grant");
     assert!(
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
