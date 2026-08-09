@@ -189,6 +189,19 @@ struct ConditionAttributeKeys {
     claim_keys: std::collections::BTreeSet<String>,
 }
 
+/// Resolved network/address facts for HTTP `when:` attribute materialization.
+///
+/// Bundled (Copy values only) so [`MeshAuthz::build_http_condition_attributes`]
+/// stays under clippy's argument cap without hot-path allocation or clones.
+/// Only keys flagged in [`ConditionAttributeKeys`] are written into the map.
+#[derive(Debug, Clone, Copy)]
+struct HttpConditionNetworkAttrs {
+    port: Option<u16>,
+    source_ip: Option<std::net::IpAddr>,
+    remote_ip: Option<std::net::IpAddr>,
+    destination_ip: Option<std::net::IpAddr>,
+}
+
 // An attribute the gateway can source but that is genuinely absent for THIS
 // request (a header the client did not send, an SNI-less plaintext connection)
 // is simply left out of the materialized map, and the evaluator applies Istio's
@@ -1388,16 +1401,13 @@ impl MeshAuthz {
         keys: &ConditionAttributeKeys,
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
-        port: Option<u16>,
-        source_ips: (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
-        destination_ip: Option<std::net::IpAddr>,
+        network: HttpConditionNetworkAttrs,
         headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         if !keys.any {
             return attributes;
         }
-        let (source_ip, remote_ip) = source_ips;
         if keys.source_principal
             && let Some(principal) = source_principal
         {
@@ -1435,7 +1445,7 @@ impl MeshAuthz {
             );
         }
         if keys.destination_port
-            && let Some(port) = port
+            && let Some(port) = network.port
         {
             attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
         }
@@ -1448,12 +1458,12 @@ impl MeshAuthz {
         // is the direct downstream peer, while `remote.ip` is the trusted
         // forwarded/original client IP when one was resolved.
         if keys.source_ip
-            && let Some(ip) = source_ip
+            && let Some(ip) = network.source_ip
         {
             attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
         }
         if keys.remote_ip
-            && let Some(ip) = remote_ip
+            && let Some(ip) = network.remote_ip
         {
             attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
         }
@@ -1463,7 +1473,7 @@ impl MeshAuthz {
         // connection property, and a client-settable one would let a caller
         // pick which destination-scoped rule it is judged by.
         if keys.destination_ip
-            && let Some(ip) = destination_ip
+            && let Some(ip) = network.destination_ip
         {
             attributes.insert(ATTR_DESTINATION_IP.to_string(), ip.to_string().into());
         }
@@ -2139,9 +2149,12 @@ impl Plugin for MeshAuthz {
             condition_keys,
             ctx,
             source_principal.as_ref(),
-            port,
-            (source_ip, remote_ip),
-            destination_ip,
+            HttpConditionNetworkAttrs {
+                port,
+                source_ip,
+                remote_ip,
+                destination_ip,
+            },
             &headers,
         );
         let request = MeshAuthzRequest {

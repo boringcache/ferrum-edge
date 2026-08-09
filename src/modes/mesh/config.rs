@@ -1009,17 +1009,15 @@ pub fn validate_mesh_condition(
                         issues.push(MeshConditionIssue::value(field, index, reason));
                     }
                 }
-                MeshConditionKeyKind::DestinationPort => {
-                    // Istio validates port conditions with a strict numeric
-                    // parse; a wildcard or non-numeric value can never match a
-                    // port, which is fail-open for a DENY.
-                    if value.parse::<u16>().is_err() {
-                        issues.push(MeshConditionIssue::value(
-                            field,
-                            index,
-                            "must be a numeric port in 0..=65535",
-                        ));
-                    }
+                // Istio validates port conditions with a strict numeric
+                // parse; a wildcard or non-numeric value can never match a
+                // port, which is fail-open for a DENY.
+                MeshConditionKeyKind::DestinationPort if value.parse::<u16>().is_err() => {
+                    issues.push(MeshConditionIssue::value(
+                        field,
+                        index,
+                        "must be a numeric port in 0..=65535",
+                    ));
                 }
                 _ => {
                     // Istio string-match values are exact / `*` (presence) /
