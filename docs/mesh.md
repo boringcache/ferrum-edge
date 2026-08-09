@@ -2648,14 +2648,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   netns), where pod IPs are **FORWARDED, not `LOCAL`**, so inbound UDP to a pod
   would match the OUTBOUND chain's `! --dst-type LOCAL` discriminator and be
   mis-captured as egress. There is no host-netns-safe `addrtype`-style
-  discriminator without per-pod IP knowledge the iptables fallback does not carry,
-  so the **node-agent's host-netns iptables fallback emits NO UDP TPROXY rules**
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family`) and
-  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **Node-agent
-  host-netns UDP capture is unsupported in this stage**, and **eBPF does not cover
-  UDP either** — the eBPF capture programs are `connect()`-cgroup-hooked and
-  TCP-only (no UDP hooks; see the node-waypoint UDP/DTLS limitation above). UDP
-  capture lives in the **injector's pod-netns path** (its iptables init container
+  discriminator, so the **node-agent's host-netns iptables fallback emits NO UDP
+  TPROXY rules** (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family`) and logs the limitation when
+  `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. The node-agent has no UDP listener
+  either, and rules without a socket are a black hole, so it stays out of the UDP
+  datapath entirely; **eBPF does not cover UDP** — the eBPF capture programs are
+  `connect()`-cgroup-hooked and TCP-only (no UDP hooks; see the node-waypoint
+  UDP/DTLS limitation above). What DOES capture UDP in the host namespace is the
+  mesh proxy's **host-network UDP capture path**
+  (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`, issue #3288), which replaces the
+  `addrtype` split with an **ingress-interface** split — see "Host-network UDP
+  capture" below. UDP capture otherwise lives in the **injector's pod-netns path**
+  (its iptables init container
   runs in the pod netns, where the pod IP is `LOCAL` so the direction split holds);
   node-agent / node-waypoint UDP capture is a **future stage**.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
@@ -2713,14 +2718,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `FERRUM_MESH_CAPTURE_UDP_PORT`, and `FERRUM_MESH_TPROXY_MARK` from the **same**
   injector config that drives the init container's TPROXY rules (these are not in
   `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env). The
-  **node-agent / ambient host-netns** path still installs no UDP TPROXY rules
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family` —
-  the `--dst-type LOCAL` direction split is unsafe in the host netns). Ambient's
-  UDP source-capture instead rides the **per-pod-netns producer** (#2013, see the
-  end-to-end status bullet under Stages 3–4): it installs the UDP TPROXY rules and
-  binds the transparent sockets INSIDE each enrolled pod's netns via `setns`, so
-  the host-netns "no UDP rules" invariant is **preserved** while Ambient still
-  captures UDP. eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
+  **pod-netns rule generator** still installs no UDP TPROXY rules for
+  `host_netns` (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family` — the `--dst-type LOCAL` direction split is
+  unsafe in the host netns). Ambient's UDP source-capture rides one of two
+  placements, both consuming the same relay/session machinery:
+
+  * **Per-pod-netns producer** (#2013, the default; see the end-to-end status
+    bullet under Stages 3–4): installs the UDP TPROXY rules and binds the
+    transparent sockets INSIDE each enrolled pod's netns via `setns`.
+  * **Host-network capture** (#3288, `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true`;
+    see "Host-network UDP capture" below): installs interface-scoped rules and one
+    transparent socket in the proxy's own namespace, entering no pod namespace.
+
+  eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
   malformed settings:** on a capture-relay
   runtime (Ambient or Sidecar), when the flag is set but a UDP capture var is
   malformed, mesh startup aborts (`serve_mesh_runtime` validates the env before
@@ -2805,10 +2816,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   a lock-free atomic count so a spoofed-source flood never walks every DashMap
   shard), an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the
   recvmmsg batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`); GRO-coalesced reads are
-  framed **per segment**, not as one superblock. When capture is enabled the
-  capture port is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream
-  proxy or ServiceEntry declaring the same listen port is rejected at validation
-  rather than racing the capture listener at startup. The listener carries
+  framed **per segment**, not as one superblock. When the mesh proxy itself binds
+  the capture port (Sidecar, or Ambient with the host-netns placement), that port
+  is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream proxy or
+  ServiceEntry declaring the same listen port is rejected at validation rather
+  than racing the capture listener at startup. Ambient's default per-pod-netns
+  placement binds inside each pod and therefore does not reserve the host port.
+  The listener carries
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. With the flag off there is no
@@ -3244,6 +3258,157 @@ nodeAgent:
 
 Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` for kernel-backcompat on 5.7.x and for every `node_waypoint` deployment's pod-netns `setns()`/veth discovery. Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`, `hostPID: true`. See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
 
+### Host-network UDP capture (issue #3288)
+
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` (default `false`, requires
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true` and `FERRUM_MESH_TOPOLOGY=ambient`) moves
+Ambient's UDP source-capture from each pod's network namespace into the mesh
+proxy's own. Setting it without the capture switch, or on any topology but
+Ambient, is a **startup error**, not a silent no-op — both halves are enforced in
+the process (the capture-switch half in `capture::udp_capture_settings_from_env`,
+the topology half in `modes::mesh::validate_udp_host_netns_placement` on the
+serving path), so a direct-env or hand-rolled-manifest deployment that never
+renders the chart still fails closed rather than starting with no producer. It
+captures the same traffic and feeds the same session, relay, overload, and
+return-path machinery as the per-pod-netns producer — only the placement differs.
+
+**Why the host namespace needed a different mechanism.** The pod-netns generator
+splits inbound from outbound with `-m addrtype --dst-type LOCAL`, which is only
+true inside a pod. In the host namespace pod IPs are forwarded, not local, so
+inbound-to-pod UDP would match the outbound chain's `! --dst-type LOCAL` and be
+mis-captured. The host path therefore does not use `addrtype` at all.
+
+**The discriminator is the ingress interface.** In `mangle PREROUTING`, every
+capture rule carries `-i <that pod's host-side interface>`:
+
+| Traffic | Where it appears in the host namespace | Captured? |
+|---|---|---|
+| An enrolled pod's egress | `PREROUTING` on **that pod's** interface | **Yes** — this is the whole capture set |
+| Traffic destined for a pod | `PREROUTING` on the **node uplink**, then forwarded | No — never matches a pod interface |
+| The node's own traffic (kubelet, CNI, DNS, `hostNetwork` pods, the proxy's own relay egress) | `OUTPUT` only | No — **the host path installs no `mangle OUTPUT` chain at all** |
+
+That last row is structural, not a filter: there is no OUTPUT chain, no `-j MARK`,
+and no loopback reinjection loop, so node traffic cannot be captured even by
+misconfiguration.
+
+**Per-datagram identity.** One transparent socket serves every enrolled pod, so
+evidence is resolved per datagram from two kernel-provided facts — the original
+destination (`IP_RECVORIGDSTADDR`, un-rewritten by TPROXY) and the ingress
+interface index (`IP_PKTINFO`/`IPV6_PKTINFO`, a fatal `setsockopt` for this path).
+The interface index must map to exactly one enrolled pod **and** the datagram's
+source address must be one that pod published in the registry. Neither fact comes
+from the datagram payload, so forging a source address does not change which
+interface a packet entered on. A datagram failing either check is dropped; the
+path never falls back to an unattested or mesh-wide identity.
+
+**Requires per-pod host interfaces.** Two enrolled pods resolving to one interface
+(a shared-bridge CNI, or a stale registry entry on a recycled veth) make
+attribution ambiguous, so **both** are refused — first-wins would be a
+cross-tenant identity bug. Refused pods are not captured and their readiness
+marker is withheld, so the node-agent's tc guard keeps their UDP egress closed
+rather than letting it bypass the mesh. A pod is also refused when it has no
+attested SPIFFE identity, no published address, an unresolvable interface, or a
+name this path will not place in an `iptables -i` argument (notably a `+` suffix,
+which would be a prefix wildcard).
+
+**Privileges.** The host UDP path needs `NET_ADMIN` plus `iproute2`/`iptables` in
+the image — but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no
+namespace is entered. The chart narrows those capabilities automatically when
+this placement is selected while retaining the ambient container's baseline
+`NET_RAW`. The registry hostPath and read-only host cgroup mount stay (the
+enrolled-pod set and interface resolution use them); interface resolution falls
+back to the host route table keyed on the registry-published pod IP when `/proc`
+is not shared. That fallback covers **both families** — `/proc/net/route` for a
+v4 address and `/proc/net/ipv6_route` for a v6 one — which is what lets an
+IPv6-only enrolled pod use this placement at all: without `hostPID` the route
+table is the only resolver, so a v4-only fallback would refuse every such pod
+while the path claimed dual-stack support. Route fallback accepts only an
+unambiguous `RTF_UP` host route (`/32` for IPv4 or `/128` for IPv6), and the
+resolved sysfs device must expose a distinct non-zero peer `iflink`: a broader
+subnet route commonly names a shared CNI bridge, while a self-linked device is
+not a dedicated pod peer. Using either in `iptables -i` could capture enrolled
+and unenrolled neighbours alike. Two devices claiming the same host route
+resolve to nothing rather than to a guess, an oversized table refuses instead
+of answering from a truncated view, and malformed rows are ignored unless a
+valid, unambiguous host route remains.
+
+**Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
+guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
+priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
+node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
+the other's state. Startup reaps the previous generation before installing
+anything — but only **after** discharging its durable readiness handshake (next
+paragraph); a deployment that is **not** using this placement runs the same
+recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
+socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
+DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
+socket bind, or guard release failing all leave the node dropping enrolled UDP
+egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
+the node-agent to acknowledge that its BPF gates closed, and only then removes
+everything; without the acknowledgement it retains the DROP guard.
+
+**A restart is a handshake too.** Readiness is durable and shared with the
+node-agent, so a generation that dies — a crash, a restart, a rollout that
+switches placement or turns UDP capture off — leaves behind BOTH its `mangle`
+state and an open BPF UDP gate for every pod it readied. Leaving the rules is
+safe (a capture path whose socket died with its process drops), but removing them
+while those gates are open is exactly a plaintext window, and the stale interface
+set does not bound the damage: a pod that restarted onto a new veth has no stale
+rule at all and an open gate regardless. So the first thing a new generation does
+is **not** a teardown. It reads the durable `.udp-ready` and `.udp-ack-required`
+directories, puts every pod they name back through the ordinary close handshake
+(persist a fresh `.udp-ack-required`, delete any `.udp-not-ready` so a stale
+acknowledgement cannot authorize this handoff, then retract `.udp-ready`), and
+waits for the node-agent to republish `.udp-not-ready`. Nothing is applied and
+nothing is removed until that settles, and a reap that fails is retried rather
+than logged once — an abandoned `PREROUTING` jump would otherwise black-hole the
+node's UDP with no code path left to clean it up. A pod also settles when
+readiness REAPPEARS for it: this recovery's own retraction removed the marker, so
+a marker that exists again was published by the incoming per-pod-netns producer,
+which publishes only once it is capturing that pod inside its namespace — its
+egress no longer reaches the host namespace at all. Without that clause the two
+halves of a placement switch would deadlock, each waiting on the other. On a node
+whose placement is now the pod-netns producer, mesh startup runs one bounded
+recovery pass before returning to unrelated listener startup. If safe retraction
+is still incomplete, recovery continues in the background and only the incoming
+UDP producer waits on that boundary, so it cannot fight recovery over the shared
+markers; admin, HBONE, and other proxy listeners still start. Until the boundary
+resolves, predecessor rules remain installed and enrolled UDP stays fail-closed.
+Stale-state reaping can continue after the incoming producer starts because
+discovery/retraction is then frozen, and republished readiness is the
+acknowledgement that settles a placement switch.
+
+**A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
+`.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,
+so a pod that is removed or becomes refused keeps its capture rule until the
+node-agent publishes the matching `.udp-not-ready` acknowledgement — the same
+durable `.udp-ack-required` handshake shutdown and the pod-netns cleanup manager
+use. Until then the guard installed for the rebuild covers the **union** of the
+interfaces the new generation captures and the interfaces of every pod still
+owing an acknowledgement, so the departing pod's egress is dropped rather than
+released in plaintext; a failed persistence or an acknowledgement timeout keeps
+that posture and retries on the next poll. A pod that re-enters capture before
+its acknowledgement arrives cancels the handshake and is readied again by the
+ordinary apply path. Withdrawing (or re-attributing) a binding also **restarts
+the shared capture listener** before the new evidence generation goes live: a
+session admitted earlier still holds the old workload identity and its
+transparent reply socket, so a one-way return stream would otherwise keep
+reaching a removed — or recycled — pod address until it idled out. A pure
+addition is not disruptive and leaves live sessions alone. The capture loop is
+supervised on every reconcile: one that exits on its own (a socket error, a
+panicked task) is detected, the datapath is guarded, stale evidence is cleared,
+and the loop is restarted through the normal guarded apply path instead of the
+node black-holing captured traffic while readiness stays published. An
+operator-requested shutdown is never mistaken for such an exit.
+
+**Placement migration.** This path reaps only host-namespace state. Rules a
+previous per-pod-netns generation installed live inside each pod's namespace and
+are destroyed with it, so switching placement on a running node leaves
+already-running pods diverting UDP to a socket that no longer exists there —
+fail-closed (dropped), but not captured. Roll the workloads, or do one
+transitional rollout with UDP capture disabled so the pod-netns cleanup manager
+reaps them first.
+
 ### Ambient UDP upgrade notes
 
 Ambient topology now keeps the per-pod registry and stale-rule cleanup lifecycle
@@ -3479,7 +3644,7 @@ spec:
 
 ## Gateway API Status
 
-When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, the controller watches `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`, `ReferenceGrant`, `BackendTLSPolicy`, `BackendLBPolicy` (historical `v1alpha2`, when installed), and `XBackendTrafficPolicy` (pinned `v1.5.1` experimental successor), plus MCS `ServiceImport` (`multicluster.x-k8s.io`, when that CRD is installed) for GEP-1748 backendRefs, resources and writes status subresources for the GatewayClass, Gateway, route, `BackendTLSPolicy`, and BackendLB/`XBackendTrafficPolicy` kinds. `BackendTLSPolicy` is translated onto Service-backed HTTPRoute/GRPCRoute backends and receives Gateway API `PolicyStatus` (`status.ancestors[]`) patches: its ancestor is the targeted Service itself rather than the managed Gateways that route to it — Ferrum's overlay decision and its `Accepted`/`ResolvedRefs` verdict take no Gateway as input, so the verdict provably cannot vary per Gateway, and Ferrum's own contribution is bounded at one entry no matter how many Gateways route to the Service. Ferrum still writes status only for a policy whose targeted Service a managed Gateway *effectively* routes to (a route that materialized on an accepted parentRef, not merely one naming a Gateway). If third-party controllers have already filled the CRD's 16-entry `ancestors` maximum, Gateway API forbids adding another entry, so Ferrum publishes none — but the policy still translates and still governs backend TLS. That ceiling is an output constraint on the status writer alone: `status.ancestors` is mutable state owned by other controllers, and gating translation on it would let any controller holding status-write access disable backend TLS origination and fault covered traffic. A full ancestor map therefore costs reporting fidelity for that policy, not traffic. Each Ferrum ancestor carries Ferrum-authored `Accepted` and `ResolvedRefs` conditions using the portable `PolicyConditionReason` vocabulary (`Accepted` / `Conflicted` / `Invalid` / `NoValidCACertificate` / `TargetNotFound`; `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted`). Like route `status.parents`, `status.ancestors` is an atomic array in the upstream CRD, so it follows the same read-modify-write mandate: preserve fresh non-Ferrum ancestors, replace Ferrum-owned ones within the remaining 16-entry budget, guard with `metadata.resourceVersion`, and refetch/re-merge/retry after `409 Conflict`. When Istio status writing is also enabled, both writers observe the same immutable Kubernetes object generation for that reconcile (one shared snapshot; no second full deep copy), while retaining independent update plans and failure handling. Status planning builds immutable indexes (managed classes/gateways, parent refs, a precomputed ReferenceGrant from×to permission index, services/secrets, conflicts) once per reconcile, reuses the primary translation/materialization result (plus per-object skip errors keyed with exact-or-versionless identity) instead of retranslating a filtered snapshot once per status object, and borrows included `K8sObject` values during translation rather than deep-cloning `spec`/`status` JSON. Gateway API status planning alone applies a fair deterministic work budget of 256 candidates *before* expensive per-object status computation so the cap bounds CPU as well as API writes. All eligible Gateway API status kinds — including GatewayClass and Gateway — share that deterministic window (planning itself can be expensive, so these kinds are not exempted), and therefore enter it within at most `ceil(eligible_candidates / 256)` successful planning/patch rounds for a stable candidate set. The rotating cursor advances after an empty successful plan or a successful patch batch; patch errors and batch timeouts leave the cursor unchanged so the same bounded window retries on the next serialized reconcile. Istio status planning reuses the same translation/index snapshot path but remains unlimited. Each writer's complete Kubernetes status-patch batch has a 60-second wall-clock ceiling: a stalled API request is cancelled so it cannot retain the reconcile loop indefinitely, and unfinished updates are retried by a later watch event or periodic full sync. GatewayClass and Gateway status use Kubernetes server-side apply with the stable `ferrum.io/gateway-controller` field manager and `force=true`; their structural condition/listener arrays are keyed list-maps, so Ferrum applies only the fields it owns. Route `status.parents` is atomic in the upstream CRDs and therefore cannot be safely split by SSA ownership. Route writes instead follow the Gateway API read-modify-write mandate: preserve fresh non-Ferrum parents, replace Ferrum-owned parents, guard the merge patch with `metadata.resourceVersion`, and refetch/re-merge/retry up to five times with jitter after `409 Conflict`. Ferrum manages only `GatewayClass` objects whose `spec.controllerName` is `ferrum.io/gateway-controller`. `Gateway.status.conditions` and route `status.parents[].conditions` include Ferrum-authored `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted` entries with that controller name. The status writer is driven by the same translation inputs as the control-plane config: accepted routes report programmed from typed route-to-parent materialization records captured when Ferrum generates proxies (never by parsing proxy IDs), rejected routes report unresolved references for cases such as missing `ReferenceGrant` authorization or unsupported backend target kinds, and route collisions report `Conflicted=True`. Live `TCPRoute` attachment/traffic/status/update/deletion evidence is release-gated by the Gateway API conformance black-box lab (see [`docs/gateway_api_conformance.md`](gateway_api_conformance.md)); Ferrum does not advertise an upstream `GATEWAY-TCP` profile on the pinned Gateway API `v1.5.1` channel.
+When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, the controller watches `GatewayClass`, `Gateway`, `ListenerSet` (optional; discovery skips when the CRD is absent), `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`, `ReferenceGrant`, `BackendTLSPolicy`, `BackendLBPolicy` (historical `v1alpha2`, when installed), and `XBackendTrafficPolicy` (pinned `v1.5.1` experimental successor), plus MCS `ServiceImport` (`multicluster.x-k8s.io`, when that CRD is installed) for GEP-1748 backendRefs, resources and writes status subresources for the GatewayClass, Gateway, ListenerSet, route, `BackendTLSPolicy`, and BackendLB/`XBackendTrafficPolicy` kinds. `BackendTLSPolicy` is translated onto Service-backed HTTPRoute/GRPCRoute backends and receives Gateway API `PolicyStatus` (`status.ancestors[]`) patches: its ancestor is the targeted Service itself rather than the managed Gateways that route to it — Ferrum's overlay decision and its `Accepted`/`ResolvedRefs` verdict take no Gateway as input, so the verdict provably cannot vary per Gateway, and Ferrum's own contribution is bounded at one entry no matter how many Gateways route to the Service. Ferrum still writes status only for a policy whose targeted Service a managed Gateway *effectively* routes to (a route that materialized on an accepted parentRef, not merely one naming a Gateway). If third-party controllers have already filled the CRD's 16-entry `ancestors` maximum, Gateway API forbids adding another entry, so Ferrum publishes none — but the policy still translates and still governs backend TLS. That ceiling is an output constraint on the status writer alone: `status.ancestors` is mutable state owned by other controllers, and gating translation on it would let any controller holding status-write access disable backend TLS origination and fault covered traffic. A full ancestor map therefore costs reporting fidelity for that policy, not traffic. Each Ferrum ancestor carries Ferrum-authored `Accepted` and `ResolvedRefs` conditions using the portable `PolicyConditionReason` vocabulary (`Accepted` / `Conflicted` / `Invalid` / `NoValidCACertificate` / `TargetNotFound`; `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted`). Like route `status.parents`, `status.ancestors` is an atomic array in the upstream CRD, so it follows the same read-modify-write mandate: preserve fresh non-Ferrum ancestors, replace Ferrum-owned ones within the remaining 16-entry budget, guard with `metadata.resourceVersion`, and refetch/re-merge/retry after `409 Conflict`. When Istio status writing is also enabled, both writers observe the same immutable Kubernetes object generation for that reconcile (one shared snapshot; no second full deep copy), while retaining independent update plans and failure handling. Status planning builds immutable indexes (managed classes/gateways, parent refs, a precomputed ReferenceGrant from×to permission index, services/secrets, conflicts) once per reconcile, reuses the primary translation/materialization result (plus per-object skip errors keyed with exact-or-versionless identity) instead of retranslating a filtered snapshot once per status object, and borrows included `K8sObject` values during translation rather than deep-cloning `spec`/`status` JSON. Gateway API status planning alone applies a fair deterministic work budget of 256 candidates *before* expensive per-object status computation so the cap bounds CPU as well as API writes. All eligible Gateway API status kinds — including GatewayClass and Gateway — share that deterministic window (planning itself can be expensive, so these kinds are not exempted), and therefore enter it within at most `ceil(eligible_candidates / 256)` successful planning/patch rounds for a stable candidate set. The rotating cursor advances after an empty successful plan or a successful patch batch; patch errors and batch timeouts leave the cursor unchanged so the same bounded window retries on the next serialized reconcile. Istio status planning reuses the same translation/index snapshot path but remains unlimited. Each writer's complete Kubernetes status-patch batch has a 60-second wall-clock ceiling: a stalled API request is cancelled so it cannot retain the reconcile loop indefinitely, and unfinished updates are retried by a later watch event or periodic full sync. GatewayClass, Gateway, and ListenerSet status use Kubernetes server-side apply with the stable `ferrum.io/gateway-controller` field manager and `force=true`; their structural condition/listener arrays are keyed list-maps, so Ferrum applies only the fields it owns. Route `status.parents` is atomic in the upstream CRDs and therefore cannot be safely split by SSA ownership. Route writes instead follow the Gateway API read-modify-write mandate: preserve fresh non-Ferrum parents, replace Ferrum-owned parents, guard the merge patch with `metadata.resourceVersion`, and refetch/re-merge/retry up to five times with jitter after `409 Conflict`. Ferrum manages only `GatewayClass` objects whose `spec.controllerName` is `ferrum.io/gateway-controller`. `Gateway.status.conditions` and route `status.parents[].conditions` include Ferrum-authored `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted` entries with that controller name. The status writer is driven by the same translation inputs as the control-plane config: accepted routes report programmed from typed route-to-parent materialization records captured when Ferrum generates proxies (never by parsing proxy IDs), rejected routes report unresolved references for cases such as missing `ReferenceGrant` authorization or unsupported backend target kinds, and route collisions report `Conflicted=True`. Live `TCPRoute` attachment/traffic/status/update/deletion evidence is release-gated by the Gateway API conformance black-box lab (see [`docs/gateway_api_conformance.md`](gateway_api_conformance.md)); Ferrum does not advertise an upstream `GATEWAY-TCP` profile on the pinned Gateway API `v1.5.1` channel.
 
 MCS backendRefs match only objects from the exact `multicluster.x-k8s.io` API group. Ferrum admits TCP ports (an omitted `ServiceImport.spec.ports[].protocol` uses the Kubernetes `TCP` default) and reports `UnsupportedProtocol` for UDP, SCTP, unknown, or malformed protocols. An omitted backendRef port is derived only when the import exposes exactly one valid TCP port; zero or multiple TCP candidates fail closed. HTTPRoute/GRPCRoute backends can expand across ready MCS-labeled EndpointSlice addresses when pod discovery is enabled, while TCPRoute/TLSRoute always retain the stable ClusterSet DNS name rather than selecting and discarding all but one EndpointSlice address. A `ServiceImport` carries no `targetPort`, so expansion never assumes the ClusterSet port number is also the container port: a **named** `ServiceImport.spec.ports[]` entry resolves against the like-named MCS EndpointSlice port (the same name-based mapping a core Service uses for a named `targetPort`), and an **unnamed** entry resolves against a single-port slice. A slice that offers no unambiguous mapping is skipped and the backend falls back to the ClusterSet DNS name instead of dialing the ClusterSet port number on a pod address. `UDPRoute` does not claim `ServiceImport` backendRefs and keeps core `Service` legs only.
 
@@ -3503,7 +3668,7 @@ materialization. Listener status reports `Accepted=False` and
 path. Valid `All`, `Same`, empty-selector, and well-formed selector behavior is
 unchanged, and valid sibling listeners reconcile independently.
 
-Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
+Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/ListenerSet/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
 ## Istio CRD Status
 

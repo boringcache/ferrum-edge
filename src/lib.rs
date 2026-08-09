@@ -720,6 +720,27 @@ pub mod _test_support {
         crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
     }
 
+    /// Resolve the production final request-body dispatch requirements for a
+    /// synthetic plugin chain. This exposes the mixed-chain decision boundary
+    /// without widening the runtime helper's public API.
+    pub fn final_request_body_requirements_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        request_may_need_buffering: bool,
+        has_terminal_body_dispatch: bool,
+        has_contextual_final_body_hook: bool,
+        has_finalized_request_egress: bool,
+    ) -> (bool, bool, bool) {
+        crate::proxy::final_request_body_requirements(
+            plugins,
+            ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
+    }
+
     /// Exercise the mesh RTDS generation reconciliation boundary without
     /// widening its runtime API beyond the crate.
     pub fn reconcile_runtime_overlay_plugin_generations_for_test(
@@ -2385,6 +2406,22 @@ pub mod _test_support {
         plugin.schema_type_cache_stats_for_test()
     }
 
+    // ── plugins/trigger ──────────────────────────────────────────────────────
+    /// Project a stream connection's memoized execution-trigger decisions onto
+    /// a disconnect summary, exactly as every production TCP/UDP/DTLS
+    /// disconnect path does.
+    ///
+    /// The carrier is deliberately not constructible with real content outside
+    /// this crate — that is what stops a plugin forging another instance's
+    /// admission decision — so external tests reach the production projection
+    /// through here rather than through a new runtime API.
+    pub fn attach_stream_trigger_decisions_for_test(
+        summary: &mut crate::plugins::StreamTransactionSummary,
+        ctx: &crate::plugins::StreamConnectionContext,
+    ) {
+        summary.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
@@ -2408,6 +2445,7 @@ pub mod _test_support {
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::plugins::StreamTransactionSummary {
         crate::plugins::StreamTransactionSummary {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-proxy".to_string(),
             proxy_lifecycle_generation: None,
@@ -6160,6 +6198,17 @@ pub mod _test_support {
         flavor: crate::config::types::HttpFlavor,
     ) {
         ctx.set_request_http_flavor(flavor);
+    }
+
+    /// Stamp the authoritative client-visible wire transport a frontend would
+    /// record, so trigger `protocol:` predicates can be exercised without
+    /// standing up an H1/H2/H3 listener.
+    pub fn set_request_wire_protocol_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        transport: crate::config::types::HttpWireTransport,
+        is_grpc_web: bool,
+    ) {
+        ctx.set_request_wire_protocol(transport, is_grpc_web);
     }
 
     pub async fn wait_for_tcp_peer_reset_for_test(stream: &tokio::net::TcpStream) {
