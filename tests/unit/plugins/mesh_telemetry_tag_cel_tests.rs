@@ -440,6 +440,47 @@ async fn mesh_series_budget_caps_cel_cardinality_and_keeps_admitted_keys_updatin
     }
 }
 
+#[test]
+fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
+    let registry = std::sync::Arc::new(MetricsRegistry::new());
+    registry.set_mesh_series_budget_per_family_for_test(4);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(33));
+    let mut workers = Vec::new();
+
+    for i in 0..32 {
+        let registry = std::sync::Arc::clone(&registry);
+        let barrier = std::sync::Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let mut metadata = mesh_identity_metadata(HashMap::new());
+            metadata.insert("mesh.source.workload".into(), format!("host-{i}.example"));
+            let summary = TransactionSummary {
+                http_method: "GET".into(),
+                response_status_code: 200,
+                metadata,
+                ..TransactionSummary::default()
+            };
+            barrier.wait();
+            registry.record(&summary);
+        }));
+    }
+
+    barrier.wait();
+    for worker in workers {
+        worker.join().expect("concurrent admission worker");
+    }
+
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_COUNT"),
+        Some(4)
+    );
+    assert_eq!(registry.mesh_request_counter.len(), 4);
+    assert_eq!(
+        registry.mesh_series_overflow_for_test("REQUEST_COUNT"),
+        Some(28),
+        "every distinct key beyond the exact budget must be dropped once"
+    );
+}
+
 #[tokio::test]
 async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
     let workload_metrics = WorkloadMetrics::new(&json!({

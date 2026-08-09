@@ -767,7 +767,7 @@ pub struct MetricsRegistry {
     /// Per-family live `MeshRequestKey` series budget (exact atomic accounting).
     mesh_series_budget_per_family: AtomicUsize,
     /// Live count + overflow totals for each [`prometheus_helpers::MeshMetricFamily`].
-    mesh_series_budgets: [MeshFamilySeriesBudget; 10],
+    mesh_series_budgets: [CachePadded<MeshFamilySeriesBudget>; 10],
 }
 
 impl Default for MetricsRegistry {
@@ -847,7 +847,9 @@ impl MetricsRegistry {
             ),
             namespace_label: std::sync::RwLock::new(String::new()),
             mesh_series_budget_per_family: AtomicUsize::new(DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY),
-            mesh_series_budgets: std::array::from_fn(|_| MeshFamilySeriesBudget::new()),
+            mesh_series_budgets: std::array::from_fn(|_| {
+                CachePadded::new(MeshFamilySeriesBudget::new())
+            }),
         }
     }
 
@@ -1815,9 +1817,14 @@ impl MetricsRegistry {
     }
 
     fn release_mesh_series(&self, family: prometheus_helpers::MeshMetricFamily) {
-        self.mesh_series_budgets[family.index()]
-            .live
-            .fetch_sub(1, Ordering::AcqRel);
+        // Removal and admission use the same DashMap shard lock, so a zero
+        // count would indicate an invariant violation. Refuse to wrap the
+        // live count to `usize::MAX` even under that defensive case.
+        let _ = self.mesh_series_budgets[family.index()].live.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| count.checked_sub(1),
+        );
     }
 
     fn record_mesh_series_overflow(&self, family: prometheus_helpers::MeshMetricFamily) {
