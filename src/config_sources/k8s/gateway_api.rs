@@ -1485,22 +1485,44 @@ struct GatewayFrontendTlsNamespaceSlotPlan {
     /// Gateway namespace → the single `(cert_path, key_path)` that namespace will
     /// present on TLS-terminating sockets.
     serving_by_namespace: BTreeMap<String, (String, String)>,
-    /// `(parent kind, namespace, parent name)` identities that named more than one distinct
-    /// credential and therefore cannot occupy the namespace serving slot.
-    multi_cert_gateways: BTreeSet<(GatewayApiListenerParentKind, String, String)>,
+    /// `(parent kind, resource namespace, parent name)` identities that named
+    /// more than one distinct credential and therefore cannot occupy the
+    /// Gateway namespace serving slot.
+    multi_cert_parents: BTreeSet<(GatewayApiListenerParentKind, String, String)>,
 }
 
+type GatewayFrontendTlsParent = (GatewayApiListenerParentKind, String, String);
 type GatewayFrontendTlsCredentials =
-    BTreeMap<(GatewayApiListenerParentKind, String), BTreeSet<(String, String)>>;
+    BTreeMap<GatewayFrontendTlsParent, BTreeSet<(String, String)>>;
+
+/// Physical frontend-TLS serving is scoped to the attached Gateway namespace.
+/// A cross-namespace ListenerSet keeps its own namespace in its listener key
+/// (for identity, status, routes, and Secret resolution), but it must compete
+/// for the parent Gateway's serving slot rather than minting a foreign slot.
+fn gateway_frontend_tls_slot_namespace<'a>(
+    key: &'a GatewayApiListenerKey,
+    policy: &'a GatewayApiListenerPolicy,
+) -> &'a str {
+    if key.parent_kind == GatewayApiListenerParentKind::ListenerSet
+        && let Some((namespace, _)) = policy.parent_gateway.as_ref()
+    {
+        namespace
+    } else {
+        &key.namespace
+    }
+}
 
 /// Build the shared namespace TLS-slot plan from listener policies alone.
 fn plan_gateway_frontend_tls_namespace_slots(
     acc: &K8sAccumulator,
 ) -> GatewayFrontendTlsNamespaceSlotPlan {
-    // namespace → (parent kind, parent name) → distinct credentials on that
-    // resource's materializable TLS listeners. Including the kind prevents a
-    // same-named Gateway and ListenerSet from collapsing into one credential
-    // claim. BTree maps keep selection order-independent.
+    // Gateway namespace → (parent kind, resource namespace, parent name) →
+    // distinct credentials on that resource's materializable TLS listeners.
+    // ListenerSets attach to the parent Gateway namespace's physical slot;
+    // retaining their resource namespace in the owner identity prevents
+    // same-named cross-namespace ListenerSets from collapsing. BTree maps keep
+    // selection order-independent, with a Gateway owner preceding ListenerSet
+    // owners so an extension cannot displace its parent Gateway's credential.
     let mut credentials_by_gateway: BTreeMap<String, GatewayFrontendTlsCredentials> =
         BTreeMap::new();
     for (key, policy) in &acc.gateway_api_listener_policies {
@@ -1516,29 +1538,34 @@ fn plan_gateway_frontend_tls_namespace_slots(
         let Some(source) = policy.frontend_tls_source.clone() else {
             continue;
         };
+        let slot_namespace = gateway_frontend_tls_slot_namespace(key, policy).to_string();
         credentials_by_gateway
-            .entry(key.namespace.clone())
+            .entry(slot_namespace)
             .or_default()
-            .entry((key.parent_kind, key.gateway.clone()))
+            .entry((
+                key.parent_kind,
+                key.namespace.clone(),
+                key.gateway.clone(),
+            ))
             .or_default()
             .insert(source);
     }
 
     let mut plan = GatewayFrontendTlsNamespaceSlotPlan::default();
     for (namespace, gateways) in credentials_by_gateway {
-        let mut candidates: BTreeMap<(GatewayApiListenerParentKind, String), (String, String)> =
+        let mut candidates: BTreeMap<GatewayFrontendTlsParent, (String, String)> =
             BTreeMap::new();
-        for ((parent_kind, gateway), sources) in gateways {
+        for (parent, sources) in gateways {
             if sources.len() != 1 {
-                plan.multi_cert_gateways
-                    .insert((parent_kind, namespace.clone(), gateway));
+                plan.multi_cert_parents.insert(parent);
                 continue;
             }
             if let Some(source) = sources.into_iter().next() {
-                candidates.insert((parent_kind, gateway), source);
+                candidates.insert(parent, source);
             }
         }
-        // Lexicographically first Gateway name wins the namespace slot.
+        // Gateways precede ListenerSets; otherwise resource namespace/name
+        // provide deterministic arbitration within one Gateway namespace.
         if let Some((_, source)) = candidates.into_iter().next() {
             plan.serving_by_namespace.insert(namespace, source);
         }
@@ -1563,12 +1590,13 @@ fn apply_gateway_frontend_tls_namespace_slot_route_limits(
         if !policy.requires_frontend_tls || !policy.routes_materializable {
             continue;
         }
-        let clear_routes = plan.multi_cert_gateways.contains(&(
+        let clear_routes = plan.multi_cert_parents.contains(&(
             key.parent_kind,
             key.namespace.clone(),
             key.gateway.clone(),
         )) || match (
-            plan.serving_by_namespace.get(&key.namespace),
+            plan.serving_by_namespace
+                .get(gateway_frontend_tls_slot_namespace(key, policy)),
             policy.frontend_tls_source.as_ref(),
         ) {
             (Some(serving), Some(source)) => serving != source,
@@ -1624,7 +1652,7 @@ fn listener_is_effective_tls_serving_claim(
     plan: &GatewayFrontendTlsNamespaceSlotPlan,
 ) -> bool {
     if !policy.requires_frontend_tls
-        || plan.multi_cert_gateways.contains(&(
+        || plan.multi_cert_parents.contains(&(
             key.parent_kind,
             key.namespace.clone(),
             key.gateway.clone(),
@@ -1633,7 +1661,8 @@ fn listener_is_effective_tls_serving_claim(
         return false;
     }
     match (
-        plan.serving_by_namespace.get(&key.namespace),
+        plan.serving_by_namespace
+            .get(gateway_frontend_tls_slot_namespace(key, policy)),
         policy.frontend_tls_source.as_ref(),
     ) {
         (Some(serving), Some(source)) => serving == source,
@@ -1720,8 +1749,11 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                 claims.effective_tls.push(key.clone());
                 claims
                     .effective_tls_namespaces
-                    .insert(key.namespace.clone());
-                if let Some(source) = plan.serving_by_namespace.get(&key.namespace) {
+                    .insert(gateway_frontend_tls_slot_namespace(key, policy).to_string());
+                if let Some(source) = plan
+                    .serving_by_namespace
+                    .get(gateway_frontend_tls_slot_namespace(key, policy))
+                {
                     claims.effective_tls_credentials.insert(source.clone());
                 }
             }
@@ -1867,7 +1899,28 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
     // `refuse_incompatible_same_port_listeners` from the same deterministic
     // rule translation and status share. Align this Gateway with that plan
     // instead of letting object order mint a competing slot.
-    let source_namespace = object.metadata.namespace.clone();
+    let source_namespace = if object.kind == "ListenerSet" {
+        let Some(namespace) = acc
+            .gateway_api_listener_policies
+            .iter()
+            .find(|(key, _)| {
+                key.parent_kind == GatewayApiListenerParentKind::ListenerSet
+                    && key.namespace == object.metadata.namespace
+                    && key.gateway == object.metadata.name
+            })
+            .and_then(|(_, policy)| {
+                policy
+                    .parent_gateway
+                    .as_ref()
+                    .map(|(namespace, _)| namespace.clone())
+            })
+        else {
+            return false;
+        };
+        namespace
+    } else {
+        object.metadata.namespace.clone()
+    };
     let Some(existing) = acc
         .config
         .frontend_tls_namespace_sources

@@ -202,7 +202,7 @@ fn listenerset_default_not_allowed() {
 
 #[test]
 fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
-    let mut namespace = object("Namespace", "default", json!({}));
+    let mut namespace = object("Namespace", "extension-ns", json!({}));
     namespace.api_version = "v1".to_string();
     namespace.metadata.namespace.clear();
     namespace
@@ -220,7 +220,7 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
             }
         }),
     );
-    let selected = listenerset(
+    let mut selected = listenerset(
         "selected-set",
         "selected",
         json!([{
@@ -229,6 +229,7 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
             "protocol": "HTTP"
         }]),
     );
+    selected.metadata.namespace = "extension-ns".to_string();
 
     let mut malformed_gateway = http_gateway("malformed", None);
     malformed_gateway.spec.as_object_mut().unwrap().insert(
@@ -259,7 +260,10 @@ fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
             malformed_gateway,
             malformed,
         ],
-        options(),
+        options().with_source_namespaces(vec![
+            "default".to_string(),
+            "extension-ns".to_string(),
+        ]),
     )
     .expect("translate strict allowedListeners selectors");
     assert!(
@@ -1047,6 +1051,108 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
         }),
         "a ListenerSet-scoped ReferenceGrant must authorize the valid cross-namespace TLS Secret"
     );
+}
+
+#[test]
+fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
+    let mut gateway = object(
+        "Gateway",
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "allowedListeners": { "namespaces": { "from": "All" } },
+            "listeners": [{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "gateway.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } },
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{ "name": "gateway-cert" }]
+                }
+            }]
+        }),
+    );
+    gateway.metadata.namespace = "gateway-ns".to_string();
+
+    let mut set = listenerset(
+        "extra",
+        "edge",
+        json!([{
+            "name": "https-extra",
+            "port": 443,
+            "protocol": "HTTPS",
+            "hostname": "extra.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } },
+            "tls": {
+                "mode": "Terminate",
+                "certificateRefs": [{ "name": "listenerset-cert" }]
+            }
+        }]),
+    );
+    set.metadata.namespace = "extension-ns".to_string();
+    set.spec["parentRef"]["namespace"] = json!("gateway-ns");
+
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        set,
+        tls_secret("gateway-cert", "gateway-ns"),
+        tls_secret("listenerset-cert", "extension-ns"),
+    ];
+    let opts = options().with_source_namespaces(vec![
+        "gateway-ns".to_string(),
+        "extension-ns".to_string(),
+    ]);
+    let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
+
+    assert_eq!(translation.config.frontend_tls_namespace_sources.len(), 1);
+    assert_eq!(
+        translation.config.frontend_tls_source_namespace.as_deref(),
+        Some("gateway-ns")
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_cert_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with("k8s://gateway-ns/gateway-cert#tls.crt?")),
+        "the parent Gateway must retain the physical TLS serving slot"
+    );
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services.iter().any(|service| {
+            service.namespace == "gateway-ns" && service.name == "edge-https"
+        }) && !mesh.services.iter().any(|service| {
+            service.namespace == "extension-ns"
+                && service.name == "listenerset-extra-https-extra"
+        })
+    }));
+
+    let updates =
+        plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
+    let gateway_update = updates
+        .iter()
+        .find(|update| {
+            update.kind == "Gateway"
+                && update.namespace == "gateway-ns"
+                && update.name == "edge"
+        })
+        .expect("Gateway status update");
+    let gateway_listener = gateway_update.status["listeners"]
+        .as_array()
+        .expect("Gateway listeners")
+        .iter()
+        .find(|listener| listener["name"] == "https")
+        .expect("Gateway HTTPS listener");
+    let conflicted = gateway_listener["conditions"]
+        .as_array()
+        .expect("Gateway listener conditions")
+        .iter()
+        .find(|condition| condition["type"] == "Conflicted")
+        .expect("Gateway Conflicted condition");
+    assert_eq!(conflicted["status"], "False");
+    assert_eq!(conflicted["reason"], "NoConflicts");
 }
 
 fn listenerset_listener_condition<'a>(
