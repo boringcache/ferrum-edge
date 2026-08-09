@@ -322,34 +322,47 @@ pub(crate) enum CapturedSourceEvidence {
     HostIngress(std::sync::Arc<super::host_udp_capture::HostUdpIdentityIndex>),
 }
 
+/// Evidence retained from the exact snapshot that authorized one datagram.
+/// Fixed-evidence listeners borrow their already-owned identity without cloning
+/// on refreshes; host listeners retain the binding `Arc` from the one ArcSwap
+/// load used for authorization.
 #[cfg(target_os = "linux")]
-impl CapturedSourceEvidence {
-    /// Per-datagram admission. Deliberately clone-free so the `Fixed` arm costs
-    /// nothing on the receive path and the `HostIngress` arm costs one lock-free
-    /// snapshot load plus a hash lookup.
-    fn authorize(
-        &self,
-        ingress_ifindex: Option<u32>,
-        client: SocketAddr,
-    ) -> Result<(), &'static str> {
-        match self {
-            Self::Fixed(_) => Ok(()),
-            Self::HostIngress(index) => index
-                .authorize(ingress_ifindex, client.ip())
-                .map_err(super::host_udp_capture::HostUdpDatagramRefusal::as_str),
-        }
-    }
+enum AuthorizedCapturedSource<'a> {
+    Fixed(Option<&'a std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>),
+    Host(std::sync::Arc<super::host_udp_capture::HostUdpPodBinding>),
+}
 
-    /// Evidence for an already-authorized datagram, resolved only when a session
-    /// is admitted so the `Arc` clone stays off the refresh path.
-    fn identity_for(
-        &self,
-        ingress_ifindex: Option<u32>,
-        client: SocketAddr,
+#[cfg(target_os = "linux")]
+impl AuthorizedCapturedSource<'_> {
+    /// Materialize the identity only for a newly admitted session. The host arm
+    /// can never produce `None`: host authorization requires an attested binding
+    /// and this value retains that exact binding generation.
+    fn into_session_identity(
+        self,
     ) -> Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>> {
         match self {
-            Self::Fixed(identity) => identity.clone(),
-            Self::HostIngress(index) => index.identity_for(ingress_ifindex, client.ip()),
+            Self::Fixed(identity) => identity.cloned(),
+            Self::Host(binding) => Some(std::sync::Arc::new(binding.identity.clone())),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedSourceEvidence {
+    /// Per-datagram admission. The `Fixed` arm is clone-free; the `HostIngress`
+    /// arm costs one lock-free snapshot load, one hash lookup, and one `Arc`
+    /// retain so a later generation swap cannot change the admitted evidence.
+    fn authorize<'a>(
+        &'a self,
+        ingress_ifindex: Option<u32>,
+        client: SocketAddr,
+    ) -> Result<AuthorizedCapturedSource<'a>, &'static str> {
+        match self {
+            Self::Fixed(identity) => Ok(AuthorizedCapturedSource::Fixed(identity.as_ref())),
+            Self::HostIngress(index) => index
+                .authorized_binding(ingress_ifindex, client.ip())
+                .map(AuthorizedCapturedSource::Host)
+                .map_err(super::host_udp_capture::HostUdpDatagramRefusal::as_str),
         }
     }
 }
@@ -902,18 +915,21 @@ fn handle_captured_datagram(
     // datagram must never reserve a session slot, so an unattributable flood
     // cannot evict attributable flows. The `Fixed` placements short-circuit to
     // `Ok(())` with no work.
-    if let Err(reason) = source_identity.authorize(ingress_ifindex, client) {
-        debug!(
-            client = %client,
-            // `0` is the kernel's "unspecified interface" value, so it doubles as
-            // the absent-cmsg marker without logging an `Option`.
-            ingress_ifindex = ingress_ifindex.unwrap_or(0),
-            reason,
-            "Mesh UDP capture: dropping datagram whose source could not be attributed to an \
-             enrolled workload"
-        );
-        return false;
-    }
+    let authorized_source = match source_identity.authorize(ingress_ifindex, client) {
+        Ok(authorized) => authorized,
+        Err(reason) => {
+            debug!(
+                client = %client,
+                // `0` is the kernel's "unspecified interface" value, so it doubles as
+                // the absent-cmsg marker without logging an `Option`.
+                ingress_ifindex = ingress_ifindex.unwrap_or(0),
+                reason,
+                "Mesh UDP capture: dropping datagram whose source could not be attributed to an \
+                 enrolled workload"
+            );
+            return false;
+        }
+    };
 
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
@@ -998,7 +1014,7 @@ fn handle_captured_datagram(
                 queued_bytes,
                 outcome_signal,
                 epoch,
-                source_identity.identity_for(ingress_ifindex, client),
+                authorized_source.into_session_identity(),
                 reply_factory.clone(),
                 session_shutdown.clone(),
                 session_tasks,
@@ -2686,6 +2702,13 @@ listen_port: 15011
 /// - That a reply can be SOURCED from the captured original destination on an
 ///   `IP_TRANSPARENT` socket (`build_transparent_reply_socket`'s recipe), the
 ///   return-path primitive the egress session uses.
+/// - The host-network placement's distinct live boundary: a veth-side datagram
+///   re-enters a throwaway host namespace on the peer interface, matches a real
+///   `PREROUTING -i <peer> -j TPROXY` rule, reaches the production
+///   pktinfo-enabled transparent socket, preserves its original destination, and
+///   reports that exact peer ifindex for per-pod attribution. The test also runs
+///   the production dedicated-peer sysfs check against the live veth and rejects
+///   the self-linked loopback device.
 ///
 /// ## What this does NOT cover (deliberately — a thin smoke test)
 /// - No full two-gateway loop: no HBONE / mesh-mTLS tunnel, no egress relay, no
@@ -2794,6 +2817,44 @@ mod live_netns_tests {
              iptables -t mangle -A OUTPUT -p udp -m addrtype ! --dst-type LOCAL \
                -j MARK --set-mark {mark_arg} || exit 98; \
              iptables -t mangle -A PREROUTING -p udp -m mark --mark {mark_arg} \
+               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 98; \
+             exec sleep 30"
+        );
+        Command::new("unshare")
+            .args(["--net", "sh", "-c", &script])
+            .spawn()
+            .ok()
+    }
+
+    /// Spawn a throwaway host-shaped namespace with both ends of a veth pair in
+    /// that namespace. A locally generated client datagram leaves `pod0`,
+    /// re-enters through its peer `vethhost`, and therefore traverses the same
+    /// `mangle PREROUTING -i <pod host interface>` hook as real pod egress. The
+    /// host-network capture rule then TPROXY-delivers it to the production
+    /// transparent socket while preserving both the original destination and
+    /// the ingress-interface pktinfo cmsg.
+    fn spawn_host_tproxy_veth_child() -> Option<Child> {
+        let mark = crate::capture::DEFAULT_TPROXY_MARK;
+        let mask = crate::capture::TPROXY_MARK_MASK;
+        let table = crate::capture::TPROXY_HOST_ROUTE_TABLE;
+        let prio = crate::capture::TPROXY_HOST_ROUTE_RULE_PRIORITY;
+        let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        let script = format!(
+            "set -e; \
+             command -v iptables >/dev/null 2>&1 || exit 97; \
+             command -v ip >/dev/null 2>&1 || exit 97; \
+             ip link set lo up 2>/dev/null || true; \
+             ip link add pod0 type veth peer name vethhost || exit 98; \
+             ip link set pod0 up || exit 98; \
+             ip link set vethhost up || exit 98; \
+             ip address add 10.0.0.2/32 dev pod0 || exit 98; \
+             printf '1\n' > /proc/sys/net/ipv4/conf/vethhost/accept_local || exit 98; \
+             host_mac=$(cat /sys/class/net/vethhost/address) || exit 98; \
+             ip neigh add {REMOTE_DST} lladdr \"$host_mac\" dev pod0 nud permanent || exit 98; \
+             ip route add {REMOTE_DST}/32 dev pod0 src 10.0.0.2 || exit 98; \
+             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 98; \
+             ip route add local 0.0.0.0/0 dev lo table {table} || exit 98; \
+             iptables -t mangle -A PREROUTING -i vethhost -p udp \
                -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 98; \
              exec sleep 30"
         );
@@ -2962,6 +3023,133 @@ mod live_netns_tests {
             Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
             "a TPROXY-captured datagram must recover its pre-TPROXY (original) \
              destination from the IP_RECVORIGDSTADDR cmsg"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root + veth + iptables/TPROXY + iproute2 in a fresh netns"]
+    fn host_veth_capture_reports_original_destination_and_ingress_interface() {
+        if !is_root() {
+            skip_or_fail("not root; cannot create a veth / TPROXY namespace");
+            return;
+        }
+        let Some(mut child) = spawn_host_tproxy_veth_child() else {
+            skip_or_fail("`unshare --net` unavailable");
+            return;
+        };
+
+        let mut setup_exit: Option<std::process::ExitStatus> = None;
+        let mut setup_status_unknown = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    setup_exit = Some(status);
+                    break;
+                }
+                Err(_) => {
+                    setup_status_unknown = true;
+                    break;
+                }
+                Ok(None) => {}
+            }
+        }
+        if let Some(status) = setup_exit {
+            if status.code() == Some(98) {
+                panic!(
+                    "host-veth UDP TPROXY setup failed (exit 98): the veth, route, fwmark, or \
+                     interface-scoped TPROXY rule did not install"
+                );
+            }
+            skip_or_fail(&format!(
+                "host-veth capture prerequisites unavailable (setup child exited {:?})",
+                status.code()
+            ));
+            return;
+        }
+        if setup_status_unknown {
+            skip_or_fail("could not determine host-veth setup-child status");
+            return;
+        }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+
+        let observed = std::thread::spawn(move || -> Result<_, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open host-shaped netns handle: {e}"))?;
+            // Safety: `ns` is an open netns handle owned for this throwaway
+            // thread, which exits without returning to the test runtime.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+
+            let sysfs = std::path::Path::new("/sys/class/net");
+            let expected_ifindex =
+                super::super::host_udp_capture::dedicated_host_ifindex(sysfs, "vethhost")
+                    .map_err(|error| format!("validate live host-side veth: {error}"))?;
+            if super::super::host_udp_capture::dedicated_host_ifindex(sysfs, "lo").is_ok() {
+                return Err("self-linked loopback device passed the dedicated-peer check".into());
+            }
+
+            let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
+            let (capture, _, v4_origdst, _) =
+                super::bind_mesh_udp_capture_socket_with_pktinfo(bind, true)
+                    .map_err(|error| format!("bind production host capture socket: {error}"))?;
+            if !v4_origdst {
+                return Err("production socket did not enable IPv4 orig-dst recovery".to_string());
+            }
+            let capture_fd = capture.as_raw_fd();
+
+            let client = std::net::UdpSocket::bind("10.0.0.2:0")
+                .map_err(|error| format!("bind veth-side client: {error}"))?;
+            let dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            client
+                .send_to(b"host-veth-capture", dst)
+                .map_err(|error| format!("send veth-side datagram to {dst}: {error}"))?;
+
+            let mut batch = super::super::udp_batch::RecvMmsgBatch::new(8, true);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match batch.recv(capture_fd, 8) {
+                    Ok(n) if n > 0 => {
+                        let (payload, source) = batch.datagram(0);
+                        let local = batch.local_addr(0).ok_or_else(|| {
+                            "captured datagram carried no IP_PKTINFO cmsg".to_string()
+                        })?;
+                        return Ok((
+                            payload.to_vec(),
+                            source,
+                            batch.orig_dst(0),
+                            local.ifindex,
+                            expected_ifindex,
+                        ));
+                    }
+                    _ if Instant::now() >= deadline => {
+                        return Err(
+                            "host capture socket received no veth-ingress datagram within the \
+                             deadline"
+                                .to_string(),
+                        );
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        })
+        .join()
+        .expect("host-veth capture scenario thread must not panic")
+        .expect("live host-veth UDP capture scenario must complete");
+
+        assert_eq!(observed.0, b"host-veth-capture");
+        assert_eq!(observed.1.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            observed.2,
+            Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
+            "the host capture socket must recover the pre-TPROXY destination"
+        );
+        assert_eq!(
+            observed.3, observed.4,
+            "IP_PKTINFO must report the pod's host-side ingress interface, which is the \
+             production attribution key"
         );
     }
 

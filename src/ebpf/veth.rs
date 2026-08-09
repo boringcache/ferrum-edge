@@ -70,24 +70,44 @@ pub fn discover_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
     }
 }
 
-/// Discover the host-side interface that routes to a local pod's IPv6 address.
+/// Discover a dedicated host-side interface for a local pod IPv4 address.
 ///
-/// The IPv6 counterpart of [`discover_veth_for_pod_ip`], and what lets an
-/// IPv6-only enrolled pod use a deployment that shares neither host `/proc` nor
-/// the `setns` privileges: the IPv4 fallback is keyed on an address such a pod
-/// does not have, so without this it could only ever be refused.
-///
-/// `/proc/net/ipv6_route` is parsed strictly and the answer is fail-closed:
-/// only `RTF_UP` routes with a non-zero prefix length participate, the longest
-/// matching prefix wins, and two DIFFERENT devices tying at that prefix length
-/// resolve to NOTHING rather than to whichever the kernel happened to print
-/// first. A guessed interface is exactly the cross-tenant attribution error the
-/// consumer of this lookup exists to prevent, so an ambiguous table is treated
-/// like an unresolvable one.
-pub fn discover_veth_for_pod_ip6(pod_ip: std::net::Ipv6Addr) -> Option<String> {
+/// Unlike [`discover_veth_for_pod_ip`], this is safe to use as an iptables
+/// ingress-interface capture boundary: it accepts only an unambiguous `/32`
+/// host route. A broader route can legitimately identify a shared CNI bridge
+/// for the eBPF caller above, whose pod-IP map narrows classification, but using
+/// that bridge in `iptables -i` would capture traffic from every attached pod.
+pub fn discover_dedicated_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        resolve_iface_by_ipv6_route(Path::new("/proc/net/ipv6_route"), pod_ip)
+        resolve_dedicated_iface_by_ipv4_route(Path::new("/proc/net/route"), pod_ip)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pod_ip;
+        None
+    }
+}
+
+/// Discover a dedicated host-side interface for a local pod IPv6 address.
+///
+/// The IPv6 counterpart of [`discover_dedicated_veth_for_pod_ip`], and what lets
+/// an IPv6-only enrolled pod use a deployment that shares neither host `/proc`
+/// nor the `setns` privileges: the IPv4 fallback is keyed on an address such a
+/// pod does not have, so without this it could only ever be refused.
+///
+/// `/proc/net/ipv6_route` is parsed strictly and the answer is fail-closed:
+/// only an `RTF_UP` `/128` host route participates, and two DIFFERENT devices
+/// claiming it resolve to NOTHING rather than to whichever the kernel happened
+/// to print first. A broader subnet route through a shared bridge is not
+/// per-pod ownership evidence. A guessed interface is exactly the cross-tenant
+/// attribution error the consumer of this lookup exists to prevent, so an
+/// ambiguous table is treated like an unresolvable one.
+pub fn discover_dedicated_veth_for_pod_ip6(pod_ip: std::net::Ipv6Addr) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_dedicated_iface_by_ipv6_route(Path::new("/proc/net/ipv6_route"), pod_ip)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -273,9 +293,30 @@ fn read_route_table(route_path: &Path) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<String> {
+    resolve_iface_by_ipv4_route_mode(route_path, pod_ip, false)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_dedicated_iface_by_ipv4_route(
+    route_path: &Path,
+    pod_ip: Ipv4Addr,
+) -> Option<String> {
+    if pod_ip.is_unspecified() || pod_ip.is_loopback() || pod_ip.is_multicast() {
+        return None;
+    }
+    resolve_iface_by_ipv4_route_mode(route_path, pod_ip, true)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_iface_by_ipv4_route_mode(
+    route_path: &Path,
+    pod_ip: Ipv4Addr,
+    require_host_route: bool,
+) -> Option<String> {
     let routes = read_route_table(route_path)?;
     let ip_raw = u32::from_le_bytes(pod_ip.octets());
     let mut best: Option<(u32, String)> = None;
+    let mut ambiguous = false;
 
     for line in routes.lines().skip(1) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -295,7 +336,7 @@ fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<St
         ) else {
             continue;
         };
-        if flags & 0x1 == 0 || mask == 0 {
+        if flags & 0x1 == 0 || mask == 0 || (require_host_route && mask != u32::MAX) {
             continue;
         }
         if ip_raw & mask != destination & mask {
@@ -303,19 +344,30 @@ fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<St
         }
 
         let prefix_len = mask.count_ones();
-        if best
-            .as_ref()
-            .is_none_or(|(best_prefix, _)| prefix_len > *best_prefix)
-        {
-            best = Some((prefix_len, iface.to_string()));
+        if let Some((best_prefix, best_iface)) = best.as_ref() {
+            if require_host_route && prefix_len == *best_prefix {
+                ambiguous |= best_iface.as_str() != iface;
+            }
+            if prefix_len <= *best_prefix {
+                continue;
+            }
         }
+        best = Some((prefix_len, iface.to_string()));
+        ambiguous = false;
     }
 
-    best.map(|(_, iface)| iface)
+    if ambiguous {
+        None
+    } else {
+        best.map(|(_, iface)| iface)
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) -> Option<String> {
+fn resolve_dedicated_iface_by_ipv6_route(
+    route_path: &Path,
+    pod_ip: Ipv6Addr,
+) -> Option<String> {
     // An unspecified, loopback, or multicast "pod address" names no single pod
     // interface, so it is refused before the table is consulted rather than
     // being allowed to match a broad route.
@@ -348,9 +400,11 @@ fn resolve_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) -> Option<St
         ) else {
             continue;
         };
-        // `RTF_UP`, and never the default route: `::/0` matches every pod and
-        // would attribute one to the node uplink.
-        if flags & 0x1 == 0 || prefix_len == 0 || prefix_len > 128 {
+        // Only a host route is evidence that this device belongs to this pod.
+        // A covering subnet route commonly names a shared CNI bridge; placing
+        // that device in an ingress-interface capture rule would intercept all
+        // attached pods, including unenrolled ones.
+        if flags & 0x1 == 0 || prefix_len != 128 {
             continue;
         }
         if !ipv6_prefix_matches(&destination, &address, prefix_len) {
@@ -658,7 +712,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_ipv4_route_uses_longest_matching_pod_route() {
+    fn ipv4_route_resolution_preserves_ebpf_scope_but_capture_requires_a_host_route() {
         let dir = tempdir().unwrap();
         let route = dir.path().join("route");
         write(
@@ -686,6 +740,51 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
             resolve_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()).as_deref(),
             Some("vethpod")
         );
+        assert_eq!(
+            resolve_iface_by_ipv4_route(&route, "10.244.1.9".parse().unwrap()),
+            Some("cni0".to_string()),
+            "the eBPF fallback may attach to a covering bridge because its pod-IP map narrows \
+             classification"
+        );
+        assert_eq!(
+            resolve_dedicated_iface_by_ipv4_route(
+                &route,
+                "10.244.1.5".parse().unwrap()
+            )
+            .as_deref(),
+            Some("vethpod")
+        );
+        assert_eq!(
+            resolve_dedicated_iface_by_ipv4_route(
+                &route,
+                "10.244.1.9".parse().unwrap()
+            ),
+            None,
+            "iptables ingress capture must reject the same shared-bridge route"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dedicated_ipv4_route_refuses_two_host_route_claimants() {
+        let dir = tempdir().unwrap();
+        let route = dir.path().join("route");
+        let pod = route_hex("10.244.1.5");
+        let host = route_hex("255.255.255.255");
+        write(
+            &route,
+            &format!(
+                "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                 vetha {pod} 00000000 0001 0 0 0 {host} 0 0 0\n\
+                 vethb {pod} 00000000 0001 0 0 0 {host} 0 0 0\n"
+            ),
+        );
+
+        assert_eq!(
+            resolve_dedicated_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()),
+            None,
+            "two devices claiming one pod host route must resolve to nothing"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -712,7 +811,7 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_ipv6_route_uses_longest_matching_pod_route() {
+    fn dedicated_ipv6_route_uses_only_an_unambiguous_host_route() {
         let dir = tempdir().unwrap();
         let route = dir.path().join("ipv6_route");
         write(
@@ -730,18 +829,20 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
         );
 
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()).as_deref(),
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap())
+                .as_deref(),
             Some("vethpod"),
             "an IPv6-only pod must resolve to its own host-side interface, not the CNI bridge \
              route that also covers it"
         );
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:1::9".parse().unwrap()).as_deref(),
-            Some("cni0"),
-            "with no per-pod route the covering prefix is the only answer"
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:1::9".parse().unwrap())
+                .as_deref(),
+            None,
+            "a subnet route through a shared bridge is not per-pod interface evidence"
         );
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:2::9".parse().unwrap()),
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:2::9".parse().unwrap()),
             None,
             "the default route must not be allowed to attribute a pod to the node uplink"
         );
@@ -749,7 +850,7 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_ipv6_route_refuses_an_ambiguous_longest_prefix() {
+    fn dedicated_ipv6_route_refuses_two_host_route_claimants() {
         let dir = tempdir().unwrap();
         let route = dir.path().join("ipv6_route");
         write(
@@ -762,7 +863,7 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
         );
 
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()),
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()),
             None,
             "two devices tying at the longest prefix must resolve to nothing; picking whichever \
              the kernel printed first would attribute the pod to a guessed interface"
@@ -771,7 +872,7 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_ipv6_route_rejects_hostile_rows_and_addresses() {
+    fn dedicated_ipv6_route_rejects_hostile_rows_and_addresses() {
         let dir = tempdir().unwrap();
         let route = dir.path().join("ipv6_route");
         let zero = "0".repeat(32);
@@ -789,13 +890,14 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
         );
 
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()).as_deref(),
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap())
+                .as_deref(),
             Some("vethpod"),
             "malformed rows are skipped, never partially decoded into a match"
         );
         for refused in ["::", "::1", "ff02::1"] {
             assert_eq!(
-                resolve_iface_by_ipv6_route(&route, refused.parse().unwrap()),
+                resolve_dedicated_iface_by_ipv6_route(&route, refused.parse().unwrap()),
                 None,
                 "{refused} names no single pod interface"
             );
@@ -818,7 +920,7 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
              the most specific one"
         );
         assert_eq!(
-            resolve_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()),
+            resolve_dedicated_iface_by_ipv6_route(&route, "fd00:0:0:1::5".parse().unwrap()),
             None,
             "so the lookup refuses rather than answering from the readable remainder"
         );

@@ -3019,13 +3019,15 @@ is not shared. That fallback covers **both families** — `/proc/net/route` for 
 v4 address and `/proc/net/ipv6_route` for a v6 one — which is what lets an
 IPv6-only enrolled pod use this placement at all: without `hostPID` the route
 table is the only resolver, so a v4-only fallback would refuse every such pod
-while the path claimed dual-stack support. IPv6 resolution is fail-closed in the
-same way the rest of the path is: only `RTF_UP` routes with a non-zero prefix
-participate (never the `::/0` default, which would attribute a pod to the node
-uplink), the longest matching prefix wins, two different devices tying at that
-prefix resolve to nothing rather than to a guess, an oversized table refuses
-instead of answering from a truncated view, and malformed rows are ignored
-unless a valid, unambiguous match remains.
+while the path claimed dual-stack support. Route fallback accepts only an
+unambiguous `RTF_UP` host route (`/32` for IPv4 or `/128` for IPv6), and the
+resolved sysfs device must expose a distinct non-zero peer `iflink`: a broader
+subnet route commonly names a shared CNI bridge, while a self-linked device is
+not a dedicated pod peer. Using either in `iptables -i` could capture enrolled
+and unenrolled neighbours alike. Two devices claiming the same host route
+resolve to nothing rather than to a guess, an oversized table refuses instead
+of answering from a truncated view, and malformed rows are ignored unless a
+valid, unambiguous host route remains.
 
 **Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
 guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`

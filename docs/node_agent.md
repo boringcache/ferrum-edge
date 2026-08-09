@@ -402,8 +402,12 @@ mount (the enrolled-pod set and interface resolution use them), and falls back t
 the host route table keyed on the registry-published pod IP when host `/proc` is
 not shared — `/proc/net/route` for a v4 address and `/proc/net/ipv6_route` for a
 v6 one, so an **IPv6-only** enrolled pod resolves on this path too rather than
-being refused for want of an address it does not have. It requires a CNI that
-gives each pod its own host-side interface.
+being refused for want of an address it does not have. The fallback accepts only
+an unambiguous `/32` or `/128` host route, and sysfs must identify the resolved
+device as a distinct peer rather than a self-linked bridge/uplink. A broader
+route through a shared bridge is refused because it is not per-pod interface
+ownership evidence. It requires a CNI that gives each pod its own host-side
+interface.
 Full behaviour, ownership, and the placement-migration constraint are in
 [`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
 

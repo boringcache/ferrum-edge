@@ -437,15 +437,29 @@ impl HostUdpIdentityIndex {
         self.len() == 0
     }
 
-    /// Per-datagram admission check. Deliberately allocation-free and clone-free
-    /// so it can run on the receive path for every datagram: one lock-free
-    /// snapshot load, one hash lookup, one address comparison.
+    /// Per-datagram admission check: one lock-free snapshot load, one hash lookup,
+    /// one address comparison, and one `Arc` retain for the authorized binding.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn authorize(
         &self,
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Result<(), HostUdpDatagramRefusal> {
+        self.authorized_binding(ingress_ifindex, source).map(|_| ())
+    }
+
+    /// Return the exact binding generation that authorized this datagram.
+    ///
+    /// The capture loop retains this `Arc` until it knows whether the flow is a
+    /// refresh or a new admission. That makes authorization and session identity
+    /// one atomic-snapshot decision: a concurrent generation swap can never turn
+    /// an authorized host datagram into an identity-less session.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn authorized_binding(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<Arc<HostUdpPodBinding>, HostUdpDatagramRefusal> {
         let Some(ifindex) = ingress_ifindex.filter(|index| *index != 0) else {
             return Err(HostUdpDatagramRefusal::NoIngressInterface);
         };
@@ -456,24 +470,17 @@ impl HostUdpIdentityIndex {
         if !binding.owns_source(source) {
             return Err(HostUdpDatagramRefusal::SourceAddressMismatch);
         }
-        Ok(())
+        Ok(binding.clone())
     }
 
-    /// Resolve the attested evidence for an ALREADY-authorized datagram. Called
-    /// only when a new session is admitted, so the `Arc` clone stays off the
-    /// per-datagram refresh path.
+    /// Resolve attested evidence from one authorization snapshot.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn identity_for(
         &self,
         ingress_ifindex: Option<u32>,
         source: IpAddr,
     ) -> Option<Arc<UdpSourceIdentity>> {
-        let ifindex = ingress_ifindex.filter(|index| *index != 0)?;
-        let snapshot = self.by_ifindex.load();
-        let binding = snapshot.get(&ifindex)?;
-        if !binding.owns_source(source) {
-            return None;
-        }
+        let binding = self.authorized_binding(ingress_ifindex, source).ok()?;
         Some(Arc::new(binding.identity.clone()))
     }
 }
@@ -1672,21 +1679,49 @@ impl ProxyHostUdpBackend {
     /// than derived from the name.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn ifindex_for(&self, name: &str) -> Result<u32, String> {
-        crate::capture::validate_host_capture_interface(name)?;
-        let path = self.sysfs_net.join(name).join("ifindex");
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        raw.trim()
-            .parse::<u32>()
-            .map_err(|_| format!("{} does not contain an interface index", path.display()))
-            .and_then(|index| {
-                if index == 0 {
-                    Err("interface index 0 is not a usable capture attribution key".to_string())
-                } else {
-                    Ok(index)
-                }
-            })
+        dedicated_host_ifindex(&self.sysfs_net, name)
     }
+}
+
+/// Validate that a resolved device is a dedicated host-side peer and return its
+/// kernel interface index.
+///
+/// `iptables -i` is safe only at a per-pod boundary, not on a shared bridge or
+/// uplink. Route discovery already requires an exact host route, but that alone
+/// does not prove interface shape. A host-side veth has a distinct peer
+/// `iflink`; a bridge or ordinary physical interface links to itself. Refuse
+/// uncertainty rather than widening one enrolled pod's capture rule to unrelated
+/// neighbours.
+pub(crate) fn dedicated_host_ifindex(sysfs_net: &Path, name: &str) -> Result<u32, String> {
+    crate::capture::validate_host_capture_interface(name)?;
+    let iface_path = sysfs_net.join(name);
+    let index_path = iface_path.join("ifindex");
+    let raw = std::fs::read_to_string(&index_path)
+        .map_err(|error| format!("could not read {}: {error}", index_path.display()))?;
+    let index = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{} does not contain an interface index", index_path.display()))?;
+    if index == 0 {
+        return Err("interface index 0 is not a usable capture attribution key".to_string());
+    }
+
+    let link_path = iface_path.join("iflink");
+    let link_raw = std::fs::read_to_string(&link_path)
+        .map_err(|error| format!("could not read {}: {error}", link_path.display()))?;
+    let link = link_raw.trim().parse::<u32>().map_err(|_| {
+        format!(
+            "{} does not contain an interface link index",
+            link_path.display()
+        )
+    })?;
+    if link == 0 || link == index || iface_path.join("bridge").exists() {
+        return Err(
+            "resolved interface is not a dedicated host-side peer; refusing shared capture"
+                .to_string(),
+        );
+    }
+    Ok(index)
 }
 
 #[cfg(target_os = "linux")]
@@ -1709,13 +1744,13 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
                 target
                     .source_ips
                     .ipv4
-                    .and_then(crate::ebpf::veth::discover_veth_for_pod_ip)
+                    .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip)
             })
             .or_else(|| {
                 target
                     .source_ips
                     .ipv6
-                    .and_then(crate::ebpf::veth::discover_veth_for_pod_ip6)
+                    .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip6)
             })
             .ok_or_else(|| "no host-side interface resolved for this pod".to_string())?;
         let ifindex = self.ifindex_for(&name)?;

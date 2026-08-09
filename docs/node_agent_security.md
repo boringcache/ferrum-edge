@@ -177,11 +177,13 @@ state, exactly as in the default placement.
 Dropping `hostPID` means the pod's own `/proc` view is unavailable, so interface
 resolution falls through to the host route table for **both** address families
 (`/proc/net/route` and `/proc/net/ipv6_route`). That parsing is treated as
-hostile input: bounded reads, strict field decoding, `RTF_UP` and non-default
-routes only, longest prefix wins, and a tie between two devices at that prefix
-resolves to nothing — so a crafted or degenerate route table can make a pod
-*unresolvable* (refused, egress stays closed) but never resolvable to a device
-that is not its own.
+hostile input: bounded reads, strict field decoding, and only an unambiguous
+`RTF_UP` host route (`/32` or `/128`), followed by a sysfs check that the device
+has a distinct non-zero peer `iflink` and is not a bridge. A broader route or a
+self-linked device is not ownership evidence and is refused; two devices
+claiming the host route also resolve to nothing. A crafted or degenerate route
+table can therefore make a pod *unresolvable* (refused, egress stays closed) but
+never deliberately select a covering shared device.
 
 Two properties bound the blast radius of the rules it installs. It emits **no
 `mangle OUTPUT` chain**, so the node's own traffic (kubelet, CNI, DNS, every
