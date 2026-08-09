@@ -237,16 +237,16 @@ fn udp_route_materializes_udp_stream_proxy_on_listener_port() {
 }
 
 #[test]
-fn udp_route_without_materialized_listener_falls_back_to_backend_port() {
+fn udp_route_without_materialized_listener_opens_no_listener() {
     let objects = [udp_route("dns", simple_rule("coredns", 5353))];
 
     let translated = translate_k8s_objects(&objects, options());
     let result = translated.expect("translation succeeds");
 
-    assert_eq!(result.config.proxies.len(), 1);
-    let proxy = &result.config.proxies[0];
-    assert_eq!(proxy.listen_port, Some(5353));
-    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
+    assert!(result.config.proxies.is_empty());
+    assert!(result.warnings.iter().any(|warning| {
+        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+    }));
 }
 
 #[test]
@@ -350,8 +350,23 @@ fn udp_route_cross_namespace_backend_ref_requires_reference_grant() {
             .contains("requires a matching ReferenceGrant")
     );
 
+    // A matching grant authorizes the backendRef, but UDPRoute still requires a
+    // valid attached Gateway listener before any proxy is materialized.
     let grant = reference_grant("allow-udproute", "UDPRoute");
-    let granted = [udp_route("dns", spec), grant];
+    let attached_cross_namespace = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": [{
+            "name": "coredns",
+            "namespace": "backends",
+            "port": 5353
+        }]}]
+    });
+    let granted = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns", attached_cross_namespace),
+        grant,
+    ];
 
     let translated = translate_k8s_objects(&granted, multi_namespace_options());
     let result = translated.expect("a matching grant authorizes the ref");
@@ -765,12 +780,14 @@ fn tls_route_with_unknown_gateway_parent_opens_no_listener() {
 
 #[test]
 fn parentless_l4_routes_keep_the_backend_port_fallback() {
-    // The legacy parentless shape is unchanged: with no declared parent there
-    // is no parent status to contradict, so the backend port stays the listen
-    // port for both stream kinds.
+    // UDPRoute is Gateway API-only: a parentless shape opens no listener.
+    // Parentless TCPRoute/TLSRoute keep the legacy backend-port fallback.
     let udp_objects = [udp_route("dns", simple_rule("coredns", 5353))];
     let udp = translate_k8s_objects(&udp_objects, options()).expect("translation succeeds");
-    assert_eq!(udp.config.proxies[0].listen_port, Some(5353));
+    assert!(udp.config.proxies.is_empty());
+    assert!(udp.warnings.iter().any(|warning| {
+        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+    }));
 
     let tcp_route = l4_route(
         "TCPRoute",
@@ -779,6 +796,17 @@ fn parentless_l4_routes_keep_the_backend_port_fallback() {
     );
     let tcp = translate_k8s_objects(&[tcp_route], options()).expect("translation succeeds");
     assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
+
+    let tls_route = l4_route(
+        "TLSRoute",
+        "db",
+        json!({
+            "hostnames": ["db.example.com"],
+            "rules": [{"backendRefs": [{"name": "db", "port": 15443}]}]
+        }),
+    );
+    let tls = translate_k8s_objects(&[tls_route], options()).expect("translation succeeds");
+    assert_eq!(tls.config.proxies[0].listen_port, Some(15443));
 }
 
 #[test]
@@ -2016,13 +2044,15 @@ fn udp_route_on_two_listeners_shares_one_upstream_across_distinct_proxies() {
 #[test]
 fn udp_route_proxy_ids_do_not_collide_with_a_same_named_tcp_route() {
     // The historical L4 proxy id encodes only (namespace, name, rule index).
+    // Attach a real UDP Gateway so the UDPRoute materializes; parentless
+    // TCPRoute keeps the legacy backend-port fallback.
     let tcp = l4_route(
         "TCPRoute",
         "dns",
         json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
     );
-    let udp = udp_route("dns", simple_rule("coredns", 5353));
-    let objects = [tcp, udp];
+    let udp = udp_route("dns", attached_rule("edge", "dns", "coredns", 5353));
+    let objects = [gateway_class(), udp_gateway("edge", "dns", 15353), tcp, udp];
 
     let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
