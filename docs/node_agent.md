@@ -369,6 +369,20 @@ close the BPF gate synchronously, so removing the rule first would let that pod'
 UDP egress leave the node in plaintext for as long as the node-agent took to
 notice.
 
+That handshake also crosses the **process boundary**. Those markers are durable,
+so a producer that dies leaves the node-agent holding an open UDP gate for every
+pod it had readied — and the node-agent has no way to tell a dead producer from a
+busy one. A replacement therefore does not reap the previous generation's host
+rules first: it re-issues the close handshake for every pod the durable state
+names, waits for `.udp-not-ready`, and only then removes anything. Until it
+settles, the predecessor's rules stay installed (a capture path whose socket died
+with its process drops rather than leaks) and this generation applies nothing.
+The same recovery runs on a node that switched **away** from the host placement,
+before the replacement producer starts, so the two can never fight over the
+shared `.udp-ready` markers. A node-agent that stops acknowledging therefore
+leaves those pods' UDP dropped rather than released — the mesh proxy logs the
+outstanding pods periodically and keeps retrying.
+
 Direction is discriminated by INGRESS INTERFACE — `mangle PREROUTING -i <the
 pod's host-side interface>` — which is exact in the host namespace: a pod's egress
 is the only traffic entering there on that pod's own interface, pod-destined
@@ -386,7 +400,10 @@ narrows the ambient DaemonSet's capabilities accordingly while retaining its
 baseline `NET_RAW`. It keeps the registry hostPath and the read-only host cgroup
 mount (the enrolled-pod set and interface resolution use them), and falls back to
 the host route table keyed on the registry-published pod IP when host `/proc` is
-not shared. It requires a CNI that gives each pod its own host-side interface.
+not shared — `/proc/net/route` for a v4 address and `/proc/net/ipv6_route` for a
+v6 one, so an **IPv6-only** enrolled pod resolves on this path too rather than
+being refused for want of an address it does not have. It requires a CNI that
+gives each pod its own host-side interface.
 Full behaviour, ownership, and the placement-migration constraint are in
 [`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
 

@@ -11519,6 +11519,35 @@ type PreparedMeshRuntimeBeforeOwner = (
     Vec<JoinHandle<()>>,
 );
 
+/// Refuse the host-network UDP capture placement on any topology but Ambient.
+///
+/// [`crate::capture::udp_capture_settings_from_env`] already rejects the
+/// placement switch without the capture switch, but it is shared with the
+/// injector and the node-agent — neither of which knows the mesh topology — so
+/// the topology half of the contract has to be enforced on the serving path
+/// instead. Without it a Sidecar (or waypoint, or gateway) process ACCEPTS
+/// `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` and comes up with no host
+/// capture producer at all, while `docs/configuration.md`, `docs/mesh.md`, and
+/// the chart all promise a startup error. The Helm gate is not enforcement: a
+/// direct-env, non-Helm, or hand-rolled manifest deployment never sees it.
+///
+/// Ambient is the only topology whose proxy runs OUTSIDE the workload pod netns,
+/// which is the entire premise of the placement; every other topology either
+/// captures UDP from inside the pod netns (Sidecar) or has no UDP relay at all.
+pub fn validate_udp_host_netns_placement(
+    topology: MeshTopology,
+    settings: &crate::capture::UdpCaptureSettings,
+) -> Result<(), String> {
+    if !settings.udp_host_netns_enabled || topology == MeshTopology::Ambient {
+        return Ok(());
+    }
+    Err(format!(
+        "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient \
+         (host-network UDP capture is the Ambient placement whose proxy runs outside the workload \
+         pod network namespace); this process resolved topology {topology:?}"
+    ))
+}
+
 fn prepare_mesh_runtime_before_owner(
     env_config: &EnvConfig,
     runtime: &MeshRuntimeConfig,
@@ -11535,7 +11564,12 @@ fn prepare_mesh_runtime_before_owner(
     // the very top of the serving path, makes an operator config error abort
     // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
     // (which a later `?` would have left running for in-process retries/tests).
-    crate::capture::udp_capture_settings_from_env()
+    let udp_capture_settings = crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+    // Same contract, topology half: the shared parser cannot see the topology,
+    // so this is the boundary that makes the documented "startup error" real for
+    // a non-Helm deployment.
+    validate_udp_host_netns_placement(runtime.topology, &udp_capture_settings)
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
 
     // Same contract for the NodeWaypoint transparent inbound capture listener
@@ -11827,13 +11861,41 @@ async fn arm_mesh_runtime_startup(
             anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
         })?;
         // Reap host-namespace UDP state whenever THIS process is not the one that
-        // owns it. Host capture's own manager reaps (and then rebuilds) its state
-        // at startup, but a node that switched to the pod-netns placement or
+        // owns it. Host capture's own manager recovers (and then rebuilds) its
+        // state at startup, but a node that switched to the pod-netns placement or
         // disabled UDP entirely would otherwise keep a `PREROUTING` jump into a
         // chain no socket serves — captured egress diverted into a black hole with
         // no remaining code path to clean it up.
+        //
+        // The reap is SEQUENCED behind the durable readiness handshake, and it is
+        // awaited here rather than spawned, for two reasons that both concern the
+        // producer started below:
+        //
+        // * the node-agent still holds a BPF UDP gate open for every pod the
+        //   previous host generation readied, so removing that generation's rules
+        //   before those gates are acknowledged closed would release the pods'
+        //   UDP egress in plaintext; and
+        // * the retraction must land BEFORE the incoming per-pod-netns producer
+        //   starts publishing readiness of its own, so the two never fight over
+        //   the shared `.udp-ready` markers.
+        //
+        // Only the waiting and the reap itself continue in the background, and a
+        // pod the incoming producer readies settles the recovery rather than
+        // deadlocking it.
         if !settings.udp_host_netns_enabled {
-            crate::proxy::host_udp_capture::reap_stale_host_udp_state();
+            let host_ready_dir =
+                std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                    .join(".udp-ready");
+            if let Some(handle) =
+                crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
+                    Some(host_ready_dir),
+                    std::time::Duration::from_secs(2),
+                    shutdown_tx.subscribe(),
+                )
+                .await
+            {
+                owner.push_mesh_background(handle);
+            }
         }
         if settings.udp_capture_enabled {
             if !cfg!(target_os = "linux") {

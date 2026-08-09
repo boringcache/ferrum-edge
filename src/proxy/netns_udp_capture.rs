@@ -362,8 +362,21 @@ pub(crate) fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     }
 }
 
-fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
     ready_dir.parent().map(|dir| dir.join(".udp-ack-required"))
+}
+
+/// The node-agent's durable proof that a pod's BPF UDP gate is shut.
+///
+/// Shared with the host-network producer so both placements read the same
+/// evidence from the same path; an absent handshake directory means nothing
+/// gated the pod on a readiness marker in the first place.
+pub(crate) fn udp_gate_close_acknowledged(ready_dir: &Path, pod_uid: &str) -> bool {
+    let Some(registry_dir) = ready_dir.parent() else {
+        return false;
+    };
+    let ack_dir = registry_dir.join(".udp-not-ready");
+    udp_ready_marker_path(&ack_dir, pod_uid).is_some_and(|marker| marker.is_file())
 }
 
 fn persist_udp_ack_requirement(ready_dir: &Path, pod_uid: &str) -> bool {

@@ -13,10 +13,11 @@
 //!   remove the other's rules or routing.
 
 use ferrum_edge::capture::{
-    CaptureConfig, Ip6TablesMode, IptablesPlan, MAX_HOST_UDP_CAPTURE_INTERFACES,
+    CaptureConfig, Ip6TablesMode, IptablesPlan, MAX_HOST_UDP_CAPTURE_INTERFACES, UdpCaptureSettings,
     udp_capture_settings_from_env, validate_host_capture_interface,
     validate_host_capture_interfaces,
 };
+use ferrum_edge::modes::mesh::{MeshTopology, validate_udp_host_netns_placement};
 
 use crate::unit::env_lock::EnvGuard;
 
@@ -447,4 +448,55 @@ fn host_netns_switch_without_udp_capture_is_a_configuration_error() {
         !settings.udp_host_netns_enabled,
         "the pod-netns producer stays the default placement"
     );
+}
+
+fn udp_settings(host_netns_enabled: bool) -> UdpCaptureSettings {
+    UdpCaptureSettings {
+        udp_capture_enabled: true,
+        udp_outbound_port: 15011,
+        tproxy_mark: 0x733,
+        udp_host_netns_enabled: host_netns_enabled,
+    }
+}
+
+/// Every topology but Ambient. Ambient is the only one whose proxy runs OUTSIDE
+/// the workload pod netns, which is the entire premise of the host placement.
+const NON_AMBIENT_TOPOLOGIES: &[MeshTopology] = &[
+    MeshTopology::Sidecar,
+    MeshTopology::NodeWaypoint,
+    MeshTopology::ServiceWaypoint,
+    MeshTopology::EastWestGateway,
+    MeshTopology::EgressGateway,
+];
+
+#[test]
+fn host_netns_placement_outside_ambient_is_a_startup_error() {
+    // `udp_capture_settings_from_env` is shared with the injector and the
+    // node-agent, neither of which knows the topology, so the topology half of
+    // the documented contract has to hold here — on the serving path — or a
+    // direct-env deployment that never renders the chart silently starts with no
+    // host capture producer while believing UDP is covered.
+    for topology in NON_AMBIENT_TOPOLOGIES {
+        let error = validate_udp_host_netns_placement(*topology, &udp_settings(true))
+            .expect_err("the host placement is Ambient-only");
+        assert!(
+            error.contains("FERRUM_MESH_TOPOLOGY=ambient"),
+            "the diagnostic must name the topology the placement requires: {error}"
+        );
+        assert!(
+            error.contains("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED"),
+            "and the switch that has to be withdrawn: {error}"
+        );
+    }
+
+    assert!(
+        validate_udp_host_netns_placement(MeshTopology::Ambient, &udp_settings(true)).is_ok(),
+        "Ambient is exactly the deployment this placement exists for"
+    );
+    for topology in NON_AMBIENT_TOPOLOGIES {
+        assert!(
+            validate_udp_host_netns_placement(*topology, &udp_settings(false)).is_ok(),
+            "the default placement stays valid everywhere: {topology:?}"
+        );
+    }
 }

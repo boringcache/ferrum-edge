@@ -81,13 +81,29 @@
 //! its own and, if it did, guards the datapath and restarts it rather than
 //! leaving a published-ready node black-holing captured traffic.
 //!
+//! # Crossing a process boundary
+//!
+//! Readiness is DURABLE and shared with the node-agent, so a generation that
+//! dies leaves behind both its `mangle` state and open BPF UDP gates for every
+//! pod it readied. Removing the former while the latter are open is precisely a
+//! plaintext window, and the stale interface set does not even bound the damage:
+//! a pod that restarted onto a new veth has no stale rule at all and an open gate
+//! regardless. So the first thing a new generation does is NOT a teardown — it is
+//! [`HostUdpStaleGenerationRecovery`], which puts every pod the durable state
+//! names back through the close handshake and waits for the node-agent's
+//! acknowledgement. Nothing is applied and nothing is removed until it settles;
+//! the predecessor's objects are retained meanwhile, and a capture path whose
+//! socket died with its process drops rather than leaks. The same recovery runs
+//! on a node that switched AWAY from this placement
+//! ([`recover_and_reap_stale_host_udp_state`]), where no manager exists to do it.
+//!
 //! Linux-only. The reconcile/attribution logic is platform-independent and unit
 //! tested with a mock backend; the socket/iptables datapath is exercised on a
 //! live node.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -529,6 +545,324 @@ impl HostUdpListenerHandle {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Stale-generation recovery
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on the directory ENTRIES one recovery pass will examine in one
+/// durable handshake directory — not just the ones that turn out to be valid
+/// markers, because the directory is written by another process and the work it
+/// can demand has to be bounded by what is present.
+///
+/// Hitting the bound is not silently ignored: the pass reports itself unsettled
+/// and rescans, so nothing stale is removed until the directory reads in full.
+/// A node has one entry per pod, so this is an order of magnitude above any real
+/// backlog and reaching it means something is wrong — for which never reaping is
+/// the correct posture.
+const MAX_STALE_RECOVERY_MARKERS: usize = 4096;
+
+/// How long ONE recovery pass waits for the node-agent's acknowledgements before
+/// returning unsettled and letting the caller retry. Deliberately short: the
+/// caller retries on its ordinary poll cadence, and the datapath stays
+/// fail-closed for the whole wait either way, so a long single wait would only
+/// delay the first useful log line.
+const STALE_RECOVERY_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// How long between repeat warnings while a recovery cannot settle. A stalled
+/// node-agent must stay visible without warning on every poll.
+const STALE_RECOVERY_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Fail-closed recovery of the durable UDP readiness handshake a PREVIOUS
+/// generation of the host capture producer left behind.
+///
+/// # Why removing stale host state has to be a handshake
+///
+/// `.udp-ready` / `.udp-ack-required` live in a durable directory shared with
+/// the node-agent and survive this process. When a generation dies — a crash, a
+/// restart, a rollout that switches placement or turns UDP capture off — its
+/// sockets die with it but three things do not: its `mangle` chains, its
+/// published readiness markers, and (because readiness is what opens it) the
+/// node-agent's BPF UDP gate for every pod it readied.
+///
+/// A socketless capture path still DROPS, so leaving it is safe. Removing it
+/// while those gates are open is not: the pod's UDP egress is then neither
+/// captured nor gated and leaves the node in plaintext. The interface set is not
+/// a safe proxy for that either — a pod that restarted onto a new veth is not
+/// covered by the stale rules at all, yet its gate is still open.
+///
+/// So before ANY stale host object is removed, this recovers every pod the
+/// durable state names and puts it back through the ordinary close handshake:
+/// [`request_udp_gate_close`](super::netns_udp_capture::request_udp_gate_close)
+/// persists a fresh `.udp-ack-required`, deletes any `.udp-not-ready` (so a
+/// stale acknowledgement can never authorize this new handoff), and only then
+/// retracts `.udp-ready`. The pod is settled when the node-agent republishes
+/// `.udp-not-ready`, which is the proof its gate is shut.
+///
+/// # The one other way a pod settles
+///
+/// A pod also settles when READINESS reappears for it. That is not a shortcut:
+/// a pod only reaches the awaiting set once its own `request_udp_gate_close`
+/// reported success, which includes having removed the readiness marker, so a
+/// marker that exists again was published by a DIFFERENT producer — on this node
+/// that is the per-pod-netns producer starting under the new placement, which
+/// publishes readiness only once it is capturing that pod INSIDE its namespace.
+/// Its egress therefore never reaches the host namespace, and removing the host
+/// rules cannot leak it. Without this the two halves of a placement switch would
+/// deadlock: the incoming producer opens the gate the outgoing recovery is
+/// waiting to see closed.
+pub struct HostUdpStaleGenerationRecovery {
+    /// `<registry>/.udp-ready`. `None` means nothing gated any pod on a
+    /// readiness marker, so there is no durable obligation to recover.
+    ready_dir: Option<PathBuf>,
+    /// Discovered pods whose durable close request has not been persisted yet.
+    /// Retried every pass: an obligation must never be dropped because one
+    /// filesystem write failed, or the recovery would settle and reap while that
+    /// pod's gate is still open.
+    pending_request: BTreeSet<String>,
+    /// Pods whose close this recovery persisted and whose settlement has not
+    /// arrived. Membership is also what stops a pod being re-requested: a repeat
+    /// `request_udp_gate_close` would delete the very acknowledgement being
+    /// awaited.
+    awaiting: BTreeSet<String>,
+    /// Discovery is ONE-SHOT once both directories have been read in full. The
+    /// previous generation's obligations are exactly what was on disk when this
+    /// process started; re-scanning later would retract readiness the INCOMING
+    /// producer has since published for a newly enrolled pod, which is the one
+    /// way this recovery could fight the producer it runs ahead of.
+    discovery_complete: bool,
+    /// A marker directory this pass could not read in full.
+    scan_truncated: bool,
+    announced: bool,
+    last_warned: Option<Instant>,
+}
+
+impl HostUdpStaleGenerationRecovery {
+    pub fn new(ready_dir: Option<PathBuf>) -> Self {
+        Self {
+            ready_dir,
+            pending_request: BTreeSet::new(),
+            awaiting: BTreeSet::new(),
+            discovery_complete: false,
+            scan_truncated: false,
+            announced: false,
+            last_warned: None,
+        }
+    }
+
+    /// Pods whose gate is not yet provably closed.
+    pub fn outstanding(&self) -> usize {
+        self.pending_request.len() + self.awaiting.len()
+    }
+
+    /// Run one bounded pass. `true` means every durable obligation the previous
+    /// generation left is discharged and its host objects may now be removed;
+    /// `false` means the caller must retain them and retry.
+    pub async fn poll_once(&mut self, ack_wait: Duration) -> bool {
+        let Some(ready_dir) = self.ready_dir.clone() else {
+            return true;
+        };
+        // A per-pass verdict: a directory that reads cleanly this time must not
+        // stay poisoned by an earlier failure.
+        self.scan_truncated = false;
+        if !self.discovery_complete {
+            self.discover(&ready_dir);
+        }
+        self.request_pending(&ready_dir);
+        self.await_acknowledgements(&ready_dir, ack_wait).await;
+
+        let settled =
+            self.pending_request.is_empty() && self.awaiting.is_empty() && !self.scan_truncated;
+        self.report(settled);
+        settled
+    }
+
+    /// Collect the durable obligations: every pod with published readiness (its
+    /// gate may be open) and every pod with an outstanding close request (a
+    /// previous generation started the handshake and died before it completed).
+    fn discover(&mut self, ready_dir: &Path) {
+        let mut pods: BTreeSet<String> = BTreeSet::new();
+        let mut dirs = vec![ready_dir.to_path_buf()];
+        if let Some(request_dir) = super::netns_udp_capture::udp_ack_required_dir(ready_dir) {
+            dirs.push(request_dir);
+        }
+        for dir in dirs {
+            match read_handshake_marker_uids(&dir) {
+                Ok((uids, truncated)) => {
+                    if truncated {
+                        warn!(
+                            path = %dir.display(),
+                            limit = MAX_STALE_RECOVERY_MARKERS,
+                            "Host UDP capture: too many entries in the durable UDP handshake \
+                             directory to recover in one pass; retaining the previous \
+                             generation's host state and rescanning"
+                        );
+                        self.scan_truncated = true;
+                    }
+                    pods.extend(uids);
+                }
+                Err(error) => {
+                    warn!(
+                        path = %dir.display(),
+                        %error,
+                        "Host UDP capture: could not scan the durable UDP handshake directory; \
+                         retaining the previous generation's host state and retrying"
+                    );
+                    self.scan_truncated = true;
+                }
+            }
+        }
+        // Only a complete scan retires discovery. An incomplete one rescans, and
+        // is anomalous enough (thousands of entries, or an unreadable directory)
+        // that never reaping is the right posture until it clears.
+        self.discovery_complete = !self.scan_truncated;
+        for pod_uid in pods {
+            if self.awaiting.contains(&pod_uid) {
+                continue;
+            }
+            self.pending_request.insert(pod_uid);
+        }
+    }
+
+    /// Persist (or re-persist) the close request for every discovered pod.
+    fn request_pending(&mut self, ready_dir: &Path) {
+        if self.pending_request.is_empty() {
+            return;
+        }
+        if !self.announced {
+            self.announced = true;
+            info!(
+                pods = self.pending_request.len(),
+                "Host UDP capture: a previous generation left durable UDP readiness state; \
+                 retracting it and requiring the node-agent to acknowledge closing those gates \
+                 before any stale host state is removed"
+            );
+        }
+        for pod_uid in std::mem::take(&mut self.pending_request) {
+            let one: HashSet<String> = std::iter::once(pod_uid.clone()).collect();
+            if super::netns_udp_capture::request_udp_gate_close(ready_dir, &one) {
+                self.awaiting.insert(pod_uid);
+            } else {
+                // Retried on the next pass, never dropped: forgetting it would
+                // let the recovery settle and reap while this pod's gate is open.
+                debug!(
+                    pod_uid = %pod_uid,
+                    "Host UDP capture: could not persist the recovery gate-close handshake"
+                );
+                self.pending_request.insert(pod_uid);
+            }
+        }
+    }
+
+    async fn await_acknowledgements(&mut self, ready_dir: &Path, budget: Duration) {
+        if self.awaiting.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            self.reap_settled(ready_dir);
+            if self.awaiting.is_empty() || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(GATE_CLOSE_ACK_POLL).await;
+        }
+    }
+
+    fn reap_settled(&mut self, ready_dir: &Path) {
+        let settled: Vec<String> = self
+            .awaiting
+            .iter()
+            .filter(|pod_uid| {
+                let pod_uid = pod_uid.as_str();
+                super::netns_udp_capture::udp_gate_close_acknowledged(ready_dir, pod_uid)
+                    || readiness_republished(ready_dir, pod_uid)
+            })
+            .cloned()
+            .collect();
+        for pod_uid in settled {
+            let one: HashSet<String> = std::iter::once(pod_uid.clone()).collect();
+            super::netns_udp_capture::clear_udp_ack_requirement(ready_dir, &one);
+            self.awaiting.remove(&pod_uid);
+        }
+    }
+
+    fn report(&mut self, settled: bool) {
+        if settled {
+            if self.announced {
+                self.announced = false;
+                self.last_warned = None;
+                info!(
+                    "Host UDP capture: every UDP gate a previous generation left open is \
+                     acknowledged closed; the stale host state may now be removed"
+                );
+            }
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_warned
+            .is_some_and(|last| now.duration_since(last) < STALE_RECOVERY_WARN_INTERVAL)
+        {
+            return;
+        }
+        self.last_warned = Some(now);
+        warn!(
+            awaiting_acknowledgement = self.awaiting.len(),
+            unpersisted_requests = self.pending_request.len(),
+            scan_incomplete = self.scan_truncated,
+            "Host UDP capture: the UDP gates a previous generation left open are not yet provably \
+             closed; its host state is retained (a capture path with no socket drops, it does not \
+             leak) and recovery is retried"
+        );
+    }
+}
+
+/// Whether a producer OTHER than this recovery has published readiness for the
+/// pod since the retraction — see the type-level note on why that settles it.
+fn readiness_republished(ready_dir: &Path, pod_uid: &str) -> bool {
+    super::netns_udp_capture::udp_ready_marker_path(ready_dir, pod_uid)
+        .is_some_and(|marker| marker.is_file())
+}
+
+/// Names in one Ferrum-owned handshake directory, bounded and exact-name scoped.
+///
+/// Only plain files whose name is one this path would itself have written are
+/// returned, so nothing outside Ferrum's own marker convention is ever acted on.
+/// Returns whether the scan hit [`MAX_STALE_RECOVERY_MARKERS`]; an absent
+/// directory is an empty, complete scan.
+fn read_handshake_marker_uids(dir: &Path) -> Result<(Vec<String>, bool), std::io::Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut uids: Vec<String> = Vec::new();
+    let mut truncated = false;
+    let mut scanned = 0usize;
+    for entry in entries.flatten() {
+        // EVERY entry counts, not just the accepted ones: the directory is
+        // written by another process, so the work a scan can be made to do has
+        // to be bounded by what is present, not by what turns out to be valid.
+        scanned += 1;
+        if scanned > MAX_STALE_RECOVERY_MARKERS {
+            truncated = true;
+            break;
+        }
+        let Ok(pod_uid) = entry.file_name().into_string() else {
+            continue;
+        };
+        if super::netns_udp_capture::udp_ready_marker_path(dir, &pod_uid).is_none() {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        uids.push(pod_uid);
+    }
+    Ok((uids, truncated))
+}
+
 /// Reconciles host-network UDP capture against the enrolled-pod registry.
 pub struct HostUdpCaptureManager<B: HostUdpCaptureBackend> {
     source: Arc<dyn PodCaptureSource>,
@@ -584,6 +918,14 @@ pub struct HostUdpCaptureManager<B: HostUdpCaptureBackend> {
     /// Refusal reasons already logged, so a persistently unresolvable pod does
     /// not warn on every poll.
     logged_refusals: HashMap<String, HostUdpRefusal>,
+    /// The durable handshake a previous generation of this process left behind.
+    recovery: HostUdpStaleGenerationRecovery,
+    /// Armed by [`Self::run`], the entry point that owns a whole process
+    /// lifetime and is therefore the one that can have a predecessor. While it
+    /// is set, nothing is applied and nothing is torn down: either would race
+    /// the node-agent's still-open UDP gates. A caller driving the reconcile
+    /// steps itself is responsible for having recovered first.
+    startup_recovery_pending: bool,
 }
 
 impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
@@ -603,10 +945,13 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             published_ready: HashMap::new(),
             awaiting_gate_close: HashMap::new(),
             logged_refusals: HashMap::new(),
+            recovery: HostUdpStaleGenerationRecovery::new(None),
+            startup_recovery_pending: false,
         }
     }
 
     pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.recovery = HostUdpStaleGenerationRecovery::new(dir.clone());
         self.ready_dir = dir;
         self
     }
@@ -620,17 +965,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
     }
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
-        // Reap any state a previous generation of this process left behind
-        // BEFORE the first apply. Running it unconditionally is what makes a
-        // crash-restart converge: the current configuration may render a
-        // different interface set, and a stale chain would keep steering the
-        // pods it named into a socket this process has not bound yet.
-        if let Err(error) = self.backend.teardown_all() {
-            warn!(
-                %error,
-                "Host UDP capture: could not reap stale host capture state at startup; continuing"
-            );
-        }
+        // This is the entry point that owns a whole process lifetime, so it is
+        // the one that can have a predecessor whose durable state must be
+        // recovered before anything else happens.
+        self.startup_recovery_pending = true;
         let mut ticker = tokio::time::interval(self.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -641,6 +979,18 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                     }
                 }
                 _ = ticker.tick() => {
+                    // Startup recovery gates the FIRST apply, not just the reap:
+                    // applying would publish readiness for this generation while
+                    // the previous generation's gates are still open and its
+                    // rules still installed, which is the same mixed state the
+                    // recovery exists to resolve. Failing closed and retrying is
+                    // the correct posture — enrolled UDP egress stays dropped by
+                    // the retained state rather than escaping in plaintext.
+                    if self.startup_recovery_pending
+                        && !self.recover_stale_generation_once().await
+                    {
+                        continue;
+                    }
                     self.reconcile_once().await;
                 }
             }
@@ -648,9 +998,44 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         self.shutdown().await;
     }
 
+    /// One bounded startup-recovery pass: discharge the durable handshake a
+    /// previous generation left, then reap its host objects.
+    ///
+    /// `true` means the datapath is now genuinely empty of predecessor state and
+    /// the first apply may run. `false` means everything the predecessor
+    /// installed is retained — a capture path whose socket died with its process
+    /// drops, so retaining it is the fail-closed posture, and a reap that failed
+    /// is retried rather than logged once and forgotten.
+    pub async fn recover_stale_generation_once(&mut self) -> bool {
+        // Same shape as the reconcile-time budget: bounded by the configured
+        // handshake window so a shortened test window shortens this too, and by
+        // the per-pass ceiling so a stalled node-agent still yields a log line
+        // and a retry instead of one long silent wait.
+        let budget = self.gate_close_timeout.min(STALE_RECOVERY_ACK_WAIT);
+        if !self.recovery.poll_once(budget).await {
+            return false;
+        }
+        if let Err(error) = self.backend.teardown_all() {
+            warn!(
+                %error,
+                "Host UDP capture: could not reap the previous generation's host capture state; \
+                 retaining it and retrying before anything is applied"
+            );
+            return false;
+        }
+        self.startup_recovery_pending = false;
+        true
+    }
+
     /// One reconcile pass. Never panics and never leaves the datapath in a state
     /// that leaks plaintext: every failure path either keeps the previous live
     /// ruleset or retains the DROP guard.
+    ///
+    /// Assumes [`Self::recover_stale_generation_once`] has already succeeded —
+    /// [`Self::run`] guarantees that. A caller that drives this directly owns
+    /// that precondition: applying over a predecessor's un-acknowledged state
+    /// would publish this generation's readiness while the node-agent still has
+    /// the previous generation's gates open.
     pub async fn reconcile_once(&mut self) -> &HostUdpDesiredState {
         self.supervise_listener().await;
         let targets = self.source.list_targets();
@@ -1088,6 +1473,27 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
     /// path could release it as plaintext while the node-agent still believes
     /// capture is live.
     pub async fn shutdown(&mut self) {
+        // A shutdown that races an unfinished startup recovery must remove
+        // NOTHING. This process published no readiness of its own and installed
+        // no rules of its own, so it owns no teardown here; every host object
+        // present belongs to the previous generation and is the only thing
+        // holding its still-un-acknowledged pods closed. The ordinary path below
+        // would see an empty `published_ready`, conclude nothing was ready, and
+        // reap exactly that state.
+        if self.startup_recovery_pending {
+            warn!(
+                pods = self.recovery.outstanding(),
+                "Host UDP capture: shutting down before startup recovery completed; retaining \
+                 every host object so the UDP gates a previous generation left open stay closed \
+                 by its rules"
+            );
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
+            }
+            self.index.clear();
+            return;
+        }
+
         // Every pod this process ever published readiness for, INCLUDING the ones
         // a reconcile already moved onto the handshake but could not retire: both
         // still owe an acknowledgement, and both still need guard coverage.
@@ -1156,12 +1562,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         let Some(ready_dir) = &self.ready_dir else {
             return true;
         };
-        let Some(registry_dir) = ready_dir.parent() else {
-            return false;
-        };
-        let ack_dir = registry_dir.join(".udp-not-ready");
-        super::netns_udp_capture::udp_ready_marker_path(&ack_dir, pod_uid)
-            .is_some_and(|marker| marker.is_file())
+        super::netns_udp_capture::udp_gate_close_acknowledged(ready_dir, pod_uid)
     }
 
     fn log_refusals(&mut self, desired: &HostUdpDesiredState) {
@@ -1263,12 +1664,25 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
         // keyed on the registry-published pod IP, which needs neither `hostPID`
         // nor `setns` — that fallback is what lets this path run without the
         // per-pod-netns producer's elevated privileges.
+        //
+        // BOTH families are tried, and that is load-bearing rather than tidiness:
+        // on the intended deployment (no `hostPID`, so the cgroup/`/proc` view is
+        // unavailable) the route table is the ONLY resolver, so a v4-only
+        // fallback would refuse every IPv6-only enrolled pod while this path
+        // claims dual-stack support. v4 is tried first so a dual-stack pod keeps
+        // resolving exactly as before.
         let name = crate::ebpf::veth::discover_veth_for_pod(None, Some(&target.cgroup_path))
             .or_else(|| {
                 target
                     .source_ips
                     .ipv4
                     .and_then(crate::ebpf::veth::discover_veth_for_pod_ip)
+            })
+            .or_else(|| {
+                target
+                    .source_ips
+                    .ipv6
+                    .and_then(crate::ebpf::veth::discover_veth_for_pod_ip6)
             })
             .ok_or_else(|| "no host-side interface resolved for this pod".to_string())?;
         let ifindex = self.ifindex_for(&name)?;
@@ -1389,30 +1803,96 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
     }
 }
 
-/// Best-effort removal of every Ferrum-owned host-netns UDP object, for the
-/// deployments that are NOT running the host capture path.
+/// Removal of every Ferrum-owned host-netns UDP object, for the deployments that
+/// are NOT running the host capture path.
 ///
 /// A node that once ran host capture and now runs the pod-netns producer (or has
 /// UDP capture switched off entirely) would otherwise keep a `PREROUTING` jump
 /// into a chain whose socket nobody binds — captured egress diverted into a black
 /// hole, with nothing left to reap it, because both the shutdown teardown and the
 /// setup path are owned by a code path that no longer runs. This is the same
-/// unconditional pre-setup reap the node-agent performs for the pod-netns UDP
-/// objects, applied to the host-netns ones.
+/// pre-setup reap the node-agent performs for the pod-netns UDP objects, applied
+/// to the host-netns ones.
 ///
-/// Every command targets an exact Ferrum-owned object and is best-effort, so it
-/// is a no-op when no host state exists.
-pub fn reap_stale_host_udp_state() {
+/// Every command targets an exact Ferrum-owned object, so it is a no-op when no
+/// host state exists. NOT public on its own: removing these objects is only safe
+/// once the durable readiness handshake they back has been discharged, which is
+/// what [`recover_and_reap_stale_host_udp_state`] sequences.
+fn reap_stale_host_udp_state() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
-        return;
+        return Ok(());
     }
-    let script = IptablesPlan::host_udp_teardown_script();
-    if let Err(error) = run_host_script(&script) {
-        debug!(
-            %error,
-            "Host UDP capture: stale host-namespace UDP state reap did not complete (expected \
-             when no host capture state exists)"
-        );
+    run_host_script(&IptablesPlan::host_udp_teardown_script())
+}
+
+/// Discharge the durable UDP readiness handshake a previous HOST-capture
+/// generation left, then reap its host objects — for a node whose placement is
+/// now the per-pod-netns producer, or which has UDP capture switched off.
+///
+/// This is the disabled/switched half of the same fail-closed recovery
+/// [`HostUdpCaptureManager::recover_stale_generation_once`] runs: the node-agent
+/// keeps a pod's BPF UDP gate open on a `.udp-ready` marker no live producer
+/// owns any more, so reaping the host rules first would leave that pod's egress
+/// neither captured nor gated.
+///
+/// Ordering matters and is the caller's responsibility: run this BEFORE starting
+/// the incoming producer. The retraction happens exactly once, in the first
+/// (awaited) pass, so it can never fight a per-pod-netns producer that has begun
+/// publishing readiness of its own — and once that producer does republish, the
+/// pod settles (see [`HostUdpStaleGenerationRecovery`]), so the two halves of a
+/// placement switch cannot deadlock.
+///
+/// Returns a retry task when the first pass could not complete; until it does,
+/// the predecessor's objects stay installed, which drops enrolled UDP rather
+/// than releasing it.
+pub async fn recover_and_reap_stale_host_udp_state(
+    ready_dir: Option<PathBuf>,
+    retry_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut recovery = HostUdpStaleGenerationRecovery::new(ready_dir);
+    if recover_and_reap_once(&mut recovery).await {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(retry_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The immediate first tick is the attempt the caller already awaited.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if recover_and_reap_once(&mut recovery).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }))
+}
+
+async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) -> bool {
+    if !recovery.poll_once(STALE_RECOVERY_ACK_WAIT).await {
+        return false;
+    }
+    match reap_stale_host_udp_state() {
+        Ok(()) => true,
+        Err(error) => {
+            // A reap that cannot complete is retried, not logged once: leaving a
+            // `PREROUTING` jump into a socketless chain black-holes every
+            // enrolled pod's UDP on this node until something removes it, and
+            // after this point nothing else would.
+            warn!(
+                %error,
+                "Host UDP capture: stale host-namespace UDP state reap did not complete; retrying"
+            );
+            false
+        }
     }
 }
 

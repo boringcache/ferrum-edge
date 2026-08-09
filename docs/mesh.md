@@ -2960,10 +2960,14 @@ Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >
 `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` (default `false`, requires
 `FERRUM_MESH_CAPTURE_UDP_ENABLED=true` and `FERRUM_MESH_TOPOLOGY=ambient`) moves
 Ambient's UDP source-capture from each pod's network namespace into the mesh
-proxy's own. Setting it without the capture switch is a **startup error**, not a
-silent no-op. It captures the same traffic and feeds the same session, relay,
-overload, and return-path machinery as the per-pod-netns producer — only the
-placement differs.
+proxy's own. Setting it without the capture switch, or on any topology but
+Ambient, is a **startup error**, not a silent no-op — both halves are enforced in
+the process (the capture-switch half in `capture::udp_capture_settings_from_env`,
+the topology half in `modes::mesh::validate_udp_host_netns_placement` on the
+serving path), so a direct-env or hand-rolled-manifest deployment that never
+renders the chart still fails closed rather than starting with no producer. It
+captures the same traffic and feeds the same session, relay, overload, and
+return-path machinery as the per-pod-netns producer — only the placement differs.
 
 **Why the host namespace needed a different mechanism.** The pod-netns generator
 splits inbound from outbound with `-m addrtype --dst-type LOCAL`, which is only
@@ -3011,21 +3015,57 @@ this placement is selected while retaining the ambient container's baseline
 `NET_RAW`. The registry hostPath and read-only host cgroup mount stay (the
 enrolled-pod set and interface resolution use them); interface resolution falls
 back to the host route table keyed on the registry-published pod IP when `/proc`
-is not shared.
+is not shared. That fallback covers **both families** — `/proc/net/route` for a
+v4 address and `/proc/net/ipv6_route` for a v6 one — which is what lets an
+IPv6-only enrolled pod use this placement at all: without `hostPID` the route
+table is the only resolver, so a v4-only fallback would refuse every such pod
+while the path claimed dual-stack support. IPv6 resolution is fail-closed in the
+same way the rest of the path is: only `RTF_UP` routes with a non-zero prefix
+participate (never the `::/0` default, which would attribute a pod to the node
+uplink), the longest matching prefix wins, two different devices tying at that
+prefix resolve to nothing rather than to a guess, and an oversized or malformed
+table refuses instead of answering from what it could read.
 
 **Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
 guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
 priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
 node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
 the other's state. Startup reaps the previous generation before installing
-anything; a deployment that is **not** using this placement reaps host state
-unconditionally, so a switched-away node cannot keep a jump into a chain no socket
-serves. Reconciliation rebuilds the chain's contents behind a scope-exact DROP
-guard while the `PREROUTING` jump stays constant; guard install, capture install,
+anything — but only **after** discharging its durable readiness handshake (next
+paragraph); a deployment that is **not** using this placement runs the same
+recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
+socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
+DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
 socket bind, or guard release failing all leave the node dropping enrolled UDP
 egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
 the node-agent to acknowledge that its BPF gates closed, and only then removes
 everything; without the acknowledgement it retains the DROP guard.
+
+**A restart is a handshake too.** Readiness is durable and shared with the
+node-agent, so a generation that dies — a crash, a restart, a rollout that
+switches placement or turns UDP capture off — leaves behind BOTH its `mangle`
+state and an open BPF UDP gate for every pod it readied. Leaving the rules is
+safe (a capture path whose socket died with its process drops), but removing them
+while those gates are open is exactly a plaintext window, and the stale interface
+set does not bound the damage: a pod that restarted onto a new veth has no stale
+rule at all and an open gate regardless. So the first thing a new generation does
+is **not** a teardown. It reads the durable `.udp-ready` and `.udp-ack-required`
+directories, puts every pod they name back through the ordinary close handshake
+(persist a fresh `.udp-ack-required`, delete any `.udp-not-ready` so a stale
+acknowledgement cannot authorize this handoff, then retract `.udp-ready`), and
+waits for the node-agent to republish `.udp-not-ready`. Nothing is applied and
+nothing is removed until that settles, and a reap that fails is retried rather
+than logged once — an abandoned `PREROUTING` jump would otherwise black-hole the
+node's UDP with no code path left to clean it up. A pod also settles when
+readiness REAPPEARS for it: this recovery's own retraction removed the marker, so
+a marker that exists again was published by the incoming per-pod-netns producer,
+which publishes only once it is capturing that pod inside its namespace — its
+egress no longer reaches the host namespace at all. Without that clause the two
+halves of a placement switch would deadlock, each waiting on the other. On a node
+whose placement is now the pod-netns producer, mesh startup runs the same
+recovery — awaited, and **before** that producer starts — so the retraction can
+never fight it over the shared markers. If the handshake cannot complete, startup
+stays fail-closed and retries rather than serving.
 
 **A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
 `.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,

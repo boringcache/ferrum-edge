@@ -174,6 +174,15 @@ an `ip rule`, and an `ip route` in the host namespace, and still binds
 Treat a compromised proxy in this placement as able to rewrite host netfilter
 state, exactly as in the default placement.
 
+Dropping `hostPID` means the pod's own `/proc` view is unavailable, so interface
+resolution falls through to the host route table for **both** address families
+(`/proc/net/route` and `/proc/net/ipv6_route`). That parsing is treated as
+hostile input: bounded reads, strict field decoding, `RTF_UP` and non-default
+routes only, longest prefix wins, and a tie between two devices at that prefix
+resolves to nothing — so a crafted or degenerate route table can make a pod
+*unresolvable* (refused, egress stays closed) but never resolvable to a device
+that is not its own.
+
 Two properties bound the blast radius of the rules it installs. It emits **no
 `mangle OUTPUT` chain**, so the node's own traffic (kubelet, CNI, DNS, every
 `hostNetwork` pod) is structurally outside the capture set rather than excluded by

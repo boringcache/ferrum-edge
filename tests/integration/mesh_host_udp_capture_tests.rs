@@ -12,6 +12,10 @@
 //!   ready before its capture is genuinely live, its rules survive until the
 //!   node-agent acknowledges closing its BPF gate, and a capture loop that dies
 //!   is restarted instead of black-holing the node.
+//! * **Process boundary** — readiness is durable and shared with the node-agent,
+//!   so a new generation discharges the previous one's close handshake BEFORE it
+//!   reaps that generation's rules or applies its own. Reaping first is the one
+//!   way this path can produce a plaintext window.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -22,8 +26,8 @@ use ferrum_edge::identity::spiffe::SpiffeId;
 use ferrum_edge::modes::mesh::hbone::UdpSourceIdentity;
 use ferrum_edge::proxy::host_udp_capture::{
     HostUdpCaptureBackend, HostUdpCaptureManager, HostUdpDatagramRefusal, HostUdpIdentityIndex,
-    HostUdpListenerHandle, HostUdpPodBinding, HostUdpRefusal, ResolvedInterface,
-    plan_host_udp_bindings,
+    HostUdpListenerHandle, HostUdpPodBinding, HostUdpRefusal, HostUdpStaleGenerationRecovery,
+    ResolvedInterface, plan_host_udp_bindings,
 };
 use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
 
@@ -348,6 +352,7 @@ struct FakeBackendState {
     fail_install_guard: bool,
     fail_install_capture: bool,
     fail_release_guard: bool,
+    fail_teardown_all: bool,
     /// The next `start_listener` hands back a capture loop that returns on its
     /// own, standing in for a socket error or a panicked task.
     listener_exits: bool,
@@ -396,6 +401,10 @@ impl FakeBackend {
     fn set_fail_install_guard(&self, fail: bool) {
         self.inner.lock().unwrap().fail_install_guard = fail;
     }
+
+    fn set_fail_teardown_all(&self, fail: bool) {
+        self.inner.lock().unwrap().fail_teardown_all = fail;
+    }
 }
 
 impl HostUdpCaptureBackend for FakeBackend {
@@ -440,6 +449,9 @@ impl HostUdpCaptureBackend for FakeBackend {
 
     fn teardown_all(&self) -> Result<(), String> {
         self.record("teardown_all");
+        if self.inner.lock().unwrap().fail_teardown_all {
+            return Err("xtables lock timeout".to_string());
+        }
         Ok(())
     }
 
@@ -1057,6 +1069,265 @@ async fn startup_reaps_stale_host_state_before_the_first_apply() {
          own, or a chain no socket serves keeps black-holing egress: {:?}",
         backend.calls()
     );
+}
+
+// ── Stale-generation recovery ───────────────────────────────────────────────
+//
+// Readiness is durable and shared with the node-agent, so a generation that dies
+// leaves BOTH its host rules and an open BPF UDP gate for every pod it readied.
+// Reaping the rules while those gates are open is the plaintext window; these
+// pin that the reap is sequenced behind the close handshake instead.
+
+/// One unsettled pass sleeps a poll interval, so keep the budget small.
+const RECOVERY_WAIT: Duration = Duration::from_millis(20);
+
+/// Publish one durable handshake marker, creating its directory the way the
+/// producer and the node-agent both do.
+fn write_marker(dir: &std::path::Path, pod_uid: &str) {
+    std::fs::create_dir_all(dir).expect("marker dir");
+    std::fs::write(dir.join(pod_uid), b"").expect("marker");
+}
+
+fn recovery_manager(
+    backend: FakeBackend,
+    ready_dir: &std::path::Path,
+) -> HostUdpCaptureManager<FakeBackend> {
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    manager(source, backend, Some(ready_dir.to_path_buf())).with_gate_close_timeout(RECOVERY_WAIT)
+}
+
+#[tokio::test]
+async fn startup_recovery_retracts_stale_readiness_before_reaping_host_state() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_required = registry.path().join(".udp-ack-required");
+    let ack_dir = registry.path().join(".udp-not-ready");
+    // A previous generation readied pod A and died. Its rules are still installed
+    // and the node-agent's UDP gate for A is still open.
+    write_marker(&ready_dir, POD_A_UID);
+    let backend = FakeBackend::default();
+    let mut manager = recovery_manager(backend.clone(), &ready_dir);
+
+    assert!(
+        !manager.recover_stale_generation_once().await,
+        "the previous generation's rules may not be removed until the node-agent confirms it \
+         closed the gate that readiness opened"
+    );
+    assert!(
+        !ready_dir.join(POD_A_UID).is_file(),
+        "readiness must be retracted so the node-agent starts closing the gate"
+    );
+    assert!(
+        ack_required.join(POD_A_UID).is_file(),
+        "and the durable requirement must be persisted, so a further crash still recovers"
+    );
+    assert!(
+        backend.calls().is_empty(),
+        "nothing may touch host state while a gate is possibly still open — a capture path with \
+         no socket drops, removing it would release plaintext: {:?}",
+        backend.calls()
+    );
+
+    write_marker(&ack_dir, POD_A_UID);
+    assert!(manager.recover_stale_generation_once().await);
+    assert_eq!(
+        backend.calls(),
+        vec!["teardown_all".to_string()],
+        "only an acknowledged handoff reaps the predecessor's state"
+    );
+    assert!(
+        !ack_required.join(POD_A_UID).is_file(),
+        "an acknowledged recovery clears the requirement it raised"
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_adopts_a_close_request_a_previous_generation_left_unfinished() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_dir = registry.path().join(".udp-not-ready");
+    // Readiness was already retracted; the process died awaiting the ack. The
+    // requirement alone is still evidence that a gate may be open.
+    write_marker(&registry.path().join(".udp-ack-required"), POD_A_UID);
+    let backend = FakeBackend::default();
+    let mut manager = recovery_manager(backend.clone(), &ready_dir);
+
+    assert!(!manager.recover_stale_generation_once().await);
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+
+    write_marker(&ack_dir, POD_A_UID);
+    assert!(manager.recover_stale_generation_once().await);
+    assert_eq!(backend.calls(), vec!["teardown_all".to_string()]);
+}
+
+#[tokio::test]
+async fn a_stale_acknowledgement_cannot_authorize_the_startup_handoff() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_dir = registry.path().join(".udp-not-ready");
+    write_marker(&ready_dir, POD_A_UID);
+    // Left over from an OLDER close; it says nothing about the gate the readiness
+    // above opened.
+    write_marker(&ack_dir, POD_A_UID);
+    let backend = FakeBackend::default();
+    let mut manager = recovery_manager(backend.clone(), &ready_dir);
+
+    assert!(
+        !manager.recover_stale_generation_once().await,
+        "a pre-existing acknowledgement must not settle this handoff"
+    );
+    assert!(
+        !ack_dir.join(POD_A_UID).is_file(),
+        "the request ordering deletes it, so only a freshly published one can settle the recovery"
+    );
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+}
+
+#[tokio::test]
+async fn a_handshake_that_cannot_be_persisted_never_reaps_the_previous_generation() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    write_marker(&ready_dir, POD_A_UID);
+    // A plain file where the durable request directory belongs, so persisting the
+    // requirement fails.
+    std::fs::write(registry.path().join(".udp-ack-required"), b"").expect("blocking file");
+    let backend = FakeBackend::default();
+    let mut manager = recovery_manager(backend.clone(), &ready_dir);
+
+    assert!(!manager.recover_stale_generation_once().await);
+    assert!(
+        ready_dir.join(POD_A_UID).is_file(),
+        "readiness is retracted only AFTER the durable requirement is persisted; retracting first \
+         would lose the restart insurance"
+    );
+    assert!(
+        backend.calls().is_empty(),
+        "and an unpersisted handshake never authorizes a reap: {:?}",
+        backend.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_stale_state_reap_is_retried_rather_than_logged_once() {
+    // No durable obligation: this is about the reap itself. A failure that was
+    // only logged would leave a socketless capture path black-holing the node
+    // with nothing left to clean it up.
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let backend = FakeBackend::default();
+    backend.set_fail_teardown_all(true);
+    let mut manager = recovery_manager(backend.clone(), &ready_dir);
+
+    assert!(!manager.recover_stale_generation_once().await);
+    assert_eq!(backend.calls(), vec!["teardown_all".to_string()]);
+
+    backend.set_fail_teardown_all(false);
+    backend.reset_calls();
+    assert!(manager.recover_stale_generation_once().await);
+    assert_eq!(
+        backend.calls(),
+        vec!["teardown_all".to_string()],
+        "the reap is retried on the next pass"
+    );
+}
+
+#[tokio::test]
+async fn a_node_agent_that_never_acknowledges_leaves_the_previous_generation_installed() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    write_marker(&ready_dir, POD_A_UID);
+    let backend = FakeBackend::default();
+    let manager = recovery_manager(backend.clone(), &ready_dir);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move { manager.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = shutdown_tx.send(true);
+    handle.await.expect("manager exits");
+
+    assert!(
+        backend.calls().is_empty(),
+        "an unrecovered startup applies nothing and reaps nothing — including on the way out, \
+         where the ordinary teardown would see an empty published set and conclude nothing was \
+         ready: {:?}",
+        backend.calls()
+    );
+    assert_eq!(backend.listeners(), 0);
+    assert!(
+        !ready_dir.join(POD_A_UID).is_file(),
+        "readiness stays retracted, so the node-agent keeps closing rather than reopening the gate"
+    );
+}
+
+#[tokio::test]
+async fn a_placement_switch_settles_when_the_incoming_producer_republishes_readiness() {
+    // The disabled/switched half: no manager runs here, so the recovery is driven
+    // on its own exactly as mesh startup drives it before starting the
+    // per-pod-netns producer.
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_required = registry.path().join(".udp-ack-required");
+    write_marker(&ready_dir, POD_A_UID);
+    let mut recovery = HostUdpStaleGenerationRecovery::new(Some(ready_dir.clone()));
+
+    assert!(!recovery.poll_once(RECOVERY_WAIT).await);
+    assert_eq!(recovery.outstanding(), 1);
+    assert!(!ready_dir.join(POD_A_UID).is_file());
+
+    // The producer this node switched TO now captures pod A inside its own
+    // namespace and publishes readiness again. That egress never reaches the host
+    // namespace, so the stale host rules can go — and without this the two halves
+    // of a placement switch would deadlock, each waiting on the other.
+    write_marker(&ready_dir, POD_A_UID);
+    assert!(recovery.poll_once(RECOVERY_WAIT).await);
+    assert_eq!(recovery.outstanding(), 0);
+    assert!(
+        ready_dir.join(POD_A_UID).is_file(),
+        "the incoming producer's own readiness must be left alone, not retracted again"
+    );
+    assert!(
+        !ack_required.join(POD_A_UID).is_file(),
+        "and the requirement this recovery raised is cleared"
+    );
+}
+
+#[tokio::test]
+async fn recovery_touches_only_ferrum_owned_marker_names() {
+    let registry = tempfile::tempdir().expect("tempdir");
+    let ready_dir = registry.path().join(".udp-ready");
+    let ack_dir = registry.path().join(".udp-not-ready");
+    write_marker(&ready_dir, POD_A_UID);
+    std::fs::create_dir_all(ready_dir.join("a-directory-not-a-marker")).expect("subdir");
+    let mut recovery = HostUdpStaleGenerationRecovery::new(Some(ready_dir.clone()));
+
+    assert!(!recovery.poll_once(RECOVERY_WAIT).await);
+    assert_eq!(
+        recovery.outstanding(),
+        1,
+        "only the pod marker is adopted; a non-file entry is not a readiness marker"
+    );
+    assert!(
+        ready_dir.join("a-directory-not-a-marker").is_dir(),
+        "and nothing outside the marker convention is removed"
+    );
+
+    write_marker(&ack_dir, POD_A_UID);
+    assert!(recovery.poll_once(RECOVERY_WAIT).await);
+}
+
+#[tokio::test]
+async fn recovery_is_a_no_op_without_a_handshake_directory() {
+    let backend = FakeBackend::default();
+    let source = Arc::new(FakeSource::default());
+    let mut manager = manager(source, backend.clone(), None);
+
+    assert!(
+        manager.recover_stale_generation_once().await,
+        "nothing gated a pod on a readiness marker, so there is no durable obligation to discharge"
+    );
+    assert_eq!(backend.calls(), vec!["teardown_all".to_string()]);
 }
 
 #[test]
