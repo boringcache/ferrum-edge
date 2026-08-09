@@ -62,11 +62,13 @@ pub struct MeshAuthzRequest {
     pub attributes: BTreeMap<String, MeshAuthzAttribute>,
     /// Direct connection peer IP (`source.ip`), used by Istio source
     /// `ipBlocks` / `notIpBlocks` matchers. `None` when the listener could
-    /// not resolve a socket peer address.
+    /// not resolve a socket peer address; `when: source.ip` then treats the
+    /// attribute as unsourceable and fails closed.
     pub source_ip: Option<std::net::IpAddr>,
     /// XFF-derived remote client IP (`remote.ip`), used by Istio source
     /// `remoteIpBlocks` / `notRemoteIpBlocks` matchers. `None` when no
-    /// trusted forwarded address was resolved.
+    /// trusted forwarded address was resolved; `when: remote.ip` then treats
+    /// the attribute as unsourceable and fails closed.
     pub remote_ip: Option<std::net::IpAddr>,
     /// Authoritative destination IP of the connection this request/session
     /// arrived on (`destination.ip`) — the pre-NAT original destination when
@@ -700,17 +702,18 @@ fn condition_key_is_sourceable(key: &str, request: &MeshAuthzRequest) -> bool {
         | MeshConditionKeyKind::RequestAuthPresenter
         | MeshConditionKeyKind::RequestAuthAudiences
         | MeshConditionKeyKind::RequestAuthClaim => request.protocol == MeshAuthzProtocol::Http,
-        // Every connection has a destination address, so an unresolved one is
-        // missing evidence rather than a genuinely absent attribute (a UDP or
-        // DTLS session with no captured original destination, for example).
+        // Every connection has source, remote, and destination addresses. An
+        // unresolved typed value is therefore missing transport evidence, not
+        // a genuinely absent optional attribute. Treat it as unsourceable so a
+        // parse/capture failure cannot silently disarm a DENY condition.
+        MeshConditionKeyKind::SourceIp => request.source_ip.is_some(),
+        MeshConditionKeyKind::RemoteIp => request.remote_ip.is_some(),
         MeshConditionKeyKind::DestinationIp => request.destination_ip.is_some(),
         MeshConditionKeyKind::DestinationPort => request.port.is_some(),
         MeshConditionKeyKind::SourcePrincipal
         | MeshConditionKeyKind::SourceNamespace
         | MeshConditionKeyKind::SourceServiceAccount
         | MeshConditionKeyKind::SourceTrustDomain
-        | MeshConditionKeyKind::SourceIp
-        | MeshConditionKeyKind::RemoteIp
         | MeshConditionKeyKind::ConnectionSni => true,
     }
 }

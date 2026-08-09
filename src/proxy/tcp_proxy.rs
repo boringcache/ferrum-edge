@@ -1810,16 +1810,21 @@ async fn run_tcp_accept_loop(
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
                     // A trusted inbound PROXY tuple is the earliest
-                    // authoritative destination. Otherwise keep the complete
-                    // kernel/capture socket address; dropping its port would
-                    // mis-advertise fixed capture listeners (for example
-                    // :15001) as the application's original destination.
-                    let original_destination = forwarded_dst
+                    // authoritative destination. Otherwise prefer the complete
+                    // kernel/capture socket address, then fall back to the
+                    // accepted socket's local address for an ordinary direct
+                    // listener. Dropping the port would mis-advertise fixed
+                    // capture listeners (for example :15001) as the
+                    // application's original destination.
+                    let authoritative_destination = forwarded_dst
                         .or(node_waypoint_orig_dst)
                         .or_else(|| crate::socket_opts::original_dst(&stream))
+                        .or_else(|| stream.local_addr().ok())
                         .map(crate::util::client_identity::canonical_socket_addr);
-                    stream_ctx.destination_ip = original_destination.map(|addr| addr.ip());
-                    stream_ctx.destination_port = original_destination.map(|addr| addr.port());
+                    stream_ctx.destination_ip =
+                        authoritative_destination.map(|addr| addr.ip());
+                    stream_ctx.destination_port =
+                        authoritative_destination.map(|addr| addr.port());
                     // Gateway binding is process/listener configuration — never
                     // inferred from wire data. EnvConfig supplies `mesh` only
                     // for mesh Sidecar topology; every other default is no

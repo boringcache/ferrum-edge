@@ -2021,6 +2021,58 @@ async fn condition_allow_on_destination_ip_fails_closed_without_evidence() {
     );
 }
 
+/// A connection always has source and remote addresses. If their typed
+/// transport evidence cannot be recovered, that is an observation failure —
+/// not an absent optional attribute — so both DENY and ALLOW must fail closed.
+#[tokio::test]
+async fn condition_source_and_remote_ip_fail_closed_without_typed_evidence() {
+    for (key, clear_source) in [("source.ip", true), ("remote.ip", false)] {
+        let deny = condition_policy(
+            "deny-private",
+            PolicyAction::Deny,
+            key,
+            vec!["10.0.0.0/8"],
+            Vec::new(),
+        );
+        let deny_plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+        let mut deny_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+        if clear_source {
+            deny_ctx.direct_client_ip = "not-an-ip".to_string();
+        } else {
+            deny_ctx.client_ip = "not-an-ip".to_string();
+        }
+        assert!(
+            matches!(
+                deny_plugin.authorize(&mut deny_ctx).await,
+                PluginResult::Reject { .. }
+            ),
+            "missing {key} evidence must not disarm a DENY"
+        );
+
+        let allow = condition_policy(
+            "allow-private",
+            PolicyAction::Allow,
+            key,
+            vec!["10.0.0.0/8"],
+            Vec::new(),
+        );
+        let allow_plugin = build_mesh_authz_for_workload(&[], vec![allow]);
+        let mut allow_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+        if clear_source {
+            allow_ctx.direct_client_ip = "not-an-ip".to_string();
+        } else {
+            allow_ctx.client_ip = "not-an-ip".to_string();
+        }
+        assert!(
+            matches!(
+                allow_plugin.authorize(&mut allow_ctx).await,
+                PluginResult::Reject { .. }
+            ),
+            "missing {key} evidence must never grant an ALLOW"
+        );
+    }
+}
+
 /// The L4 stream path sources `destination.ip` from the trusted PROXY tuple /
 /// `SO_ORIGINAL_DST` / capture metadata the accept path stamped.
 #[tokio::test]

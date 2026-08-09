@@ -16492,8 +16492,9 @@ components:
         An attribute the path CAN source but that this request lacks follows
         ordinary Istio semantics (a `values` check fails; a `notValues`-only
         check passes). An attribute the path can NEVER source — an HTTP-only key
-        on a TCP/UDP/DTLS connection, `destination.ip` or `destination.port`
-        with no transport evidence, or any `experimental.envoy.filters.*` key — is fail-closed in
+        on a TCP/UDP/DTLS connection, a source/remote/destination IP or
+        destination port with no typed transport evidence, or any
+        `experimental.envoy.filters.*` key — is fail-closed in
         both directions, matching Istio's non-HTTP-port behavior: a DENY rule
         ignores the field and still matches, while an ALLOW or AUDIT rule can
         never match. `destination.ip` is sourced only from the captured pre-NAT

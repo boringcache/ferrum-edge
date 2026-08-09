@@ -211,7 +211,7 @@ struct HttpConditionNetworkAttrs {
 //
 // "This path can never source the attribute" is a different fact and is NOT
 // expressed by omission — it is carried on `MeshAuthzRequest` as
-// `protocol` / `destination_ip` and resolved by
+// `protocol` / typed transport IP evidence and resolved by
 // `crate::modes::mesh::policy::condition_key_is_sourceable`, which fails closed
 // (an ALLOW/AUDIT rule cannot match; a DENY rule ignores the field and still
 // matches). Encoding it as a missing attribute instead would let an
