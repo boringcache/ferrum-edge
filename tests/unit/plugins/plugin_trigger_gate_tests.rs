@@ -1141,13 +1141,7 @@ async fn stream_triggers_gate_on_network_facts() {
 #[tokio::test]
 async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_scheme() {
     let gated = with_trigger(
-        make_plugin_config_with_json(
-            "throttle",
-            "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1}),
-            PluginScope::Proxy,
-            Some("udp"),
-        ),
+        builtin("protocol-gate", "ip_restriction", "udp"),
         json!({"when": {"match": {"protocol": ["dtls"]}}}),
     );
     let plugins = published(
@@ -1175,7 +1169,7 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
         dtls_frontend
             .metadata
             .as_ref()
-            .and_then(|metadata| metadata.get("plugin_trigger.throttle.skipped"))
+            .and_then(|metadata| metadata.get("plugin_trigger.protocol-gate.skipped"))
             .is_none(),
         "DTLS accepted at the frontend must match even when the backend is plain UDP"
     );
@@ -1191,7 +1185,7 @@ async fn stream_protocol_triggers_use_the_frontend_transport_not_the_backend_sch
         udp_frontend
             .metadata
             .as_ref()
-            .and_then(|metadata| metadata.get("plugin_trigger.throttle.skipped"))
+            .and_then(|metadata| metadata.get("plugin_trigger.protocol-gate.skipped"))
             .map(String::as_str),
         Some("true"),
         "plain UDP must not be mislabeled DTLS by its encrypted backend"
