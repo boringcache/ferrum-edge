@@ -15353,9 +15353,8 @@ async fn h3_mesh_reload(
         .build()
         .expect("admin client");
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = String::from("<no admin response yet>");
     loop {
-        match client
+        let last = match client
             .get(&url)
             .header("Authorization", gateway.auth_header())
             .send()
@@ -15374,12 +15373,12 @@ async fn h3_mesh_reload(
                     if tags == expected {
                         return;
                     }
-                    last = format!("live target tags {tags:?}");
+                    format!("live target tags {tags:?}")
                 }
-                Err(error) => last = format!("unreadable admin response: {error}"),
+                Err(error) => format!("unreadable admin response: {error}"),
             },
-            Err(error) => last = format!("admin request failed: {error}"),
-        }
+            Err(error) => format!("admin request failed: {error}"),
+        };
         let logs = gateway.diagnostic_captured_output();
         assert!(
             gateway.is_running(),
