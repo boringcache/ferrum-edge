@@ -547,12 +547,14 @@ Ferrum's Kubernetes controller patches Gateway API status across every level the
 | ListenerSet status (`Accepted`, `Programmed`, per-listener conditions including `Conflicted`) | Emitted when the ListenerSet CRD is installed and Ferrum watches it |
 | TLSRoute / TCPRoute parent status | Emitted for watched L4 routes |
 
-GatewayClass and Gateway status updates use Kubernetes server-side apply with
-the stable field manager `ferrum.io/gateway-controller`. Their structural
-condition and listener lists are keyed list-maps, so the minimal apply document
-can own Ferrum's entries without copying another manager's fields. Ferrum sets
-`force=true` to reclaim the status fields it continuously reconciles after
-upgrades or legacy merge-patch writes.
+GatewayClass, Gateway, and ListenerSet status updates use Kubernetes server-side
+apply with the stable field manager `ferrum.io/gateway-controller`. Their
+structural condition and listener lists are keyed list-maps, so the minimal
+apply document can own Ferrum's entries without copying or claiming another
+manager's fields. The ListenerSet document is limited to Ferrum's
+`Accepted`/`Programmed` conditions and the listener entries it reconciles.
+Ferrum sets `force=true` to reclaim the status fields it continuously
+reconciles after upgrades or legacy merge-patch writes.
 
 Route `status.parents` is an atomic list in the upstream Gateway API CRDs, so a
 partial server-side apply would still replace the entire list and could remove

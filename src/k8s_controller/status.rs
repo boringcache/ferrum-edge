@@ -2708,7 +2708,7 @@ fn gateway_status_apply_patch_for_update(
     let mut status_patch = serde_json::Map::new();
 
     match update.kind.as_str() {
-        "GatewayClass" | "Gateway" => {
+        "GatewayClass" | "Gateway" | "ListenerSet" => {
             let desired_conditions = preserve_live_condition_transition_times(
                 desired_owned_conditions(&update.status, owned_condition_types(&update.kind)),
                 live_status.and_then(existing_conditions),
@@ -2728,6 +2728,10 @@ fn gateway_status_apply_patch_for_update(
                 if let Some(attached) = update.status.get("attachedListenerSets").cloned() {
                     status_patch.insert("attachedListenerSets".to_string(), attached);
                 }
+            } else if update.kind == "ListenerSet"
+                && let Some(listeners) = update.status.get("listeners").cloned()
+            {
+                status_patch.insert("listeners".to_string(), listeners);
             }
         }
         "BackendLBPolicy" | "XBackendTrafficPolicy" => {
@@ -2961,6 +2965,7 @@ fn owned_condition_types(kind: &str) -> &'static [&'static str] {
     match kind {
         "GatewayClass" => &["Accepted", "SupportedVersion"],
         "Gateway" => &["Accepted", "ResolvedRefs", "Programmed", "Conflicted"],
+        "ListenerSet" => &["Accepted", "Programmed"],
         _ => &[],
     }
 }
@@ -6253,7 +6258,7 @@ mod tests {
     }
 
     #[test]
-    fn status_apply_patch_for_gateway_contains_only_ferrum_owned_fields() {
+    fn status_apply_patch_contains_only_ferrum_owned_fields() {
         let update = GatewayApiStatusUpdate {
             api_version: "gateway.networking.k8s.io/v1".to_string(),
             kind: "Gateway".to_string(),
@@ -6315,6 +6320,54 @@ mod tests {
         assert!(conditions.iter().all(|condition| {
             condition.get("type").and_then(Value::as_str) != Some("example.com/CustomReady")
         }));
+
+        let listenerset_update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "ListenerSet".to_string(),
+            namespace: "default".to_string(),
+            name: "extra".to_string(),
+            status: json!({
+                "conditions": [
+                    {
+                        "type": "Accepted",
+                        "status": "True",
+                        "observedGeneration": 7,
+                        "reason": "Accepted",
+                        "message": "[ferrum-edge] accepted",
+                        "lastTransitionTime": "2026-02-01T00:00:00Z"
+                    },
+                    {
+                        "type": "example.com/CustomReady",
+                        "status": "True"
+                    }
+                ],
+                "listeners": [{"name": "http", "conditions": []}],
+                "example.com/foreignField": "must not be claimed"
+            }),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
+        };
+        let listenerset_patch =
+            gateway_status_apply_patch_for_update(&listenerset_update, None);
+        assert_eq!(
+            listenerset_patch["status"]["conditions"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            listenerset_patch["status"]["conditions"][0]["type"].as_str(),
+            Some("Accepted")
+        );
+        assert_eq!(
+            listenerset_patch["status"]["listeners"][0]["name"].as_str(),
+            Some("http")
+        );
+        assert!(
+            listenerset_patch["status"]
+                .get("example.com/foreignField")
+                .is_none()
+        );
     }
 
     #[test]
