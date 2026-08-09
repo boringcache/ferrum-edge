@@ -13,8 +13,8 @@
 //!   remove the other's rules or routing.
 
 use ferrum_edge::capture::{
-    CaptureConfig, Ip6TablesMode, IptablesPlan, MAX_HOST_UDP_CAPTURE_INTERFACES, UdpCaptureSettings,
-    udp_capture_settings_from_env, validate_host_capture_interface,
+    CaptureConfig, Ip6TablesMode, IptablesPlan, MAX_HOST_UDP_CAPTURE_INTERFACES,
+    UdpCaptureSettings, udp_capture_settings_from_env, validate_host_capture_interface,
     validate_host_capture_interfaces,
 };
 use ferrum_edge::modes::mesh::{MeshTopology, validate_udp_host_netns_placement};

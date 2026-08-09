@@ -664,8 +664,7 @@ impl HostUdpStaleGenerationRecovery {
     /// markers for predecessor state. Acknowledgements and stale-rule teardown
     /// may still be pending and can continue in the background.
     pub fn retraction_complete(&self) -> bool {
-        self.ready_dir.is_none()
-            || (self.discovery_complete && self.pending_request.is_empty())
+        self.ready_dir.is_none() || (self.discovery_complete && self.pending_request.is_empty())
     }
 
     /// Run one bounded pass. `true` means every durable obligation the previous
