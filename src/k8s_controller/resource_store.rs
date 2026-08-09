@@ -141,7 +141,8 @@ impl ResourceStoreSet {
     }
 
     /// Swap a fresh reflector store in for the one already registered under the
-    /// same `(api_version, kind, scope)` triple, in place and under one lock.
+    /// same `(api_version, kind, scope)` triple, or add it when the old scope was
+    /// concurrently deregistered. Does NOT notify subscribers.
     ///
     /// This is the make-before-break half of the idle relist in
     /// [`super::watcher`]: the previous generation's store keeps serving its
@@ -150,19 +151,31 @@ impl ResourceStoreSet {
     /// scope contributes zero objects. A gap there would look exactly like a
     /// mass deletion to the reconciler and would broadcast a config wipe.
     ///
-    /// Returns `false` when no store is registered for the triple; the caller
-    /// then falls back to [`Self::add_store`] rather than dropping the scope.
-    pub fn replace_store_for_scope(&mut self, store: Arc<CrdResourceStore>) -> bool {
+    /// Deferring notification is load-bearing for the Kubernetes config
+    /// revision tracker (issue #3611): the watcher must commit the replacement
+    /// generation's convergence evidence under this same `ResourceStoreSet`
+    /// lock and only then wake reconciliation. Otherwise a reconciler can pair
+    /// the new store with the old scalar revision and permanently withhold the
+    /// changed mesh when the relisted scope is quiet.
+    ///
+    /// Returns `true` when an existing store was replaced and `false` when the
+    /// scope had to be re-added. The caller MUST invoke [`Self::notify_change`]
+    /// after committing any state that describes this store and before
+    /// releasing its outer lock.
+    pub fn replace_or_add_store_for_scope_without_notify(
+        &mut self,
+        store: Arc<CrdResourceStore>,
+    ) -> bool {
         let Some(index) = self.stores.iter().position(|existing| {
             existing.api_version == store.api_version
                 && existing.kind == store.kind
                 && existing.scope == store.scope
         }) else {
+            self.stores.push(store);
             return false;
         };
 
         self.stores[index] = store;
-        self.notify_change();
         true
     }
 
@@ -180,6 +193,26 @@ impl ResourceStoreSet {
 
     pub fn stores(&self) -> Vec<Arc<CrdResourceStore>> {
         self.stores.clone()
+    }
+
+    /// Identity of every currently registered scope.
+    ///
+    /// The revision tracker's aggregation set (issue #3611). Callers pin it and
+    /// read the watermark under the SAME lock they later call
+    /// [`Self::snapshot_all`] under, and in that order: between the two the
+    /// stores can only move forward, so the snapshot is never older than the
+    /// watermark claims.
+    pub fn scope_keys(&self) -> Vec<crate::k8s_controller::revision::K8sWatchScopeKey> {
+        self.stores
+            .iter()
+            .map(|store| {
+                crate::k8s_controller::revision::watch_scope_key(
+                    &store.api_version,
+                    &store.kind,
+                    &store.scope,
+                )
+            })
+            .collect()
     }
 
     pub fn snapshot_all(&self) -> Vec<K8sObject> {

@@ -40,9 +40,9 @@
 //! [`try_ktls_accept`] is allowed to touch the socket destructively only after
 //! every recoverable refusal has been made. Everything that can decline —
 //! kernel/cipher probes, secret-extraction opt-in, ClientHello facts (TLS 1.3
-//! offered, no kernel-supported AEAD suite), an SNI this path cannot reproduce
-//! as faithfully as `ServerConnection::server_name()` would,
-//! receive-window pin/readback, and
+//! offered, a finite-limit AES-GCM suite among the selectable offers, no
+//! kernel-supported unlimited AEAD suite), an SNI this path cannot reproduce
+//! as faithfully as `ServerConnection::server_name()` would, and
 //! `TCP_ULP` install — happens before any TLS byte is consumed (the ClientHello
 //! is only `MSG_PEEK`ed) and returns [`KtlsAcceptOutcome::Declined`] with a
 //! stream the ordinary buffered tokio-rustls accept can continue using.
@@ -52,24 +52,17 @@
 //! rustls stops counting protected messages the moment
 //! `dangerous_into_kernel_connection` is called, and its `kernel` module makes
 //! aborting before the suite's `CipherSuiteCommon::confidentiality_limit` the
-//! caller's responsibility. This module therefore reads that limit from the
-//! *negotiated* suite, refuses any limited suite whose kernel record sequence
-//! number this kernel cannot report (before the handshake is consumed), and
-//! hands [`crate::proxy::ktls_confidentiality::KtlsConfidentialityPolicy`] —
-//! seeded from the kernel's own post-install readback, so the records the
-//! handshake already spent are counted — to the relay, which enforces it per
-//! direction.
-//!
-//! The receive half of that budget rests on a bound for how many records one
-//! nonblocking `splice(2)` can consume, which in turn rests on how much wire
-//! data the socket may hold. That is only a bound if the kernel cannot enlarge
-//! it, so for a suite with a finite limit this module pins the socket receive
-//! buffer (`SO_RCVBUF`, which sets `SOCK_RCVBUF_LOCK` and ends autotuning for
-//! this socket) and reads the pinned size back **before the handshake consumes
-//! any bytes**. If that cannot be done, the handoff cleanly falls back to the
-//! ordinary userspace rustls accept rather than dropping a valid connection or
-//! relaying records no budget covers. An unlimited suite pins nothing and keeps
-//! ordinary receive autotuning.
+//! caller's responsibility. Finite-limit TLS 1.2 AES-GCM suites are therefore
+//! removed from ClientHello eligibility before the handshake consumes the
+//! socket: Linux cannot report a race-free bound for records already admitted
+//! before a post-accept `SO_RCVBUF` pin (`FIONREAD` omits out-of-order skbs),
+//! so those connections keep the ordinary buffered rustls relay. Only
+//! ChaCha20-Poly1305 (rustls `confidentiality_limit: u64::MAX`) remains
+//! eligible; it builds no confidentiality guard, pins nothing, and keeps
+//! ordinary receive autotuning. The defensive budget machinery in
+//! [`crate::proxy::ktls_confidentiality`] stays fail-closed if a future caller
+//! ever presents a limited suite, but it is not a basis for making AES-GCM
+//! eligible again.
 //!
 //! # TLS 1.3 is refused, not silently mishandled
 //!
@@ -99,7 +92,6 @@ use crate::modes::mesh::node_waypoint_observability::{
 };
 use crate::proxy::ktls_confidentiality::{
     KtlsConfidentialityPolicy, KtlsDirection, KtlsSessionLimits, observe_record_seq,
-    pin_receive_window,
 };
 use crate::socket_opts::ktls;
 
@@ -256,27 +248,12 @@ pub(crate) async fn try_ktls_accept(
         return KtlsAcceptOutcome::Declined(stream);
     }
 
-    // AES-GCM's finite confidentiality limit is only enforceable against a
-    // receive window the kernel will not silently enlarge. Pin and read that
-    // window while the peeked ClientHello is still the only TLS input we have
-    // observed. If either syscall fails, the ordinary buffered rustls accept
-    // can continue on the unconsumed stream. Pin whenever AES is one of the
-    // selectable offers, even if ChaCha20 is also present, because rustls may
-    // choose either suite.
-    let stable_receive_ceiling = if facts.requires_receive_window_pin() {
-        match pin_receive_window(stream.as_raw_fd()) {
-            Ok(ceiling) => ceiling,
-            Err(e) => {
-                debug!(
-                    peer = %peer.ip(),
-                    "kTLS: receive window could not be pinned ({e}), retaining the userspace rustls relay"
-                );
-                return KtlsAcceptOutcome::Declined(stream);
-            }
-        }
-    } else {
-        0
-    };
+    // Finite-limit AES-GCM suites are deliberately excluded above. Linux does
+    // not expose a race-free bound for data admitted before SO_RCVBUF is
+    // pinned: FIONREAD omits out-of-order skbs, so it cannot prove the receive
+    // record budget. ChaCha20-Poly1305 has no finite confidentiality limit and
+    // therefore needs neither a pinned window nor a receive ceiling.
+    let stable_receive_ceiling = 0;
 
     let mut conn = match UnbufferedServerConnection::new(config.clone()) {
         Ok(conn) => conn,
@@ -365,9 +342,9 @@ pub(crate) async fn try_ktls_accept(
              report record sequence numbers",
         ));
     }
-    // The pre-handshake ClientHello gate pins the receive window whenever an
-    // AES-GCM suite is selectable. Restate that invariant against the suite
-    // rustls actually chose before consuming the session.
+    // The pre-handshake ClientHello gate excludes every finite-limit suite.
+    // Restate that invariant against the suite rustls actually chose before
+    // consuming the session.
     if limits.requires_enforcement() && stable_receive_ceiling == 0 {
         record_frontend_tls_failure(record_mesh_mtls_metric, "error");
         return KtlsAcceptOutcome::Failed(io::Error::other(
@@ -728,13 +705,12 @@ fn cipher_kernel_available(cipher: ktls::KtlsCipher) -> bool {
 
 /// Whether a cipher may be offered to the handoff at all.
 ///
-/// Installability is necessary but not sufficient: a suite with a finite
-/// confidentiality limit also needs the kernel to expose its live record
-/// sequence number, since that counter is the only thing that can enforce the
-/// limit after rustls stops tracking messages. Requiring it *here* — from the
-/// peeked ClientHello, before `UnbufferedServerConnection` reads a byte — is
-/// what makes the refusal a clean fall-back to the buffered rustls relay
-/// rather than a dropped connection.
+/// Installability is necessary but not sufficient. A suite with a finite
+/// confidentiality limit also needs a sound upper bound on records already in
+/// the receive queue. Linux's `FIONREAD` omits out-of-order skbs, so no such
+/// bound is available when `SO_RCVBUF` is pinned after accept. Refuse those
+/// suites here, before `UnbufferedServerConnection` reads a byte, so the
+/// connection cleanly falls back to the buffered rustls relay.
 ///
 /// ChaCha20-Poly1305 carries `confidentiality_limit: u64::MAX` in both pinned
 /// providers, so it is deliberately *not* subject to the sequence-number
@@ -743,7 +719,7 @@ fn cipher_handoff_usable(cipher: ktls::KtlsCipher) -> bool {
     if !cipher_kernel_available(cipher) {
         return false;
     }
-    !cipher_has_confidentiality_limit(cipher) || ktls::is_ktls_record_seq_observable(cipher)
+    !cipher_has_confidentiality_limit(cipher)
 }
 
 /// Whether the TLS 1.2 suites that map to `cipher` carry a finite
@@ -783,11 +759,13 @@ fn suite_confidentiality_limit(suite: rustls::SupportedCipherSuite) -> u64 {
 /// requested ones) seed the policy, so the budget starts from what the kernel
 /// will actually count from.
 ///
-/// `stable_receive_ceiling` is the already-pinned receive bound from
-/// [`pin_receive_window`], established before the rustls session was consumed.
-/// It is carried through unchanged: this function must not re-derive a ceiling,
-/// because a value read here would be a fresh observation of a quantity the
-/// budget needs to be immutable.
+/// `stable_receive_ceiling` is the receive bound established before the rustls
+/// session was consumed. The active handoff path always passes `0` today:
+/// finite-limit suites are refused at the ClientHello gate, and unlimited
+/// suites never pin a receive window. The argument is still threaded through so
+/// a future finite-limit caller can supply a sound ceiling without re-deriving
+/// one here — this function must not invent a fresh observation of a quantity
+/// the budget needs to be immutable.
 fn seed_confidentiality_policy(
     fd: std::os::unix::io::RawFd,
     limits: &KtlsSessionLimits,
