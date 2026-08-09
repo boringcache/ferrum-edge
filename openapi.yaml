@@ -8790,8 +8790,9 @@ components:
         header:
           description: >-
             Request header field, evaluated against the pristine inbound wire
-            view. Field names are ASCII-case-insensitive; non-UTF-8 field lines
-            are skipped rather than lossily transcoded.
+            view. Field names are ASCII-case-insensitive. A non-UTF-8 value
+            remains structurally present but matches no configured text; it is
+            never lossily transcoded.
           $ref: "#/components/schemas/PluginTriggerFieldMatch"
         query:
           description: >-
@@ -8932,10 +8933,11 @@ components:
             normalized into another configured field. Header names must
             additionally be valid HTTP tokens and are matched
             case-insensitively; query and cookie names are matched exactly.
-            A field occurrence whose name or value is not valid UTF-8 (a
-            non-UTF-8 header line, a percent-encoding that decodes to invalid
-            UTF-8) is not observable to a trigger and is skipped, so it can
-            satisfy neither `presence: present` nor a `value` comparison.
+            A named field occurrence remains present even when its value is not
+            valid UTF-8: it satisfies presence but cannot satisfy a textual
+            `value` matcher. A percent-encoded query name that cannot be decoded
+            cannot be attributed to this configured name and is skipped. Invalid
+            bytes are never lossily transcoded, copied, reflected, or logged.
         presence:
           type: string
           enum: [present, absent]

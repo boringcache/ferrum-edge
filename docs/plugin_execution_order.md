@@ -1224,13 +1224,16 @@ Available `match` predicates:
   `cookie.name` must be printable ASCII with no whitespace. `" x-tier "` is
   rejected rather than silently normalized into `x-tier`, so a padded name can
   never quietly address a field the operator did not write.
-* **Unrepresentable occurrences are invisible.** A trigger compares text. A
-  header line that is not valid UTF-8, or a query pair whose percent-decoded
-  name or value is not valid UTF-8, is skipped: it satisfies neither
-  `presence: present` nor a `value` comparison, and the bytes are never copied,
-  reflected, or logged. Lossy transcoding is deliberately not used — it would
-  let `?q=%FF` match a configured `U+FFFD` and, under `not`, switch a security
-  instance off.
+* **Unrepresentable values still have presence.** A trigger compares text, but
+  a named field's occurrence is structural. A non-UTF-8 header value, or a
+  query value whose matched percent-decoded name is valid but whose value is
+  not, satisfies `presence: present` and defeats `presence: absent`; it cannot
+  satisfy any `value` matcher. Cookie names are parsed from the raw ASCII
+  framing, so a named cookie with a non-UTF-8 value follows the same rule. A
+  query pair whose name cannot be decoded cannot be attributed to the
+  configured name and is skipped. The bytes are never copied, reflected, or
+  logged. Lossy transcoding is deliberately not used — it would let `?q=%FF`
+  match a configured `U+FFFD` and, under `not`, switch a security instance off.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
   Stream identities are likewise client-facing: `udp` versus `dtls` comes from

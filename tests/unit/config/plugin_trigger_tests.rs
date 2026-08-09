@@ -76,7 +76,7 @@ fn visit_pairs(pairs: &[(String, String)], name: &str, visit: &mut FieldVisitor<
         if candidate != name {
             continue;
         }
-        if !visit(value) {
+        if !visit(Some(value)) {
             return;
         }
     }

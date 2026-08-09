@@ -352,7 +352,7 @@ async fn an_unrepresentable_query_pair_fails_closed_to_running_under_not() {
 }
 
 #[tokio::test]
-async fn an_unrepresentable_query_pair_is_skipped_without_aborting_the_scan() {
+async fn unrepresentable_query_components_preserve_safe_scan_and_presence_semantics() {
     let plugins = published(
         &config(
             vec![make_proxy("api", "/api", vec!["stamp"])],
@@ -372,8 +372,8 @@ async fn an_unrepresentable_query_pair_is_skipped_without_aborting_the_scan() {
     mixed.set_raw_query_string("%FF=zzz&q=ok".to_string());
     assert!(!run_request(&plugins, &mut mixed).await.is_empty());
 
-    // An occurrence whose value cannot be represented is not observable at all,
-    // so it satisfies neither a value comparison nor bare presence.
+    // Once the name is decoded, occurrence is authoritative even when the value
+    // is not text. It satisfies bare presence but no value comparison.
     let presence = published(
         &config(
             vec![make_proxy("api", "/api", vec!["stamp"])],
@@ -386,7 +386,104 @@ async fn an_unrepresentable_query_pair_is_skipped_without_aborting_the_scan() {
     );
     let mut invalid = request("GET", "/api");
     invalid.set_raw_query_string("q=%FF".to_string());
-    assert!(run_request(&presence, &mut invalid).await.is_empty());
+    assert!(!run_request(&presence, &mut invalid).await.is_empty());
+
+    let absent = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"query": {
+                    "name": "q", "presence": "absent"
+                }}}}),
+            )],
+        ),
+        "api",
+    );
+    let mut invalid = request("GET", "/api");
+    invalid.set_raw_query_string("q=%FF".to_string());
+    assert!(run_request(&absent, &mut invalid).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_non_utf8_header_value_remains_present_but_matches_no_text() {
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["present", "value", "absent"])],
+            vec![
+                with_trigger(
+                    header_stamper("present", PluginScope::Proxy, Some("api"), "x-present"),
+                    json!({"when": {"match": {"header": {"name": "authorization"}}}}),
+                ),
+                with_trigger(
+                    header_stamper("value", PluginScope::Proxy, Some("api"), "x-value"),
+                    json!({"when": {"match": {"header": {
+                        "name": "authorization", "value": {"regex": ".*"}
+                    }}}}),
+                ),
+                with_trigger(
+                    header_stamper("absent", PluginScope::Proxy, Some("api"), "x-absent"),
+                    json!({"when": {"match": {"header": {
+                        "name": "authorization", "presence": "absent"
+                    }}}}),
+                ),
+            ],
+        ),
+        "api",
+    );
+    let mut raw = hyper::HeaderMap::new();
+    raw.insert(
+        hyper::header::AUTHORIZATION,
+        hyper::header::HeaderValue::from_bytes(&[0xff]).expect("obs-text header value"),
+    );
+    let mut ctx = request("GET", "/api");
+    ctx.set_raw_headers(raw);
+
+    let headers = run_request(&plugins, &mut ctx).await;
+    assert_eq!(headers.get("x-present").map(String::as_str), Some("1"));
+    assert!(!headers.contains_key("x-value"));
+    assert!(!headers.contains_key("x-absent"));
+}
+
+#[tokio::test]
+async fn a_cookie_with_a_non_utf8_value_remains_present_but_matches_no_text() {
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["present", "value", "absent"])],
+            vec![
+                with_trigger(
+                    header_stamper("present", PluginScope::Proxy, Some("api"), "x-present"),
+                    json!({"when": {"match": {"cookie": {"name": "session"}}}}),
+                ),
+                with_trigger(
+                    header_stamper("value", PluginScope::Proxy, Some("api"), "x-value"),
+                    json!({"when": {"match": {"cookie": {
+                        "name": "session", "value": {"regex": ".*"}
+                    }}}}),
+                ),
+                with_trigger(
+                    header_stamper("absent", PluginScope::Proxy, Some("api"), "x-absent"),
+                    json!({"when": {"match": {"cookie": {
+                        "name": "session", "presence": "absent"
+                    }}}}),
+                ),
+            ],
+        ),
+        "api",
+    );
+    let mut raw = hyper::HeaderMap::new();
+    raw.insert(
+        hyper::header::COOKIE,
+        hyper::header::HeaderValue::from_bytes(b"other=ok; session=\xff")
+            .expect("obs-text cookie value"),
+    );
+    let mut ctx = request("GET", "/api");
+    ctx.set_raw_headers(raw);
+
+    let headers = run_request(&plugins, &mut ctx).await;
+    assert_eq!(headers.get("x-present").map(String::as_str), Some("1"));
+    assert!(!headers.contains_key("x-value"));
+    assert!(!headers.contains_key("x-absent"));
 }
 
 // ---------------------------------------------------------------------------

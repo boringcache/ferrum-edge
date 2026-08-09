@@ -331,9 +331,11 @@ struct CompiledCidr {
     end: u128,
 }
 
-/// Callback invoked once per observed occurrence of a named field. Returning
-/// `false` stops the scan early.
-pub type FieldVisitor<'a> = dyn FnMut(&str) -> bool + 'a;
+/// Callback invoked once per observed occurrence of a named field. `None`
+/// means the occurrence is authoritative but its value is not representable as
+/// UTF-8; it still counts for presence while matching no configured text.
+/// Returning `false` stops the scan early.
+pub type FieldVisitor<'a> = dyn FnMut(Option<&str>) -> bool + 'a;
 
 /// Everything a compiled trigger can read about one request or stream
 /// connection. Implemented in `crate::plugins::trigger` for the live contexts.
@@ -364,16 +366,17 @@ pub trait TriggerFacts {
     ///
     /// # Representability rule (all three field surfaces)
     ///
-    /// A trigger compares text. An occurrence whose name or value is not valid
-    /// UTF-8 — a non-UTF-8 header line, a percent-encoding that decodes to
-    /// invalid UTF-8 — is **not observable** to a trigger: implementations skip
-    /// it rather than transcoding it. Lossy transcoding would let a hostile byte
-    /// sequence be coerced into `U+FFFD` and match a configured replacement
-    /// character, which under `not` flips a security instance's decision. The
-    /// skipped bytes are never copied, reflected, or logged.
+    /// A trigger compares text, but presence is a structural fact. An
+    /// occurrence whose value is not valid UTF-8 is reported as `None`: it
+    /// satisfies presence, but no configured value matcher. An occurrence whose
+    /// name itself cannot be decoded cannot be attributed to `lower_name` and is
+    /// skipped. Lossy transcoding is never used — it would let hostile bytes be
+    /// coerced into `U+FFFD` and match a configured replacement character. The
+    /// offending bytes are never copied, reflected, or logged.
     fn for_each_header_value(&self, lower_name: &str, visit: &mut FieldVisitor<'_>);
-    /// Visit every percent-decoded value of the named query parameter. Pairs
-    /// that do not decode to valid UTF-8 are skipped (see
+    /// Visit every percent-decoded value of the named query parameter. Once a
+    /// decoded name matches, an invalid-UTF-8 value is reported as `None`; a
+    /// name that cannot be decoded is skipped (see
     /// [`Self::for_each_header_value`]).
     fn for_each_query_value(&self, name: &str, visit: &mut FieldVisitor<'_>);
     /// Visit every value of the named cookie. Cookie lines that are not valid
@@ -1009,11 +1012,18 @@ fn matches_field(field: &CompiledFieldMatch, kind: FieldKind, facts: &dyn Trigge
     let mut any_matched = false;
     let mut all_matched = true;
     {
-        let mut visit = |value: &str| -> bool {
+        let mut visit = |value: Option<&str>| -> bool {
             seen = true;
             let Some(matcher) = matcher else {
                 // Presence-only: one occurrence settles it.
                 return false;
+            };
+            let Some(value) = value else {
+                // The field occurred, but hostile/non-text bytes can satisfy no
+                // text matcher. `all` is settled false; `any` keeps scanning for
+                // another representable occurrence that may match.
+                all_matched = false;
+                return !want_all;
             };
             if matches_string(matcher, value) {
                 any_matched = true;

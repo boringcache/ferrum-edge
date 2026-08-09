@@ -334,14 +334,18 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         // Read the PRISTINE inbound wire view. A trigger must describe what the
         // client actually sent, not what an earlier plugin rewrote — and the
         // memoized decision is taken before any transformer runs anyway.
-        // Non-UTF-8 field lines are skipped rather than lossily transcoded, so a
-        // hostile byte sequence can never be coerced into matching a pattern.
+        // A non-UTF-8 value still reports structural presence but is never
+        // lossily transcoded, so hostile bytes cannot match a text pattern or
+        // make a present credential field look absent.
         if let Some(raw) = self.ctx.raw_headers.as_ref() {
             for value in raw.get_all(lower_name) {
                 let Ok(value) = value.to_str() else {
+                    if !visit(None) {
+                        return;
+                    }
                     continue;
                 };
-                if !visit(value) {
+                if !visit(Some(value)) {
                     return;
                 }
             }
@@ -350,7 +354,7 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         // Direct plugin callers and tests that never carried a wire header map
         // fall back to the folded view, which holds one value per name.
         if let Some(value) = self.ctx.headers.get(lower_name) {
-            visit(value);
+            visit(Some(value));
         }
     }
 
@@ -369,10 +373,11 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
             // Decode STRICTLY. `decode_utf8_lossy` would turn an invalid
             // percent-decoded sequence into `U+FFFD`, so `?q=%FF` could satisfy
             // a configured `"\u{FFFD}"` value — and beneath `not` that flips a
-            // security instance from "runs" to "skipped". An unrepresentable
-            // pair is simply not observable to a trigger, matching how a
-            // non-UTF-8 header line is skipped. The offending bytes are never
-            // copied, reflected, or logged.
+            // security instance from "runs" to "skipped". Once the name is
+            // known, an unrepresentable value is reported as present without a
+            // textual value; an unrepresentable name is skipped because it
+            // cannot be attributed to this predicate. The offending bytes are
+            // never copied, reflected, or logged.
             let Ok(decoded_name) = percent_decode_str(raw_name).decode_utf8() else {
                 continue;
             };
@@ -380,16 +385,32 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
                 continue;
             }
             let Ok(decoded_value) = percent_decode_str(raw_value).decode_utf8() else {
+                if !visit(None) {
+                    return;
+                }
                 continue;
             };
-            if !visit(decoded_value.as_ref()) {
+            if !visit(Some(decoded_value.as_ref())) {
                 return;
             }
         }
     }
 
     fn for_each_cookie_value(&self, name: &str, visit: &mut FieldVisitor<'_>) {
-        self.for_each_header_value("cookie", &mut |header_value: &str| -> bool {
+        if let Some(raw) = self.ctx.raw_headers.as_ref() {
+            for header_value in raw.get_all("cookie") {
+                if !visit_cookie_header_bytes(header_value.as_bytes(), name.as_bytes(), visit) {
+                    return;
+                }
+            }
+            return;
+        }
+        self.for_each_header_value("cookie", &mut |header_value: Option<&str>| -> bool {
+            let Some(header_value) = header_value else {
+                // The Cookie line exists, but without text it cannot prove that
+                // this particular cookie name occurred.
+                return true;
+            };
             for pair in header_value.split(';') {
                 let pair = pair.trim();
                 if pair.is_empty() {
@@ -407,13 +428,62 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
                     .strip_prefix('"')
                     .and_then(|rest| rest.strip_suffix('"'))
                     .unwrap_or(cookie_value);
-                if !visit(cookie_value) {
+                if !visit(Some(cookie_value)) {
                     return false;
                 }
             }
             true
         });
     }
+}
+
+/// Visit one raw Cookie field without lossily transcoding it.
+///
+/// Cookie names are configured as printable ASCII, so byte comparison can
+/// establish the named occurrence even when its value contains obs-text that
+/// makes the complete header invalid UTF-8. The occurrence is then reported as
+/// present with no textual value, exactly like a named non-UTF-8 header/query
+/// value. Returns `false` when the caller settled the predicate early.
+fn visit_cookie_header_bytes(
+    header_value: &[u8],
+    name: &[u8],
+    visit: &mut FieldVisitor<'_>,
+) -> bool {
+    for pair in header_value.split(|byte| *byte == b';') {
+        let pair = trim_ascii_whitespace_bytes(pair);
+        if pair.is_empty() {
+            continue;
+        }
+        let (cookie_name, cookie_value) = match pair.iter().position(|byte| *byte == b'=') {
+            Some(index) => (&pair[..index], &pair[index + 1..]),
+            None => (pair, &[][..]),
+        };
+        if trim_ascii_whitespace_bytes(cookie_name) != name {
+            continue;
+        }
+        let mut cookie_value = trim_ascii_whitespace_bytes(cookie_value);
+        if cookie_value.len() >= 2
+            && cookie_value.first() == Some(&b'"')
+            && cookie_value.last() == Some(&b'"')
+        {
+            cookie_value = &cookie_value[1..cookie_value.len() - 1];
+        }
+        let value = std::str::from_utf8(cookie_value).ok();
+        if !visit(value) {
+            return false;
+        }
+    }
+    true
+}
+
+fn trim_ascii_whitespace_bytes(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
