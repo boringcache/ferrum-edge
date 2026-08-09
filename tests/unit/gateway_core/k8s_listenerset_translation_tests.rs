@@ -1048,3 +1048,517 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
         "a ListenerSet-scoped ReferenceGrant must authorize the valid cross-namespace TLS Secret"
     );
 }
+
+fn listenerset_listener_condition<'a>(
+    updates: &'a [ferrum_edge::k8s_controller::status::GatewayApiStatusUpdate],
+    listenerset: &str,
+    listener: &str,
+    condition_type: &str,
+) -> &'a Value {
+    let update = updates
+        .iter()
+        .find(|update| update.kind == "ListenerSet" && update.name == listenerset)
+        .expect("ListenerSet status update");
+    let listeners = update.status["listeners"].as_array().expect("listeners");
+    let listener_status = listeners
+        .iter()
+        .find(|entry| entry["name"] == listener)
+        .expect("listener status");
+    listener_status["conditions"]
+        .as_array()
+        .expect("conditions")
+        .iter()
+        .find(|condition| condition["type"] == condition_type)
+        .expect("condition")
+}
+
+fn route_parent_condition<'a>(
+    updates: &'a [ferrum_edge::k8s_controller::status::GatewayApiStatusUpdate],
+    route: &str,
+    condition_type: &str,
+) -> &'a Value {
+    let update = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == route)
+        .expect("HTTPRoute status update");
+    let parents = update.status["parents"].as_array().expect("parents");
+    parents[0]["conditions"]
+        .as_array()
+        .expect("conditions")
+        .iter()
+        .find(|condition| condition["type"] == condition_type)
+        .expect("condition")
+}
+
+#[test]
+fn listenerset_resolved_refs_same_namespace_tls_secret_outcomes() {
+    let secret = tls_secret("edge-cert", "default");
+    let with_secret = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "tls-set",
+            "edge",
+            json!([{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "secure.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } },
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{ "name": "edge-cert" }]
+                }
+            }]),
+        ),
+        secret,
+    ];
+    let translation = translate_k8s_objects(&with_secret, options()).expect("translate");
+    let updates = plan_gateway_api_status_updates(&with_secret, options(), &[]);
+    let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
+    assert_eq!(resolved["status"], "True");
+    assert_eq!(resolved["reason"], "ResolvedRefs");
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services
+            .iter()
+            .any(|service| service.name == "listenerset-tls-set-https")
+    }));
+
+    let missing = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "tls-set",
+            "edge",
+            json!([{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "secure.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } },
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{ "name": "missing-cert" }]
+                }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&missing, options()).expect("translate missing");
+    let updates = plan_gateway_api_status_updates(&missing, options(), &[]);
+    let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
+    assert_eq!(resolved["status"], "False");
+    assert_eq!(resolved["reason"], "InvalidCertificateRef");
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
+        !mesh
+            .services
+            .iter()
+            .any(|service| service.name == "listenerset-tls-set-https")
+    }));
+}
+
+#[test]
+fn listenerset_resolved_refs_cross_namespace_grant_boundary() {
+    let opts = options().with_source_namespaces(vec!["default".to_string(), "certs".to_string()]);
+    let secret = tls_secret("cert", "certs");
+    let without_grant = vec![
+        gateway_class(),
+        http_gateway("edge", Some("All")),
+        listenerset(
+            "tls-set",
+            "edge",
+            json!([{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "hostname": "secure.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } },
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{
+                        "name": "cert",
+                        "namespace": "certs"
+                    }]
+                }
+            }]),
+        ),
+        secret.clone(),
+    ];
+    let updates = plan_gateway_api_status_updates(&without_grant, opts.clone(), &[]);
+    let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
+    assert_eq!(resolved["status"], "False");
+    assert_eq!(resolved["reason"], "RefNotPermitted");
+
+    let mut grant = object(
+        "ReferenceGrant",
+        "allow-listenerset-cert",
+        json!({
+            "from": [{
+                "namespace": "default",
+                "group": "gateway.networking.k8s.io",
+                "kind": "ListenerSet"
+            }],
+            "to": [{
+                "group": "",
+                "kind": "Secret",
+                "name": "cert"
+            }]
+        }),
+    );
+    grant.api_version = "gateway.networking.k8s.io/v1beta1".to_string();
+    grant.metadata.namespace = "certs".to_string();
+    let mut with_grant = without_grant;
+    with_grant.push(grant);
+    let updates = plan_gateway_api_status_updates(&with_grant, opts, &[]);
+    let resolved = listenerset_listener_condition(&updates, "tls-set", "https", "ResolvedRefs");
+    assert_eq!(resolved["status"], "True");
+    assert_eq!(resolved["reason"], "ResolvedRefs");
+}
+
+#[test]
+fn listenerset_resolved_refs_invalid_route_kinds() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "bad-kinds",
+            "edge",
+            json!([{
+                "name": "http",
+                "port": 8080,
+                "protocol": "HTTP",
+                "hostname": "kinds.example.com",
+                "allowedRoutes": {
+                    "namespaces": { "from": "Same" },
+                    "kinds": [{ "kind": "TCPRoute" }]
+                }
+            }]),
+        ),
+    ];
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    let resolved = listenerset_listener_condition(&updates, "bad-kinds", "http", "ResolvedRefs");
+    assert_eq!(resolved["status"], "False");
+    assert_eq!(resolved["reason"], "InvalidRouteKinds");
+    let accepted = listenerset_listener_condition(&updates, "bad-kinds", "http", "Accepted");
+    assert_eq!(accepted["status"], "True");
+    let conflicted = listenerset_listener_condition(&updates, "bad-kinds", "http", "Conflicted");
+    assert_eq!(conflicted["status"], "False");
+}
+
+#[test]
+fn listenerset_route_status_unknown_section_and_namespace_rejection() {
+    let opts = options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]);
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "extra",
+            "edge",
+            json!([{
+                "name": "a",
+                "port": 8080,
+                "protocol": "HTTP",
+                "hostname": "a.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+        service("backend"),
+        http_route(
+            "bad-section",
+            json!([{
+                "kind": "ListenerSet",
+                "name": "extra",
+                "namespace": "default",
+                "sectionName": "missing"
+            }]),
+            "a.example.com",
+            "/missing",
+        ),
+        {
+            let mut other_ns_route = http_route(
+                "other-ns",
+                json!([{
+                    "kind": "ListenerSet",
+                    "name": "extra",
+                    "namespace": "default"
+                }]),
+                "a.example.com",
+                "/other",
+            );
+            other_ns_route.metadata.namespace = "other".to_string();
+            other_ns_route
+        },
+    ];
+    let updates = plan_gateway_api_status_updates(&objects, opts, &[]);
+
+    let accepted = route_parent_condition(&updates, "bad-section", "Accepted");
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "NoMatchingParent");
+    let resolved = route_parent_condition(&updates, "bad-section", "ResolvedRefs");
+    assert_eq!(resolved["status"], "True");
+    assert_eq!(resolved["reason"], "ResolvedRefs");
+
+    let other = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == "other-ns")
+        .expect("other-ns route status");
+    let accepted = other.status["parents"][0]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|condition| condition["type"] == "Accepted")
+        .unwrap();
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "NotAllowedByListeners");
+}
+
+#[test]
+fn listenerset_catch_all_and_wildcard_coexist_with_exact_hostname() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "mixed",
+            "edge",
+            json!([
+                {
+                    "name": "fallback",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "exact",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "exact.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "wild",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "*.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                }
+            ]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "mixed")
+        .expect("status");
+    assert!(status.accepted);
+    assert!(status.listener_conflicts.is_empty());
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        ["fallback", "exact", "wild"].iter().all(|listener| {
+            mesh.services
+                .iter()
+                .any(|service| service.name == format!("listenerset-mixed-{listener}"))
+        })
+    }));
+}
+
+#[test]
+fn listenerset_identical_hostnames_still_conflict() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "dup",
+            "edge",
+            json!([
+                {
+                    "name": "first",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "same.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "second",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "same.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                }
+            ]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "dup")
+        .expect("status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "second" && reason == "HostnameConflict")
+    );
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services
+            .iter()
+            .any(|service| service.name == "listenerset-dup-first")
+            && !mesh
+                .services
+                .iter()
+                .any(|service| service.name == "listenerset-dup-second")
+    }));
+}
+
+#[test]
+fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
+    let missing_fields = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "missing",
+            "edge",
+            json!([{
+                "hostname": "missing.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&missing_fields, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "missing")
+        .expect("status");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "ListenersNotValid");
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| mesh.services.is_empty()));
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("spec.listeners[].name"))
+    );
+
+    let duplicates = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "dups",
+            "edge",
+            json!([
+                {
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "a.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "http",
+                    "port": 8081,
+                    "protocol": "HTTP",
+                    "hostname": "b.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                }
+            ]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&duplicates, options()).expect("translate dups");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "dups")
+        .expect("status");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert!(status.accepted_message.contains("unique"));
+
+    let mut over_limit_listeners = Vec::new();
+    for index in 0..65 {
+        over_limit_listeners.push(json!({
+            "name": format!("http-{index}"),
+            "port": 8080 + index,
+            "protocol": "HTTP",
+            "hostname": format!("h{index}.example.com"),
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        }));
+    }
+    let over_limit = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset("too-many", "edge", Value::Array(over_limit_listeners)),
+    ];
+    let translation = translate_k8s_objects(&over_limit, options()).expect("translate over-limit");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "too-many")
+        .expect("status");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert!(status.accepted_message.contains("at most 64"));
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| mesh.services.is_empty()));
+
+    let malformed = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "malformed",
+            "edge",
+            json!([
+                {
+                    "name": "bad-proto",
+                    "port": 8080,
+                    "protocol": "FTP",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "bad-tls",
+                    "port": 8081,
+                    "protocol": "HTTP",
+                    "tls": { "mode": "Terminate" },
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "bad-host",
+                    "port": 8082,
+                    "protocol": "HTTP",
+                    "hostname": "not a hostname!!",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "ok",
+                    "port": 8083,
+                    "protocol": "HTTP",
+                    "hostname": "ok.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                }
+            ]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&malformed, options()).expect("translate malformed");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "malformed")
+        .expect("status");
+    assert!(status.accepted, "partially valid ListenerSets may remain accepted");
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services
+            .iter()
+            .any(|service| service.name == "listenerset-malformed-ok")
+            && !mesh.services.iter().any(|service| {
+                service.name == "listenerset-malformed-bad-proto"
+                    || service.name == "listenerset-malformed-bad-tls"
+                    || service.name == "listenerset-malformed-bad-host"
+            })
+    }));
+    let updates = plan_gateway_api_status_updates(&malformed, options(), &[]);
+    for listener in ["bad-proto", "bad-tls", "bad-host"] {
+        let accepted = listenerset_listener_condition(&updates, "malformed", listener, "Accepted");
+        assert_eq!(accepted["status"], "False");
+        assert_eq!(accepted["reason"], "Invalid");
+    }
+    let ok = listenerset_listener_condition(&updates, "malformed", "ok", "Accepted");
+    assert_eq!(ok["status"], "True");
+}

@@ -15,8 +15,8 @@ mod mesh_config;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status, merge_backend_lb_policy_status,
-    namespace_selector_matches, parse_reference_grant_permissions,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
+    merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
@@ -218,6 +218,15 @@ pub fn validate_gateway_listener_allowed_routes(
     listener: &Value,
 ) -> Result<(), GatewayApiListenerValidationError> {
     gateway_api::allowed_route_namespaces(listener).map(|_| ())
+}
+
+/// Validate one unstructured ListenerSet listener against the pinned v1.5.1
+/// ListenerEntry required/bounded shape (name/port/protocol/hostname/TLS plus
+/// allowedRoutes). Translation and status share this predicate.
+pub fn validate_listenerset_listener_entry(
+    listener: &Value,
+) -> Result<(), GatewayApiListenerValidationError> {
+    gateway_api::validate_listenerset_listener_entry(listener)
 }
 
 impl K8sTranslationOptions {

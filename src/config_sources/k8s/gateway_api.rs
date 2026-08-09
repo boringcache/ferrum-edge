@@ -5060,6 +5060,165 @@ pub(crate) fn normalize_gateway_hostname(hostname: &str) -> String {
     hostname.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Gateway API `SectionName` grammar (pinned v1.5.1 shared_types.go).
+pub(crate) fn gateway_api_section_name_is_valid(name: &str) -> bool {
+    valid_kubernetes_dns_subdomain(name)
+}
+
+/// Gateway API `Hostname` grammar (pinned v1.5.1 shared_types.go).
+///
+/// Allows an optional single leading `*.` wildcard label, then a DNS1123
+/// subdomain. IP literals are never valid Hostnames.
+pub(crate) fn gateway_api_hostname_is_valid(hostname: &str) -> bool {
+    let hostname = normalize_gateway_hostname(hostname);
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+    if hostname.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let rest = match hostname.strip_prefix("*.") {
+        Some(rest) => rest,
+        None if hostname.contains('*') => return false,
+        None => hostname.as_str(),
+    };
+    valid_kubernetes_dns_subdomain(rest)
+}
+
+/// Whether `protocol` is a pinned Gateway API `ProtocolType` value.
+pub(crate) fn gateway_api_protocol_type_is_known(protocol: &str) -> bool {
+    matches!(
+        protocol.to_ascii_uppercase().as_str(),
+        "HTTP" | "HTTPS" | "TLS" | "TCP" | "UDP"
+    )
+}
+
+/// Bounded ListenerSet listener core-shape validation (pinned v1.5.1
+/// `apis/v1/listenerset_types.go` ListenerEntry + XValidation).
+///
+/// Field paths are static so diagnostics never echo hostile input. Callers must
+/// not silently default missing `name` / `protocol` / `port`.
+pub(crate) fn validate_listenerset_listener_entry(
+    listener: &Value,
+) -> Result<(), GatewayApiListenerValidationError> {
+    let Some(name) = string_field(listener, "name") else {
+        return Err(listener_validation_error(
+            "spec.listeners[].name",
+            "is required",
+        ));
+    };
+    if name.is_empty() || !gateway_api_section_name_is_valid(name) {
+        return Err(listener_validation_error(
+            "spec.listeners[].name",
+            "must be a nonempty valid SectionName",
+        ));
+    }
+
+    let Some(port) = listener.get("port") else {
+        return Err(listener_validation_error(
+            "spec.listeners[].port",
+            "is required",
+        ));
+    };
+    let Some(port) = port.as_u64() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].port",
+            "must be an integer between 1 and 65535",
+        ));
+    };
+    if port == 0 || port > u16::MAX as u64 {
+        return Err(listener_validation_error(
+            "spec.listeners[].port",
+            "must be an integer between 1 and 65535",
+        ));
+    }
+
+    let Some(protocol) = string_field(listener, "protocol") else {
+        return Err(listener_validation_error(
+            "spec.listeners[].protocol",
+            "is required",
+        ));
+    };
+    if !gateway_api_protocol_type_is_known(protocol) {
+        return Err(listener_validation_error(
+            "spec.listeners[].protocol",
+            "must be one of HTTP, HTTPS, TLS, TCP, or UDP",
+        ));
+    }
+    let protocol = protocol.to_ascii_uppercase();
+
+    if let Some(hostname) = listener.get("hostname") {
+        let Some(hostname) = hostname.as_str() else {
+            return Err(listener_validation_error(
+                "spec.listeners[].hostname",
+                "must be a string Hostname",
+            ));
+        };
+        if protocol == "TCP" || protocol == "UDP" {
+            if !hostname.is_empty() {
+                return Err(listener_validation_error(
+                    "spec.listeners[].hostname",
+                    "must not be specified for protocols TCP or UDP",
+                ));
+            }
+        } else if !hostname.is_empty() && !gateway_api_hostname_is_valid(hostname) {
+            return Err(listener_validation_error(
+                "spec.listeners[].hostname",
+                "must be a valid Gateway API Hostname",
+            ));
+        }
+    }
+
+    let tls = listener.get("tls");
+    match protocol.as_str() {
+        "HTTP" | "TCP" | "UDP" => {
+            if tls.is_some() {
+                return Err(listener_validation_error(
+                    "spec.listeners[].tls",
+                    "must not be specified for protocols HTTP, TCP, or UDP",
+                ));
+            }
+        }
+        "HTTPS" => {
+            let Some(tls) = tls else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].tls",
+                    "is required for protocol HTTPS",
+                ));
+            };
+            if let Some(mode) = string_field(tls, "mode")
+                && !mode.is_empty()
+                && !mode.eq_ignore_ascii_case("Terminate")
+            {
+                return Err(listener_validation_error(
+                    "spec.listeners[].tls.mode",
+                    "must be Terminate for protocol HTTPS",
+                ));
+            }
+        }
+        "TLS" => {
+            let Some(tls) = tls else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].tls",
+                    "is required for protocol TLS",
+                ));
+            };
+            match string_field(tls, "mode") {
+                None | Some("") => {
+                    return Err(listener_validation_error(
+                        "spec.listeners[].tls.mode",
+                        "must be set for protocol TLS",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        _ => {}
+    }
+
+    allowed_route_namespaces(listener).map(|_| ())
+}
+
 fn intersect_hostnames(route_hostname: &str, listener_hostname: &str) -> Option<String> {
     if route_hostname == "*" {
         return Some(listener_hostname.to_string());

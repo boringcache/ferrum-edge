@@ -17,10 +17,10 @@ use chrono::DateTime;
 use serde_json::Value;
 
 use super::gateway_api::{
-    allowed_route_namespaces, listener_allowed_route_kinds, listener_app_protocol,
-    listener_is_materializable, listener_protocol_mode_is_supported,
+    allowed_route_namespaces, gateway_api_section_name_is_valid, listener_allowed_route_kinds,
+    listener_app_protocol, listener_is_materializable, listener_protocol_mode_is_supported,
     listener_requires_frontend_tls, listener_selected_frontend_tls_source, namespace_selector,
-    namespace_selector_matches, normalize_gateway_hostname,
+    namespace_selector_matches, normalize_gateway_hostname, validate_listenerset_listener_entry,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
@@ -31,6 +31,8 @@ use crate::modes::mesh::config::{MeshService, ServicePort};
 
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 const LISTENERSET_STATUS_OWNER_MARKER: &str = "[ferrum-edge]";
+/// Pinned Gateway API v1.5.1 ListenerSetSpec.Listeners MaxItems.
+const MAX_LISTENERSET_LISTENERS: usize = 64;
 
 fn ferrum_listenerset_status_message(message: &str) -> String {
     format!("{LISTENERSET_STATUS_OWNER_MARKER} {message}")
@@ -161,13 +163,57 @@ fn collect_one_listenerset(
         );
         return Ok(());
     }
+    if listeners.len() > MAX_LISTENERSET_LISTENERS {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must contain at most 64 listeners",
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners must contain at most 64 listeners",
+        );
+        return Ok(());
+    }
+    if listenerset_listener_names_are_duplicated(listeners) {
+        record_listenerset_status(
+            acc,
+            resource,
+            Some((parent.namespace.clone(), parent.name.clone())),
+            false,
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners[].name values must be unique",
+            false,
+            "Invalid",
+            "ListenerSet spec.listeners[].name values must be unique",
+        );
+        return Ok(());
+    }
 
     let mut saw_valid_listener = false;
     for listener in listeners {
-        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        // Never invent a default listener name. Unnamed / invalid SectionName
+        // entries stay unindexed so they cannot materialize traffic or steal
+        // sectionName attachment from a valid sibling.
+        let Some(listener_name) = string_field(listener, "name")
+            .filter(|name| !name.is_empty() && gateway_api_section_name_is_valid(name))
+        else {
+            acc.warnings.push(format!(
+                "Gateway API ListenerSet {}/{} listener rejected: spec.listeners[].name is required and must be a valid SectionName",
+                object.metadata.namespace, object.metadata.name
+            ));
+            continue;
+        };
         let requires_frontend_tls = listener_requires_frontend_tls(listener);
-        let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
-            Ok(namespaces) => (namespaces, None),
+        let (namespaces, validation_error) = match validate_listenerset_listener_entry(listener) {
+            Ok(()) => match allowed_route_namespaces(listener) {
+                Ok(namespaces) => (namespaces, None),
+                Err(error) => (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error)),
+            },
             Err(error) => {
                 acc.warnings.push(format!(
                     "Gateway API ListenerSet {}/{} listener {} rejected: {}",
@@ -182,15 +228,17 @@ fn collect_one_listenerset(
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
         }
+        // Missing protocol is a shape error above; never default to HTTP.
         let protocol = string_field(listener, "protocol")
-            .unwrap_or("HTTP")
-            .to_ascii_uppercase();
+            .map(|protocol| protocol.to_ascii_uppercase())
+            .unwrap_or_default();
         let frontend_tls_source = if requires_frontend_tls {
             listener_selected_frontend_tls_source(acc, object, listener)
         } else {
             None
         };
         let materializable = validation_error.is_none()
+            && !protocol.is_empty()
             && listener_protocol_mode_is_supported(listener)
             && listener_is_materializable(acc, object, listener);
         if materializable {
@@ -199,7 +247,9 @@ fn collect_one_listenerset(
         let policy = GatewayApiListenerPolicy {
             namespaces,
             validation_error,
-            hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
+            hostname: string_field(listener, "hostname")
+                .filter(|hostname| !hostname.is_empty())
+                .map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
             protocol,
             route_kinds: listener_allowed_route_kinds(listener),
@@ -369,7 +419,11 @@ pub(crate) fn materialize_listenerset_mesh_services(
         .into_iter()
         .flatten()
     {
-        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let Some(listener_name) = string_field(listener, "name")
+            .filter(|name| !name.is_empty() && gateway_api_section_name_is_valid(name))
+        else {
+            continue;
+        };
         let key = GatewayApiListenerKey {
             namespace: object.metadata.namespace.clone(),
             parent_kind: GatewayApiListenerParentKind::ListenerSet,
@@ -525,6 +579,19 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
             status.programmed_reason = "ListenersNotValid".to_string();
             status.programmed_message = status.accepted_message.clone();
             status.programmed_listeners.clear();
+        } else if saw_listener {
+            // Indexed listeners exist but none are materializable (shape /
+            // TLS / protocol failures). Keep fail-closed with no traffic.
+            status.attached = false;
+            status.accepted = false;
+            status.accepted_reason = "ListenersNotValid".to_string();
+            status.accepted_message = ferrum_listenerset_status_message(
+                "Every ListenerSet listener was invalid or unsupported",
+            );
+            status.programmed = false;
+            status.programmed_reason = "ListenersNotValid".to_string();
+            status.programmed_message = status.accepted_message.clone();
+            status.programmed_listeners.clear();
         }
     }
 }
@@ -548,11 +615,29 @@ fn conflict_against_accepted(
 }
 
 fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+    // Pinned Gateway listener distinctness: exact, wildcard, and fallback
+    // (empty/unset hostname) are distinct values. Only equal hostname values
+    // conflict on the same protocol+port; runtime precedence handles overlap.
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left == right,
-        (None, Some(_)) | (Some(_), None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
     }
+}
+
+fn listenerset_listener_names_are_duplicated(listeners: &[Value]) -> bool {
+    let mut seen = HashMap::new();
+    for listener in listeners {
+        let Some(name) = string_field(listener, "name")
+            .filter(|name| !name.is_empty() && gateway_api_section_name_is_valid(name))
+        else {
+            continue;
+        };
+        if seen.insert(name, ()).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 struct ConflictCandidate {
