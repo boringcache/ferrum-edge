@@ -1145,3 +1145,26 @@ fn k8s_telemetry_metric_upsert_accepts_bounded_cel_expressions() {
         )
     }));
 }
+
+#[test]
+fn k8s_telemetry_metric_upsert_counts_surrounding_whitespace_in_cel_limit() {
+    use ferrum_edge::modes::mesh::metric_tag_cel::MAX_METRIC_TAG_CEL_EXPR_LEN;
+
+    let padded = format!("{}request.host", " ".repeat(MAX_METRIC_TAG_CEL_EXPR_LEN));
+    let error = telemetry_translation_error(json!({
+        "metrics": [{
+            "overrides": [{
+                "match": {"metric": "REQUEST_COUNT"},
+                "tagOverrides": {
+                    "source_workload": {
+                        "operation": "UPSERT",
+                        "value": padded
+                    }
+                }
+            }]
+        }]
+    }));
+
+    assert!(error.contains("exceeds maximum length"), "{error}");
+    assert!(!error.contains("request.host"));
+}

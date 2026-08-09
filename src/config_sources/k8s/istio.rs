@@ -6467,8 +6467,7 @@ fn telemetry_metric_upsert_operation(
     let expression = tag_spec
         .get("value")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             invalid_resource(
                 object,
@@ -6477,7 +6476,7 @@ fn telemetry_metric_upsert_operation(
                 ),
             )
         })?;
-    if let Ok(value) = serde_json::from_str::<String>(expression) {
+    if let Ok(value) = serde_json::from_str::<String>(expression.trim()) {
         return Ok(TagOverrideOperation::Set { value });
     }
     let compiled = parse_metric_tag_cel_expression(expression).map_err(|message| {

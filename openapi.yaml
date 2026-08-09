@@ -17423,6 +17423,7 @@ components:
           properties:
             tag_overrides:
               type: array
+              maxItems: 128
               items:
                 type: object
                 required: [name, operation]
@@ -17492,8 +17493,9 @@ components:
                         description: |
                           Bounded CEL source when `type` is `set_expr` and a
                           compiled `expression` AST is not supplied. Limits:
-                          512 UTF-8 bytes, 32 tokens, nesting depth 8, 24 AST
-                          nodes. Supported forms: attribute reads,
+                          512 UTF-8 bytes including surrounding whitespace, 32
+                          tokens, nesting depth 8, 24 AST nodes. Supported
+                          forms: attribute reads,
                           `string(<int attribute>)`, and
                           `has(<string attribute>) ? <then> : <else>`.
                       expression:
@@ -17502,7 +17504,11 @@ components:
                           Precompiled CEL AST produced by Telemetry translation
                           / materialization (`op`: `literal`, `attribute`,
                           `string_of_int`, `has_then_else`).
-              description: Per-metric tag overrides translated from the Istio Telemetry CRD.
+              description: |
+                Ordered per-metric tag overrides translated from the Istio
+                Telemetry CRD. Runtime admission accepts at most 128 entries
+                and at most 16384 encoded bytes across the per-family plans
+                stamped into transaction metadata.
             disabled_metrics:
               type: array
               items:

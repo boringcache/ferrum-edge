@@ -289,6 +289,40 @@ fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
     assert_eq!(sanitize_metric_tag_value("a\nb\"c"), "a_b_c");
 }
 
+#[test]
+fn metric_tag_override_count_and_aggregate_plan_bytes_are_bounded() {
+    let too_many: Vec<_> = (0..129)
+        .map(|_| {
+            json!({
+                "name": "source_workload",
+                "operation": {"type": "remove"}
+            })
+        })
+        .collect();
+    let error = WorkloadMetrics::new(&json!({
+        "metrics": {"tag_overrides": too_many}
+    }))
+    .err()
+    .expect("override count must be bounded");
+    assert!(error.contains("exceeds 128 entries"), "{error}");
+
+    let oversized_plan: Vec<_> = (0..7)
+        .map(|_| {
+            let value = "x".repeat(256);
+            json!({
+                "name": "source_workload",
+                "operation": {"type": "set", "value": value}
+            })
+        })
+        .collect();
+    let error = WorkloadMetrics::new(&json!({
+        "metrics": {"tag_overrides": oversized_plan}
+    }))
+    .err()
+    .expect("aggregate encoded plans must be bounded");
+    assert!(error.contains("exceed 16384 bytes"), "{error}");
+}
+
 #[tokio::test]
 async fn tag_override_reload_update_and_delete_change_emitted_labels() {
     let first = WorkloadMetrics::new(&json!({

@@ -66,6 +66,8 @@ const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
 const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
+const MAX_METRIC_TAG_OVERRIDES: usize = 128;
+const MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES: usize = 16 * 1024;
 const MESH_REQUEST_HOST_METADATA: &str = "mesh.request.host";
 const MESH_REQUEST_METHOD_METADATA: &str = "mesh.request.method";
 const MESH_DESTINATION_PORT_METADATA: &str = "mesh.destination.port";
@@ -1436,11 +1438,17 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     }
 
     let mut plans: HashMap<MeshMetricFamily, String> = HashMap::new();
+    let mut total_plan_bytes = 0usize;
     let mut cel_stamp_needs = MetricTagCelStampNeeds::default();
     if let Some(value) = object.get("tag_overrides") {
         let overrides = value.as_array().ok_or_else(|| {
             "workload_metrics: metrics.tag_overrides must be an array".to_string()
         })?;
+        if overrides.len() > MAX_METRIC_TAG_OVERRIDES {
+            return Err(format!(
+                "workload_metrics: metrics.tag_overrides exceeds {MAX_METRIC_TAG_OVERRIDES} entries"
+            ));
+        }
         for entry in overrides {
             let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
                 "workload_metrics: metric tag override name is required".to_string()
@@ -1503,6 +1511,20 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                     )
                 }
             };
+            let family_count = match selector {
+                MetricSelector::All => MeshMetricFamily::ALL.len(),
+                MetricSelector::Emitted(_) => 1,
+            };
+            total_plan_bytes = encoded
+                .len()
+                .checked_mul(family_count)
+                .and_then(|added| total_plan_bytes.checked_add(added))
+                .filter(|total| *total <= MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES)
+                .ok_or_else(|| {
+                    format!(
+                        "workload_metrics: encoded metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} bytes"
+                    )
+                })?;
             match selector {
                 MetricSelector::All => {
                     for family in MeshMetricFamily::ALL {
