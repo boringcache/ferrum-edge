@@ -3115,6 +3115,29 @@ fn mesh_policy_admits_experimental_envoy_filter_key_and_rejects_the_bare_form() 
         "a documented experimental condition key must not reject the policy"
     );
 
+    let mut admitted_with_bracket = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    admitted_with_bracket.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy[db]table]".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(
+            &[],
+            &[],
+            &[admitted_with_bracket],
+            &[],
+            &[],
+            &[],
+            None
+        )
+        .is_empty(),
+        "Istio treats the first '[' and final ']' as delimiters, so an interior bracket remains part of the metadata key"
+    );
+
     let mut bare = policy_with_request_match(RequestMatch {
         methods: vec!["GET".into()],
         ..RequestMatch::default()

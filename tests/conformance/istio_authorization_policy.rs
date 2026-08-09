@@ -915,7 +915,6 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "request.headers[x:invalid]",
         "request.auth.claims[realm_access[roles]",
         "request.auth.claims[realm_access][]",
-        "experimental.envoy.filters.network.mysql_proxy[db]table]",
     ] {
         let message = condition_translation_error(malformed_key, json!(["x"]));
         assert!(
@@ -923,6 +922,22 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
             "a structurally malformed condition key must fail closed: {message}"
         );
     }
+
+    // Istio's validateMapKey/envoyFilterGenerator treats the first `[` and
+    // final `]` as delimiters; an interior `]` remains part of the metadata
+    // key. Ferrum must admit the same documented key shape so a DENY policy is
+    // not dropped before unsourceable-attribute fail-closed evaluation.
+    let experimental_with_bracket = condition_policy(
+        "DENY",
+        "experimental.envoy.filters.network.mysql_proxy[db]table]",
+        json!(["books"]),
+        Value::Null,
+    );
+    assert_eq!(
+        experimental_with_bracket.rules[0].when[0].key,
+        "experimental.envoy.filters.network.mysql_proxy[db]table]",
+        "an Istio-valid experimental metadata key must be admitted"
+    );
 
     let too_many_values: Vec<String> = (0..300).map(|index| format!("v{index}")).collect();
     let values_message = condition_translation_error("connection.sni", json!(too_many_values));

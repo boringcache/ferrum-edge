@@ -841,17 +841,18 @@ pub fn classify_mesh_condition_key(key: &str) -> Option<MeshConditionKeyKind> {
 /// metadata key. Returns `None` unless both are present and non-empty — Istio
 /// requires the bracketed metadata key, and a bare `experimental.envoy.filters.x`
 /// would otherwise be admitted as an attribute nothing can ever populate.
+///
+/// Match Istio's `validateMapKey` / `envoyFilterGenerator` shape exactly: the
+/// first `[` starts the metadata key and the final `]` ends it. Brackets inside
+/// the metadata-key string are not structural nesting and remain valid. Being
+/// stricter here would reject a policy Istio accepts; for a DENY that drops the
+/// policy entirely and is fail-open, whereas admitting the documented key lets
+/// Ferrum apply its explicit unsourceable-attribute semantics.
 fn experimental_envoy_filter_metadata_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix(CONDITION_EXPERIMENTAL_ENVOY_FILTER_PREFIX)?;
     let (filter, metadata) = rest.split_once('[')?;
     let metadata = metadata.strip_suffix(']')?;
-    if filter.is_empty()
-        || metadata.is_empty()
-        || filter.contains('[')
-        || filter.contains(']')
-        || metadata.contains('[')
-        || metadata.contains(']')
-    {
+    if filter.is_empty() || metadata.is_empty() {
         return None;
     }
     Some((filter, metadata))
