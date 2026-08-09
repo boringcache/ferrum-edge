@@ -355,28 +355,22 @@ impl ClientHelloKtlsFacts {
         !self.offers_server_name || parsed_sni.is_some()
     }
 
-    /// Whether rustls could select a suite whose finite confidentiality limit
-    /// requires a kernel-pinned receive window before the handshake begins.
-    ///
-    /// ChaCha20-Poly1305 is unlimited in both pinned providers, while both
-    /// AES-GCM suites have a finite limit. This predicate is deliberately
-    /// conservative: if the ClientHello offers AES alongside ChaCha20, rustls
-    /// may still select AES, so the receive window must already be pinned.
-    pub fn requires_receive_window_pin(&self) -> bool {
-        self.offers_aes128_gcm || self.offers_aes256_gcm
-    }
-
     /// Whether a kTLS handoff may be attempted for this ClientHello, given the
-    /// per-cipher kernel probe results.
+    /// per-cipher handoff-usability results.
     ///
-    /// Fails closed on both axes:
+    /// The three booleans are *handoff usability*, not bare kernel install
+    /// probes: production marks AES-GCM families unusable (finite
+    /// confidentiality limit; Linux cannot establish a race-free receive-record
+    /// bound after accept) and ChaCha20-Poly1305 usable only when that cipher's
+    /// kernel probe passed.
+    ///
+    /// Fails closed on every axis:
     /// * a TLS 1.3 offer disqualifies the connection outright, and
     /// * **every** selectable TLS 1.2 AEAD suite the client offered must be
-    ///   installable in this kernel. Predicting rustls's exact suite choice
-    ///   would mean duplicating its selection logic, so an offer set that
-    ///   contains even one suite the kernel cannot install is declined rather
-    ///   than gambled on. That matters on Linux 4.17–5.10, where AES-GCM kTLS
-    ///   exists but ChaCha20-Poly1305 does not.
+    ///   handoff-usable. Predicting rustls's exact suite choice would mean
+    ///   duplicating its selection logic, so an offer set that contains even
+    ///   one unusable suite (AES-GCM under the confidentiality gate, or any
+    ///   suite this kernel cannot install) is declined rather than gambled on.
     pub fn ktls_eligible(
         &self,
         aes128gcm_available: bool,
