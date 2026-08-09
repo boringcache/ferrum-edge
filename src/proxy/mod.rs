@@ -24753,6 +24753,21 @@ async fn handle_proxy_request_inner(
             };
             match hbone_relay {
                 Some(relay_proxy) => {
+                    // Preserve the CONNECT authority port for mesh
+                    // authorization on every synthesized HBONE relay. UDP
+                    // EgressGateway may dial a ServiceEntry targetPort that
+                    // differs from this authority port; TCP relays dial the
+                    // authority port directly. Either way AuthorizationPolicy
+                    // `destination.port` must see the authority port, and the
+                    // synthesized proxy's backend_port remains the socket dial
+                    // port. Stamp unconditionally (not only for UDP) so a
+                    // missing stamp can fail closed in `mesh_inbound_app_port`
+                    // without breaking TCP HBONE, which previously relied on
+                    // falling through to backend_port.
+                    ctx.mesh_inbound_listener_authz_port = req
+                        .uri()
+                        .authority()
+                        .and_then(|authority| authority.port_u16());
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
