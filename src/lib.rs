@@ -2468,7 +2468,9 @@ pub mod _test_support {
         crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
     }
 
-    pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
+    pub use crate::proxy::tcp_proxy::{
+        StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
+    };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
     /// `DisconnectCause` mapping that the TCP accept loop uses when

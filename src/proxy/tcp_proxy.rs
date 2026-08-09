@@ -483,6 +483,18 @@ pub fn disconnect_cause_for_failure(
     }
 }
 
+/// Whether an attributed relay failure occurred on the client socket and must
+/// therefore remain neutral for backend circuit-breaker accounting.
+#[inline]
+#[doc(hidden)]
+pub fn relay_failure_is_client_facing(failure: &StreamFirstFailure) -> bool {
+    matches!(
+        (failure.0, failure.2),
+        (Direction::ClientToBackend, Some(StreamIoSide::Read))
+            | (Direction::BackendToClient, Some(StreamIoSide::Write))
+    )
+}
+
 /// Map a pre-copy error class (no bytes flowed, direction unknown) to a
 /// `DisconnectCause`. Backend-facing failure classes (DNS lookup, connect,
 /// port exhaustion, pool errors) map to `BackendError` so `stream_disconnects`
@@ -3135,10 +3147,12 @@ async fn handle_tcp_connection_inner(
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
             );
-            if copy_result.first_failure.is_some() {
-                cb.record_failure(502, true, cb_info.is_half_open_probe);
-            } else {
-                cb.record_success(cb_info.is_half_open_probe);
+            match copy_result.first_failure.as_ref() {
+                Some(failure) if relay_failure_is_client_facing(failure) => {
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
+                Some(_) => cb.record_failure(502, true, cb_info.is_half_open_probe),
+                None => cb.record_success(cb_info.is_half_open_probe),
             }
         }
 
@@ -3963,10 +3977,12 @@ async fn handle_tcp_connection_inner(
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
         );
-        if copy_result.first_failure.is_some() {
-            cb.record_failure(502, true, current_cb_info.is_half_open_probe);
-        } else {
-            cb.record_success(current_cb_info.is_half_open_probe);
+        match copy_result.first_failure.as_ref() {
+            Some(failure) if relay_failure_is_client_facing(failure) => {
+                cb.record_neutral(current_cb_info.is_half_open_probe);
+            }
+            Some(_) => cb.record_failure(502, true, current_cb_info.is_half_open_probe),
+            None => cb.record_success(current_cb_info.is_half_open_probe),
         }
     }
 
