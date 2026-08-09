@@ -1698,10 +1698,12 @@ pub(crate) fn dedicated_host_ifindex(sysfs_net: &Path, name: &str) -> Result<u32
     let index_path = iface_path.join("ifindex");
     let raw = std::fs::read_to_string(&index_path)
         .map_err(|error| format!("could not read {}: {error}", index_path.display()))?;
-    let index = raw
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| format!("{} does not contain an interface index", index_path.display()))?;
+    let index = raw.trim().parse::<u32>().map_err(|_| {
+        format!(
+            "{} does not contain an interface index",
+            index_path.display()
+        )
+    })?;
     if index == 0 {
         return Err("interface index 0 is not a usable capture attribution key".to_string());
     }

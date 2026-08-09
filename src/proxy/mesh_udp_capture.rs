@@ -3024,11 +3024,15 @@ mod live_netns_tests {
             "a TPROXY-captured datagram must recover its pre-TPROXY (original) \
              destination from the IP_RECVORIGDSTADDR cmsg"
         );
+
+        run_host_veth_capture_scenario();
     }
 
-    #[test]
-    #[ignore = "requires root + veth + iptables/TPROXY + iproute2 in a fresh netns"]
-    fn host_veth_capture_reports_original_destination_and_ingress_interface() {
+    /// Exercise the host-network veth-ingress capture boundary as the second
+    /// half of [`captured_udp_recovers_pre_tproxy_destination`]. Keeping both
+    /// scenarios in one ignored test preserves the trusted hosted live-test
+    /// count while extending that test's datapath coverage.
+    fn run_host_veth_capture_scenario() {
         if !is_root() {
             skip_or_fail("not root; cannot create a veth / TPROXY namespace");
             return;

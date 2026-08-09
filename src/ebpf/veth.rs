@@ -297,10 +297,7 @@ fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<St
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_dedicated_iface_by_ipv4_route(
-    route_path: &Path,
-    pod_ip: Ipv4Addr,
-) -> Option<String> {
+fn resolve_dedicated_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<String> {
     if pod_ip.is_unspecified() || pod_ip.is_loopback() || pod_ip.is_multicast() {
         return None;
     }
@@ -364,10 +361,7 @@ fn resolve_iface_by_ipv4_route_mode(
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_dedicated_iface_by_ipv6_route(
-    route_path: &Path,
-    pod_ip: Ipv6Addr,
-) -> Option<String> {
+fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) -> Option<String> {
     // An unspecified, loopback, or multicast "pod address" names no single pod
     // interface, so it is refused before the table is consulted rather than
     // being allowed to match a broad route.
@@ -747,18 +741,11 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
              classification"
         );
         assert_eq!(
-            resolve_dedicated_iface_by_ipv4_route(
-                &route,
-                "10.244.1.5".parse().unwrap()
-            )
-            .as_deref(),
+            resolve_dedicated_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()).as_deref(),
             Some("vethpod")
         );
         assert_eq!(
-            resolve_dedicated_iface_by_ipv4_route(
-                &route,
-                "10.244.1.9".parse().unwrap()
-            ),
+            resolve_dedicated_iface_by_ipv4_route(&route, "10.244.1.9".parse().unwrap()),
             None,
             "iptables ingress capture must reject the same shared-bridge route"
         );

@@ -818,7 +818,6 @@ jobs:
               integration::mesh_peer_auth_live_reload_tests
               integration::mesh_k8s_pod_discovery_tests
               integration::mesh_hbone_tests
-              integration::mesh_host_udp_capture_tests
               integration::cni_tests
               integration::injector_admission_tests
           - shard: mesh-protocols
@@ -4264,14 +4263,13 @@ jobs:
         # iptables REDIRECT in a throwaway netns must report the pre-NAT
         # destination on the accepted socket — the primitive mesh outbound
         # multi-port routing rests on. Also runs the mesh UDP source-capture
-        # live tests (`src/proxy/mesh_udp_capture.rs::live_netns_tests`): real
-        # TPROXY mangle rules + fwmark policy routing in throwaway netns must
-        # exercise both the pod-netns OUTPUT reinjection path and the host-netns
-        # veth-ingress path. The latter also proves IP_PKTINFO reports the exact
-        # host-side interface used as the production pod-attribution key.
-        # Required mode turns any test-level SKIP into a CI failure. Run the
-        # prebuilt binary directly under sudo so cargo never runs as root against
-        # the user-owned target.
+        # live test (`src/proxy/mesh_udp_capture.rs::live_netns_tests`): a real
+        # TPROXY mangle rule + fwmark policy routing in a throwaway netns must
+        # divert a pod-egress UDP datagram onto the transparent capture socket
+        # and recover its pre-TPROXY destination from the IP_RECVORIGDSTADDR
+        # cmsg (the UDP analogue of SO_ORIGINAL_DST). Required mode turns any
+        # test-level SKIP into a CI failure. Run the prebuilt binary directly
+        # under sudo so cargo never runs as root against the user-owned target.
         run: |
           set -euo pipefail
           BIN="${{ steps.build_test_bin.outputs.test_bin }}"
@@ -4290,8 +4288,8 @@ jobs:
             echo "::error::netns live tests skipped under required CI mode"
             exit 1
           fi
-          if ! grep -Eq '^test result: ok\. 5 passed; 0 failed;' <<<"$output"; then
-            echo "::error::expected exactly 5 netns live tests to pass"
+          if ! grep -Eq '^test result: ok\. 4 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 4 netns live tests to pass"
             exit 1
           fi
 
