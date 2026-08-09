@@ -47,10 +47,16 @@ pub const MAX_METRIC_TAG_CEL_OUTPUT_BYTES: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetricTagCelExpr {
-    Literal { value: String },
-    Attribute { name: MetricTagCelAttr },
+    Literal {
+        value: String,
+    },
+    Attribute {
+        name: MetricTagCelAttr,
+    },
     /// `string(<int attribute>)`.
-    StringOfInt { attribute: MetricTagCelAttr },
+    StringOfInt {
+        attribute: MetricTagCelAttr,
+    },
     /// `has(<string attribute>) ? <then> : <else>`.
     HasThenElse {
         attribute: MetricTagCelAttr,
@@ -100,9 +106,9 @@ impl MetricTagCelAttr {
             | "destination_workload_namespace" => Some(Self::DestinationNamespace),
             "destination.principal" | "destination_principal" => Some(Self::DestinationPrincipal),
             "destination.app" | "destination_app" => Some(Self::DestinationApp),
-            "destination.service"
-            | "destination_service"
-            | "destination.canonical_service" => Some(Self::DestinationService),
+            "destination.service" | "destination_service" | "destination.canonical_service" => {
+                Some(Self::DestinationService)
+            }
             "request.protocol" | "request_protocol" => Some(Self::RequestProtocol),
             "response.flags" | "response_flags" => Some(Self::ResponseFlags),
             "connection.security_policy" | "connection_security_policy" => {
@@ -331,9 +337,8 @@ fn walk_validate(expr: &MetricTagCelExpr, depth: usize, nodes: &mut usize) -> Re
 fn expr_uses_http_only(expr: &MetricTagCelExpr) -> bool {
     match expr {
         MetricTagCelExpr::Literal { .. } => false,
-        MetricTagCelExpr::Attribute { name } | MetricTagCelExpr::StringOfInt { attribute: name } => {
-            name.is_http_only()
-        }
+        MetricTagCelExpr::Attribute { name }
+        | MetricTagCelExpr::StringOfInt { attribute: name } => name.is_http_only(),
         MetricTagCelExpr::HasThenElse {
             attribute,
             then_expr,
@@ -562,12 +567,10 @@ impl<'a> CelParser<'a> {
     }
 
     fn parse_string_literal(&mut self) -> Result<String, String> {
-        let quote = self
-            .peek_char()
-            .ok_or_else(|| {
-                "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string literal is malformed"
-                    .to_string()
-            })?;
+        let quote = self.peek_char().ok_or_else(|| {
+            "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string literal is malformed"
+                .to_string()
+        })?;
         self.pos += 1;
         self.bump_token_count()?;
         let mut out = String::new();
@@ -819,9 +822,6 @@ mod tests {
             parse_metric_tag_cel_expression(r#"has(request.host) ? request.host : "unknown""#)
                 .unwrap();
         assert_eq!(evaluate_metric_tag_cel(&ternary, ctx), "unknown");
-        assert_eq!(
-            sanitize_metric_tag_value("a\nb\"c"),
-            "a_b_c"
-        );
+        assert_eq!(sanitize_metric_tag_value("a\nb\"c"), "a_b_c");
     }
 }

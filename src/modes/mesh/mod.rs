@@ -9,10 +9,10 @@
 pub mod access_log_filter;
 pub mod config;
 pub mod config_consumer;
-pub mod metric_tag_cel;
 pub mod dns_proxy;
 pub mod federation;
 pub mod hbone;
+pub mod metric_tag_cel;
 pub mod multicluster;
 pub mod node_waypoint;
 pub mod node_waypoint_observability;

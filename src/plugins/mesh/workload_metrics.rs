@@ -1292,7 +1292,9 @@ fn validate_metric_tag_cel_expr_named(
     expression: &MetricTagCelExpr,
 ) -> Result<(), String> {
     crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
-        |message| format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}"),
+        |message| {
+            format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}")
+        },
     )
 }
 
@@ -1340,14 +1342,21 @@ fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
             .orig_dst
             .map(|addr| addr.port())
             .or(ctx.mesh_outbound_destination_authz_port)
-            .or_else(|| ctx.matched_proxy.as_ref().and_then(|proxy| proxy.listen_port))
+            .or_else(|| {
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.listen_port)
+            })
             .filter(|port| *port != 0);
     }
     if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound)
         && let Some(proxy) = ctx.matched_proxy.as_ref()
         && crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
     {
-        if let Some(port) = ctx.mesh_inbound_listener_authz_port.filter(|port| *port != 0) {
+        if let Some(port) = ctx
+            .mesh_inbound_listener_authz_port
+            .filter(|port| *port != 0)
+        {
             return Some(port);
         }
         if proxy.backend_port != 0 {
@@ -1355,7 +1364,11 @@ fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
         }
     }
     ctx.frontend_listen_port
-        .or_else(|| ctx.matched_proxy.as_ref().and_then(|proxy| proxy.listen_port))
+        .or_else(|| {
+            ctx.matched_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.listen_port)
+        })
         .filter(|port| *port != 0)
 }
 

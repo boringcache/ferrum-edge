@@ -90,7 +90,9 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         Some("reviews.default.svc.cluster.local")
     );
     assert_eq!(
-        ctx.metadata.get("mesh.destination.port").map(String::as_str),
+        ctx.metadata
+            .get("mesh.destination.port")
+            .map(String::as_str),
         Some("9080")
     );
     assert!(
@@ -121,7 +123,10 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         counter.contains(r#"source_workload="reviews.default.svc.cluster.local""#),
         "{counter}"
     );
-    assert!(counter.contains(r#"destination_service="9080""#), "{counter}");
+    assert!(
+        counter.contains(r#"destination_service="9080""#),
+        "{counter}"
+    );
     assert!(counter.contains(r#"source_app="edge""#), "{counter}");
 }
 
@@ -184,7 +189,9 @@ fn rejects_unsupported_malformed_and_costly_cel() {
         }
     }))
     .expect_err("http-only on tcp");
-    assert!(err.contains("HTTP-only") || err.contains("unrepresentable") || err.contains("rejected"));
+    assert!(
+        err.contains("HTTP-only") || err.contains("unrepresentable") || err.contains("rejected")
+    );
 
     let oversized = format!("request.{}", "x".repeat(MAX_METRIC_TAG_CEL_EXPR_LEN));
     let err = parse_metric_tag_cel_expression(&oversized).expect_err("oversize");
@@ -218,7 +225,8 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
         }
     }))
     .expect("updated generation");
-    let deleted = WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": []}})).expect("deleted");
+    let deleted =
+        WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": []}})).expect("deleted");
 
     async fn emit(plugin: &WorkloadMetrics) -> String {
         let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());

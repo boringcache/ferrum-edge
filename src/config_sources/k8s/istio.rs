@@ -4,9 +4,6 @@ use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::access_log_filter::parse_access_log_filter_expression;
-use crate::modes::mesh::metric_tag_cel::{
-    parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
-};
 use crate::modes::mesh::config::{
     AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshConsistentHash,
     MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
@@ -21,6 +18,9 @@ use crate::modes::mesh::config::{
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     admit_request_match_port_pattern, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
     mesh_condition_has_values, validate_mesh_condition_ip_block, validate_mesh_export_to,
+};
+use crate::modes::mesh::metric_tag_cel::{
+    parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
 };
 
 use super::{
@@ -6515,9 +6515,7 @@ fn telemetry_metric_upsert_operation(
 
 fn metric_selector_includes_tcp(metric: &str) -> bool {
     let upper = metric.trim().to_ascii_uppercase();
-    upper == "ALL_METRICS"
-        || upper.starts_with("TCP_")
-        || upper.starts_with("FERRUM_MESH_TCP_")
+    upper == "ALL_METRICS" || upper.starts_with("TCP_") || upper.starts_with("FERRUM_MESH_TCP_")
 }
 
 fn telemetry_sampling_percentage(

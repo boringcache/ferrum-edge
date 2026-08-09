@@ -1586,12 +1586,14 @@ fn apply_metric_override_plan(
                         connection_security_policy: key.connection_security_policy.as_ref(),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
-                        response_code: extras.response_code.or(Some(key.response_code).filter(|_| {
-                            key.response_code_override.is_none()
-                                && key.removed_labels
-                                    & (1u16 << MeshMetricLabel::ResponseCode.index())
-                                    == 0
-                        })),
+                        response_code: extras.response_code.or(Some(key.response_code).filter(
+                            |_| {
+                                key.response_code_override.is_none()
+                                    && key.removed_labels
+                                        & (1u16 << MeshMetricLabel::ResponseCode.index())
+                                        == 0
+                            },
+                        )),
                         destination_port: extras.destination_port,
                     };
                     evaluate_metric_tag_cel(&expr, live_ctx)
@@ -1674,7 +1676,6 @@ fn take_number_end(value: &str) -> Option<(usize, &str)> {
     let number = value.get(..end)?.parse::<usize>().ok()?;
     Some((number, value.get(end..)?))
 }
-
 
 fn take_number_until(value: &str, delimiter: u8) -> Option<(usize, &str)> {
     let delimiter_index = value
