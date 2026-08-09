@@ -421,6 +421,50 @@ jobs:
           echo "- test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
           echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
 
+      - name: Run kTLS live-kernel handoff proof
+        # Issue #3619 re-enabled a handoff that had been INERT, so classifier
+        # unit tests are not sufficient evidence. These tests drive a real
+        # rustls TLS 1.2 client against the real `try_ktls_accept`, install
+        # kernel TLS keys on this runner's kernel, relay application bytes
+        # through splice(2), and assert the close handshake: an authenticated
+        # close_notify is clean EOF, a bare FIN is a truncation, a backend EOF
+        # produces the reciprocal alert, and an unauthenticated record never
+        # becomes EOF.
+        #
+        # `FERRUM_KTLS_LIVE_REQUIRED=1` makes an unavailable kernel capability
+        # a failure rather than a skip, and the SKIP/`test result` assertions
+        # below make "the live path did not run" indistinguishable from a red
+        # gate. This job is `require_success "Unit and inline lib"` in the
+        # required `Tests` aggregate, so the live path is genuinely blocking.
+        run: |
+          set -euo pipefail
+          # The TLS ULP normally autoloads from setsockopt(TCP_ULP); load it
+          # explicitly too so a failure below is about the handoff, not the
+          # module.
+          sudo modprobe tls || true
+
+          set +e
+          output="$(cargo test --lib -- --ignored --nocapture --test-threads=1 \
+            proxy::ktls_live_kernel_tests 2>&1)"
+          status=$?
+          set -e
+
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::kTLS live-kernel tests skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 3 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 3 kTLS live-kernel tests to pass"
+            exit 1
+          fi
+        env:
+          FERRUM_KTLS_LIVE_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
       - name: Run unit tests
         run: cargo test --test unit_tests
         env:

@@ -44,6 +44,37 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+/// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
+/// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
+/// the buffered tokio-rustls accept and the userspace relay.
+#[cfg(target_os = "linux")]
+pub(crate) mod ktls_accept;
+/// Per-direction traffic-key confidentiality budget for handed-off kTLS
+/// sessions (issue #3619). rustls stops counting protected messages at
+/// `dangerous_into_kernel_connection`, so the relay tracks the kernel's own
+/// record sequence numbers against the negotiated suite's
+/// `confidentiality_limit`. The arithmetic is platform-independent and public
+/// so the deterministic unit suite can pin it.
+///
+/// `#[allow(dead_code)]` because the enforcement consumers are Linux-only
+/// (`ktls_accept`, the splice relay) while the arithmetic and its tests are
+/// not, and the `ferrum-edge` binary compiles this as an internal tree where
+/// `pub` does not imply an external consumer.
+#[allow(dead_code)]
+pub mod ktls_confidentiality;
+/// Live-kernel proof that the #3619 handoff is not inert: real TLS 1.2
+/// sessions, real `setsockopt(SOL_TLS, ...)`, real `splice(2)`. Ignored by
+/// default and gated on kernel capability; the hosted kTLS live gate runs it
+/// with `FERRUM_KTLS_LIVE_REQUIRED=1` so an unavailable capability fails
+/// instead of quietly skipping.
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_live_kernel_tests;
+/// TLS control-record classification and the `SOL_TLS` `recvmsg`/`sendmsg`
+/// ancillary contract used by the kTLS splice relay (issue #3619). The
+/// classification half is platform-independent so it can be tested anywhere;
+/// the syscall wrappers are Linux-only.
+#[allow(dead_code)] // Several code points/helpers are exercised only by tests.
+pub mod ktls_record;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
