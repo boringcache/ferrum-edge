@@ -9839,9 +9839,6 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
     ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
-        if plugin_migrations.is_empty() {
-            return Ok(Vec::new());
-        }
         let runner =
             crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
         let status = runner.plugin_status(plugin_migrations).await?;
@@ -9852,9 +9849,6 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
     ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
-        if plugin_migrations.is_empty() {
-            return Ok(Vec::new());
-        }
         let runner =
             crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
         runner.run_plugin_pending(plugin_migrations).await

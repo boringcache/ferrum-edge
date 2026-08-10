@@ -148,19 +148,26 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 
 **MongoDB** does not use SQL migrations. When `FERRUM_DB_TYPE=mongodb`, the migration runner creates indexes instead (idempotent `createIndex` operations). See the [MongoDB Migrations](#mongodb-migrations) section below.
 
-### Checksum Validation
+### Migration History Integrity
 
 Each migration has a checksum. V001 uses a `sha256:<hex>` digest derived from
 the V001 wrapper and dialect schema source, so changing the baseline changes the
-stored value and makes later source tampering visible. When the gateway starts,
-it compares the checksum of each applied migration against the expected
-checksum in the code. A mismatch is a blocking migration-history integrity
-error. Ferrum does not apply pending core or plugin migrations, run the V001
-compatibility pass, overwrite the stored checksum, or re-run the changed
-migration. Automatic `database` / `cp` startup and explicit `up`, `status`, and
-database dry-run commands all return an error; command-line use therefore exits
-non-zero. During build-out there is deliberately no compatibility shim for the
-former fixed `v001_initial_schema` label and no checksum-mismatch override.
+stored value and makes later source tampering visible. Before any write, Ferrum
+first requires unique namespaces, unique positive version IDs, and increasing
+declaration order. It then requires every applied namespace to be an exact
+checksum-matching prefix of the binary's declarations. An unknown applied ID,
+a missing earlier row before a later applied version, a duplicate/ambiguous
+declaration or history identifier, checksum drift, or custom-plugin history
+whose plugin is absent from the compiled binary is a blocking integrity error.
+A declaration suffix after the applied prefix remains legitimately pending.
+
+Ferrum does not apply pending core or plugin migrations, create tracking
+tables, run the V001 compatibility pass, overwrite history, or re-run changed
+migration source after a refusal. Automatic `database` / `cp` startup and
+explicit `up`, `status`, and database dry-run commands all return an error;
+command-line use therefore exits non-zero. During build-out there is
+deliberately no compatibility shim for the former fixed
+`v001_initial_schema` label and no migration-integrity override.
 
 ## Custom Plugin Migrations
 
@@ -299,14 +306,17 @@ Dialect transactionality for custom-plugin migrations:
   plugin-prefixed names, and do not use this pattern to replace indexes owned
   by another plugin or by the gateway core.
 
-### Checksum Validation
+### Migration History Integrity
 
-Like core migrations, applied plugin checksums are validated on every status or
-apply run. Ferrum validates all compiled plugins before applying work for any
-one plugin, and explicit `migrate up` validates both core and plugin history
-before applying either. A mismatch is a blocking error even when no migration
-is pending and regardless of `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`; it never
-updates the stored checksum or runs the changed migration.
+Like core migrations, each applied plugin sequence is validated on every status
+or apply run. Ferrum validates all declarations and histories before applying
+work for any one plugin, and explicit `migrate up` validates both core and
+plugin history before applying either. Unknown, missing, duplicate, and drifted
+history is blocking even when no migration is pending and regardless of
+`FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`; it never updates history or runs changed
+migration source. A history namespace for a plugin absent from the compiled
+declaration list is orphaned and unverifiable, so it is fatal rather than
+silently ignored.
 
 ### Table Naming Convention
 
@@ -382,9 +392,9 @@ FERRUM_MODE=migrate \
 
 `status` is strictly read-only. If the core or plugin tracking table does not
 exist, Ferrum reports every known migration as pending without creating either
-tracking table. If an applied core or compiled-plugin checksum has drifted,
-`status` returns an integrity error and exits non-zero instead of reporting the
-database as healthy.
+tracking table. If any applied sequence is unknown, incomplete, duplicate,
+orphaned, or checksum-drifted, `status` returns an integrity error and exits
+non-zero instead of reporting the database as healthy.
 
 ### Check Migration Status
 
@@ -531,21 +541,24 @@ fn migration_chain() -> Vec<(&'static str, &'static str, ConfigMigrationFn)> {
 
 This means the migration chain has a gap. Every version must have a migration step to the next version. Check that all migration functions are registered in `migration_chain()`.
 
-### Migration checksum mismatch integrity error
+### Migration history integrity error
 
-This means the current binary's immutable migration source does not match the
-checksum recorded when that migration was applied. Possible causes include a
-modified historical migration, a divergent build or deployment, a database
-restored from incompatible provenance, or a changed tracking row. Ferrum stops
-before later migration or compatibility work and does not rewrite history.
+This means the current binary cannot prove that applied history is an exact
+prefix of its immutable declarations. Possible causes include an unknown or
+duplicate version, a missing earlier row, duplicate compiled plugin/version
+IDs, checksum drift, a divergent build or deployment, a database restored from
+incompatible provenance, a changed tracking row, or orphan plugin history after
+that plugin was omitted from the binary. Ferrum stops before tracking-table,
+schema, later migration, or compatibility writes and does not rewrite history.
 
 Treat the mismatch as an incident until provenance is understood:
 
 1. Stop the rollout and preserve a database backup plus the exact binary/build
    metadata that observed the failure.
-2. Compare the deployed artifact, immutable migration source, database backup,
-   and tracking history to identify which side drifted. Do not place database
-   credentials, migration SQL, or secrets in shared diagnostics.
+2. Compare the deployed artifact (including its compiled custom-plugin list),
+   immutable migration declarations, database backup, and tracking history to
+   identify the unknown, missing, duplicate, orphaned, or drifted entry. Do not
+   place database credentials, migration SQL, or secrets in shared diagnostics.
 3. Restore the original immutable migration/binary that matches the applied
    database, or restore the correct database backup for the intended binary.
 4. If the intended schema must change, keep the applied migration immutable and
@@ -556,9 +569,13 @@ Treat the mismatch as an incident until provenance is understood:
 5. Re-run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status`, then `up`, only
    after the immutable history and database agree.
 
-Never repair drift by manually overwriting a stored checksum or by changing and
-re-running an already-applied migration. Ferrum intentionally provides no
-emergency bypass for this integrity check.
+For orphan plugin history, restore a trusted binary that includes the matching
+plugin declarations and keep those declarations compiled for that database, or
+restore/rebuild a database whose verified history matches the intended binary.
+Do not merely delete the orphan rows. Never repair an integrity failure by
+manually inserting/deleting tracking rows, overwriting a stored checksum, or
+changing and re-running an already-applied migration. Ferrum intentionally
+provides no emergency bypass for this integrity check.
 
 ### MySQL stale identity collation warning
 

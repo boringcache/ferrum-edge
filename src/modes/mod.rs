@@ -177,8 +177,8 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 ///
 /// Errors propagate when auto-apply is on (a failed plugin migration is
 /// fatal — the gateway should not come up with an inconsistent schema).
-/// When auto-apply is off, the warning is informational and never fails
-/// startup.
+/// When auto-apply is off, ordinary probe failures remain warn-only, but any
+/// typed migration-history integrity failure is fatal in every mode.
 pub(crate) async fn handle_startup_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
@@ -191,9 +191,10 @@ pub(crate) async fn handle_startup_plugin_migrations(
 /// Recovery variant of [`handle_startup_plugin_migrations`].
 ///
 /// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
-/// **probe failure** is logged and does not block recovered config publication
-/// (in-place recovery must not be strictly weaker than a process restart against
-/// the same database). Auto-apply mode stays fail-closed on probe/apply errors.
+/// non-integrity **probe failure** is logged and does not block recovered config
+/// publication (in-place recovery must not be strictly weaker than a process
+/// restart against the same database). History-integrity failures stay fatal;
+/// auto-apply mode remains fail-closed on every probe/apply error.
 /// A probe that **succeeds** and reports pending migrations still follows the
 /// warn-and-continue / auto-apply policy unchanged.
 pub(crate) async fn handle_recovery_plugin_migrations(
@@ -260,14 +261,10 @@ async fn handle_startup_plugin_migrations_with_list(
     mode: &str,
     plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
 ) -> Result<(), anyhow::Error> {
-    if plugin_migrations.is_empty() {
-        return Ok(());
-    }
-
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
-            if e.is::<crate::config::migrations::MigrationChecksumMismatch>() {
+            if e.is::<crate::config::migrations::MigrationHistoryIntegrityError>() {
                 return Err(e).with_context(|| {
                     format!(
                         "custom-plugin migration history integrity validation failed (mode={mode})"

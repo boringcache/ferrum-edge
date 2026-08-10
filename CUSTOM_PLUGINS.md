@@ -1289,11 +1289,15 @@ Custom plugins that need their own database tables can declare migrations that r
    migration lock, using the dialect-specific transaction contract documented
    in [Database Migrations](docs/migrations.md#multi-statement-migrations)
 
-Ferrum validates all applied core and compiled-plugin checksums under that lock
-before applying either core or plugin work. Any drift is a blocking integrity
-error for startup, `up`, dry-run, and `status`; Ferrum does not overwrite the
-stored checksum or re-run changed migration source. See the
-[operator repair path](docs/migrations.md#migration-checksum-mismatch-integrity-error).
+Ferrum validates the complete core and plugin migration histories under that
+lock before applying either core or plugin work. Declared plugin names and
+positive version IDs must be unique and versions must be ordered. Applied rows
+must be an exact checksum-matching prefix of those declarations; unknown IDs,
+missing earlier rows, duplicates, checksum drift, and orphan history for a
+plugin absent from the compiled binary are blocking integrity errors for
+startup, `up`, dry-run, and `status`. Ferrum does not rewrite history or re-run
+changed migration source. See the
+[operator repair path](docs/migrations.md#migration-history-integrity-error).
 
 ### Declaring Migrations
 
@@ -1458,7 +1462,7 @@ Plugin migrations are tracked in the `_ferrum_plugin_migrations` table with a co
 | `version` | Migration version within the plugin |
 | `name` | Human-readable migration name |
 | `applied_at` | RFC 3339 timestamp of when the migration was applied |
-| `checksum` | Checksum at the time of application (source drift blocks status, startup, and later migration work) |
+| `checksum` | Checksum at the time of application (the complete ordered history, including this checksum, must remain verifiable before status, startup, or later migration work) |
 | `execution_time_ms` | How long the migration took to execute |
 
 This is separate from the core `_ferrum_migrations` table, so plugin versions never conflict with gateway versions.
