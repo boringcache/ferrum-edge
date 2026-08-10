@@ -1528,7 +1528,8 @@ async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
         &serde_json::json!({"mesh_series_budget_per_family": 0}),
         "ferrum",
     )
-    .expect_err("0 must be rejected — no unlimited mesh series mode");
+    .err()
+    .expect("0 must be rejected — no unlimited mesh series mode");
     assert!(
         err.contains("mesh_series_budget_per_family"),
         "error should name the field: {err}"
