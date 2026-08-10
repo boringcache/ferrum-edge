@@ -4,8 +4,8 @@ use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
-    ClientDisconnectKey, CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry,
-    PrometheusMetrics, DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY, global_registry,
+    ClientDisconnectKey, CounterKey, DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY, HboneRelayFailureKey,
+    MeshTcpEgressConnKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
@@ -1519,9 +1519,7 @@ async fn test_plugin_config_sets_registry_tunables() {
     // cross-test budget pollution.
     let registry = global_registry();
     assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
-    registry.set_mesh_series_budget_per_family_for_test(
-        DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY,
-    );
+    registry.set_mesh_series_budget_per_family_for_test(DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY);
 }
 
 #[tokio::test]

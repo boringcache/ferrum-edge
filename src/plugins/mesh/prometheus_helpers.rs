@@ -2416,29 +2416,31 @@ mod tests {
         let key = mesh_request_key_for_family(&summary, &base, MeshMetricFamily::RequestCount);
         assert_eq!(key, base);
         assert!(!compact_metric_tag_cel_is_valid("é"));
-        assert!(evaluate_compact_metric_tag_cel(
-            "é",
-            MetricTagCelContext {
-                source_workload: "frontend",
-                source_namespace: "default",
-                source_principal: "source-principal",
-                source_app: "frontend",
-                source_service: "frontend",
-                destination_workload: "backend",
-                destination_namespace: "default",
-                destination_principal: "destination-principal",
-                destination_app: "backend",
-                destination_service: "backend",
-                request_protocol: "http",
-                response_flags: "-",
-                connection_security_policy: "mutual_tls",
-                request_method: Some("GET"),
-                request_host: Some("example"),
-                response_code: Some(200),
-                destination_port: Some(8080),
-            }
-        )
-        .is_none());
+        assert!(
+            evaluate_compact_metric_tag_cel(
+                "é",
+                MetricTagCelContext {
+                    source_workload: "frontend",
+                    source_namespace: "default",
+                    source_principal: "source-principal",
+                    source_app: "frontend",
+                    source_service: "frontend",
+                    destination_workload: "backend",
+                    destination_namespace: "default",
+                    destination_principal: "destination-principal",
+                    destination_app: "backend",
+                    destination_service: "backend",
+                    request_protocol: "http",
+                    response_flags: "-",
+                    connection_security_policy: "mutual_tls",
+                    request_method: Some("GET"),
+                    request_host: Some("example"),
+                    response_code: Some(200),
+                    destination_port: Some(8080),
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
