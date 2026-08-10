@@ -1467,11 +1467,8 @@ async fn run_with_backend(
         None
     };
     let initial_topology = if let Some(monitor) = topology_monitor.as_mut() {
-        match tokio::time::timeout(
-            INGRESS_TOPOLOGY_INITIAL_TIMEOUT,
-            monitor.outcomes.changed(),
-        )
-        .await
+        match tokio::time::timeout(INGRESS_TOPOLOGY_INITIAL_TIMEOUT, monitor.outcomes.changed())
+            .await
         {
             Ok(Ok(())) => monitor.outcomes.borrow_and_update().clone(),
             Ok(Err(_)) => IngressTopologyOutcome::monitor_stopped(

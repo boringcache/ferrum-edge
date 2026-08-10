@@ -6,9 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ferrum_edge::ebpf::ingress_topology::{
     IngressTopologyReason, IngressTopologyState, IpCidr, LinkState, RouteEntry,
-    TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file,
-    read_link_state_from_root, requirements_from_nodes, validate_host_topology_from_roots,
-    validate_topology_snapshot,
+    TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file, read_link_state_from_root,
+    requirements_from_nodes, validate_host_topology_from_roots, validate_topology_snapshot,
 };
 use k8s_openapi::api::core::v1::Node;
 use serde_json::json;
@@ -393,7 +392,10 @@ fn proc_route_parsers_preserve_endianness_metrics_flags_and_negative_evidence() 
     assert_eq!(routes[0].destination, cidr("fd00:1024:2::/64"));
     assert_eq!(routes[0].metric, 5);
     assert!(routes[0].usable);
-    assert!(!routes[1].usable, "source-specific route is negative evidence");
+    assert!(
+        !routes[1].usable,
+        "source-specific route is negative evidence"
+    );
     assert!(!routes[2].usable, "reject route is negative evidence");
 }
 
@@ -409,8 +411,7 @@ fn malformed_ipv6_hex_is_rejected_without_utf8_indexing() {
         parse_ipv6_route_file(&non_ascii),
         Err(IngressTopologyReason::RouteTableInvalid),
     );
-    let malformed =
-        "gg000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000000 00000000 00000001 eth0\n";
+    let malformed = "gg000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000000 00000000 00000001 eth0\n";
     assert_eq!(
         parse_ipv6_route_file(malformed),
         Err(IngressTopologyReason::RouteTableInvalid),
@@ -564,15 +565,42 @@ fn node_requirements_are_ready_internal_ip_only_and_fail_closed_when_incomplete(
     );
     let requirements = requirements_from_nodes(&[local.clone(), ready], "local", true)
         .expect("complete Ready Node evidence");
-    assert_eq!(requirements.remote_node_addresses, ["172.18.0.3".parse().unwrap()]);
+    assert_eq!(
+        requirements.remote_node_addresses,
+        ["172.18.0.3".parse().unwrap()]
+    );
     assert!(requirements.require_ipv4);
     assert!(!requirements.require_ipv6);
 
     for incomplete in [
-        node("remote", &[], Some("True"), false, &[("InternalIP", "172.18.0.3")]),
-        node("remote", &["10.244.2.0/24"], None, false, &[("InternalIP", "172.18.0.3")]),
-        node("remote", &["10.244.2.0/24"], Some("Unknown"), false, &[("InternalIP", "172.18.0.3")]),
-        node("remote", &["10.244.2.0/24"], Some("True"), false, &[("ExternalIP", "203.0.113.3")]),
+        node(
+            "remote",
+            &[],
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
+        node(
+            "remote",
+            &["10.244.2.0/24"],
+            None,
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
+        node(
+            "remote",
+            &["10.244.2.0/24"],
+            Some("Unknown"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
+        node(
+            "remote",
+            &["10.244.2.0/24"],
+            Some("True"),
+            false,
+            &[("ExternalIP", "203.0.113.3")],
+        ),
     ] {
         assert_eq!(
             requirements_from_nodes(&[local.clone(), incomplete], "local", true),
@@ -593,8 +621,7 @@ fn only_positively_not_ready_unschedulable_nodes_may_be_ignored() {
     );
     let dormant = node("new", &[], Some("False"), true, &[]);
     assert!(
-        requirements_from_nodes(&[local.clone(), ready.clone(), dormant], "local", false)
-            .is_ok()
+        requirements_from_nodes(&[local.clone(), ready.clone(), dormant], "local", false).is_ok()
     );
     let schedulable = node("new", &[], Some("False"), false, &[]);
     assert_eq!(
@@ -636,8 +663,8 @@ fn node_family_derivation_handles_ipv4_dual_stack_and_ipv6_only_capture() {
         false,
         &[("InternalIP", "172.18.0.3"), ("InternalIP", "fd00::3")],
     );
-    let dual_requirements = requirements_from_nodes(&[local.clone(), dual], "local", true)
-        .expect("dual-stack cluster");
+    let dual_requirements =
+        requirements_from_nodes(&[local.clone(), dual], "local", true).expect("dual-stack cluster");
     assert!(dual_requirements.require_ipv4);
     assert!(dual_requirements.require_ipv6);
 
@@ -648,9 +675,12 @@ fn node_family_derivation_handles_ipv4_dual_stack_and_ipv6_only_capture() {
         false,
         &[("InternalIP", "172.18.0.3")],
     );
-    let v4_capture_requirements =
-        requirements_from_nodes(&[local.clone(), dual_without_ipv6_internal_ip], "local", false)
-            .expect("dual-stack cluster intersected with IPv4-only capture");
+    let v4_capture_requirements = requirements_from_nodes(
+        &[local.clone(), dual_without_ipv6_internal_ip],
+        "local",
+        false,
+    )
+    .expect("dual-stack cluster intersected with IPv4-only capture");
     assert!(v4_capture_requirements.require_ipv4);
     assert!(!v4_capture_requirements.require_ipv6);
 

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Node;
 use kube::Api;
-use kube::runtime::watcher::{self as kube_watcher, Event};
 use kube::Client;
+use kube::runtime::watcher::{self as kube_watcher, Event};
 
 pub const MAX_CONFIGURED_INTERFACES: usize = 16;
 pub const MAX_CONFIGURED_INTERFACE_BYTES: usize = 512;
@@ -608,9 +608,7 @@ fn publish_requirement_failure(
         IngressTopologyReason::FamilyUnproved => {
             "no observed remote PodCIDR family is supported by the configured capture listener"
         }
-        _ => {
-            "Ready Kubernetes Nodes must publish supported PodCIDR and InternalIP evidence"
-        }
+        _ => "Ready Kubernetes Nodes must publish supported PodCIDR and InternalIP evidence",
     };
     outcomes.send_replace(unavailable(
         reason,
@@ -949,7 +947,11 @@ pub fn requirements_from_nodes(
             .status
             .as_ref()
             .and_then(|status| status.conditions.as_ref())
-            .and_then(|conditions| conditions.iter().find(|condition| condition.type_ == "Ready"));
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|condition| condition.type_ == "Ready")
+            });
         match ready.map(|condition| condition.status.as_str()) {
             Some("True") => {}
             Some("False") if safely_ignorable_unallocated_node(spec) => {
@@ -1033,21 +1035,13 @@ pub fn requirements_from_nodes(
             return Err(IngressTopologyReason::NodeTopologyIncomplete);
         }
         for cidr in node_cidrs {
-            push_unique_bounded(
-                &mut remote_pod_cidrs,
-                cidr,
-                remote_node_addresses.len(),
-            )?;
+            push_unique_bounded(&mut remote_pod_cidrs, cidr, remote_node_addresses.len())?;
         }
         for address in internal_ipv4.into_iter().chain(internal_ipv6) {
             if (address.is_ipv4() && node_requires_ipv4)
                 || (address.is_ipv6() && node_requires_ipv6)
             {
-                push_unique_bounded(
-                    &mut remote_node_addresses,
-                    address,
-                    remote_pod_cidrs.len(),
-                )?;
+                push_unique_bounded(&mut remote_node_addresses, address, remote_pod_cidrs.len())?;
             }
         }
     }
@@ -1228,9 +1222,7 @@ fn read_bounded(path: &Path) -> Result<String, IngressTopologyReason> {
 }
 
 #[doc(hidden)]
-pub fn parse_ipv4_route_file(
-    contents: &str,
-) -> Result<Vec<RouteEntry>, IngressTopologyReason> {
+pub fn parse_ipv4_route_file(contents: &str) -> Result<Vec<RouteEntry>, IngressTopologyReason> {
     parse_ipv4_routes(contents)
 }
 
@@ -1279,9 +1271,7 @@ fn parse_ipv4_routes(contents: &str) -> Result<Vec<RouteEntry>, IngressTopologyR
 }
 
 #[doc(hidden)]
-pub fn parse_ipv6_route_file(
-    contents: &str,
-) -> Result<Vec<RouteEntry>, IngressTopologyReason> {
+pub fn parse_ipv6_route_file(contents: &str) -> Result<Vec<RouteEntry>, IngressTopologyReason> {
     parse_ipv6_routes(contents)
 }
 

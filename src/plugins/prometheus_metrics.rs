@@ -3574,7 +3574,9 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_configured_interfaces Number of explicitly configured ingress interfaces (names are never labels).\n",
             );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n");
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n",
+            );
             render_process_counter(
                 &mut output,
                 "ferrum_node_agent_ingress_interface_configured_interfaces",
@@ -3584,7 +3586,8 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
             );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
+            output
+                .push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
             render_process_counter(
                 &mut output,
                 "ferrum_node_agent_ingress_interface_expected_interfaces",
