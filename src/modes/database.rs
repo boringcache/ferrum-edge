@@ -3154,7 +3154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_recovery_warn_only_probe_failure_matches_startup_and_allows_publication() {
+    async fn offline_recovery_warn_only_integrity_failure_stays_fail_closed() {
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if plugin_migrations.is_empty() {
             // Default production builds deliberately compile no pedagogical
@@ -3172,23 +3172,24 @@ mod tests {
         let db_available = AtomicBool::new(false);
         let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
 
-        // Warn-only probe failure must not wedge harder than a process restart
-        // (startup uses the non-strict probe path and continues).
+        // A malformed migration ledger is a typed integrity failure, not an
+        // ordinary availability probe failure. It must block publication even
+        // when automatic plugin migrations are disabled.
         assert!(
-            mark_db_available_after_successful_poll_load(
+            !mark_db_available_after_successful_poll_load(
                 &db,
                 &db_available,
-                "test failed custom-plugin probe",
+                "test malformed custom-plugin migration ledger",
                 false,
                 &reconcile_state,
             )
             .await,
-            "warn-only recovery must publish after a loud probe-failure warn"
+            "warn-only recovery must fail closed on migration-history corruption"
         );
-        assert!(db_available.load(Ordering::Relaxed));
+        assert!(!db_available.load(Ordering::Relaxed));
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
-            PLUGIN_MIGRATIONS_RECONCILED
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
         );
     }
 
@@ -3265,7 +3266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_recovery_validation_rejection_cannot_bypass_plugin_probe() {
+    async fn offline_recovery_validation_rejection_cannot_bypass_plugin_integrity_gate() {
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if plugin_migrations.is_empty() {
             return;
@@ -3294,16 +3295,16 @@ mod tests {
         )
         .await;
         assert!(config_rejected.load(Ordering::Relaxed));
-        // Warn-only probe failure matches startup (does not block writes); the
-        // independent config_rejected signal still prevents serving the bad
-        // snapshot while in-band repair remains available.
+        // A validation-rejected snapshot does not weaken the independent
+        // migration-history integrity gate. The malformed ledger must keep
+        // admin writes blocked even in warn-only mode.
         assert!(
-            db_available.load(Ordering::Relaxed),
-            "warn-only probe failure must not wedge admin writes harder than restart"
+            !db_available.load(Ordering::Relaxed),
+            "migration-history corruption must keep admin writes fail closed"
         );
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
-            PLUGIN_MIGRATIONS_RECONCILED
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
         );
         assert!(
             config_rejected.load(Ordering::Relaxed),
