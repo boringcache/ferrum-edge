@@ -7,8 +7,9 @@ set -eu
 
 stage_root="${1:-/iproute2-root}"
 base_root="${2:-}"
+iproute2_version="${3:?exact iproute2 package version is required}"
 apt-get update
-apt-get install -y --no-install-recommends iproute2
+apt-get install -y --no-install-recommends "iproute2=${iproute2_version}"
 mkdir -p "${stage_root}/usr/sbin" "${stage_root}/usr/lib" "${stage_root}/usr/lib64"
 cp /usr/sbin/ip "${stage_root}/usr/sbin/ip"
 

@@ -82,6 +82,7 @@ const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
     "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const INGRESS_TOPOLOGY_INITIAL_TIMEOUT: Duration = Duration::from_secs(2);
+const INGRESS_TOPOLOGY_DATAPATH_RETRY: Duration = Duration::from_secs(5);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
 // Verified handshakes need longer than the ordinary orphan grace for producer
@@ -1486,7 +1487,9 @@ async fn run_with_backend(
             diagnostic: "inbound ingress redirect is disabled".to_string(),
         }
     };
-    apply_ingress_topology_outcome(
+    let topology_publication_ok = apply_ingress_topology_outcome(
+        owner.backend_mut(),
+        config,
         metrics.as_ref(),
         topology_ready.as_ref(),
         startup_ready.as_ref(),
@@ -1509,6 +1512,7 @@ async fn run_with_backend(
         Some(client),
         topology_monitor,
         topology_ready,
+        topology_publication_ok,
         pod_stream,
         std::iter::empty(),
     )
@@ -1516,6 +1520,8 @@ async fn run_with_backend(
 }
 
 fn apply_ingress_topology_outcome(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     topology_ready: &AtomicBool,
     startup_ready: &AtomicBool,
@@ -1523,16 +1529,37 @@ fn apply_ingress_topology_outcome(
     capture_failures_pending: bool,
     outcome: &IngressTopologyOutcome,
     phase: &'static str,
-) {
-    let previous = metrics.snapshot().ingress_topology;
-    metrics.set_ingress_topology(outcome.status);
-    let ready = outcome.status.is_ready();
+) -> bool {
+    let previous_snapshot = metrics.snapshot();
+    let previous = previous_snapshot.ingress_topology;
+    let requested_ready = outcome.status.is_ready();
+    let datapath_update_ok = backend
+        .update_capture_config(
+            &config
+                .capture_contract
+                .bpf_capture_config_for_topology(requested_ready),
+        )
+        .is_ok();
+    let (status, diagnostic) = if datapath_update_ok {
+        (outcome.status, outcome.diagnostic.as_str())
+    } else {
+        (
+            IngressTopologyStatus {
+                state: crate::ebpf::ingress_topology::IngressTopologyState::Unavailable,
+                reason: crate::ebpf::ingress_topology::IngressTopologyReason::DatapathUpdateFailed,
+                ..outcome.status
+            },
+            "the ingress redirect quarantine state could not be published to the BPF capture map",
+        )
+    };
+    metrics.set_ingress_topology(status);
+    let ready = requested_ready && datapath_update_ok;
     topology_ready.store(ready, Ordering::Release);
     if ready {
         if initial_sync_complete {
             startup_ready.store(true, Ordering::Release);
         }
-        if metrics.snapshot().capture_state
+        if previous_snapshot.capture_state
             == NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
         {
             metrics.set_capture_state(if capture_failures_pending {
@@ -1541,38 +1568,70 @@ fn apply_ingress_topology_outcome(
                 NODE_AGENT_CAPTURE_STATE_READY
             });
         }
-        if previous.state != outcome.status.state || previous.reason != outcome.status.reason {
+        if previous.state != status.state || previous.reason != status.reason {
             info!(
                 phase,
-                state = outcome.status.state.label(),
-                reason = outcome.status.reason.label(),
-                configured_interfaces = outcome.status.configured_interfaces,
-                expected_interfaces = outcome.status.expected_interfaces,
-                ipv4_covered = outcome.status.ipv4_covered,
-                ipv6_required = outcome.status.ipv6_required,
-                ipv6_covered = outcome.status.ipv6_covered,
+                state = status.state.label(),
+                reason = status.reason.label(),
+                configured_interfaces = status.configured_interfaces,
+                expected_interfaces = status.expected_interfaces,
+                ipv4_covered = status.ipv4_covered,
+                ipv6_required = status.ipv6_required,
+                ipv6_covered = status.ipv6_covered,
                 "NodeWaypoint ingress interface topology is proved"
             );
         }
     } else {
         startup_ready.store(false, Ordering::Release);
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
-        if previous.state != outcome.status.state || previous.reason != outcome.status.reason {
+        if previous.state != status.state || previous.reason != status.reason {
             warn!(
                 phase,
-                state = outcome.status.state.label(),
-                reason = outcome.status.reason.label(),
-                configured_interfaces = outcome.status.configured_interfaces,
-                expected_interfaces = outcome.status.expected_interfaces,
-                ipv4_required = outcome.status.ipv4_required,
-                ipv6_required = outcome.status.ipv6_required,
-                diagnostic = %outcome.diagnostic,
+                state = status.state.label(),
+                reason = status.reason.label(),
+                configured_interfaces = status.configured_interfaces,
+                expected_interfaces = status.expected_interfaces,
+                ipv4_required = status.ipv4_required,
+                ipv6_required = status.ipv6_required,
+                diagnostic,
                 "NodeWaypoint ingress interface topology is unproved; readiness withdrawn. \
                  Correct the explicit interface set or restore the node routes/link state; \
                  Ferrum will not guess or broaden capture."
             );
         }
     }
+    datapath_update_ok
+}
+
+/// Narrow external-test seam for the production topology outcome transition.
+/// It exposes only the two readiness bits; BPF-map and metrics effects remain
+/// observable through the existing mock backend and metrics snapshots.
+pub(crate) fn apply_ingress_topology_outcome_for_test(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    topology_ready: bool,
+    startup_ready: bool,
+    initial_sync_complete: bool,
+    outcome: &IngressTopologyOutcome,
+) -> (bool, bool) {
+    let topology_ready = AtomicBool::new(topology_ready);
+    let startup_ready = AtomicBool::new(startup_ready);
+    let _ = apply_ingress_topology_outcome(
+        backend,
+        config,
+        metrics,
+        &topology_ready,
+        &startup_ready,
+        initial_sync_complete,
+        false,
+        outcome,
+        "test",
+    );
+    (
+        topology_ready.load(Ordering::Acquire),
+        startup_ready.load(Ordering::Acquire),
+    )
 }
 
 /// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
@@ -1613,8 +1672,67 @@ where
         None,
         None,
         topology_ready,
+        true,
         pod_stream,
         seed_pods,
+    )
+    .await
+}
+
+/// Inject completed topology outcomes into the production pod/CNI select loop.
+/// Kubernetes and host I/O stay outside this seam; it exists solely so external
+/// tests can exercise the real outcome arm and readiness/quarantine wiring.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    pod_stream: S,
+    initial_topology: IngressTopologyOutcome,
+    mut topology_stream: T,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    T: Stream<Item = IngressTopologyOutcome> + Unpin + Send + 'static,
+{
+    let (outcomes_tx, outcomes) = tokio::sync::watch::channel(initial_topology.clone());
+    let task = tokio::spawn(async move {
+        while let Some(outcome) = topology_stream.next().await {
+            outcomes_tx.send_replace(outcome);
+        }
+    });
+    let monitor = IngressTopologyMonitor { outcomes, task };
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let topology_ready = Arc::new(AtomicBool::new(false));
+    let topology_publication_ok = apply_ingress_topology_outcome(
+        backend,
+        config,
+        metrics.as_ref(),
+        topology_ready.as_ref(),
+        startup_ready.as_ref(),
+        false,
+        false,
+        &initial_topology,
+        "test_startup",
+    );
+    let mut owner = InitializedBackendOwner::borrowed(backend, false);
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        CniListenerConfig {
+            enabled: false,
+            socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+        },
+        None,
+        Some(monitor),
+        topology_ready,
+        topology_publication_ok,
+        pod_stream,
+        std::iter::empty(),
     )
     .await
 }
@@ -1630,6 +1748,7 @@ async fn run_with_pod_stream<S, I>(
     kube_client: Option<Client>,
     mut topology_monitor: Option<IngressTopologyMonitor>,
     topology_ready: Arc<AtomicBool>,
+    mut topology_publication_ok: bool,
     mut pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -1709,6 +1828,11 @@ where
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
     let mut topology_monitor_open = topology_monitor.is_some();
+    let mut last_topology_outcome = topology_monitor
+        .as_ref()
+        .map(|monitor| monitor.outcomes.borrow().clone());
+    let mut topology_datapath_retry = tokio::time::interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
+    topology_datapath_retry.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
@@ -1814,34 +1938,22 @@ where
                             });
                             continue;
                         };
-                        let maintenance_not_ready = match work.request.verb {
-                            RpcVerb::Gc => !initial_sync_complete,
-                            RpcVerb::Status => !startup_ready.load(Ordering::Acquire),
-                            _ => false,
-                        };
-                        if maintenance_not_ready {
+                        if let Some(reason) = cni_topology_readiness_rejection(
+                            work.request.verb,
+                            initial_sync_complete,
+                            startup_ready.load(Ordering::Acquire),
+                        ) {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
                             // pod_states is not authoritative enough to prove
                             // those keys unowned, so GC must retry later.
-                            // STATUS additionally shares the topology readiness
-                            // gate and fails closed while either prerequisite is
-                            // unavailable for ADD.
-                            let reason = match work.request.verb {
-                                RpcVerb::Status if !initial_sync_complete => {
-                                    "node-agent initial pod sync is incomplete; not ready for ADD"
-                                        .to_string()
-                                }
-                                RpcVerb::Status => {
-                                    "NodeWaypoint ingress interface topology is unproved; not ready for ADD"
-                                        .to_string()
-                                }
-                                _ => {
-                                    "node-agent initial pod sync is incomplete; retry GC"
-                                        .to_string()
-                                }
-                            };
-                            let _ = work.respond.send(CniRpcResponse::Error { reason });
+                            // ADD/CHECK/STATUS share the topology readiness gate
+                            // so neither a new nor existing attachment is
+                            // reported capture-ready while the redirect is
+                            // quarantined.
+                            let _ = work.respond.send(CniRpcResponse::Error {
+                                reason: reason.to_string(),
+                            });
                             continue;
                         }
                         let enrolled_uid = process_cni_work_item(
@@ -1918,7 +2030,9 @@ where
                             continue;
                         };
                         let outcome = monitor.outcomes.borrow_and_update().clone();
-                        apply_ingress_topology_outcome(
+                        topology_publication_ok = apply_ingress_topology_outcome(
+                            owner.backend_mut(),
+                            config,
                             metrics.as_ref(),
                             topology_ready.as_ref(),
                             startup_ready.as_ref(),
@@ -1928,13 +2042,16 @@ where
                             &outcome,
                             "runtime_revalidation",
                         );
+                        last_topology_outcome = Some(outcome);
                     }
                     Err(_) => {
                         topology_monitor_open = false;
                         let outcome = IngressTopologyOutcome::monitor_stopped(
                             config.capture_contract.ingress_redirect_ifaces.len(),
                         );
-                        apply_ingress_topology_outcome(
+                        topology_publication_ok = apply_ingress_topology_outcome(
+                            owner.backend_mut(),
+                            config,
                             metrics.as_ref(),
                             topology_ready.as_ref(),
                             startup_ready.as_ref(),
@@ -1944,7 +2061,24 @@ where
                             &outcome,
                             "runtime_revalidation",
                         );
+                        last_topology_outcome = Some(outcome);
                     }
+                }
+            }
+            _ = topology_datapath_retry.tick(), if !topology_publication_ok => {
+                if let Some(outcome) = last_topology_outcome.as_ref() {
+                    topology_publication_ok = apply_ingress_topology_outcome(
+                        owner.backend_mut(),
+                        config,
+                        metrics.as_ref(),
+                        topology_ready.as_ref(),
+                        startup_ready.as_ref(),
+                        initial_sync_complete,
+                        has_failed_pod_enrollments(&pod_states)
+                            || has_pending_capture_failures(&pod_states),
+                        outcome,
+                        "datapath_publication_retry",
+                    );
                 }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
@@ -1997,6 +2131,33 @@ where
             Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
         }
     }
+}
+
+fn cni_topology_readiness_rejection(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    startup_ready: bool,
+) -> Option<&'static str> {
+    match verb {
+        RpcVerb::Gc if !initial_sync_complete => {
+            Some("node-agent initial pod sync is incomplete; retry GC")
+        }
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !initial_sync_complete => {
+            Some("node-agent initial pod sync is incomplete; capture is not ready")
+        }
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !startup_ready => Some(
+            "NodeWaypoint ingress interface topology is unproved; enrollment is quarantined",
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn cni_topology_readiness_rejection_for_test(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    startup_ready: bool,
+) -> Option<&'static str> {
+    cni_topology_readiness_rejection(verb, initial_sync_complete, startup_ready)
 }
 
 fn watcher_init_stale_uids(
@@ -7888,7 +8049,11 @@ fn initialize_backend_after_load(
     routing_installed: &std::cell::Cell<bool>,
 ) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
-    if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
+    if let Err(e) = backend.update_capture_config(
+        &config
+            .capture_contract
+            .bpf_capture_config_for_topology(false),
+    ) {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));

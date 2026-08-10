@@ -406,6 +406,22 @@ impl CaptureContract {
             .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
             .with_node_waypoint_ingress_capture_port(ingress_capture_port)
     }
+
+    /// Build the capture-map value for the current topology-proof state.
+    /// Outbound capture and the direct-pod authorization guard stay intact,
+    /// while the node-level ingress redirect mark/port are published only once
+    /// the route proof is Ready. This is the runtime quarantine used during
+    /// startup, watch recovery, and route/link drift.
+    pub fn bpf_capture_config_for_topology(&self, topology_ready: bool) -> BpfCaptureConfig {
+        let config = self.bpf_capture_config();
+        if topology_ready {
+            config
+        } else {
+            config
+                .with_node_waypoint_ingress_redirect_mark(0)
+                .with_node_waypoint_ingress_capture_port(0)
+        }
+    }
 }
 
 /// Metrics tracked by the node agent.
@@ -1018,6 +1034,8 @@ pub struct MockEbpfBackend {
     pub cidr_includes: Vec<String>,
     pub port_excludes: Vec<u16>,
     pub capture_config: Option<BpfCaptureConfig>,
+    /// Ordered capture-map publications for topology transition tests.
+    pub capture_config_updates: Vec<BpfCaptureConfig>,
     /// Per-cgroup `includeOutboundPorts` writes ordered by the order the
     /// node-agent issued them. Insert overwrites the previous entry for
     /// the same `cgroup_id`. Tests assert on this map to verify a pod's
@@ -1130,6 +1148,7 @@ impl EbpfBackend for MockEbpfBackend {
             return Err("capture config update failed".to_string());
         }
         self.capture_config = Some(*config);
+        self.capture_config_updates.push(*config);
         Ok(())
     }
 

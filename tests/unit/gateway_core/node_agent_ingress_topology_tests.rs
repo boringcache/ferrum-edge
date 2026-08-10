@@ -1,16 +1,33 @@
 //! External unit coverage for NodeWaypoint ingress-interface topology proof.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
-use ferrum_edge::ebpf::ingress_topology::{
-    IngressTopologyReason, IngressTopologyState, IpCidr, LinkState, NodeWatchCacheDecision,
-    NodeWatchCacheRecovery, RouteEntry, TopologyRequirements, parse_ipv4_route_file,
-    parse_ipv6_route_file, read_link_state_from_root, requirements_from_nodes,
-    validate_host_topology_from_roots, validate_topology_snapshot,
+use ferrum_edge::_test_support::{
+    apply_node_agent_ingress_topology_outcome_for_test,
+    node_agent_cni_topology_readiness_rejection_for_test,
+    run_with_node_agent_topology_outcome_stream_for_test,
+    spawn_node_agent_ingress_topology_monitor_for_test,
 };
+use ferrum_edge::capture::{CaptureConfig, CaptureMode};
+use ferrum_edge::cni::rpc::RpcVerb;
+use ferrum_edge::ebpf::ingress_topology::{
+    IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState,
+    IngressTopologyValidator, IpCidr, LinkState, NodeWatchCacheDecision, NodeWatchCacheRecovery,
+    RouteEntry, TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file,
+    read_link_state_from_root, requirements_from_nodes, validate_host_topology_from_roots,
+    validate_topology_snapshot,
+};
+use ferrum_edge::ebpf::{
+    CaptureContract, FallbackMode, MockEbpfBackend, NODE_AGENT_CAPTURE_STATE_READY,
+    NodeAgentMetrics, NodeAgentProxyMode, NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+};
+use ferrum_edge::modes::node_agent::NodeAgentConfig;
+use futures::{StreamExt, stream};
 use k8s_openapi::api::core::v1::Node;
+use kube::runtime::watcher::Event;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -87,6 +104,50 @@ fn v4_requirements() -> TopologyRequirements {
         require_ipv4: true,
         require_ipv6: false,
     }
+}
+
+fn node_waypoint_config() -> NodeAgentConfig {
+    let mut capture_config = CaptureConfig::explicit(15006, 15001);
+    capture_config.mode = CaptureMode::Ebpf;
+    let mut capture_contract = CaptureContract::new(
+        NodeAgentProxyMode::NodeWaypoint,
+        15001,
+        15008,
+        "/run/ferrum/node-agent.sock",
+    )
+    .expect("valid NodeWaypoint capture contract");
+    capture_contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+    capture_contract.node_waypoint_ingress_redirect_mark =
+        NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+    capture_contract.ingress_capture_port = 15006;
+    capture_contract.ingress_capture_supports_ipv6 = true;
+    NodeAgentConfig {
+        node_name: "local".to_string(),
+        capture_config,
+        cgroup_root: "/nonexistent".to_string(),
+        bpf_fs_path: "/nonexistent".to_string(),
+        fallback_mode: FallbackMode::Fail,
+        excluded_namespaces: HashSet::new(),
+        capture_contract,
+        trust_domain: "cluster.local".to_string(),
+        node_waypoint_pod_registry_dir: None,
+    }
+}
+
+fn ready_outcome() -> IngressTopologyOutcome {
+    validate_topology_snapshot(
+        &["eth0".to_string()],
+        &v4_requirements(),
+        &[
+            route("10.244.2.0/24", "eth0", 0),
+            route("172.18.0.0/16", "eth0", 0),
+        ],
+        &BTreeMap::from([("eth0".to_string(), up_link())]),
+    )
+}
+
+fn unavailable_outcome() -> IngressTopologyOutcome {
+    IngressTopologyOutcome::monitor_stopped(1)
 }
 
 #[test]
@@ -206,6 +267,19 @@ fn missing_invalid_and_unsupported_devices_are_rejected() {
         .reason,
         IngressTopologyReason::UnsupportedDevice,
     );
+    for unsafe_name in [".", ".."] {
+        assert_eq!(
+            validate_topology_snapshot(
+                &[unsafe_name.to_string()],
+                &v4_requirements(),
+                &routes,
+                &BTreeMap::new(),
+            )
+            .status
+            .reason,
+            IngressTopologyReason::InvalidInterfaceName,
+        );
+    }
 }
 
 #[test]
@@ -555,7 +629,7 @@ fn sysfs_link_ingestion_classifies_physical_peer_loopback_and_unsafe_shapes() {
 }
 
 #[test]
-fn node_requirements_are_ready_internal_ip_only_and_fail_closed_when_incomplete() {
+fn node_requirements_use_complete_topology_evidence_without_admitting_peer_health() {
     let local = node("local", &[], None, false, &[]);
     let ready = node(
         "remote",
@@ -574,27 +648,7 @@ fn node_requirements_are_ready_internal_ip_only_and_fail_closed_when_incomplete(
     assert!(!requirements.require_ipv6);
 
     for incomplete in [
-        node(
-            "remote",
-            &[],
-            Some("True"),
-            false,
-            &[("InternalIP", "172.18.0.3")],
-        ),
-        node(
-            "remote",
-            &["10.244.2.0/24"],
-            None,
-            false,
-            &[("InternalIP", "172.18.0.3")],
-        ),
-        node(
-            "remote",
-            &["10.244.2.0/24"],
-            Some("Unknown"),
-            false,
-            &[("InternalIP", "172.18.0.3")],
-        ),
+        node("remote", &[], Some("True"), false, &[("InternalIP", "172.18.0.3")]),
         node(
             "remote",
             &["10.244.2.0/24"],
@@ -611,7 +665,7 @@ fn node_requirements_are_ready_internal_ip_only_and_fail_closed_when_incomplete(
 }
 
 #[test]
-fn only_positively_not_ready_unschedulable_nodes_may_be_ignored() {
+fn joining_rebooting_and_draining_nodes_do_not_poison_cluster_topology_proof() {
     let local = node("local", &[], None, false, &[]);
     let ready = node(
         "ready",
@@ -620,15 +674,22 @@ fn only_positively_not_ready_unschedulable_nodes_may_be_ignored() {
         false,
         &[("InternalIP", "172.18.0.3")],
     );
-    let dormant = node("new", &[], Some("False"), true, &[]);
-    assert!(
-        requirements_from_nodes(&[local.clone(), ready.clone(), dormant], "local", false).is_ok()
-    );
-    let schedulable = node("new", &[], Some("False"), false, &[]);
-    assert_eq!(
-        requirements_from_nodes(&[local.clone(), ready.clone(), schedulable], "local", false),
-        Err(IngressTopologyReason::NodeTopologyIncomplete),
-    );
+    for transient in [
+        node("joining", &[], None, false, &[]),
+        node("rebooting", &[], Some("Unknown"), false, &[]),
+        node("draining", &[], Some("False"), true, &[]),
+    ] {
+        let requirements = requirements_from_nodes(
+            &[local.clone(), ready.clone(), transient],
+            "local",
+            false,
+        )
+        .expect("peer health must not invalidate unchanged route evidence");
+        assert_eq!(requirements.remote_pod_cidrs, [cidr("10.244.2.0/24")]);
+    }
+
+    // Complete evidence remains useful even while a peer is non-Ready: Ready
+    // is a health condition, not an admission predicate for cluster topology.
     let allocated = node(
         "allocated",
         &["10.244.9.0/24"],
@@ -636,9 +697,25 @@ fn only_positively_not_ready_unschedulable_nodes_may_be_ignored() {
         true,
         &[("InternalIP", "172.18.0.9")],
     );
+    let requirements = requirements_from_nodes(&[local, ready, allocated], "local", false)
+        .expect("complete non-Ready topology evidence");
+    assert!(requirements.remote_pod_cidrs.contains(&cidr("10.244.9.0/24")));
+}
+
+#[test]
+fn single_node_cluster_has_a_truthful_closed_outcome() {
+    let local = node("local", &[], Some("True"), false, &[]);
     assert_eq!(
-        requirements_from_nodes(&[local, ready, allocated], "local", false),
-        Err(IngressTopologyReason::NodeTopologyIncomplete),
+        requirements_from_nodes(&[local.clone()], "local", true),
+        Err(IngressTopologyReason::NoRemoteTopologyEvidence),
+    );
+    assert_eq!(
+        requirements_from_nodes(
+            &[local, node("joining", &[], None, false, &[])],
+            "local",
+            true,
+        ),
+        Err(IngressTopologyReason::NoRemoteTopologyEvidence),
     );
 }
 
@@ -713,7 +790,10 @@ fn node_and_aggregate_requirement_bounds_have_distinct_closed_reasons() {
     );
 
     let local = node("local", &[], None, false, &[]);
-    let cidrs: Vec<String> = (0..1_025)
+    // 1,023 pending CIDRs plus two pending same-family InternalIPs proves the
+    // aggregate calculation counts every collection, not only the destination
+    // vector currently receiving an item.
+    let cidrs: Vec<String> = (0..1_023)
         .map(|index| format!("fd00::{index:x}/128"))
         .collect();
     let cidr_refs: Vec<&str> = cidrs.iter().map(String::as_str).collect();
@@ -722,7 +802,10 @@ fn node_and_aggregate_requirement_bounds_have_distinct_closed_reasons() {
         &cidr_refs,
         Some("True"),
         false,
-        &[("InternalIP", "fd00::ffff")],
+        &[
+            ("InternalIP", "fd00::fffe"),
+            ("InternalIP", "fd00::ffff"),
+        ],
     );
     assert_eq!(
         requirements_from_nodes(&[local, oversized], "local", true),
@@ -735,7 +818,7 @@ fn invalid_node_cache_never_allows_ready_from_incremental_events() {
     let mut recovery = NodeWatchCacheRecovery::new();
     assert_eq!(
         recovery.on_incremental_invalid(IngressTopologyReason::NodeSetTooLarge),
-        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1_200 },
     );
     assert_eq!(
         recovery.invalid_reason(),
@@ -771,7 +854,7 @@ fn node_cache_recovery_requires_complete_valid_replacement_snapshot() {
     );
     assert_eq!(
         recovery.on_invalid_snapshot(IngressTopologyReason::NodeSetTooLarge),
-        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1_200 },
     );
     assert_eq!(
         recovery.on_incremental(),
@@ -826,8 +909,8 @@ fn repeated_invalid_node_cache_snapshots_stay_bounded_without_spinning() {
         );
     }
 
-    assert_eq!(observed, vec![1, 2, 4, 8, 16, 30, 30, 30]);
-    assert_eq!(recovery.relist_backoff_secs(), 30);
+    assert_eq!(observed, vec![1_200; 8]);
+    assert_eq!(recovery.relist_backoff_secs(), 1);
 
     // A successful replacement snapshot is the only path that resets pacing.
     assert_eq!(
@@ -838,6 +921,275 @@ fn repeated_invalid_node_cache_snapshots_stay_bounded_without_spinning() {
     assert_eq!(
         recovery.on_invalid_snapshot(IngressTopologyReason::NodeTopologyIncomplete),
         NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+    );
+}
+
+#[tokio::test]
+async fn production_topology_monitor_processes_synthetic_node_events_and_skips_heartbeats() {
+    let fixture = tempdir().expect("temporary topology fixture");
+    let proc_root = fixture.path().join("proc");
+    let sys_root = fixture.path().join("sys/class/net");
+    fs::create_dir_all(proc_root.join("net")).expect("create proc net");
+    fs::create_dir_all(&sys_root).expect("create sys net");
+    write_link(&sys_root, "eth0", 2, 1);
+    fs::write(
+        proc_root.join("net/route"),
+        concat!(
+            "Iface\tDestination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n",
+            "eth0\t0002F40A 00000000 0001 0 0 0 00FFFFFF 0 0 0\n",
+            "eth0\t000012AC 00000000 0001 0 0 0 0000FFFF 0 0 0\n",
+        ),
+    )
+    .expect("write IPv4 routes");
+
+    let validator = IngressTopologyValidator::new(vec!["eth0".to_string()], "local", false)
+        .with_roots(proc_root.clone(), sys_root);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<Result<Event<Node>, kube::runtime::watcher::Error>>(16);
+    let event_stream = stream::unfold(event_rx, |mut receiver| async move {
+        receiver.recv().await.map(|event| (event, receiver))
+    });
+    let (mut outcomes, task) = spawn_node_agent_ingress_topology_monitor_for_test(
+        validator,
+        shutdown_rx,
+        event_stream,
+    );
+
+    let local = node("local", &[], Some("True"), false, &[]);
+    let remote = node(
+        "remote",
+        &["10.244.2.0/24"],
+        Some("True"),
+        false,
+        &[("InternalIP", "172.18.0.3")],
+    );
+    for event in [
+        Event::Init,
+        Event::InitApply(local),
+        Event::InitApply(remote.clone()),
+        Event::InitDone,
+    ] {
+        event_tx.send(Ok(event)).await.expect("send init event");
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), outcomes.changed())
+        .await
+        .expect("initial topology outcome timeout")
+        .expect("monitor outcome channel");
+    assert_eq!(
+        outcomes.borrow_and_update().status.state,
+        IngressTopologyState::Ready,
+    );
+
+    // Remove the host evidence after the initial proof. An unrelated Node
+    // heartbeat must not trigger procfs/sysfs validation; the periodic drift
+    // lane will detect it on its own five-second tick.
+    fs::remove_file(proc_root.join("net/route")).expect("remove route evidence");
+    let mut heartbeat = remote;
+    heartbeat.metadata.annotations = Some(BTreeMap::from([(
+        "example.test/heartbeat".to_string(),
+        "changed".to_string(),
+    )]));
+    event_tx
+        .send(Ok(Event::Apply(heartbeat)))
+        .await
+        .expect("send heartbeat");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), outcomes.changed())
+            .await
+            .is_err(),
+        "unchanged projected evidence must not publish a host revalidation",
+    );
+
+    // A newly joining non-Ready Node changes the projected cache but not the
+    // derived requirements, so it must neither poison readiness nor force a
+    // host revalidation.
+    event_tx
+        .send(Ok(Event::Apply(node(
+            "joining",
+            &[],
+            None,
+            false,
+            &[],
+        ))))
+        .await
+        .expect("send joining Node");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), outcomes.changed())
+            .await
+            .is_err(),
+        "an incomplete non-Ready peer must not poison the proved topology",
+    );
+
+    event_tx
+        .send(Ok(Event::Apply(node(
+            "remote",
+            &[],
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ))))
+        .await
+        .expect("send incomplete Ready Node");
+    tokio::time::timeout(std::time::Duration::from_secs(2), outcomes.changed())
+        .await
+        .expect("closed topology outcome timeout")
+        .expect("monitor outcome channel");
+    assert_eq!(
+        outcomes.borrow_and_update().status.reason,
+        IngressTopologyReason::NodeTopologyIncomplete,
+    );
+
+    shutdown_tx.send(true).expect("request monitor shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("monitor shutdown timeout")
+        .expect("monitor task");
+}
+
+#[test]
+fn topology_outcome_application_arms_and_quarantines_the_bpf_redirect() {
+    let config = node_waypoint_config();
+    let metrics = NodeAgentMetrics::default();
+    let mut backend = MockEbpfBackend::default();
+
+    let flags = apply_node_agent_ingress_topology_outcome_for_test(
+        &mut backend,
+        &config,
+        &metrics,
+        false,
+        false,
+        true,
+        &ready_outcome(),
+    );
+    assert_eq!(flags, (true, true));
+    assert!(
+        backend
+            .capture_config
+            .expect("ready capture config")
+            .ingress_redirect_armed()
+    );
+
+    backend.fail_update_capture_config = true;
+    let flags = apply_node_agent_ingress_topology_outcome_for_test(
+        &mut backend,
+        &config,
+        &metrics,
+        true,
+        true,
+        true,
+        &unavailable_outcome(),
+    );
+    assert_eq!(flags, (false, false));
+    assert_eq!(
+        metrics.snapshot().ingress_topology.reason,
+        IngressTopologyReason::DatapathUpdateFailed,
+    );
+
+    // The production select loop retries a failed capture-map publication on
+    // its bounded timer. Drive that retry through the same transition helper.
+    backend.fail_update_capture_config = false;
+    let flags = apply_node_agent_ingress_topology_outcome_for_test(
+        &mut backend,
+        &config,
+        &metrics,
+        false,
+        false,
+        true,
+        &unavailable_outcome(),
+    );
+    assert_eq!(flags, (false, false));
+    assert!(
+        !backend
+            .capture_config
+            .expect("quarantined capture config")
+            .ingress_redirect_armed()
+    );
+    assert_eq!(
+        metrics.snapshot().ingress_topology.reason,
+        IngressTopologyReason::KubernetesUnavailable,
+    );
+}
+
+#[test]
+fn cni_add_check_and_status_withhold_capture_ready_during_topology_loss() {
+    for verb in [RpcVerb::Add, RpcVerb::Check, RpcVerb::Status] {
+        assert!(
+            node_agent_cni_topology_readiness_rejection_for_test(verb, true, false)
+                .is_some(),
+            "{verb:?} must be rejected while topology is quarantined",
+        );
+        assert_eq!(
+            node_agent_cni_topology_readiness_rejection_for_test(verb, true, true),
+            None,
+        );
+    }
+    assert_eq!(
+        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Del, true, false),
+        None,
+        "cleanup must remain available while capture is quarantined",
+    );
+    assert!(
+        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Gc, false, false).is_some()
+    );
+    assert_eq!(
+        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Gc, true, false),
+        None,
+        "post-sync GC must remain available while capture is quarantined",
+    );
+}
+
+#[tokio::test]
+async fn production_select_loop_applies_synthetic_ready_to_unavailable_transition() {
+    let config = node_waypoint_config();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+    let mut backend = MockEbpfBackend::default();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let pod_events = stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)])
+        .chain(stream::pending());
+    let transitions = stream::iter(vec![ready_outcome(), unavailable_outcome()])
+        .then(|outcome| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            outcome
+        });
+    let shutdown = shutdown_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let _ = shutdown.send(true);
+    });
+
+    let result = run_with_node_agent_topology_outcome_stream_for_test(
+        &mut backend,
+        &config,
+        metrics.clone(),
+        &shutdown_tx,
+        pod_events,
+        ready_outcome(),
+        Box::pin(transitions),
+    )
+    .await;
+
+    assert!(result.is_ok(), "synthetic transition loop failed: {result:?}");
+    assert!(
+        backend
+            .capture_config_updates
+            .iter()
+            .any(|config| config.ingress_redirect_armed()),
+        "Ready transition must arm the redirect",
+    );
+    assert!(
+        !backend
+            .capture_config_updates
+            .last()
+            .expect("at least one topology publication")
+            .ingress_redirect_armed(),
+        "topology loss must leave the redirect quarantined",
+    );
+    assert_eq!(
+        metrics.snapshot().ingress_topology.reason,
+        IngressTopologyReason::KubernetesUnavailable,
     );
 }
 

@@ -34,23 +34,14 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 The Dockerfile uses a **multi-stage build** for optimal size:
 
-1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
-2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
-3. **Runtime Tool Stage**: Extracts the `ip` executable and only its non-base resolved shared-library closure from Debian 13 for the NodeWaypoint ingress policy-rule lifecycle. The shared staging helper used by both Docker definitions excludes glibc, the dynamic loader, libgcc, and libstdc++, which remain owned by the distroless base ABI
-4. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) plus that bounded `ip` closure — no shell, package manager, or iptables fallback tools
-
-> **Current eBPF build coupling.** The runtime stage unconditionally copies the
-> eBPF ELF from the `ebpf-builder` stage, so every `docker build` runs that
-> stage, including the default image built with `FEATURES=cloud-secrets`.
-> The resulting `/app/bpf/ferrum-ebpf` file is only used when the binary is
-> built with the `ebpf` feature for node-agent or ambient-mesh capture, but the
-> Docker build still depends on the nightly Rust toolchain, `rust-src`,
-> `bpf-linker`, and `-Z build-std=core` inside the build container. If an image
-> build fails before the main Rust binary compiles, inspect the `ebpf-builder`
-> stage first.
+1. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
+2. **Common Runtime Stage**: Produces the ordinary Google distroless runtime (`gcr.io/distroless/cc-debian13:nonroot`) with neither an eBPF ELF nor `ip`
+3. **eBPF Builder Stage**: Only the explicit `runtime-ebpf` target compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
+4. **Runtime Tool Stage**: For `runtime-ebpf`, extracts the `ip` executable and only its non-base resolved shared-library closure from a digest-pinned Debian 13 image with an exact `iproute2` package version. The shared staging helper excludes glibc, the dynamic loader, libgcc, and libstdc++, which remain owned by the distroless base ABI
+5. **eBPF Runtime Stage**: Adds that bounded `ip` closure and the BPF ELF to the common runtime — no shell, package manager, or iptables fallback tools
 
 **Image Features**:
-- **Distroless**: The source-build eBPF image adds only `ip` and non-base resolved shared objects to the distroless base; it contains no shell, package manager, `iptables`, or `ip6tables`. PR CI builds the production root Dockerfile, runs `ip -V` and `ferrum-edge version` through explicit entrypoints, and inspects the exported filesystem for forbidden runtime tools
+- **Distroless**: The ordinary target omits `ip`; the source-build eBPF target adds only `ip` and non-base resolved shared objects. Both contain no shell, package manager, `iptables`, or `ip6tables`. PR CI builds both targets, runs their expected entrypoints, and inspects normalized exported filesystems for forbidden runtime tools
 - Non-root user execution by default (UID 65532, distroless `nonroot`; the node-agent chart overrides this for kernel capture)
 - Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)

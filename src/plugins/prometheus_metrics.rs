@@ -3598,28 +3598,36 @@ impl MetricsRegistry {
                 "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
             );
             output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n");
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
-            for (family, required, covered) in [
-                ("ipv4", topology.ipv4_required, topology.ipv4_covered),
-                ("ipv6", topology.ipv6_required, topology.ipv6_covered),
+            for (family, required) in [
+                ("ipv4", topology.ipv4_required),
+                ("ipv6", topology.ipv6_required),
             ] {
                 if ns_label.is_empty() {
                     output.push_str(&format!(
                         "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"}} {}\n",
                         u64::from(required),
                     ));
-                    output.push_str(&format!(
-                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"}} {}\n",
-                        u64::from(covered),
-                    ));
                 } else {
                     output.push_str(&format!(
                         "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"{ns_label}}} {}\n",
                         u64::from(required),
                     ));
+                }
+            }
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
+            for (family, covered) in [
+                ("ipv4", topology.ipv4_covered),
+                ("ipv6", topology.ipv6_covered),
+            ] {
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"}} {}\n",
+                        u64::from(covered),
+                    ));
+                } else {
                     output.push_str(&format!(
                         "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"{ns_label}}} {}\n",
                         u64::from(covered),

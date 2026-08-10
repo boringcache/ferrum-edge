@@ -70,29 +70,62 @@ jobs:
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Build production root Dockerfile
+      - name: Build ordinary and eBPF production targets
         run: |
           set -euo pipefail
           docker build \
+            --tag ferrum-edge:production-default-smoke \
+            --file Dockerfile \
+            .
+          docker build \
+            --target runtime-ebpf \
             --build-arg FEATURES=cloud-secrets,ebpf \
-            --tag ferrum-edge:production-dockerfile-smoke \
+            --tag ferrum-edge:production-ebpf-smoke \
             --file Dockerfile \
             .
 
-      - name: Execute distroless runtime entrypoints
+      - name: Verify distroless runtime contracts
         run: |
           set -euo pipefail
-          image=ferrum-edge:production-dockerfile-smoke
-          docker run --rm --entrypoint /usr/sbin/ip "$image" -V
-          docker run --rm --entrypoint /app/ferrum-edge "$image" version
-          container="$(docker create "$image")"
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-          docker export "$container" | tar -tf - > runtime-files.txt
-          for forbidden in bin/sh usr/bin/apt usr/bin/apt-get usr/sbin/iptables usr/sbin/ip6tables; do
-            if grep -Fxq "$forbidden" runtime-files.txt; then
-              echo "forbidden runtime tool is present: /$forbidden" >&2
-              exit 1
-            fi
+          ordinary_image=ferrum-edge:production-default-smoke
+          ebpf_image=ferrum-edge:production-ebpf-smoke
+          docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+          docker run --rm --entrypoint /app/ferrum-edge "$ebpf_image" version
+          docker run --rm --entrypoint /usr/sbin/ip "$ebpf_image" -V
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+          inventory_image "$ebpf_image" ebpf-runtime-files.txt
+
+          # Positive controls prove the normalized exact-path assertion is live.
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          grep -Fxq app/ferrum-edge ebpf-runtime-files.txt
+          grep -Fxq usr/sbin/ip ebpf-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
+            exit 1
+          fi
+
+          for inventory in ordinary-runtime-files.txt ebpf-runtime-files.txt; do
+            for forbidden in \
+              bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+              bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+              bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+              usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+              usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+              usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+              usr/sbin/ip6tables usr/sbin/nft; do
+              if grep -Fxq "$forbidden" "$inventory"; then
+                echo "forbidden runtime tool is present: /$forbidden" >&2
+                exit 1
+              fi
+            done
           done
 
   node-waypoint-ebpf-live:

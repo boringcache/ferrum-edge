@@ -8259,6 +8259,27 @@ pub mod _test_support {
         kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Pod>,
         kube::runtime::watcher::Error,
     >;
+    pub type NodeAgentIngressTopologyOutcomeForTest =
+        crate::ebpf::ingress_topology::IngressTopologyOutcome;
+    pub type NodeAgentNodeWatcherEventForTest = Result<
+        kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Node>,
+        kube::runtime::watcher::Error,
+    >;
+
+    pub fn spawn_node_agent_ingress_topology_monitor_for_test<S>(
+        validator: crate::ebpf::ingress_topology::IngressTopologyValidator,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        stream: S,
+    ) -> (
+        tokio::sync::watch::Receiver<NodeAgentIngressTopologyOutcomeForTest>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        S: futures_util::Stream<Item = NodeAgentNodeWatcherEventForTest> + Send + 'static,
+    {
+        let monitor = validator.spawn_monitor_with_event_stream_for_test(stream, shutdown_rx);
+        (monitor.outcomes, monitor.task)
+    }
 
     pub async fn run_with_pod_stream_for_test<S, I>(
         backend: &mut crate::ebpf::MockEbpfBackend,
@@ -8281,6 +8302,66 @@ pub mod _test_support {
             seed_pods,
         )
         .await
+    }
+
+    pub fn apply_node_agent_ingress_topology_outcome_for_test(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: &crate::ebpf::NodeAgentMetrics,
+        topology_ready: bool,
+        startup_ready: bool,
+        initial_sync_complete: bool,
+        outcome: &crate::ebpf::ingress_topology::IngressTopologyOutcome,
+    ) -> (bool, bool) {
+        crate::modes::node_agent::apply_ingress_topology_outcome_for_test(
+            backend,
+            config,
+            metrics,
+            topology_ready,
+            startup_ready,
+            initial_sync_complete,
+            outcome,
+        )
+    }
+
+    pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: Arc<crate::ebpf::NodeAgentMetrics>,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        pod_stream: S,
+        initial_topology: NodeAgentIngressTopologyOutcomeForTest,
+        topology_stream: T,
+    ) -> Result<(), anyhow::Error>
+    where
+        S: futures_util::Stream<Item = NodeAgentPodWatcherEventForTest> + Unpin,
+        T: futures_util::Stream<Item = NodeAgentIngressTopologyOutcomeForTest>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        crate::modes::node_agent::run_with_topology_outcome_stream_for_test(
+            backend,
+            config,
+            metrics,
+            shutdown_tx,
+            pod_stream,
+            initial_topology,
+            topology_stream,
+        )
+        .await
+    }
+
+    pub fn node_agent_cni_topology_readiness_rejection_for_test(
+        verb: crate::cni::rpc::RpcVerb,
+        initial_sync_complete: bool,
+        startup_ready: bool,
+    ) -> Option<&'static str> {
+        crate::modes::node_agent::cni_topology_readiness_rejection_for_test(
+            verb,
+            initial_sync_complete,
+            startup_ready,
+        )
     }
 
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────

@@ -1101,8 +1101,9 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
   # only on Linux with `--features ebpf`, plus the compiled `ferrum-ebpf` BPF
   # ELF embedded in the image. Unlike the default job (which copies a pre-built
   # binary into Dockerfile.release), this variant builds from source with the
-  # root `Dockerfile`, which BOTH builds the `--build-arg FEATURES=...,ebpf`
-  # binary AND compiles+COPYs the BPF ELF via its `ebpf-builder` stage. Each
+  # root `Dockerfile`'s explicit `runtime-ebpf` target, which BOTH builds the
+  # `--build-arg FEATURES=...,ebpf` binary AND compiles+COPYs the BPF ELF via
+  # its `ebpf-builder` stage. Each
   # platform builds natively (no QEMU) so the from-source Rust + nightly eBPF
   # build stays within sane time limits.
   #

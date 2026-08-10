@@ -70,8 +70,8 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
   redirect topology, maintains one bounded cluster-wide `nodes`
   (`list`/`watch`) cache via the Kubernetes API using the in-cluster
   ServiceAccount token. The pod watcher is filtered server-side to
-  `spec.nodeName=$FERRUM_NODE_AGENT_NODE_NAME`; the Node cache supplies only
-  PodCIDRs, Ready/unschedulable conditions, and InternalIP route evidence.
+  `spec.nodeName=$FERRUM_NODE_AGENT_NODE_NAME`; the projected Node cache retains
+  only names, PodCIDRs, the Ready truth value, and InternalIP route evidence.
 - On kernels that do not support cgroup/sockaddr BPF (< 5.7 or no cgroup v2),
   falls back to `iptables` / `ip6tables` rules invoked via `sh -c`
   ([`handle_fallback` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)).

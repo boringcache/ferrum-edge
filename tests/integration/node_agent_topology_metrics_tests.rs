@@ -45,6 +45,16 @@ fn unavailable_topology_renders_only_closed_labels_and_bounded_counts() {
     assert!(
         output.contains("ferrum_node_agent_ingress_interface_family_covered{family=\"ipv6\"} 0")
     );
+    assert!(output.contains(
+        "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n\
+# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n\
+ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 1\n\
+ferrum_node_agent_ingress_interface_family_required{family=\"ipv6\"} 1\n\
+# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n\
+# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n\
+ferrum_node_agent_ingress_interface_family_covered{family=\"ipv4\"} 0\n\
+ferrum_node_agent_ingress_interface_family_covered{family=\"ipv6\"} 0\n"
+    ));
     assert!(!output.contains("eth0"));
     assert!(!output.contains("mgmt0"));
 }

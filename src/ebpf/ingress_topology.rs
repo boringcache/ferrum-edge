@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::Node;
 use kube::Api;
 use kube::Client;
@@ -30,6 +31,14 @@ const MAX_ROUTE_FILE_BYTES: u64 = 1_048_576;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
 const REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const WATCH_ERROR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A structural cluster bound cannot normally heal on transport-retry cadence.
+/// Keep the proof failed closed while limiting every node-agent to four LISTs
+/// per hour until the cluster shape changes.
+const STRUCTURAL_RELIST_SECS: u64 = 20 * 60;
+
+type NodeWatchStream =
+    Pin<Box<dyn Stream<Item = Result<Event<Node>, kube_watcher::Error>> + Send + 'static>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressTopologyState {
@@ -61,7 +70,9 @@ pub enum IngressTopologyReason {
     RequirementSetTooLarge,
     LocalNodeMissing,
     NodeTopologyIncomplete,
+    NoRemoteTopologyEvidence,
     FamilyUnproved,
+    DatapathUpdateFailed,
     TooManyInterfaces,
     InvalidInterfaceName,
     DeviceMissing,
@@ -91,7 +102,9 @@ impl IngressTopologyReason {
             Self::RequirementSetTooLarge => "requirement_set_too_large",
             Self::LocalNodeMissing => "local_node_missing",
             Self::NodeTopologyIncomplete => "node_topology_incomplete",
+            Self::NoRemoteTopologyEvidence => "no_remote_topology_evidence",
             Self::FamilyUnproved => "family_unproved",
+            Self::DatapathUpdateFailed => "datapath_update_failed",
             Self::TooManyInterfaces => "too_many_interfaces",
             Self::InvalidInterfaceName => "invalid_interface_name",
             Self::DeviceMissing => "device_missing",
@@ -341,8 +354,8 @@ impl IngressTopologyValidator {
     ///
     /// The returned channel carries only completed outcomes, so neither Node
     /// API latency nor procfs/sysfs reads occupy the pod/CNI select loop. The
-    /// worker owns at most `MAX_NODES` cached objects, performs one initial
-    /// paged LIST followed by a watch, and stops on the supplied shutdown.
+    /// worker owns at most `MAX_NODES` cached evidence projections, performs
+    /// one initial paged LIST followed by a watch, and stops on shutdown.
     ///
     /// Authoritative cache-invalid outcomes (for example `NodeSetTooLarge`)
     /// withdraw readiness immediately and schedule a paced fresh LIST/watch
@@ -350,28 +363,68 @@ impl IngressTopologyValidator {
     pub(crate) fn spawn_monitor(
         self,
         client: Client,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> IngressTopologyMonitor {
+        let nodes: Api<Node> = Api::all(client);
+        let watcher_config = kube_watcher::Config::default().page_size((MAX_NODES + 1) as u32);
+        self.spawn_monitor_with_stream_factory(
+            move || -> NodeWatchStream {
+                Box::pin(kube_watcher::watcher(nodes.clone(), watcher_config.clone()))
+            },
+            shutdown_rx,
+        )
+    }
+
+    /// Inject a Node event stream into the production monitor loop without a
+    /// Kubernetes client. Kept crate-private and surfaced only through the
+    /// existing external-test adapter.
+    pub(crate) fn spawn_monitor_with_event_stream_for_test<S>(
+        self,
+        stream: S,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> IngressTopologyMonitor
+    where
+        S: Stream<Item = Result<Event<Node>, kube_watcher::Error>> + Send + 'static,
+    {
+        let mut stream = Some(stream);
+        self.spawn_monitor_with_stream_factory(
+            move || -> NodeWatchStream {
+                match stream.take() {
+                    Some(stream) => Box::pin(stream),
+                    None => Box::pin(futures_util::stream::pending()),
+                }
+            },
+            shutdown_rx,
+        )
+    }
+
+    fn spawn_monitor_with_stream_factory<F>(
+        self,
+        mut stream_factory: F,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> IngressTopologyMonitor
+    where
+        F: FnMut() -> NodeWatchStream + Send + 'static,
+    {
         let pending = IngressTopologyOutcome {
             status: IngressTopologyStatus::validating(self.configured_interfaces.len()),
             diagnostic: "NodeWaypoint ingress topology validation is pending".to_string(),
         };
         let (outcomes_tx, outcomes) = tokio::sync::watch::channel(pending);
         let task = tokio::spawn(async move {
-            let nodes: Api<Node> = Api::all(client);
-            let watcher_config = kube_watcher::Config::default().page_size((MAX_NODES + 1) as u32);
             let mut recovery = NodeWatchCacheRecovery::new();
             let mut interval = tokio::time::interval(REVALIDATE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
+            let mut last_watch_error_log = None;
+            let mut suppressed_watch_errors = 0_u64;
 
             'relist: loop {
                 if *shutdown_rx.borrow() {
                     break;
                 }
-                let mut stream =
-                    Box::pin(kube_watcher::watcher(nodes.clone(), watcher_config.clone()));
-                let mut active_nodes = BTreeMap::<String, Node>::new();
+                let mut stream = stream_factory();
+                let mut active_nodes = BTreeMap::<String, NodeTopologyEvidence>::new();
                 let mut initializing: Option<BoundedNodeSet> = None;
                 let mut requirements: Option<TopologyRequirements> = None;
 
@@ -466,6 +519,7 @@ impl IngressTopologyValidator {
                                         &outcomes_tx,
                                         &self,
                                         active_nodes.values(),
+                                        None,
                                     ).await;
                                 }
                                 Ok(Event::Apply(node)) => {
@@ -481,13 +535,15 @@ impl IngressTopologyValidator {
                                         continue;
                                     }
                                     match update_active_node(&mut active_nodes, node) {
-                                        Ok(()) => {
+                                        Ok(true) => {
                                             requirements = derive_and_publish(
                                                 &outcomes_tx,
                                                 &self,
                                                 active_nodes.values(),
+                                                requirements.as_ref(),
                                             ).await;
                                         }
+                                        Ok(false) => {}
                                         Err(reason) => {
                                             let decision =
                                                 recovery.on_incremental_invalid(reason);
@@ -527,6 +583,7 @@ impl IngressTopologyValidator {
                                             &outcomes_tx,
                                             &self,
                                             active_nodes.values(),
+                                            requirements.as_ref(),
                                         ).await;
                                     } else {
                                         let reason =
@@ -550,10 +607,15 @@ impl IngressTopologyValidator {
                                         }
                                     }
                                 }
-                                Err(_) => {
+                                Err(error) => {
                                     // kube-runtime reconnects and relists, but stale
                                     // Kubernetes evidence must never keep readiness
                                     // true while that recovery is in progress.
+                                    log_watch_error(
+                                        &error,
+                                        &mut last_watch_error_log,
+                                        &mut suppressed_watch_errors,
+                                    );
                                     let _ = recovery.on_watch_error();
                                     requirements = None;
                                     initializing = None;
@@ -711,6 +773,11 @@ impl NodeWatchCacheRecovery {
     }
 
     fn force_relist(&mut self) -> NodeWatchCacheDecision {
+        if self.invalid_reason.is_some_and(structural_failure) {
+            return NodeWatchCacheDecision::ForceRelist {
+                backoff_secs: STRUCTURAL_RELIST_SECS,
+            };
+        }
         let backoff_secs = self.relist_backoff_secs;
         self.relist_backoff_secs =
             crate::util::backoff::next_backoff_secs(self.relist_backoff_secs, true);
@@ -725,50 +792,63 @@ pub(crate) struct IngressTopologyMonitor {
 
 #[derive(Default)]
 struct BoundedNodeSet {
-    nodes: BTreeMap<String, Node>,
+    nodes: BTreeMap<String, NodeTopologyEvidence>,
     failure: Option<IngressTopologyReason>,
 }
 
 impl BoundedNodeSet {
     fn insert(&mut self, node: Node) {
-        let Some(name) = node.metadata.name.clone() else {
-            self.failure = Some(IngressTopologyReason::NodeTopologyIncomplete);
-            return;
+        let evidence = match NodeTopologyEvidence::from_node(&node) {
+            Ok(evidence) => evidence,
+            Err(reason) => {
+                self.failure = Some(reason);
+                return;
+            }
         };
+        let name = evidence.name.clone();
         if !self.nodes.contains_key(&name) && self.nodes.len() >= MAX_NODES {
             self.failure = Some(IngressTopologyReason::NodeSetTooLarge);
             return;
         }
-        self.nodes.insert(name, node);
+        self.nodes.insert(name, evidence);
     }
 }
 
 fn update_active_node(
-    nodes: &mut BTreeMap<String, Node>,
+    nodes: &mut BTreeMap<String, NodeTopologyEvidence>,
     node: Node,
-) -> Result<(), IngressTopologyReason> {
-    let Some(name) = node.metadata.name.clone() else {
-        return Err(IngressTopologyReason::NodeTopologyIncomplete);
-    };
+) -> Result<bool, IngressTopologyReason> {
+    let evidence = NodeTopologyEvidence::from_node(&node)?;
+    let name = evidence.name.clone();
     if !nodes.contains_key(&name) && nodes.len() >= MAX_NODES {
         return Err(IngressTopologyReason::NodeSetTooLarge);
     }
-    nodes.insert(name, node);
-    Ok(())
+    if nodes.get(&name) == Some(&evidence) {
+        return Ok(false);
+    }
+    nodes.insert(name, evidence);
+    Ok(true)
 }
 
 async fn derive_and_publish<'a>(
     outcomes: &tokio::sync::watch::Sender<IngressTopologyOutcome>,
     validator: &IngressTopologyValidator,
-    nodes: impl Iterator<Item = &'a Node>,
+    nodes: impl Iterator<Item = &'a NodeTopologyEvidence>,
+    previous: Option<&TopologyRequirements>,
 ) -> Option<TopologyRequirements> {
-    let nodes: Vec<Node> = nodes.cloned().collect();
-    match requirements_from_nodes(
-        &nodes,
+    match requirements_from_evidence(
+        nodes,
         &validator.node_name,
         validator.capture_supports_ipv6,
     ) {
         Ok(requirements) => {
+            // Node heartbeats generate frequent Apply events. The projected
+            // evidence is cheap to rebuild, but procfs/sysfs validation is not:
+            // only a changed route requirement needs an event-driven host pass.
+            // The five-second interval remains the host-drift revalidation lane.
+            if previous == Some(&requirements) {
+                return Some(requirements);
+            }
             let outcome = validate_with_timeout(validator, requirements.clone()).await;
             outcomes.send_replace(outcome);
             Some(requirements)
@@ -818,6 +898,9 @@ fn publish_requirement_failure(
         }
         IngressTopologyReason::LocalNodeMissing => {
             "the local Node is absent from the complete Kubernetes Node snapshot"
+        }
+        IngressTopologyReason::NoRemoteTopologyEvidence => {
+            "no remote Node currently supplies an off-node route topology to prove"
         }
         IngressTopologyReason::FamilyUnproved => {
             "no observed remote PodCIDR family is supported by the configured capture listener"
@@ -1141,22 +1224,28 @@ pub fn requirements_from_nodes(
     if nodes.len() > MAX_NODES {
         return Err(IngressTopologyReason::NodeSetTooLarge);
     }
-    let mut local_found = false;
-    let mut remote_pod_cidrs = Vec::new();
-    let mut remote_node_addresses = Vec::new();
-    let mut observed_ipv4 = false;
-    let mut observed_ipv6 = false;
-    for node in nodes {
-        let Some(name) = node.metadata.name.as_deref() else {
-            return Err(IngressTopologyReason::NodeTopologyIncomplete);
-        };
-        if name == local_node_name {
-            local_found = true;
-            continue;
-        }
-        let Some(spec) = node.spec.as_ref() else {
-            return Err(IngressTopologyReason::NodeTopologyIncomplete);
-        };
+    let evidence = nodes
+        .iter()
+        .map(NodeTopologyEvidence::from_node)
+        .collect::<Result<Vec<_>, _>>()?;
+    requirements_from_evidence(evidence.iter(), local_node_name, capture_supports_ipv6)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeTopologyEvidence {
+    name: String,
+    ready: bool,
+    pod_cidrs: Vec<String>,
+    internal_ips: Vec<String>,
+}
+
+impl NodeTopologyEvidence {
+    fn from_node(node: &Node) -> Result<Self, IngressTopologyReason> {
+        let name = node
+            .metadata
+            .name
+            .clone()
+            .ok_or(IngressTopologyReason::NodeTopologyIncomplete)?;
         let ready = node
             .status
             .as_ref()
@@ -1165,77 +1254,87 @@ pub fn requirements_from_nodes(
                 conditions
                     .iter()
                     .find(|condition| condition.type_ == "Ready")
-            });
-        match ready.map(|condition| condition.status.as_str()) {
-            Some("True") => {}
-            Some("False") if safely_ignorable_unallocated_node(spec) => {
-                // This is the only safely ignorable registration shape: the
-                // control plane positively says an as-yet-unallocated Node is
-                // not Ready and scheduling is disabled. A Node with an assigned
-                // PodCIDR may already carry pods and is never ignored.
-                continue;
-            }
-            _ => return Err(IngressTopologyReason::NodeTopologyIncomplete),
-        }
-        let cidrs = spec
-            .pod_cidrs
-            .clone()
-            .or_else(|| spec.pod_cidr.clone().map(|cidr| vec![cidr]))
-            .unwrap_or_default();
-        if cidrs.is_empty() {
-            return Err(IngressTopologyReason::NodeTopologyIncomplete);
-        }
-        let mut node_cidrs = Vec::new();
-        for cidr in cidrs {
-            let cidr = IpCidr::parse(&cidr)?;
-            match cidr.family() {
-                IpFamily::Ipv4 => observed_ipv4 = true,
-                IpFamily::Ipv6 => observed_ipv6 = true,
-            }
-            if cidr.family() == IpFamily::Ipv4 || capture_supports_ipv6 {
-                push_requirement(
-                    &mut node_cidrs,
-                    cidr,
-                    remote_pod_cidrs.len() + remote_node_addresses.len(),
-                )?;
+            })
+            .is_some_and(|condition| condition.status == "True");
+        let mut pod_cidrs = Vec::new();
+        if let Some(spec) = node.spec.as_ref() {
+            if let Some(cidrs) = spec.pod_cidrs.as_ref() {
+                pod_cidrs.extend(cidrs.iter().take(MAX_REQUIREMENTS + 1).cloned());
+            } else if let Some(cidr) = spec.pod_cidr.as_ref() {
+                pod_cidrs.push(cidr.clone());
             }
         }
-        let addresses = node
+        if pod_cidrs.len() > MAX_REQUIREMENTS {
+            return Err(IngressTopologyReason::RequirementSetTooLarge);
+        }
+        let internal_ips = node
             .status
             .as_ref()
             .and_then(|status| status.addresses.as_ref())
             .into_iter()
-            .flatten();
-        let mut internal_ipv4 = Vec::new();
-        let mut internal_ipv6 = Vec::new();
-        for address in addresses {
-            if address.type_ != "InternalIP" {
-                continue;
+            .flatten()
+            .filter(|address| address.type_ == "InternalIP")
+            .take(MAX_REQUIREMENTS + 1)
+            .map(|address| address.address.clone())
+            .collect::<Vec<_>>();
+        if internal_ips.len() > MAX_REQUIREMENTS {
+            return Err(IngressTopologyReason::RequirementSetTooLarge);
+        }
+        Ok(Self {
+            name,
+            ready,
+            pod_cidrs,
+            internal_ips,
+        })
+    }
+}
+
+fn requirements_from_evidence<'a>(
+    nodes: impl Iterator<Item = &'a NodeTopologyEvidence>,
+    local_node_name: &str,
+    capture_supports_ipv6: bool,
+) -> Result<TopologyRequirements, IngressTopologyReason> {
+    let mut local_found = false;
+    let mut remote_pod_cidrs = Vec::new();
+    let mut remote_node_addresses = Vec::new();
+    let mut observed_ipv4 = false;
+    let mut observed_ipv6 = false;
+    let mut remote_evidence_found = false;
+    for node in nodes {
+        if node.name == local_node_name {
+            local_found = true;
+            continue;
+        }
+        if node.pod_cidrs.is_empty() {
+            if node.ready {
+                return Err(IngressTopologyReason::NodeTopologyIncomplete);
             }
-            let Ok(address) = address.address.parse::<IpAddr>() else {
-                continue;
+            continue;
+        }
+        let mut node_cidrs = Vec::new();
+        let mut node_cidr_invalid = false;
+        let mut node_observed_ipv6 = false;
+        for raw_cidr in &node.pod_cidrs {
+            let cidr = match IpCidr::parse(raw_cidr) {
+                Ok(cidr) => cidr,
+                Err(reason) if node.ready => return Err(reason),
+                Err(_) => {
+                    node_cidr_invalid = true;
+                    break;
+                }
             };
-            if !usable_internal_ip(address) {
-                continue;
-            }
-            match address {
-                IpAddr::V4(_) => push_unique_bounded(
-                    &mut internal_ipv4,
-                    address,
-                    remote_pod_cidrs.len()
+            node_observed_ipv6 |= cidr.family() == IpFamily::Ipv6;
+            if cidr.family() == IpFamily::Ipv4 || capture_supports_ipv6 {
+                if !remote_pod_cidrs.contains(&cidr) {
+                    let total = remote_pod_cidrs.len()
                         + remote_node_addresses.len()
-                        + node_cidrs.len()
-                        + internal_ipv6.len(),
-                )?,
-                IpAddr::V6(_) => push_unique_bounded(
-                    &mut internal_ipv6,
-                    address,
-                    remote_pod_cidrs.len()
-                        + remote_node_addresses.len()
-                        + node_cidrs.len()
-                        + internal_ipv4.len(),
-                )?,
+                        + node_cidrs.len();
+                    push_unique_bounded(&mut node_cidrs, cidr, total)?;
+                }
             }
+        }
+        if node_cidr_invalid {
+            continue;
         }
         let node_requires_ipv4 = node_cidrs
             .iter()
@@ -1243,30 +1342,57 @@ pub fn requirements_from_nodes(
         let node_requires_ipv6 = node_cidrs
             .iter()
             .any(|cidr| cidr.family() == IpFamily::Ipv6);
-        if (node_requires_ipv4 && internal_ipv4.is_empty())
-            || (node_requires_ipv6 && internal_ipv6.is_empty())
-        {
-            return Err(IngressTopologyReason::NodeTopologyIncomplete);
-        }
-        for cidr in node_cidrs {
-            push_unique_bounded(&mut remote_pod_cidrs, cidr, remote_node_addresses.len())?;
-        }
-        for address in internal_ipv4.into_iter().chain(internal_ipv6) {
-            if (address.is_ipv4() && node_requires_ipv4)
-                || (address.is_ipv6() && node_requires_ipv6)
-            {
-                push_unique_bounded(&mut remote_node_addresses, address, remote_pod_cidrs.len())?;
+        let mut node_addresses = Vec::new();
+        for raw_address in &node.internal_ips {
+            let Ok(address) = raw_address.parse::<IpAddr>() else {
+                continue;
+            };
+            if !usable_internal_ip(address) {
+                continue;
             }
+            let required_family = (address.is_ipv4() && node_requires_ipv4)
+                || (address.is_ipv6() && node_requires_ipv6);
+            if required_family && !remote_node_addresses.contains(&address) {
+                let total = remote_pod_cidrs.len()
+                    + remote_node_addresses.len()
+                    + node_cidrs.len()
+                    + node_addresses.len();
+                push_unique_bounded(&mut node_addresses, address, total)?;
+            }
+        }
+        if (node_requires_ipv4 && !node_addresses.iter().any(IpAddr::is_ipv4))
+            || (node_requires_ipv6 && !node_addresses.iter().any(IpAddr::is_ipv6))
+        {
+            if node.ready {
+                return Err(IngressTopologyReason::NodeTopologyIncomplete);
+            }
+            continue;
+        }
+        observed_ipv4 |= node_requires_ipv4;
+        observed_ipv6 |= node_observed_ipv6;
+        remote_evidence_found = true;
+        for cidr in node_cidrs {
+            let total = remote_pod_cidrs.len() + remote_node_addresses.len();
+            push_unique_bounded(&mut remote_pod_cidrs, cidr, total)?;
+        }
+        for address in node_addresses {
+            let total = remote_pod_cidrs.len() + remote_node_addresses.len();
+            push_unique_bounded(&mut remote_node_addresses, address, total)?;
         }
     }
     if !local_found {
         return Err(IngressTopologyReason::LocalNodeMissing);
+    }
+    if !remote_evidence_found {
+        return Err(IngressTopologyReason::NoRemoteTopologyEvidence);
     }
     let require_ipv4 = observed_ipv4;
     let require_ipv6 = observed_ipv6 && capture_supports_ipv6;
     if !require_ipv4 && !require_ipv6 {
         return Err(IngressTopologyReason::FamilyUnproved);
     }
+    remote_pod_cidrs.sort_by_key(|cidr| (cidr.address, cidr.prefix_len));
+    remote_node_addresses.sort_unstable();
     Ok(TopologyRequirements {
         remote_pod_cidrs,
         remote_node_addresses,
@@ -1275,29 +1401,15 @@ pub fn requirements_from_nodes(
     })
 }
 
-fn safely_ignorable_unallocated_node(spec: &k8s_openapi::api::core::v1::NodeSpec) -> bool {
-    spec.unschedulable == Some(true)
-        && spec.pod_cidr.is_none()
-        && spec.pod_cidrs.as_ref().is_none_or(Vec::is_empty)
-}
-
-fn push_requirement(
-    requirements: &mut Vec<IpCidr>,
-    value: IpCidr,
-    other_len: usize,
-) -> Result<(), IngressTopologyReason> {
-    push_unique_bounded(requirements, value, other_len)
-}
-
 fn push_unique_bounded<T: PartialEq>(
     requirements: &mut Vec<T>,
     value: T,
-    other_len: usize,
+    current_total: usize,
 ) -> Result<(), IngressTopologyReason> {
     if requirements.contains(&value) {
         return Ok(());
     }
-    if requirements.len() + other_len >= MAX_REQUIREMENTS {
+    if current_total >= MAX_REQUIREMENTS {
         return Err(IngressTopologyReason::RequirementSetTooLarge);
     }
     requirements.push(value);
@@ -1627,10 +1739,78 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn valid_interface_name(interface: &str) -> bool {
     !interface.is_empty()
+        && interface != "."
+        && interface != ".."
         && interface.len() <= 15
         && interface
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn structural_failure(reason: IngressTopologyReason) -> bool {
+    matches!(
+        reason,
+        IngressTopologyReason::NodeSetTooLarge | IngressTopologyReason::RequirementSetTooLarge
+    )
+}
+
+fn log_watch_error(
+    error: &kube_watcher::Error,
+    last_log: &mut Option<std::time::Instant>,
+    suppressed: &mut u64,
+) {
+    let now = std::time::Instant::now();
+    if last_log.is_some_and(|last| now.duration_since(last) < WATCH_ERROR_LOG_INTERVAL) {
+        *suppressed = suppressed.saturating_add(1);
+        return;
+    }
+    let (stage, class, status_code) = classify_watch_error(error);
+    tracing::warn!(
+        stage,
+        class,
+        status_code,
+        suppressed_since_last = *suppressed,
+        "Kubernetes Node topology watch failed; readiness remains withdrawn while kube-rs retries"
+    );
+    *last_log = Some(now);
+    *suppressed = 0;
+}
+
+fn classify_watch_error(error: &kube_watcher::Error) -> (&'static str, &'static str, u16) {
+    match error {
+        kube_watcher::Error::InitialListFailed(error) => {
+            let (class, code) = classify_client_error(error);
+            ("initial_list", class, code)
+        }
+        kube_watcher::Error::WatchStartFailed(error) => {
+            let (class, code) = classify_client_error(error);
+            ("watch_start", class, code)
+        }
+        kube_watcher::Error::WatchError(status) => {
+            ("watch_event", classify_status_code(status.code), status.code)
+        }
+        kube_watcher::Error::WatchFailed(error) => {
+            let (class, code) = classify_client_error(error);
+            ("watch_stream", class, code)
+        }
+        kube_watcher::Error::NoResourceVersion => ("resource_version", "protocol", 0),
+    }
+}
+
+fn classify_client_error(error: &kube::Error) -> (&'static str, u16) {
+    match error {
+        kube::Error::Api(status) => (classify_status_code(status.code), status.code),
+        _ => ("transport", 0),
+    }
+}
+
+fn classify_status_code(code: u16) -> &'static str {
+    match code {
+        401 | 403 => "authorization",
+        404 | 405 => "api_contract",
+        408 | 429 | 500..=599 => "transient_api",
+        _ => "api_error",
+    }
 }
 
 fn mask_ip(address: IpAddr, prefix_len: u8) -> IpAddr {
