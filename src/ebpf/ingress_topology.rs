@@ -369,7 +369,8 @@ impl IngressTopologyValidator {
                 if *shutdown_rx.borrow() {
                     break;
                 }
-                let mut stream = Box::pin(kube_watcher::watcher(nodes.clone(), watcher_config.clone()));
+                let mut stream =
+                    Box::pin(kube_watcher::watcher(nodes.clone(), watcher_config.clone()));
                 let mut active_nodes = BTreeMap::<String, Node>::new();
                 let mut initializing: Option<BoundedNodeSet> = None;
                 let mut requirements: Option<TopologyRequirements> = None;
@@ -661,10 +662,7 @@ impl NodeWatchCacheRecovery {
     }
 
     #[doc(hidden)]
-    pub fn on_invalid_snapshot(
-        &mut self,
-        reason: IngressTopologyReason,
-    ) -> NodeWatchCacheDecision {
+    pub fn on_invalid_snapshot(&mut self, reason: IngressTopologyReason) -> NodeWatchCacheDecision {
         self.invalid_reason = Some(reason);
         self.force_relist()
     }
