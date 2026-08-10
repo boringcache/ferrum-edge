@@ -237,16 +237,16 @@ fn udp_route_materializes_udp_stream_proxy_on_listener_port() {
 }
 
 #[test]
-fn udp_route_without_materialized_listener_falls_back_to_backend_port() {
+fn udp_route_without_materialized_listener_opens_no_listener() {
     let objects = [udp_route("dns", simple_rule("coredns", 5353))];
 
     let translated = translate_k8s_objects(&objects, options());
     let result = translated.expect("translation succeeds");
 
-    assert_eq!(result.config.proxies.len(), 1);
-    let proxy = &result.config.proxies[0];
-    assert_eq!(proxy.listen_port, Some(5353));
-    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
+    assert!(result.config.proxies.is_empty());
+    assert!(result.warnings.iter().any(|warning| {
+        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+    }));
 }
 
 #[test]
@@ -296,9 +296,13 @@ fn udp_route_rejects_non_service_backend_kind() {
     let objects = [udp_route("dns", spec)];
 
     let translated = translate_k8s_objects(&objects, options());
-    let err = translated.expect_err("only core Service backends");
+    let err = translated.expect_err("unsupported backendRef target kind fails closed");
 
-    assert!(err.to_string().contains("only core Service backendRefs"));
+    let message = err.to_string();
+    assert!(
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]
@@ -346,8 +350,23 @@ fn udp_route_cross_namespace_backend_ref_requires_reference_grant() {
             .contains("requires a matching ReferenceGrant")
     );
 
+    // A matching grant authorizes the backendRef, but UDPRoute still requires a
+    // valid attached Gateway listener before any proxy is materialized.
     let grant = reference_grant("allow-udproute", "UDPRoute");
-    let granted = [udp_route("dns", spec), grant];
+    let attached_cross_namespace = json!({
+        "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+        "rules": [{"backendRefs": [{
+            "name": "coredns",
+            "namespace": "backends",
+            "port": 5353
+        }]}]
+    });
+    let granted = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns", attached_cross_namespace),
+        grant,
+    ];
 
     let translated = translate_k8s_objects(&granted, multi_namespace_options());
     let result = translated.expect("a matching grant authorizes the ref");
@@ -514,6 +533,136 @@ fn udp_route_status_reports_unresolved_missing_backend() {
     );
 }
 
+#[test]
+fn udp_route_rejects_present_service_import_with_invalid_kind_status_parity() {
+    // A fully present TCP ServiceImport is still InvalidKind on UDPRoute:
+    // translation refuses non-Service backends and ResolvedRefs must not claim
+    // the inventory resolved (#3270 status/traffic parity).
+    let import = object_in(
+        "ServiceImport",
+        "multicluster.x-k8s.io/v1alpha1",
+        "default",
+        "dns-import",
+        json!({
+            "type": "ClusterSetIP",
+            "ports": [{ "port": 5353, "protocol": "TCP" }]
+        }),
+    );
+    let route = udp_route(
+        "dns",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{
+                "backendRefs": [{
+                    "group": "multicluster.x-k8s.io",
+                    "kind": "ServiceImport",
+                    "name": "dns-import",
+                    "port": 5353
+                }]
+            }]
+        }),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        import,
+        route,
+    ];
+
+    let err = translate_k8s_objects(&objects, options())
+        .expect_err("UDPRoute must reject ServiceImport backends");
+    let message = err.to_string();
+    assert!(message.contains(
+        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+    ));
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("InvalidKind")
+    );
+}
+
+#[test]
+fn udp_route_service_import_reference_grant_cannot_override_invalid_kind() {
+    // Fail-closed ordering: capability classification precedes ReferenceGrant.
+    // A grant for ServiceImport must not authorize a kind UDPRoute cannot
+    // materialize, and status must stay InvalidKind (not RefNotPermitted or
+    // ResolvedRefs=True).
+    let import = object_in(
+        "ServiceImport",
+        "multicluster.x-k8s.io/v1alpha1",
+        "backends",
+        "dns-import",
+        json!({
+            "type": "ClusterSetIP",
+            "ports": [{ "port": 5353, "protocol": "TCP" }]
+        }),
+    );
+    let grant = object_in(
+        "ReferenceGrant",
+        "gateway.networking.k8s.io/v1beta1",
+        "backends",
+        "allow-import",
+        json!({
+            "from": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "namespace": "default"
+            }],
+            "to": [{
+                "group": "multicluster.x-k8s.io",
+                "kind": "ServiceImport"
+            }]
+        }),
+    );
+    let route = udp_route(
+        "dns",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [{
+                "backendRefs": [{
+                    "group": "multicluster.x-k8s.io",
+                    "kind": "ServiceImport",
+                    "name": "dns-import",
+                    "namespace": "backends",
+                    "port": 5353
+                }]
+            }]
+        }),
+    );
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        import,
+        grant,
+        route,
+    ];
+
+    let err = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect_err("a ServiceImport grant must not authorize UDPRoute");
+    let message = err.to_string();
+    assert!(message.contains(
+        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+    ));
+    assert!(!message.contains("ReferenceGrant"));
+
+    let updates = plan_gateway_api_status_updates(&objects, multi_namespace_options(), &[]);
+    assert_eq!(
+        route_condition(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition_reason(&updates, "dns", "ResolvedRefs").as_deref(),
+        Some("InvalidKind")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Declared-parent fail-closed invariant (shared with TCPRoute / TLSRoute)
 // ---------------------------------------------------------------------------
@@ -631,12 +780,14 @@ fn tls_route_with_unknown_gateway_parent_opens_no_listener() {
 
 #[test]
 fn parentless_l4_routes_keep_the_backend_port_fallback() {
-    // The legacy parentless shape is unchanged: with no declared parent there
-    // is no parent status to contradict, so the backend port stays the listen
-    // port for both stream kinds.
+    // UDPRoute is Gateway API-only: a parentless shape opens no listener.
+    // Parentless TCPRoute/TLSRoute keep the legacy backend-port fallback.
     let udp_objects = [udp_route("dns", simple_rule("coredns", 5353))];
     let udp = translate_k8s_objects(&udp_objects, options()).expect("translation succeeds");
-    assert_eq!(udp.config.proxies[0].listen_port, Some(5353));
+    assert!(udp.config.proxies.is_empty());
+    assert!(udp.warnings.iter().any(|warning| {
+        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+    }));
 
     let tcp_route = l4_route(
         "TCPRoute",
@@ -645,6 +796,17 @@ fn parentless_l4_routes_keep_the_backend_port_fallback() {
     );
     let tcp = translate_k8s_objects(&[tcp_route], options()).expect("translation succeeds");
     assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
+
+    let tls_route = l4_route(
+        "TLSRoute",
+        "db",
+        json!({
+            "hostnames": ["db.example.com"],
+            "rules": [{"backendRefs": [{"name": "db", "port": 15443}]}]
+        }),
+    );
+    let tls = translate_k8s_objects(&[tls_route], options()).expect("translation succeeds");
+    assert_eq!(tls.config.proxies[0].listen_port, Some(15443));
 }
 
 #[test]
@@ -684,21 +846,6 @@ fn udp_route_with_only_non_gateway_parents_opens_no_listener() {
         let invalid_objects = [gateway_class(), udp_route("invalid-parent-refs", invalid)];
         assert_no_listener_for_declared_parent(&invalid_objects, 5353);
     }
-}
-
-#[test]
-fn non_gateway_parents_keep_the_tcp_route_fallback() {
-    // The stricter UDP rule above must not change shared TCPRoute/TLSRoute
-    // behavior: only a Gateway parent arms their fail-closed listener gate.
-    let spec = json!({
-        "parentRefs": [{"group": "", "kind": "Service", "name": "db"}],
-        "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
-    });
-    let objects = [gateway_class(), l4_route("TCPRoute", "db", spec)];
-    let tcp = translate_k8s_objects(&objects, options()).expect("translation succeeds");
-
-    assert_eq!(tcp.config.proxies.len(), 1);
-    assert_eq!(tcp.config.proxies[0].listen_port, Some(5432));
 }
 
 #[test]
@@ -999,7 +1146,11 @@ fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
     let err = translate_k8s_objects(&objects, options())
         .expect_err("an unsupported kind fails the rule closed");
 
-    assert!(err.to_string().contains("only core Service backendRefs"));
+    let message = err.to_string();
+    assert!(
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]
@@ -1037,7 +1188,11 @@ fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
     let err = translate_k8s_objects(&objects, options())
         .expect_err("an unsupported zero-weight target kind fails closed");
 
-    assert!(err.to_string().contains("only core Service backendRefs"));
+    let message = err.to_string();
+    assert!(
+        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+    );
+    assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
 
 #[test]
@@ -1874,13 +2029,15 @@ fn udp_route_on_two_listeners_shares_one_upstream_across_distinct_proxies() {
 #[test]
 fn udp_route_proxy_ids_do_not_collide_with_a_same_named_tcp_route() {
     // The historical L4 proxy id encodes only (namespace, name, rule index).
+    // Attach a real UDP Gateway so the UDPRoute materializes; parentless
+    // TCPRoute keeps the legacy backend-port fallback.
     let tcp = l4_route(
         "TCPRoute",
         "dns",
         json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
     );
-    let udp = udp_route("dns", simple_rule("coredns", 5353));
-    let objects = [tcp, udp];
+    let udp = udp_route("dns", attached_rule("edge", "dns", "coredns", 5353));
+    let objects = [gateway_class(), udp_gateway("edge", "dns", 15353), tcp, udp];
 
     let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 

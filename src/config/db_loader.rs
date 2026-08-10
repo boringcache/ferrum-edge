@@ -3792,7 +3792,7 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&pc.id)
         .bind(&pc.namespace)
@@ -3802,6 +3802,7 @@ impl DatabaseStore {
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.priority_override.map(|v| v as i32))
+        .bind(plugin_config_trigger_json(pc)?)
         .bind(pc.created_at.to_rfc3339())
         .bind(pc.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -3856,7 +3857,7 @@ impl DatabaseStore {
             return Ok(false);
         }
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
         .bind(&config_json)
@@ -3864,6 +3865,7 @@ impl DatabaseStore {
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.priority_override.map(|v| v as i32))
+        .bind(plugin_config_trigger_json(pc)?)
         .bind(pc.updated_at.to_rfc3339())
         .bind(&pc.id)
         .bind(&pc.namespace)
@@ -4973,37 +4975,6 @@ impl DatabaseStore {
                 return Ok(true);
             }
         }
-    }
-
-    /// Check if a listen_port is unique across all stream proxies.
-    /// Returns `true` if the port is unique (no conflicts found).
-    pub async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(
-                &self.q(
-                    "SELECT id FROM proxies WHERE namespace = ? AND listen_port = ? AND id != ?",
-                ),
-            )
-            .bind(namespace)
-            .bind(port as i32)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?
-        } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND listen_port = ?"))
-                .bind(namespace)
-                .bind(port as i32)
-                .fetch_all(&self.pool())
-                .await?
-        };
-        self.check_slow_query("check_listen_port_unique", start);
-        Ok(rows.is_empty())
     }
 
     /// Check if an upstream with the given ID exists in `namespace`.
@@ -6277,7 +6248,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -6297,6 +6268,7 @@ impl DatabaseStore {
                 .bind(&pc.proxy_id)
                 .bind(if pc.enabled { 1i32 } else { 0 })
                 .bind(pc.priority_override.map(|v| v as i32))
+                .bind(plugin_config_trigger_json(pc)?)
                 .bind(pc.created_at.to_rfc3339())
                 .bind(pc.updated_at.to_rfc3339())
                 .execute(&mut **tx)
@@ -7699,8 +7671,8 @@ impl DatabaseStore {
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
                  (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
-                  priority_override, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  priority_override, trigger_json, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -7709,6 +7681,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
+            .bind(plugin_config_trigger_json(pc)?)
             .bind(api_spec_id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
@@ -8145,8 +8118,8 @@ impl DatabaseStore {
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
                  (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
-                  priority_override, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  priority_override, trigger_json, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -8155,6 +8128,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
+            .bind(plugin_config_trigger_json(pc)?)
             .bind(&spec.id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
@@ -9734,15 +9708,6 @@ impl DatabaseBackend for DatabaseStore {
             .await
     }
 
-    async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_proxy_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
-    }
-
     async fn check_upstream_exists(
         &self,
         upstream_id: &str,
@@ -10476,6 +10441,18 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
     })
 }
 
+/// Serialize the optional per-instance execution trigger for the
+/// `plugin_configs.trigger_json` column.
+///
+/// `None` is stored as SQL `NULL` so an untriggered instance keeps exactly the
+/// historical row shape and the loader cannot mistake `"null"` for a trigger.
+fn plugin_config_trigger_json(pc: &PluginConfig) -> Result<Option<String>, anyhow::Error> {
+    match pc.trigger.as_ref() {
+        Some(trigger) => Ok(Some(serde_json::to_string(trigger)?)),
+        None => Ok(None),
+    }
+}
+
 /// Parse a plugin_config row into a PluginConfig struct.
 fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let id_preview: String = row
@@ -10513,6 +10490,27 @@ fn row_to_plugin_config_inner(
         )
     })?;
 
+    let trigger = optional_utf8_text_column(row, "trigger_json").map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to read trigger_json column: {}",
+            id_preview,
+            e
+        )
+    })?;
+    let trigger = match trigger {
+        // A stored trigger that no longer parses is a fail-closed error, not a
+        // silently untriggered instance: dropping it would run a plugin the
+        // operator scoped away.
+        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "PluginConfig {}: failed to parse trigger JSON: {}",
+                id_preview,
+                e
+            )
+        })?),
+        None => None,
+    };
+
     Ok(PluginConfig {
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
@@ -10530,6 +10528,7 @@ fn row_to_plugin_config_inner(
             .ok()
             .flatten()
             .map(|v| v.clamp(0, 10_000) as u16),
+        trigger,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.

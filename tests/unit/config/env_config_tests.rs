@@ -522,6 +522,68 @@ fn test_env_config_mesh_mode_missing_grpc_url() {
     );
 }
 
+/// The stock xDS interoperability profile (issue #3317) must be an accepted
+/// `FERRUM_MESH_CONFIG_PROTOCOL` value at the single configuration boundary.
+/// `MeshRuntimeConfig::from_env_config` never runs if `EnvConfig::validate`
+/// already refused the value, so a missing arm here makes the whole profile
+/// unstartable in production while every in-process test still passes.
+#[test]
+fn test_env_config_mesh_mode_stock_xds_requires_the_local_policy_document() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "stock_xds"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_FILE_CONFIG_PATH");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let error = EnvConfig::from_env()
+                .expect_err("stock_xds without its policy document must fail closed");
+            assert!(
+                error.contains("FERRUM_MESH_FILE_CONFIG_PATH"),
+                "stock_xds must be refused for the missing POLICY DOCUMENT, got: {error}"
+            );
+            assert!(
+                !error.contains("Invalid FERRUM_MESH_CONFIG_PROTOCOL"),
+                "stock_xds must be a recognized protocol value, got: {error}"
+            );
+        },
+    );
+}
+
+/// A stock control plane is a third party: `stock_xds` dials
+/// `FERRUM_MESH_STOCK_XDS_URLS` and must never be asked for — or present — the
+/// Ferrum CP/DP credentials.
+#[test]
+fn test_env_config_mesh_mode_stock_xds_needs_no_ferrum_cp_credentials() {
+    // `validate()` only checks that the path is CONFIGURED; the document itself
+    // is read later, by the mesh runtime.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "stock_xds"),
+            ("FERRUM_MESH_FILE_CONFIG_PATH", "/etc/ferrum/mesh.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            // Later mesh validation (CA backend, workload identity) may still
+            // reject this minimal env; what must NOT happen is a refusal for a
+            // Ferrum control-plane URL or secret neither this protocol nor its
+            // client ever consumes.
+            if let Err(error) = EnvConfig::from_env() {
+                assert!(
+                    !error.contains("FERRUM_DP_CP_GRPC_URLS")
+                        && !error.contains("FERRUM_CP_DP_GRPC_JWT_SECRET")
+                        && !error.contains("Invalid FERRUM_MESH_CONFIG_PROTOCOL"),
+                    "stock_xds must not require Ferrum CP/DP credentials, got: {error}"
+                );
+            }
+        },
+    );
+}
+
 #[test]
 fn test_env_config_mesh_mode_missing_jwt_secret() {
     with_env_vars(
@@ -784,6 +846,119 @@ fn test_env_config_mesh_mode_gateway_svid_takes_precedence_over_ca_backend() {
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
+    // Mesh startup deliberately suppresses automatic CA-backed issuance when
+    // any explicit file SVID path is present. Validation must reject that
+    // combination before accepting a Workload API surface with no issuer.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            let error = EnvConfig::from_env().expect_err(
+                "file SVID override must not leave an enabled Workload API without an issuer",
+            );
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED"));
+            assert!(error.contains("FERRUM_GATEWAY_SVID"));
+            assert!(error.contains("overrides automatic CA-backed issuance"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+            (
+                "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES",
+                "uid:not-a-number=spiffe://cluster.local/ns/default/sa/app",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject an attestor rule startup cannot parse");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES"));
+            assert!(error.contains("not a numeric uid"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_requires_available_attestor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            remove_var("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject a Workload API with no usable attestor");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED=true"));
+            assert!(error.contains("requires at least one attestor"));
         },
     );
 }
@@ -1978,6 +2153,233 @@ fn test_env_config_cp_rejects_surrounding_whitespace_in_mesh_config_authority() 
                 !error.contains("\" db\""),
                 "the rejected value must not be echoed"
             );
+        },
+    );
+}
+
+/// `k8s` (and any `k8s:...` form) names the Kubernetes `resourceVersion`
+/// ordering domain. A change-log control plane that claimed it would advertise
+/// `config_changes` sequences under a name Kubernetes data planes treat as
+/// comparable — a cross-domain ordering claim no gate can detect, because
+/// comparability is exactly what an equal authority asserts (issue #3611).
+#[test]
+fn test_env_config_cp_rejects_the_reserved_kubernetes_authority_domain() {
+    for reserved in ["k8s", "k8s:east-2"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "cp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "admin-secret-padding-32-chars!!!",
+                ),
+                ("FERRUM_DB_TYPE", "postgres"),
+                ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+                ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "grpc-secret-padding-32-char-min!",
+                ),
+                ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+                ("FERRUM_MESH_CONFIG_AUTHORITY_ID", reserved),
+            ],
+            || {
+                let error =
+                    EnvConfig::from_env().expect_err("the reserved domain must fail closed");
+                assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+                assert!(error.contains("reserved"));
+            },
+        );
+    }
+
+    // A merely similar id is a distinct, legitimate ordering domain.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", "k8sconfig"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a similar id is not the reserved domain");
+            assert_eq!(config.mesh_config_authority_id, "k8sconfig");
+        },
+    );
+}
+
+/// The Kubernetes domain is COMPOSED (`k8s:<qualifier>`), so it is validated
+/// through the composed value — that is what a data plane orders against and
+/// what the bounded diagnostics render (issue #3611).
+#[test]
+fn test_env_config_k8s_cp_validates_the_composed_kubernetes_authority() {
+    let oversized = "q".repeat(129);
+    for (qualifier, expected_fragment) in [
+        ("east\n2", "control-character-free"),
+        (" east-2", "no surrounding whitespace"),
+        (oversized.as_str(), "128 bytes"),
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "cp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "admin-secret-padding-32-chars!!!",
+                ),
+                ("FERRUM_DB_TYPE", "postgres"),
+                ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+                ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "grpc-secret-padding-32-char-min!",
+                ),
+                ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+                ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+                ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", qualifier),
+            ],
+            || {
+                let error = EnvConfig::from_env()
+                    .expect_err("an ill-formed Kubernetes authority must fail closed");
+                assert!(error.contains("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID"));
+                assert!(
+                    error.contains(expected_fragment),
+                    "expected {expected_fragment:?} in {error}"
+                );
+                assert!(
+                    !error.contains(qualifier.trim()),
+                    "the rejected value must not be echoed"
+                );
+            },
+        );
+    }
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east-2"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a well-formed qualifier is accepted");
+            assert_eq!(config.mesh_config_k8s_authority_id, "east-2");
+            // The change-log id keeps its default and stays the on/off switch.
+            assert_eq!(config.mesh_config_authority_id, "db");
+        },
+    );
+}
+
+/// The Kubernetes qualifier is a DIFFERENT variable from the one that disables
+/// publication, so disabling publication must not turn it into an unchecked
+/// input (issue #3611). Accepting an ill-formed ordering-domain name while
+/// `FERRUM_MESH_CONFIG_AUTHORITY_ID` is empty would defer the startup failure
+/// to whenever an operator re-enables publication — typically during the
+/// incident that made them disable it in the first place.
+#[test]
+fn test_env_config_k8s_cp_validates_the_qualifier_even_when_publication_is_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            // Publication disabled on either ordering domain.
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east\n2"),
+        ],
+        || {
+            let error = EnvConfig::from_env()
+                .expect_err("an ill-formed qualifier must fail closed even while disabled");
+            assert!(error.contains("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID"));
+            assert!(
+                !error.contains("east"),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+
+    // A well-formed qualifier still starts, and publication stays disabled.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "true"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+            ("FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID", "east-2"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("a well-formed qualifier is accepted");
+            assert_eq!(config.mesh_config_k8s_authority_id, "east-2");
+            assert_eq!(config.mesh_config_authority_id, "");
+        },
+    );
+
+    // An empty change-log authority on a NON-Kubernetes CP still disables
+    // publication without being validated as an authority.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", ""),
+        ],
+        || {
+            let config =
+                EnvConfig::from_env().expect("an empty change-log authority disables publication");
+            assert_eq!(config.mesh_config_authority_id, "");
         },
     );
 }
@@ -4613,6 +5015,31 @@ fn test_reserved_gateway_ports_extracts_ipv6_grpc_port() {
             let config = EnvConfig::from_env().unwrap();
             let ports = config.reserved_gateway_ports();
             assert!(ports.contains(&50051), "should contain IPv6 CP gRPC port");
+        },
+    );
+}
+
+#[test]
+fn test_reserved_gateway_ports_includes_ambient_host_udp_capture_socket() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_MESH_TOPOLOGY", "ambient"),
+            ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED", "true"),
+            ("FERRUM_MESH_CAPTURE_UDP_PORT", "15011"),
+        ],
+        || {
+            let mut config = EnvConfig::from_env().unwrap();
+            // `reserved_gateway_ports` is shared by every mode; exercise the
+            // mesh-only branch without requiring a full mesh startup fixture.
+            config.mode = OperatingMode::Mesh;
+            assert!(
+                config.reserved_gateway_ports().contains(&15011),
+                "Ambient host placement binds the shared capture socket in the \
+                 proxy's own namespace and must reserve it from stream listeners"
+            );
         },
     );
 }

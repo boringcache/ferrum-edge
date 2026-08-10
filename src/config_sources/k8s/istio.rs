@@ -16,8 +16,10 @@ use crate::modes::mesh::config::{
     PortPatternAdmission, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
     ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
-    admit_request_match_port_pattern, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    mesh_condition_has_values, validate_mesh_condition_ip_block, validate_mesh_export_to,
+    admit_request_match_port_pattern, validate_mesh_condition, validate_mesh_export_to,
+};
+use crate::modes::mesh::metric_tag_cel::{
+    parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
 };
 
 use super::{
@@ -517,6 +519,17 @@ fn mesh_rules(
         let conditions = when_value
             .as_array()
             .ok_or_else(|| invalid_resource(object, "rules[].when must be an array"))?;
+        // Bound the externally supplied condition list: `when[]` is conjunctive
+        // and walked in order on every request that reaches the rule.
+        if conditions.len() > crate::modes::mesh::config::MAX_MESH_RULE_CONDITIONS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "rules[].when supports at most {} entries",
+                    crate::modes::mesh::config::MAX_MESH_RULE_CONDITIONS
+                ),
+            ));
+        }
         for (index, condition) in conditions.iter().enumerate() {
             when.push(condition_match(object, index, condition)?);
         }
@@ -853,49 +866,31 @@ fn condition_match(
     let key = string_field(value, "key").ok_or_else(|| {
         invalid_resource(object, format!("rules[].when[{index}].key is required"))
     })?;
-    if !is_supported_mesh_condition_key(key) {
-        return Err(invalid_resource(
-            object,
-            format!("rules[].when[{index}].key '{key}' is unsupported"),
-        ));
-    }
-    let values = string_array(value, "values");
-    let not_values = string_array(value, "notValues");
     let condition = ConditionMatch {
         key: key.to_string(),
-        values,
-        not_values,
+        values: string_array(value, "values"),
+        not_values: string_array(value, "notValues"),
     };
-    if !mesh_condition_has_values(&condition) {
+    // One shared contract for every configuration surface (Kubernetes here,
+    // file/native `MeshConfig` validation, and the `mesh_authz` construction
+    // gate). Documented Istio keys Ferrum cannot source are ADMITTED here on
+    // purpose: rejecting the resource drops the whole AuthorizationPolicy,
+    // which is fail-OPEN for a DENY. The evaluator applies Istio's explicit
+    // unsourceable-attribute semantics instead — see
+    // `crate::modes::mesh::policy::condition_kind_is_sourceable`.
+    if let Err(issues) = validate_mesh_condition(&condition)
+        && let Some(issue) = issues.first()
+    {
         return Err(invalid_resource(
             object,
-            format!("rules[].when[{index}].key '{key}' must set values or notValues"),
+            format!(
+                "rules[].when[{index}].{} {}",
+                issue.istio_path(),
+                issue.reason
+            ),
         ));
     }
-    if is_mesh_condition_ip_key(key) {
-        validate_condition_ip_blocks(object, index, "values", &condition.values)?;
-        validate_condition_ip_blocks(object, index, "notValues", &condition.not_values)?;
-    }
     Ok(condition)
-}
-
-fn validate_condition_ip_blocks(
-    object: &K8sObject,
-    condition_index: usize,
-    field: &str,
-    values: &[String],
-) -> Result<(), K8sTranslateError> {
-    for (value_index, value) in values.iter().enumerate() {
-        validate_mesh_condition_ip_block(value).map_err(|error| {
-            invalid_resource(
-                object,
-                format!(
-                    "rules[].when[{condition_index}].{field}[{value_index}] '{value}' is invalid: {error}"
-                ),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn peer_authentication(
@@ -1039,12 +1034,13 @@ fn sidecar(
     }
 
     // `spec.ingress[]` — custom inbound listeners. Each entry MUST declare a
-    // `port.number` and a `defaultEndpoint`; everything else is optional. We
+    // `port.number`; `defaultEndpoint` and everything else are optional. We
     // translate the entry shape here (parse + validate the required fields) and
-    // defer the routable/unsupported decision (Unix sockets, non-HTTP-family,
-    // arbitrary IPs) to `MeshSidecarIngress::resolve` at slice build, so the
-    // status writer can keep unsupported entries in `deferred_fields` while
-    // accepting the resource.
+    // defer the routable/unsupported decision (admissible vs. inadmissible Unix
+    // paths, non-HTTP-family protocols, arbitrary IPs, or an omitted endpoint)
+    // to `MeshSidecarIngress::resolve` at slice build, so the status writer can
+    // keep unsupported entries in `deferred_fields` while accepting the
+    // resource.
     let mut ingress = Vec::new();
     // Istio distinguishes an OMITTED `ingress` block (keep automatic
     // per-service-port inbound defaults) from a DECLARED one — including an
@@ -5136,6 +5132,7 @@ fn route_mirror_plugin(
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -5618,6 +5615,7 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -6366,12 +6364,12 @@ fn telemetry(
                                 .unwrap_or("");
                             let operation = match op {
                                 "REMOVE" => TagOverrideOperation::Remove,
-                                "UPSERT" => {
-                                    let value = telemetry_metric_upsert_literal(
-                                        object, tag_name, tag_spec,
-                                    )?;
-                                    TagOverrideOperation::Set { value }
-                                }
+                                "UPSERT" => telemetry_metric_upsert_operation(
+                                    object,
+                                    tag_name,
+                                    tag_spec,
+                                    matched_metric,
+                                )?,
                                 "" => {
                                     return Err(invalid_resource(
                                         object,
@@ -6463,16 +6461,16 @@ fn telemetry(
     })
 }
 
-fn telemetry_metric_upsert_literal(
+fn telemetry_metric_upsert_operation(
     object: &K8sObject,
     tag_name: &str,
     tag_spec: &Value,
-) -> Result<String, K8sTranslateError> {
+    matched_metric: &str,
+) -> Result<TagOverrideOperation, K8sTranslateError> {
     let expression = tag_spec
         .get("value")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             invalid_resource(
                 object,
@@ -6481,14 +6479,37 @@ fn telemetry_metric_upsert_literal(
                 ),
             )
         })?;
-    serde_json::from_str::<String>(expression).map_err(|_| {
+    if let Ok(value) = serde_json::from_str::<String>(expression.trim()) {
+        return Ok(TagOverrideOperation::Set { value });
+    }
+    let compiled = parse_metric_tag_cel_expression(expression).map_err(|message| {
+        // Parser diagnostics are field-specific and never echo expression text.
         invalid_resource(
             object,
-            format!(
-                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value must be a double-quoted string literal; CEL expressions are unsupported"
+            message.replace(
+                "Telemetry metrics.overrides[].tagOverrides UPSERT",
+                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
             ),
         )
+    })?;
+    let includes_tcp = metric_selector_includes_tcp(matched_metric);
+    validate_metric_tag_cel_for_families(&compiled, includes_tcp).map_err(|message| {
+        invalid_resource(
+            object,
+            message.replace(
+                "Telemetry metrics.overrides[].tagOverrides UPSERT",
+                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
+            ),
+        )
+    })?;
+    Ok(TagOverrideOperation::SetExpr {
+        expression: compiled,
     })
+}
+
+fn metric_selector_includes_tcp(metric: &str) -> bool {
+    let upper = metric.trim().to_ascii_uppercase();
+    upper == "ALL_METRICS" || upper.starts_with("TCP_") || upper.starts_with("FERRUM_MESH_TCP_")
 }
 
 fn telemetry_sampling_percentage(
@@ -20728,7 +20749,9 @@ extensionProviders:
         assert_eq!(sc.ingress[0].name.as_deref(), Some("https"));
         assert_eq!(sc.ingress[0].bind.as_deref(), Some("127.0.0.1"));
         assert_eq!(sc.ingress[0].default_endpoint, "127.0.0.1:8080");
-        // The unix-socket entry is parsed (deferred later), not rejected.
+        // The unix-socket entry is parsed for later Sidecar resolution; an
+        // admissible path is materialized when the data plane enables an
+        // allowed containment root, while an inadmissible path is deferred.
         assert_eq!(sc.ingress[1].port, 9000);
         assert_eq!(sc.ingress[1].default_endpoint, "unix:///var/run/grpc.sock");
     }

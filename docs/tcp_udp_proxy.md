@@ -128,7 +128,7 @@ proxies:
     backend_port: 443
 ```
 
-**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default.
+**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default. The same routing plane is available on ordinary opaque `tcp` listeners — see [Opaque TLS SNI routing](#opaque-tls-sni-routing).
 
 ```yaml
 proxies:
@@ -166,7 +166,7 @@ proxies:
 - Backend TLS fields (`backend_tls_client_cert_path`, etc.) cannot be set — the proxy does not originate its own TLS
 - Plugins that require decrypted content cannot run; connection-level plugins (IP restriction, rate limiting, logging, throttle) still operate normally
 - SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins (TLS/DTLS passthrough ClientHello peek, TCP TLS termination, and DTLS termination)
-- When sharing a port, all proxies must have `passthrough: true`, hosts must not overlap, and at most one catch-all (empty `hosts`) is allowed
+- When sharing a port, every proxy must agree on `passthrough`, no two proxies may tie inside one routing tier, and at most one catch-all (empty `hosts`) is allowed — see [Conflict rejection](#opaque-tls-sni-routing)
 
 **What's available in passthrough logs:**
 - Client IP/port, backend IP/port
@@ -174,6 +174,81 @@ proxies:
 - Bytes transferred (both directions)
 - Connection duration, timestamps
 - Connection success/failure
+
+### Opaque TLS SNI routing
+
+SNI routing is not limited to `passthrough: true`. Any **opaque** stream listener — one that terminates nothing — can select its backend from the client's TLS `server_name`. A listener is opaque when it is either `passthrough: true` (any stream scheme) or an ordinary `tcp` listener with `frontend_tls: false`; such a listener already relays client bytes verbatim, so the ClientHello reaches the backend untouched.
+
+Declaring `hosts` on an opaque listener turns it into an SNI route. Two ordinary `tcp` proxies may therefore share one port when they are distinguished only by SNI:
+
+```yaml
+proxies:
+  - id: "tenant-a"
+    listen_port: 8443
+    backend_scheme: tcp            # opaque relay; frontend_tls stays false
+    hosts: ["tenant-a.example.com"]
+    backend_host: "a.internal"
+    backend_port: 443
+
+  - id: "tenant-b"
+    listen_port: 8443
+    backend_scheme: tcp
+    hosts: ["*.tenant-b.example.com"]
+    backend_host: "b.internal"
+    backend_port: 443
+
+  # Optional: exactly one default route for hostnames no tier claims.
+  - id: "default-route"
+    listen_port: 8443
+    backend_scheme: tcp
+    hosts: []
+    backend_host: "default.internal"
+    backend_port: 443
+```
+
+**Route precedence** (absolute, not declaration order):
+
+1. **Exact** host match.
+2. **Wildcard** match (`*.example.com` matches any DNS name below `example.com`, but not `example.com` itself).
+3. **Catch-all / default** — the one proxy on the port with empty `hosts`.
+4. No tier matched and no default declared → the connection is closed. No backend is resolved, dialed, health-scored, or circuit-breaker-charged.
+
+Candidates that also carry Istio `stream_match` L4 predicates are evaluated in declaration order (VirtualService first-match-wins) with SNI ANDed onto each rule, instead of the tier ladder.
+
+**Normalization.** Configured `hosts` are validated as lowercase ASCII DNS names with no trailing dot, no port, and no scheme; the wire `server_name` is ASCII-lowercased before comparison. IDNA is an **A-label contract on both sides**: put punycode (`xn--…`) in `hosts`, because a non-ASCII `server_name` is not a representable SNI and a U-label in `hosts` is a config error.
+
+**ClientHello peek bounds.** The peek is non-consuming (`TcpStream::peek`), so every inspected byte still reaches the selected backend — TLS is never terminated, and no byte is rewritten or dropped. A ClientHello fragmented across TCP segments or across TLS records is reassembled. The peek is bounded two ways:
+
+- **Time** — `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (the same deadline that bounds terminating handshakes). `0` disables the clock; the peek then takes a small bounded number of attempts instead.
+- **Bytes** — a hard 16 KiB cap (one maximum TLS record). A hello that has not completed within the cap is refused rather than parsed from a prefix.
+
+**Fail-closed admission.** What the peek concludes decides admission:
+
+| ClientHello peek result | Behavior |
+|---|---|
+| `server_name` present and representable | Route through the precedence ladder above |
+| Complete, well-formed hello with no `server_name` | Route to the default route only; closed if none is declared |
+| Provably **not** TLS (first byte is not a handshake record, or the first handshake message is not a ClientHello) | **Closed**, unless `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK=true` — then routed to the default route |
+| Timed out, exceeded the 16 KiB cap, ended early, malformed, or a `server_name` this gateway cannot represent | **Closed, always** |
+
+The last row is the security boundary: such a connection may have declared *any* tenant's hostname, so quietly sending it to the default route would be a cross-tenant downgrade. `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` deliberately does **not** rescue it — it authorizes only the determinate non-TLS case, for ports intentionally shared with direct plaintext TCP clients.
+
+A port whose candidates declare no `hosts` at all is not SNI-routed and none of this applies: it is a plain relay that accepts every connection. A lone `passthrough: true` listener there still peeks the ClientHello to populate `sni_hostname` for stream lifecycle plugins and logs, but that peek never gates admission; a lone ordinary `tcp` listener does not peek at all.
+
+**Conflict rejection.** Config admission rejects only what the ladder cannot resolve, so a tie inside one tier is an error while a cross-tier pair is not:
+
+| Pair on one port | Verdict |
+|---|---|
+| same exact host twice | rejected — one hostname, two owners |
+| two wildcards that can both match some name (equal, or one nested below the other) | rejected |
+| an exact host and a wildcard that covers it (`api.example.com` + `*.example.com`) | **allowed** — exact wins |
+| a named host and the catch-all | **allowed** — the catch-all is the last tier |
+| two catch-alls | rejected — one default route per port |
+| mixed `passthrough` on one port | rejected — the shared socket is built from one representative before any route is selected |
+
+Candidates that all carry `stream_match` are exempt from the tie rules: their declaration order makes first-match deterministic.
+
+`hosts` on a stream listener that *cannot* read a ClientHello — `frontend_tls: true`, `tcps` (backend TLS origination), or non-passthrough `udp`/`dtls` — is a validation error with a field-specific diagnostic, rather than silently inert config that looks like an admission restriction but is not.
 
 ### Frontend TLS Termination (TCP)
 
@@ -391,7 +466,7 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A watchdog compares the last activity timestamp against the timeout. It ticks every 1 second for sub-30s timeouts and every 5 seconds for 30s+ timeouts, reducing timer churn for production-length connections
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. Frontend-TLS TCP connections currently **retain the userspace rustls relay** even when `FERRUM_KTLS_ENABLED=auto`/`true` and the kernel `tls` module is loaded: the buffered tokio-rustls `TlsStream` cannot prove inbound TLS record alignment before secret extraction (issue #2955 — silent plaintext loss or deframer desync). Kernel kTLS splice will only be re-enabled from an unbuffered rustls handshake that reaches `WriteTraffic` before `dangerous_into_kernel_connection`. Plaintext-to-plaintext splice is unaffected. Stream transaction summaries report `splice=false` for frontend-TLS relays while this gate is in effect.
+- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. Frontend-TLS TCP connections use `splice(2)` too when — and only when — the TLS session can be handed to the kernel TLS ULP; see "Frontend-TLS kTLS splice" below. Every connection that cannot be handed off keeps the userspace rustls relay and reports `splice=false` in its stream transaction summary.
 - TLS userspace relays additionally collapse to `tokio::io::copy_bidirectional_with_sizes` (no per-direction tracking) when the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`); any non-zero bound opts into the direction-tracking copy path
 
 ```yaml
@@ -424,6 +499,279 @@ Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement f
 
 **Splice/kTLS paths**: The per-direction inactivity timeouts apply to the Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths too. Each direction carries a watermark refreshed on every successful splice syscall (read or write), and the same watchdog cadence (1 s under 30 s timeouts, 5 s otherwise) checks them. For the io_uring path the watermark is polled inline inside the blocking worker; on timeout the worker returns a sentinel error and the parent issues a `shutdown(SHUT_RDWR)` to unblock the other worker if needed. Successfully delivered bytes are preserved on EOF, idle timeout, per-direction read/write timeout, cancellation, and I/O/setup errors — the io_uring and libc-fallback workers return `bytes_so_far` with the error so metrics and `StreamTransactionSummary` still reflect volume transferred before the ending (issue #2957).
 
+## Frontend-TLS kTLS Splice
+
+`FERRUM_KTLS_ENABLED=auto|true` lets a TLS-terminating TCP proxy hand its
+session keys to the Linux kernel TLS ULP so the relay can use `splice(2)`
+instead of decrypting in userspace. This is a pure optimization: **every**
+connection that cannot be handed off safely keeps the userspace rustls relay
+and is never dropped for it.
+
+### What is supported
+
+| Axis | Supported | Everything else |
+| --- | --- | --- |
+| Platform | Linux with the `tls` kernel module (`modprobe tls`) | userspace relay |
+| TLS version | **TLS 1.2 only** | userspace relay |
+| Cipher | `ECDHE_{RSA,ECDSA}_WITH_CHACHA20_POLY1305_SHA256` (Linux 5.11+), gated on its own startup probe. TLS 1.2 AES-GCM suites stay on the userspace rustls relay — Linux cannot establish a race-free receive-record bound after accept (`FIONREAD` omits out-of-order skbs) | userspace relay |
+| Backend | plain `tcp` backend | userspace relay |
+| Plugins | no plugin requesting decrypted first bytes | userspace relay |
+| Frontend mode | terminating `tcp_tls` (not `passthrough`) | unchanged |
+
+TLS 1.3 is **refused, not approximated**. The kernel holds a static copy of the
+application traffic secret and this gateway does not implement KeyUpdate
+(RFC 8446 §4.6.3) rekeying, so a TLS 1.3 client is declined before any
+handshake work — detected from the `supported_versions` extension in the
+peeked ClientHello — and served by the userspace relay instead.
+
+### Why the handoff is safe (issues #2955, #3619)
+
+`ServerConnection::dangerous_extract_secrets` silently discards
+decrypted-but-unread plaintext and any residual bytes in rustls's private
+inbound deframer. Because kTLS resumes decryption straight off the socket at
+the extracted `rx` sequence number, either would corrupt the stream — and
+neither is observable through the buffered tokio-rustls API, which is why
+issue #2955 pinned that path closed.
+
+The handshake therefore runs on `rustls::server::UnbufferedServerConnection`
+(`src/proxy/ktls_accept.rs`), whose input buffer is owned by the gateway, and
+the gateway reads **one whole TLS record at a time, only while rustls reports
+`BlockedHandshake`**. Reaching `ConnectionState::WriteTraffic` then proves all
+three preconditions at once:
+
+1. no decrypted plaintext is staged (`ReadTraffic`/`ReadEarlyData` would have
+   been emitted first),
+2. no outbound record is pending (`EncodeTlsData`/`TransmitTlsData` would have
+   been emitted first, and `dangerous_into_kernel_connection` re-checks), and
+3. the gateway-owned inbound buffer is empty and the socket is positioned on a
+   record boundary.
+
+A client that coalesces application data behind its handshake tail simply
+leaves that record in the kernel receive queue, where the kTLS record layer
+picks it up — the exact case that motivated #2955.
+
+### Fallback contract
+
+Eligibility is decided from a **peeked** (never consumed) ClientHello, so all
+of the following decline with the socket byte-for-byte intact and the ordinary
+buffered tokio-rustls accept takes over: secret extraction not enabled on the
+listener, no kernel cipher probe passed, no complete ClientHello observable
+before `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, a TLS 1.3 offer, any
+selectable AES-GCM suite in the offer set (finite confidentiality limit), an
+offer set containing any suite this kernel cannot install for the remaining
+unlimited ChaCha20-Poly1305 path, a `server_name` extension whose hostname this
+path cannot reproduce as faithfully as `ServerConnection::server_name()` would
+(see "Observability and semantics"), or a `TCP_ULP` install failure.
+`TCP_ULP` is installed *before* the handshake precisely so its
+failure is still recoverable; with no keys installed the ULP is the kernel's
+transparent `TLS_BASE` variant, so the userspace relay on the decline path is
+unaffected.
+
+`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` is **one budget for the whole
+frontend admission**, not one allowance per stage. The deadline is opened once
+in `accept_frontend_tls` and shared by the ClientHello peek, the unbuffered
+kTLS handshake, and the buffered fallback, so a peer that dribbles a partial
+hello cannot spend the budget on the kTLS attempt and then be granted a fresh
+full timer on the fallback. A refusal made before the point of no return
+records no handshake metric and leaves the socket pristine; the timeout/failure
+metric is recorded exactly once, by whichever path actually terminates the
+connection.
+
+Handshake failures, peer I/O errors, and handshake timeouts terminate the
+connection exactly as they would on the buffered path, with the same
+`StreamSetupKind::FrontendTlsHandshake` attribution and the same mesh mTLS
+handshake metrics. The one residual unrecoverable window is a failing
+`setsockopt(SOL_TLS, TLS_TX/TLS_RX)` *after* the handshake completed and
+rustls's session was consumed — guarded by the startup per-cipher probe (an
+identical install on a real loopback socket) plus the pre-handshake `TCP_ULP`
+install on this socket, leaving ENOMEM-class kernel failure.
+
+### Observability and semantics
+
+A handed-off connection reports `splice=true` in its stream transaction
+summary; a fallback reports `splice=false`. Peer certificate identity (mTLS),
+SNI, `on_stream_connect` plugin ordering, `tcp_idle_timeout_seconds`,
+`tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`,
+`backend_write_timeout_ms`, byte accounting, and first-failure direction
+attribution are identical on both paths — the kTLS socket carries plaintext to
+userspace, so it feeds the same splice loops as a plain-to-plain relay.
+
+SNI is the one value with no shared source: the buffered path reads
+`ServerConnection::server_name()`, while `UnbufferedServerConnection` exposes no
+equivalent accessor, so the kTLS path re-parses the peeked ClientHello. Ferrum's
+SNI validator is deliberately stricter than the `DnsName` rules rustls applies
+to a received SNI — it refuses underscore labels and a trailing root dot, both
+of which rustls accepts — so a ClientHello whose `server_name` extension is
+present but not representable here would report no SNI where the buffered path
+reports a hostname. Rather than let the two paths disagree, those connections
+**decline the handoff** (before the socket is touched) and take the buffered
+accept, which reports rustls's own value. Every handed-off connection therefore
+observes the same SNI the userspace relay would have.
+
+### TLS close handshake on a spliced connection
+
+Both halves of the TLS shutdown are handled explicitly, because a kernel-owned
+record layer changes how each one surfaces.
+
+**Receive.** A kTLS receive side returns `EINVAL` from `splice(2)` for *any*
+non-application record and **leaves that record queued** — `EINVAL` is not a
+synonym for `close_notify`. It also covers fatal alerts, other warning alerts,
+renegotiation handshake records, and ChangeCipherSpec, and `splice(2)` can
+return `EINVAL` for reasons unrelated to TLS. The client-leg splice loop
+therefore reads the pending record back with the `SOL_TLS` /
+`TLS_GET_RECORD_TYPE` `recvmsg(2)` ancillary contract and classifies it
+(`src/proxy/ktls_record.rs`). Only an **authenticated TLS 1.2 warning-level
+`close_notify`** — the kernel delivers a record only after its AEAD tag
+verifies, so it cannot be spoofed into an established session — is treated as a
+clean EOF, and only then is the close not reported as a relay failure or
+charged to the backend circuit breaker. A fatal alert, any other alert, an
+unexpected control record, a malformed (non-two-byte) alert body, and an
+unrelated `EINVAL` all remain attributed relay errors.
+
+**A bare FIN is a truncation, not an EOF.** Because the kernel record layer
+delivers `close_notify` as a queued alert record, a kTLS receive side that
+reaches a plain zero-byte `splice(2)` — or a zero-byte `recvmsg(2)` while
+resolving an `EINVAL` — has seen the peer stop writing with *nothing
+authenticated* saying the stream ended. That is RFC 5246 §7.2.1 truncation, so
+both paths return an attributed `ClientToBackend` / read failure instead of a
+clean relay close. Only the classified warning-level `close_notify` produces
+the clean outcome.
+
+**Transmit.** A graceful backend EOF is propagated to the client as exactly one
+TLS 1.2 warning `close_notify`, emitted through kTLS TX with the matching
+`TLS_SET_RECORD_TYPE` `sendmsg(2)` ancillary message **after** the last
+application byte and **before** the raw `shutdown(SHUT_WR)`. Without it a
+conformant TLS client sees a truncated session rather than a clean close. Only
+a `sendmsg(2)` that reports **exactly** the two alert bytes counts as an
+emitted `close_notify`; a zero-length, short, or oversized result is an
+explicit error and becomes an attributed backend-to-client write failure rather
+than being accepted as a completed shutdown. The send is non-blocking and
+bounded (250 ms): a peer that stopped reading cannot wedge teardown. The raw
+half-close still follows even when the alert could not be delivered, while the
+transaction remains observably failed instead of reporting a clean TLS close.
+Because this write targets the client socket, the failure is neutral for the
+backend circuit breaker; a client that resets or stops accepting the final
+alert cannot make a healthy backend accumulate connection failures.
+Half-close semantics are
+preserved in both directions — receiving the client's `close_notify` half-closes
+only the client→backend direction, so the backend's remaining response bytes
+still reach the client and the reciprocal `close_notify` is sent after they
+drain.
+
+The io_uring splice path is not used for kTLS connections.
+
+Secret material never leaves `Zeroizing` buffers, is never logged, and the
+`KernelConnection` handle rustls returns alongside the secrets is dropped
+immediately (it exists only for TLS 1.3 KeyUpdate and client-side session
+tickets, neither of which applies here).
+
+### Traffic-key confidentiality budget
+
+rustls normally counts the messages each traffic key protects and refuses to
+continue past the negotiated suite's `CipherSuiteCommon::confidentiality_limit`.
+`dangerous_into_kernel_connection` ends that accounting: rustls's own `kernel`
+module states that a `KernelConnection` cannot track it and that aborting before
+the limit becomes the caller's responsibility. In the pinned providers
+(`rustls 0.23.40`, aws-lc-rs and ring alike) the TLS 1.2 AES-GCM suites carry
+`confidentiality_limit: 1 << 24` and ChaCha20-Poly1305 carries `u64::MAX`.
+
+Ferrum does not hand finite-limit suites to kTLS. Linux does not expose a
+race-free bound for TLS records admitted before a post-accept `SO_RCVBUF` pin:
+`FIONREAD` reports only the contiguous readable prefix and can omit
+out-of-order skbs already charged to the old, autotuned receive window. An
+attacker could reveal those bytes after the pin and exceed the record count
+precharged for one nonblocking receive.
+
+Both TLS 1.2 AES-GCM families are therefore removed from kTLS ClientHello
+eligibility before the handshake reads the socket. Those connections continue
+through the ordinary buffered rustls relay, which retains rustls's own traffic
+key accounting and preserves TLS functionality. This deliberately trades
+AES-GCM splice acceleration for a sound confidentiality bound.
+
+ChaCha20-Poly1305 has rustls's unlimited (`u64::MAX`) confidentiality posture,
+so it remains eligible for kTLS, builds no confidentiality guard, and retains
+normal receive autotuning. The defensive budget machinery in
+`src/proxy/ktls_confidentiality.rs` remains fail-closed if a future caller ever
+presents a finite-limit suite, but it is not a basis for making AES-GCM eligible.
+
+`bidirectional_copy` is not a legal relay for a kTLS client leg (it enforces
+neither the close handshake nor this budget), so the unreachable
+kTLS-client-to-TLS-backend combination now fails closed rather than relaying.
+
+### Ancillary-message safety
+
+Every `msg_control` buffer in `src/proxy/ktls_record.rs` is an
+`AlignedCmsgBuf`, whose storage is overlaid with a real `libc::cmsghdr` so it
+carries that type's alignment. `CMSG_FIRSTHDR` / `CMSG_NXTHDR` hand back
+`*mut cmsghdr` pointers into that storage and both the writer and the reader
+dereference them, so a bare `[u8; N]` (alignment 1) would be undefined
+behaviour irrespective of how a given stack frame happens to be laid out. Each
+`CMSG_DATA` read is additionally gated on the header having declared at least
+`CMSG_LEN(1)`, the control-buffer walk is clamped to the gateway's own
+capacity, `MSG_CTRUNC` is an error rather than a guess, and a platform whose
+`CMSG_SPACE(1)` does not fit the inline capacity fails closed instead of
+truncating.
+
+### Hosted live-kernel coverage
+
+Because the whole point of issue #3619 is that the handoff had been *inert*,
+classifier unit tests are not accepted as evidence on their own. The required
+`Unit Tests` job runs `proxy::ktls_live_kernel_tests` on the GitHub-hosted
+Linux runner's real kernel with `FERRUM_KTLS_LIVE_REQUIRED=1`, which proves, on
+every pull request:
+
+1. a real rustls TLS 1.2 ChaCha20-Poly1305 client reaches
+   `KtlsAcceptOutcome::Installed` — the kernel actually took the keys — and an
+   AES-GCM-only offer is refused with the socket still pristine (folded into
+   the same test so the required pass count stays three);
+2. application bytes relay both ways through `splice(2)`, i.e. the kernel is
+   really decrypting on read and encrypting on write;
+3. an authenticated `close_notify` is a clean EOF that half-closes the backend
+   leg;
+4. the clean backend EOF that follows produces the **reciprocal**
+   `close_notify`, so the client's own rustls session closes cleanly instead of
+   reporting a truncation;
+5. a bare TCP FIN with no alert behind it is an attributed client→backend read
+   failure; and
+6. a record the kernel cannot authenticate ends the relay with an attributed
+   failure and never with an EOF; and
+7. the handed-off ChaCha20-Poly1305 session carries rustls's unlimited
+   confidentiality posture (`u64::MAX`): no per-direction guard is built and no
+   receive window is pinned.
+
+Case 7 (and the AES refusal in case 1) is asserted inside case 1's test rather
+than as a fourth test, so the required live gate's expected pass count stays at
+three.
+
+The tests are `#[ignore]`d by default and pin their throwaway TLS 1.2 install
+client and server to ChaCha20-Poly1305 — the only cipher family production still
+hands off — so the hosted kernel gate needs that kTLS family (Linux 5.11+). The
+AES refusal coverage uses a separate AES-128-GCM-only offer set and never
+requires AES kTLS support. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an unavailable
+ChaCha20-Poly1305 capability into a failure rather than a skip, and the CI step
+also fails on any `SKIP:` line or on a pass count other than three — so a green
+required check cannot mean "the live path did not run".
+
+Because that gate stands entirely on the per-cipher capability probe, the probe
+has to be asking the kernel the right question. `setsockopt(SOL_TLS, TLS_TX)`
+is accepted only when `optlen` is **exactly** the cipher's
+`tls12_crypto_info_*` size, and ChaCha20-Poly1305's `salt` member is
+zero-length (`TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE == 0`), making that struct
+56 bytes rather than the 60 an AES-shaped 4-byte salt would produce. A struct
+of the wrong length is refused with `EINVAL` on every kernel and reads back
+indistinguishably from "this kernel has no ChaCha20-Poly1305 kTLS". Two things
+keep that from recurring silently: `socket_opts::ktls` pins all three struct
+sizes and `rec_seq` offsets to `libc`'s UAPI definitions with compile-time
+assertions, so a layout regression fails the build; and the availability probe
+records each cipher's install `errno`, which
+`ktls::ktls_availability_diagnostic()` reports in the live gate's failure
+message instead of a bare `chacha20=false`.
+
+Residual, covered only by the deterministic unit suite: peer-originated fatal
+alerts and non-`close_notify` warning alerts are classified by
+`classify_ktls_control_record`, because rustls exposes no API for emitting an
+arbitrary alert mid-session. The live half of that contract is case 6 above.
+
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
@@ -437,6 +785,31 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
+
+### Mesh UDP capture is a separate datapath
+
+Everything above describes a **configured** UDP proxy: an operator-declared
+`listen_port`, an explicit backend, and sessions keyed by client source address.
+Service-mesh UDP capture is a different entry point into the same session,
+relay, overload, and idle-expiry machinery — there is no `listen_port` because
+datagrams arrive transparently, and the destination is recovered per datagram
+from the `IP_RECVORIGDSTADDR` cmsg (netfilter `TPROXY` delivers without rewriting
+it, which is why capture cannot use the TCP `REDIRECT` model).
+
+Captured sessions are keyed by `(client, original destination)` rather than by
+client alone, and Ambient offers two capture **placements** with identical
+downstream behaviour:
+
+- **Per-pod-netns producer** (default) — rules and socket inside each enrolled
+  pod's network namespace.
+- **Host-network capture** (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true`,
+  issue #3288) — one transparent socket in the mesh proxy's own namespace, with
+  `mangle PREROUTING` rules scoped per enrolled pod's host-side interface and each
+  datagram attributed to a pod by that interface plus its registered source
+  address.
+
+See [mesh.md](mesh.md) → "UDP TPROXY capture" and "Host-network UDP capture" for
+the capture rules, identity model, and fail-closed contract.
 
 ## Kubernetes Gateway API (`TCPRoute` / `UDPRoute`)
 
@@ -472,12 +845,17 @@ Route admission is strict and fail closed (required `spec.rules` and
 at most one *supported* rule per `UDPRoute`, same-listener UDPRoute ownership
 by oldest `creationTimestamp` then `{namespace}/{name}`, and no listener at all
 for a declared Gateway parent that matches nothing or lost every claimed
-listener). A `UDPRoute` whose `parentRefs` name only non-Gateway parents (a
-GAMMA `Service` parent, a mistyped `kind`) likewise opens nothing; present
+listener). Every `UDPRoute` requires a concrete attached Gateway UDP listener:
+a route with no `parentRefs`, or whose `parentRefs` name only non-Gateway
+parents (a GAMMA `Service` parent or a mistyped `kind`), opens nothing. Present
 but malformed or explicitly empty `parentRefs` fail closed too. Ferrum
-implements no non-Gateway `UDPRoute` parent, that route is not a status
-candidate, and the backend-port fallback would be an unannounced listener bind.
-Only a `UDPRoute` with no `parentRefs` field at all keeps that fallback.
+implements no non-Gateway `UDPRoute` parent, and treating the backend port as a
+listener would create an unannounced north-south bind. The historical
+backend-port fallback remains only for genuinely parentless
+`TCPRoute`/`TLSRoute` inputs. A TCPRoute or TLSRoute carrying only a
+non-Gateway parent (including a GAMMA `Service` parent) also opens nothing:
+Ferrum implements no such L4 parent, and treating the declaration as absent
+would create the same unannounced listener.
 Same-listener ownership suppresses **effective traffic** only: both
 otherwise-valid `UDPRoute`s stay `Accepted=True` (attached), the oldest alone
 is `Programmed`/effective, the shadowed newer route reports
@@ -529,7 +907,8 @@ Notes:
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
 | `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `false` | Enables live reload for frontend TCP TLS, admin TLS, and frontend DTLS source changes |
-| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes, and for the opaque-TLS SNI ClientHello peek. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
+| `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` | `false` | Whether an [opaque-TLS SNI listener](#opaque-tls-sni-routing) may send provably non-TLS opening bytes to its declared catch-all route instead of closing the connection. Enable only for a port deliberately shared with direct plaintext TCP clients. Never applies to a ClientHello that timed out, exceeded the 16 KiB peek bound, ended early, was malformed, or named an unrepresentable host — those always fail closed |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
@@ -541,7 +920,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe and cipher gating for TCP frontend-TLS paths (AES-128-GCM / AES-256-GCM on Linux 4.13/4.17+, ChaCha20-Poly1305 on 5.11+; **TLS 1.2 only** — TLS 1.3 KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. **Handoff from the buffered tokio-rustls accept path is currently disabled** (issue #2955): rustls's public buffered API cannot prove the inbound deframer is empty, so every frontend-TLS connection keeps the userspace relay. Re-enable only with an unbuffered `UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection` handshake. |
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (**ChaCha20-Poly1305 on Linux 5.11+** is the only handoff-eligible family; AES-128-GCM / AES-256-GCM stay on the userspace rustls relay because Linux cannot report all out-of-order data admitted before a receive-buffer pin; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction), but concurrent io_uring relays are capped at 128 — beyond the cap, additional streams transparently fall back to the async libc splice path, so worst-case io_uring blocking-thread usage is 256. Keep `FERRUM_BLOCKING_THREADS` at the 512 default or higher so other `spawn_blocking` work retains headroom. Each blocking thread consumes ~2-4 MB of stack |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
@@ -653,9 +1032,9 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 ## Validation Rules
 
 - `listen_port` is required for stream proxies (1024-65535)
-- `listen_port` must be unique across all stream proxies (checked via database in DB/CP mode, in-memory in file mode)
+- `listen_port` must be unique across stream proxies unless every sharer forms one opaque-TLS SNI listener (homogeneous passthrough or ordinary opaque TCP) or one L4 `stream_match` group
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
-- HTTP proxies must not set `listen_port`
+- `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)

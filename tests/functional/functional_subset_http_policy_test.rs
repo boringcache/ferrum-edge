@@ -548,6 +548,11 @@ fn mesh_runtime_config() -> MeshRuntimeConfig {
         cp_urls: vec!["http://127.0.0.1:1".to_string()],
         config_protocol: MeshConfigProtocol::Native,
         file_config_path: None,
+        stock_xds_urls: Vec::new(),
+        stock_xds_node_id: None,
+        stock_xds_node_metadata: Default::default(),
+        stock_xds_token_file: None,
+        stock_xds_limits: Default::default(),
         topology: MeshTopology::Sidecar,
         inbound_listen_addr: "127.0.0.1:0".parse().expect("addr"),
         outbound_listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -556,6 +561,7 @@ fn mesh_runtime_config() -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "0.0.0.0:15090".parse().expect("addr"),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: None,
         xds_node_cluster: "default".to_string(),
@@ -585,6 +591,8 @@ fn mesh_runtime_config() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        unix_socket_allowed_roots: Vec::new(),
+        unix_socket_allowed_uids: Vec::new(),
         locality_lb_strict: false,
     }
 }

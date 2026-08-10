@@ -801,6 +801,14 @@ impl CpGrpcServer {
         config.consumers.retain(|c| c.namespace == namespace);
         config.plugin_configs.retain(|pc| pc.namespace == namespace);
         config.upstreams.retain(|u| u.namespace == namespace);
+        // The Gateway-listener TLS classification is namespace-qualified, so it
+        // carries other tenants' namespace names and listener-port topology.
+        // Prune it at this PRIMARY authorization boundary — the DP-side filter
+        // is defense in depth, not the place a tenant's port map stops being
+        // serialized to another tenant's subscriber.
+        config
+            .http_tls_listen_ports
+            .retain(|(entry_namespace, _)| entry_namespace == namespace);
         config.known_namespaces = vec![namespace.to_string()];
         filter_frontend_tls_sources_to_namespace(config, namespace);
     }
@@ -2650,6 +2658,49 @@ mod tests {
         assert_eq!(filtered.proxies.len(), 1);
         assert_eq!(filtered.proxies[0].namespace, "ns-a");
         assert_eq!(filtered.proxies[0].id, "p-a");
+    }
+
+    /// The Gateway-listener TLS classification is tenant topology: it names
+    /// other namespaces and the ports they terminate TLS on. It must be pruned
+    /// here, at the CP's own authorization boundary — not left for the remote
+    /// DP's defense-in-depth filter to remove after the CP already serialized
+    /// it to that subscriber.
+    #[test]
+    fn namespace_filter_strips_foreign_gateway_listener_tls_classification() {
+        use crate::config::types::*;
+        let p_a = serde_json::from_value::<Proxy>(serde_json::json!({
+            "id": "p-a",
+            "namespace": "ns-a",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "listen_port": 8443,
+        }))
+        .expect("proxy fixture should deserialize");
+
+        let mut config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            proxies: vec![p_a],
+            ..Default::default()
+        };
+        config
+            .http_tls_listen_ports
+            .insert(("ns-a".to_string(), 8443));
+        config
+            .http_tls_listen_ports
+            .insert(("ns-b".to_string(), 9443));
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(
+            filtered.http_tls_listen_ports,
+            [("ns-a".to_string(), 8443)].into_iter().collect(),
+            "only the subscriber's own listener classification may cross the CP boundary"
+        );
+        let serialized = serde_json::to_string(&filtered).expect("serialize filtered snapshot");
+        assert!(
+            !serialized.contains("ns-b") && !serialized.contains("9443"),
+            "no foreign namespace or listener port may appear on the wire: {serialized}"
+        );
     }
 
     #[test]

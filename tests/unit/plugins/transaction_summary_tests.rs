@@ -479,6 +479,7 @@ fn test_backend_response_carries_error_class() {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_lifecycle_generation: None,
@@ -685,6 +686,38 @@ fn test_summary_redacts_authorization_metadata_value() {
         "Bearer token must not leak into log output, got: {}",
         json
     );
+}
+
+#[test]
+fn test_summary_omits_internal_mesh_metrics_metadata() {
+    let mut summary = make_full_summary();
+    summary.metadata.insert(
+        "mesh.metrics.prometheus_metrics_observed".to_string(),
+        "1".to_string(),
+    );
+    summary.metadata.insert(
+        "Mesh.Metrics.Request_Count.Tag_Overrides".to_string(),
+        "internal-plan".to_string(),
+    );
+    summary
+        .metadata
+        .insert("mesh.source.workload".to_string(), "frontend".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert!(
+        parsed["metadata"]
+            .get("mesh.metrics.prometheus_metrics_observed")
+            .is_none()
+    );
+    assert!(
+        parsed["metadata"]
+            .get("Mesh.Metrics.Request_Count.Tag_Overrides")
+            .is_none()
+    );
+    assert_eq!(parsed["metadata"]["mesh.source.workload"], "frontend");
+    assert!(!json.contains("internal-plan"));
 }
 
 #[test]
@@ -907,6 +940,28 @@ fn test_stream_summary_redacts_metadata() {
         "Stream metadata bearer token must not leak: {}",
         json
     );
+}
+
+#[test]
+fn test_stream_summary_omits_internal_mesh_metrics_metadata() {
+    let mut summary = make_stream_summary();
+    summary.metadata.insert(
+        "mesh.metrics.tcp_opened_finalized".to_string(),
+        "1".to_string(),
+    );
+    summary
+        .metadata
+        .insert("mesh.destination.service".to_string(), "db".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert!(
+        parsed["metadata"]
+            .get("mesh.metrics.tcp_opened_finalized")
+            .is_none()
+    );
+    assert_eq!(parsed["metadata"]["mesh.destination.service"], "db");
 }
 
 #[test]

@@ -21,6 +21,7 @@ use crate::k8s_controller::ControllerTaskRegistry;
 use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates_budgeted};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
+use crate::k8s_controller::revision::K8sConfigRevisionTracker;
 use crate::k8s_controller::status::{
     GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
     gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
@@ -28,6 +29,7 @@ use crate::k8s_controller::status::{
 use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 use crate::modes::mesh::config::MeshConfig;
+use crate::modes::mesh::revision::{MeshConfigRevision, MeshRevisionOrder};
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = DEFAULT_STATUS_PLAN_WORK_BUDGET;
@@ -44,6 +46,25 @@ const STATUS_PATCH_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct AcceptedK8sOverlay {
     pub translation: GatewayConfig,
     pub managed_namespaces: BTreeSet<String>,
+    /// Authoritative mesh config revision for this overlay (issue #3611).
+    ///
+    /// Lives on the overlay, not on the DB snapshot, because on a
+    /// Kubernetes-controller CP the mesh block is authored ENTIRELY by this
+    /// overlay — CP database full loads clear `mesh` unconditionally and re-merge
+    /// it from here (#2982). Anything else would let a DB reload publish a mesh
+    /// snapshot stamped with a revision that did not describe it, or (as before
+    /// this change) wipe the revision entirely on the next poll.
+    ///
+    /// Bound atomically to every Kubernetes-owned field that can ride a
+    /// `MeshSlice`: `translation.mesh` plus matcher-bearing Istio
+    /// VirtualService L4 proxies and their referenced upstreams. An equal
+    /// scalar with divergent slice content retains the previously accepted
+    /// fields rather than storing the divergent candidate under the old
+    /// sequence.
+    ///
+    /// `None` when revision publication is disabled or no convergence evidence
+    /// has ever been established.
+    pub mesh_revision: Option<MeshConfigRevision>,
 }
 
 /// Shared slot written by the K8s reconciler and read by CP DB publication.
@@ -120,6 +141,7 @@ pub fn store_accepted_k8s_overlay(
     slot: &K8sOverlaySlot,
     mut translation: GatewayConfig,
     managed_namespaces: BTreeSet<String>,
+    mesh_revision: Option<MeshConfigRevision>,
 ) {
     if !translation.k8s_mesh_overlay.is_authoritative()
         && translation.mesh.is_none()
@@ -130,6 +152,7 @@ pub fn store_accepted_k8s_overlay(
     slot.store(Arc::new(Some(AcceptedK8sOverlay {
         translation,
         managed_namespaces,
+        mesh_revision,
     })));
 }
 
@@ -144,7 +167,32 @@ pub fn compose_db_with_k8s_overlay(
     let Some(overlay) = slot.as_ref() else {
         return db_config.clone();
     };
-    merge_k8s_translation(db_config, &overlay.translation, &overlay.managed_namespaces)
+    let translation = &overlay.translation;
+    let managed = &overlay.managed_namespaces;
+    let mut composed = merge_k8s_translation(db_config, translation, managed);
+    apply_k8s_mesh_revision(&mut composed, overlay.mesh_revision.as_ref());
+    composed
+}
+
+/// Stamp the Kubernetes-authored mesh config revision onto a composed snapshot
+/// (issue #3611).
+///
+/// The single site both CP publishers use, so the DB poll loop and the
+/// reconciler can never stamp differently for the same overlay.
+///
+/// `None` leaves the snapshot's existing revision untouched rather than clearing
+/// it. Clearing would turn a *versioned* CP into an *unversioned* one mid-flight,
+/// and a data plane that has already accepted a revision quarantines the next
+/// unversioned slice (`missing_revision`) — so "no evidence right now" must not
+/// be published as "this authority has no ordering". The tracker's own
+/// retain-last-good rule normally makes this arm unreachable once a sequence is
+/// established; it stays fail-safe for the ordering in which a DB reload composes
+/// before the first reconcile has published anything.
+fn apply_k8s_mesh_revision(config: &mut GatewayConfig, revision: Option<&MeshConfigRevision>) {
+    let Some(revision) = revision else {
+        return;
+    };
+    config.mesh_revision = Some(revision.clone());
 }
 
 pub struct ReconcilerConfig {
@@ -197,6 +245,7 @@ pub(crate) fn spawn_reconcile_loop(
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     shutdown: watch::Receiver<bool>,
     registry: &ControllerTaskRegistry,
 ) -> bool {
@@ -215,6 +264,7 @@ pub(crate) fn spawn_reconcile_loop(
         gateway_status_writer,
         istio_status_writer,
         metrics,
+        revision,
         shutdown.clone(),
     );
 
@@ -231,6 +281,7 @@ async fn run_reconcile_loop(
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    revision: Arc<K8sConfigRevisionTracker>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut change_rx = {
@@ -297,6 +348,7 @@ async fn run_reconcile_loop(
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
+            revision: Arc::clone(&revision),
         },
     )
     .await;
@@ -346,6 +398,7 @@ async fn run_reconcile_loop(
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
+                        revision: Arc::clone(&revision),
                     },
                 ).await;
             }
@@ -389,6 +442,7 @@ async fn run_reconcile_loop(
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
+                        revision: Arc::clone(&revision),
                     },
                 ).await;
             }
@@ -580,6 +634,9 @@ struct ReconcileContext {
     /// a no-op when None — every other code path stays unchanged.
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+    /// Kubernetes `resourceVersion` convergence evidence and the authoritative
+    /// mesh config revision derived from it (issue #3611).
+    revision: Arc<K8sConfigRevisionTracker>,
 }
 
 fn namespaces_for_broadcast(
@@ -641,6 +698,21 @@ fn namespaces_for_broadcast(
 /// Returns the published snapshot, or `None` when the merge produced no
 /// content change (nothing committed, nothing broadcast).
 ///
+/// Inside the gate this also **binds mesh content to the authoritative
+/// revision** (issue #3611): a candidate whose sequence equals the last
+/// accepted overlay's sequence but whose mesh differs retains the previously
+/// accepted mesh (and that same sequence). The effective translation stored in
+/// [`K8sOverlaySlot`], merged into `config_arc`, and broadcast is therefore one
+/// value — a store-then-merge mismatch cannot resurrect a withheld divergent
+/// mesh on a later DB reload. Non-mesh Gateway/API fields from the candidate
+/// still publish. Unversioned publication (no sequence established yet) is
+/// unchanged bootstrap behavior.
+///
+/// A retention also raises
+/// [`K8sConfigRevisionTracker::request_evidence_refresh`] on `revision_tracker`
+/// (when one is supplied), so the withheld mesh is released after one relist
+/// round trip instead of after a whole idle-relist window.
+///
 /// The overlay slot is still written BEFORE the CAS. Holding the gate means
 /// there is no losing CAS writer in practice, but the ordering is preserved so
 /// the CAS retry loops stay correct on their own terms: a writer that did lose
@@ -658,8 +730,36 @@ pub fn publish_k8s_reconcile(
     cp_scope: &CpScope,
     mesh_update_tx: &broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: &MeshNodeRegistry,
+    mesh_revision: Option<&MeshConfigRevision>,
+    revision_tracker: Option<&K8sConfigRevisionTracker>,
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
+        let previous = overlay_slot.load_full();
+        let K8sMeshRevisionBinding {
+            translation: retained_translation,
+            revision: effective_revision,
+            retained_mesh,
+        } = bind_k8s_mesh_revision_publication(
+            previous.as_ref().as_ref(),
+            translation,
+            mesh_revision,
+        );
+        if retained_mesh {
+            // Retention is the fail-closed answer, but it means the data plane
+            // is serving mesh content older than the cluster's. The aggregate
+            // watermark is a MINIMUM, so a quiet scope pins it until its next
+            // generation adopts a fresh boundary: ask for that generation now
+            // instead of waiting out `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`. This
+            // asks for PROOF; it never fabricates a watermark, so nothing about
+            // the ordering or content-identity contract relaxes (issue #3611).
+            if let Some(tracker) = revision_tracker {
+                tracker.request_evidence_refresh();
+            }
+        }
+        // A retention publishes its edited copy; every other reconcile
+        // publishes the candidate itself, with no clone at all.
+        let effective_translation = retained_translation.as_ref().unwrap_or(translation);
+
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin
         // configurations, so without this gate it could bypass the CP full and
@@ -671,9 +771,16 @@ pub fn publish_k8s_reconcile(
         // Every other admission point calls a policy function that returns
         // immediately when FIPS mode is off; doing the merge unconditionally
         // here would charge every ordinary reconcile for a second full clone.
+        //
+        // FIPS runs on the EFFECTIVE translation (after equal-revision mesh
+        // retention), so a withheld divergent mesh cannot be admitted by
+        // validating a candidate that will not be stored.
         if crate::fips::is_enforcing() {
-            let candidate =
-                merge_k8s_translation(config_arc.load().as_ref(), translation, managed_namespaces);
+            let candidate = merge_k8s_translation(
+                config_arc.load().as_ref(),
+                effective_translation,
+                managed_namespaces,
+            );
             if let Err(error) = crate::fips::policy::check_gateway_config(&candidate) {
                 error!("Kubernetes configuration rejected — FIPS policy: {}", error);
                 return None;
@@ -683,10 +790,16 @@ pub fn publish_k8s_reconcile(
         // reloads can re-merge it instead of broadcasting a wipe (#2982).
         store_accepted_k8s_overlay(
             overlay_slot,
-            translation.clone(),
+            effective_translation.clone(),
             managed_namespaces.clone(),
+            effective_revision.clone(),
         );
-        let new_config = swap_merged_k8s_translation(config_arc, translation, managed_namespaces)?;
+        let new_config = swap_merged_k8s_translation(
+            config_arc,
+            effective_translation,
+            managed_namespaces,
+            effective_revision.as_ref(),
+        )?;
 
         // Notify DPs and mesh subscribers of the config change.
         for namespace in
@@ -709,19 +822,280 @@ pub fn publish_k8s_reconcile(
     })
 }
 
+/// Outcome of [`bind_k8s_mesh_revision_publication`]: the revision that must
+/// stamp this publication, an optional owned override of the translation to
+/// publish in the candidate's place, and whether mesh content was withheld.
+struct K8sMeshRevisionBinding {
+    /// `None` when the candidate translation publishes exactly as it arrived,
+    /// which is every ordinary reconcile. Only a retention needs an owned,
+    /// edited copy, so the common path borrows the candidate instead of
+    /// deep-cloning the whole `GatewayConfig` to hand back an unmodified one —
+    /// the same reason [`publish_k8s_reconcile`] gates its FIPS composition on
+    /// enforcement rather than composing unconditionally.
+    translation: Option<GatewayConfig>,
+    revision: Option<MeshConfigRevision>,
+    /// The candidate mesh could not be published under the sequence available
+    /// for it, so the last accepted mesh is serving instead.
+    ///
+    /// Retention is CORRECT but must be BRIEF: the data plane is running older
+    /// mesh content than the cluster describes for as long as it lasts. The
+    /// caller turns this into a
+    /// [`K8sConfigRevisionTracker::request_evidence_refresh`], which is the only
+    /// way a quiet scope's watermark — and therefore the aggregate minimum —
+    /// can move before the idle relist window elapses.
+    retained_mesh: bool,
+}
+
+impl K8sMeshRevisionBinding {
+    /// Publish the candidate as-is under `revision`.
+    fn released(revision: Option<MeshConfigRevision>) -> Self {
+        Self {
+            translation: None,
+            revision,
+            retained_mesh: false,
+        }
+    }
+
+    /// Withhold the candidate mesh: publish the candidate's non-mesh fields
+    /// carrying the previously accepted mesh, still stamped with the sequence
+    /// that mesh was accepted under. The one place the candidate is cloned.
+    fn retaining(
+        translation: &GatewayConfig,
+        previous: &AcceptedK8sOverlay,
+        previous_revision: &MeshConfigRevision,
+    ) -> Self {
+        let mut effective = translation.clone();
+        retain_previously_accepted_k8s_mesh(&mut effective, previous);
+        Self {
+            translation: Some(effective),
+            revision: Some(previous_revision.clone()),
+            retained_mesh: true,
+        }
+    }
+}
+
+/// Bind the mesh snapshot that may leave this CP to the authoritative
+/// Kubernetes config revision (issue #3611).
+///
+/// `K8sConfigRevisionTracker::publish` may retain/republish an equal scalar
+/// while `do_reconcile` has already evolved the reflector snapshot (incomplete
+/// evidence, or a complete aggregate MIN pinned by a quiet scope). Broadcasting
+/// that divergent mesh under the old scalar is exactly what
+/// `MeshRevisionGate` must reject as `divergent_content`. The producer therefore
+/// keeps the last accepted mesh until the sequence advances, and reports the
+/// retention so the caller can request the evidence that would let it advance.
+///
+/// Decision happens only at the publication boundary; callers must invoke this
+/// inside [`CpPublicationGate`].
+fn bind_k8s_mesh_revision_publication(
+    previous: Option<&AcceptedK8sOverlay>,
+    translation: &GatewayConfig,
+    mesh_revision: Option<&MeshConfigRevision>,
+) -> K8sMeshRevisionBinding {
+    let Some(previous) = previous else {
+        // Unversioned bootstrap / disabled authority: no prior scalar exists
+        // to bind. A present malformed value is retained for the existing
+        // downstream validation boundary to reject rather than normalized.
+        return K8sMeshRevisionBinding::released(mesh_revision.cloned());
+    };
+    let Some(previous_revision) = previous
+        .mesh_revision
+        .as_ref()
+        .filter(|revision| revision.is_well_formed())
+    else {
+        // First established sequence after unversioned publication.
+        return K8sMeshRevisionBinding::released(mesh_revision.cloned());
+    };
+    // Every arm below that cannot authorize the candidate mesh retains the last
+    // accepted one AND reports it, so the caller can ask for the fresh
+    // convergence evidence that would let the sequence advance.
+    let Some(candidate_revision) = mesh_revision.filter(|revision| revision.is_well_formed())
+    else {
+        // Once a usable sequence is established, an absent or malformed claim
+        // cannot authorize different mesh content. The tracker is expected to
+        // retain its floor, but this publication boundary must fail closed if
+        // that invariant is ever violated.
+        return K8sMeshRevisionBinding::retaining(translation, previous, previous_revision);
+    };
+
+    match MeshConfigRevision::compare(Some(previous_revision), Some(candidate_revision)) {
+        MeshRevisionOrder::Newer | MeshRevisionOrder::Incomparable => {
+            // Sequence advanced (or a new ordering domain): release the newest
+            // mesh, including authoritative withdrawals.
+            K8sMeshRevisionBinding::released(Some(candidate_revision.clone()))
+        }
+        MeshRevisionOrder::Same => {
+            if k8s_published_mesh_content_matches(&previous.translation, translation) {
+                // Idempotent equal-revision republish.
+                K8sMeshRevisionBinding::released(Some(candidate_revision.clone()))
+            } else {
+                warn!(
+                    retained_sequence = previous_revision.sequence,
+                    "Kubernetes mesh content changed under an unchanged authoritative revision; \
+                     retaining the last accepted mesh snapshot and requesting fresh convergence \
+                     evidence so the sequence can advance"
+                );
+                K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
+            }
+        }
+        MeshRevisionOrder::Older => {
+            // A non-advancing claim cannot authorize different mesh content.
+            // The tracker floor normally prevents Older; fail closed anyway.
+            K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
+        }
+        MeshRevisionOrder::Unversioned | MeshRevisionOrder::Bootstrap => {
+            // Both inputs above are known well formed, so these outcomes would
+            // violate `MeshConfigRevision::compare`'s contract. Fail closed if
+            // that contract changes instead of treating this as bootstrap.
+            K8sMeshRevisionBinding::retaining(translation, previous, previous_revision)
+        }
+    }
+}
+
+fn retain_previously_accepted_k8s_mesh(
+    effective: &mut GatewayConfig,
+    previous: &AcceptedK8sOverlay,
+) {
+    effective.mesh = previous.translation.mesh.clone();
+    effective.k8s_mesh_overlay = previous.translation.k8s_mesh_overlay.clone();
+
+    // GatewayConfig proxies/upstreams do not normally ride MeshSlice, but the
+    // slice builder deliberately carries matcher-bearing Istio
+    // VirtualService L4 routes. Retain that translator-owned subset too: a
+    // quiet informer scope can pin the aggregate revision while another scope
+    // has already changed a TCP/TLS route or weighted backend set. Publishing
+    // the new objects under the pinned scalar would make the DP's exact
+    // equal-revision content binding quarantine an otherwise healthy CP.
+    let previous_l4_proxies = mesh_slice_l4_proxies(&previous.translation)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let previous_l4_upstreams =
+        mesh_slice_l4_upstreams(&previous.translation, previous_l4_proxies.iter())
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+    effective
+        .proxies
+        .retain(|proxy| !is_mesh_slice_l4_proxy(proxy));
+    effective.proxies.extend(previous_l4_proxies);
+
+    // This prefix is reserved to the translator-owned upstreams carried beside
+    // the retained L4 proxies. Remove candidate orphan/withdrawn entries as
+    // well, both to avoid duplicate ids and to keep the retained overlay a
+    // coherent proxy+upstream snapshot.
+    effective
+        .upstreams
+        .retain(|upstream| !is_mesh_slice_l4_upstream(upstream));
+    effective.upstreams.extend(previous_l4_upstreams);
+}
+
+/// Whether two translations carry the same mesh-slice content protected by
+/// [`MeshConfigRevision`].
+///
+/// Uses the shared canonical digest so producer retention and the data-plane
+/// equal-revision identity agree on semantic equality. Digests are compared,
+/// never logged. An uncomputable identity fails closed (not a match).
+fn k8s_published_mesh_content_matches(left: &GatewayConfig, right: &GatewayConfig) -> bool {
+    match (
+        k8s_published_mesh_content_identity(left),
+        k8s_published_mesh_content_identity(right),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => false,
+    }
+}
+
+const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+
+fn is_mesh_slice_l4_proxy(proxy: &crate::config::types::Proxy) -> bool {
+    proxy
+        .id
+        .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+        && proxy
+            .stream_match
+            .as_ref()
+            .is_some_and(|criteria| !criteria.is_empty())
+}
+
+fn is_mesh_slice_l4_upstream(upstream: &crate::config::types::Upstream) -> bool {
+    upstream.id.starts_with(MESH_SLICE_L4_UPSTREAM_ID_PREFIX)
+}
+
+fn mesh_slice_l4_proxies(config: &GatewayConfig) -> Vec<&crate::config::types::Proxy> {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| is_mesh_slice_l4_proxy(proxy))
+        .collect()
+}
+
+fn mesh_slice_l4_upstreams<'a, 'p>(
+    config: &'a GatewayConfig,
+    proxies: impl IntoIterator<Item = &'p crate::config::types::Proxy>,
+) -> Vec<&'a crate::config::types::Upstream> {
+    let referenced: BTreeSet<(&str, &str)> = proxies
+        .into_iter()
+        .filter_map(|proxy| {
+            proxy
+                .upstream_id
+                .as_deref()
+                .map(|upstream_id| (proxy.namespace.as_str(), upstream_id))
+        })
+        .collect();
+    config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            is_mesh_slice_l4_upstream(upstream)
+                && referenced.contains(&(upstream.namespace.as_str(), upstream.id.as_str()))
+        })
+        .collect()
+}
+
+fn k8s_published_mesh_content_identity(config: &GatewayConfig) -> Option<[u8; 32]> {
+    let proxies = mesh_slice_l4_proxies(config);
+    let upstreams = mesh_slice_l4_upstreams(config, proxies.iter().copied());
+
+    // Preserve array order exactly: MeshSlice content equality and its
+    // canonical digest treat arrays as order-sensitive. The tuple contains
+    // precisely the Kubernetes-owned GatewayConfig fields that
+    // MeshSlice::from_gateway_config can serialize for any namespace.
+    crate::grpc::mesh_slice_drift::canonical_content_digest(&(
+        config.mesh.as_deref(),
+        proxies,
+        upstreams,
+    ))
+    .ok()
+}
+
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
     let start = std::time::Instant::now();
     ctx.metrics
         .reconciliations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let objects = {
+    let (revision_watermark, objects) = {
         // `lock_owned` keeps the guard from holding a `&Mutex<…>` borrow across
         // the `.await`, which would otherwise force rustc into an HRTB Send
         // analysis it can't satisfy when the future is `tokio::spawn`-ed.
         let set = Arc::clone(&store_set).lock_owned().await;
-        set.snapshot_all()
+        // Coherence point (issue #3611). The scope set is pinned under the same
+        // lock that materializes the snapshot, and the watermark is read FIRST:
+        // between the two reads a reflector store can only move forward, so the
+        // snapshot is never older than the sequence claims. Reading it after
+        // would allow the reverse — a sequence covering changes the snapshot
+        // does not contain.
+        let scopes = set.scope_keys();
+        let watermark = ctx.revision.converged_watermark(scopes.iter());
+        (watermark, set.snapshot_all())
     };
+    // Publication applies the in-process monotonic floor and the
+    // retain-last-good sequence rule for incomplete evidence. Equal-sequence
+    // mesh retention (when the candidate mesh diverges under that scalar) is
+    // applied later inside `publish_k8s_reconcile`.
+    let mesh_revision = ctx.revision.publish(revision_watermark);
 
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
@@ -772,6 +1146,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &ctx.cp_scope,
         &ctx.mesh_update_tx,
         &ctx.mesh_registry,
+        mesh_revision.as_ref(),
+        Some(ctx.revision.as_ref()),
     );
     let Some(new_config) = published else {
         debug!("No config changes detected, skipping swap");
@@ -1060,15 +1436,21 @@ pub fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
     managed_namespaces: &BTreeSet<String>,
+    mesh_revision: Option<&MeshConfigRevision>,
 ) -> Option<Arc<GatewayConfig>> {
     let mut old_config = config_arc.load();
 
     loop {
-        let new_config = Arc::new(merge_k8s_translation(
-            old_config.as_ref(),
-            k8s_config,
-            managed_namespaces,
-        ));
+        let base = old_config.as_ref();
+        let mut merged = merge_k8s_translation(base, k8s_config, managed_namespaces);
+        apply_k8s_mesh_revision(&mut merged, mesh_revision);
+        let new_config = Arc::new(merged);
+        // `GatewayConfig.mesh_revision` is `#[serde(skip)]`, so the content
+        // comparison below does not see it. That is deliberate and matches the
+        // slice-level contract (`MeshSlice::content_eq` ignores `revision`): a
+        // revision-only change is not a config change and must not fan a frame
+        // out to every subscriber. The advanced sequence is still recorded on
+        // the overlay slot, so the next content change carries it.
         if !gateway_config_content_changed(&new_config, old_config.as_ref()) {
             return None;
         }
@@ -1205,6 +1587,7 @@ pub fn merge_k8s_translation(
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
     merge_k8s_frontend_tls(&mut merged, k8s_config);
+    merge_http_tls_listen_ports(&mut merged, k8s_config, managed_namespaces);
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -1280,6 +1663,44 @@ fn merge_k8s_mesh_overlay(merged: &mut GatewayConfig, k8s_config: &GatewayConfig
     merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative { base_mesh };
 }
 
+/// Recompose the `(namespace, listen_port)` TLS classification for Gateway API
+/// listener ports.
+///
+/// This field is derived state that must travel with the proxies it describes.
+/// Composition rebuilds `merged.proxies` from the retained base plus this
+/// translation, so the classification is rebuilt the same way: drop every entry
+/// no surviving HTTP-family proxy still claims (that is how a deleted Gateway
+/// listener is withdrawn), then adopt this translation's entries.
+///
+/// Dropping this step is not cosmetic — an HTTPS listener's routes would be
+/// published classified as plaintext and every TLS request to them would 404.
+fn merge_http_tls_listen_ports(
+    merged: &mut GatewayConfig,
+    k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+) {
+    let claimed: BTreeSet<(String, u16)> = merged
+        .proxies
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .listen_port
+                .map(|port| (proxy.namespace.clone(), port))
+        })
+        .collect();
+    merged.http_tls_listen_ports.retain(|entry| {
+        // A current translation is authoritative for every managed
+        // namespace. Do not infer ownership from a surviving proxy at the
+        // same `(namespace, port)`: that proxy may be file/native-authored,
+        // and retaining the old Kubernetes bit would silently reclassify
+        // it as TLS after the Gateway listener was deleted.
+        !namespace_is_managed(&entry.0, managed_namespaces) && claimed.contains(entry)
+    });
+    merged
+        .http_tls_listen_ports
+        .extend(k8s_config.http_tls_listen_ports.iter().cloned());
+}
+
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
     let k8s_supplies_tls = !k8s_config.frontend_tls_certificate_sources.is_empty()
         || k8s_config.frontend_tls_cert_path.is_some()
@@ -1319,6 +1740,10 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "frontend_tls_key_path": &config.frontend_tls_key_path,
         "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
         "frontend_tls_certificate_sources": &config.frontend_tls_certificate_sources,
+        // Derived Gateway-listener TLS classification. Included because a
+        // listener flipping HTTP<->HTTPS leaves every other field identical,
+        // and a dedupe that ignored it would keep serving the old class.
+        "http_tls_listen_ports": &config.http_tls_listen_ports,
         "mesh": &config.mesh,
     });
     strip_volatile_timestamps(&mut value);
@@ -1534,6 +1959,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

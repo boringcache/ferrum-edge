@@ -340,9 +340,62 @@ pub async fn accept_with_optional_timeout<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    accept_with_optional_deadline(
+        acceptor,
+        stream,
+        frontend_tls_handshake_deadline(timeout_secs),
+        timeout_secs,
+        peer,
+        record_mesh_mtls_metric,
+    )
+    .await
+}
+
+/// Start-of-handshake deadline for `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
+///
+/// `0` disables the clock and yields `None`. Computing the deadline once — and
+/// then passing the *same* `Instant` to every stage of frontend TLS admission —
+/// is what keeps the configured value a single end-to-end budget instead of a
+/// per-stage allowance (issue #3619: a slow partial ClientHello consumed the
+/// kTLS pre-handshake budget and the buffered fallback then started a fresh
+/// full timer, so a stalled peer could hold a frontend slot for twice the
+/// configured seconds).
+pub fn frontend_tls_handshake_deadline(timeout_secs: u64) -> Option<tokio::time::Instant> {
+    if timeout_secs == 0 {
+        return None;
+    }
+
+    let now = tokio::time::Instant::now();
+    Some(match now.checked_add(Duration::from_secs(timeout_secs)) {
+        Some(deadline) => deadline,
+        // A syntactically valid but unrepresentable operator timeout must not
+        // panic a production connection task or turn into an unbounded clock.
+        // An already-expired deadline preserves the fail-closed contract.
+        None => now,
+    })
+}
+
+/// Accept a frontend TLS stream bounded by an already-established deadline.
+///
+/// `budget_secs` is used only to describe the configured budget in the timeout
+/// log line; the deadline is authoritative. An already-elapsed deadline fails
+/// immediately with the same `TimedOut` error and the same single metric
+/// record, which is the correct outcome when an earlier admission stage
+/// consumed the whole budget.
+pub async fn accept_with_optional_deadline<S>(
+    acceptor: &TlsAcceptor,
+    stream: S,
+    deadline: Option<tokio::time::Instant>,
+    budget_secs: u64,
+    peer: &SocketAddr,
+    record_mesh_mtls_metric: bool,
+) -> io::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let accept_fut = acceptor.accept(stream);
-    let result = if timeout_secs > 0 {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
+    let result = if let Some(deadline) = deadline {
+        match tokio::time::timeout_at(deadline, accept_fut).await {
             Ok(result) => result,
             Err(_) => {
                 if record_mesh_mtls_metric {
@@ -357,7 +410,7 @@ where
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
                     peer.ip(),
-                    timeout_secs
+                    budget_secs
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1186,7 +1239,7 @@ pub enum MeshClientAuth {
 /// material (parsed once — a later reload never incidentally re-reads changed
 /// cert/key files from disk; the operator owns rotation) or the
 /// **gateway-SVID-backed** source, which resolves live from the shared
-/// rotating SVID slot so a file-based SVID rotation reaches the inbound
+/// rotating SVID slot so a configured SVID rotation reaches the inbound
 /// listener without a restart.
 pub struct MeshServerIdentity {
     cert_path: String,
@@ -1201,7 +1254,7 @@ enum MeshServerCertSource {
         key: PrivateKeyDer<'static>,
     },
     /// Gateway-SVID-backed: the server cert resolves per handshake from the
-    /// same `SharedSvidBundle` slot the SVID file watcher rotates, so the
+    /// same `SharedSvidBundle` slot the SVID source watcher rotates, so the
     /// inbound listener presents the CURRENT leaf, not the startup one.
     SvidRotating {
         bundle: crate::identity::SharedSvidBundle,
@@ -1297,7 +1350,7 @@ struct SvidResolvedCert {
 /// Live server-cert resolver for the gateway-SVID-backed mesh inbound
 /// identity. Per handshake (hot path) it does one `ArcSwap` load plus an
 /// `Arc::ptr_eq` against the cached snapshot; the `CertifiedKey` is rebuilt
-/// only when the SVID file watcher (or a future CA-backend rotation loop)
+/// only when the SVID source watcher or CA-backend rotation loop
 /// stores a new bundle into the shared slot.
 ///
 /// Failure semantics, fail-closed: an EMPTY slot or a snapshot whose material
@@ -1410,7 +1463,7 @@ fn certified_key_from_svid_bundle(
 
 /// Build the gateway-SVID-backed mesh server identity: the inbound listener's
 /// server certificate resolves LIVE from `bundle` (the same shared slot the
-/// SVID file watcher rotates), so file-based SVID rotation reaches inbound
+/// SVID source watcher rotates), so configured SVID rotation reaches inbound
 /// handshakes without a restart. Fails closed at startup when the slot's
 /// current material cannot back a server certificate — a configured-but-broken
 /// identity is a real fault, exactly like the static loader's semantics.

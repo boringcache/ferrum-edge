@@ -35,6 +35,7 @@ fn default_client() -> PluginHttpClient {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_lifecycle_generation: None,
@@ -543,6 +544,7 @@ fn test_statsd_logging_disabled_config_skips_construction_validation() {
             proxy_id: None,
             enabled: false,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -577,6 +579,7 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

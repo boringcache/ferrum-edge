@@ -1701,3 +1701,177 @@ fn encoded_slash_case_insensitive_hex() {
     let upper = cache.find_proxy(None, "/api%2Fadmin").unwrap();
     assert_eq!(upper.proxy.id, "protected");
 }
+
+#[test]
+fn port_scoped_siblings_select_by_frontend_port() {
+    let mut plain = test_proxy("plain", "/api");
+    plain.hosts = vec!["app.example.com".into()];
+    plain.listen_port = Some(80);
+    plain.backend_port = 8080;
+
+    let mut tls = test_proxy("tls", "/api");
+    tls.hosts = vec!["app.example.com".into()];
+    tls.listen_port = Some(443);
+    tls.backend_port = 8443;
+
+    let tls_namespace = tls.namespace.clone();
+    let mut config = test_config(vec![plain, tls]);
+    config.http_tls_listen_ports.insert((tls_namespace, 443));
+    let cache = RouterCache::new(&config, 100);
+
+    let on_http = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+        .expect("plaintext remap to the single nontls listen_port");
+    assert_eq!(on_http.proxy.id, "plain");
+
+    let on_https = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8443), true)
+        .expect("TLS remap to the single tls listen_port");
+    assert_eq!(on_https.proxy.id, "tls");
+
+    let exact_plain = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(80), false)
+        .expect("exact nontls port");
+    assert_eq!(exact_plain.proxy.id, "plain");
+}
+
+/// A TLS listener on `:443` in one namespace must not reclassify another
+/// namespace's plaintext `:443` route. The classification key is
+/// `(namespace, port)`, resolved once per candidate at table build time.
+#[test]
+fn tls_classification_does_not_leak_across_namespaces() {
+    let mut plain = test_proxy("plain", "/api");
+    plain.namespace = "team-a".to_string();
+    plain.hosts = vec!["a.example.com".into()];
+    plain.listen_port = Some(443);
+    plain.backend_port = 8080;
+
+    let mut secure = test_proxy("secure", "/api");
+    secure.namespace = "team-b".to_string();
+    secure.hosts = vec!["b.example.com".into()];
+    secure.listen_port = Some(443);
+    secure.backend_port = 8443;
+
+    let mut config = test_config(vec![plain, secure]);
+    // Only team-b terminates TLS on 443.
+    config
+        .http_tls_listen_ports
+        .insert(("team-b".to_string(), 443));
+    let cache = RouterCache::new(&config, 100);
+
+    let on_plaintext = cache
+        .find_proxy_on_frontend(Some("a.example.com"), "/api/x", Some(443), false)
+        .expect("team-a's plaintext :443 route must still match a plaintext frontend");
+    assert_eq!(on_plaintext.proxy.id, "plain");
+
+    let on_tls = cache
+        .find_proxy_on_frontend(Some("b.example.com"), "/api/x", Some(443), true)
+        .expect("team-b's TLS :443 route must match a TLS frontend");
+    assert_eq!(on_tls.proxy.id, "secure");
+
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("a.example.com"), "/api/x", Some(443), true)
+            .is_none(),
+        "a plaintext-classified route must not be served on a TLS frontend"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("b.example.com"), "/api/x", Some(443), false)
+            .is_none(),
+        "a TLS-classified route must not be served on a plaintext frontend"
+    );
+}
+
+#[test]
+fn same_protocol_distinct_ports_require_exact_frontend_match() {
+    let mut a = test_proxy("a", "/api");
+    a.hosts = vec!["app.example.com".into()];
+    a.listen_port = Some(9001);
+    a.backend_port = 7001;
+
+    let mut b = test_proxy("b", "/api");
+    b.hosts = vec!["app.example.com".into()];
+    b.listen_port = Some(9002);
+    b.backend_port = 7002;
+
+    let config = test_config(vec![a, b]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(9001), false)
+            .unwrap()
+            .proxy
+            .id,
+        "a"
+    );
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(9002), false)
+            .unwrap()
+            .proxy
+            .id,
+        "b"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api", Some(8000), false)
+            .is_none(),
+        "multiple nontls listen_ports disable protocol remap"
+    );
+}
+
+#[test]
+fn port_scoped_regex_beats_its_port_agnostic_fallback_on_the_exact_listener() {
+    let mut fallback = test_proxy("fallback", "~^/items/(?P<id>[^/]+)$");
+    fallback.hosts = vec!["app.example.com".into()];
+
+    let mut scoped = test_proxy("scoped", "~^/items/(?P<id>[^/]+)$");
+    scoped.hosts = vec!["app.example.com".into()];
+    scoped.listen_port = Some(9001);
+
+    // A second plaintext listener disables the documented single-listener
+    // protocol remap, leaving the agnostic route as the fallback off :9001.
+    let mut other_listener = test_proxy("other-listener", "/other");
+    other_listener.hosts = vec!["other.example.com".into()];
+    other_listener.listen_port = Some(9003);
+
+    // Put the agnostic route first to pin the regression: regex lookup used to
+    // return the first admissible config-order match without applying the port
+    // rank shared by exact, prefix, and host-only routes.
+    let config = test_config(vec![fallback, scoped, other_listener]);
+    let cache = RouterCache::new(&config, 100);
+
+    let exact = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9001), false)
+        .expect("the exact listener-scoped regex must match");
+    assert_eq!(exact.proxy.id, "scoped");
+    assert_eq!(
+        exact.path_params,
+        vec![("id".to_string(), "42".to_string())]
+    );
+
+    let elsewhere = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/items/42", Some(9002), false)
+        .expect("the agnostic regex remains the fallback elsewhere");
+    assert_eq!(elsewhere.proxy.id, "fallback");
+}
+
+#[test]
+fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
+    let mut protected = test_proxy("protected-admin", "~^/admin/.*$");
+    protected.hosts = vec!["app.example.com".into()];
+
+    let mut scoped_fallback = test_proxy("scoped-fallback", "~^/.*$");
+    scoped_fallback.hosts = vec!["app.example.com".into()];
+    scoped_fallback.listen_port = Some(9001);
+
+    let config = test_config(vec![protected, scoped_fallback]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/admin/secret", Some(9001), false)
+        .expect("the earlier protected regex must match");
+    assert_eq!(matched.proxy.id, "protected-admin");
+}

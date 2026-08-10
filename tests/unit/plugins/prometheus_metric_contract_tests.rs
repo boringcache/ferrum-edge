@@ -591,6 +591,7 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
 
 fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_lifecycle_generation: None,
@@ -626,7 +627,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 /// inventory + chart validators rather than this scrape fixture.
 fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
-    registry.configure(60, 3600, 0, "contract-ns");
+    registry.configure(60, 3600, 0, 10_000, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
     let mut grpc_summary = make_summary("contract-grpc-proxy");
     grpc_summary
@@ -674,6 +675,11 @@ fn representative_exposition() -> String {
 
     let mut tcp_meta = HashMap::new();
     tcp_meta.extend([
+        (
+            ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
+                .into(),
+            "1".into(),
+        ),
         (
             ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
                 .into(),

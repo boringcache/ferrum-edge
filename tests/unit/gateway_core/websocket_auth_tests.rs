@@ -95,6 +95,7 @@ fn keyauth_plugin_config() -> PluginConfig {
         proxy_id: Some(PROXY_ID.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

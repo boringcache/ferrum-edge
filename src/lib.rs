@@ -720,6 +720,27 @@ pub mod _test_support {
         crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
     }
 
+    /// Resolve the production final request-body dispatch requirements for a
+    /// synthetic plugin chain. This exposes the mixed-chain decision boundary
+    /// without widening the runtime helper's public API.
+    pub fn final_request_body_requirements_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        request_may_need_buffering: bool,
+        has_terminal_body_dispatch: bool,
+        has_contextual_final_body_hook: bool,
+        has_finalized_request_egress: bool,
+    ) -> (bool, bool, bool) {
+        crate::proxy::final_request_body_requirements(
+            plugins,
+            ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
+    }
+
     /// Exercise the mesh RTDS generation reconciliation boundary without
     /// widening its runtime API beyond the crate.
     pub fn reconcile_runtime_overlay_plugin_generations_for_test(
@@ -2271,6 +2292,57 @@ pub mod _test_support {
         )
     }
 
+    /// Forcibly remove a process replay scope from the shared registry.
+    ///
+    /// External-test isolation only: production prune never removes poisoned or
+    /// structurally inconsistent state. After a unit test has proved that
+    /// fail-closed contract, call this (or drop a
+    /// [`SoapNonceReplayScopeLease`]) so the slot cannot starve parallel
+    /// siblings against the process-global 1024-scope cap.
+    pub fn soap_remove_nonce_replay_scope_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::remove_nonce_replay_scope_for_tests(scope_key)
+    }
+
+    /// RAII lease that force-removes tracked process replay scopes on drop.
+    ///
+    /// Use around tests that deliberately leave non-reclaimable (poisoned /
+    /// inconsistent / live-claim) registry entries, or that temporarily fill
+    /// the shared registry toward [`MAX_NONCE_REPLAY_SCOPES_FOR_TESTS`].
+    pub struct SoapNonceReplayScopeLease {
+        scope_keys: Vec<String>,
+    }
+
+    impl SoapNonceReplayScopeLease {
+        pub fn empty() -> Self {
+            Self {
+                scope_keys: Vec::new(),
+            }
+        }
+
+        pub fn for_plugin_config_ids(plugin_config_ids: &[&str]) -> Self {
+            let mut lease = Self::empty();
+            for plugin_config_id in plugin_config_ids {
+                lease.track_plugin_config_id(plugin_config_id);
+            }
+            lease
+        }
+
+        pub fn track_plugin_config_id(&mut self, plugin_config_id: &str) {
+            let key = soap_nonce_replay_scope_key_for_test(plugin_config_id);
+            if !self.scope_keys.iter().any(|existing| existing == &key) {
+                self.scope_keys.push(key);
+            }
+        }
+    }
+
+    impl Drop for SoapNonceReplayScopeLease {
+        fn drop(&mut self) {
+            for scope_key in self.scope_keys.drain(..) {
+                let _ = soap_remove_nonce_replay_scope_for_test(&scope_key);
+            }
+        }
+    }
+
     /// Build a scoped process-replay plugin and poison its registry mutex.
     pub fn soap_poison_process_replay_scope_for_test(
         config: &serde_json::Value,
@@ -2334,6 +2406,22 @@ pub mod _test_support {
         plugin.schema_type_cache_stats_for_test()
     }
 
+    // ── plugins/trigger ──────────────────────────────────────────────────────
+    /// Project a stream connection's memoized execution-trigger decisions onto
+    /// a disconnect summary, exactly as every production TCP/UDP/DTLS
+    /// disconnect path does.
+    ///
+    /// The carrier is deliberately not constructible with real content outside
+    /// this crate — that is what stops a plugin forging another instance's
+    /// admission decision — so external tests reach the production projection
+    /// through here rather than through a new runtime API.
+    pub fn attach_stream_trigger_decisions_for_test(
+        summary: &mut crate::plugins::StreamTransactionSummary,
+        ctx: &crate::plugins::StreamConnectionContext,
+    ) {
+        summary.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
@@ -2357,6 +2445,7 @@ pub mod _test_support {
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::plugins::StreamTransactionSummary {
         crate::plugins::StreamTransactionSummary {
+            plugin_trigger_decisions: Default::default(),
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-proxy".to_string(),
             proxy_lifecycle_generation: None,
@@ -2417,7 +2506,9 @@ pub mod _test_support {
         crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
     }
 
-    pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
+    pub use crate::proxy::tcp_proxy::{
+        StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
+    };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
     /// `DisconnectCause` mapping that the TCP accept loop uses when
@@ -2769,17 +2860,6 @@ pub mod _test_support {
             .and_then(|hv| hv.to_str().ok())
             .map(|s| s.to_string());
         Ok((handshake.stream, proto))
-    }
-
-    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
-    /// for kTLS. Always returns `false`: the public buffered API cannot prove
-    /// that the inbound deframer is empty and record-aligned (issue #2955).
-    /// The shared borrow is part of the contract — external tests use it to
-    /// pin that the refusal leaves every staged application byte readable.
-    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
-        server_conn: &rustls::ServerConnection,
-    ) -> bool {
-        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
     }
 
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
@@ -6120,6 +6200,17 @@ pub mod _test_support {
         ctx.set_request_http_flavor(flavor);
     }
 
+    /// Stamp the authoritative client-visible wire transport a frontend would
+    /// record, so trigger `protocol:` predicates can be exercised without
+    /// standing up an H1/H2/H3 listener.
+    pub fn set_request_wire_protocol_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        transport: crate::config::types::HttpWireTransport,
+        is_grpc_web: bool,
+    ) {
+        ctx.set_request_wire_protocol(transport, is_grpc_web);
+    }
+
     pub async fn wait_for_tcp_peer_reset_for_test(stream: &tokio::net::TcpStream) {
         crate::proxy::tcp_proxy::wait_for_tcp_peer_reset(stream).await;
     }
@@ -7756,15 +7847,70 @@ pub mod _test_support {
             >,
         >,
         resource: kube::api::ApiResource,
+        revision: std::sync::Arc<crate::k8s_controller::revision::K8sConfigRevisionTracker>,
+        metrics: std::sync::Arc<crate::k8s_controller::metrics::ControllerMetrics>,
     }
 
     impl K8sWatchScopeForTest {
+        /// The Kubernetes convergence watermark for this scope set, read at the
+        /// production coherence point (issue #3611): the registered scope set is
+        /// pinned under the `ResourceStoreSet` lock and the watermark is read
+        /// BEFORE any snapshot would be materialized from it.
+        pub async fn revision_watermark(&self) -> Option<u64> {
+            let set = self.store_set.lock().await;
+            let scopes = set.scope_keys();
+            self.revision.converged_watermark(scopes.iter())
+        }
+
+        /// The revision this scope set would stamp on a publication right now,
+        /// including the in-process monotonic floor and the retain-last-good
+        /// behaviour when evidence is incomplete.
+        pub async fn publish_revision(
+            &self,
+        ) -> Option<crate::modes::mesh::revision::MeshConfigRevision> {
+            let watermark = self.revision_watermark().await;
+            self.revision.publish(watermark)
+        }
+
+        /// Tracker counters (withheld advances, unsequenced publications,
+        /// unparsable `resourceVersion` values).
+        pub fn revision_stats(&self) -> crate::k8s_controller::revision::K8sRevisionStats {
+            self.revision.stats()
+        }
+
+        /// Idle/readiness-timeout relists recorded by the production watcher.
+        /// Demand-driven revision-evidence refreshes deliberately do not
+        /// increment this long-standing metric.
+        pub fn watch_idle_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Raise the demand-driven evidence refresh the reconciler publication
+        /// boundary raises when it has to withhold mesh content under a
+        /// sequence it cannot advance (issue #3611). Every subscribed watch
+        /// scope starts a fresh generation, spaced by its own floor interval.
+        pub fn request_evidence_refresh(&self) {
+            self.revision.request_evidence_refresh();
+        }
         /// A `DynamicObject` in this scope's namespace, shaped like one the
         /// reflector would receive.
         pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
             kube::api::DynamicObject::new(name, &self.resource)
                 .within(namespace)
                 .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// [`Self::object`] stamped with a `metadata.resourceVersion`, as every
+        /// object the API server returns is.
+        pub fn object_at(
+            &self,
+            namespace: &str,
+            name: &str,
+            resource_version: &str,
+        ) -> kube::api::DynamicObject {
+            let mut object = self.object(namespace, name);
+            object.metadata.resource_version = Some(resource_version.to_string());
+            object
         }
 
         /// Deliver one watch event on `generation`'s stream. Panics if that
@@ -7831,8 +7977,47 @@ pub mod _test_support {
         generations: usize,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        k8s_watch_scope_with_revision_for_test(
+            group,
+            version,
+            kind,
+            plural,
+            scope,
+            idle_relist_secs,
+            generations,
+            None,
+            Vec::new(),
+            shutdown,
+        )
+    }
+
+    /// [`k8s_watch_scope_for_test`] plus the Kubernetes mesh-config revision
+    /// tracker (issue #3611).
+    ///
+    /// `authority` is the ordering domain the scope publishes under (`None`
+    /// disables publication). `boundaries` scripts the authoritative
+    /// `resourceVersion` boundary each successive watcher generation reads
+    /// immediately before its list — the value a one-item consistent list
+    /// returns in production. Generations past the end of `boundaries` read no
+    /// boundary, which is exactly what a failed or timed-out read yields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_with_revision_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        authority: Option<String>,
+        boundaries: Vec<Option<u64>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
         use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
-        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use crate::k8s_controller::revision::K8sConfigRevisionTracker;
+        use crate::k8s_controller::watcher::{
+            RelistPolicy, WatchBoundaryReader, WatchTarget, run_watcher_generations,
+        };
         use futures_util::{Stream, StreamExt};
         use kube::api::{ApiResource, DynamicObject};
         use kube::runtime::{reflector, watcher};
@@ -7899,13 +8084,27 @@ pub mod _test_support {
             }
         };
 
+        let revision = std::sync::Arc::new(K8sConfigRevisionTracker::new(authority));
+        let queue = std::collections::VecDeque::from(boundaries);
+        let scripted_boundaries = std::sync::Arc::new(std::sync::Mutex::new(queue));
+        let read_boundary: WatchBoundaryReader = Box::new(move || {
+            let next = match scripted_boundaries.lock() {
+                Ok(mut queue) => queue.pop_front().flatten(),
+                Err(poisoned) => poisoned.into_inner().pop_front().flatten(),
+            };
+            Box::pin(std::future::ready(next))
+        });
+
+        let metrics = std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new());
         let task = run_watcher_generations(
             target,
             initial_writer,
             store_set.clone(),
             change_notifier,
             RelistPolicy::from_idle_secs(idle_relist_secs),
-            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            std::sync::Arc::clone(&metrics),
+            std::sync::Arc::clone(&revision),
+            read_boundary,
             shutdown,
             make_stream,
         );
@@ -7915,6 +8114,8 @@ pub mod _test_support {
                 store_set,
                 senders,
                 resource,
+                revision,
+                metrics,
             },
             task,
         )

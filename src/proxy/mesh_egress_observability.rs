@@ -292,6 +292,9 @@ impl CapturedMeshEgressLifecycle {
             namespace: self.namespace.clone(),
             proxy_id: self.proxy_id.clone(),
             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
+            // Carry the connect-time execution-trigger outcomes so a skipped
+            // instance stays skipped at disconnect.
+            plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
             proxy_name: self.proxy_name.clone(),
             client_ip: self.client_ip.clone(),
             consumer_username: stream_ctx.effective_identity().map(str::to_owned),
@@ -550,6 +553,11 @@ mod tests {
         metadata.insert("mesh.request_protocol".to_string(), "tcp".to_string());
         metadata.insert(
             crate::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+                .to_string(),
+            "1".to_string(),
+        );
+        metadata.insert(
+            crate::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
                 .to_string(),
             "1".to_string(),
         );

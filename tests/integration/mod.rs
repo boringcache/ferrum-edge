@@ -50,7 +50,9 @@ mod file_mode_admin_jwt_tests;
 mod file_mode_reload_observability_tests;
 mod frontend_tls_live_reload_tests;
 mod gateway_allowed_routes_selector_tests;
+mod gateway_api_backend_ref_kinds_tests;
 mod gateway_api_backend_tls_policy_tests;
+mod gateway_api_listenerset_tests;
 mod gateway_api_udproute_datapath_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_multi_cert_sni_tests;
@@ -84,8 +86,13 @@ mod mesh_dr_service_entry_e2e_tests;
 mod mesh_ew_egress_e2e_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
+mod mesh_grpc_transport_tests;
 mod mesh_hbone_tests;
+// Keep host UDP capture coverage on the existing trusted mesh-platform shard:
+// its filter matches this module-name prefix without changing CI workflow code.
 mod mesh_k8s_pod_discovery_tests;
+#[path = "mesh_k8s_pod_discovery/host_udp_capture_tests.rs"]
+mod mesh_k8s_pod_discovery_tests_host_udp_capture;
 mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;
 mod mesh_multicluster_discovery_tests;
@@ -98,12 +105,14 @@ mod mesh_retry_rotation_tests;
 mod mesh_runtime_overlay_consumers_tests;
 mod mesh_service_waypoint_tests;
 mod mesh_sidecar_e2e_tests;
+mod mesh_stock_xds_tests;
 mod mesh_subscribe_validation_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
 mod mesh_topology_hbone_tests;
 mod policy_path_canonicalization_tests;
+mod port_aware_route_traffic_tests;
 mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
@@ -114,3 +123,4 @@ mod udp_hook_concurrency_tests;
 mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module
+mod workload_api_jwt_svid_tests;

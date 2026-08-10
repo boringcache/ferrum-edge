@@ -525,8 +525,10 @@ LIGHTWEIGHT_PATTERNS = [
 
 # Markdown under vendor/ participates in VENDOR_INTEGRITY.sha256 and must run
 # the vendored-patch and integration guards even when a manifest update was
-# accidentally omitted.
-FULL_CI_PREFIXES = ("vendor/",)
+# accidentally omitted. Files under charts/ are executable Helm inputs
+# regardless of extension and must run the full CI mode that hosts chart
+# security validation.
+FULL_CI_PREFIXES = ("vendor/", "charts/")
 
 # These checked-in artifacts are executable contract inputs, not lightweight
 # prose. Changes must run the Rust parity tests and static contract validator.
@@ -760,6 +762,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
+            "full",
+        ),
+        (
+            "pull_request",
+            ["charts/ferrum-mesh/templates/node-agent.md"],
             "full",
         ),
         ("pull_request", ["docs/vendored-patch-lifecycle.json"], "full"),

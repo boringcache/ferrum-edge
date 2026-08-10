@@ -39,11 +39,48 @@ pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
+pub mod gateway_listener;
 pub mod grpc_proxy;
+/// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
+/// Hyper's client handshake proves only the client half, so both h2c transports
+/// — the pooled gRPC path and the Unix-socket path — establish through here.
+pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
+pub mod host_udp_capture;
 pub mod http2_pool;
+/// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
+/// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
+/// the buffered tokio-rustls accept and the userspace relay.
+#[cfg(target_os = "linux")]
+pub(crate) mod ktls_accept;
+/// Per-direction traffic-key confidentiality budget for handed-off kTLS
+/// sessions (issue #3619). rustls stops counting protected messages at
+/// `dangerous_into_kernel_connection`, so the relay tracks the kernel's own
+/// record sequence numbers against the negotiated suite's
+/// `confidentiality_limit`. The arithmetic is platform-independent and public
+/// so the deterministic unit suite can pin it.
+///
+/// `#[allow(dead_code)]` because the enforcement consumers are Linux-only
+/// (`ktls_accept`, the splice relay) while the arithmetic and its tests are
+/// not, and the `ferrum-edge` binary compiles this as an internal tree where
+/// `pub` does not imply an external consumer.
+#[allow(dead_code)]
+pub mod ktls_confidentiality;
+/// Live-kernel proof that the #3619 handoff is not inert: real TLS 1.2
+/// sessions, real `setsockopt(SOL_TLS, ...)`, real `splice(2)`. Ignored by
+/// default and gated on kernel capability; the hosted kTLS live gate runs it
+/// with `FERRUM_KTLS_LIVE_REQUIRED=1` so an unavailable capability fails
+/// instead of quietly skipping.
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_live_kernel_tests;
+/// TLS control-record classification and the `SOL_TLS` `recvmsg`/`sendmsg`
+/// ancillary contract used by the kTLS splice relay (issue #3619). The
+/// classification half is platform-independent so it can be tested anywhere;
+/// the syscall wrappers are Linux-only.
+#[allow(dead_code)] // Several code points/helpers are exercised only by tests.
+pub mod ktls_record;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
@@ -65,6 +102,7 @@ pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_proxy;
+pub mod unix_backend;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -78,11 +116,11 @@ use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -108,6 +146,10 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::svid_source_watch::{
+    GATEWAY_SVID_FILE_POLL_INTERVAL, GatewaySvidPublishFn, GatewaySvidSourceSet,
+    GatewaySvidSourceTracker, GatewaySvidWatchConfig, run_gateway_svid_source_rotation_loop,
+};
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
@@ -807,7 +849,10 @@ const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 pub(crate) const FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KiB
 pub(crate) const FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
 pub(crate) const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 default)
-const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
+// Reserved, validation-safe ID for the gateway-injected instance. Keep this
+// deliberately unlike a normal operator-selected ID: the injector treats it
+// as managed state and may replace its contents on SVID rotation/reload.
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "ferrum-internal-gateway-workload-metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
     "source.",
@@ -901,14 +946,16 @@ fn inject_gateway_workload_metrics_if_svid(
         .plugin_configs
         .iter()
         .position(|plugin| {
-            plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            plugin.namespace == namespace
+                && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                 && plugin.enabled
                 && plugin.scope == PluginScope::Global
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
         })
         .or_else(|| {
             config.plugin_configs.iter().position(|plugin| {
-                plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                plugin.namespace == namespace
+                    && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                     && plugin.scope == PluginScope::Global
                     && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
             })
@@ -928,12 +975,25 @@ fn inject_gateway_workload_metrics_if_svid(
     if let Some(existing) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
     }) {
+        // The managed ID is validation-safe and can therefore collide with an
+        // operator-owned plugin. Never change the type (and potentially the
+        // security role) of such a plugin merely because its ID collides.
+        if existing.plugin_name != WORKLOAD_METRICS_PLUGIN_NAME {
+            warn!(
+                namespace,
+                plugin_id = GATEWAY_WORKLOAD_METRICS_PLUGIN_ID,
+                plugin_name = %existing.plugin_name,
+                "Gateway workload metrics injection skipped due to an operator plugin ID collision"
+            );
+            return;
+        }
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
         existing.scope = PluginScope::Global;
         existing.proxy_id = None;
         existing.enabled = true;
         existing.priority_override = None;
+        existing.trigger = None;
         existing.api_spec_id = None;
         existing.config = serde_json::json!({
             "workload_spiffe_id": spiffe_id,
@@ -953,20 +1013,28 @@ fn inject_gateway_workload_metrics_if_svid(
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: timestamp,
         updated_at: timestamp,
     });
 }
 
-fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespace: &str) -> bool {
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
-        && config
-            .plugin_configs
-            .iter()
-            .all(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        && config.plugin_configs.iter().all(|plugin| {
+            plugin.namespace == namespace
+                && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.scope == PluginScope::Global
+                && plugin.proxy_id.is_none()
+                && plugin.enabled
+                && plugin.priority_override.is_none()
+                && plugin.trigger.is_none()
+                && plugin.api_spec_id.is_none()
+        })
 }
 
 fn gateway_hbone_mtls_observed(
@@ -2281,6 +2349,101 @@ fn inbound_hbone_relay_destination_allowed(
     })
 }
 
+/// Round-robin cursor over an admitted external UDP destination's precomputed
+/// dial endpoints (issue #3263).
+///
+/// One relaxed `fetch_add` per admitted CONNECT — no lock, no allocation, and no
+/// per-destination state that a reload would have to migrate: the endpoint set
+/// itself lives in the `ArcSwap`ped config snapshot, so an apply that changes the
+/// set changes what the very next CONNECT selects, while this cursor only
+/// spreads sessions across whatever set is current.
+static MESH_EGRESS_UDP_ENDPOINT_CURSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve the destination an EgressGateway may dial for a `udp`-marked mesh
+/// CONNECT naming external `host:port` (issue #3263), or `None` when the pair is
+/// not an admitted external UDP egress destination.
+///
+/// The allowlist is materialized ONLY under `EgressGateway` topology, ONLY from
+/// `MESH_EXTERNAL` `ServiceEntry` ports whose protocol is `UDP`, and ONLY when
+/// stream-family egress is enabled — so on every other proxy this is an empty
+/// vector and the lookup denies. Matching is EXACT on the AUTHORITY host (ASCII
+/// case-insensitive; the stored host is already lowercased) and exact on the
+/// service port: wildcard ServiceEntry hosts are refused at materialization, so
+/// no admission is ever decided by a prefix or subnet guess.
+///
+/// The returned `(host, port)` is a DIAL endpoint, which is not the authority: a
+/// `STATIC` ServiceEntry's host resolves to one of its operator-declared
+/// `endpoints[]`, so the gateway never DNS-resolves a STATIC authority. The set
+/// is precomputed and bounded at materialization; selection is a modulo index
+/// over it.
+///
+/// This deliberately does NOT widen [`inbound_hbone_relay_destination_allowed`]:
+/// the byte-stream HBONE relay stays bounded to loopback / slice-known workload
+/// targets. Only the datagram handler consults this second, egress-specific
+/// allowlist.
+fn mesh_egress_udp_destination_dial_endpoint(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<(String, u16)> {
+    let mesh = mesh?;
+    if mesh.egress_udp_destinations.is_empty() {
+        return None;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    let dest = mesh
+        .egress_udp_destinations
+        .iter()
+        .find(|dest| dest.port == port && dest.host.eq_ignore_ascii_case(host))?;
+    if dest.dial_endpoints.is_empty() {
+        // Materialization refuses an endpoint-less admission, so this is
+        // unreachable in practice; fail closed rather than inventing a fallback
+        // that would dial the authority itself.
+        return None;
+    }
+    let index = MESH_EGRESS_UDP_ENDPOINT_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        as usize
+        % dest.dial_endpoints.len();
+    let endpoint = &dest.dial_endpoints[index];
+    Some((endpoint.host.clone(), endpoint.port))
+}
+
+/// Whether `host:port` is a precomputed dial endpoint of an admitted external
+/// UDP egress destination.
+///
+/// This is the live post-route-override guard in `handle_hbone_udp_request`.
+/// Route-miss synthesis already selected an admitted dial endpoint from the
+/// CONNECT authority via [`mesh_egress_udp_destination_dial_endpoint`], but the
+/// synthesized relay proxy inherits the global plugin chain and a `before_proxy`
+/// route-override can rewrite `app_host` / `app_port` before any socket opens.
+/// Re-checking here is therefore necessary and nonredundant — and it MUST match
+/// dial endpoints only, never authority hosts: a `STATIC` ServiceEntry host is
+/// a valid CONNECT authority, but admitting it as an effective socket target
+/// would let `resolve_local_udp_dest` DNS-resolve that hostname and bypass the
+/// operator-declared `endpoints[]` set. Under `DNS`/`NONE` the dial endpoint
+/// *is* the authority host, so those destinations stay usable; a `STATIC`
+/// endpoint-IP authority is usable because that IP is itself a dial endpoint.
+/// The original-authority lookup used at CONNECT synthesis is unchanged.
+fn mesh_egress_udp_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let Some(mesh) = mesh else {
+        return false;
+    };
+    if mesh.egress_udp_destinations.is_empty() {
+        return false;
+    }
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.egress_udp_destinations.iter().any(|dest| {
+        dest.dial_endpoints
+            .iter()
+            .any(|endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(host))
+    })
+}
+
 fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     let Some(inner) = host
         .strip_prefix('[')
@@ -2300,9 +2463,18 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
 /// terminator where no inbound route is materialized. Returns `None` (caller
 /// 404s) when the authority is missing/portless or is not a safe local relay
 /// target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` selects the SECOND, narrower admission source used only by
+/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
+/// naming an external destination the EgressGateway's `ServiceEntry`-derived
+/// allowlist admits relays to that external host over a local `UdpSocket`, with
+/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
+/// relay never consults it, so a bare CONNECT stays bounded to loopback /
+/// slice-known workload targets exactly as before.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    is_udp_connect: bool,
 ) -> Option<Arc<Proxy>> {
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
@@ -2310,12 +2482,22 @@ fn build_inbound_hbone_relay_proxy(
     if host.is_empty() || port == 0 {
         return None;
     }
-    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return None;
+    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+        ));
     }
-    Some(Arc::new(
-        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-    ))
+    if is_udp_connect
+        && let Some((dial_host, dial_port)) =
+            mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
+    {
+        // The relay dials the SELECTED ENDPOINT, not the authority: a STATIC
+        // ServiceEntry host must never be DNS-resolved here.
+        return Some(Arc::new(
+            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(&dial_host, dial_port),
+        ));
+    }
+    None
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -3894,6 +4076,15 @@ pub(crate) fn final_request_body_requirements(
                 needs_final_context |= plugin.needs_final_request_body_context();
             }
         }
+        // A trigger-skipped body plugin correctly contributes no buffering of
+        // its own, but another instance may still buffer the same request. In
+        // that mixed chain the skipped wrapper's context-free compatibility
+        // hooks are still visited by the final transform/policy passes. Force
+        // those passes onto the context-aware dispatch whenever any published
+        // instance requires it and a body will actually be buffered; otherwise
+        // the skipped instance cannot evaluate its trigger and may rewrite or
+        // reject a path it does not govern.
+        needs_final_context |= has_contextual_final_body_hook && requires_buffering;
         // An egress plugin must observe the exact backend-visible request, and
         // the ordinary ladder finalizes the body *inside* `proxy_to_backend`
         // — while the backend request is already being built. Pull the
@@ -4014,7 +4205,9 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
-    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
+    // `mesh.metrics.*` coordination keys stay on the in-process summary until
+    // built-in observers consume them and external serialization omits them.
+    crate::plugins::utils::metadata_redaction::strip_dedup_internal_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -5539,6 +5732,53 @@ pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
     delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
+/// Config-publication notification handle carried by [`ProxyState`].
+///
+/// This is a deliberately one-way seam. Subscribing is public so watchers that
+/// own sockets — notably
+/// [`crate::proxy::gateway_listener::GatewayListenerManager`], which cannot be
+/// constructed before the state it serves — can react to a config swap without
+/// polling the `ArcSwap`. *Advancing* the revision is crate-private, so only
+/// [`ProxyState::bump_config_revision`], reached from a committed config
+/// publication, can signal one. Exposing the raw `watch::Sender` would let any
+/// holder fake a publication and drive listener bind / withdrawal for a config
+/// generation that was never installed.
+///
+/// Construction stays public (`new` / `Default`) so external test crates can
+/// still build a `ProxyState` without that write capability.
+#[derive(Clone)]
+pub struct ConfigRevisionNotifier {
+    tx: Arc<watch::Sender<u64>>,
+}
+
+impl ConfigRevisionNotifier {
+    /// A notifier whose revision starts at `0` and has no watchers.
+    pub fn new() -> Self {
+        Self {
+            tx: Arc::new(watch::channel(0u64).0),
+        }
+    }
+
+    /// Watch for config publications. The value is meaningless; only the
+    /// change notification matters.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
+
+    /// Signal that a new config generation is live.
+    fn bump(&self) {
+        self.tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+}
+
+impl Default for ConfigRevisionNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -5582,9 +5822,16 @@ pub struct ProxyState {
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
     pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
-    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
-    /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
-    pub alt_svc_header: Option<String>,
+    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement on the
+    /// process-global proxy ports. `None` when HTTP/3 is disabled; avoids a
+    /// `format!()` allocation per response.
+    pub alt_svc_header: Option<Arc<str>>,
+    /// Pre-computed Alt-Svc values for dynamically bound Gateway API listener
+    /// ports that really have a QUIC socket, published by
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] on each
+    /// reconcile. Read lock-free; a port that is absent advertises nothing,
+    /// so a client is never steered to a port with no HTTP/3 listener.
+    pub gateway_h3_alt_svc: Arc<ArcSwap<HashMap<u16, Arc<str>>>>,
     /// Pre-computed Via header values per protocol version (RFC 9110 §7.6.3).
     /// `None` when `FERRUM_ADD_VIA_HEADER=false` (default). Keyed by protocol version string.
     pub via_header_http11: Option<String>,
@@ -5634,6 +5881,19 @@ pub struct ProxyState {
     pub max_concurrent_requests_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
+    /// Monotonic counter bumped once per successful config publication.
+    ///
+    /// Watchers that must react to a config swap but do not live inside
+    /// `ProxyState` — notably
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`], which owns
+    /// sockets and therefore cannot be constructed before the state it serves
+    /// — subscribe here instead of polling the `ArcSwap`. The value itself is
+    /// meaningless; only the change notification matters, and `watch`
+    /// coalesces bursts so a rapid reload sequence costs one reconcile.
+    ///
+    /// The field is public but the write capability is not: see
+    /// [`ConfigRevisionNotifier`].
+    pub config_revision: ConfigRevisionNotifier,
     /// Windowed per-second rate metrics computed by a background task.
     /// Read by the admin `/status` endpoint; written by `metrics::start_metrics_monitor`.
     pub windowed_metrics: Arc<crate::metrics::WindowedMetrics>,
@@ -5683,14 +5943,15 @@ pub struct ProxyState {
     /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
     /// readers.
     pub gateway_svid_bundle: SharedSvidBundle,
-    /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
-    /// override; when a CP snapshot removes them, this restores file trust.
+    /// Latest SVID bundle loaded from configured or runtime sources.
+    /// CP-delivered trust bundles are an override; when a CP snapshot removes
+    /// them, this restores the source-provided trust.
     pub gateway_file_svid_bundle: SharedSvidBundle,
     /// Latest CP-delivered gateway trust bundles, stored even when this DP has
     /// no local SVID so later bridge phases can verify mesh peers from CP state.
     pub gateway_trust_bundles: SharedGatewayTrustBundles,
     /// Serializes the cold-path gateway SVID writers:
-    /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
+    /// CP-delivered trust-bundle apply, CP trust clear, and source SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
@@ -5726,9 +5987,9 @@ pub struct ProxyState {
     /// The internal consumer side ([`spawn_backend_svid_rotation_task`]) holds
     /// a `Receiver` and drives `backend_svid_generation` plus pool drains.
     ///
-    /// The gateway SVID file watcher publishes to this sender when
-    /// `FERRUM_GATEWAY_SVID_*` files are configured and a validated reload
-    /// succeeds. Future in-memory producers can also wire in by cloning the
+    /// The gateway SVID source watcher publishes to this sender when
+    /// `FERRUM_GATEWAY_SVID_*` sources are configured and a validated reload
+    /// succeeds. In-memory producers can also wire in by cloning the
     /// sender and handing the clone to `RotationConfig.revision_tx`
     /// ([`crate::identity::rotation::RotationConfig::new`]) or
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
@@ -5849,6 +6110,12 @@ struct RequestConnectionMetadata {
     /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
+    /// Connection-local (destination) IP resolved at accept: the captured
+    /// pre-NAT original destination when there is one, else the listener's
+    /// specific bind address, else the accepted socket's local address.
+    /// Stamped onto `RequestContext::destination_ip` for Istio's
+    /// `destination.ip` condition. Never derived from request headers.
+    destination_ip: Option<std::net::IpAddr>,
     /// Captured inbound app port actually used for accept-time mesh TLS policy
     /// selection, after applying any Sidecar ingress listener-to-app alias.
     /// `None` for direct dials and non-mesh listeners.
@@ -5946,15 +6213,15 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
     Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
-#[derive(Debug, Clone)]
-struct GatewaySvidFilePaths {
-    cert: PathBuf,
-    key: PathBuf,
-    trust_bundle: PathBuf,
-    expected_spiffe_id: Option<String>,
-}
-
-fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvidFilePaths> {
+/// Collect the configured gateway SVID material sources for the rotation
+/// watcher.
+///
+/// Every supported source form participates — filesystem paths, `file://`,
+/// inline PEM, and provider URIs — because the watcher classifies each source's
+/// own refresh cadence (see [`crate::identity::svid_source_watch`]). Inline PEM
+/// contributes no cadence and stays static until config reload, so a fully
+/// inline triple makes the watcher exit immediately.
+fn gateway_svid_source_set_from_env(env_config: &EnvConfig) -> Option<GatewaySvidSourceSet> {
     let (Some(cert), Some(key), Some(trust_bundle)) = (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
@@ -5962,25 +6229,55 @@ fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ) else {
         return None;
     };
-    let cert_source = CertSource::parse(cert, MaterialKind::Cert);
-    let key_source = CertSource::parse(key, MaterialKind::Key);
-    let trust_bundle_source = CertSource::parse(trust_bundle, MaterialKind::CaBundle);
 
-    let (Some(cert), Some(key), Some(trust_bundle)) = (
-        cert_source.as_file_path(),
-        key_source.as_file_path(),
-        trust_bundle_source.as_file_path(),
-    ) else {
-        info!("Gateway SVID source includes non-file material; file rotation watcher disabled");
-        return None;
-    };
+    Some(GatewaySvidSourceSet::new(
+        cert.to_string(),
+        key.to_string(),
+        trust_bundle.to_string(),
+        env_config.gateway_spiffe_id.clone(),
+    ))
+}
 
-    Some(GatewaySvidFilePaths {
-        cert,
-        key,
-        trust_bundle,
-        expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
-    })
+/// Build the gateway SVID source set and prime its rotation-comparison
+/// baseline.
+///
+/// Runs in `ProxyState::new` **before** [`load_gateway_svid_bundle`], not
+/// inside the spawned watcher task. `tokio::spawn` only queues the task: it
+/// does not run until the caller yields to the runtime, which is after the
+/// remainder of gateway startup (TLS policy, listener binds, DNS warmup) and,
+/// for an embedded `ProxyState`, potentially much later. A source rewritten in
+/// that window would be adopted *as* the watcher's baseline, so the rotation
+/// would never be observed and the gateway would keep using the pre-rotation
+/// identity until the material changed again.
+///
+/// Priming ahead of the bundle load also keeps the failure direction safe: the
+/// baseline is taken from material at or before what the live slot ends up
+/// holding, so a startup-window change costs one redundant rotation instead of
+/// a silently stale identity.
+///
+/// A prime that cannot read every source is *not* necessarily fatal: the bundle
+/// load that follows re-reads the sources, so a transiently unavailable one can
+/// have recovered in between and construction succeeds with a live bundle this
+/// tracker never fingerprinted. `GatewaySvidSourceTracker::prime` latches a
+/// forced first publish for exactly that case, so the first complete
+/// fingerprint set is reloaded and published rather than adopted as a silent
+/// baseline.
+fn prime_gateway_svid_rotation_baseline(
+    env_config: &EnvConfig,
+) -> Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)> {
+    let sources = gateway_svid_source_set_from_env(env_config)?;
+    let provider_interval = Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1));
+    let mut tracker =
+        GatewaySvidSourceTracker::new(&sources, GATEWAY_SVID_FILE_POLL_INTERVAL, provider_interval);
+    if tracker.is_watchable() {
+        // An unreadable source leaves the baseline unset. If the bundle load
+        // immediately after this also fails, construction fails and nothing
+        // downstream runs; if it succeeds because the source recovered in
+        // between, the latched forced first publish makes the watcher's first
+        // complete read reload and publish instead of baselining silently.
+        tracker.prime(std::time::Instant::now());
+    }
+    Some((sources, tracker))
 }
 
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
@@ -6144,135 +6441,6 @@ fn push_tls_material_source(
     if seen.insert((kind, source.pool_key_component())) {
         sources.push(
             crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
-        );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileFingerprint {
-    cert: GatewaySvidFileStamp,
-    key: GatewaySvidFileStamp,
-    trust_bundle: GatewaySvidFileStamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewaySvidFileStamp {
-    len: u64,
-    modified_nanos: Option<u128>,
-}
-
-fn gateway_svid_file_stamp(path: &Path) -> Result<GatewaySvidFileStamp, anyhow::Error> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("failed to stat {}: {}", path.display(), e))?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    Ok(GatewaySvidFileStamp {
-        len: metadata.len(),
-        modified_nanos,
-    })
-}
-
-fn gateway_svid_file_fingerprint(
-    paths: &GatewaySvidFilePaths,
-) -> Result<GatewaySvidFileFingerprint, anyhow::Error> {
-    Ok(GatewaySvidFileFingerprint {
-        cert: gateway_svid_file_stamp(&paths.cert)?,
-        key: gateway_svid_file_stamp(&paths.key)?,
-        trust_bundle: gateway_svid_file_stamp(&paths.trust_bundle)?,
-    })
-}
-
-async fn run_gateway_svid_file_rotation_loop(
-    state: ProxyState,
-    paths: GatewaySvidFilePaths,
-    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-) {
-    const GATEWAY_SVID_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-    let mut last_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Gateway SVID file watcher could not read startup fingerprint; continuing and will retry"
-            );
-            None
-        }
-    };
-    let mut interval = tokio::time::interval(GATEWAY_SVID_FILE_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-            return;
-        }
-
-        if let Some(shutdown) = shutdown_rx.as_mut() {
-            tokio::select! {
-                _ = interval.tick() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            interval.tick().await;
-        }
-
-        let next_fingerprint = match gateway_svid_file_fingerprint(&paths) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Gateway SVID file watcher could not inspect SVID files; keeping current backend identity"
-                );
-                continue;
-            }
-        };
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            continue;
-        }
-
-        let bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
-            &paths.cert,
-            &paths.key,
-            &paths.trust_bundle,
-            paths.expected_spiffe_id.as_deref(),
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    cert_path = %paths.cert.display(),
-                    key_path = %paths.key.display(),
-                    trust_bundle_path = %paths.trust_bundle.display(),
-                    "Gateway SVID files changed but reload failed; keeping current backend identity"
-                );
-                // Record the failing fingerprint so we don't re-warn every
-                // poll while the bad state is stable. The next genuine
-                // change (good or different-bad) will compare unequal and
-                // re-attempt the load.
-                last_fingerprint = Some(next_fingerprint);
-                continue;
-            }
-        };
-
-        let spiffe_id = bundle.spiffe_id.to_string();
-        state.install_gateway_file_svid_bundle(bundle);
-        state
-            .backend_svid_rotation_tx
-            .send_modify(|revision| *revision = revision.saturating_add(1));
-        let revision = *state.backend_svid_rotation_tx.borrow();
-        last_fingerprint = Some(next_fingerprint);
-        info!(
-            spiffe_id = %spiffe_id,
-            svid_revision = revision,
-            "Gateway SVID files reloaded; backend SVID rotation published"
         );
     }
 }
@@ -6465,13 +6633,13 @@ impl ProxyState {
 
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
-    /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
+    /// If the gateway already has a source-loaded SVID, rebuild the SVID bundle
     /// with the new trust material so TLS builders see the update through the
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
     ///
     /// This is called from the DP config-apply loop, which is single-writer for
-    /// CP-delivered gateway trust. The gateway SVID file watcher can also swap
+    /// CP-delivered gateway trust. The gateway SVID source watcher can also swap
     /// the SVID bundle, so all gateway SVID slot writes are serialized by
     /// `gateway_svid_update_lock`.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
@@ -6489,7 +6657,7 @@ impl ProxyState {
         }
     }
 
-    /// Clear CP-delivered trust bundles and restore the latest file-loaded SVID.
+    /// Clear CP-delivered trust bundles and restore the latest source-loaded SVID.
     pub fn clear_gateway_trust_bundles(&self) {
         let _guard = self
             .gateway_svid_update_lock
@@ -6524,7 +6692,7 @@ impl ProxyState {
 
     /// Force a gateway SVID reload from the currently configured sources.
     ///
-    /// This is the admin-triggered equivalent of the file watcher path. It
+    /// This is the admin-triggered equivalent of the source watcher path. It
     /// accepts any source form supported by `load_svid_bundle_from_sources`
     /// (file path, inline PEM, typed URI), preserves any CP-delivered trust
     /// override, and publishes a backend SVID generation bump so backend pools
@@ -6861,15 +7029,48 @@ impl ProxyState {
         )
     }
 
-    fn start_gateway_svid_file_rotation_task(
+    /// Start the gateway SVID source rotation watcher.
+    ///
+    /// Covers every configured SVID source form: file paths keep the historical
+    /// 1s cadence, provider URIs are re-fetched on
+    /// `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (or their own `?poll=`), and a
+    /// fully inline-PEM triple makes the watcher exit at once. The publish
+    /// closure is the same pipeline `POST /admin/tls/rotate/svid` drives:
+    /// install the validated bundle into the SVID slot (preserving any
+    /// CP-delivered trust override), then bump the backend SVID generation so
+    /// pool keys, pool drains, and health probes observe one coherent update.
+    ///
+    /// `primed` carries the source set together with the baseline
+    /// [`prime_gateway_svid_rotation_baseline`] already established, so the
+    /// watcher compares against material read at startup rather than against
+    /// whatever the sources hold when the runtime first schedules this task.
+    fn start_gateway_svid_rotation_task(
         &self,
+        primed: Option<(GatewaySvidSourceSet, GatewaySvidSourceTracker)>,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let paths = gateway_svid_file_paths_from_env(&self.env_config)?;
+        let (sources, tracker) = primed?;
         let state = self.clone();
-        Some(tokio::spawn(run_gateway_svid_file_rotation_loop(
-            state,
-            paths,
+        let provider_interval =
+            Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1));
+        let publish: GatewaySvidPublishFn = Box::new(move |bundle| {
+            // Slot first, then the generation bump the backend pools, pool
+            // keys, and health probes key off — never the other way round.
+            state.install_gateway_file_svid_bundle(bundle);
+            state
+                .backend_svid_rotation_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+            *state.backend_svid_rotation_tx.borrow()
+        });
+        let config = GatewaySvidWatchConfig {
+            sources,
+            file_interval: GATEWAY_SVID_FILE_POLL_INTERVAL,
+            provider_interval,
+            tracker: Some(tracker),
+            publish,
+        };
+        Some(tokio::spawn(run_gateway_svid_source_rotation_loop(
+            config,
             shutdown_rx,
         )))
     }
@@ -6987,8 +7188,11 @@ impl ProxyState {
             ));
         }
 
-        let alt_svc_header = if env_config.enable_http3 {
-            Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
+        let alt_svc_header: Option<Arc<str>> = if env_config.enable_http3 {
+            Some(Arc::from(format!(
+                "h3=\":{}\"; ma=86400",
+                env_config.proxy_https_port
+            )))
         } else {
             None
         };
@@ -7088,6 +7292,10 @@ impl ProxyState {
             ),
         );
         let env_config_arc = Arc::new(env_config.clone());
+        // Baseline the rotation watcher *before* the initial bundle load; see
+        // `prime_gateway_svid_rotation_baseline`. Doing it inside the spawned
+        // task would swallow any source change made during startup.
+        let gateway_svid_rotation = prime_gateway_svid_rotation_baseline(&env_config_arc);
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         inject_gateway_workload_metrics_if_svid(
             &mut config,
@@ -7434,6 +7642,11 @@ impl ProxyState {
         // private per-listener limiter (which would make the effective ceiling
         // `cap` per listener plus another `cap` for the whole HTTP family).
         stream_listener_manager.attach_backend_conn_limit(backend_conn_limit.clone());
+        // Publish the opaque-TLS SNI plaintext-fallback authorization before the
+        // first `reconcile()`. Absent the call every SNI-routed stream listener
+        // stays fail-closed, which is the intended default.
+        stream_listener_manager
+            .set_stream_sni_plaintext_fallback(env_config_arc.stream_sni_plaintext_fallback);
 
         let state = Self {
             config: config_arc,
@@ -7471,6 +7684,7 @@ impl ProxyState {
             backend_capabilities,
             backend_capabilities_refresh,
             alt_svc_header,
+            gateway_h3_alt_svc: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             via_header_http11,
             via_header_http2,
             via_header_http3,
@@ -7506,6 +7720,7 @@ impl ProxyState {
             },
             max_concurrent_requests_per_ip,
             stream_listener_manager,
+            config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
@@ -7534,8 +7749,9 @@ impl ProxyState {
                 ),
             ),
         };
+        let svid_shutdown_rx = health_check_restart_rx.clone();
         if let Some(handle) =
-            state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
+            state.start_gateway_svid_rotation_task(gateway_svid_rotation, svid_shutdown_rx)
         {
             health_check_handles.push(handle);
         }
@@ -7605,6 +7821,54 @@ impl ProxyState {
             ));
         }
         Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
+    /// Subscribe to config-publication notifications.
+    ///
+    /// Used by [`crate::proxy::gateway_listener::GatewayListenerManager`] to
+    /// reconcile Gateway API listener sockets on reload / update / delete /
+    /// withdrawal without polling.
+    pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
+        self.config_revision.subscribe()
+    }
+
+    /// The Alt-Svc value to advertise for the frontend port a request arrived
+    /// on, or `None` when HTTP/3 is not reachable there.
+    ///
+    /// HTTP/3 lives on a UDP socket, so it is only advertisable where one
+    /// exists. The process-global proxy ports keep the precomputed value; a
+    /// Gateway API listener port advertises itself only while
+    /// [`crate::proxy::gateway_listener::GatewayListenerManager`] has a QUIC
+    /// listener bound on it. Advertising the global HTTPS port from a
+    /// port-scoped listener would steer the client to a socket whose route
+    /// table cannot match the port-scoped route. One `ArcSwap` load and one
+    /// small-map lookup; no allocation and no lock.
+    pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
+        let global = self.alt_svc_header.as_ref()?;
+        match frontend_port {
+            Some(port)
+                if port != self.env_config.proxy_https_port
+                    && port != self.env_config.proxy_http_port =>
+            {
+                self.gateway_h3_alt_svc.load().get(&port).cloned()
+            }
+            _ => Some(Arc::clone(global)),
+        }
+    }
+
+    /// Publish the Gateway API listener ports that currently have a live QUIC
+    /// listener, with their precomputed Alt-Svc values.
+    pub fn publish_gateway_h3_alt_svc(&self, ports: &[u16]) {
+        let map: HashMap<u16, Arc<str>> = ports
+            .iter()
+            .map(|port| (*port, Arc::from(format!("h3=\":{port}\"; ma=86400"))))
+            .collect();
+        self.gateway_h3_alt_svc.store(Arc::new(map));
+    }
+
+    /// Notify config watchers that a new config generation is live.
+    fn bump_config_revision(&self) {
+        self.config_revision.bump();
     }
 
     fn collect_backend_capability_targets(
@@ -9216,6 +9480,15 @@ impl ProxyState {
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
+        // Listener TLS class is route-table input resolved onto
+        // `PortScopedProxy` at build time, but it lives on GatewayConfig rather
+        // than the Proxy and therefore never appears in ConfigDelta. A pure
+        // HTTP<->HTTPS class flip must rebuild the table even when every proxy
+        // object and timestamp is byte-identical.
+        if old_config.http_tls_listen_ports != new_config.http_tls_listen_ports {
+            return true;
+        }
+
         // Keyed by `(namespace, id)`: a bare-id index would let one tenant's
         // same-id proxy stand in for another's, masking a real projected
         // route-content change (or inventing one that never happened).
@@ -9252,6 +9525,10 @@ impl ProxyState {
         new_config: &GatewayConfig,
     ) -> Vec<Upstream> {
         fn content_eq(a: &Upstream, b: &Upstream) -> bool {
+            // Authored target tags (mesh.mtls / mesh.hbone / SPIFFE pins / …) are
+            // ordinary serialized fields, but compare them explicitly here so a
+            // same-timestamp tag-only rewrite cannot depend solely on HashMap
+            // serde round-tripping to rebuild the LB / request epoch (#3284).
             let skipped_fields_equal = a.resolved_subset_tls == b.resolved_subset_tls
                 && a.dispatch_port_override_fallback == b.dispatch_port_override_fallback
                 && a.targets.len() == b.targets.len()
@@ -9260,6 +9537,7 @@ impl ProxyState {
                     .zip(&b.targets)
                     .all(|(a_target, b_target)| {
                         a_target.service_port_policy_key == b_target.service_port_policy_key
+                            && a_target.tags == b_target.tags
                     });
             if !skipped_fields_equal {
                 return false;
@@ -9903,8 +10181,10 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
-        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
+        let old_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&old_config, &self.env_config.namespace);
+        let new_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&new_config, &self.env_config.namespace);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -10001,6 +10281,11 @@ impl ProxyState {
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
             self.spawn_backend_capability_refresh();
 
+            // Wake external config watchers (Gateway API listener lifecycle).
+            // Published AFTER the epoch swap, so a woken reconciler always
+            // reads the config it is reacting to — never a half-applied one.
+            self.bump_config_revision();
+
             // Reconcile stream proxy listeners (TCP/UDP)
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -10067,9 +10352,10 @@ impl ProxyState {
                     let mesh_changed = current.config.mesh != new_config.mesh;
                     // DestinationRule-derived projections
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
-                    // `resolved_tls`, stream-relay dispatch maps) are
-                    // `#[serde(skip)]` and invisible to ConfigDelta's
-                    // `updated_at` comparison. A DR-only edit that left every
+                    // `resolved_tls`, stream-relay dispatch maps) and the
+                    // Gateway-level `http_tls_listen_ports` classification are
+                    // invisible to ConfigDelta's `updated_at` comparison. A
+                    // DR-only edit or listener-class flip that left every
                     // resource timestamp unchanged must still republish the
                     // route table (and LB, which also consumes DR-derived
                     // upstream policy) before any status/revision ACK — otherwise
@@ -10187,6 +10473,11 @@ impl ProxyState {
             &published.plugin_cache,
             &published.config,
         );
+
+        // Wake external config watchers (Gateway API listener lifecycle) on the
+        // incremental path too — an add/update/delete of a port-scoped route
+        // arrives here, not through the full-rebuild branch.
+        self.bump_config_revision();
 
         // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
         // there is no resource delta to drive pruning, DNS warmup, listener
@@ -10661,21 +10952,36 @@ impl ProxyState {
                     // disappear after its off-thread MMDB generation was
                     // accepted. Claim and publish that handoff rather than
                     // leaving it unowned or retaining stale geo readers.
-                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                    let plugin_cache = self.plugin_cache.build_country_mmdb_reload_inner(
                         &current.plugin_cache,
                         &new_config,
                         false,
-                    )?
-                    else {
+                    )?;
+                    // Gateway listener TLS classification and other projected
+                    // route-table inputs live outside ConfigDelta. An
+                    // incremental snapshot can therefore carry a real class
+                    // flip while every resource identity/timestamp remains
+                    // unchanged; publish the new table before waking the
+                    // listener manager.
+                    let rebuild_routes =
+                        Self::projected_route_proxy_content_changed(&current.config, &new_config)
+                            || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                    if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
-                    };
+                    }
+                    route_changed.set(rebuild_routes);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: Arc::clone(&current.route_table),
-                        plugin_cache,
+                        route_table: if rebuild_routes {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: false,
+                        route_changed: rebuild_routes,
                         lb_changed: false,
                     }));
                 }
@@ -10708,8 +11014,14 @@ impl ProxyState {
             &published.config,
         );
 
+        // `apply_incremental` is a distinct publication path used by database
+        // and CP/DP deltas. Wake socket reconciliation here as well as in the
+        // full-snapshot path; otherwise a newly added/removed listener waits for
+        // the slow supervision tick despite its config already being live.
+        self.bump_config_revision();
+
         let Some(delta) = applied_delta else {
-            debug!("Incremental config: accepted MMDB-only generation republished");
+            debug!("Incremental config: accepted projected route/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
 
@@ -10923,7 +11235,8 @@ impl ProxyState {
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
     /// identity or credential state triggers one of them — most visibly a DP
-    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// with a gateway SVID, where the injected
+    /// `ferrum-internal-gateway-workload-metrics`
     /// plugin config exists only on the applied side.
     ///
     /// The ConfigSync older-cross-source identical-payload exception
@@ -11002,6 +11315,7 @@ async fn handle_connection(
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
+    destination_ip: Option<std::net::IpAddr>,
     mesh_inbound_pre_handshake_app_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
@@ -11057,6 +11371,7 @@ async fn handle_connection(
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
             orig_dst,
+            destination_ip,
             mesh_inbound_pre_handshake_app_port,
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
@@ -15878,6 +16193,29 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_bound_listener_and_mesh_direction(
+        listener, state, shutdown, tls_config, None,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_bound_listener`] with an explicit mesh traffic
+/// direction stamped on every accepted connection.
+///
+/// Mesh listeners are normally bound by `modes::mesh`, which owns the direction
+/// per listener descriptor. This variant exists so an out-of-process-free test
+/// harness can drive the direction-gated inbound paths — the transparent HBONE
+/// relay synthesis and the datagram-over-mesh UDP relay — over a pre-bound
+/// socket with a static mTLS `ServerConfig`, instead of standing up a full mesh
+/// runtime. It adds no behavior of its own: `None` is exactly the existing
+/// entry point.
+pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> Result<(), anyhow::Error> {
     let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
@@ -15906,7 +16244,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         },
         conn_semaphore,
         shutdown,
-        None,
+        mesh_direction,
         0,
         SourceIpOverride::none(),
         None,
@@ -16544,6 +16882,8 @@ struct TlsConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// See [`RequestConnectionMetadata::orig_dst`].
     orig_dst: Option<SocketAddr>,
+    /// See [`RequestConnectionMetadata::destination_ip`].
+    destination_ip: Option<std::net::IpAddr>,
     /// See [`RequestConnectionMetadata::mesh_inbound_pre_handshake_app_port`].
     mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
@@ -16837,7 +17177,20 @@ async fn run_accept_loop(
     source_ip_override: SourceIpOverride,
     node_waypoint_expected_pod_uid: Option<[u8; 16]>,
 ) {
-    let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
+    let frontend_bound_addr = listener.local_addr().ok();
+    let frontend_listen_port = frontend_bound_addr.map(|addr| addr.port());
+    // A listener bound to a specific address is the destination IP of every
+    // connection it accepts, so resolve it once here instead of calling
+    // `getsockname()` per connection. A wildcard bind (`0.0.0.0` / `::`) has no
+    // single answer and falls back to the accepted socket's local address.
+    let frontend_bound_ip = frontend_bound_addr
+        .map(|addr| addr.ip())
+        .filter(|ip| !ip.is_unspecified());
+    // `destination.ip` is only consumed by `mesh_authz`, which exists solely in
+    // mesh mode. Outside it, skip the wildcard-bind `getsockname()` fallback
+    // entirely so a non-mesh gateway's accept loop is byte-for-byte unchanged.
+    let resolve_connection_destination_ip = frontend_bound_ip.is_none()
+        && state.env_config.mode == crate::config::env_config::OperatingMode::Mesh;
     // Count consecutive accept() failures to back off a busy-loop. Under fd
     // exhaustion (EMFILE/ENFILE) accept() fails WITHOUT consuming the pending
     // connection or clearing the socket's read-readiness, so the next accept()
@@ -16967,6 +17320,25 @@ async fn run_accept_loop(
                         } else {
                             None
                         };
+                        // Istio `destination.ip` input for this connection. A
+                        // captured original destination wins when present (it
+                        // is the address the client actually dialled, whereas
+                        // the socket's local address would be the interception
+                        // listener); otherwise it is the connection's own local
+                        // address. A specific bind IP answers for every
+                        // connection and was resolved once above the loop, so
+                        // only a wildcard-bound mesh listener pays a
+                        // per-connection `getsockname()` — never a per-request
+                        // cost, and never anything a client sends.
+                        let connection_destination_ip = orig_dst
+                            .map(|addr| addr.ip())
+                            .or(frontend_bound_ip)
+                            .or_else(|| {
+                                resolve_connection_destination_ip
+                                    .then(|| stream.local_addr().ok().map(|addr| addr.ip()))
+                                    .flatten()
+                            })
+                            .map(crate::util::client_identity::canonical_ip);
                         let tls_selection = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
                         // frontend reload slot, MeshInbound peer-auth slot)
@@ -17196,6 +17568,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    destination_ip: connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
                                 };
                                 handle_tls_connection(
@@ -17217,6 +17590,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
                                 )
                                 .await
@@ -17369,6 +17743,7 @@ async fn handle_tls_connection(
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
             orig_dst: tls_connection_metadata.orig_dst,
+            destination_ip: tls_connection_metadata.destination_ip,
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
@@ -22978,6 +23353,7 @@ const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required
 
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
 ) -> (u16, Bytes, HashMap<String, String>) {
     let mut headers = HashMap::new();
     // Challenge selection follows configured priority order: mechanisms that
@@ -22985,6 +23361,7 @@ fn missing_authentication_reject(
     // challenge wins.
     let challenge = auth_plugins
         .iter()
+        .filter(|plugin| plugin.authentication_applies(ctx))
         .find_map(|plugin| plugin.authentication_challenge())
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
@@ -23576,6 +23953,10 @@ pub async fn run_authentication_phase(
     for auth_plugin in auth_plugins {
         auth_plugin.mark_query_credentials_for_redaction(ctx);
     }
+    let applicable_auth_plugin_count = auth_plugins
+        .iter()
+        .filter(|plugin| plugin.authentication_applies(ctx))
+        .count();
 
     match auth_mode {
         AuthMode::Multi => {
@@ -23585,6 +23966,9 @@ pub async fn run_authentication_phase(
             let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
+                if !auth_plugin.authentication_applies(ctx) {
+                    continue;
+                }
                 let deadline = ctx.grpc_deadline_at();
                 let auth_result = match crate::plugins::await_grpc_deadline(
                     deadline,
@@ -23628,13 +24012,14 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+            let mesh_permissive_only_auth_plugin = applicable_auth_plugin_count == 1
                 && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
                     .is_some_and(|v| v == "true");
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
+                || applicable_auth_plugin_count == 0
                 || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
                 ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -23642,13 +24027,16 @@ pub async fn run_authentication_phase(
             } else {
                 let mut reject = server_reject
                     .or(last_reject)
-                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins));
+                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                 Some(reject)
             }
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                if !auth_plugin.authentication_applies(ctx) {
+                    continue;
+                }
                 if request_is_authenticated(ctx) {
                     return None;
                 }
@@ -23675,7 +24063,7 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+            let mesh_permissive_only_auth_plugin = applicable_auth_plugin_count == 1
                 && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
@@ -23683,11 +24071,12 @@ pub async fn run_authentication_phase(
             ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
+                || applicable_auth_plugin_count == 0
                 || mesh_permissive_only_auth_plugin
             {
                 None
             } else {
-                Some(missing_authentication_reject(auth_plugins))
+                Some(missing_authentication_reject(auth_plugins, ctx))
             }
         }
     }
@@ -23894,6 +24283,7 @@ async fn handle_proxy_request_inner(
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.orig_dst = connection_metadata.orig_dst;
+    ctx.destination_ip = connection_metadata.destination_ip;
     let mesh_inbound_pre_handshake_app_port =
         connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
@@ -24392,6 +24782,8 @@ async fn handle_proxy_request_inner(
             epoch.route_generation,
             request_host.as_deref(),
             &path,
+            ctx.frontend_listen_port,
+            is_tls,
         ),
     };
 
@@ -24413,6 +24805,8 @@ async fn handle_proxy_request_inner(
                 request_host.as_deref(),
                 &path,
                 ctx.mesh_direction,
+                ctx.frontend_listen_port,
+                is_tls,
             )
         }
         other => other,
@@ -24623,15 +25017,37 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
+            // A UDP CONNECT additionally consults the EgressGateway's
+            // ServiceEntry-derived external-destination allowlist (issue #3263),
+            // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+                build_inbound_hbone_relay_proxy(
+                    req.uri().authority(),
+                    epoch.config.mesh.as_deref(),
+                    is_udp_hbone_connect,
+                )
             } else {
                 None
             };
             match hbone_relay {
                 Some(relay_proxy) => {
+                    // Preserve the CONNECT authority port for mesh
+                    // authorization on every synthesized HBONE relay. UDP
+                    // EgressGateway may dial a ServiceEntry targetPort that
+                    // differs from this authority port; TCP relays dial the
+                    // authority port directly. Either way AuthorizationPolicy
+                    // `destination.port` must see the authority port, and the
+                    // synthesized proxy's backend_port remains the socket dial
+                    // port. Stamp unconditionally (not only for UDP) so a
+                    // missing stamp can fail closed in `mesh_inbound_app_port`
+                    // without breaking TCP HBONE, which previously relied on
+                    // falling through to backend_port.
+                    ctx.mesh_inbound_listener_authz_port = req
+                        .uri()
+                        .authority()
+                        .and_then(|authority| authority.port_u16());
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
@@ -24716,6 +25132,19 @@ async fn handle_proxy_request_inner(
     // Content-Type.
     let is_h2_ws = is_h2_websocket_connect(&req);
     ctx.set_request_http_flavor(flavor);
+    // Stamp the authoritative client-visible wire transport for declarative
+    // plugin execution triggers, from the accepted frontend version and the
+    // same pre-routing gRPC-Web classification used for policy selection.
+    // HTTP/0.9 and HTTP/1.0 are carried as `Http1`: the trigger surface
+    // distinguishes major transports, not minor versions.
+    ctx.set_request_wire_protocol(
+        match req.version() {
+            hyper::Version::HTTP_2 => crate::config::types::HttpWireTransport::Http2,
+            hyper::Version::HTTP_3 => crate::config::types::HttpWireTransport::Http3,
+            _ => crate::config::types::HttpWireTransport::Http1,
+        },
+        grpc_web_request,
+    );
 
     // Resolve the client-visible protocol before route-level rejects so every
     // post-routing synthesized initial HEADERS block uses the same precomputed
@@ -26999,6 +27428,52 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
+    // Fail-closed WebSocket gate for Unix-socket backends (a Sidecar `ingress[]`
+    // `defaultEndpoint: unix://…`, carried on the selected target's reserved
+    // `mesh.unix_socket` tag).
+    //
+    // **WebSocket over a Unix ingress socket is explicitly NOT supported.** The
+    // WebSocket dial machinery below is written against TCP/TLS and the mesh
+    // H2/HBONE CONNECT tunnels; it has no Unix transport, and the target's
+    // `host:port` is a placeholder nothing listens on (on a sidecar it is the
+    // gateway's OWN inbound listener port, so a fallback dial would loop the
+    // proxy back into itself). Refusing is therefore strictly better than
+    // falling through, and mirrors the `hbone_required` / `mesh_mtls_required`
+    // contract: a mesh-tagged target that cannot dispatch over its own
+    // transport is refused, never downgraded.
+    //
+    // gRPC is NOT gated here (issue #3261): an `http2`/`grpc`-declared listener
+    // dispatches natively over h2c through the generic path's Unix branch, and
+    // an `http`-declared (HTTP/1.1) one is refused with a clean gRPC
+    // UNAVAILABLE by the direct-dispatch mesh-transport screen further down
+    // (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), which produces a
+    // protocol-correct trailers response instead of this 502.
+    if request_protocol == ProxyProtocol::WebSocket
+        && upstream_target
+            .as_deref()
+            .is_some_and(unix_backend::target_is_unix_backend)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            "unix-socket backend target cannot serve a WebSocket upgrade; refusing rather \
+             than dialing the placeholder loopback address"
+        );
+        // This refusal precedes any backend dispatch, so release a HALF_OPEN
+        // probe slot `check_circuit_breaker` may have claimed — otherwise
+        // repeated refusals leak `half_open_in_flight` slots and wedge the
+        // breaker (same reason the HBONE / mesh-mTLS refusals do it).
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        record_request(&state, 502);
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"unix-socket backend does not support WebSocket dispatch"}"#,
+        ));
+    }
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -27152,21 +27627,18 @@ async fn handle_proxy_request_inner(
         // needs `&mut ctx` and may publish backend header overlay entries.
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
-        // branch cannot dispatch over its secured transport (issue #2003):
-        //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
-        //     `mesh.mtls`): the dial host is a remote-pod / scoped synthetic
-        //     identity that is NOT directly routable, and the dial has no
-        //     east-west gateway dial-host override, no destination-FQDN SNI
-        //     override, and no trust-domain-scoped verification. gRPC over
-        //     cross-cluster HBONE / mesh-mTLS is a documented follow-up
-        //     (HTTP-first), mirroring the WebSocket cross-cluster guards.
-        //   * Same-cluster Ambient `mesh.hbone` targets: the HBONE inner
-        //     protocol is HTTP/1.1 over a byte tunnel, which cannot carry the
-        //     HTTP/2 trailers gRPC requires — an explicit non-goal (see the
-        //     out-of-scope list in docs/mesh_supported_matrix.md), fail
-        //     closed rather than silently corrupt.
-        //   * `MeshMtls` is normally unreachable here (the fall-through above
-        //     routes it down the generic mesh path) — refuse defensively.
+        // direct-pool branch cannot dispatch over its secured transport
+        // (issue #2003):
+        //   * Sidecar `mesh.mtls` targets, same-cluster and cross-cluster,
+        //     normally fall through above to the generic trailer-preserving
+        //     mesh-mTLS path. Refuse defensively if either reaches this branch.
+        //   * Ambient `mesh.hbone` targets remain unsupported on this H1/H2
+        //     frontend because its generic HBONE path runs HTTP/1.1 inside the
+        //     CONNECT tunnel and cannot carry gRPC trailers. The H3 bridge uses
+        //     a separate nested-HTTP/2 transport for these targets (#3284).
+        //   * Malformed cross-cluster targets fail closed because the secured
+        //     east-west dial cannot be materialized without its transport,
+        //     destination-FQDN SNI override, and trust-domain scope.
         // Refuse cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
         // connection-level failure) before any backend dial / circuit-breaker
         // charge — NEVER a direct plaintext dial that would bypass the mesh
@@ -27174,9 +27646,14 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+                // The generic HTTP-family mesh path this frontend falls through
+                // to runs an HTTP/1.1 client inside the HBONE byte tunnel, so it
+                // cannot carry `grpc-status` trailers. (The H3 bridge does not
+                // use that path — it runs a nested HTTP/2 client over the same
+                // tunnel; see `GrpcDispatchTransport`, issue #3284.)
+                grpc_proxy::GrpcMeshDispatch::HboneCrossCluster => Some(
                     "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
                     "gRPC over cross-cluster east-west routing requires a destination SNI \
@@ -27185,9 +27662,9 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
-                grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
+                grpc_proxy::GrpcMeshDispatch::Hbone => Some(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
-                     (HBONE inner protocol cannot carry gRPC trailers)",
+                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
                 ),
                 // `MeshMtlsCrossCluster` normally falls through to the generic
                 // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
@@ -27196,6 +27673,18 @@ async fn handle_proxy_request_inner(
                 | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => {
                     Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
                 }
+                // An h2c Unix backend normally falls through to the generic
+                // path's Unix branch (issue #3261); refuse defensively here —
+                // this loop's direct `GrpcConnectionPool` dial has no Unix
+                // transport and would dial the placeholder loopback address.
+                grpc_proxy::GrpcMeshDispatch::UnixSocketH2c => {
+                    Some("gRPC to a unix-socket backend cannot be dialed directly")
+                }
+                grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => Some(
+                    "gRPC over an http-declared unix-socket ingress listener is not supported \
+                     (HTTP/1.1 cannot carry gRPC trailers); declare the listener protocol as \
+                     GRPC or HTTP2",
+                ),
             };
             if let Some(message) = refusal {
                 warn!(
@@ -27739,7 +28228,14 @@ async fn handle_proxy_request_inner(
                 crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
-                &state.grpc_pool,
+                // Direct-dial only, and provably so: this branch is entered
+                // only for `grpc_uses_native_dispatch`, whose mesh screen above
+                // refuses every non-`Direct` class before dispatch, and a
+                // `mesh.mtls` target is routed onto the generic mesh-mTLS path
+                // by `grpc_mesh_dispatch_falls_through` before that. The H3
+                // bridge is the surface that materializes the mesh transports
+                // (issues #2003, #3284).
+                &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                 &state.dns_cache,
                 owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
@@ -28007,7 +28503,11 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
-                            &state.grpc_pool,
+                            // Direct-dial only, for the same reason as the
+                            // split-path call above: the native-gRPC mesh screen
+                            // refuses every non-`Direct` class and `MeshMtls`
+                            // never reaches this branch (issues #2003, #3284).
+                            &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                             &state.dns_cache,
                             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
@@ -28487,7 +28987,10 @@ async fn handle_proxy_request_inner(
                     crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
-                    &state.grpc_pool,
+                    // Direct-dial only: the loop re-screens every rotated
+                    // target above and refuses a mesh-tagged one before it can
+                    // reach this call (issue #2003).
+                    &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
@@ -30470,7 +30973,8 @@ async fn handle_proxy_request_inner(
         };
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
@@ -30530,7 +31034,8 @@ async fn handle_proxy_request_inner(
         let block_reason = "sidecar SVID-mTLS backend transport is not available";
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
@@ -30963,6 +31468,52 @@ async fn handle_proxy_request_inner(
                     Some(&original_request_path),
                 )
                 .await);
+            }
+
+            // This retry planner has no Unix-stream attempt implementation.
+            // Screen every rotated (and same-target) candidate before mesh
+            // transport selection, circuit-breaker admission, plugins, or a
+            // network dial. This also rejects a corrupted target carrying both
+            // Unix and HBONE/mTLS markers instead of letting tag ordering pick
+            // a different security boundary than the materializer declared.
+            if current_target
+                .as_deref()
+                .is_some_and(unix_backend::target_is_unix_backend)
+            {
+                let reason = "Unix socket retry dispatch is unavailable";
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                    target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                    "Unix-socket retry target cannot be dispatched by the network retry planner; failing closed"
+                );
+                result = if is_grpc_request {
+                    mesh_grpc_unavailable_response(
+                        None,
+                        reason,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    )
+                } else {
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::buffered(
+                            br#"{"error":"Bad Gateway","message":"Unix socket retry dispatch unavailable"}"#
+                                .to_vec(),
+                        ),
+                        headers: HashMap::from([(
+                            "gateway-error-reason".to_string(),
+                            reason.to_string(),
+                        )]),
+                        connection_error: false,
+                        backend_resolved_ip: None,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    }
+                };
+                final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
+                backend_admission_started_at = Instant::now();
+                skip_final_cb_record = true;
+                break;
             }
 
             // Resolve the exact selected target's transport for this attempt.
@@ -32485,9 +33036,10 @@ async fn handle_proxy_request_inner(
         resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
     }
 
-    // Advertise HTTP/3 availability via pre-computed Alt-Svc header
-    if let Some(ref alt_svc) = state.alt_svc_header {
-        resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
+    // Advertise HTTP/3 availability via pre-computed Alt-Svc header, for the
+    // frontend port this request actually arrived on.
+    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
+        resp_builder = resp_builder.header("alt-svc", alt_svc.as_ref());
     }
 
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
@@ -32591,7 +33143,7 @@ async fn handle_proxy_request_inner(
             gateway_owned_headers
                 .insert(headers_mod::GatewayOwnedResponseHeader::GatewayUpstreamStatus);
         }
-        if let Some(alt_svc) = state.alt_svc_header.as_ref() {
+        if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
             final_headers.insert("alt-svc".into(), alt_svc.to_string());
             gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::AltSvc);
         }
@@ -33781,6 +34333,16 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
+    // A `mesh.unix_socket` target is a Unix-stream backend, and this retry path
+    // is reqwest-only (no Unix transport). Refuse rather than dial the target's
+    // placeholder loopback `host:port`, which nothing listens on — the same
+    // fail-closed contract the HBONE / mesh-mTLS transports enforce. Unreachable
+    // for the materialized Sidecar ingress proxies (they configure no retry
+    // policy), so this is a defensive gate, not a live limitation.
+    if upstream_target.is_some_and(unix_backend::target_is_unix_backend) {
+        return unix_backend_dispatch_unavailable_response(proxy, "retry");
+    }
+
     // A retry attempt must be admitted under the same effective ceiling as the
     // first attempt: the route policy is request-scoped, so a replay cannot
     // widen back to the global allowance (`GHSA-xrfj-852f-645j`).
@@ -34568,6 +35130,10 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // Mesh transport only: this helper is reached exclusively for
+            // `mesh.hbone`/`mesh.mtls` targets. A `mesh.unix_socket` target is
+            // refused before any retry dispatch.
+            None,
         )
         .await
     };
@@ -35322,13 +35888,24 @@ async fn proxy_to_backend(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // A Unix backend's `host:port` is only a schema-compatible carrier. It is
+    // never resolved or dialed: the reserved target tag below is re-admitted
+    // against the data plane's socket-root policy and the resulting path is
+    // connected with `UnixStream`. Keep the synthetic loopback authority out
+    // of IP-egress policy too. Otherwise `FERRUM_BACKEND_ALLOW_IPS=public`
+    // rejects an entirely local Unix socket before its real containment and
+    // inode/peer-credential gates can run.
+    let unix_target = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t));
+
     // Enforce the backend egress policy for a literal-IP backend before dialing
     // (reqwest/pools skip the DnsCacheResolver for IP literals).
-    if let Some(reason) = denied_literal_backend_or_dns_override(
-        effective_host,
-        proxy,
-        &state.env_config.backend_allow_ips,
-    ) {
+    if unix_target.is_none()
+        && let Some(reason) = denied_literal_backend_or_dns_override(
+            effective_host,
+            proxy,
+            &state.env_config.backend_allow_ips,
+        )
+    {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,
@@ -35347,8 +35924,9 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let resolved_ip = if dispatch_hbone
-        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
+    let resolved_ip = if unix_target.is_some()
+        || (dispatch_hbone
+            && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target))
     {
         None
     } else {
@@ -35388,6 +35966,207 @@ async fn proxy_to_backend(
             }
         }
     };
+
+    // Sidecar `ingress[]` Unix-socket backend: the selected target carries the
+    // reserved `mesh.unix_socket` tag, so this request is dialed over a
+    // `tokio::net::UnixStream` and NEVER over the target's placeholder
+    // loopback `host:port`. Same admission ordering as the HBONE / mesh-mTLS
+    // branches below, and the same fail-closed contract — a tagged target that
+    // cannot dispatch here is refused, never downgraded to TCP.
+    //
+    // TWO wire protocols, chosen by the carried `mesh.unix_socket_h2c` tag and
+    // never guessed (issue #3261):
+    //
+    //   * **HTTP/1.1** (`http`-declared listener) → `proxy_to_backend_unix`.
+    //   * **h2c prior-knowledge HTTP/2** (`http2` / `https` / `grpc`-declared)
+    //     → the SAME dispatch body the sidecar mesh-mTLS transport uses, with
+    //     the pooled TLS sender swapped for a 1:1 h2c `UnixStream` sender. That
+    //     reuse is what makes gRPC over the socket real rather than nominal:
+    //     request/response streaming, the receipt-anchored gRPC deadline,
+    //     cancellation, `te: trailers` regeneration, and terminal-trailer
+    //     forwarding are the identical code path on both transports.
+    if let Some(unix_target) = unix_target {
+        let unix_h2c = unix_backend::target_unix_backend_is_h2c(unix_target);
+        let socket_path = match unix_backend::resolve_unix_socket_target(
+            unix_target,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+        ) {
+            Some(Ok(path)) => path,
+            // The tag is present but its path failed re-admission at dial time.
+            // Refuse: the carrier may have crossed a CP/DP or file boundary
+            // since translation admitted it, and the containment allowlist is a
+            // DATA-PLANE policy this process is the first to be able to apply.
+            Some(Err(rejection)) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    rejection = rejection.reason(),
+                    "Refusing unix-socket backend dispatch: tagged path failed admission"
+                );
+                return backend_dispatch_response(
+                    unix_backend_error_response(
+                        proxy,
+                        &unix_backend::UnixBackendError::InadmissiblePath(rejection),
+                        resolved_ip.clone(),
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // Unreachable: `target_is_unix_backend` already proved the tag.
+            None => {
+                return backend_dispatch_response(
+                    unix_backend_dispatch_unavailable_response(proxy, "missing_tag"),
+                    None,
+                    None,
+                );
+            }
+        };
+        // Flavor-aware declared-Content-Length check BEFORE admission, so a
+        // capacity rejection cannot mask the size violation as a 503 (same
+        // ordering rationale as the HBONE / mesh-mTLS branches). A gRPC-flavored
+        // request on the h2c socket is bounded by the gRPC receive limit, not
+        // the HTTP one, and gets the direct pool's Trailers-Only
+        // RESOURCE_EXHAUSTED shape — running the generic HTTP check first would
+        // reject an in-budget gRPC body with the wrong status AND the wrong
+        // framing whenever the HTTP limit is the smaller of the two.
+        let unix_grpc_flavored = unix_h2c
+            && headers
+                .get("content-type")
+                .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+        if unix_grpc_flavored {
+            // Route ceilings are protocol-agnostic client policy, so an active
+            // one narrows the selected gRPC receive limit too
+            // (`GHSA-xrfj-852f-645j`).
+            let grpc_limit = effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            );
+            if grpc_limit > 0
+                && request_may_have_body(method, headers)
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
+                    crate::util::body_limit::declared_content_length(headers)
+                && len > grpc_limit as u64
+            {
+                return backend_dispatch_response(
+                    grpc_proxy::grpc_request_body_too_large_backend_response(
+                        &proxy.id,
+                        resolved_ip.clone(),
+                        usize::try_from(len).ok(),
+                        grpc_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        } else if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
+            return reject;
+        }
+        let unix_request_body_limit = if unix_grpc_flavored {
+            effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            )
+        } else {
+            effective_max_request_body_size_bytes
+        };
+        let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
+            client_request_body,
+            method,
+            headers,
+            unix_request_body_limit,
+            proxy.backend_read_timeout_ms,
+            request_ctx.grpc_deadline_at(),
+            plugins,
+            ctx.as_deref_mut(),
+            stream_request_body,
+            request_body_prepared,
+            retain_request_body,
+            ctx_bytes_sent_observed,
+            resolved_ip.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return backend_dispatch_response(response, None, None),
+        };
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
+        *backend_admission_started_at = Instant::now();
+        let (backend_resp, body_bytes, request_body_exceeded) = if unix_h2c {
+            proxy_to_backend_mesh_mtls(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                upstream_target,
+                plugins,
+                request_ctx,
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+                Some(socket_path),
+            )
+            .await
+        } else {
+            proxy_to_backend_unix(
+                state,
+                proxy,
+                socket_path,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                plugins,
+                Some(request_ctx),
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                effective_max_request_body_size_bytes,
+                effective_max_response_body_size_bytes,
+            )
+            .await
+        };
+        return BackendDispatchResult::Response {
+            response: Box::new(backend_resp),
+            retained_body: unix_retained_body.or(body_bytes),
+            backend_admission_permits,
+            request_body_exceeded,
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+        };
+    }
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -35579,6 +36358,8 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // SVID-mTLS transport, not a unix socket.
+            None,
         )
         .await;
         return BackendDispatchResult::Response {
@@ -37859,6 +38640,54 @@ fn mesh_mtls_request_authority(preserved_host: &str, service_port: u16) -> Strin
     format!("{host}:{service_port}")
 }
 
+/// Resolve the request `:authority` a Sidecar mesh-mTLS dispatch presents to the
+/// peer sidecar's inbound listener.
+///
+/// `:authority` is the routing key on the peer: its materialized inbound route
+/// matches the SERVICE host. Precedence, highest first:
+///
+/// 1. `mesh.mtls_authority_host` — stamped only by `sidecar`-topology mesh
+///    service discovery (the gateway-to-mesh bridge). A north-south gateway's
+///    client `Host` is a public hostname the peer would 404, and the
+///    no-preserve fallback is the pod dial address (same 404).
+/// 2. A preserved, non-empty client `Host` when `preserve_host_header` is on.
+/// 3. The dial authority (peer pod + app port), matching the HBONE inner
+///    request's Host fallback.
+///
+/// For a MULTI-PORT destination the materializer stamped the owning service
+/// port (`mesh.mtls_authority_port`) on the target and the authority is
+/// rewritten to `<host>:<service_port>` — the peer's inbound `:15006` dials are
+/// direct (never NATed, no orig-dst), so the authority port is the only channel
+/// that tells its per-port inbound siblings apart. Single-port destinations
+/// carry no port tag and keep the host-only / client authority byte-for-byte.
+///
+/// Shared by the generic HTTP-family mesh-mTLS dispatch and the gRPC mesh
+/// transport (issue #3284) so the two cannot drift on peer route selection.
+pub(crate) fn mesh_mtls_dispatch_authority<'a>(
+    target: &'a UpstreamTarget,
+    preserve_host_header: bool,
+    client_host: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => std::borrow::Cow::Owned(format!("{service_host}:{service_port}")),
+            None => std::borrow::Cow::Borrowed(service_host),
+        };
+    }
+    if preserve_host_header && let Some(host) = client_host.filter(|host| !host.is_empty()) {
+        return match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            Some(service_port) => {
+                std::borrow::Cow::Owned(mesh_mtls_request_authority(host, service_port))
+            }
+            None => std::borrow::Cow::Borrowed(host),
+        };
+    }
+    std::borrow::Cow::Owned(hbone_pool::authority_for_host_port(
+        &target.host,
+        target.port,
+    ))
+}
+
 /// Normalize a Host/authority value for host-based routing.
 ///
 /// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
@@ -39538,6 +40367,658 @@ async fn proxy_to_backend_hbone(
     }
 }
 
+/// Refusal response for a `mesh.unix_socket` target on a dispatch path that has
+/// no Unix transport (the reqwest-backed retry path, or a corrupted tag).
+///
+/// Fail-closed by construction: the alternative would be dialing the target's
+/// placeholder loopback `host:port`, which nothing listens on and which — on a
+/// sidecar — is the gateway's own inbound listener port. `DispatchPolicyRejected`
+/// keeps it health-neutral and non-retryable: replaying it would resolve the
+/// same way.
+fn unix_backend_dispatch_unavailable_response(
+    proxy: &Proxy,
+    stage: &'static str,
+) -> retry::BackendResponse {
+    let error_class = retry::ErrorClass::DispatchPolicyRejected;
+    warn!(
+        proxy_id = %proxy.id,
+        stage,
+        "Refusing unix-socket backend dispatch on a path with no unix transport; \
+         failing closed rather than dialing the placeholder loopback address"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend dispatch unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: None,
+        error_class: Some(error_class),
+    }
+}
+
+/// Backend response for a failed Unix dial (path rejected, connect error,
+/// connect timeout, or an unsupported platform).
+///
+/// The operator-supplied socket path is deliberately NOT echoed into the client
+/// body — it is a filesystem location on the workload host — while the log line
+/// carries the concrete reason for diagnosis.
+fn unix_backend_error_response(
+    proxy: &Proxy,
+    err: &unix_backend::UnixBackendError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = err.error_class();
+    warn!(
+        proxy_id = %proxy.id,
+        error = %err,
+        "Unix-socket backend dispatch failed"
+    );
+    let status_code = if matches!(
+        error_class,
+        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout
+    ) {
+        504
+    } else {
+        502
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+/// HTTP-family dispatch to a co-located Unix-domain STREAM socket
+/// (Istio `Sidecar` `ingress[].defaultEndpoint: unix:///path`).
+///
+/// Mirrors [`proxy_to_backend_hbone`]'s contract — an HTTP/1.1 client handshake
+/// over an arbitrary byte stream, the same header regeneration, size-limit and
+/// timeout handling, and the same streaming-vs-buffered response decision — but
+/// the stream is a fresh `UnixStream` instead of a pooled HBONE tunnel.
+///
+/// **Not pooled.** Each request dials its own socket and drops the connection
+/// when the response completes. The destination is a co-located app on the same
+/// host, so the dial is a local `connect(2)` with no DNS, TCP handshake, or TLS;
+/// pooling is a documented follow-up rather than a correctness requirement.
+///
+/// **HTTP/1.1 only.** This function serves an `http`-declared listener. An
+/// `http2` / `https` / `grpc`-declared listener carries the
+/// `mesh.unix_socket_h2c` tag and is dispatched by `proxy_to_backend_mesh_mtls`
+/// over an h2c `UnixStream` instead, which is what gives gRPC its trailers,
+/// deadlines, and bidirectional streaming. A gRPC-flavored request that reaches
+/// an `http`-declared socket is refused with a clean gRPC UNAVAILABLE before it
+/// gets here (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), never downgraded.
+///
+/// The third return element is the client-upload overflow flag, returned — like
+/// the HBONE path — only alongside a streaming response so the caller can
+/// reclassify a post-header upload overflow as neutral `RequestBodyTooLarge`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
+async fn proxy_to_backend_unix(
+    state: &ProxyState,
+    proxy: &Proxy,
+    socket_path: &str,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    let dial = unix_backend::dial_unix_backend(
+        socket_path,
+        proxy.backend_connect_timeout_ms,
+        &state.env_config.mesh_unix_socket_allowed_roots,
+        &state.env_config.mesh_unix_socket_allowed_uids,
+    );
+    let stream = match dial.await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return (
+                unix_backend_error_response(proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(err) => {
+            return (
+                unix_hyper_error_response(proxy, err, resolved_ip, false),
+                None,
+                None,
+            );
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("unix_backend: connection closed: {}", e);
+        }
+    });
+
+    // Only `path_and_query` is read out of the computed backend URL — a Unix
+    // socket has no network authority, so the request target is origin-form and
+    // the Host header (below) carries the authority the app sees.
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid unix backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    let backend_authority = uri.authority().map(|a| a.as_str()).unwrap_or("localhost");
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    let origin_form_uri = hyper::Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .unwrap_or_else(|_| hyper::Uri::from_static("/"));
+
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if effective_request_body_size_limit > 0 {
+        effective_request_body_size_limit
+    } else {
+        usize::MAX
+    };
+    let request_body_replayable = matches!(
+        &client_request_body,
+        MeshClientRequestBody::Replayable { .. }
+    );
+    let (mut parts, body) = match client_request_body {
+        MeshClientRequestBody::Streaming(request) => {
+            let (parts, body) = request.into_parts();
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            );
+            let body = match ctx {
+                Some(c)
+                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &c.metadata,
+                    ) =>
+                {
+                    body.with_grpc_message_counter(Arc::clone(
+                        &c.grpc_request_messages_observed,
+                    ))
+                }
+                _ => body,
+            };
+            (parts, http_body_util::Either::Left(body))
+        }
+        MeshClientRequestBody::Replayable {
+            body,
+            headers,
+            trailers,
+        } => {
+            let (mut parts, ()) = Request::new(()).into_parts();
+            parts.headers = headers;
+            (
+                parts,
+                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+            )
+        }
+    };
+    parts.uri = origin_form_uri;
+    parts.version = hyper::Version::HTTP_11;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "unix", method);
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    headers_mod::merge_proxy_headers_preserving_repeated(&mut parts.headers, headers);
+    headers_mod::strip_backend_request_headers(&mut parts.headers);
+    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    if !proxy.preserve_host_header {
+        parts.headers.remove(hyper::header::HOST);
+    }
+    if !proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST) {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "backend_host",
+            "host",
+            backend_authority,
+        );
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if request_is_secure { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
+    }
+    if let Some(ref via) = state.via_header_http11 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "configured_via",
+            "via",
+            via,
+        );
+    }
+    if state.add_forwarded_header {
+        let proto_str = if request_is_secure { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "Unix backend read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    if effective_max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > effective_max_response_body_size_bytes
+    {
+        return (
+            unix_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                effective_max_response_body_size_bytes,
+            ),
+            None,
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        response_decision_ctx,
+        status,
+        &resp_headers,
+    );
+
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            Some(body_size_exceeded),
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            effective_max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    unix_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        effective_max_response_body_size_bytes,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "unix"),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, false),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "Unix backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            None,
+        )
+    }
+}
+
+/// Non-Unix build stub. Sidecar mesh deployments are Linux-only, so this is
+/// unreachable in practice; it exists so the Windows build keeps the same
+/// fail-closed refusal instead of losing the transport gate at compile time.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(unix))]
+async fn proxy_to_backend_unix(
+    _state: &ProxyState,
+    proxy: &Proxy,
+    _socket_path: &str,
+    _backend_url: &str,
+    _method: &str,
+    _headers: &HashMap<String, String>,
+    _client_request_body: MeshClientRequestBody,
+    _plugins: &[Arc<dyn crate::plugins::Plugin>],
+    _ctx: Option<&RequestContext>,
+    _response_decision_ctx: Option<&RequestContext>,
+    _stream_response: bool,
+    _client_ip: &str,
+    _xff_append_ip: &str,
+    _request_is_secure: bool,
+    resolved_ip: Option<String>,
+    _ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    _effective_request_body_size_limit: usize,
+    _effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    (
+        unix_backend_error_response(
+            proxy,
+            &unix_backend::UnixBackendError::PlatformUnsupported,
+            resolved_ip,
+        ),
+        None,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn unix_hyper_error_response(
+    proxy: &Proxy,
+    err: hyper::Error,
+    resolved_ip: Option<String>,
+    request_body_replayable: bool,
+) -> retry::BackendResponse {
+    error!(proxy_id = %proxy.id, error = %err, "Unix backend HTTP request failed");
+    // Same pre-wire/post-wire split the HBONE arm uses: a canceled dispatch with
+    // an immutable body proves the request never reached the app.
+    let error_class = if request_body_replayable && err.is_canceled() {
+        retry::ErrorClass::ConnectionPoolError
+    } else {
+        retry::ErrorClass::ProtocolError
+    };
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+#[cfg(unix)]
+fn unix_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        max_request_body_size_bytes = max_size,
+        "Unix backend streaming request body exceeded configured size limit"
+    );
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+#[cfg(unix)]
+fn unix_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
 /// Sidecar egress dispatch: send the request as HTTP/2 over a pooled SVID-mTLS
 /// session to the destination sidecar's inbound listener (`mesh.mtls` targets).
 ///
@@ -39581,6 +41062,18 @@ async fn proxy_to_backend_mesh_mtls(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // `Some(path)` reuses this entire dispatch body for a Sidecar `ingress[]`
+    // **h2c Unix-socket** backend (issue #3261): the pooled SVID-mTLS sender is
+    // replaced by a 1:1 `UnixStream` h2c sender and the request `:scheme`
+    // becomes `http`, while everything else — gRPC flavor detection, the
+    // receipt-anchored deadline, `te: trailers`, the never-buffer-native-gRPC
+    // rule, streaming trailer forwarding, and the body ceilings — is the SAME
+    // code. Sharing it is deliberate: two copies of the gRPC-over-h2 contract
+    // would drift. On this path the target carries NO mesh transport tag, so the
+    // mesh-mTLS dial plan (pinned peer, trust domain, SNI) does not apply; the
+    // socket's containment allowlist, file type, owner uid, and mode are its
+    // identity boundary instead.
+    unix_socket_path: Option<&str>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -39632,12 +41125,29 @@ async fn proxy_to_backend_mesh_mtls(
     //     the destination service FQDN (`mesh.eastwest_sni`). A missing SNI or
     //     trust domain FAILS CLOSED (502) — never a fallback to the gateway
     //     address as SNI or any-federated verification.
+    //
+    // The h2c Unix transport has no TLS session at all, so it takes the vacant
+    // plan rather than resolving one: `MeshMtlsDialPlan::resolve` REQUIRES a
+    // pinned `mesh.spiffe_id`, which a Unix ingress target correctly never
+    // carries, and would fail the dispatch closed. Its security boundary is the
+    // socket-path containment gate already applied by the caller and re-applied
+    // at the dial.
+    let unix_dial_plan = mesh_mtls_pool::MeshMtlsDialPlan {
+        cross_cluster: false,
+        expected_peer: None,
+        expected_trust_domain: None,
+        sni_override: None,
+    };
     let mesh_mtls_pool::MeshMtlsDialPlan {
         cross_cluster,
         expected_peer,
         expected_trust_domain,
         sni_override,
-    } = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+    } = match if unix_socket_path.is_some() {
+        Ok(unix_dial_plan)
+    } else {
+        mesh_mtls_pool::MeshMtlsDialPlan::resolve(target)
+    } {
         Ok(plan) => plan,
         Err(mesh_mtls_pool::MeshMtlsDialError::PinnedPeer(err)) => {
             error!(
@@ -39716,7 +41226,8 @@ async fn proxy_to_backend_mesh_mtls(
             .map(|td| td.as_str())
             .unwrap_or(""),
         sni_override = sni_override.unwrap_or(""),
-        "Proxying request via sidecar SVID-mTLS HTTP/2"
+        unix_socket_backend = unix_socket_path.is_some(),
+        "Proxying request via sidecar HTTP/2 (SVID-mTLS, or h2c over a unix socket)"
     );
 
     // gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips the
@@ -39852,34 +41363,80 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
-    let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-    let get_sender = state.mesh_mtls_pool.get_sender(
-        proxy,
-        &target.host,
-        target.port,
-        target.dispatch_policy_port(),
-        mtls_port,
-        expected_peer.as_ref(),
-        expected_trust_domain.as_ref(),
-        sni_override,
-    );
-    let sender_result = if let Some(deadline) = client_grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, get_sender).await {
-            Ok(result) => result,
-            Err(_) => {
+    // Unix h2c: a fresh 1:1 socket per request, admitted at the TOCTOU boundary
+    // (containment, symlink-resolved containment, socket file type, owner uid,
+    // mode) and bounded by the proxy's connect timeout. Not pooled — the
+    // destination is a co-located app reached by a local `connect(2)` with no
+    // DNS, TCP handshake, or TLS; pooling is a documented performance follow-up,
+    // not a correctness requirement.
+    let sender_result = if let Some(socket_path) = unix_socket_path {
+        let dial = unix_backend::dial_unix_h2c_sender(
+            socket_path,
+            proxy.backend_connect_timeout_ms,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+            &state.env_config.mesh_unix_socket_allowed_uids,
+        );
+        // The client's end-to-end RPC deadline caps the dial exactly as it caps
+        // the pooled sender acquisition below: a wedged local app must not
+        // outlive the deadline the caller already committed to.
+        let dialed = if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, dial).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            dial.await
+        };
+        match dialed {
+            Ok(sender) => Ok(sender),
+            Err(err) => {
                 return (
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
+                    unix_backend_error_response(proxy, &err, resolved_ip),
                     None,
                     None,
                 );
             }
         }
     } else {
-        get_sender.await
+        let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+        let get_sender = state.mesh_mtls_pool.get_sender(
+            proxy,
+            &target.host,
+            target.port,
+            target.dispatch_policy_port(),
+            mtls_port,
+            expected_peer.as_ref(),
+            expected_trust_domain.as_ref(),
+            sni_override,
+        );
+        if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, get_sender).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            get_sender.await
+        }
     };
     let mut sender = match sender_result {
         Ok(sender) => sender,
@@ -39914,8 +41471,18 @@ async fn proxy_to_backend_mesh_mtls(
     };
     // Bound readiness by the connect budget: a pooled-but-saturated connection
     // (stream-cap reached) must not stall the request indefinitely.
-    let connect_deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms));
+    let readiness_connect_timeout_ms = if unix_socket_path.is_some() {
+        unix_backend::effective_connect_timeout_ms(proxy.backend_connect_timeout_ms)
+    } else {
+        proxy.backend_connect_timeout_ms
+    };
+    let readiness_started_at = tokio::time::Instant::now();
+    let connect_deadline = readiness_started_at
+        .checked_add(Duration::from_millis(readiness_connect_timeout_ms))
+        // The Unix transport promises a bounded establishment path. An
+        // unrepresentable clock duration therefore expires immediately instead
+        // of falling through to the legacy mesh-pool "no deadline" behavior.
+        .or_else(|| unix_socket_path.is_some().then_some(readiness_started_at));
     let ready_deadline = match (client_grpc_deadline_at, connect_deadline) {
         (Some(client), Some(connect)) => Some(client.min(connect)),
         (Some(client), None) => Some(client),
@@ -39955,7 +41522,7 @@ async fn proxy_to_backend_mesh_mtls(
             warn!(
                 proxy_id = %proxy.id,
                 "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
-                proxy.backend_connect_timeout_ms
+                readiness_connect_timeout_ms
             );
             if is_grpc_flavored {
                 if client_grpc_deadline_at
@@ -40054,48 +41621,30 @@ async fn proxy_to_backend_mesh_mtls(
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-    // `:authority` is the routing key on the peer: its materialized inbound
-    // route matches the SERVICE host. A `sidecar`-topology mesh-SD target
-    // (gateway-to-mesh bridge) carries that service host as a tag
-    // (`mesh.mtls_authority_host`) and it takes precedence over BOTH branches
-    // below — a north-south gateway's client Host is a public hostname the
-    // peer would 404, and the no-preserve fallback is the pod dial address
-    // (same 404). Otherwise a preserved client Host wins; without
-    // preservation fall back to the dial authority (peer pod + app port),
-    // matching the HBONE inner request's Host fallback. For a MULTI-PORT
-    // destination the materializer stamped the owning service port on the
-    // target, and the authority is rewritten to `<host>:<service_port>` —
-    // the peer's inbound `:15006` dials are direct (never NATed, no
-    // orig-dst), so the authority port is the only channel that tells its
-    // per-port inbound siblings apart. The original client Host still rides
-    // `x-forwarded-host` below. Single-port destinations carry no port tag
-    // and keep the host-only / client authority byte-for-byte.
-    let authority_owned;
-    let authority =
-        if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
-            match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                Some(service_port) => {
-                    authority_owned = format!("{service_host}:{service_port}");
-                    authority_owned.as_str()
-                }
-                None => service_host,
-            }
-        } else if proxy.preserve_host_header
-            && let Some(host) = headers.get("host")
-            && !host.is_empty()
-        {
-            if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                authority_owned = mesh_mtls_request_authority(host, service_port);
-                authority_owned.as_str()
-            } else {
-                host.as_str()
-            }
-        } else {
-            authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
-            authority_owned.as_str()
-        };
+    // `:authority` is the routing key on the peer. Precedence, the multi-port
+    // service-port rewrite, and the dial-authority fallback all live in the
+    // shared resolver so the gRPC mesh transport cannot drift from this path
+    // (see `mesh_mtls_dispatch_authority`). The original client Host still
+    // rides `x-forwarded-host` below. A Unix-socket dispatch reuses this hop
+    // and carries no mesh authority tag, so it lands on the preserved client
+    // Host or the target's placeholder dial authority — exactly as before.
+    let authority_resolved = mesh_mtls_dispatch_authority(
+        target,
+        proxy.preserve_host_header,
+        headers.get("host").map(String::as_str),
+    );
+    let authority = authority_resolved.as_ref();
+    // `:scheme` must describe the actual hop: `https` for the SVID-mTLS session,
+    // `http` for a plaintext h2c Unix socket. An `https` scheme on the socket
+    // would make the co-located app build absolute URLs / redirects claiming a
+    // TLS hop that does not exist.
+    let request_scheme = if unix_socket_path.is_some() {
+        "http"
+    } else {
+        "https"
+    };
     let tunneled_uri = match hyper::Uri::builder()
-        .scheme("https")
+        .scheme(request_scheme)
         .authority(authority)
         .path_and_query(path_and_query)
         .build()
@@ -40157,7 +41706,7 @@ async fn proxy_to_backend_mesh_mtls(
             } else {
                 body
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body))
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -40168,7 +41717,9 @@ async fn proxy_to_backend_mesh_mtls(
             parts.headers = headers;
             (
                 parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
+                    body, trailers,
+                )),
             )
         }
     };
@@ -50118,7 +51669,7 @@ mod tests {
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .rfind("build_inbound_hbone_relay_proxy(")
             .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
         assert!(
             relay_pos < gate_pos,
@@ -50357,6 +51908,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50425,6 +51977,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50482,6 +52035,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50535,6 +52089,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50573,6 +52128,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50606,6 +52162,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50646,6 +52203,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50682,6 +52240,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50715,6 +52274,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -50752,6 +52312,7 @@ mod tests {
             proxy_id: Some("p".to_string()),
             enabled: false,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -52001,11 +53562,116 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
             .expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.backend_host, "fd00:10:244:1::4");
         assert_eq!(relay.backend_port, 8080);
+    }
+
+    #[test]
+    fn mesh_egress_udp_post_override_allows_only_dial_endpoints() {
+        use crate::modes::mesh::config::{
+            MeshConfig, MeshEgressUdpDestination, MeshEgressUdpDialEndpoint,
+        };
+
+        // STATIC host authority + declared endpoint: CONNECT may name the
+        // hostname, but the effective socket target after synthesis/override
+        // must be a dial endpoint. Admitting the hostname here would let
+        // resolve_local_udp_dest DNS-bypass endpoints[].
+        let mesh = MeshConfig {
+            egress_udp_destinations: vec![
+                MeshEgressUdpDestination {
+                    host: "static.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "198.51.100.9".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "198.51.100.9".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "static".to_string(),
+                    namespace: "default".to_string(),
+                },
+                MeshEgressUdpDestination {
+                    host: "dns.external.com".to_string(),
+                    port: 53,
+                    dial_endpoints: vec![MeshEgressUdpDialEndpoint {
+                        host: "dns.external.com".to_string(),
+                        port: 53,
+                    }],
+                    service_entry: "dns".to_string(),
+                    namespace: "default".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Original-authority lookup is unchanged: STATIC hostname still
+        // selects a declared dial endpoint.
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("static.external.com", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+        assert_eq!(
+            mesh_egress_udp_destination_dial_endpoint("STATIC.EXTERNAL.COM", 53, Some(&mesh)),
+            Some(("198.51.100.9".to_string(), 53))
+        );
+
+        // Post-override guard: STATIC hostname is NOT a dialable socket target.
+        assert!(
+            !mesh_egress_udp_destination_allowed("static.external.com", 53, Some(&mesh)),
+            "STATIC hostname must not pass the post-override dial-endpoint guard"
+        );
+        // Declared STATIC endpoint IP and DNS/NONE dial targets still pass.
+        assert!(mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "dns.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(mesh_egress_udp_destination_allowed(
+            "DNS.EXTERNAL.COM",
+            53,
+            Some(&mesh)
+        ));
+        // Unrelated host stays denied; empty mesh denies.
+        assert!(!mesh_egress_udp_destination_allowed(
+            "other.external.com",
+            53,
+            Some(&mesh)
+        ));
+        assert!(!mesh_egress_udp_destination_allowed(
+            "198.51.100.9",
+            53,
+            None
+        ));
+
+        // Synthesis converts a STATIC authority CONNECT into the dial endpoint
+        // backend — the unmodified happy path that the post-override guard must
+        // still accept.
+        let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+            .expect("STATIC authority must synthesize a dial-endpoint relay");
+        assert_eq!(relay.backend_host, "198.51.100.9");
+        assert_eq!(relay.backend_port, 53);
+        assert!(mesh_egress_udp_destination_allowed(
+            &relay.backend_host,
+            relay.backend_port,
+            Some(&mesh)
+        ));
     }
 
     #[test]
@@ -52212,6 +53878,7 @@ mod tests {
             frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }
@@ -52402,6 +54069,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -52415,6 +54083,7 @@ mod tests {
                 proxy_id: None,
                 enabled: false,
                 priority_override: Some(2100),
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -52463,6 +54132,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -52476,6 +54146,7 @@ mod tests {
                 proxy_id: None,
                 enabled: false,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -52489,6 +54160,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -52527,6 +54199,146 @@ mod tests {
     }
 
     #[test]
+    fn gateway_workload_metrics_does_not_replace_colliding_operator_plugin() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: Some(100),
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert_eq!(config.plugin_configs.len(), 1);
+        let plugin = &config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "key_auth");
+        assert_eq!(plugin.scope, PluginScope::Global);
+        assert!(plugin.enabled);
+        assert_eq!(plugin.priority_override, Some(100));
+        assert_eq!(plugin.config, json!({ "key_names": ["api-key"] }));
+    }
+
+    #[test]
+    fn gateway_workload_metrics_operator_selection_is_namespace_scoped() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: "tenant-b-metrics".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "tenant-b".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://tenant-b.example/ns/tenant-b/sa/gateway"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://old.example/ns/ferrum/sa/old"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        let tenant_b = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "tenant-b-metrics")
+            .expect("tenant-b operator plugin should remain");
+        assert_eq!(
+            tenant_b
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://tenant-b.example/ns/tenant-b/sa/gateway")
+        );
+        let ferrum = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "ferrum" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("ferrum managed plugin should remain");
+        assert_eq!(
+            ferrum
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn colliding_operator_plugin_is_not_ignored_as_empty_config() {
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        assert!(!config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
+        assert!(config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].namespace = "tenant-b".to_string();
+        assert!(
+            !config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"),
+            "a managed-looking plugin from another tenant remains real config"
+        );
+    }
+
+    #[test]
     fn gateway_workload_metrics_managed_identity_is_namespace_qualified() {
         let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
             test_runtime_trust_bundles("file.local", vec![vec![1]]),
@@ -52541,6 +54353,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: timestamp,
             updated_at: timestamp,
@@ -52878,6 +54691,7 @@ mod tests {
             proxy_id: Some("p1".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -52920,6 +54734,7 @@ mod tests {
             proxy_id: Some("p1".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -52985,6 +54800,7 @@ mod tests {
             proxy_id: Some("p1".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,

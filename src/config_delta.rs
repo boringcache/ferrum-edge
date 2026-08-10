@@ -504,6 +504,7 @@ mod tests {
             frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }
@@ -579,6 +580,7 @@ mod tests {
             proxy_id: proxy_id.map(str::to_string),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: updated_at,
             updated_at,

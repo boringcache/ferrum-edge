@@ -26,6 +26,11 @@ fn runtime_for(topology: MeshTopology) -> MeshRuntimeConfig {
         cp_urls: vec!["http://127.0.0.1:1".to_string()],
         config_protocol: MeshConfigProtocol::Native,
         file_config_path: None,
+        stock_xds_urls: Vec::new(),
+        stock_xds_node_id: None,
+        stock_xds_node_metadata: Default::default(),
+        stock_xds_token_file: None,
+        stock_xds_limits: Default::default(),
         topology,
         inbound_listen_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         outbound_listen_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
@@ -34,6 +39,7 @@ fn runtime_for(topology: MeshTopology) -> MeshRuntimeConfig {
         egress_hbone_port: 15008,
         egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:15090".parse::<SocketAddr>().unwrap(),
+        egress_gateway: None,
         workload_spiffe_id: None,
         waypoint_name: match topology {
             // ServiceWaypoint REQUIRES a waypoint name (env validation rejects
@@ -51,6 +57,8 @@ fn runtime_for(topology: MeshTopology) -> MeshRuntimeConfig {
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
         trusted_hbone_assertors: Vec::new(),
+        unix_socket_allowed_roots: Vec::new(),
+        unix_socket_allowed_uids: Vec::new(),
         workload_labels: HashMap::new(),
         dns_enabled: false,
         dns_listen_addr: "127.0.0.1:15053".parse::<SocketAddr>().unwrap(),

@@ -1482,13 +1482,48 @@ pub struct EnvConfig {
     /// SVID lifetime hint (seconds) passed to the CA backend. The CA may
     /// clamp or ignore this value.
     pub mesh_cert_ttl_seconds: u64,
+    /// Expose Ferrum's own in-process SPIFFE Workload API server on a Unix
+    /// domain socket so local workloads can fetch X.509-SVIDs and JWT-SVIDs
+    /// from it. Requires a CA backend that can mint for an attested workload
+    /// identity. A bind or socket-contract failure is fatal to startup.
+    pub mesh_workload_api_enabled: bool,
+    /// Absolute path of the Unix socket the Workload API server binds. The
+    /// parent directory must already exist and must not be world-writable
+    /// without the sticky bit.
+    pub mesh_workload_api_socket_path: String,
+    /// Octal permission bits applied to the Workload API socket. World-writable
+    /// values are refused.
+    pub mesh_workload_api_socket_mode: String,
+    /// Lifetime (seconds) of X.509-SVIDs the Workload API server mints for
+    /// attested workloads. The CA clamps this to its own ceiling.
+    pub mesh_workload_api_svid_ttl_seconds: u64,
+    /// Lifetime (seconds) of JWT-SVIDs the Workload API server mints. Clamped
+    /// down to the JWT-SVID ceiling; never raised.
+    pub mesh_jwt_svid_ttl_seconds: u64,
+    /// How long an **ephemeral** (dev/test) JWT signing key stays active before
+    /// the background rotation task replaces it. `0` — the default — disables
+    /// time-based JWT key rotation.
+    ///
+    /// Must be `0` whenever `FERRUM_MESH_JWT_SIGNING_KEY_PEM` is configured:
+    /// operator-configured material rotates externally, by rolling a new
+    /// primary with the outgoing key published for verification.
+    pub mesh_jwt_key_lifetime_seconds: u64,
+    /// Peer-credential attestation rules for the Workload API server, as
+    /// `uid:<uid>=<spiffe-id>` / `sha256:<hex>=<spiffe-id>` entries. A workload
+    /// that matches no rule is refused: the Workload API never assigns an
+    /// identity it was not told to assign.
+    pub mesh_workload_api_unix_identity_rules: Vec<String>,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
-    /// `xds` consumes Envoy-compatible ADS; `file` loads a localized mesh
-    /// config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control plane).
+    /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
+    /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
+    /// plane); `stock_xds` consumes standard v3 CDS/EDS/LDS/RDS from a stock
+    /// Envoy / third-party Istio control plane for discovery only, with the
+    /// enforcement posture supplied by `FERRUM_MESH_FILE_CONFIG_PATH`.
     pub mesh_config_protocol: String,
     /// Path to the localized mesh config document (YAML/JSON) consumed when
-    /// `mesh_config_protocol` is `file`. The document carries only the `mesh`
-    /// section of a gateway config; reloaded on SIGHUP (Unix).
+    /// `mesh_config_protocol` is `file` (the whole slice) or `stock_xds` (the
+    /// mandatory policy half). The document carries only the `mesh` section of
+    /// a gateway config; reloaded on SIGHUP (Unix).
     pub mesh_file_config_path: Option<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -1504,6 +1539,24 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
+    /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket may live (issue #3261). **No default: empty means the
+    /// feature is OFF and every `unix://` endpoint is refused.** There is
+    /// deliberately no built-in `/run` or `/var/run` allowance — a Sidecar is
+    /// operator-authored config, and an unconstrained path would let it point
+    /// the (often privileged) Ferrum process at any local socket, e.g.
+    /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
+    /// bare `/`; the socket must be a STRICT descendant. Pure path syntax is
+    /// checked at translation; the data-plane-only containment policy is
+    /// enforced at materialization and again at dial (where symlink resolution
+    /// must land inside a root too) — see `crate::util::unix_socket`.
+    pub mesh_unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
+    /// (the default) admits ONLY the Ferrum process's own effective uid, so a
+    /// root-owned system socket that happens to sit inside an allowed root is
+    /// still refused for a non-root Ferrum. Set this when the co-located
+    /// application runs as a different uid than the sidecar.
+    pub mesh_unix_socket_allowed_uids: Vec<u32>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -1543,9 +1596,27 @@ pub struct EnvConfig {
     /// shared `config_changes` change log. Bump it after a deliberate source
     /// reset (restore from backup, migration to a new store) so data planes see
     /// a new ordering domain rather than a silent sequence rewind. Empty
-    /// disables revision publication entirely. Ignored when the K8s CRD
-    /// controller is enabled (that authority has no shared monotonic sequence).
+    /// disables revision publication entirely, on either ordering domain.
+    ///
+    /// `k8s` and any `k8s:...` value are RESERVED for the Kubernetes
+    /// `resourceVersion` ordering domain and refused here (issue #3611). When
+    /// the K8s CRD controller is enabled this setting is only the on/off
+    /// switch: that CP advertises the Kubernetes domain instead, built from
+    /// [`Self::mesh_config_k8s_authority_id`].
     pub mesh_config_authority_id: String,
+    /// CP-side: qualifier for the Kubernetes mesh config ordering domain
+    /// (`FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID`, issue #3611).
+    ///
+    /// Only meaningful when the K8s CRD controller is enabled. The effective
+    /// authority is the reserved domain `k8s`, or `k8s:<this value>` when set.
+    /// Every CP replica watching the SAME Kubernetes cluster must carry the same
+    /// value, because their sequences come from that cluster's shared
+    /// `resourceVersion` space. Set it to name a NEW domain after an etcd
+    /// restore-from-backup (the one event that can rewind `resourceVersion`
+    /// inside a cluster), or to distinguish two clusters whose control planes a
+    /// single data plane lists in `FERRUM_DP_CP_GRPC_URLS`. Publication is
+    /// disabled by an empty `FERRUM_MESH_CONFIG_AUTHORITY_ID`, not by this.
+    pub mesh_config_k8s_authority_id: String,
     /// DP-side: seconds a foreign config authority must be observed
     /// continuously before the mesh data plane adopts it
     /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`, issue #2473).
@@ -2167,6 +2238,25 @@ pub struct EnvConfig {
     /// enforces per-connection timeouts and per-direction failure attribution
     /// is not consumed by your dashboards/alerts.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Whether an opaque-TLS SNI stream listener may fall back to its catch-all
+    /// route for a connection whose opening bytes are provably **not** TLS.
+    ///
+    /// An SNI-routed stream listener (`passthrough: true`, or an ordinary `tcp`
+    /// listener whose group declares `hosts`) selects its backend from the
+    /// client's TLS `server_name`. A connection that never sends a ClientHello
+    /// has no attributable route, so the default (`false`) closes it before any
+    /// backend is resolved or dialed. Set `true` only when the same port is
+    /// deliberately shared with direct, non-TLS TCP clients that should reach
+    /// the group's catch-all proxy — the pre-#3264 behavior.
+    ///
+    /// This authorizes the **determinate** non-TLS case only. A ClientHello
+    /// that times out, overruns the 16 KiB peek bound, ends early, is malformed,
+    /// or names a host this gateway cannot represent is always refused: such a
+    /// connection may have declared any tenant's hostname, and defaulting it
+    /// would be a cross-tenant downgrade.
+    ///
+    /// Default: `false` (fail closed).
+    pub stream_sni_plaintext_fallback: bool,
 
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
@@ -2802,10 +2892,20 @@ impl Default for EnvConfig {
             mesh_ca_backend: "none".to_string(),
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
+            mesh_workload_api_enabled: false,
+            mesh_workload_api_socket_path:
+                crate::identity::workload_api::DEFAULT_FERRUM_WORKLOAD_API_SOCKET.to_string(),
+            mesh_workload_api_socket_mode: "0660".to_string(),
+            mesh_workload_api_svid_ttl_seconds: 3600,
+            mesh_jwt_svid_ttl_seconds: 300,
+            mesh_jwt_key_lifetime_seconds: 0,
+            mesh_workload_api_unix_identity_rules: Vec::new(),
             mesh_config_protocol: "native".to_string(),
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
+            mesh_unix_socket_allowed_roots: Vec::new(),
+            mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -2814,6 +2914,7 @@ impl Default for EnvConfig {
             mesh_sidecar_identity_narrowing: false,
             mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
                 .to_string(),
+            mesh_config_k8s_authority_id: String::new(),
             mesh_config_revision_adopt_secs:
                 crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
@@ -2952,6 +3053,7 @@ impl Default for EnvConfig {
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
+            stream_sni_plaintext_fallback: false,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             udp_recvmmsg_batch_size: 64,
@@ -3317,10 +3419,19 @@ impl EnvConfig {
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
+            mesh_workload_api_enabled: bool = "FERRUM_MESH_WORKLOAD_API_ENABLED" => false;
+            mesh_workload_api_socket_path: String = "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH" => crate::identity::workload_api::DEFAULT_FERRUM_WORKLOAD_API_SOCKET.to_string();
+            mesh_workload_api_socket_mode: String = "FERRUM_MESH_WORKLOAD_API_SOCKET_MODE" => "0660".to_string();
+            mesh_workload_api_svid_ttl_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_SVID_TTL_SECONDS" => 3600u64;
+            mesh_jwt_svid_ttl_seconds: u64 = "FERRUM_MESH_JWT_SVID_TTL_SECONDS" => 300u64;
+            mesh_jwt_key_lifetime_seconds: u64 = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS" => 0u64;
+            mesh_workload_api_unix_identity_rules: Vec<String> = "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES" => Vec::new();
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
+            mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
+            mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -3328,6 +3439,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
+            mesh_config_k8s_authority_id: String = "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID" => String::new();
             mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
@@ -3481,6 +3593,7 @@ impl EnvConfig {
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
+            stream_sni_plaintext_fallback: bool = "FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK" => false;
             udp_max_sessions: usize = "FERRUM_UDP_MAX_SESSIONS" => 10_000usize, max(1usize);
             udp_cleanup_interval_seconds: u64 = "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS" => 10u64;
             udp_recvmmsg_batch_size: usize = "FERRUM_UDP_RECVMMSG_BATCH_SIZE" => 64usize, clamp(1usize, 1024usize);
@@ -4063,10 +4176,19 @@ impl EnvConfig {
             mesh_ca_backend,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
+            mesh_workload_api_enabled,
+            mesh_workload_api_socket_path,
+            mesh_workload_api_socket_mode,
+            mesh_workload_api_svid_ttl_seconds,
+            mesh_jwt_svid_ttl_seconds,
+            mesh_jwt_key_lifetime_seconds,
+            mesh_workload_api_unix_identity_rules,
             mesh_config_protocol,
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
+            mesh_unix_socket_allowed_roots,
+            mesh_unix_socket_allowed_uids,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -4074,6 +4196,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
             mesh_config_authority_id,
+            mesh_config_k8s_authority_id,
             mesh_config_revision_adopt_secs,
             mesh_egress_stream_enabled,
             mesh_egress_stream_allow_plaintext,
@@ -4202,6 +4325,7 @@ impl EnvConfig {
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
+            stream_sni_plaintext_fallback,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             udp_recvmmsg_batch_size,
@@ -4516,20 +4640,17 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // SIDECAR only (#2013): the CURRENT-netns capture listener
+        // SIDECAR and Ambient host placement (#2013/#3288): the CURRENT-netns
+        // capture listener
         // (`MeshRuntimeConfig::udp_capture_listener()`) binds this port in the
         // sidecar's own (pod) netns, so a UDP/DTLS stream proxy or ServiceEntry
         // declaring the same listen port would race that bind at startup —
-        // reserve it. AMBIENT no longer binds a host-netns listener: its
-        // per-pod-netns UDP producer (`NetnsUdpCaptureManager`) binds the capture
-        // socket INSIDE each enrolled pod's netns, so the mesh proxy's OWN (host)
-        // netns leaves this port free and reserving it here would wrongly reject a
-        // valid host-netns UDP/DTLS stream proxy on it. So gate the reservation on
-        // the SAME condition `udp_capture_listener()` now uses: Sidecar emits the
-        // listener; Ambient/other return `None`. UNSET `FERRUM_MESH_TOPOLOGY`
-        // defaults to `sidecar` in `MeshRuntimeConfig::from_env_config` (which
-        // binds the listener), so treat unset as `sidecar` here too, or a UDP/DTLS
-        // stream proxy on it would pass validation then race the sidecar's bind.
+        // reserve it. Ambient's default per-pod-netns producer binds inside each
+        // enrolled pod and leaves the host port free, but the opt-in host-netns
+        // placement binds the shared capture socket in the mesh proxy's own
+        // namespace and therefore needs the same reservation. UNSET
+        // `FERRUM_MESH_TOPOLOGY` defaults to `sidecar` in
+        // `MeshRuntimeConfig::from_env_config`, so treat unset as sidecar here too.
         // MESH MODE ONLY (codex r2): `reserved_gateway_ports()` is shared by
         // file/database/CP/DP validation, where no mesh capture listener ever binds
         // (`MeshRuntimeConfig::listener_plan()` runs only in mesh mode). Reserving
@@ -4543,7 +4664,9 @@ impl EnvConfig {
             && let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && udp_capture_topology.eq_ignore_ascii_case("sidecar")
+            && (udp_capture_topology.eq_ignore_ascii_case("sidecar")
+                || (udp_capture_topology.eq_ignore_ascii_case("ambient")
+                    && udp.udp_host_netns_enabled))
         {
             ports.insert(udp.udp_outbound_port);
         }
@@ -5140,21 +5263,79 @@ impl EnvConfig {
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
 
-        if matches!(&self.mode, OperatingMode::ControlPlane)
-            && !self.k8s_controller_enabled
-            && !self.mesh_config_authority_id.is_empty()
-        {
-            let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
-                self.mesh_config_authority_id.as_str(),
-                0,
-            );
-            if !authority.is_well_formed() {
-                return Err(format!(
-                    "FERRUM_MESH_CONFIG_AUTHORITY_ID must be empty or a \
-                     printable, control-character-free value with no surrounding \
-                     whitespace and no longer than {} bytes",
+        // Mesh config ordering domains (issues #2473 / #3611). Both are
+        // validated here, at the single configuration boundary, and neither
+        // error echoes the operator-supplied value: an authority that reaches
+        // the accepted watermark is rendered into the reset audit log and the
+        // `/mesh/config-drift` diagnostics, so refusing an ill-formed one
+        // without repeating it keeps those records unshapeable from config.
+        if matches!(&self.mode, OperatingMode::ControlPlane) {
+            let malformed_authority = || {
+                format!(
+                    "must be empty or a printable, control-character-free value with no \
+                     surrounding whitespace, and the effective authority must be no longer \
+                     than {} bytes",
                     crate::modes::mesh::revision::MAX_AUTHORITY_LEN
-                ));
+                )
+            };
+            // The Kubernetes qualifier is validated whenever this CP runs the
+            // CRD controller, INDEPENDENTLY of the disable switch. It is a
+            // separate variable from the one that disables publication, so
+            // gating it on `FERRUM_MESH_CONFIG_AUTHORITY_ID` would silently
+            // accept an ill-formed ordering-domain name and defer the startup
+            // failure to whenever an operator re-enables publication — usually
+            // during the incident that made them disable it.
+            if self.k8s_controller_enabled {
+                // The Kubernetes domain is COMPOSED, so both halves are
+                // checked. The composed value is what a data plane orders
+                // against and what the bounded diagnostics render, so it must
+                // be well formed; but the qualifier is also checked for
+                // surrounding whitespace on its own, because the `k8s:` prefix
+                // would otherwise turn a leading space into a merely interior
+                // one and let `k8s: east-2` through.
+                let qualifier = self.mesh_config_k8s_authority_id.as_str();
+                let trimmed = qualifier.trim() == qualifier;
+                let printable = !qualifier.chars().any(char::is_control);
+                let qualifier_ok = qualifier.is_empty() || (trimmed && printable);
+                let authority = crate::modes::mesh::revision::kubernetes_authority(qualifier);
+                let composed = crate::modes::mesh::revision::MeshConfigRevision::new(authority, 0);
+                if !qualifier_ok || !composed.is_well_formed() {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID {}",
+                        malformed_authority()
+                    ));
+                }
+            } else if !self.mesh_config_authority_id.is_empty() {
+                // Empty is the explicit disable switch, so there is no
+                // change-log authority to check.
+                let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
+                    self.mesh_config_authority_id.as_str(),
+                    0,
+                );
+                if !authority.is_well_formed() {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_AUTHORITY_ID {}",
+                        malformed_authority()
+                    ));
+                }
+                // `k8s` is reserved for the Kubernetes `resourceVersion`
+                // ordering domain. A change-log control plane that claimed it
+                // would advertise sequences from an unrelated number space
+                // under a name a Kubernetes control plane's data planes treat
+                // as comparable — a silent cross-domain ordering claim the gate
+                // could not detect, because comparability is exactly what an
+                // equal authority asserts.
+                if crate::modes::mesh::revision::is_kubernetes_authority(
+                    self.mesh_config_authority_id.as_str(),
+                ) {
+                    return Err(format!(
+                        "FERRUM_MESH_CONFIG_AUTHORITY_ID must not use the reserved '{}' \
+                         ordering domain (that domain sequences from Kubernetes \
+                         resourceVersion, not from the config change log); choose another \
+                         authority id",
+                        crate::modes::mesh::revision::KUBERNETES_AUTHORITY_DOMAIN
+                    ));
+                }
             }
         }
 
@@ -5232,35 +5413,38 @@ impl EnvConfig {
                 // Validate the protocol value before the per-protocol CP
                 // requirements so a typo'd FERRUM_MESH_CONFIG_PROTOCOL fails
                 // with the protocol error, not a misleading missing-CP-URL one.
-                match self
-                    .mesh_config_protocol
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "native" | "xds" | "file" => {}
+                let normalized_mesh_protocol =
+                    self.mesh_config_protocol.trim().to_ascii_lowercase();
+                match normalized_mesh_protocol.as_str() {
+                    "native" | "xds" | "file" | "stock_xds" | "stock-xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
-                             Expected: native, xds, or file",
+                             Expected: native, xds, file, or stock_xds",
                             crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
-                // The localized `file` protocol has no control plane: the CP
-                // URL and CP/DP JWT secret are not required (nor consumed).
+                // The localized `file` protocol has no control plane, and
+                // `stock_xds` dials a THIRD-PARTY ADS server named by
+                // `FERRUM_MESH_STOCK_XDS_URLS` — neither consumes the Ferrum
+                // CP URL or the CP/DP JWT secret, and `stock_xds` must never
+                // present a Ferrum-minted CP/DP JWT to a stock control plane.
+                // Both require the local mesh document instead (`file` for the
+                // whole slice, `stock_xds` for the mandatory policy half).
                 // Native/xDS keep both hard requirements, including the
                 // minimum secret length the env macro used to enforce when
                 // `required_for` still listed "mesh".
-                let file_protocol = self
-                    .mesh_config_protocol
-                    .trim()
-                    .eq_ignore_ascii_case("file");
-                if file_protocol {
+                let local_document_protocol = matches!(
+                    normalized_mesh_protocol.as_str(),
+                    "file" | "stock_xds" | "stock-xds"
+                );
+                if local_document_protocol {
                     if self.mesh_file_config_path.is_none() {
-                        return Err("FERRUM_MESH_FILE_CONFIG_PATH is required when \
-                             FERRUM_MESH_CONFIG_PROTOCOL=file"
-                            .into());
+                        return Err(format!(
+                            "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                             FERRUM_MESH_CONFIG_PROTOCOL={normalized_mesh_protocol}"
+                        ));
                     }
                 } else {
                     if self.dp_cp_grpc_urls.is_empty() {
@@ -5287,38 +5471,43 @@ impl EnvConfig {
                 // File-based SVID material is the explicit identity override.
                 // Blank paths were normalized to `None` at parse, so a presence
                 // check is exact.
+                let any_file_workload_identity = self.gateway_svid_cert_path.is_some()
+                    || self.gateway_svid_key_path.is_some()
+                    || self.gateway_svid_trust_bundle_path.is_some();
                 let has_file_workload_identity = self.gateway_svid_cert_path.is_some()
                     && self.gateway_svid_key_path.is_some()
                     && self.gateway_svid_trust_bundle_path.is_some();
-                if mesh_ca_backend != crate::identity::ca::CaBackend::None
+                // File SVIDs deliberately override the CA-backed runtime
+                // identity source, and therefore leave no issuer for this
+                // server. Refuse the combination before validating the
+                // otherwise-suppressed backend so partial and complete file
+                // tuples receive the same decisive diagnostic.
+                if self.mesh_workload_api_enabled && any_file_workload_identity {
+                    return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
+                }
+                let workload_spiffe_id = if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
                     let workload_spiffe_id = crate::config::conf_file::resolve_ferrum_var(
                         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     )
-                    .filter(|value| !value.trim().is_empty());
-                    match workload_spiffe_id {
-                        None => {
-                            return Err(
-                                "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
-                                 the issued runtime SVID matches the local mesh workload identity"
-                                    .into(),
-                            );
-                        }
-                        Some(id) => {
-                            // Parse it exactly like startup's
-                            // `configured_mesh_workload_spiffe_id` so `validate`
-                            // and mesh startup agree: a non-SPIFFE value (e.g.
-                            // `not-a-spiffe-id`) must fail here, not silently pass
-                            // settings validation then abort at boot.
-                            crate::identity::SpiffeId::new(id).map_err(|e| {
-                                format!(
-                                    "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
-                                     FERRUM_MESH_CA_BACKEND is enabled: {e}"
-                                )
-                            })?;
-                        }
-                    }
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
+                         the issued runtime SVID matches the local mesh workload identity"
+                            .to_string()
+                    })?;
+                    // Parse it exactly like startup's
+                    // `configured_mesh_workload_spiffe_id` so `validate` and
+                    // mesh startup agree: a non-SPIFFE value must fail here,
+                    // not silently pass settings validation then abort at boot.
+                    let workload_spiffe_id = crate::identity::SpiffeId::new(workload_spiffe_id)
+                        .map_err(|e| {
+                            format!(
+                                "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+                                 FERRUM_MESH_CA_BACKEND is enabled: {e}"
+                            )
+                        })?;
                     // Mirror `bootstrap_dev_root`'s refusal so `validate` agrees
                     // with startup: the internal self-signed CA only bootstraps in
                     // non-production with FERRUM_MESH_CA_BOOTSTRAP_DEV=true. Without
@@ -5343,6 +5532,92 @@ impl EnvConfig {
                                     .into(),
                             );
                         }
+                    }
+                    Some(workload_spiffe_id)
+                } else {
+                    None
+                };
+                if self.mesh_workload_api_enabled {
+                    // The backend gate runs FIRST. A backend that cannot serve
+                    // this surface at all is the decisive diagnostic; reporting
+                    // a socket-path problem ahead of it would send the operator
+                    // to fix the wrong thing.
+                    match mesh_ca_backend {
+                        crate::identity::ca::CaBackend::None => {
+                            return Err(Self::WORKLOAD_API_REQUIRES_CA_BACKEND.to_string());
+                        }
+                        // The SPIRE backend cannot serve this surface, and the
+                        // failure would otherwise be silent-at-runtime rather
+                        // than loud-at-startup. `SpireAgentCa` fetches Ferrum's
+                        // OWN agent SVID; it has no way to issue for the
+                        // downstream identity `FetchX509SVID` attests, and
+                        // SPIRE authorizes `FetchJWTSVID` by the calling
+                        // process, so proxying it would substitute Ferrum's
+                        // SPIFFE ID. Both are terminal without SPIRE's
+                        // delegated-identity API. Refuse the combination
+                        // outright rather than bind a Workload API that can
+                        // only mis-issue or refuse.
+                        crate::identity::ca::CaBackend::SpireAgent => {
+                            return Err(Self::WORKLOAD_API_SPIRE_UNSUPPORTED.to_string());
+                        }
+                        crate::identity::ca::CaBackend::Internal => {}
+                    }
+                }
+                // JWT-SVID signing material and the Workload API socket
+                // contract are validated here so `validate` and mesh startup
+                // agree: an operator must not get a clean `validate` for a
+                // Workload API surface that cannot bind, or for a JWT authority
+                // whose keys vanish on restart.
+                self.validate_mesh_jwt_svid_settings(&mesh_ca_backend)?;
+                if self.mesh_workload_api_enabled {
+                    let socket =
+                        crate::identity::workload_api::WorkloadApiSocketConfig::from_parts(
+                            self.mesh_workload_api_socket_path.as_str(),
+                            self.mesh_workload_api_socket_mode.as_str(),
+                        )
+                        .map_err(|e| format!("Invalid FERRUM_MESH_WORKLOAD_API_* settings: {e}"))?;
+                    // The path/ownership/mode checks touch the filesystem, so
+                    // they are validated too: `validate` runs on the host that
+                    // will serve, and a missing or unsafe parent directory is
+                    // exactly the misconfiguration worth catching before boot.
+                    socket.validate().map_err(|e| {
+                        format!("Invalid FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: {e}")
+                    })?;
+
+                    // Parse the attestor configuration through the same
+                    // identity-layer parser startup uses. This stays after the
+                    // backend and socket gates so their decisive diagnostics
+                    // retain priority over a malformed mapping rule.
+                    let trust_domain = workload_spiffe_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "internal: enabled Workload API has no parsed workload SPIFFE ID"
+                                .to_string()
+                        })?
+                        .trust_domain();
+                    let mut has_unix_attestor = false;
+                    for raw in &self.mesh_workload_api_unix_identity_rules {
+                        let entry = raw.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        crate::identity::attestation::unix::parse_identity_rule(
+                            entry,
+                            trust_domain,
+                        )
+                        .map_err(|error| {
+                            format!("Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}")
+                        })?;
+                        has_unix_attestor = true;
+                    }
+                    if !has_unix_attestor && !crate::identity::allow_static_id() {
+                        return Err(
+                            "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires at least one attestor: \
+                             set FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES to map peer \
+                             credentials to SPIFFE IDs. For dev/test only, \
+                             FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
+                                .into(),
+                        );
                     }
                 }
                 // Validate the production-mode flag value loudly — like
@@ -6019,6 +6294,154 @@ impl EnvConfig {
                 50051,
             ))
         }
+    }
+
+    /// Enabling the Workload API surface with no CA backend at all.
+    const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
+         API has an authority to mint SVIDs from";
+
+    /// Enabling the Workload API while explicit file identity suppresses the
+    /// automatic CA-backed issuer at mesh startup.
+    const WORKLOAD_API_FILE_SVID_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true cannot be combined with \
+         FERRUM_GATEWAY_SVID_CERT_PATH, FERRUM_GATEWAY_SVID_KEY_PATH, or \
+         FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH. File-based gateway SVID material overrides \
+         automatic CA-backed issuance, so Ferrum would have no certificate authority to issue \
+         SVIDs for attested downstream workloads. Remove the FERRUM_GATEWAY_SVID_* override and \
+         use FERRUM_MESH_CA_BACKEND=internal, or disable Ferrum's Workload API";
+
+    /// Enabling the Workload API surface on the SPIRE backend, which can only
+    /// ever issue Ferrum's own identity (issue #3617).
+    const WORKLOAD_API_SPIRE_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
+         FERRUM_MESH_CA_BACKEND=spire. A SPIRE agent issues only the calling process's own \
+         identity, so Ferrum cannot mint an X.509-SVID or a JWT-SVID for an attested downstream \
+         workload through it — serving the surface would either fail every request or substitute \
+         Ferrum's own SPIFFE ID. Point workloads at their local SPIRE agent socket \
+         (FERRUM_MESH_SPIRE_AGENT_SOCKET) instead, or use FERRUM_MESH_CA_BACKEND=internal with \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes SPIRE's X.509 SVID and trust \
+         bundles for peer verification under FERRUM_MESH_CA_BACKEND=spire; only serving a \
+         Workload API is refused";
+
+    /// Configured JWT signing material rotates externally, so an in-process
+    /// cadence alongside it is refused rather than silently normalized away.
+    const JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED: &str = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 when FERRUM_MESH_JWT_SIGNING_KEY_PEM is \
+         configured. Configured JWT signing material is rotated EXTERNALLY: set the new key in \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM and the outgoing one in \
+         FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM, roll the fleet, then drop the previous key \
+         once the verification overlap has elapsed. Generating a replacement in process would \
+         give every replica a different key and lose the signer of every still-live token on \
+         restart";
+
+    /// Enforce the JWT-SVID signing-material and rotation contract (issue #3617).
+    ///
+    /// The JWT authority of a trust domain is only meaningful if it is *stable*:
+    /// an ephemeral key makes every token unverifiable after a restart and makes
+    /// two replicas of one trust domain publish different JWKS. So:
+    ///
+    /// 1. Configured signing material is parsed here — not merely at first use —
+    ///    so unusable or wrong-key-type material fails `validate` and startup
+    ///    rather than the first mint. The diagnostic is `JwtSvidError`'s fixed
+    ///    string; it names no part of the key and no source reference.
+    /// 2. A **previous** key may only be configured alongside a primary. On its
+    ///    own it would mean "publish a key nothing signs with", which is an
+    ///    operator mistake worth reporting, not a posture to honour.
+    /// 3. With no material configured, the dev opt-in
+    ///    `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` is required — and, like the other
+    ///    identity dev shortcuts, is refused unconditionally under
+    ///    `FERRUM_MESH_PRODUCTION_MODE=true`. Absent both, the Workload API's JWT
+    ///    surface is refused rather than started with disappearing keys.
+    /// 4. Configured material rotates **externally**, so an explicit nonzero
+    ///    `FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS` alongside it is refused rather
+    ///    than silently normalized: an in-process replacement would be a random
+    ///    key per replica, lost on restart. For the ephemeral dev key — which
+    ///    has no continuity to lose — an in-process cadence is allowed, and must
+    ///    be one whose overlap guarantee is provable: a lifetime shorter than
+    ///    the overlap divided by the published-authority budget could not retain
+    ///    every still-verifiable key, so it is refused here with the exact
+    ///    minimum.
+    ///
+    /// The gate is scoped to **the backend that consumes the material**:
+    /// JWT-SVIDs are minted only by the Workload API surface, and only the
+    /// `internal` CA backend owns a JWT signing authority. A mesh that does not
+    /// serve the surface — or that serves it from a backend which never reads a
+    /// local JWT key — is not made to carry signing material it never uses.
+    fn validate_mesh_jwt_svid_settings(
+        &self,
+        mesh_ca_backend: &crate::identity::ca::CaBackend,
+    ) -> Result<(), String> {
+        if !self.mesh_workload_api_enabled
+            || *mesh_ca_backend != crate::identity::ca::CaBackend::Internal
+        {
+            return Ok(());
+        }
+        let signing_key = crate::identity::jwt_signing_key_pem();
+        let previous_key = crate::identity::jwt_previous_signing_key_pem();
+
+        if signing_key.is_none() && previous_key.is_some() {
+            return Err("FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM is set without \
+                 FERRUM_MESH_JWT_SIGNING_KEY_PEM: a retired key is published for verification \
+                 only, so there would be no key to mint with"
+                .into());
+        }
+        if signing_key.is_none() {
+            if crate::identity::production_mode() {
+                return Err(
+                    "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_MESH_WORKLOAD_API_ENABLED=true \
+                     requires FERRUM_MESH_JWT_SIGNING_KEY_PEM (an ES256 / P-256 private key, \
+                     resolvable through the _VAULT / _AWS / _AZURE / _GCP / _FILE suffixes). \
+                     Without stable signing material the trust domain's JWT authority changes on \
+                     every restart and differs on every replica, so already-issued JWT-SVIDs stop \
+                     validating"
+                        .into(),
+                );
+            }
+            if !crate::identity::allow_ephemeral_jwt_key() {
+                return Err("FERRUM_MESH_WORKLOAD_API_ENABLED=true requires \
+                     FERRUM_MESH_JWT_SIGNING_KEY_PEM so the trust domain's JWT authority survives \
+                     restart and matches every replica. For dev/test only, set \
+                     FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY=true to accept a process-local key whose \
+                     tokens become unverifiable on restart"
+                    .into());
+            }
+        }
+
+        // Parse the material through exactly the constructor mesh startup will
+        // use, so `validate` cannot pass on a key startup would reject.
+        let mut jwt_config = crate::identity::jwt_svid::LocalJwtAuthorityConfig::new(
+            // The trust domain does not affect signing-material or cadence
+            // validation; a placeholder keeps this check independent of whether
+            // FERRUM_MESH_WORKLOAD_SPIFFE_ID has been resolved yet.
+            crate::identity::TrustDomain::new("validate.invalid".to_string())
+                .map_err(|e| format!("internal: placeholder trust domain rejected: {e}"))?,
+        );
+        let configured_material = signing_key.is_some();
+        jwt_config.signing_key_pem = signing_key;
+        jwt_config.retired_key_pems = previous_key.into_iter().collect();
+        jwt_config.key_lifetime_secs = self.mesh_jwt_key_lifetime_seconds;
+        jwt_config.allow_ephemeral_key = crate::identity::allow_ephemeral_jwt_key();
+        if self.mesh_jwt_key_lifetime_seconds > 0 {
+            if configured_material {
+                // Refused, not normalized: an operator who set a cadence
+                // believes a rotation is scheduled. It is not, and it cannot
+                // be — a process-local replacement for configured material
+                // would publish a different key on every replica and be lost
+                // on restart, stranding every token it had signed.
+                return Err(Self::JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED.to_string());
+            }
+            let minimum = crate::identity::jwt_svid::min_key_lifetime_secs(
+                crate::identity::jwt_svid::MAX_JWT_SVID_TTL_SECS,
+            );
+            if self.mesh_jwt_key_lifetime_seconds < minimum {
+                return Err(format!(
+                    "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 (rotation disabled) or at \
+                     least {minimum}: a shorter cadence would retire keys faster than the \
+                     rotation verification overlap releases them, so a JWT-SVID inside its \
+                     permitted lifetime could stop validating"
+                ));
+            }
+        }
+        crate::identity::jwt_svid::LocalJwtAuthority::new(jwt_config)
+            .map(|_| ())
+            .map_err(|e| format!("Invalid JWT-SVID signing configuration: {e}"))
     }
 
     /// Enforce the secure-by-default CP/DP gRPC transport policy.

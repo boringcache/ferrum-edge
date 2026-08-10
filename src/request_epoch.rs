@@ -51,6 +51,16 @@ pub struct RequestEpoch {
 }
 
 impl RequestEpoch {
+    /// Read-only access to the configuration published with this request epoch.
+    ///
+    /// Callers that need to compare request-facing state with another runtime
+    /// projection must read it through the epoch so the configuration and its
+    /// derived caches cannot come from different reload generations.
+    #[inline]
+    pub fn config(&self) -> &GatewayConfig {
+        self.config.as_ref()
+    }
+
     /// Namespace-qualified proxy lookup.
     ///
     /// This is the only proxy-by-identity accessor: every runtime caller must
@@ -242,6 +252,7 @@ mod tests {
             frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         }
@@ -259,6 +270,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
         }
     }
@@ -512,7 +524,14 @@ mod tests {
         let after = store.load();
         let cache = RouterCache::new(&after.config, 100);
         let matched = cache
-            .find_proxy_in_snapshot(&after.route_table, after.route_generation, None, "/secure")
+            .find_proxy_in_snapshot(
+                &after.route_table,
+                after.route_generation,
+                None,
+                "/secure",
+                None,
+                false,
+            )
             .unwrap_or_else(|| panic!("secure route should be visible"));
         assert_eq!(matched.proxy.id, "secure");
 
@@ -529,7 +548,7 @@ mod tests {
         let old_table = RouterCache::build_route_table_snapshot(&old);
         assert!(
             cache
-                .find_proxy_in_snapshot(&old_table, 1, None, "/old")
+                .find_proxy_in_snapshot(&old_table, 1, None, "/old", None, false)
                 .is_some()
         );
 
@@ -537,12 +556,12 @@ mod tests {
         let new_table = RouterCache::build_route_table_snapshot(&new);
         assert!(
             cache
-                .find_proxy_in_snapshot(&new_table, 2, None, "/old")
+                .find_proxy_in_snapshot(&new_table, 2, None, "/old", None, false)
                 .is_none()
         );
         assert!(
             cache
-                .find_proxy_in_snapshot(&new_table, 2, None, "/new")
+                .find_proxy_in_snapshot(&new_table, 2, None, "/new", None, false)
                 .is_some()
         );
     }
@@ -1530,6 +1549,54 @@ impl RequestEpochStore {
             route_generation: 1,
             lb_generation: 1,
         })
+    }
+
+    /// Republish a config snapshot into an existing store for an integration test.
+    ///
+    /// Harnesses that drive [`crate::proxy::stream_listener::StreamListenerManager`]
+    /// without a full [`crate::proxy::ProxyState`] reload must call this before
+    /// (or together with) swapping the manager's config `ArcSwap` and calling
+    /// `reconcile()`. Stream accept paths dial backends from the published
+    /// request epoch, while reconcile only reads the config `ArcSwap` for
+    /// listener identity / SNI-group membership — updating one without the
+    /// other leaves new connections on a restarted `__sni_{port}` listener
+    /// dialing the previous backend.
+    ///
+    /// Production reloads must keep using [`Self::update_config`] through
+    /// `ProxyState::update_config`, which publishes the epoch and mirrors it
+    /// into the shared config slot under the writer lock.
+    #[doc(hidden)]
+    pub fn republish_from_runtime_parts_for_test(
+        &self,
+        config: GatewayConfig,
+        plugin_cache: &PluginCache,
+        consumer_index: &ConsumerIndex,
+        load_balancer_cache: &LoadBalancerCache,
+    ) -> Result<(), String> {
+        let staged_config = Arc::new(config);
+        let route_table = RouterCache::build_route_table_snapshot(&staged_config);
+        let plugin_inner = plugin_cache.load_inner();
+        let consumer_inner = consumer_index.load_inner();
+        let lb_inner = load_balancer_cache.load_inner();
+        // Harness-only path: the staged snapshot is already validated by the
+        // caller, and there are no compatibility wrappers to mirror.
+        match self.update_config(
+            |_| {
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::clone(&staged_config),
+                    route_table: Arc::clone(&route_table),
+                    plugin_cache: Arc::clone(&plugin_inner),
+                    consumer_index: Arc::clone(&consumer_inner),
+                    load_balancer: Arc::clone(&lb_inner),
+                    route_changed: true,
+                    lb_changed: true,
+                }))
+            },
+            |_| {},
+        )? {
+            Some(_) => Ok(()),
+            None => Err("request epoch harness republish produced no epoch".to_string()),
+        }
     }
 
     #[inline]
