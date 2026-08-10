@@ -1459,6 +1459,17 @@ async fn run_with_backend(
         Ok(client) => client,
         Err(err) => return Err(owner.fail_with(err)),
     };
+    let udp_migration_generation =
+        crate::proxy::udp_placement_migration::migration_generation_from_env()
+            .map_err(anyhow::Error::msg)?;
+    if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
+        anyhow::bail!(
+            "Ambient UDP migration generation requires the node-waypoint pod registry directory"
+        );
+    }
+    if cni_config.enabled && ownership_store_path_for_socket(&cni_config.socket_path).is_none() {
+        anyhow::bail!("CNI listener requires an absolute socket path with a parent directory");
+    }
     // A tc attach proves only that the configured link accepted the program.
     // One shutdown-owned background monitor performs the initial bounded Node
     // LIST, follows its watch, and re-reads host route/link state. The pod/CNI
@@ -1489,9 +1500,6 @@ async fn run_with_backend(
             diagnostic: "inbound ingress redirect is disabled".to_string(),
         }
     };
-    let udp_migration_generation =
-        crate::proxy::udp_placement_migration::migration_generation_from_env()
-            .map_err(anyhow::Error::msg)?;
     let topology_publication_ok = apply_ingress_topology_outcome(
         owner.backend_mut(),
         config,
@@ -1535,6 +1543,21 @@ fn set_node_agent_startup_readiness(
     let ready = initial_pod_sync_complete && topology_ready && udp_migration_ready;
     startup_ready.store(ready, Ordering::Release);
     ready
+}
+
+#[allow(dead_code)] // External unit tests cover the combined readiness boundary.
+pub(crate) fn set_node_agent_startup_readiness_for_test(
+    initial_pod_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> bool {
+    let startup_ready = AtomicBool::new(false);
+    set_node_agent_startup_readiness(
+        &startup_ready,
+        initial_pod_sync_complete,
+        topology_ready,
+        udp_migration_ready,
+    )
 }
 
 // This publication boundary deliberately receives each independent readiness
@@ -1946,12 +1969,15 @@ where
                             &pod,
                         );
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
@@ -1994,12 +2020,15 @@ where
                             handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
@@ -2186,12 +2215,15 @@ where
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during CNI registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
@@ -2522,6 +2554,21 @@ fn cni_topology_readiness_rejection(
     topology_ready: bool,
 ) -> Option<&'static str> {
     cni_capture_readiness_rejection(verb, initial_sync_complete, topology_ready, true)
+}
+
+#[allow(dead_code)] // External unit tests cover the combined proof gate.
+pub(crate) fn cni_capture_readiness_rejection_for_test(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> Option<&'static str> {
+    cni_capture_readiness_rejection(
+        verb,
+        initial_sync_complete,
+        topology_ready,
+        udp_migration_ready,
+    )
 }
 
 #[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.

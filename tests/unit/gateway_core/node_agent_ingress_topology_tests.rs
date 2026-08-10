@@ -8,8 +8,10 @@ use std::sync::Arc;
 use ferrum_edge::_test_support::{
     apply_bounded_node_topology_sequence_for_test,
     apply_node_agent_ingress_topology_outcome_for_test,
+    node_agent_cni_capture_readiness_rejection_for_test,
     node_agent_cni_topology_readiness_rejection_for_test,
     run_with_node_agent_topology_outcome_stream_for_test,
+    set_node_agent_startup_readiness_for_test,
     spawn_node_agent_ingress_topology_monitor_for_test,
 };
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
@@ -713,7 +715,7 @@ fn joining_rebooting_and_draining_nodes_do_not_poison_cluster_topology_proof() {
 fn single_node_cluster_has_a_truthful_closed_outcome() {
     let local = node("local", &[], Some("True"), false, &[]);
     assert_eq!(
-        requirements_from_nodes(&[local.clone()], "local", true),
+        requirements_from_nodes(std::slice::from_ref(&local), "local", true),
         Err(IngressTopologyReason::NoRemoteTopologyEvidence),
     );
     assert_eq!(
@@ -1143,6 +1145,24 @@ fn disabled_ingress_topology_skips_map_republication_and_does_not_gate_readiness
 }
 
 #[test]
+fn startup_readiness_requires_sync_topology_and_udp_migration_proofs() {
+    for initial_sync_complete in [false, true] {
+        for topology_ready in [false, true] {
+            for udp_migration_ready in [false, true] {
+                assert_eq!(
+                    set_node_agent_startup_readiness_for_test(
+                        initial_sync_complete,
+                        topology_ready,
+                        udp_migration_ready,
+                    ),
+                    initial_sync_complete && topology_ready && udp_migration_ready,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn aggregate_node_snapshot_evidence_is_bounded_before_cache_commit() {
     let cidrs = vec!["10.0.0.0/24"; 512];
     let snapshot = vec![
@@ -1242,6 +1262,40 @@ fn cni_add_check_and_status_withhold_capture_ready_during_topology_loss() {
         node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Gc, true, false),
         None,
         "post-sync GC must remain available while capture is quarantined",
+    );
+}
+
+#[test]
+fn cni_add_check_and_status_require_the_udp_migration_proof() {
+    for verb in [RpcVerb::Add, RpcVerb::Check, RpcVerb::Status] {
+        assert_eq!(
+            node_agent_cni_capture_readiness_rejection_for_test(verb, true, true, false),
+            Some("Ambient UDP migration registry proof is unavailable; enrollment is fenced"),
+        );
+        assert_eq!(
+            node_agent_cni_capture_readiness_rejection_for_test(verb, true, true, true),
+            None,
+        );
+    }
+    assert_eq!(
+        node_agent_cni_capture_readiness_rejection_for_test(
+            RpcVerb::Del,
+            true,
+            false,
+            false,
+        ),
+        None,
+        "cleanup must remain available while either readiness proof is unavailable",
+    );
+    assert_eq!(
+        node_agent_cni_capture_readiness_rejection_for_test(
+            RpcVerb::Gc,
+            true,
+            false,
+            false,
+        ),
+        None,
+        "post-sync GC must remain available while either readiness proof is unavailable",
     );
 }
 

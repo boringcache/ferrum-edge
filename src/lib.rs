@@ -8334,6 +8334,18 @@ pub mod _test_support {
         )
     }
 
+    pub fn set_node_agent_startup_readiness_for_test(
+        initial_pod_sync_complete: bool,
+        topology_ready: bool,
+        udp_migration_ready: bool,
+    ) -> bool {
+        crate::modes::node_agent::set_node_agent_startup_readiness_for_test(
+            initial_pod_sync_complete,
+            topology_ready,
+            udp_migration_ready,
+        )
+    }
+
     pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
@@ -8371,6 +8383,20 @@ pub mod _test_support {
             verb,
             initial_sync_complete,
             startup_ready,
+        )
+    }
+
+    pub fn node_agent_cni_capture_readiness_rejection_for_test(
+        verb: crate::cni::rpc::RpcVerb,
+        initial_sync_complete: bool,
+        topology_ready: bool,
+        udp_migration_ready: bool,
+    ) -> Option<&'static str> {
+        crate::modes::node_agent::cni_capture_readiness_rejection_for_test(
+            verb,
+            initial_sync_complete,
+            topology_ready,
+            udp_migration_ready,
         )
     }
 
