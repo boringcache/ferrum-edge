@@ -8235,12 +8235,12 @@ mod tests {
         assert!(
             mesh.services
                 .iter()
-                .any(|service| service.name == "sample-https-valid")
+                .any(|service| service.name == "gateway-sample-https-valid")
         );
         assert!(
             mesh.services
                 .iter()
-                .all(|service| service.name != "sample-https-invalid")
+                .all(|service| service.name != "gateway-sample-https-invalid")
         );
     }
 
@@ -8308,7 +8308,7 @@ mod tests {
             result.config.mesh.as_ref().is_none_or(|mesh| mesh
                 .services
                 .iter()
-                .all(|service| service.name != "edge-b-https-b")),
+                .all(|service| service.name != "gateway-edge-b-https-b")),
             "the accepted non-winning TLS listener must not advertise a listener under the namespace winner's certificate"
         );
         assert!(
