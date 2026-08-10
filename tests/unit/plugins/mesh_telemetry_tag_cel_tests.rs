@@ -13,6 +13,8 @@ use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use serde_json::json;
 
+use super::plugin_utils::create_test_proxy;
+
 fn mesh_identity_metadata(mut metadata: HashMap<String, String>) -> HashMap<String, String> {
     for (key, value) in [
         ("mesh.source.workload", "frontend"),
@@ -668,6 +670,41 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     assert!(
         !ctx.metadata.contains_key("mesh.request.method"),
         "port-only CEL must not stamp request.method"
+    );
+
+    // HTTP inbound attribution must use the same transport-derived port as
+    // mesh authorization. A Sidecar ingress route is scoped to its declared
+    // listener port, not the separate backend/defaultEndpoint dial port.
+    let mut ingress_proxy = create_test_proxy();
+    ingress_proxy.id = "__mesh-ingress-default-reviews-8443".into();
+    ingress_proxy.backend_port = 8080;
+    let mut ingress = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    ingress.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound);
+    ingress.matched_proxy = Some(std::sync::Arc::new(ingress_proxy));
+    ingress.frontend_listen_port = Some(15006);
+    ingress.mesh_inbound_listener_authz_port = Some(8443);
+    port_only.before_proxy(&mut ingress, &mut headers).await;
+    assert_eq!(
+        ingress
+            .metadata
+            .get("mesh.destination.port")
+            .map(String::as_str),
+        Some("8443"),
+        "ingress metrics must use the declared listener port, not backend port 8080"
+    );
+
+    // If the request-path stamp is absent, the shared resolver deliberately
+    // falls back to the actual inbound listener rather than misattributing the
+    // backend dial port as the policy/metric destination.
+    ingress.mesh_inbound_listener_authz_port = None;
+    port_only.before_proxy(&mut ingress, &mut headers).await;
+    assert_eq!(
+        ingress
+            .metadata
+            .get("mesh.destination.port")
+            .map(String::as_str),
+        Some("15006"),
+        "missing ingress stamp must not fall back to backend port 8080"
     );
 
     // Stream path: destination.port is stamped only when needed; HTTP-only
