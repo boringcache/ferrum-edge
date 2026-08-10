@@ -946,14 +946,16 @@ fn inject_gateway_workload_metrics_if_svid(
         .plugin_configs
         .iter()
         .position(|plugin| {
-            plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            plugin.namespace == namespace
+                && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                 && plugin.enabled
                 && plugin.scope == PluginScope::Global
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
         })
         .or_else(|| {
             config.plugin_configs.iter().position(|plugin| {
-                plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                plugin.namespace == namespace
+                    && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                     && plugin.scope == PluginScope::Global
                     && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
             })
@@ -973,12 +975,25 @@ fn inject_gateway_workload_metrics_if_svid(
     if let Some(existing) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
     }) {
+        // The managed ID is validation-safe and can therefore collide with an
+        // operator-owned plugin. Never change the type (and potentially the
+        // security role) of such a plugin merely because its ID collides.
+        if existing.plugin_name != WORKLOAD_METRICS_PLUGIN_NAME {
+            warn!(
+                namespace,
+                plugin_id = GATEWAY_WORKLOAD_METRICS_PLUGIN_ID,
+                plugin_name = %existing.plugin_name,
+                "Gateway workload metrics injection skipped due to an operator plugin ID collision"
+            );
+            return;
+        }
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
         existing.scope = PluginScope::Global;
         existing.proxy_id = None;
         existing.enabled = true;
         existing.priority_override = None;
+        existing.trigger = None;
         existing.api_spec_id = None;
         existing.config = serde_json::json!({
             "workload_spiffe_id": spiffe_id,
@@ -1005,14 +1020,21 @@ fn inject_gateway_workload_metrics_if_svid(
     });
 }
 
-fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespace: &str) -> bool {
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
-        && config
-            .plugin_configs
-            .iter()
-            .all(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        && config.plugin_configs.iter().all(|plugin| {
+            plugin.namespace == namespace
+                && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.scope == PluginScope::Global
+                && plugin.proxy_id.is_none()
+                && plugin.enabled
+                && plugin.priority_override.is_none()
+                && plugin.trigger.is_none()
+                && plugin.api_spec_id.is_none()
+        })
 }
 
 fn gateway_hbone_mtls_observed(
@@ -10159,8 +10181,10 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
-        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
+        let old_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&old_config, &self.env_config.namespace);
+        let new_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&new_config, &self.env_config.namespace);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -54171,6 +54195,146 @@ mod tests {
                 .get("workload_spiffe_id")
                 .and_then(serde_json::Value::as_str),
             Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn gateway_workload_metrics_does_not_replace_colliding_operator_plugin() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: Some(100),
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert_eq!(config.plugin_configs.len(), 1);
+        let plugin = &config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "key_auth");
+        assert_eq!(plugin.scope, PluginScope::Global);
+        assert!(plugin.enabled);
+        assert_eq!(plugin.priority_override, Some(100));
+        assert_eq!(plugin.config, json!({ "key_names": ["api-key"] }));
+    }
+
+    #[test]
+    fn gateway_workload_metrics_operator_selection_is_namespace_scoped() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: "tenant-b-metrics".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "tenant-b".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://tenant-b.example/ns/tenant-b/sa/gateway"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://old.example/ns/ferrum/sa/old"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        let tenant_b = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "tenant-b-metrics")
+            .expect("tenant-b operator plugin should remain");
+        assert_eq!(
+            tenant_b
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://tenant-b.example/ns/tenant-b/sa/gateway")
+        );
+        let ferrum = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "ferrum" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("ferrum managed plugin should remain");
+        assert_eq!(
+            ferrum
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn colliding_operator_plugin_is_not_ignored_as_empty_config() {
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        assert!(!config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
+        assert!(config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].namespace = "tenant-b".to_string();
+        assert!(
+            !config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"),
+            "a managed-looking plugin from another tenant remains real config"
         );
     }
 

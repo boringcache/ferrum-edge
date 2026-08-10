@@ -3062,10 +3062,10 @@ fn find_regex_match_indexed(
         return None;
     }
 
-    // RegexSet preserves config order, but listener scope has to be ranked
-    // before that order: an earlier port-agnostic regex is the fallback on
-    // other frontends and must not shadow an exact-port sibling on its own
-    // listener. Among entries with the same port rank, first match still wins.
+    // Different patterns retain config-order precedence. Listener scope is
+    // ranked only among identical-pattern siblings so that a scoped override
+    // can beat its port-agnostic fallback without letting a later, broader
+    // pattern shadow an earlier security-sensitive route.
     let mut best: Option<(&RegexRouteEntry, u8)> = None;
     if let Some(regex_set) = &routes.regex_set {
         let matches = regex_set.matches(path);
@@ -3074,6 +3074,9 @@ fn find_regex_match_indexed(
             let Some(priority) = entry.candidate.match_priority(port_ctx) else {
                 continue;
             };
+            if best.is_some_and(|(current, _)| current.pattern.as_str() != entry.pattern.as_str()) {
+                continue;
+            }
             if best.is_none_or(|(_, current)| priority < current) {
                 best = Some((entry, priority));
                 if priority == 0 {
@@ -3087,6 +3090,9 @@ fn find_regex_match_indexed(
                 continue;
             };
             if !entry.pattern.is_match(path) {
+                continue;
+            }
+            if best.is_some_and(|(current, _)| current.pattern.as_str() != entry.pattern.as_str()) {
                 continue;
             }
             if best.is_none_or(|(_, current)| priority < current) {
