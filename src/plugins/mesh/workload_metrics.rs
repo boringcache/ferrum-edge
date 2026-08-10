@@ -22,7 +22,7 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
-    parse_trust_domain_aliases, parse_trusted_hbone_assertors,
+    mesh_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -1364,38 +1364,18 @@ fn encode_metric_tag_cel_expr(expr: &MetricTagCelExpr, out: &mut String) {
 }
 
 fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
-    if ctx.mesh_direction == Some(MeshTrafficDirection::Outbound) {
-        return ctx
-            .orig_dst
-            .map(|addr| addr.port())
-            .or(ctx.mesh_outbound_destination_authz_port)
-            .or_else(|| {
-                ctx.matched_proxy
-                    .as_ref()
-                    .and_then(|proxy| proxy.listen_port)
-            })
-            .filter(|port| *port != 0);
-    }
-    if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound)
-        && let Some(proxy) = ctx.matched_proxy.as_ref()
-        && crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
-    {
-        if let Some(port) = ctx
-            .mesh_inbound_listener_authz_port
-            .filter(|port| *port != 0)
-        {
-            return Some(port);
-        }
-        if proxy.backend_port != 0 {
-            return Some(proxy.backend_port);
-        }
-    }
-    ctx.frontend_listen_port
-        .or_else(|| {
-            ctx.matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port)
-        })
+    // Keep metric attribution on the exact transport-derived port used by
+    // mesh authorization. In particular, Sidecar ingress and HBONE relay
+    // routes must not fall back to their backend dial port when the declared
+    // listener/CONNECT authority stamp is absent.
+    mesh_authz_destination_port(
+        ctx.mesh_direction,
+        ctx.matched_proxy.as_deref(),
+        ctx.mesh_inbound_listener_authz_port,
+        ctx.mesh_outbound_destination_authz_port,
+        ctx.orig_dst,
+        ctx.frontend_listen_port,
+    )
         .filter(|port| *port != 0)
 }
 

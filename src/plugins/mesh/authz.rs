@@ -973,7 +973,7 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 /// back to the router-stamped service port. They must never fall back to the
 /// outbound capture listener port (`:15001`), because that makes port-scoped
 /// ALLOWs over-deny and DENYs under-deny.
-fn mesh_authz_destination_port(
+pub(crate) fn mesh_authz_destination_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched_proxy: Option<&crate::config::types::Proxy>,
     ingress_listener_authz_port: Option<u16>,
