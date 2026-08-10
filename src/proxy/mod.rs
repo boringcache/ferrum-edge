@@ -993,6 +993,7 @@ fn inject_gateway_workload_metrics_if_svid(
         existing.proxy_id = None;
         existing.enabled = true;
         existing.priority_override = None;
+        existing.trigger = None;
         existing.api_spec_id = None;
         existing.config = serde_json::json!({
             "workload_spiffe_id": spiffe_id,
@@ -1019,13 +1020,20 @@ fn inject_gateway_workload_metrics_if_svid(
     });
 }
 
-fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespace: &str) -> bool {
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
         && config.plugin_configs.iter().all(|plugin| {
-            plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            plugin.namespace == namespace
+                && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.scope == PluginScope::Global
+                && plugin.proxy_id.is_none()
+                && plugin.enabled
+                && plugin.priority_override.is_none()
+                && plugin.trigger.is_none()
+                && plugin.api_spec_id.is_none()
         })
 }
 
@@ -10173,8 +10181,14 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
-        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
+        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(
+            &old_config,
+            &self.env_config.namespace,
+        );
+        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(
+            &new_config,
+            &self.env_config.namespace,
+        );
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -54312,10 +54326,16 @@ mod tests {
             updated_at: timestamp,
         }];
 
-        assert!(!config_empty_ignoring_gateway_managed_plugins(&config));
+        assert!(!config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"));
 
         config.plugin_configs[0].plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
-        assert!(config_empty_ignoring_gateway_managed_plugins(&config));
+        assert!(config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"));
+
+        config.plugin_configs[0].namespace = "tenant-b".to_string();
+        assert!(
+            !config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"),
+            "a managed-looking plugin from another tenant remains real config"
+        );
     }
 
     #[test]
