@@ -16,12 +16,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use dashmap::DashMap;
-use ferrum_edge::config_sources::k8s::{
-    GatewayApiListenerParentKind, gateway_api_listener_mesh_service_name,
-};
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MeshSdTopology, Upstream, UpstreamLocalityLbSetting,
     UpstreamTarget,
+};
+use ferrum_edge::config_sources::k8s::{
+    GatewayApiListenerParentKind, gateway_api_listener_mesh_service_name,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -153,16 +153,10 @@ fn epoch_store(mesh: MeshConfig) -> Arc<RequestEpochStore> {
 /// the translator's source vector.
 #[test]
 fn gateway_listener_identities_survive_multicluster_service_keying() {
-    let gateway_ab_c = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::Gateway,
-        "a-b",
-        "c",
-    );
-    let gateway_a_bc = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::Gateway,
-        "a",
-        "b-c",
-    );
+    let gateway_ab_c =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a-b", "c");
+    let gateway_a_bc =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a", "b-c");
     let listenerset_ab_c = gateway_api_listener_mesh_service_name(
         GatewayApiListenerParentKind::ListenerSet,
         "a-b",

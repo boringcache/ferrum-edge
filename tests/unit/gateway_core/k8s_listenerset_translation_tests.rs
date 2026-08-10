@@ -1948,16 +1948,10 @@ fn gateway_adversarial_hyphen_pairs_remain_distinct_after_service_keying() {
         .as_ref()
         .expect("adversarial Gateways must materialize mesh listener services");
 
-    let expected_ab_c = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::Gateway,
-        "a-b",
-        "c",
-    );
-    let expected_a_bc = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::Gateway,
-        "a",
-        "b-c",
-    );
+    let expected_ab_c =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a-b", "c");
+    let expected_a_bc =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a", "b-c");
     assert_ne!(
         expected_ab_c, expected_a_bc,
         "helper must keep the adversarial Gateway pair injective"
