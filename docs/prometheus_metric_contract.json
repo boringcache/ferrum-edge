@@ -2407,6 +2407,70 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_node_agent_ingress_interface_configured_interfaces",
+    "type": "gauge",
+    "help": "Number of explicitly configured ingress interfaces (names are never labels).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_expected_interfaces",
+    "type": "gauge",
+    "help": "Number of interfaces required by the proved node/CNI route topology (names are never labels).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_family_covered",
+    "type": "gauge",
+    "help": "Whether the required route family is currently proved complete.",
+    "labels": [
+      "family",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_family_required",
+    "type": "gauge",
+    "help": "Whether a route family must be covered by the configured interface set.",
+    "labels": [
+      "family",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_topology",
+    "type": "gauge",
+    "help": "NodeWaypoint ingress-interface topology validation state and bounded reason.",
+    "labels": [
+      "state",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_pod_annotation_updates_applied_total",
     "type": "counter",
     "help": "Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map.",
