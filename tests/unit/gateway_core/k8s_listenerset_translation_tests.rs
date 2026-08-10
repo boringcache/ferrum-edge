@@ -986,7 +986,7 @@ fn listenerset_update_and_delete_withdraw_materialization() {
 }
 
 #[test]
-fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
+fn same_named_gateway_and_listenerset_tls_services_both_materialize() {
     let mut gateway = object(
         "Gateway",
         "shared",
@@ -1044,9 +1044,9 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .all(|service| service.name != "listenerset-shared-same")
+                .any(|service| service.name == "listenerset-shared-same")
         }),
-        "the non-winning ListenerSet must not emit its kind-scoped service"
+        "the ListenerSet must retain its own certificate-backed service now that frontend TLS is listener-scoped"
     );
     let status = translation
         .listenerset_statuses
@@ -1058,8 +1058,8 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         "the non-conflicting ListenerSet stays accepted"
     );
     assert!(
-        !status.programmed && status.programmed_listeners.is_empty(),
-        "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"
+        status.programmed && status.programmed_listeners == ["same"],
+        "the independently certificate-backed ListenerSet listener must report Programmed"
     );
 }
 
