@@ -16,8 +16,9 @@ use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::metric_tag_cel::{
-    MetricTagCelExpr, MetricTagCelStampNeeds, parse_metric_tag_cel_expression,
-    validate_metric_tag_cel_for_families,
+    METRIC_TAG_CEL_DESTINATION_PORT_METADATA, METRIC_TAG_CEL_REQUEST_HOST_METADATA,
+    METRIC_TAG_CEL_REQUEST_METHOD_METADATA, MetricTagCelExpr, MetricTagCelStampNeeds,
+    parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
@@ -69,9 +70,6 @@ const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
 const MAX_METRIC_TAG_OVERRIDES: usize = 128;
 const MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES: usize = 16 * 1024;
-const MESH_REQUEST_HOST_METADATA: &str = "mesh.metrics.cel.request_host";
-const MESH_REQUEST_METHOD_METADATA: &str = "mesh.metrics.cel.request_method";
-const MESH_DESTINATION_PORT_METADATA: &str = "mesh.metrics.cel.destination_port";
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
     match direction {
@@ -430,43 +428,51 @@ impl WorkloadMetrics {
         if self.cel_stamp_needs.request_host {
             if let Some(authority) = ctx.request_authority.as_ref() {
                 if authority.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-                    ctx.metadata
-                        .insert(MESH_REQUEST_HOST_METADATA.to_string(), authority.clone());
+                    ctx.metadata.insert(
+                        METRIC_TAG_CEL_REQUEST_HOST_METADATA.to_string(),
+                        authority.clone(),
+                    );
                 } else {
-                    ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+                    ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_HOST_METADATA);
                 }
             } else if let Some(host) = header_value(headers, "host") {
                 if host.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-                    ctx.metadata
-                        .insert(MESH_REQUEST_HOST_METADATA.to_string(), host.to_string());
+                    ctx.metadata.insert(
+                        METRIC_TAG_CEL_REQUEST_HOST_METADATA.to_string(),
+                        host.to_string(),
+                    );
                 } else {
-                    ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+                    ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_HOST_METADATA);
                 }
             } else {
-                ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+                ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_HOST_METADATA);
             }
         } else {
-            ctx.metadata.remove(MESH_REQUEST_HOST_METADATA);
+            ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_HOST_METADATA);
         }
         if self.cel_stamp_needs.request_method {
             if !ctx.method.is_empty() && ctx.method.len() <= MAX_METRIC_TAG_VALUE_BYTES {
-                ctx.metadata
-                    .insert(MESH_REQUEST_METHOD_METADATA.to_string(), ctx.method.clone());
+                ctx.metadata.insert(
+                    METRIC_TAG_CEL_REQUEST_METHOD_METADATA.to_string(),
+                    ctx.method.clone(),
+                );
             } else {
-                ctx.metadata.remove(MESH_REQUEST_METHOD_METADATA);
+                ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_METHOD_METADATA);
             }
         } else {
-            ctx.metadata.remove(MESH_REQUEST_METHOD_METADATA);
+            ctx.metadata.remove(METRIC_TAG_CEL_REQUEST_METHOD_METADATA);
         }
         if self.cel_stamp_needs.destination_port {
             if let Some(port) = mesh_metric_destination_port(ctx) {
-                ctx.metadata
-                    .insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+                ctx.metadata.insert(
+                    METRIC_TAG_CEL_DESTINATION_PORT_METADATA.to_string(),
+                    port.to_string(),
+                );
             } else {
-                ctx.metadata.remove(MESH_DESTINATION_PORT_METADATA);
+                ctx.metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
             }
         } else {
-            ctx.metadata.remove(MESH_DESTINATION_PORT_METADATA);
+            ctx.metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
         }
         if let Some(direction) = ctx.mesh_direction {
             ctx.metadata.insert(
@@ -1096,8 +1102,8 @@ impl Plugin for WorkloadMetrics {
         );
         // Clear HTTP-only CEL attributes on the stream path so a reused
         // metadata bag cannot leak request.host/method into TCP metrics.
-        metadata.remove(MESH_REQUEST_HOST_METADATA);
-        metadata.remove(MESH_REQUEST_METHOD_METADATA);
+        metadata.remove(METRIC_TAG_CEL_REQUEST_HOST_METADATA);
+        metadata.remove(METRIC_TAG_CEL_REQUEST_METHOD_METADATA);
         if self.cel_stamp_needs.destination_port {
             let port = mesh_stream_authz_destination_port(
                 ctx.connection_destination_port,
@@ -1105,12 +1111,15 @@ impl Plugin for WorkloadMetrics {
                 ctx.listen_port,
             );
             if port != 0 {
-                metadata.insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
+                metadata.insert(
+                    METRIC_TAG_CEL_DESTINATION_PORT_METADATA.to_string(),
+                    port.to_string(),
+                );
             } else {
-                metadata.remove(MESH_DESTINATION_PORT_METADATA);
+                metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
             }
         } else {
-            metadata.remove(MESH_DESTINATION_PORT_METADATA);
+            metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
         }
         match stamped_direction {
             Some(MeshTrafficDirection::Inbound) => {

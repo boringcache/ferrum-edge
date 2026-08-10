@@ -43,6 +43,14 @@ pub const MAX_METRIC_TAG_CEL_AST_NODES: usize = 24;
 /// Maximum evaluated / sanitized label value bytes (matches workload_metrics).
 pub const MAX_METRIC_TAG_CEL_OUTPUT_BYTES: usize = 256;
 
+/// Internal-only metadata stamps consumed when a mesh metric key is finalized.
+/// The reserved `mesh.metrics.*` prefix keeps these request-derived values out
+/// of external transaction logs and OpenTelemetry span attributes.
+pub(crate) const METRIC_TAG_CEL_REQUEST_HOST_METADATA: &str = "mesh.metrics.cel.request_host";
+pub(crate) const METRIC_TAG_CEL_REQUEST_METHOD_METADATA: &str = "mesh.metrics.cel.request_method";
+pub(crate) const METRIC_TAG_CEL_DESTINATION_PORT_METADATA: &str =
+    "mesh.metrics.cel.destination_port";
+
 /// Serde-stable compiled UPSERT expression.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -463,14 +471,14 @@ pub fn sanitize_metric_tag_value(value: &str) -> String {
 /// Resolve `destination.port` from stamped metadata when present.
 pub fn metadata_destination_port(metadata: &HashMap<String, String>) -> Option<u16> {
     metadata
-        .get("mesh.metrics.cel.destination_port")
+        .get(METRIC_TAG_CEL_DESTINATION_PORT_METADATA)
         .and_then(|value| value.parse::<u16>().ok())
 }
 
 /// Resolve `request.host` from stamped metadata when present.
 pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str> {
     metadata
-        .get("mesh.metrics.cel.request_host")
+        .get(METRIC_TAG_CEL_REQUEST_HOST_METADATA)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
 }
@@ -478,7 +486,7 @@ pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str>
 /// Resolve `request.method` from stamped metadata when present.
 pub fn metadata_request_method(metadata: &HashMap<String, String>) -> Option<&str> {
     metadata
-        .get("mesh.metrics.cel.request_method")
+        .get(METRIC_TAG_CEL_REQUEST_METHOD_METADATA)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
 }
