@@ -662,17 +662,17 @@ pub fn validate_migration_history_integrity(
                     },
                 ));
             }
-            if let Some(previous_version) = previous_version {
-                if migration.version < previous_version {
-                    return Err(integrity_error(
-                        backend,
-                        &declaration.namespace,
-                        MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
-                            previous_version,
-                            version: migration.version,
-                        },
-                    ));
-                }
+            if let Some(previous_version) = previous_version
+                && migration.version < previous_version
+            {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
+                        previous_version,
+                        version: migration.version,
+                    },
+                ));
             }
             previous_version = Some(migration.version);
         }
