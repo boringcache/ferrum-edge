@@ -49,15 +49,23 @@ RUN cargo +nightly build \
 # shared objects resolved by its loader; do not ship a shell, package manager,
 # or the iptables fallback tools.
 FROM debian:13-slim AS iproute2-runtime
+# Distroless uses merged-/usr symlinks for /lib and /lib64. Stage loader paths
+# beneath their real /usr destinations so the final COPY never replaces them.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && mkdir -p /iproute2-root \
-    && cp --parents /usr/sbin/ip /iproute2-root \
+    && mkdir -p /iproute2-root/usr/sbin /iproute2-root/usr/lib /iproute2-root/usr/lib64 \
+    && cp /usr/sbin/ip /iproute2-root/usr/sbin/ip \
     && ldd /usr/sbin/ip > /tmp/iproute2-ldd \
     && awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
         /tmp/iproute2-ldd > /tmp/iproute2-libraries \
     && test -s /tmp/iproute2-libraries \
     && while IFS= read -r library; do \
-        cp -L --parents "$library" /iproute2-root || exit 1; \
+        case "$library" in \
+            /lib/*|/lib64/*) destination="/usr$library" ;; \
+            /usr/lib/*|/usr/lib64/*) destination="$library" ;; \
+            *) echo "unexpected iproute2 library path: $library" >&2; exit 1 ;; \
+        esac; \
+        mkdir -p "/iproute2-root$(dirname "$destination")"; \
+        cp -L "$library" "/iproute2-root$destination" || exit 1; \
     done < /tmp/iproute2-libraries \
     && rm -rf /var/lib/apt/lists/*
 
@@ -110,7 +118,9 @@ RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
 # startup and teardown, but no shell or package manager is present.
 FROM gcr.io/distroless/cc-debian13:nonroot
 
-COPY --from=iproute2-runtime /iproute2-root/ /
+COPY --from=iproute2-runtime /iproute2-root/usr/sbin/ip /usr/sbin/ip
+COPY --from=iproute2-runtime /iproute2-root/usr/lib/ /usr/lib/
+COPY --from=iproute2-runtime /iproute2-root/usr/lib64/ /usr/lib64/
 
 WORKDIR /app
 
