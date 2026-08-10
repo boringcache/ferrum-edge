@@ -6363,6 +6363,19 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "ready": true,
             "mesh": {
                 "egress_scope": health,
+                "node_waypoint_observability": node_waypoint_observability
+            }
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": health,
                 "node_waypoint_observability": node_waypoint_observability,
                 "udp_placement_migration": udp_placement_migration
             }
