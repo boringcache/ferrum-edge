@@ -74,7 +74,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Transparent DNS proxy** — resolves mesh ServiceEntry hosts and MeshService names to workload IPs, supports wildcard hosts, forwards non-mesh queries upstream (UDP/TCP, A/AAAA, EDNS(0))
 - **Multi-cluster** — east-west gateways with SNI-routed passthrough, remote cluster trust federation via `TrustBundleSet`, cross-cluster SPIFFE identity validation
 - **Egress gateway** — materializes HTTP-family proxies from `ServiceEntry` resources with `mesh_external` location and baggage stripping at egress
-- **Istio/GAMMA observability** — RED metrics (`ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms`) with source/destination workload labels, Telemetry API with per-scope tracing sampling, metric tag overrides, and access log filtering
+- **Istio/GAMMA observability** — RED metrics (`ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms`) with source/destination workload labels, Telemetry API with per-scope tracing sampling, metric tag overrides (literal UPSERT plus a bounded CEL subset for request/response/workload/peer attributes compiled at reload), and access log filtering
 - **HBONE protocol** — HTTP/2 CONNECT over mTLS for ambient topology with W3C Baggage identity propagation and percent-decoded SPIFFE principal extraction
 
 ### Kubernetes Mesh Translation

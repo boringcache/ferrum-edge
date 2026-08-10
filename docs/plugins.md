@@ -1651,6 +1651,7 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 |---|---|---|---|
 | `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/metrics` response is served before rebuilding. Covers only registry-owned families; process-static mesh observability (`ferrum_mesh_federation_*`, `ferrum_mesh_remote_discovery_*`, `ferrum_mesh_cert_*`, `ferrum_mesh_config_*`, `ferrum_xds_*`) and NodeWaypoint (`ferrum_mesh_node_waypoint_*`) series are rendered live on every scrape — see [admin_metrics.md](admin_metrics.md#what-render_cache_ttl_seconds-does-and-does-not-cover) |
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
+| `mesh_series_budget_per_family` | Integer | `10000` | Hard ceiling (`1`–`1000000`) on live `MeshRequestKey` series retained **per mesh metric family**. Shared by ordinary mesh identity dimensions and CEL-derived dimensions: newly observed keys beyond the budget are dropped for that family until `stale_entry_ttl_seconds` eviction frees capacity, and counted on `ferrum_mesh_metric_series_overflow_total{family}`. `0` is rejected — there is no unlimited mode. See [mesh.md](mesh.md#telemetry-api) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
 `ferrum_requests_total` labels standard HTTP methods individually and maps every

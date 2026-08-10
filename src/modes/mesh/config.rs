@@ -1704,8 +1704,17 @@ pub struct MetricTagOverride {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum TagOverrideOperation {
     Remove,
-    Rename { new_name: String },
-    Set { value: String },
+    Rename {
+        new_name: String,
+    },
+    /// Static UPSERT value (decoded Telemetry string literal or direct plugin config).
+    Set {
+        value: String,
+    },
+    /// Compiled Telemetry UPSERT CEL expression evaluated at metric emission.
+    SetExpr {
+        expression: super::metric_tag_cel::MetricTagCelExpr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

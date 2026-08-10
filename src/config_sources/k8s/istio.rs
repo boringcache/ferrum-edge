@@ -18,6 +18,9 @@ use crate::modes::mesh::config::{
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     admit_request_match_port_pattern, validate_mesh_condition, validate_mesh_export_to,
 };
+use crate::modes::mesh::metric_tag_cel::{
+    parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
+};
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
@@ -6361,12 +6364,12 @@ fn telemetry(
                                 .unwrap_or("");
                             let operation = match op {
                                 "REMOVE" => TagOverrideOperation::Remove,
-                                "UPSERT" => {
-                                    let value = telemetry_metric_upsert_literal(
-                                        object, tag_name, tag_spec,
-                                    )?;
-                                    TagOverrideOperation::Set { value }
-                                }
+                                "UPSERT" => telemetry_metric_upsert_operation(
+                                    object,
+                                    tag_name,
+                                    tag_spec,
+                                    matched_metric,
+                                )?,
                                 "" => {
                                     return Err(invalid_resource(
                                         object,
@@ -6458,16 +6461,16 @@ fn telemetry(
     })
 }
 
-fn telemetry_metric_upsert_literal(
+fn telemetry_metric_upsert_operation(
     object: &K8sObject,
     tag_name: &str,
     tag_spec: &Value,
-) -> Result<String, K8sTranslateError> {
+    matched_metric: &str,
+) -> Result<TagOverrideOperation, K8sTranslateError> {
     let expression = tag_spec
         .get("value")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             invalid_resource(
                 object,
@@ -6476,14 +6479,37 @@ fn telemetry_metric_upsert_literal(
                 ),
             )
         })?;
-    serde_json::from_str::<String>(expression).map_err(|_| {
+    if let Ok(value) = serde_json::from_str::<String>(expression.trim()) {
+        return Ok(TagOverrideOperation::Set { value });
+    }
+    let compiled = parse_metric_tag_cel_expression(expression).map_err(|message| {
+        // Parser diagnostics are field-specific and never echo expression text.
         invalid_resource(
             object,
-            format!(
-                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value must be a double-quoted string literal; CEL expressions are unsupported"
+            message.replace(
+                "Telemetry metrics.overrides[].tagOverrides UPSERT",
+                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
             ),
         )
+    })?;
+    let includes_tcp = metric_selector_includes_tcp(matched_metric);
+    validate_metric_tag_cel_for_families(&compiled, includes_tcp).map_err(|message| {
+        invalid_resource(
+            object,
+            message.replace(
+                "Telemetry metrics.overrides[].tagOverrides UPSERT",
+                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
+            ),
+        )
+    })?;
+    Ok(TagOverrideOperation::SetExpr {
+        expression: compiled,
     })
+}
+
+fn metric_selector_includes_tcp(metric: &str) -> bool {
+    let upper = metric.trim().to_ascii_uppercase();
+    upper == "ALL_METRICS" || upper.starts_with("TCP_") || upper.starts_with("FERRUM_MESH_TCP_")
 }
 
 fn telemetry_sampling_percentage(
