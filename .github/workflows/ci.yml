@@ -3682,6 +3682,13 @@ jobs:
               --from-literal=target="$1" --from-literal=phase="$2" \
               --from-literal=generation="$3" --from-literal=from="$4" \
               --from-literal=to="$5" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n "$namespace" label --overwrite \
+              configmap/"ferrum-mesh-udp-placement-${release}" \
+              app.kubernetes.io/managed-by=Helm
+            kubectl -n "$namespace" annotate --overwrite \
+              configmap/"ferrum-mesh-udp-placement-${release}" \
+              meta.helm.sh/release-name="$release" \
+              meta.helm.sh/release-namespace="$namespace"
           }
           render_upgrade() {
             helm upgrade "$release" "$chart" -n "$namespace" --dry-run=server \
