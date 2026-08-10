@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::conf_file::resolve_ferrum_var;
+
 const STATE_FILE: &str = ".udp-placement-state-v1.json";
 const REGISTRY_SYNC_FILE: &str = ".udp-registry-synced";
 const MAX_STATE_BYTES: u64 = 4096;
@@ -86,9 +88,8 @@ pub struct UdpPlacementRequest {
 
 impl UdpPlacementRequest {
     pub fn from_env(target: UdpPlacement) -> Result<Self, String> {
-        let phase_raw =
-            crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE")
-                .unwrap_or_else(|| "stable".to_string());
+        let phase_raw = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE")
+            .unwrap_or_else(|| "stable".to_string());
         let phase = match phase_raw.trim() {
             "stable" => UdpMigrationPhase::Stable,
             "cleanup" => UdpMigrationPhase::Cleanup,
@@ -100,14 +101,13 @@ impl UdpPlacementRequest {
                 );
             }
         };
-        let generation =
-            crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
-                .filter(|value| !value.trim().is_empty());
-        let from = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM")
+        let generation = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
+            .filter(|value| !value.trim().is_empty());
+        let from = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM")
             .filter(|value| !value.trim().is_empty())
             .map(|value| UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM"))
             .transpose()?;
-        let to = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")
+        let to = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")
             .filter(|value| !value.trim().is_empty())
             .map(|value| UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"))
             .transpose()?;
@@ -465,7 +465,7 @@ fn write_state(registry_dir: &Path, state: &DurablePlacementState) -> Result<(),
 }
 
 pub fn migration_generation_from_env() -> Result<Option<String>, String> {
-    let value = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
+    let value = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
         .filter(|value| !value.trim().is_empty());
     if let Some(value) = value.as_deref() {
         validate_generation(value)?;
