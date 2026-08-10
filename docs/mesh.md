@@ -2126,7 +2126,7 @@ Connections are **not pooled** — each request dials its own socket and closes 
 
 A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing (leaving no orphaned upstream) and a re-pointed one dials the new socket with no restart.
 
-**Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
+**Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. Operator-provided upstream targets are also forbidden from setting any `mesh.*` tag through admin create/update, API-spec import, restore, or file configuration; only Ferrum's trusted mesh projection may stamp those transport markers. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
 ### `bind` and `captureMode` limitations
 
