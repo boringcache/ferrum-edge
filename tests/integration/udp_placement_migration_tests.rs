@@ -372,20 +372,12 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
     );
     assert!(!context.registry_is_synchronized());
     assert_eq!(
-        publish_registry_sync_marker_for_pods(
-            registry.path(),
-            "generation-b",
-            &HashSet::new(),
-        ),
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-b", &HashSet::new(),),
         Ok(true)
     );
     assert!(!context.registry_is_synchronized());
     assert_eq!(
-        publish_registry_sync_marker_for_pods(
-            registry.path(),
-            "generation-a",
-            &HashSet::new(),
-        ),
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &HashSet::new(),),
         Ok(true)
     );
     assert!(context.registry_is_synchronized());
