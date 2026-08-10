@@ -1237,6 +1237,8 @@ The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` sn
 
 Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
+Consul blocking queries carry an `X-Consul-Index` cursor. Ferrum commits that cursor only for the exact response snapshot that was successfully parsed, passed shared host/egress admission, and was published into the load-balancer cache (or already matched the installed target set). A non-2xx response, malformed body, snapshot rejected by shared admission, or publication failure retains the previously committed cursor so the next poll can retry the same Consul state — including after a Consul restart that legitimately rolls the index backward on an admitted snapshot.
+
 ## Database Schema
 
 When using Database or CP modes, Ferrum auto-creates the following tables on startup:

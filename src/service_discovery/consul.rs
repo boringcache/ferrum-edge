@@ -8,12 +8,21 @@
 //! `reqwest::Client`) so that Consul API calls inherit the gateway's
 //! connection pool settings, DNS cache, trust store, and
 //! `FERRUM_TLS_NO_VERIFY` setting.
+//!
+//! The blocking-query cursor (`X-Consul-Index`) is returned as a pending
+//! [`super::DiscoveryCursorCommit`] and must be committed by the discovery
+//! manager only after shared target admission and successful publication.
+//! Failed status, malformed bodies, rejected snapshots, and publication
+//! failures retain the previously committed cursor.
 
 use crate::config::types::UpstreamTarget;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
+
+use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
 /// Encodes everything except unreserved chars and sub-delims that are safe in path segments.
@@ -52,6 +61,12 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
     .add(b'`')
     .add(b'|');
 
+/// Maximum accepted `X-Consul-Index` header value length (decimal digits of u64).
+const MAX_CONSUL_INDEX_HEADER_LEN: usize = 20;
+
+/// Hard ceiling for Consul health-API response bodies (fail closed).
+const MAX_CONSUL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Consul service discoverer.
 ///
 /// Queries Consul's `/v1/health/service/:service` endpoint to discover
@@ -65,8 +80,9 @@ pub struct ConsulDiscoverer {
     healthy_only: bool,
     token: Option<String>,
     default_weight: u32,
-    /// Last Consul index for blocking queries.
-    last_index: AtomicU64,
+    /// Last Consul index for blocking queries. Advanced only via committed
+    /// [`DiscoveryCursorCommit`] handles after snapshot admission.
+    last_index: Arc<AtomicU64>,
 }
 
 impl ConsulDiscoverer {
@@ -90,8 +106,13 @@ impl ConsulDiscoverer {
             healthy_only,
             token,
             default_weight,
-            last_index: AtomicU64::new(0),
+            last_index: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Currently committed blocking-query index (`0` means non-blocking).
+    pub fn blocking_query_index(&self) -> u64 {
+        self.last_index.load(Ordering::Relaxed)
     }
 
     fn build_url(&self) -> String {
@@ -132,9 +153,23 @@ impl ConsulDiscoverer {
     }
 }
 
+/// Parse `X-Consul-Index` with a bounded length check. Malformed or oversized
+/// values fail closed (no candidate cursor) without logging header contents.
+fn parse_consul_index_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get("X-Consul-Index")?;
+    let value = raw.to_str().ok()?;
+    if value.is_empty() || value.len() > MAX_CONSUL_INDEX_HEADER_LEN {
+        return None;
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for ConsulDiscoverer {
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+    async fn discover(&self) -> Result<DiscoverySnapshot, anyhow::Error> {
         let url = self.build_url();
 
         let mut request = self.client.get(&url);
@@ -146,44 +181,30 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         let response = request.send().await?;
 
-        // Track the Consul index for blocking queries.
-        // Per Consul docs, when a server restarts the index can reset to a
-        // lower value. Detect this and move the cursor to the new index. The
-        // current response body has already delivered that snapshot, and the
-        // next call can keep using a blocking query instead of tight-spinning
-        // on index=0 immediate responses.
-        if let Some(new_index) = response
-            .headers()
-            .get("X-Consul-Index")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            let current = self.last_index.load(Ordering::Relaxed);
-            if new_index < current {
-                warn!(
-                    "Consul index decreased from {} to {}, resetting blocking-query cursor to the new index (server likely restarted)",
-                    current, new_index
-                );
-                self.last_index.store(new_index, Ordering::Relaxed);
-            } else {
-                self.last_index.store(new_index, Ordering::Relaxed);
-            }
-        }
+        // Candidate index for this response only — never mutate `last_index`
+        // here. The manager commits after shared admission + publication.
+        let candidate_index = parse_consul_index_header(response.headers());
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = match response.text().await {
-                Ok(t) => t,
-                Err(e) => format!("<failed to read response body: {}>", e),
-            };
-            anyhow::bail!(
-                "Consul API returned {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            );
+            // Fail closed without logging response bodies (may contain secrets).
+            anyhow::bail!("Consul API returned status {}", response.status().as_u16());
         }
 
-        let body: Vec<serde_json::Value> = response.json().await?;
+        if let Some(declared) = response.content_length()
+            && declared > MAX_CONSUL_RESPONSE_BYTES as u64
+        {
+            anyhow::bail!("Consul API response exceeds size limit");
+        }
+
+        let bytes = response.bytes().await?;
+        if bytes.len() > MAX_CONSUL_RESPONSE_BYTES {
+            anyhow::bail!("Consul API response exceeds size limit");
+        }
+
+        let body: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|e| {
+            // Do not include body snippets — payloads may carry tokens/PII.
+            anyhow::anyhow!("Consul API returned malformed JSON: {}", e)
+        })?;
         let mut targets = Vec::new();
         let mut missing_service = 0usize;
         let mut missing_address = 0usize;
@@ -271,7 +292,16 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             );
         }
 
-        Ok(targets)
+        let snapshot = if let Some(index) = candidate_index {
+            DiscoverySnapshot::with_cursor(
+                targets,
+                DiscoveryCursorCommit::new(Arc::clone(&self.last_index), index),
+            )
+        } else {
+            DiscoverySnapshot::from_targets(targets)
+        };
+
+        Ok(snapshot)
     }
 
     fn provider_name(&self) -> &str {
@@ -300,7 +330,7 @@ mod tests {
             healthy_only,
             token: None,
             default_weight: 1,
-            last_index: AtomicU64::new(0),
+            last_index: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -409,5 +439,33 @@ mod tests {
         assert!(url.contains("tag=prod"));
         assert!(url.contains("index=99"));
         assert!(url.contains("wait=30s"));
+    }
+
+    #[test]
+    fn parse_consul_index_header_accepts_decimal_u64() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-Consul-Index", "42".parse().unwrap());
+        assert_eq!(parse_consul_index_header(&headers), Some(42));
+    }
+
+    #[test]
+    fn parse_consul_index_header_rejects_oversized_or_non_digit() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "X-Consul-Index",
+            "18446744073709551616".parse().unwrap(), // 2^64, 20 digits but overflows u64
+        );
+        assert_eq!(parse_consul_index_header(&headers), None);
+
+        headers.clear();
+        headers.insert("X-Consul-Index", "12abc".parse().unwrap());
+        assert_eq!(parse_consul_index_header(&headers), None);
+
+        headers.clear();
+        headers.insert(
+            "X-Consul-Index",
+            "000000000000000000000".parse().unwrap(), // 21 digits
+        );
+        assert_eq!(parse_consul_index_header(&headers), None);
     }
 }

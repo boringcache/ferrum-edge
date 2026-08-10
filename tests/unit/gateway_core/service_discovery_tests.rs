@@ -12,7 +12,9 @@ use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
 use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
-use ferrum_edge::service_discovery::{ServiceDiscoverer, ServiceDiscoveryManager};
+use ferrum_edge::service_discovery::{
+    ServiceDiscoverer, ServiceDiscoveryManager, SnapshotAdmission, admit_discovered_snapshot,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -2811,5 +2813,450 @@ async fn mesh_sd_ambient_gateway_declared_non_first_port_bridges_with_alias() {
     assert!(
         !targets.iter().any(|t| t.host == "10.9.0.1"),
         "the remote pod must be reached via the east-west gateway, never a direct pod dial"
+    );
+}
+
+// ── Consul blocking-query cursor admission (issue #3719) ──────────────
+
+fn consul_health_instance(host: &str, port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "Node": {"Address": host},
+        "Service": {
+            "Address": host,
+            "Port": port,
+            "Tags": [],
+            "Weights": {"Passing": 1, "Warning": 1}
+        }
+    }])
+}
+
+fn admit_consul_snapshot(
+    snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
+    backend_allow_ips: ferrum_edge::config::BackendEgressPolicy,
+) -> Result<Vec<UpstreamTarget>, &'static str> {
+    match admit_discovered_snapshot("up-consul", "consul", snapshot, backend_allow_ips) {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            if let Some(cursor) = cursor {
+                cursor.commit();
+            }
+            Ok(targets)
+        }
+        SnapshotAdmission::Rejected { reason } => Err(reason),
+    }
+}
+
+#[tokio::test]
+async fn consul_higher_index_http_500_does_not_advance_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("Internal Server Error")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .expect("first snapshot admitted");
+    assert_eq!(discoverer.blocking_query_index(), 10);
+
+    let err = discoverer.discover().await.expect_err("500 must fail");
+    assert!(err.to_string().contains("status 500"));
+    assert!(
+        !err.to_string().contains("Internal Server Error"),
+        "error path must not leak Consul response bodies"
+    );
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        10,
+        "higher-index 500 must retain the previously committed cursor"
+    );
+}
+
+#[tokio::test]
+async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{not-json")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(discoverer.blocking_query_index(), 10);
+
+    let err = discoverer
+        .discover()
+        .await
+        .expect_err("malformed JSON must fail");
+    assert!(err.to_string().contains("malformed JSON"));
+    assert!(
+        !err.to_string().contains("{not-json"),
+        "error path must not leak Consul response bodies"
+    );
+    assert_eq!(discoverer.blocking_query_index(), 10);
+}
+
+#[tokio::test]
+async fn consul_shared_admission_rejection_does_not_advance_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                // Private IP denied by public-only egress policy.
+                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(discoverer.blocking_query_index(), 10);
+
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(99));
+    let reason = admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+            ferrum_edge::config::BackendAllowIps::Public,
+        ),
+    )
+    .expect_err("all private targets must be rejected by shared admission");
+    assert_eq!(reason, "shared_admission_rejected");
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        10,
+        "rejected snapshot must not commit the higher Consul index"
+    );
+}
+
+#[tokio::test]
+async fn consul_successful_higher_index_commits_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "42"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    assert_eq!(discoverer.blocking_query_index(), 0);
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(discoverer.blocking_query_index(), 0, "discover must not commit early");
+    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(42));
+    let targets = admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(discoverer.blocking_query_index(), 42);
+}
+
+#[tokio::test]
+async fn consul_successful_lower_index_rollback_commits_new_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "100"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.2", 8080))
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(discoverer.blocking_query_index(), 100);
+
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(7));
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        7,
+        "admitted lower index after Consul restart must become the next request cursor"
+    );
+}
+
+#[tokio::test]
+async fn consul_rejected_same_index_then_valid_same_index_is_admitted() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Seed committed cursor at index 50.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same index, but every target fails shared admission (public-only policy).
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same index again with a routable hostname that shared admission accepts.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("backend.example.com", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    // First seed uses unrestricted so the private seed IP can establish cursor 50.
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(discoverer.blocking_query_index(), 50);
+
+    let rejected = discoverer.discover().await.unwrap();
+    assert_eq!(rejected.cursor.as_ref().map(|c| c.index()), Some(50));
+    let reason = admit_consul_snapshot(rejected, public_only.clone())
+        .expect_err("same-index private targets must be rejected");
+    assert_eq!(reason, "shared_admission_rejected");
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        50,
+        "rejected same-index response must not move or clear the cursor"
+    );
+
+    let accepted = discoverer.discover().await.unwrap();
+    assert_eq!(accepted.cursor.as_ref().map(|c| c.index()), Some(50));
+    let targets = admit_consul_snapshot(accepted, public_only).unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].host, "backend.example.com");
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        50,
+        "valid same-index response after rejection must still be admitted and keep the cursor"
+    );
+}
+
+#[tokio::test]
+async fn consul_legitimate_empty_snapshot_still_commits_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "12"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let snapshot = discoverer.discover().await.unwrap();
+    assert!(snapshot.targets.is_empty());
+    admit_consul_snapshot(
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    )
+    .unwrap();
+    assert_eq!(
+        discoverer.blocking_query_index(),
+        12,
+        "legitimate empty Consul catalog must still commit the blocking-query cursor"
     );
 }

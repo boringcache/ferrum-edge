@@ -510,21 +510,21 @@ impl MeshServiceDiscoverer {
 
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for MeshServiceDiscoverer {
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+    async fn discover(&self) -> Result<super::DiscoverySnapshot, anyhow::Error> {
         let epoch = self.request_epoch.load();
         let Some(mesh) = epoch.config.mesh.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(super::DiscoverySnapshot::from_targets(Vec::new()));
         };
 
         let Some(service) = mesh.services.iter().find(|service| {
             service.name == self.service_name && service.namespace == self.namespace
         }) else {
-            return Ok(Vec::new());
+            return Ok(super::DiscoverySnapshot::from_targets(Vec::new()));
         };
 
         let selected_service_port = self.selected_service_port(service);
         if self.port.is_some() && selected_service_port.is_none() {
-            return Ok(Vec::new());
+            return Ok(super::DiscoverySnapshot::from_targets(Vec::new()));
         }
 
         // Sidecar `:authority` disambiguation trigger — mirrors the mesh-mode
@@ -693,7 +693,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             self.namespace,
             self.service_name,
         );
-        Ok(targets)
+        Ok(super::DiscoverySnapshot::from_targets(targets))
     }
 
     fn provider_name(&self) -> &str {

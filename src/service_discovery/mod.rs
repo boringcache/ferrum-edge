@@ -4,6 +4,10 @@
 //! Kubernetes, Consul) to discover backend targets for upstreams. Discovered
 //! targets are merged with static targets and pushed into the LoadBalancerCache
 //! via atomic updates, keeping the hot proxy path lock-free.
+//!
+//! Provider-specific blocking-query cursors (Consul `X-Consul-Index`) travel
+//! with each [`DiscoverySnapshot`] and are committed only after shared target
+//! admission and successful publication.
 
 pub mod consul;
 pub mod dns_sd;
@@ -35,11 +39,170 @@ struct TaskEntry {
     handle: JoinHandle<()>,
 }
 
+/// Pending provider cursor update produced with a successfully parsed snapshot.
+///
+/// Dropping without [`DiscoveryCursorCommit::commit`] retains the previously
+/// committed cursor. The discovery manager commits only after shared target
+/// admission and successful publication (or confirmation that the admitted
+/// snapshot already matches the installed target set).
+pub struct DiscoveryCursorCommit {
+    slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    index: u64,
+}
+
+impl DiscoveryCursorCommit {
+    /// Create a commit handle for a shared atomic cursor slot.
+    pub(crate) fn new(
+        slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        index: u64,
+    ) -> Self {
+        Self { slot, index }
+    }
+
+    /// Index that will be stored on [`commit`](Self::commit).
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Persist the candidate index as the next blocking-query cursor.
+    pub fn commit(self) {
+        use std::sync::atomic::Ordering;
+        let previous = self.slot.load(Ordering::Relaxed);
+        self.slot.store(self.index, Ordering::Relaxed);
+        if self.index < previous {
+            warn!(
+                previous_index = previous,
+                new_index = self.index,
+                reason = "consul_index_rollback",
+                "Service discovery: blocking-query cursor rolled back after admitted snapshot (registry likely restarted)"
+            );
+        } else if self.index > previous {
+            debug!(
+                previous_index = previous,
+                new_index = self.index,
+                reason = "consul_index_advance",
+                "Service discovery: blocking-query cursor advanced after admitted snapshot"
+            );
+        }
+    }
+}
+
+/// Successfully parsed discovery poll result.
+///
+/// When `cursor` is set, call [`DiscoveryCursorCommit::commit`] only after the
+/// manager admits and installs (or confirms) this snapshot. Dropping the
+/// snapshot without committing retains the prior cursor.
+pub struct DiscoverySnapshot {
+    /// Provider-normalized targets (before shared host/egress admission).
+    pub targets: Vec<UpstreamTarget>,
+    /// Optional blocking-query cursor commit for this exact snapshot.
+    pub cursor: Option<DiscoveryCursorCommit>,
+}
+
+impl DiscoverySnapshot {
+    /// Snapshot with no provider cursor (DNS-SD, Kubernetes, mesh).
+    pub fn from_targets(targets: Vec<UpstreamTarget>) -> Self {
+        Self {
+            targets,
+            cursor: None,
+        }
+    }
+
+    /// Snapshot paired with a pending cursor commit (Consul blocking queries).
+    pub fn with_cursor(targets: Vec<UpstreamTarget>, cursor: DiscoveryCursorCommit) -> Self {
+        Self {
+            targets,
+            cursor: Some(cursor),
+        }
+    }
+}
+
+impl std::fmt::Debug for DiscoverySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoverySnapshot")
+            .field("targets", &self.targets)
+            .field(
+                "pending_cursor_index",
+                &self.cursor.as_ref().map(DiscoveryCursorCommit::index),
+            )
+            .finish()
+    }
+}
+
+impl std::ops::Deref for DiscoverySnapshot {
+    type Target = [UpstreamTarget];
+
+    fn deref(&self) -> &Self::Target {
+        &self.targets
+    }
+}
+
+impl std::ops::DerefMut for DiscoverySnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.targets
+    }
+}
+
+/// Result of shared target admission for a parsed discovery snapshot.
+pub enum SnapshotAdmission {
+    /// Snapshot may be published; commit `cursor` only after publication
+    /// succeeds (or when the admitted set already matches the installed set).
+    Accepted {
+        targets: Vec<UpstreamTarget>,
+        cursor: Option<DiscoveryCursorCommit>,
+    },
+    /// Shared validation rejected the snapshot; the provider cursor must not
+    /// advance and last-known targets must be retained.
+    Rejected {
+        /// Bounded structured reason for logs/metrics correlation.
+        reason: &'static str,
+    },
+}
+
+/// Apply shared host/egress validation and decide whether a parsed snapshot is
+/// admissible.
+///
+/// A legitimate empty provider payload (`targets` already empty) is accepted so
+/// scale-to-zero remains possible. When the provider returned at least one
+/// target and shared validation removes every entry, the snapshot is rejected
+/// so an unroutable catalog cannot clear backends or advance a blocking-query
+/// cursor.
+pub fn admit_discovered_snapshot(
+    upstream_id: &str,
+    provider_name: &str,
+    snapshot: DiscoverySnapshot,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+) -> SnapshotAdmission {
+    let DiscoverySnapshot { targets: raw, cursor } = snapshot;
+    let raw_len = raw.len();
+    let filtered =
+        filter_discovered_targets(upstream_id, provider_name, raw, backend_allow_ips);
+    if raw_len > 0 && filtered.is_empty() {
+        warn!(
+            upstream = %upstream_id,
+            provider = provider_name,
+            raw_targets = raw_len,
+            reason = "shared_admission_rejected",
+            "Service discovery: snapshot rejected by shared target validation; retaining last-known targets and blocking-query cursor"
+        );
+        return SnapshotAdmission::Rejected {
+            reason: "shared_admission_rejected",
+        };
+    }
+    SnapshotAdmission::Accepted {
+        targets: filtered,
+        cursor,
+    }
+}
+
 /// Trait for service discovery providers.
 #[async_trait::async_trait]
 pub trait ServiceDiscoverer: Send + Sync {
     /// Discover current targets from the external registry.
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error>;
+    ///
+    /// On success, any provider cursor in the snapshot must be committed by the
+    /// manager only after shared admission and successful publication.
+    async fn discover(&self) -> Result<DiscoverySnapshot, anyhow::Error>;
     /// Human-readable provider name for logging.
     fn provider_name(&self) -> &str;
 }
@@ -535,18 +698,33 @@ async fn run_discovery_loop(
             }
         }
 
-        // Discover targets
+        // Discover targets. Provider cursors (e.g. Consul X-Consul-Index) stay
+        // pending until shared admission and publication succeed for this exact
+        // snapshot — dropping the commit handle retains the prior cursor.
         match discoverer.discover().await {
-            Ok(discovered_raw) => {
-                let discovered = filter_discovered_targets(
+            Ok(snapshot) => {
+                let admission = admit_discovered_snapshot(
                     upstream_id,
                     discoverer.provider_name(),
-                    discovered_raw,
+                    snapshot,
                     dns_cache.backend_allow_ips(),
                 );
+                let (discovered, pending_cursor) = match admission {
+                    SnapshotAdmission::Accepted { targets, cursor } => (targets, cursor),
+                    SnapshotAdmission::Rejected { reason } => {
+                        warn!(
+                            "Service discovery [{}]: upstream {} snapshot not admitted ({}); keeping last-known targets and blocking-query cursor",
+                            discoverer.provider_name(),
+                            upstream_id,
+                            reason,
+                        );
+                        continue;
+                    }
+                };
                 // A canceled task may have completed its discover() call after
                 // the cancel signal fired.  Check before publishing so we never
-                // overwrite the new config's LB state with stale data.
+                // overwrite the new config's LB state with stale data. Drop the
+                // pending cursor without committing.
                 if *cancel_rx.borrow() {
                     info!(
                         "Service discovery: task for upstream {} canceled during discovery, discarding results",
@@ -625,7 +803,7 @@ async fn run_discovery_loop(
                         );
                         if let Err(error) = published {
                             warn!(
-                                "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets.",
+                                "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets and blocking-query cursor.",
                                 discoverer.provider_name(),
                                 upstream_id,
                                 error,
@@ -662,6 +840,12 @@ async fn run_discovery_loop(
                     }
 
                     last_discovered = discovered;
+                }
+
+                // Snapshot is installed (published or already matches). Commit
+                // the provider cursor for this exact admitted response.
+                if let Some(cursor) = pending_cursor {
+                    cursor.commit();
                 }
             }
             Err(e) => {
