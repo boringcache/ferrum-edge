@@ -2031,6 +2031,15 @@ where
     };
     if registry_proof_retracted {
         owner.shutdown_pods(&pod_states, config);
+    } else {
+        // The marker is still a live proof consumed by the mesh cleanup
+        // supervisor. Explicit backend cleanup would detach the capture guard
+        // while that stale proof remained observable, defeating the mutation
+        // fence we just enforced for every other lane. Latch the owner without
+        // cleanup so `Drop` cannot perform that unsafe teardown. Process death
+        // may still close kernel handles, but this runtime must not actively
+        // weaken the fail-closed posture it could not retract durably.
+        owner.preserve_fail_closed_state("UDP registry proof retraction failure");
     }
 
     if let Some(handle) = cni_listener_handle
@@ -8521,6 +8530,22 @@ impl<'a> InitializedBackendOwner<'a> {
         }
         self.cleaned_up = true;
         shutdown_backend_state(self.backend.as_mut(), pod_states, config);
+    }
+
+    /// Disarm automatic cleanup while deliberately preserving the installed
+    /// fail-closed backend state. This is reserved for the case where a durable
+    /// inter-process proof cannot be retracted before shutdown; running
+    /// `cleanup_all` from `Drop` would otherwise mutate capture underneath that
+    /// stale proof.
+    fn preserve_fail_closed_state(&mut self, context: &'static str) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        warn!(
+            context,
+            "Preserving installed BPF and routing state because durable proof retraction failed"
+        );
     }
 
     /// Cleanup after a late startup/runtime error (e.g. Kubernetes client
@@ -15019,6 +15044,65 @@ mod tests {
         let (result, ()) = tokio::join!(run, recover);
         result.expect("watcher exits cleanly after retraction recovery");
         assert!(!registry.path().join(".udp-registry-synced").exists());
+    }
+
+    #[tokio::test]
+    async fn udp_migration_shutdown_retraction_failure_preserves_backend_state() {
+        let registry = tempfile::tempdir().unwrap();
+        // A directory at the marker path makes remove_file fail deterministically
+        // at startup and shutdown, modeling an unretractable published proof.
+        std::fs::create_dir(registry.path().join(".udp-registry-synced")).unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let mut backend = MockEbpfBackend::default();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        initialize_backend(&mut backend, &config, metrics.as_ref()).unwrap();
+        {
+            let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
+            let startup_ready = Arc::new(AtomicBool::new(false));
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+            let events = futures_util::stream::pending::<
+                Result<Event<Pod>, kube_watcher::Error>,
+            >();
+            let run = run_with_pod_stream(
+                &mut owner,
+                &config,
+                metrics,
+                &shutdown_tx,
+                startup_ready,
+                CniListenerConfig {
+                    enabled: false,
+                    socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+                },
+                None,
+                Some("generation-1".to_string()),
+                events,
+                std::iter::empty(),
+            );
+            let stop = async {
+                tokio::task::yield_now().await;
+                let _ = shutdown_tx.send(true);
+            };
+            let (result, ()) = tokio::join!(run, stop);
+            result.expect("shutdown remains clean while fail-closed state is preserved");
+        }
+
+        assert_eq!(
+            backend.cleanup_all_calls, 0,
+            "Drop must not tear down capture underneath an unretracted registry proof"
+        );
+        assert!(registry.path().join(".udp-registry-synced").is_dir());
     }
 
     #[test]

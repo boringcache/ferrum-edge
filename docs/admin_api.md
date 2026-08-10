@@ -100,9 +100,9 @@ missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
 coarse unauthenticated responses.
 
-Ambient UDP placement rejection, unreadable/corrupt durable state, and early
-finalize disable only the UDP producer and keep mesh admin/control listeners
-running. Readiness remains false, so
+Ambient UDP placement rejection, unreadable/corrupt durable state, early
+finalize, and cleanup-tooling preflight failure disable only the UDP producer
+and keep mesh admin/control listeners running. Readiness remains false, so
 authenticated `/health` and `/metrics` expose the process-static bounded phase
 and reason needed for node-local repair while HBONE/TCP control remains
 diagnosable.

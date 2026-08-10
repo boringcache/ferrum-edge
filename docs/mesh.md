@@ -3476,7 +3476,11 @@ independent of that pipeline gate.
    `ferrum_mesh_udp_placement_migration_phase{phase="cleanup_complete"}` to be 1.
    `ferrum_mesh_udp_placement_migration_outstanding` and the bounded
    `..._failures_total{reason}` family diagnose progress without generation or
-   pod-UID labels.
+   pod-UID labels. A cleanup image missing the required setns/iptables tooling
+   reports phase `failed` with reason `pod_cleanup_failed`; the UDP producer and
+   cleanup stay stopped, but admin/HBONE/TCP listeners remain available for
+   diagnosis while readiness stays false. Repair the image or privileges and
+   restart the same cleanup tuple.
 3. Upgrade the same destination with phase `finalize` and the identical
    generation/from/to tuple. Helm requires the installed cleanup ConfigMap, and
    each incoming proxy independently requires its node-local durable completion

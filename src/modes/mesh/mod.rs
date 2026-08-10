@@ -12436,22 +12436,39 @@ async fn arm_mesh_runtime_startup(
                 context,
             )) => {
                 udp_migration_blocks_readiness = true;
-                if context.cleanup_pod_netns() {
-                    crate::proxy::netns_udp_capture::preflight_capture_tools(true)
-                        .map_err(anyhow::Error::msg)?;
+                let preflight_error = context
+                    .cleanup_pod_netns()
+                    .then(|| crate::proxy::netns_udp_capture::preflight_capture_tools(true))
+                    .transpose()
+                    .err();
+                if let Some(error) = preflight_error {
+                    use crate::proxy::udp_placement_migration::{
+                        UdpMigrationFailureReason, UdpMigrationStatusPhase, set_failure, set_phase,
+                    };
+                    set_phase(UdpMigrationStatusPhase::Failed, 0);
+                    set_failure(UdpMigrationFailureReason::PodCleanupFailed);
+                    warn!(
+                        %error,
+                        from = context.from().as_str(),
+                        to = context.to().as_str(),
+                        "Ambient UDP cleanup tooling preflight failed; no producer or cleanup will run, readiness remains false, and admin diagnostics stay available"
+                    );
+                } else {
+                    let source = Arc::new(
+                        crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                            env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+                        ),
+                    );
+                    let cleanup_shutdown = shutdown_tx.subscribe();
+                    info!(
+                        from = context.from().as_str(),
+                        to = context.to().as_str(),
+                        "Ambient UDP explicit cleanup phase started; no incoming producer will run and readiness remains false"
+                    );
+                    owner.push_mesh_background(tokio::spawn(async move {
+                        run_ambient_udp_placement_cleanup(context, source, cleanup_shutdown).await;
+                    }));
                 }
-                let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
-                    env_config.mesh_node_waypoint_pod_registry_dir.clone(),
-                ));
-                let cleanup_shutdown = shutdown_tx.subscribe();
-                info!(
-                    from = context.from().as_str(),
-                    to = context.to().as_str(),
-                    "Ambient UDP explicit cleanup phase started; no incoming producer will run and readiness remains false"
-                );
-                owner.push_mesh_background(tokio::spawn(async move {
-                    run_ambient_udp_placement_cleanup(context, source, cleanup_shutdown).await;
-                }));
                 false
             }
             None => false,
