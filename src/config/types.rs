@@ -8525,9 +8525,9 @@ impl Upstream {
         let mut errors = Vec::new();
 
         for (target_index, target) in self.targets.iter().enumerate() {
-            for key in target.tags.keys().filter(|key| key.starts_with("mesh.")) {
+            if target.tags.keys().any(|key| key.starts_with("mesh.")) {
                 errors.push(format!(
-                    "targets[{target_index}].tags key '{key}' uses the reserved mesh.* namespace \
+                    "targets[{target_index}].tags contains a key in the reserved mesh.* namespace \
                      and cannot be set directly via operator-provided config"
                 ));
             }

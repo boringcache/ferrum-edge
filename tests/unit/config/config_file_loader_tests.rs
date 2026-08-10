@@ -578,9 +578,10 @@ upstreams:
     .expect_err("file mode must reject operator-forged mesh transport tags");
     let message = err.to_string();
     assert!(
-        message.contains("mesh.unix_socket") && message.contains("reserved mesh.* namespace"),
-        "error should identify the reserved mesh transport tag: {message}"
+        message.contains("targets[0].tags") && message.contains("reserved mesh.* namespace"),
+        "error should identify the affected target without echoing tag content: {message}"
     );
+    assert!(!message.contains("mesh.unix_socket"), "{message}");
 }
 
 /// A clean operator file (no mesh-projected fields) still loads — the rejection
