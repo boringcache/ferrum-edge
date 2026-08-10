@@ -2817,7 +2817,6 @@ async fn mesh_sd_ambient_gateway_declared_non_first_port_bridges_with_alias() {
     );
 }
 
-
 // ── Consul blocking-query cursor admission (issue #3719) ──────────────
 //
 // These tests drive discover() through the exact production
@@ -3253,7 +3252,11 @@ async fn consul_successful_higher_index_publishes_then_commits() {
 
     assert_eq!(cursor_index(&discoverer), 0);
     let snapshot = discoverer.discover().await.unwrap();
-    assert_eq!(cursor_index(&discoverer), 0, "discover must not commit early");
+    assert_eq!(
+        cursor_index(&discoverer),
+        0,
+        "discover must not commit early"
+    );
     assert_eq!(snapshot.pending_cursor_index(), Some(42));
     harness.apply_snapshot(snapshot).await;
     assert_eq!(cursor_index(&discoverer), 42);
@@ -3609,9 +3612,10 @@ fn non_consul_accept_filtered_empty_policy_preserves_pre_pr_semantics() {
     // DNS-SD / Kubernetes / mesh snapshots use AcceptFilteredEmpty: even when
     // every normalized target is removed by shared admission, the empty set is
     // accepted (no atomic cursor rejection).
-    let snapshot = ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![
-        make_target("10.0.0.1", 8080),
-    ]);
+    let snapshot =
+        ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![make_target(
+            "10.0.0.1", 8080,
+        )]);
     assert_eq!(
         snapshot.admission_policy(),
         SnapshotAdmissionPolicy::AcceptFilteredEmpty

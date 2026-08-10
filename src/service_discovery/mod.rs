@@ -52,10 +52,7 @@ pub struct DiscoveryCursorCommit {
 
 impl DiscoveryCursorCommit {
     /// Create a commit handle for a shared atomic cursor slot.
-    pub(crate) fn new(
-        slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        index: u64,
-    ) -> Self {
+    pub(crate) fn new(slot: std::sync::Arc<std::sync::atomic::AtomicU64>, index: u64) -> Self {
         Self { slot, index }
     }
 
