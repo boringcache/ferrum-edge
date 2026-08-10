@@ -17,6 +17,7 @@ use chrono::Utc;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyConnection, AnyPool, Connection, Row};
+use std::fmt;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -371,6 +372,68 @@ pub struct PendingMigration {
     pub name: String,
 }
 
+/// A blocking integrity failure for an already-applied migration.
+///
+/// The diagnostic intentionally contains only migration metadata. It never
+/// includes a database URL, migration SQL, or other connection details.
+#[derive(Debug)]
+pub struct MigrationChecksumMismatch {
+    pub backend: String,
+    pub plugin_name: Option<String>,
+    pub version: i64,
+    pub stored_checksum: String,
+    pub expected_checksum: String,
+}
+
+impl fmt::Display for MigrationChecksumMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.plugin_name {
+            Some(plugin_name) => write!(
+                f,
+                "migration history integrity check failed: backend={} namespace=custom-plugin plugin={} version={} stored_checksum={} expected_checksum={}",
+                self.backend,
+                plugin_name,
+                self.version,
+                self.stored_checksum,
+                self.expected_checksum
+            ),
+            None => write!(
+                f,
+                "migration history integrity check failed: backend={} namespace=core version={} stored_checksum={} expected_checksum={}",
+                self.backend,
+                self.version,
+                self.stored_checksum,
+                self.expected_checksum
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationChecksumMismatch {}
+
+/// Validate one already-applied migration checksum using the shared invariant
+/// for every SQL adapter.
+#[doc(hidden)]
+pub fn validate_applied_migration_checksum(
+    backend: &str,
+    plugin_name: Option<&str>,
+    version: i64,
+    stored_checksum: &str,
+    expected_checksum: &str,
+) -> Result<(), MigrationChecksumMismatch> {
+    if stored_checksum == expected_checksum {
+        return Ok(());
+    }
+
+    Err(MigrationChecksumMismatch {
+        backend: backend.to_string(),
+        plugin_name: plugin_name.map(str::to_string),
+        version,
+        stored_checksum: stored_checksum.to_string(),
+        expected_checksum: expected_checksum.to_string(),
+    })
+}
+
 /// Runs versioned database migrations with tracking.
 pub struct MigrationRunner {
     pool: AnyPool,
@@ -485,11 +548,122 @@ impl MigrationRunner {
         Ok(records)
     }
 
+    fn validate_core_history(
+        &self,
+        applied: &[MigrationRecord],
+        all_migrations: &[Box<dyn MigrationEntry>],
+    ) -> Result<(), anyhow::Error> {
+        for record in applied {
+            if let Some(migration) = all_migrations
+                .iter()
+                .find(|migration| migration.version() == record.version)
+            {
+                validate_applied_migration_checksum(
+                    &self.db_type,
+                    None,
+                    record.version,
+                    &record.checksum,
+                    migration.checksum(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_plugin_history(
+        &self,
+        applied: &[PluginMigrationRecord],
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(), anyhow::Error> {
+        for (plugin_name, migrations) in plugin_migrations {
+            for record in applied
+                .iter()
+                .filter(|record| record.plugin_name == *plugin_name)
+            {
+                if let Some(migration) = migrations
+                    .iter()
+                    .find(|migration| migration.version == record.version)
+                {
+                    validate_applied_migration_checksum(
+                        &self.db_type,
+                        Some(*plugin_name),
+                        record.version,
+                        &record.checksum,
+                        migration.checksum,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_known_history_locked(
+        &self,
+        connection: &mut AnyConnection,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(), anyhow::Error> {
+        if self.tracking_table_exists(connection, false).await? {
+            let applied = self.applied_versions(connection).await?;
+            let all_migrations = self.all_migrations();
+            self.validate_core_history(&applied, &all_migrations)?;
+        }
+
+        if !plugin_migrations.is_empty() && self.tracking_table_exists(connection, true).await? {
+            let applied = self.applied_plugin_versions(connection).await?;
+            self.validate_plugin_history(&applied, plugin_migrations)?;
+        }
+
+        Ok(())
+    }
+
     /// Run all pending migrations in order. Returns the list of newly applied migrations.
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
+        self.run_pending_with_plugin_history(&[]).await
+    }
+
+    /// Validate known core and plugin history before applying pending core work.
+    ///
+    /// Startup uses this path even when automatic plugin migration application
+    /// is disabled, so plugin checksum drift cannot be hidden by successful
+    /// core migration or V001 compatibility work.
+    pub async fn run_pending_with_plugin_history(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
-        let operation = self.run_pending_locked(migration_lock.connection()).await;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            self.run_pending_locked(migration_lock.connection()).await
+        }
+        .await;
+        let release = migration_lock.finish(operation.is_ok()).await;
+        finish_locked_operation(operation, release)
+    }
+
+    /// Validate all known history, then apply core and plugin migrations under
+    /// one cross-process lock. No migration work starts until both histories
+    /// pass the checksum integrity check.
+    pub async fn run_all_pending(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(Vec<MigrationRecord>, Vec<PluginMigrationRecord>), anyhow::Error> {
+        let mut migration_lock =
+            MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            let core = self.run_pending_locked(migration_lock.connection()).await?;
+            let plugins = if plugin_migrations.is_empty() {
+                Vec::new()
+            } else {
+                self.run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
+                    .await?
+            };
+            Ok((core, plugins))
+        }
+        .await;
         let release = migration_lock.finish(operation.is_ok()).await;
         finish_locked_operation(operation, release)
     }
@@ -506,24 +680,8 @@ impl MigrationRunner {
         let applied = self.applied_versions(connection).await?;
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
-        // Validate checksums of applied migrations
         let all_migrations = self.all_migrations();
-        for record in &applied {
-            if let Some(migration) = all_migrations
-                .iter()
-                .find(|m| m.version() == record.version)
-                && migration.checksum() != record.checksum
-            {
-                warn!(
-                    "Migration V{} ({}) checksum mismatch: expected '{}', found '{}' in database. \
-                     This may indicate the migration source was modified after being applied.",
-                    record.version,
-                    record.name,
-                    migration.checksum(),
-                    record.checksum
-                );
-            }
-        }
+        self.validate_core_history(&applied, &all_migrations)?;
 
         let mut newly_applied = Vec::new();
 
@@ -602,6 +760,7 @@ impl MigrationRunner {
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
         let all_migrations = self.all_migrations();
+        self.validate_core_history(&applied, &all_migrations)?;
         let pending: Vec<PendingMigration> = all_migrations
             .iter()
             .filter(|m| !applied_versions.contains(&m.version()))
@@ -709,9 +868,13 @@ impl MigrationRunner {
 
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
-        let operation = self
-            .run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
-            .await;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            self.run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
+                .await
+        }
+        .await;
         let release = migration_lock.finish(operation.is_ok()).await;
         finish_locked_operation(operation, release)
     }
@@ -726,31 +889,15 @@ impl MigrationRunner {
         // Re-read only after the cross-process lock is held so a waiter sees
         // and skips every tracking row committed by the winner.
         let applied = self.applied_plugin_versions(connection).await?;
+        self.validate_plugin_history(&applied, plugin_migrations)?;
         let mut newly_applied = Vec::new();
 
         for (plugin_name, migrations) in plugin_migrations {
-            // Validate checksums of already-applied migrations for this plugin
             let plugin_applied: Vec<&PluginMigrationRecord> = applied
                 .iter()
                 .filter(|r| r.plugin_name == *plugin_name)
                 .collect();
             let applied_versions: Vec<i64> = plugin_applied.iter().map(|r| r.version).collect();
-
-            for record in &plugin_applied {
-                if let Some(migration) = migrations.iter().find(|m| m.version == record.version)
-                    && migration.checksum != record.checksum
-                {
-                    warn!(
-                        "Plugin '{}' migration V{} ({}) checksum mismatch: expected '{}', found '{}' in database. \
-                         This may indicate the migration source was modified after being applied.",
-                        plugin_name,
-                        record.version,
-                        record.name,
-                        migration.checksum,
-                        record.checksum
-                    );
-                }
-            }
 
             for migration in migrations {
                 if applied_versions.contains(&migration.version) {
@@ -914,11 +1061,17 @@ impl MigrationRunner {
         plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
     ) -> Result<PluginMigrationStatus, anyhow::Error> {
         let mut connection = self.pool.acquire().await?;
+        if self.tracking_table_exists(&mut connection, false).await? {
+            let core_applied = self.applied_versions(&mut connection).await?;
+            let all_migrations = self.all_migrations();
+            self.validate_core_history(&core_applied, &all_migrations)?;
+        }
         let applied = if self.tracking_table_exists(&mut connection, true).await? {
             self.applied_plugin_versions(&mut connection).await?
         } else {
             Vec::new()
         };
+        self.validate_plugin_history(&applied, plugin_migrations)?;
 
         let mut pending = Vec::new();
         for (plugin_name, migrations) in plugin_migrations {

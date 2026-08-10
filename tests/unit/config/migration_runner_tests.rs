@@ -1,6 +1,10 @@
 //! Tests for database migration runner
 
-use ferrum_edge::config::migrations::MigrationRunner;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::migrations::{
+    CustomPluginMigration, MigrationChecksumMismatch, MigrationRunner,
+    validate_applied_migration_checksum,
+};
 use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
@@ -474,6 +478,200 @@ async fn test_v001_checksum_is_content_derived_sha256() {
     assert!(checksum.starts_with("sha256:"));
     assert_eq!(checksum.len(), "sha256:".len() + 64);
     assert_ne!(checksum, "v001_initial_schema");
+}
+
+#[test]
+fn checksum_integrity_validation_is_shared_by_every_sql_adapter() {
+    for backend in ["sqlite", "postgres", "mysql"] {
+        validate_applied_migration_checksum(backend, None, 12, "same", "same")
+            .expect("an unchanged core checksum must remain valid");
+        validate_applied_migration_checksum(
+            backend,
+            Some("audit_plugin"),
+            4,
+            "same",
+            "same",
+        )
+        .expect("an unchanged plugin checksum must remain valid");
+
+        let core = validate_applied_migration_checksum(
+            backend,
+            None,
+            12,
+            "stored-core",
+            "expected-core",
+        )
+        .expect_err("core checksum drift must fail closed");
+        assert_eq!(core.backend, backend);
+        assert!(core.plugin_name.is_none());
+        assert_eq!(core.version, 12);
+
+        let plugin = validate_applied_migration_checksum(
+            backend,
+            Some("audit_plugin"),
+            4,
+            "stored-plugin",
+            "expected-plugin",
+        )
+        .expect_err("plugin checksum drift must fail closed");
+        assert_eq!(plugin.backend, backend);
+        assert_eq!(plugin.plugin_name.as_deref(), Some("audit_plugin"));
+        assert_eq!(plugin.version, 4);
+    }
+}
+
+#[tokio::test]
+async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("stored-core-checksum")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let before = sqlx::query(
+        "SELECT name, applied_at, checksum, execution_time_ms FROM _ferrum_migrations WHERE version = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let before = (
+        before.try_get::<String, _>("name").unwrap(),
+        before.try_get::<String, _>("applied_at").unwrap(),
+        before.try_get::<String, _>("checksum").unwrap(),
+        before.try_get::<i32, _>("execution_time_ms").unwrap(),
+    );
+
+    let status_error = runner
+        .status()
+        .await
+        .expect_err("status must return a blocking error on core drift");
+    assert!(status_error.is::<MigrationChecksumMismatch>());
+
+    let apply_error = runner
+        .run_pending()
+        .await
+        .expect_err("automatic core migration must fail on drift");
+    let mismatch = apply_error
+        .downcast_ref::<MigrationChecksumMismatch>()
+        .expect("error must retain structured integrity metadata");
+    assert_eq!(mismatch.backend, "sqlite");
+    assert!(mismatch.plugin_name.is_none());
+    assert_eq!(mismatch.version, 1);
+    assert_eq!(mismatch.stored_checksum, "stored-core-checksum");
+    assert!(mismatch.expected_checksum.starts_with("sha256:"));
+    assert!(!apply_error.to_string().contains("CREATE TABLE"));
+    assert!(
+        !table_exists(&pool, "proxy_route_locks").await,
+        "V001 compatibility work must not run after integrity refusal"
+    );
+
+    let after = sqlx::query(
+        "SELECT name, applied_at, checksum, execution_time_ms FROM _ferrum_migrations WHERE version = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let after = (
+        after.try_get::<String, _>("name").unwrap(),
+        after.try_get::<String, _>("applied_at").unwrap(),
+        after.try_get::<String, _>("checksum").unwrap(),
+        after.try_get::<i32, _>("execution_time_ms").unwrap(),
+    );
+    assert_eq!(after, before, "integrity refusal must not rewrite history");
+}
+
+#[tokio::test]
+async fn core_checksum_drift_blocks_later_plugin_migration() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("drift-before-plugin")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pending_plugin = vec![(
+        "pending_after_core",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_pending_after_core",
+            checksum: "pending-v1",
+            sql: "CREATE TABLE pending_after_core_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    runner
+        .run_all_pending(&pending_plugin)
+        .await
+        .expect_err("core drift must block all later plugin work");
+
+    assert!(
+        !table_exists(&pool, "pending_after_core_data").await,
+        "later plugin schema must remain pending"
+    );
+    assert!(
+        !table_exists(&pool, "_ferrum_plugin_migrations").await,
+        "preflight refusal must happen before creating plugin history"
+    );
+    let row = sqlx::query("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "drift-before-plugin"
+    );
+}
+
+#[tokio::test]
+async fn database_store_startup_surfaces_core_checksum_drift() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("startup_checksum_drift.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("startup-stored-checksum")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = match DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("automatic database startup must refuse checksum drift"),
+        Err(error) => error,
+    };
+    assert!(error.is::<MigrationChecksumMismatch>());
+
+    let row = sqlx::query("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "startup-stored-checksum"
+    );
 }
 
 #[tokio::test]

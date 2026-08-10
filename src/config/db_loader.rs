@@ -1865,7 +1865,10 @@ impl DatabaseStore {
         use crate::config::migrations::MigrationRunner;
 
         let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
-        let applied = runner.run_pending().await?;
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        let applied = runner
+            .run_pending_with_plugin_history(&plugin_migrations)
+            .await?;
 
         if applied.is_empty() {
             info!("Database schema is up to date");

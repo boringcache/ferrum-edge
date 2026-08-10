@@ -1,6 +1,9 @@
 //! Tests for custom plugin database migration support
 
-use ferrum_edge::config::migrations::{CustomPluginMigration, MigrationRunner};
+use ferrum_edge::config::migrations::{
+    CustomPluginMigration, MigrationChecksumMismatch, MigrationRunner,
+};
+use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 async fn test_pool() -> sqlx::AnyPool {
@@ -404,13 +407,12 @@ async fn test_multiple_plugins_independent_versions() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
+async fn plugin_checksum_drift_blocks_status_and_later_pending_migration() {
     let pool = test_pool().await;
     setup_core_migrations(&pool).await;
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Apply V1 with original checksum
     let migrations_v1 = vec![(
         "chk_plugin",
         vec![CustomPluginMigration {
@@ -424,8 +426,6 @@ async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
     )];
     runner.run_plugin_pending(&migrations_v1).await.unwrap();
 
-    // Now run with a different checksum for V1 + a new V2
-    // This should warn about the checksum mismatch but still apply V2
     let migrations_v1_modified = vec![(
         "chk_plugin",
         vec![
@@ -448,13 +448,215 @@ async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
         ],
     )];
 
-    // Should not error — mismatch is a warning, not a failure
-    let applied = runner
+    let status_error = runner
+        .plugin_status(&migrations_v1_modified)
+        .await
+        .expect_err("status must return a blocking error on plugin drift");
+    assert!(status_error.is::<MigrationChecksumMismatch>());
+
+    let apply_error = runner
         .run_plugin_pending(&migrations_v1_modified)
         .await
+        .expect_err("plugin drift must block the later pending migration");
+    let mismatch = apply_error
+        .downcast_ref::<MigrationChecksumMismatch>()
+        .expect("error must retain structured integrity metadata");
+    assert_eq!(mismatch.backend, "sqlite");
+    assert_eq!(mismatch.plugin_name.as_deref(), Some("chk_plugin"));
+    assert_eq!(mismatch.version, 1);
+    assert_eq!(mismatch.stored_checksum, "original_checksum");
+    assert_eq!(mismatch.expected_checksum, "modified_checksum");
+    assert!(!apply_error.to_string().contains("ALTER TABLE"));
+
+    let columns = sqlx::query("PRAGMA table_info(chk_data)")
+        .fetch_all(&pool)
+        .await
         .unwrap();
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].version, 2);
+    assert!(
+        columns
+            .iter()
+            .all(|row| row.try_get::<String, _>("name").unwrap() != "value"),
+        "V2 schema work must remain pending after checksum refusal"
+    );
+    let history = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? ORDER BY version",
+    )
+    .bind("chk_plugin")
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].try_get::<String, _>("checksum").unwrap(),
+        "original_checksum"
+    );
+}
+
+#[tokio::test]
+async fn plugin_checksum_drift_blocks_when_nothing_is_pending() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let original = vec![(
+        "no_pending_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_table",
+            checksum: "immutable-checksum",
+            sql: "CREATE TABLE no_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner.run_plugin_pending(&original).await.unwrap();
+
+    let changed = vec![(
+        "no_pending_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_table",
+            checksum: "changed-checksum",
+            sql: "CREATE TABLE no_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner
+        .run_plugin_pending(&changed)
+        .await
+        .expect_err("drift must fail even when no migration is pending");
+
+    let row = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("no_pending_plugin")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "immutable-checksum"
+    );
+}
+
+#[tokio::test]
+async fn plugin_drift_preflight_blocks_core_and_other_plugin_work() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let original = vec![(
+        "drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_drift_table",
+            checksum: "drift-original",
+            sql: "CREATE TABLE drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner.run_plugin_pending(&original).await.unwrap();
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let all_plugins = vec![
+        (
+            "clean_pending_plugin",
+            vec![CustomPluginMigration {
+                version: 1,
+                name: "create_clean_table",
+                checksum: "clean-v1",
+                sql: "CREATE TABLE clean_pending_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+        (
+            "drift_plugin",
+            vec![CustomPluginMigration {
+                version: 1,
+                name: "create_drift_table",
+                checksum: "drift-changed",
+                sql: "CREATE TABLE drift_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+    ];
+
+    runner
+        .run_all_pending(&all_plugins)
+        .await
+        .expect_err("all history must be validated before any migration work");
+
+    let clean_table = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clean_pending_data'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(clean_table.is_none(), "other-plugin work must remain pending");
+    let core_compatibility_table = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proxy_route_locks'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        core_compatibility_table.is_none(),
+        "core compatibility work must not precede plugin integrity validation"
+    );
+    let history = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("drift_plugin")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        history.try_get::<String, _>("checksum").unwrap(),
+        "drift-original"
+    );
+}
+
+#[tokio::test]
+async fn combined_core_and_plugin_apply_remains_clean_and_idempotent() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let plugins = vec![(
+        "combined_clean_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_combined_clean",
+            checksum: "combined-clean-v1",
+            sql: "CREATE TABLE combined_clean_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let (core, plugin) = runner.run_all_pending(&plugins).await.unwrap();
+    assert_eq!(core.len(), 1);
+    assert_eq!(plugin.len(), 1);
+
+    let (core_again, plugin_again) = runner.run_all_pending(&plugins).await.unwrap();
+    assert!(core_again.is_empty());
+    assert!(plugin_again.is_empty());
+    runner.status().await.unwrap();
+    runner.plugin_status(&plugins).await.unwrap();
+
+    let core_rows = sqlx::query("SELECT COUNT(*) AS row_count FROM _ferrum_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let plugin_rows = sqlx::query("SELECT COUNT(*) AS row_count FROM _ferrum_plugin_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(core_rows.try_get::<i64, _>("row_count").unwrap(), 1);
+    assert_eq!(plugin_rows.try_get::<i64, _>("row_count").unwrap(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1138,58 @@ async fn apply_plugin_migrations_runs_pending_and_creates_schema() {
     assert!(
         pending.is_empty(),
         "no pending migrations should remain after apply"
+    );
+}
+
+#[tokio::test]
+async fn startup_plugin_probe_and_auto_apply_both_block_checksum_drift() {
+    let (store, _tmp) = test_store_with_dir().await;
+    let original: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "startup_drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_startup_table",
+            checksum: "startup-original",
+            sql: "CREATE TABLE startup_drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    store.apply_plugin_migrations(&original).await.unwrap();
+
+    let changed: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "startup_drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_startup_table",
+            checksum: "startup-changed",
+            sql: "CREATE TABLE startup_drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let probe_error = store
+        .pending_plugin_migrations(&changed)
+        .await
+        .expect_err("warn-only startup probe must not downgrade integrity drift");
+    assert!(probe_error.is::<MigrationChecksumMismatch>());
+
+    let apply_error = store
+        .apply_plugin_migrations(&changed)
+        .await
+        .expect_err("auto-apply startup must fail on integrity drift");
+    assert!(apply_error.is::<MigrationChecksumMismatch>());
+
+    let row = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("startup_drift_plugin")
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "startup-original"
     );
 }
 

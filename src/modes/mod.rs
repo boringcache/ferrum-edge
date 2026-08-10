@@ -267,6 +267,13 @@ async fn handle_startup_plugin_migrations_with_list(
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
+            if e.is::<crate::config::migrations::MigrationChecksumMismatch>() {
+                return Err(e).with_context(|| {
+                    format!(
+                        "custom-plugin migration history integrity validation failed (mode={mode})"
+                    )
+                });
+            }
             if auto_apply {
                 return Err(e).with_context(|| {
                     format!(

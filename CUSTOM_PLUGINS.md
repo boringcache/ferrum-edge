@@ -1289,6 +1289,12 @@ Custom plugins that need their own database tables can declare migrations that r
    migration lock, using the dialect-specific transaction contract documented
    in [Database Migrations](docs/migrations.md#multi-statement-migrations)
 
+Ferrum validates all applied core and compiled-plugin checksums under that lock
+before applying either core or plugin work. Any drift is a blocking integrity
+error for startup, `up`, dry-run, and `status`; Ferrum does not overwrite the
+stored checksum or re-run changed migration source. See the
+[operator repair path](docs/migrations.md#migration-checksum-mismatch-integrity-error).
+
 ### Declaring Migrations
 
 Add a `plugin_migrations()` function to your plugin file that returns a `Vec<CustomPluginMigration>`:
@@ -1429,7 +1435,7 @@ Example output:
 === Ferrum Edge Migration Status ===
 
 Applied migrations:
-  V1: initial_schema (applied: 2026-04-01T..., checksum: v001_initial_schema)
+  V1: initial_schema (applied: 2026-04-01T..., checksum: sha256:<64 hex characters>)
 
 Pending migrations: (none — schema is up to date)
 
@@ -1452,7 +1458,7 @@ Plugin migrations are tracked in the `_ferrum_plugin_migrations` table with a co
 | `version` | Migration version within the plugin |
 | `name` | Human-readable migration name |
 | `applied_at` | RFC 3339 timestamp of when the migration was applied |
-| `checksum` | Checksum at the time of application (warns if source changes later) |
+| `checksum` | Checksum at the time of application (source drift blocks status, startup, and later migration work) |
 | `execution_time_ms` | How long the migration took to execute |
 
 This is separate from the core `_ferrum_migrations` table, so plugin versions never conflict with gateway versions.

@@ -89,12 +89,14 @@ When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **Mi
 
 1. Acquires a cross-process migration lock (`pg_try_advisory_lock` polling on
    PostgreSQL, `GET_LOCK` on MySQL, and `BEGIN IMMEDIATE` on SQLite)
-2. Creates the `_ferrum_migrations` tracking table if it doesn't exist
-3. Checks which migrations have been applied by reading `_ferrum_migrations`
-4. Runs any pending migrations in order
-5. Records each applied migration with its version, name, timestamp, checksum, and execution time
-6. Runs an idempotent V001 compatibility pass (folded-in tables/columns/indexes)
-7. On MySQL only, probes identity-bearing column collations against
+2. Reads any existing core and compiled custom-plugin tracking history and
+   fails closed if an applied checksum differs from the current binary
+3. Creates missing migration tracking tables
+4. Checks which migrations have been applied
+5. Runs any pending migrations in order
+6. Records each applied migration with its version, name, timestamp, checksum, and execution time
+7. Runs an idempotent V001 compatibility pass (folded-in tables/columns/indexes)
+8. On MySQL only, probes identity-bearing column collations against
    `utf8mb4_0900_bin` and emits a structured startup warning with exact
    `ALTER TABLE ... CONVERT TO` remediation when a populated upgrade still
    carries a stale collation (warn-and-continue; never refuses startup — see
@@ -152,9 +154,13 @@ Each migration has a checksum. V001 uses a `sha256:<hex>` digest derived from
 the V001 wrapper and dialect schema source, so changing the baseline changes the
 stored value and makes later source tampering visible. When the gateway starts,
 it compares the checksum of each applied migration against the expected
-checksum in the code. If a mismatch is detected, a warning is logged. This is a
-diagnostic aid, not a hard error. During build-out there is deliberately no
-compatibility shim for the former fixed `v001_initial_schema` label.
+checksum in the code. A mismatch is a blocking migration-history integrity
+error. Ferrum does not apply pending core or plugin migrations, run the V001
+compatibility pass, overwrite the stored checksum, or re-run the changed
+migration. Automatic `database` / `cp` startup and explicit `up`, `status`, and
+database dry-run commands all return an error; command-line use therefore exits
+non-zero. During build-out there is deliberately no compatibility shim for the
+former fixed `v001_initial_schema` label and no checksum-mismatch override.
 
 ## Custom Plugin Migrations
 
@@ -295,7 +301,12 @@ Dialect transactionality for custom-plugin migrations:
 
 ### Checksum Validation
 
-Like core migrations, checksums are validated on each run. If a plugin migration's checksum differs from what was recorded when it was applied, a warning is logged. This helps detect unintended modifications to already-applied migrations.
+Like core migrations, applied plugin checksums are validated on every status or
+apply run. Ferrum validates all compiled plugins before applying work for any
+one plugin, and explicit `migrate up` validates both core and plugin history
+before applying either. A mismatch is a blocking error even when no migration
+is pending and regardless of `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`; it never
+updates the stored checksum or runs the changed migration.
 
 ### Table Naming Convention
 
@@ -371,7 +382,9 @@ FERRUM_MODE=migrate \
 
 `status` is strictly read-only. If the core or plugin tracking table does not
 exist, Ferrum reports every known migration as pending without creating either
-tracking table.
+tracking table. If an applied core or compiled-plugin checksum has drifted,
+`status` returns an integrity error and exits non-zero instead of reporting the
+database as healthy.
 
 ### Check Migration Status
 
@@ -518,9 +531,34 @@ fn migration_chain() -> Vec<(&'static str, &'static str, ConfigMigrationFn)> {
 
 This means the migration chain has a gap. Every version must have a migration step to the next version. Check that all migration functions are registered in `migration_chain()`.
 
-### Migration checksum mismatch warning
+### Migration checksum mismatch integrity error
 
-This means a migration's source code was modified after it was already applied to the database. This is a warning only — the migration is not re-run. If the change was intentional (e.g., fixing a comment), the warning can be safely ignored.
+This means the current binary's immutable migration source does not match the
+checksum recorded when that migration was applied. Possible causes include a
+modified historical migration, a divergent build or deployment, a database
+restored from incompatible provenance, or a changed tracking row. Ferrum stops
+before later migration or compatibility work and does not rewrite history.
+
+Treat the mismatch as an incident until provenance is understood:
+
+1. Stop the rollout and preserve a database backup plus the exact binary/build
+   metadata that observed the failure.
+2. Compare the deployed artifact, immutable migration source, database backup,
+   and tracking history to identify which side drifted. Do not place database
+   credentials, migration SQL, or secrets in shared diagnostics.
+3. Restore the original immutable migration/binary that matches the applied
+   database, or restore the correct database backup for the intended binary.
+4. If the intended schema must change, keep the applied migration immutable and
+   author an explicit forward repair migration after provenance and current
+   state are understood. During the active build-out phase, follow the
+   [Build-Out Schema Policy](#build-out-schema-policy) and rebuild the core
+   database when the editable V001 baseline changed.
+5. Re-run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status`, then `up`, only
+   after the immutable history and database agree.
+
+Never repair drift by manually overwriting a stored checksum or by changing and
+re-running an already-applied migration. Ferrum intentionally provides no
+emergency bypass for this integrity check.
 
 ### MySQL stale identity collation warning
 

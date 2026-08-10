@@ -104,10 +104,16 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
+    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
 
     if dry_run {
         info!("Dry run mode — checking pending migrations without applying");
         let status = runner.status().await?;
+        let plugin_status = if plugin_migrations.is_empty() {
+            None
+        } else {
+            Some(runner.plugin_status(&plugin_migrations).await?)
+        };
 
         if status.pending.is_empty() {
             println!("Database schema is up to date. No pending migrations.");
@@ -119,9 +125,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         }
 
         // Custom plugin migrations (dry run)
-        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-        if !plugin_migrations.is_empty() {
-            let plugin_status = runner.plugin_status(&plugin_migrations).await?;
+        if let Some(plugin_status) = plugin_status {
             if plugin_status.pending.is_empty() {
                 println!("\nCustom plugin migrations are up to date. No pending migrations.");
             } else {
@@ -133,7 +137,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         }
     } else {
         info!("Running pending database migrations...");
-        let applied = runner.run_pending().await?;
+        let (applied, plugin_applied) = runner.run_all_pending(&plugin_migrations).await?;
 
         if applied.is_empty() {
             println!("Database schema is up to date. No migrations applied.");
@@ -145,11 +149,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         }
 
         // Custom plugin migrations
-        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if !plugin_migrations.is_empty() {
-            info!("Running pending custom plugin migrations...");
-            let plugin_applied = runner.run_plugin_pending(&plugin_migrations).await?;
-
             if plugin_applied.is_empty() {
                 println!("\nCustom plugin migrations are up to date. No migrations applied.");
             } else {
@@ -271,6 +271,12 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
     let status = runner.status().await?;
+    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+    let plugin_status = if plugin_migrations.is_empty() {
+        None
+    } else {
+        Some(runner.plugin_status(&plugin_migrations).await?)
+    };
 
     println!("=== Ferrum Edge Migration Status ===\n");
 
@@ -298,10 +304,7 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     }
 
     // Custom plugin migration status
-    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    if !plugin_migrations.is_empty() {
-        let plugin_status = runner.plugin_status(&plugin_migrations).await?;
-
+    if let Some(plugin_status) = plugin_status {
         println!("\n=== Custom Plugin Migration Status ===\n");
 
         if plugin_status.applied.is_empty() {
