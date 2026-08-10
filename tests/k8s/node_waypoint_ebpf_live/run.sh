@@ -1514,7 +1514,11 @@ run_ingress_topology_negative_and_drift_checks() {
     echo "running node-agent did not withdraw readiness after route drift" >&2
     exit 1
   fi
-  if kubectl -n "$MESH_NS" get "pod/$new_pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q '^True$'; then
+  # The node-agent withdraws /health readiness synchronously with the topology
+  # state above, but kubelet observes that change on its configured probe
+  # cadence. Wait for the Pod condition instead of racing the next probe.
+  if ! kubectl -n "$MESH_NS" wait \
+    --for=condition=Ready=false "pod/$new_pod" --timeout=30s; then
     restore_ingress_routes "$NODE_A" "$state_file"
     echo "running node-agent stayed Ready after its proved route topology drifted" >&2
     exit 1
