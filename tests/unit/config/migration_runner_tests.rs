@@ -518,8 +518,14 @@ fn applied_history(
 fn history_integrity_validation_is_shared_by_every_sql_adapter() {
     let plugin_namespace = MigrationHistoryNamespace::CustomPlugin("audit_plugin".to_string());
     let declarations = vec![
-        declared_history(MigrationHistoryNamespace::Core, &[(1, "core-1"), (2, "core-2")]),
-        declared_history(plugin_namespace.clone(), &[(3, "plugin-3"), (4, "plugin-4")]),
+        declared_history(
+            MigrationHistoryNamespace::Core,
+            &[(1, "core-1"), (2, "core-2")],
+        ),
+        declared_history(
+            plugin_namespace.clone(),
+            &[(3, "plugin-3"), (4, "plugin-4")],
+        ),
     ];
     let valid_prefix = vec![
         applied_history(MigrationHistoryNamespace::Core, &[(1, "core-1")]),
@@ -542,7 +548,10 @@ fn history_integrity_validation_is_shared_by_every_sql_adapter() {
                 .expect_err("checksum drift must fail closed");
             assert_eq!(error.backend, backend);
             assert_eq!(error.namespace, namespace);
-            assert_eq!(error.kind(), MigrationHistoryIntegrityKind::ChecksumMismatch);
+            assert_eq!(
+                error.kind(),
+                MigrationHistoryIntegrityKind::ChecksumMismatch
+            );
         }
     }
 }
@@ -551,8 +560,14 @@ fn history_integrity_validation_is_shared_by_every_sql_adapter() {
 fn shared_history_integrity_rejects_unknown_missing_and_ambiguous_sequences() {
     let plugin_namespace = MigrationHistoryNamespace::CustomPlugin("audit_plugin".to_string());
     let declarations = vec![
-        declared_history(MigrationHistoryNamespace::Core, &[(1, "core-1"), (2, "core-2")]),
-        declared_history(plugin_namespace.clone(), &[(3, "plugin-3"), (4, "plugin-4")]),
+        declared_history(
+            MigrationHistoryNamespace::Core,
+            &[(1, "core-1"), (2, "core-2")],
+        ),
+        declared_history(
+            plugin_namespace.clone(),
+            &[(3, "plugin-3"), (4, "plugin-4")],
+        ),
     ];
 
     for history in [
@@ -657,7 +672,10 @@ fn integrity_error_display_is_single_line_escaped_bounded_and_keeps_raw_fields()
     assert!(rendered.contains("version=7"));
     assert!(rendered.contains("\\n"));
     assert!(rendered.contains("\\u{1b}"));
-    assert!(rendered.len() < 700, "every string field must remain bounded");
+    assert!(
+        rendered.len() < 700,
+        "every string field must remain bounded"
+    );
 
     assert_eq!(error.backend, backend);
     assert_eq!(
@@ -691,7 +709,10 @@ fn integrity_error_remains_typed_through_anyhow_context() {
     ] {
         let error = validate_migration_history_integrity(
             "sqlite",
-            &[declared_history(MigrationHistoryNamespace::Core, &[(1, "expected")])],
+            &[declared_history(
+                MigrationHistoryNamespace::Core,
+                &[(1, "expected")],
+            )],
             &[applied],
         )
         .expect_err("invalid history must fail");
@@ -906,16 +927,13 @@ async fn database_store_startup_surfaces_core_checksum_drift() {
         .await
         .unwrap();
 
-    let error = match DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    {
-        Ok(_) => panic!("automatic database startup must refuse checksum drift"),
-        Err(error) => error,
-    };
+    let error =
+        match DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+        {
+            Ok(_) => panic!("automatic database startup must refuse checksum drift"),
+            Err(error) => error,
+        };
     assert!(error.is::<MigrationHistoryIntegrityError>());
 
     let row = sqlx::query("SELECT checksum FROM _ferrum_migrations WHERE version = 1")

@@ -643,7 +643,10 @@ async fn plugin_drift_preflight_blocks_core_and_other_plugin_work() {
     .fetch_optional(&pool)
     .await
     .unwrap();
-    assert!(clean_table.is_none(), "other-plugin work must remain pending");
+    assert!(
+        clean_table.is_none(),
+        "other-plugin work must remain pending"
+    );
     let core_compatibility_table = sqlx::query(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proxy_route_locks'",
     )
@@ -769,12 +772,8 @@ async fn later_applied_plugin_version_cannot_hide_a_missing_prefix_entry() {
             observed_version: 2,
         }
     );
-    assert!(
-        !table_exists(&pool, "missing_prefix_v1_data").await
-    );
-    assert!(
-        !table_exists(&pool, "missing_prefix_v2_data").await
-    );
+    assert!(!table_exists(&pool, "missing_prefix_v1_data").await);
+    assert!(!table_exists(&pool, "missing_prefix_v2_data").await);
 }
 
 #[tokio::test]
@@ -814,12 +813,8 @@ async fn duplicate_plugin_declarations_fail_before_creating_core_or_history_tabl
             .kind(),
         MigrationHistoryIntegrityKind::DuplicateDeclaredVersion
     );
-    assert!(
-        !table_exists(&duplicate_version_pool, "_ferrum_migrations").await
-    );
-    assert!(
-        !table_exists(&duplicate_version_pool, "_ferrum_plugin_migrations").await
-    );
+    assert!(!table_exists(&duplicate_version_pool, "_ferrum_migrations").await);
+    assert!(!table_exists(&duplicate_version_pool, "_ferrum_plugin_migrations").await);
 
     let duplicate_namespace_pool = test_pool().await;
     let duplicate_namespace_runner =
@@ -859,9 +854,7 @@ async fn duplicate_plugin_declarations_fail_before_creating_core_or_history_tabl
             .kind(),
         MigrationHistoryIntegrityKind::DuplicateDeclaredNamespace
     );
-    assert!(
-        !table_exists(&duplicate_namespace_pool, "_ferrum_migrations").await
-    );
+    assert!(!table_exists(&duplicate_namespace_pool, "_ferrum_migrations").await);
 }
 
 #[tokio::test]
@@ -1493,13 +1486,7 @@ async fn startup_plugin_probe_and_auto_apply_both_block_checksum_drift() {
 #[tokio::test]
 async fn warn_only_startup_probe_rejects_orphan_history_with_no_compiled_plugins() {
     let (store, _tmp) = test_store_with_dir().await;
-    seed_plugin_history(
-        &store.pool(),
-        "startup_orphan_plugin",
-        1,
-        "orphan-checksum",
-    )
-    .await;
+    seed_plugin_history(&store.pool(), "startup_orphan_plugin", 1, "orphan-checksum").await;
 
     let probe_error = store
         .pending_plugin_migrations(&[])
@@ -1529,13 +1516,9 @@ async fn automatic_database_startup_rejects_orphan_plugin_history() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("startup_orphan_history.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
     seed_plugin_history(
         &store.pool(),
         "automatic_startup_orphan",
@@ -1544,16 +1527,13 @@ async fn automatic_database_startup_rejects_orphan_plugin_history() {
     )
     .await;
 
-    let error = match DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    {
-        Ok(_) => panic!("automatic startup must refuse orphan plugin history"),
-        Err(error) => error,
-    };
+    let error =
+        match DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+        {
+            Ok(_) => panic!("automatic startup must refuse orphan plugin history"),
+            Err(error) => error,
+        };
     let integrity_error = error
         .downcast_ref::<MigrationHistoryIntegrityError>()
         .expect("automatic startup refusal must remain typed");

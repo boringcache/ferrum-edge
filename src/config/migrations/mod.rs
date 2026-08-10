@@ -467,9 +467,7 @@ impl MigrationHistoryIntegrityReason {
             Self::DuplicateAppliedVersion { .. } => {
                 MigrationHistoryIntegrityKind::DuplicateAppliedVersion
             }
-            Self::UnknownAppliedNamespace => {
-                MigrationHistoryIntegrityKind::UnknownAppliedNamespace
-            }
+            Self::UnknownAppliedNamespace => MigrationHistoryIntegrityKind::UnknownAppliedNamespace,
             Self::UnknownAppliedVersion { .. } => {
                 MigrationHistoryIntegrityKind::UnknownAppliedVersion
             }
@@ -554,10 +552,7 @@ impl fmt::Display for MigrationHistoryIntegrityError {
             MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
                 previous_version,
                 version,
-            } => write!(
-                f,
-                " previous_version={previous_version} version={version}"
-            ),
+            } => write!(f, " previous_version={previous_version} version={version}"),
             MigrationHistoryIntegrityReason::MissingAppliedVersion {
                 expected_version,
                 observed_version,
@@ -955,11 +950,7 @@ impl MigrationRunner {
     ) -> Result<(), anyhow::Error> {
         let declarations = vec![Self::core_history_declaration(all_migrations)];
         let applied_histories = vec![Self::core_applied_history(applied)];
-        validate_migration_history_integrity(
-            &self.db_type,
-            &declarations,
-            &applied_histories,
-        )?;
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
         Ok(())
     }
 
@@ -970,11 +961,7 @@ impl MigrationRunner {
     ) -> Result<(), anyhow::Error> {
         let declarations = Self::plugin_history_declarations(plugin_migrations);
         let applied_histories = Self::plugin_applied_histories(applied);
-        validate_migration_history_integrity(
-            &self.db_type,
-            &declarations,
-            &applied_histories,
-        )?;
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
         Ok(())
     }
 
@@ -991,11 +978,7 @@ impl MigrationRunner {
             Vec::new()
         };
         let applied_histories = vec![Self::core_applied_history(&applied)];
-        validate_migration_history_integrity(
-            &self.db_type,
-            &declarations,
-            &applied_histories,
-        )?;
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
         Ok(())
     }
 
@@ -1026,11 +1009,7 @@ impl MigrationRunner {
         };
         let mut applied_histories = vec![Self::core_applied_history(&core_applied)];
         applied_histories.extend(Self::plugin_applied_histories(&plugin_applied));
-        validate_migration_history_integrity(
-            &self.db_type,
-            &declarations,
-            &applied_histories,
-        )?;
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
 
         Ok(())
     }
@@ -1512,11 +1491,7 @@ impl MigrationRunner {
         };
         let mut applied_histories = vec![Self::core_applied_history(&core_applied)];
         applied_histories.extend(Self::plugin_applied_histories(&applied));
-        validate_migration_history_integrity(
-            &self.db_type,
-            &declarations,
-            &applied_histories,
-        )?;
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
 
         let mut pending = Vec::new();
         for (plugin_name, migrations) in plugin_migrations {
