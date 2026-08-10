@@ -383,6 +383,10 @@ pub struct K8sTranslation {
     /// route attached to one programmed parent and one fail-closed parent does
     /// not report both parents as Programmed.
     pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Gateway listeners that actually produced a synthetic `MeshService` in
+    /// this translation. Status consumes this provenance set instead of
+    /// inferring ownership from a collision-prone service name.
+    pub materialized_gateway_listeners: HashSet<GatewayApiListenerKey>,
     /// Per-`BackendTLSPolicy` translation outcome, projected for the Gateway
     /// API status writer. Computed during translation (the only place the
     /// ConfigMap/Secret CA index exists) so status planning never retranslates.
@@ -932,6 +936,7 @@ pub(crate) struct K8sAccumulator {
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    gateway_api_materialized_gateway_listeners: HashSet<GatewayApiListenerKey>,
     /// Gateway API `BackendTLSPolicy` index keyed by target Service identity.
     backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
     /// Per-policy status projections recorded as policies are collected.
@@ -989,6 +994,7 @@ impl K8sAccumulator {
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
+            gateway_api_materialized_gateway_listeners: HashSet::new(),
             backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
             backend_tls_policy_statuses: Vec::new(),
             listenerset_statuses: Vec::new(),
@@ -1512,6 +1518,7 @@ impl K8sAccumulator {
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
             materialized_route_parents: self.gateway_api_materialized_route_parents,
+            materialized_gateway_listeners: self.gateway_api_materialized_gateway_listeners,
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
             listenerset_statuses: self.listenerset_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,

@@ -1144,6 +1144,50 @@ fn kind_scoped_service_identities_disambiguate_gateway_with_listenerset_prefix()
 }
 
 #[test]
+fn core_service_with_gateway_synthetic_name_cannot_spoof_programmed_status() {
+    let gateway = object(
+        "Gateway",
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "public",
+                "protocol": "HTTP",
+                "allowedRoutes": {"namespaces": {"from": "Same"}}
+            }]
+        }),
+    );
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        service("gateway-edge-public"),
+    ];
+    let opts = options().with_pod_discovery_enabled(true);
+    let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services
+            .iter()
+            .any(|service| service.name == "gateway-edge-public")
+    }));
+
+    let updates = plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
+    let gateway_update = updates
+        .iter()
+        .find(|update| update.kind == "Gateway" && update.name == "edge")
+        .expect("Gateway status update");
+    let programmed = gateway_update.status["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|condition| condition["type"] == "Programmed")
+        .expect("Gateway Programmed condition");
+    assert_eq!(
+        programmed["status"], "False",
+        "a core Service with the synthetic display name must not impersonate Gateway listener provenance"
+    );
+}
+
+#[test]
 fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
     // Watch both namespaces so the certs Secret/ReferenceGrant are collected;
     // otherwise fail-closed looks identical to a missing grant.
