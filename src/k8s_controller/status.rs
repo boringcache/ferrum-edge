@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -1224,59 +1224,6 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("Terminate")
         .eq_ignore_ascii_case("Terminate")
-}
-
-fn listener_tls_certificate_ref_identities(
-    parent: &K8sObject,
-    listener: &Value,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> Vec<(String, String)> {
-    let from_kind = match parent.kind.as_str() {
-        "ListenerSet" => "ListenerSet",
-        _ => "Gateway",
-    };
-    listener
-        .get("tls")
-        .and_then(|tls| tls.get("certificateRefs"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|certificate_ref| {
-            let group = certificate_ref
-                .get("group")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let kind = certificate_ref
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Secret");
-            if !group.is_empty() || kind != "Secret" {
-                return None;
-            }
-            let name = certificate_ref.get("name").and_then(Value::as_str)?;
-            let namespace = certificate_ref
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or(&parent.metadata.namespace);
-            if namespace != parent.metadata.namespace
-                && !reference_grant_allows_secret_indexed(
-                    indexes,
-                    &parent.metadata.namespace,
-                    from_kind,
-                    namespace,
-                    name,
-                )
-            {
-                return None;
-            }
-            let secret = indexes
-                .secrets_by_ns_name
-                .get(&(namespace, name))
-                .copied()?;
-            secret_object_is_valid_tls_certificate(secret)
-                .then(|| (namespace.to_string(), name.to_string()))
-        })
-        .collect()
 }
 
 fn reference_grant_allows_secret_indexed(
