@@ -3003,15 +3003,19 @@ fn oauth2_introspection_cache_schema_and_docs_match_runtime_constants() {
     }
 
     let cache_guide = include_str!("../../docs/cache_management.md");
-    assert!(cache_guide.contains(
-        "| `oauth2_introspection` | `providers[].max_cache_entries` | `10000` |"
-    ));
-    assert!(cache_guide.contains(
-        "| `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` |"
-    ));
-    assert!(cache_guide.contains(
-        "| `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` |"
-    ));
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entries` | `10000` |")
+    );
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` |")
+    );
+    assert!(
+        cache_guide.contains(
+            "| `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` |"
+        )
+    );
 }
 
 #[test]

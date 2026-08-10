@@ -860,9 +860,7 @@ impl MetricsRegistry {
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
             oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
-            oauth2_introspection_cache_retained_bytes: std::array::from_fn(|_| {
-                AtomicI64::new(0)
-            }),
+            oauth2_introspection_cache_retained_bytes: std::array::from_fn(|_| AtomicI64::new(0)),
             oauth2_introspection_cache_admission_skips: std::array::from_fn(|_| {
                 std::array::from_fn(|_| AtomicU64::new(0))
             }),
@@ -2801,9 +2799,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_oauth2_introspection_cache_admission_skips_total OAuth2 introspection results not retained because a bounded cache admission could not complete.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_oauth2_introspection_cache_admission_skips_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_admission_skips_total counter\n");
         for (class_idx, class) in OAUTH2_INTROSPECTION_CACHE_CLASSES.iter().enumerate() {
             for (reason_idx, reason) in OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS
                 .iter()
@@ -2835,9 +2831,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_oauth2_introspection_cache_cleanup_work_total Bounded OAuth2 introspection eviction-index tickets examined.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_oauth2_introspection_cache_cleanup_work_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_cleanup_work_total counter\n");
         render_process_counter(
             &mut output,
             "ferrum_oauth2_introspection_cache_cleanup_work_total",
@@ -4430,21 +4424,18 @@ mod tests {
         registry.record_oauth2_introspection_cache_cleanup_work();
 
         let output = registry.render_uncached();
-        assert!(output.contains(
-            "ferrum_oauth2_introspection_cache_entries{class=\"active\"} 1"
-        ));
-        assert!(output.contains(
-            "ferrum_oauth2_introspection_cache_retained_bytes{class=\"active\"} 512"
-        ));
+        assert!(output.contains("ferrum_oauth2_introspection_cache_entries{class=\"active\"} 1"));
+        assert!(
+            output
+                .contains("ferrum_oauth2_introspection_cache_retained_bytes{class=\"active\"} 512")
+        );
         assert!(output.contains(
             "ferrum_oauth2_introspection_cache_admission_skips_total{class=\"negative\",reason=\"entry_count\"} 1"
         ));
         assert!(output.contains(
             "ferrum_oauth2_introspection_cache_evictions_total{class=\"active\",reason=\"capacity\"} 1"
         ));
-        assert!(output.contains(
-            "ferrum_oauth2_introspection_cache_cleanup_work_total 1"
-        ));
+        assert!(output.contains("ferrum_oauth2_introspection_cache_cleanup_work_total 1"));
         assert!(!output.contains("token="));
         assert!(!output.contains("digest="));
         assert!(!output.contains("subject="));

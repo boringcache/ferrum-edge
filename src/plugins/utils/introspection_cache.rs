@@ -3,8 +3,8 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -72,10 +72,9 @@ impl CachedAuthorization {
             .authorization_error
             .as_ref()
             .map_or(0, |error| error.body.len());
-        let header_bytes = self
-            .claim_headers
-            .iter()
-            .fold(0usize, |bytes, header| bytes.saturating_add(header.value.len()));
+        let header_bytes = self.claim_headers.iter().fold(0usize, |bytes, header| {
+            bytes.saturating_add(header.value.len())
+        });
         size_of::<Self>()
             .saturating_add(ARC_ALLOCATION_OVERHEAD)
             .saturating_add(identity_bytes)
@@ -280,11 +279,7 @@ impl Drop for AdmissionReservation {
     fn drop(&mut self) {
         let budget = self.budget.class(self.class);
         release_atomic(&budget.entries, 1, "entry");
-        release_atomic(
-            &budget.retained_bytes,
-            self.retained_bytes,
-            "retained-byte",
-        );
+        release_atomic(&budget.retained_bytes, self.retained_bytes, "retained-byte");
         crate::plugins::prometheus_metrics::global_registry()
             .adjust_oauth2_introspection_cache_retention(
                 self.class.metric_label(),
@@ -377,9 +372,7 @@ impl IntrospectionCache {
         if entry.expires_at > now {
             entry.recently_used.store(true, Ordering::Relaxed);
             return match &entry.value {
-                EntryValue::Active(authorization) => {
-                    CacheLookup::Active(Arc::clone(authorization))
-                }
+                EntryValue::Active(authorization) => CacheLookup::Active(Arc::clone(authorization)),
                 EntryValue::Negative => CacheLookup::Negative,
             };
         }
@@ -629,12 +622,7 @@ impl IntrospectionCache {
             .active
             .retained_bytes
             .load(Ordering::Acquire)
-            .saturating_add(
-                self.budget
-                    .negative
-                    .retained_bytes
-                    .load(Ordering::Acquire),
-            )
+            .saturating_add(self.budget.negative.retained_bytes.load(Ordering::Acquire))
     }
 }
 
@@ -721,12 +709,7 @@ mod tests {
 
         let oversized = authorization(64);
         let smaller_cache = cache(100, exact - 1, 1024 * 1024);
-        assert!(!smaller_cache.insert_active(
-            "one-byte-over",
-            oversized,
-            Instant::now(),
-            None,
-        ));
+        assert!(!smaller_cache.insert_active("one-byte-over", oversized, Instant::now(), None,));
     }
 
     #[test]
@@ -739,12 +722,7 @@ mod tests {
                     for token in 0..100 {
                         let name = format!("worker-{worker}-token-{token}");
                         if token.is_multiple_of(2) {
-                            cache.insert_active(
-                                &name,
-                                authorization(64),
-                                Instant::now(),
-                                None,
-                            );
+                            cache.insert_active(&name, authorization(64), Instant::now(), None);
                         } else {
                             cache.insert_negative(&name, Instant::now());
                         }
@@ -809,12 +787,7 @@ mod tests {
         let now = Instant::now();
         assert!(cache.insert_negative("inactive-hot", now));
         for token in 0..1000 {
-            cache.insert_active(
-                &format!("active-{token}"),
-                authorization(64),
-                now,
-                None,
-            );
+            cache.insert_active(&format!("active-{token}"), authorization(64), now, None);
         }
         assert!(matches!(
             cache.get("inactive-hot", now),

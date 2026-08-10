@@ -875,10 +875,7 @@ impl Oauth2Introspection {
         consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let identity = authorization.identity.as_deref().map(str::to_string);
-        let header_value = authorization
-            .identity_header
-            .as_deref()
-            .map(str::to_string);
+        let header_value = authorization.identity_header.as_deref().map(str::to_string);
         let consumer = identity
             .as_deref()
             .and_then(|id| consumer_index.find_by_identity(id));
