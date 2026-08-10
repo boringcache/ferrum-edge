@@ -1699,6 +1699,235 @@ fn listenerset_exact_hostname_conflicts_with_gateway_wildcard() {
 }
 
 #[test]
+fn listenerset_cannot_hijack_gateway_catch_all_with_exact_hostname() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("hostname");
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "admin",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "admin.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "admin" && reason == "HostnameConflict"),
+        "tenant exact under Gateway catch-all must conflict: {:?}",
+        status.listener_conflicts
+    );
+    assert!(translation.config.mesh.as_ref().is_none_or(|mesh| {
+        !mesh
+            .services
+            .iter()
+            .any(|service| service.name == "listenerset-tenant-admin")
+    }));
+}
+
+#[test]
+fn listenerset_catch_all_cannot_hijack_gateway_exact_hostname() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "fallback",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "fallback" && reason == "HostnameConflict"),
+        "tenant catch-all beside Gateway exact must conflict: {:?}",
+        status.listener_conflicts
+    );
+}
+
+#[test]
+fn listenerset_nested_wildcard_conflicts_with_gateway_wildcard() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"][0]["hostname"] = json!("*.example.com");
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "nested",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "*.foo.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "nested" && reason == "HostnameConflict"),
+        "nested tenant wildcard under Gateway wildcard must conflict: {:?}",
+        status.listener_conflicts
+    );
+}
+
+#[test]
+fn listenerset_label_boundary_non_overlap_coexists_with_gateway_wildcard() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"][0]["hostname"] = json!("*.example.com");
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "near-miss",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "notexample.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status.listener_conflicts.is_empty(),
+        "DNS label-boundary near-miss must not conflict: {:?}",
+        status.listener_conflicts
+    );
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        mesh.services
+            .iter()
+            .any(|service| service.name == "listenerset-tenant-near-miss")
+    }));
+}
+
+#[test]
+fn listenerset_case_and_trailing_dot_normalize_into_gateway_conflict() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"][0]["hostname"] = json!("*.Example.COM.");
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "admin",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "Admin.Example.Com.",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "admin" && reason == "HostnameConflict"),
+        "case/trailing-dot normalized overlap must conflict: {:?}",
+        status.listener_conflicts
+    );
+}
+
+#[test]
+fn listenerset_sibling_exact_and_wildcard_still_coexist() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "siblings",
+            "edge",
+            json!([
+                {
+                    "name": "exact",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "exact.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                },
+                {
+                    "name": "wild",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "hostname": "*.example.com",
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                }
+            ]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "siblings")
+        .expect("status");
+    assert!(
+        status.accepted && status.listener_conflicts.is_empty(),
+        "compatible ListenerSet siblings must coexist: {:?}",
+        status.listener_conflicts
+    );
+    assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
+        ["exact", "wild"].iter().all(|listener| {
+            mesh.services
+                .iter()
+                .any(|service| service.name == format!("listenerset-siblings-{listener}"))
+        })
+    }));
+}
+
+#[test]
 fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     let missing_fields = vec![
         gateway_class(),

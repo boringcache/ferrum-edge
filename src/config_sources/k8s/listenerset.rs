@@ -604,37 +604,60 @@ fn conflict_against_accepted(
         if !prior.protocol.eq_ignore_ascii_case(&candidate.protocol) {
             return Some("ProtocolConflict");
         }
-        if hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref()) {
+        if hostnames_conflict(prior, candidate) {
             return Some("HostnameConflict");
         }
     }
     None
 }
 
-fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+/// Hostname conflict arbitration for ListenerSet merge.
+///
+/// Gateway API v1.5.1 treats exact, wildcard, and unset/catch-all hostnames as
+/// distinct listener values: compatible siblings coexist and runtime precedence
+/// picks the most specific match. Identical hostname values still conflict.
+///
+/// Cross-trust claims are stricter. When a higher-precedence **Gateway**
+/// listener already owns a port/protocol slot, a tenant **ListenerSet** must
+/// not materialize a hostname that overlaps that Gateway coverage — including
+/// exact-vs-wildcard, nested wildcards, and unset/catch-all — or it can hijack
+/// traffic the Gateway already claims.
+fn hostnames_conflict(prior: &ConflictCandidate, candidate: &ConflictCandidate) -> bool {
+    let left = prior.hostname.as_deref();
+    let right = candidate.hostname.as_deref();
+    let cross_trust = prior.key.parent_kind == GatewayApiListenerParentKind::Gateway
+        && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet;
+
     match (left, right) {
         (None, None) => true,
+        (Some(left), Some(right)) if left == right => true,
+        (Some(left), Some(right)) => cross_trust && hostname_coverages_overlap(left, right),
+        (None, Some(_)) | (Some(_), None) => cross_trust,
+    }
+}
+
+fn hostname_coverages_overlap(left: &str, right: &str) -> bool {
+    let left_suffix = left.strip_prefix("*.");
+    let right_suffix = right.strip_prefix("*.");
+    match (left_suffix, right_suffix) {
+        (None, None) => false,
+        (Some(suffix), None) => hostname_matches_suffix(right, suffix),
+        (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
         (Some(left), Some(right)) => {
-            let left_suffix = left.strip_prefix("*.");
-            let right_suffix = right.strip_prefix("*.");
-            match (left_suffix, right_suffix) {
-                (None, None) => left == right,
-                (Some(suffix), None) => hostname_matches_suffix(right, suffix),
-                (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
-                (Some(left), Some(right)) => {
-                    suffix_is_within(left, right) || suffix_is_within(right, left)
-                }
-            }
+            suffix_is_within(left, right) || suffix_is_within(right, left)
         }
-        (None, Some(_)) | (Some(_), None) => true,
     }
 }
 
 fn hostname_matches_suffix(hostname: &str, suffix: &str) -> bool {
+    // Gateway API single-label wildcards match one DNS label under the suffix,
+    // never the bare suffix apex itself (`*.example.com` ⊄ `example.com`).
     hostname != suffix && suffix_is_within(hostname, suffix)
 }
 
 fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    // Require a DNS label boundary so `notexample.com` never matches
+    // `*.example.com` via a raw string suffix.
     hostname
         .strip_suffix(suffix)
         .is_some_and(|prefix| prefix.ends_with('.'))
