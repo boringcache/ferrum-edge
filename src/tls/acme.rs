@@ -544,6 +544,11 @@ pub enum AcmeError {
     InvalidChallengeToken(String),
     #[error("ACME certificate '{id}' does not contain {kind} material")]
     MissingMaterial { id: String, kind: &'static str },
+    /// Material bytes exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
+    ///
+    /// Deliberately content-free: diagnostics must not echo PEM or key bytes.
+    #[error("ACME certificate material exceeds the configured byte ceiling")]
+    MaterialTooLarge,
     /// Deliberately content-free apart from the order id: this fires on
     /// private-key/CSR material, so it must not describe what it found.
     #[error("ACME order '{0}' finalization material is missing or unusable")]
@@ -690,6 +695,7 @@ impl AcmeCertificateStore {
     ) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(&record.id)?;
         validate_acme_domains(&record.domains)?;
+        validate_acme_certificate_material_size(&record)?;
         self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
@@ -1251,13 +1257,16 @@ impl AcmeSourceReference {
 
     fn material_from(&self, record: AcmeCertificateRecord) -> Result<AcmeMaterial, AcmeError> {
         let bytes = match self.part {
-            AcmeMaterialPart::Cert => Some(record.public_material().into_bytes()),
-            AcmeMaterialPart::Key => Some(record.key_pem.as_bytes().to_vec()),
-        }
-        .ok_or_else(|| AcmeError::MissingMaterial {
-            id: record.id.clone(),
-            kind: self.part.source_suffix(),
-        })?;
+            AcmeMaterialPart::Cert => {
+                let pem = record.public_material();
+                ensure_acme_bytes_within_limit(pem.len())?;
+                pem.into_bytes()
+            }
+            AcmeMaterialPart::Key => {
+                ensure_acme_bytes_within_limit(record.key_pem.len())?;
+                record.key_pem.as_bytes().to_vec()
+            }
+        };
         Ok(AcmeMaterial {
             bytes,
             kind: self.part.material_kind(),
@@ -1333,6 +1342,31 @@ fn combined_public_material(cert_pem: &str, chain_pem: Option<&str>) -> String {
 
 fn fingerprint_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn acme_material_max_bytes() -> Result<usize, AcmeError> {
+    crate::tls::source::effective_tls_max_material_size_bytes()
+        .map_err(|error| AcmeError::Write(error.to_string()))
+}
+
+fn ensure_acme_bytes_within_limit(len: usize) -> Result<(), AcmeError> {
+    let max_bytes = acme_material_max_bytes()?;
+    if len > max_bytes {
+        return Err(AcmeError::MaterialTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_acme_certificate_material_size(
+    record: &AcmeCertificateRecord,
+) -> Result<(), AcmeError> {
+    ensure_acme_bytes_within_limit(record.cert_pem.len())?;
+    ensure_acme_bytes_within_limit(record.key_pem.len())?;
+    if let Some(chain) = record.chain_pem.as_deref() {
+        ensure_acme_bytes_within_limit(chain.len())?;
+    }
+    ensure_acme_bytes_within_limit(record.public_material().len())?;
+    Ok(())
 }
 
 fn validate_acme_id(id: &str) -> Result<(), AcmeError> {

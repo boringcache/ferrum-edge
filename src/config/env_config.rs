@@ -111,6 +111,56 @@ pub fn tls_store_instance_id_from_env() -> Option<String> {
     crate::config::conf_file::resolve_ferrum_var(key)
 }
 
+/// Settings key for the TLS material source byte ceiling.
+pub const TLS_MAX_MATERIAL_SIZE_BYTES_KEY: &str = "FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES";
+/// Default / recommended TLS material source byte ceiling (4 MiB).
+pub const DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
+/// Minimum accepted TLS material source byte ceiling.
+pub const MIN_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 1;
+/// Hard maximum TLS material source byte ceiling (4 MiB).
+///
+/// This is intentionally finite and equal to the default: `0` never means
+/// unlimited, and the ceiling cannot be raised past the shared PEM parse
+/// admission bound.
+pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Effective TLS material source byte ceiling
+/// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
+///
+/// Read directly rather than only through `EnvConfig` because
+/// `load_material_blocking`, managed/ACME store admission, and live-reload
+/// watchers can run before or without a fully built `EnvConfig`.
+///
+/// Absent selects the documented default. A valid number outside
+/// `[MIN, HARD_MAX]` is clamped. A malformed value is an error (never a silent
+/// fallback to unlimited or to the default). `0` is not unlimited — it clamps
+/// to the minimum.
+pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
+    parse_tls_max_material_size_bytes(
+        crate::config::conf_file::resolve_ferrum_var(TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
+    )
+}
+
+/// Pure parse/validation half of [`tls_max_material_size_bytes_from_env`].
+///
+/// `None` means the key is configured nowhere. External unit tests drive this
+/// helper so they do not race other suites on the process environment.
+pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, String> {
+    let value = match raw {
+        None => DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{TLS_MAX_MATERIAL_SIZE_BYTES_KEY} must be a whole number of bytes; \
+                 the configured value is not"
+            )
+        })?,
+    };
+    Ok(value.clamp(
+        MIN_TLS_MAX_MATERIAL_SIZE_BYTES,
+        HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES,
+    ))
+}
+
 /// SQL connection target for secondary consumers that must track the gateway
 /// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
 ///
@@ -2321,6 +2371,11 @@ pub struct EnvConfig {
     /// non-mTLS listener. Ordinary inbound TLS 1.3 uses stateless tickets.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
+    /// Maximum bytes admitted from any TLS material source before whole-value
+    /// buffering (local files, inline PEM, external secret providers,
+    /// Kubernetes Secrets, managed store, and ACME store). Default and hard
+    /// maximum are both 4 MiB; `0` is not unlimited. (default: 4194304)
+    pub tls_max_material_size_bytes: usize,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
@@ -3072,6 +3127,7 @@ impl Default for EnvConfig {
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
             tls_session_cache_size: 4096,
+            tls_max_material_size_bytes: DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
             tls_cert_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
@@ -3613,6 +3669,7 @@ impl EnvConfig {
             tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
             tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
+            tls_max_material_size_bytes: usize = "FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES" => DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES, clamp(MIN_TLS_MAX_MATERIAL_SIZE_BYTES, HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES);
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
@@ -4344,6 +4401,7 @@ impl EnvConfig {
             tls_prefer_server_cipher_order,
             tls_curves,
             tls_session_cache_size,
+            tls_max_material_size_bytes,
             tls_cert_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,

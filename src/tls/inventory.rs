@@ -281,6 +281,13 @@ impl InventoryEntryBuilder {
                 entry.error = Some(source.to_string());
                 return entry;
             }
+            Err(MaterialError::Oversized { kind, max_bytes }) => {
+                entry.state = TlsInventoryState::Invalid;
+                entry.error = Some(format!(
+                    "TLS {kind} material exceeds the configured maximum of {max_bytes} bytes"
+                ));
+                return entry;
+            }
             Err(error) => {
                 entry.state = TlsInventoryState::Invalid;
                 entry.error = Some(error.to_string());

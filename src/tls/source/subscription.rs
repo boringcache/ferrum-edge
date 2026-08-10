@@ -340,6 +340,7 @@ fn material_error_reason(error: &MaterialError) -> &'static str {
         MaterialError::UnsupportedScheme { .. } => "unsupported_scheme",
         MaterialError::Secret { .. } => "secret",
         MaterialError::InvalidSource { .. } => "invalid_source",
+        MaterialError::Oversized { .. } => "oversized",
     }
 }
 
