@@ -1736,21 +1736,21 @@ fn classify_virtual_host(
         }
         if let Some(matcher) = route.r#match.as_ref() {
             for (field, present) in [
-                ("prefix", matcher.prefix != "/"),
                 ("path", !matcher.path.is_empty()),
+                ("safe_regex", !matcher.safe_regex.is_empty()),
+                ("connect_matcher", !matcher.connect_matcher.is_empty()),
                 (
                     "path_separated_prefix",
                     !matcher.path_separated_prefix.is_empty(),
                 ),
+                ("path_match_policy", !matcher.path_match_policy.is_empty()),
+                ("prefix", matcher.prefix != "/"),
                 ("headers", !matcher.headers.is_empty()),
                 ("query_parameters", !matcher.query_parameters.is_empty()),
                 ("grpc", !matcher.grpc.is_empty()),
                 ("runtime_fraction", !matcher.runtime_fraction.is_empty()),
-                ("safe_regex", !matcher.safe_regex.is_empty()),
                 ("tls_context", !matcher.tls_context.is_empty()),
-                ("connect_matcher", !matcher.connect_matcher.is_empty()),
                 ("dynamic_metadata", !matcher.dynamic_metadata.is_empty()),
-                ("path_match_policy", !matcher.path_match_policy.is_empty()),
             ] {
                 if present {
                     return Err(refuse(

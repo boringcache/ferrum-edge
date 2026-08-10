@@ -1608,27 +1608,39 @@ fn stock_regex_route_match_refuses_the_virtual_host() {
 }
 
 #[test]
-fn stock_path_limited_route_matches_refuse_the_virtual_host() {
+fn stock_route_match_constraints_refuse_the_virtual_host() {
     let constrained_matches = [
-        sp::RouteMatch {
-            prefix: "/admin-only".to_string(),
-            ..Default::default()
-        },
-        sp::RouteMatch {
-            path: "/admin-only".to_string(),
-            ..Default::default()
-        },
-        sp::RouteMatch {
-            path_separated_prefix: "/admin".to_string(),
-            ..Default::default()
-        },
-        sp::RouteMatch {
-            prefix: "/".to_string(),
-            tls_context: vec![vec![1]],
-            ..Default::default()
-        },
+        (
+            sp::RouteMatch {
+                prefix: "/admin-only".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.prefix",
+        ),
+        (
+            sp::RouteMatch {
+                path: "/admin-only".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.path",
+        ),
+        (
+            sp::RouteMatch {
+                path_separated_prefix: "/admin".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.path_separated_prefix",
+        ),
+        (
+            sp::RouteMatch {
+                prefix: "/".to_string(),
+                tls_context: vec![vec![1]],
+                ..Default::default()
+            },
+            "routes[].match.tls_context",
+        ),
     ];
-    for route_match in constrained_matches {
+    for (route_match, expected_detail) in constrained_matches {
         let mut config = route_config("9080", &["10.96.0.5"], REVIEWS_CLUSTER);
         config.virtual_hosts[0].routes[0].r#match = Some(route_match);
         let accumulator = rds_with(config);
@@ -1636,6 +1648,7 @@ fn stock_path_limited_route_matches_refuse_the_virtual_host() {
             refusal_reasons(&accumulator),
             vec![refusal::UNSUPPORTED_ROUTE_MATCH]
         );
+        assert_eq!(accumulator.refusals()[0].detail, expected_detail);
         assert!(
             accumulator.route_configs()["9080"].virtual_hosts.is_empty(),
             "a path-constrained virtual host must not contribute a VIP"
