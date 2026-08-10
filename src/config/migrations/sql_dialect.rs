@@ -824,6 +824,7 @@ impl V001SqlBuilder {
                 proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                trigger_json MEDIUMTEXT DEFAULT NULL,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
@@ -841,6 +842,7 @@ impl V001SqlBuilder {
                 proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                trigger_json TEXT DEFAULT NULL,
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

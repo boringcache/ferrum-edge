@@ -484,6 +484,16 @@ pub struct MeshRuntimeConfig {
     /// `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Each entry is either a bare
     /// Kubernetes service-account name or a full SPIFFE id.
     pub trusted_hbone_assertors: Vec<String>,
+    /// Containment roots admitted for a `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket (issue #3261). Sourced from
+    /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`; **empty means the feature is
+    /// OFF** and every `unix://` endpoint is refused fail-closed. There is no
+    /// built-in allowance — see `crate::util::unix_socket`.
+    pub unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for such a socket. Empty admits only the Ferrum
+    /// process's own effective uid. Sourced from
+    /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS`.
+    pub unix_socket_allowed_uids: Vec<u32>,
     /// Workload labels for this mesh data plane. Used by `mesh_authz`'s
     /// PolicyScope filter (and by `MeshSlice::from_gateway_config`'s
     /// WorkloadSelector matching) to decide which policies apply to this
@@ -774,6 +784,17 @@ impl MeshRuntimeConfig {
         }
         let trusted_hbone_assertors = env_config.mesh_trusted_hbone_assertors.clone();
 
+        // Sidecar ingress Unix-socket containment (issue #3261). Validated here
+        // so a typo in a security allowlist fails startup loudly instead of
+        // silently narrowing (or widening) which local sockets an operator's
+        // `Sidecar` may point the proxy at. Empty is legal and means the
+        // feature is OFF — every `unix://` `defaultEndpoint` is then refused.
+        crate::util::unix_socket::validate_allowed_roots(
+            &env_config.mesh_unix_socket_allowed_roots,
+        )?;
+        let unix_socket_allowed_roots = env_config.mesh_unix_socket_allowed_roots.clone();
+        let unix_socket_allowed_uids = env_config.mesh_unix_socket_allowed_uids.clone();
+
         let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(DEFAULT_DNS_ENABLED);
@@ -861,6 +882,8 @@ impl MeshRuntimeConfig {
             xds_connect_timeout_seconds,
             trust_domain_aliases,
             trusted_hbone_assertors,
+            unix_socket_allowed_roots,
+            unix_socket_allowed_uids,
             workload_labels,
             workload_svid_cert_path,
             workload_svid_key_path,
@@ -1398,13 +1421,15 @@ fn prepare_normalized_gateway_config_for_mesh(
             .local_ingress_listeners
             .iter()
             .filter(|listener| {
-                if !listener.endpoint_is_valid() {
+                if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                     warn!(
                         listener_port = listener.port,
                         endpoint_host = %listener.endpoint_host,
                         endpoint_port = listener.endpoint_port,
+                        has_unix_path = listener.endpoint_unix_path.is_some(),
                         "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                         (not a loopback host:port); failing closed rather than routing it"
+                         (neither a loopback host:port nor a contained, admissible unix socket path); \
+                         failing closed rather than routing it"
                     );
                     return false;
                 }
@@ -4605,18 +4630,19 @@ fn materialize_sidecar_inbound_proxies(
 }
 
 /// Materialize the workload's Sidecar `ingress[]` custom inbound listeners as
-/// loopback routes (F6 §6.2). Called only when the slice resolved at least one
-/// listener; per Istio these REPLACE the default per-service-port inbound
-/// routes, so the caller returns without running the service-port path.
+/// co-located loopback-TCP or Unix-stream routes (F6 §6.2). Per Istio these
+/// REPLACE the default per-service-port inbound routes, so the caller returns
+/// without running the service-port path even when every declared listener is
+/// refused.
 ///
 /// Each listener becomes one route: hosts = the union of its owning local
 /// service's FQDN variants (the owner identity the slice builder stamped from
 /// the resolved local-inbound view — Istio only configures ingress "if and only
 /// if the workload is associated with a service"); backend = the entry's
-/// resolved loopback `defaultEndpoint`; listen path `/`. The listener port
-/// disambiguates per-port siblings exactly like the default inbound path, but
-/// the captured original destination matches the LISTENER port (the dialed
-/// port) rather than the backend port — see
+/// resolved loopback or Unix-stream `defaultEndpoint`; listen path `/`. The
+/// listener port disambiguates per-port siblings exactly like the default
+/// inbound path, but the captured original destination matches the LISTENER
+/// port rather than the TCP backend port (a Unix backend has none) — see
 /// `HostRouteTable::select_mesh_inbound_port_route` and the router's ingress
 /// grouping. Operator-proxy yield mirrors the default inbound path.
 fn materialize_sidecar_ingress_listener_proxies(
@@ -4633,8 +4659,9 @@ fn materialize_sidecar_ingress_listener_proxies(
     // untrusted wire JSON. Drop a listener that fails EITHER guard, fail-closed:
     //
     //   1. Backend endpoint: must pass the same loopback/instance-IP +
-    //      nonzero-port allowlist `MeshSidecarIngress::resolve` enforces, so the
-    //      carrier path can never dial somewhere resolution would have refused.
+    //      nonzero-port rules `MeshSidecarIngress::resolve` enforces, or the
+    //      Unix shape/syntax rules PLUS this DP's containment roots, so the
+    //      carrier path can never dial somewhere either boundary would refuse.
     //   2. Owner anchor: must carry a non-empty `owner_namespace`/`owner_service`
     //      (the slice builder stamps these from the resolved local service; it
     //      clears ALL listeners when no local service anchors them). An owner-less
@@ -4654,14 +4681,16 @@ fn materialize_sidecar_ingress_listener_proxies(
         .local_ingress_listeners
         .iter()
         .filter(|listener| {
-            if !listener.endpoint_is_valid() {
+            if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                 warn!(
                     local_spiffe,
                     listener_port = listener.port,
                     endpoint_host = %listener.endpoint_host,
                     endpoint_port = listener.endpoint_port,
+                    has_unix_path = listener.endpoint_unix_path.is_some(),
                     "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                     (not a loopback host:port); failing closed rather than dialing it"
+                     (neither a loopback host:port nor a contained, admissible unix socket path); \
+                     failing closed rather than dialing it"
                 );
                 return false;
             }
@@ -4732,18 +4761,66 @@ fn materialize_sidecar_ingress_listener_proxies(
 
     let mut materialized = 0usize;
     for listener in listeners.iter().copied() {
-        let proxy = mesh_inbound_loopback_proxy_to(
-            &mesh_ingress_proxy_id(
-                &listener.owner_namespace,
-                &listener.owner_service,
-                listener.port,
-            ),
-            hosts.clone(),
+        // Re-derive the TYPED backend from the same guard that admitted the
+        // listener above, so the two can never disagree about which shape this
+        // entry is. `None` is unreachable here (the filter already ran) but is
+        // handled by skipping rather than by an `expect`.
+        let Some(backend) = listener.backend(&runtime.unix_socket_allowed_roots) else {
+            continue;
+        };
+        let proxy_id = mesh_ingress_proxy_id(
             &listener.owner_namespace,
-            &listener.endpoint_host,
-            listener.endpoint_port,
-            now,
+            &listener.owner_service,
+            listener.port,
         );
+        let mut unix_upstream: Option<Upstream> = None;
+        let proxy = match &backend {
+            crate::modes::mesh::config::MeshIngressBackend::Loopback { host, port } => {
+                mesh_inbound_loopback_proxy_to(
+                    &proxy_id,
+                    hosts.clone(),
+                    &listener.owner_namespace,
+                    host,
+                    *port,
+                    now,
+                )
+            }
+            crate::modes::mesh::config::MeshIngressBackend::Unix { path, h2c } => {
+                // The socket path rides a single-target upstream tag rather than
+                // a `Proxy` field: `UpstreamTarget.tags` is the established
+                // mesh transport-marker carrier (`mesh.hbone`, `mesh.mtls`), and
+                // the reserved `mesh.` namespace is stripped from every
+                // operator/workload-label copy so the tag cannot be forged.
+                let upstream_id = mesh_ingress_unix_upstream_id(
+                    &listener.owner_namespace,
+                    &listener.owner_service,
+                    listener.port,
+                );
+                let mut proxy = mesh_inbound_loopback_proxy_to(
+                    &proxy_id,
+                    hosts.clone(),
+                    &listener.owner_namespace,
+                    // Placeholder host:port. It is NEVER dialed: dispatch is
+                    // gated fail-closed on the `mesh.unix_socket` tag (a tagged
+                    // target refuses rather than falling back to TCP), and it
+                    // exists only so the route/URL machinery has a syntactically
+                    // valid authority to build request targets from.
+                    MESH_INGRESS_UNIX_PLACEHOLDER_HOST,
+                    listener.port,
+                    now,
+                );
+                proxy.upstream_id = Some(upstream_id.clone());
+                unix_upstream = Some(mesh_ingress_unix_upstream(
+                    &upstream_id,
+                    &listener.owner_namespace,
+                    listener.port,
+                    path,
+                    *h2c,
+                    now,
+                ));
+                proxy
+            }
+        };
         // Yield to an explicit operator proxy already routing this host/path,
         // exactly like the default inbound path. Exclude this workload's OWN
         // ingress siblings (grouped by the router); another proxy still wins
@@ -4776,6 +4853,20 @@ fn materialize_sidecar_ingress_listener_proxies(
         } else {
             config.proxies.push(proxy);
         }
+        // The Unix upstream is installed ONLY once its proxy survived the
+        // operator-yield scan, so a yielded listener leaves no orphan upstream
+        // behind on reload.
+        if let Some(upstream) = unix_upstream {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+        }
         materialized += 1;
     }
 
@@ -4785,6 +4876,95 @@ fn materialize_sidecar_ingress_listener_proxies(
             local_spiffe,
             "Materialized Sidecar ingress[] custom inbound listeners to the local application"
         );
+    }
+}
+
+/// Reserved id prefix for the single-target upstream that carries a Sidecar
+/// `ingress[]` listener's Unix-socket backend path. Distinct id space from the
+/// outbound/egress upstream prefixes; collected as a trusted mesh-generated
+/// identity by the shared `__mesh` prefix rule.
+pub(crate) const MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX: &str = "__mesh-ingress-unix-";
+
+/// Placeholder backend host stamped on a Unix-backed ingress proxy.
+///
+/// It is never dialed — `proxy_to_backend` refuses a `mesh.unix_socket` target
+/// outright rather than falling back to TCP — but the router, URL builder, and
+/// backend-egress preflight all expect a syntactically valid authority, and
+/// loopback is the only host this co-located-app model would ever accept.
+pub(crate) const MESH_INGRESS_UNIX_PLACEHOLDER_HOST: &str = "127.0.0.1";
+
+/// Id for the Unix-backend upstream of one Sidecar `ingress[]` listener.
+///
+/// Shares the `mesh_*_id` family's latent-collision caveat (see
+/// [`mesh_inbound_proxy_id`]): safe today because the slice is scoped to a
+/// single namespace, so only `name`+`port` vary.
+fn mesh_ingress_unix_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("{MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-")
+}
+
+/// The single-target upstream carrying one ingress listener's Unix-socket
+/// backend path on the reserved `mesh.unix_socket` tag.
+///
+/// No health checks: an active probe would dial the placeholder loopback
+/// host:port (which nothing listens on) and eject the only target, and a
+/// passive probe has nothing to observe on a single-target upstream.
+fn mesh_ingress_unix_upstream(
+    upstream_id: &str,
+    namespace: &str,
+    listener_port: u16,
+    socket_path: &str,
+    h2c: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Upstream {
+    let mut tags = HashMap::new();
+    tags.insert(
+        crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG.to_string(),
+        socket_path.to_string(),
+    );
+    // The wire protocol is resolved once at translation from the declared
+    // `port.protocol` and carried explicitly. Both boolean values are written:
+    // dispatch rejects a missing or malformed marker rather than inferring a
+    // protocol or silently downgrading a partially stripped h2c carrier.
+    tags.insert(
+        crate::proxy::unix_backend::MESH_UNIX_SOCKET_H2C_TAG.to_string(),
+        h2c.to_string(),
+    );
+    Upstream {
+        id: upstream_id.to_string(),
+        name: Some(upstream_id.to_string()),
+        namespace: namespace.to_string(),
+        targets: vec![UpstreamTarget {
+            host: MESH_INGRESS_UNIX_PLACEHOLDER_HOST.to_string(),
+            port: listener_port,
+            service_port_policy_key: None,
+            weight: 1,
+            tags,
+            locality: None,
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        source_labels: Default::default(),
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
     }
 }
 
@@ -7811,6 +7991,7 @@ fn synthesize_mesh_outbound_cors_plugins(
                 proxy_id: Some(proxy_id),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -11250,6 +11431,7 @@ fn ensure_global_plugin_inner(
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -11700,6 +11882,35 @@ type PreparedMeshRuntimeBeforeOwner = (
     Vec<JoinHandle<()>>,
 );
 
+/// Refuse the host-network UDP capture placement on any topology but Ambient.
+///
+/// [`crate::capture::udp_capture_settings_from_env`] already rejects the
+/// placement switch without the capture switch, but it is shared with the
+/// injector and the node-agent — neither of which knows the mesh topology — so
+/// the topology half of the contract has to be enforced on the serving path
+/// instead. Without it a Sidecar (or waypoint, or gateway) process ACCEPTS
+/// `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` and comes up with no host
+/// capture producer at all, while `docs/configuration.md`, `docs/mesh.md`, and
+/// the chart all promise a startup error. The Helm gate is not enforcement: a
+/// direct-env, non-Helm, or hand-rolled manifest deployment never sees it.
+///
+/// Ambient is the only topology whose proxy runs OUTSIDE the workload pod netns,
+/// which is the entire premise of the placement; every other topology either
+/// captures UDP from inside the pod netns (Sidecar) or has no UDP relay at all.
+pub fn validate_udp_host_netns_placement(
+    topology: MeshTopology,
+    settings: &crate::capture::UdpCaptureSettings,
+) -> Result<(), String> {
+    if !settings.udp_host_netns_enabled || topology == MeshTopology::Ambient {
+        return Ok(());
+    }
+    Err(format!(
+        "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient \
+         (host-network UDP capture is the Ambient placement whose proxy runs outside the workload \
+         pod network namespace); this process resolved topology {topology:?}"
+    ))
+}
+
 fn prepare_mesh_runtime_before_owner(
     env_config: &EnvConfig,
     runtime: &MeshRuntimeConfig,
@@ -11716,7 +11927,12 @@ fn prepare_mesh_runtime_before_owner(
     // the very top of the serving path, makes an operator config error abort
     // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
     // (which a later `?` would have left running for in-process retries/tests).
-    crate::capture::udp_capture_settings_from_env()
+    let udp_capture_settings = crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+    // Same contract, topology half: the shared parser cannot see the topology,
+    // so this is the boundary that makes the documented "startup error" real for
+    // a non-Helm deployment.
+    validate_udp_host_netns_placement(runtime.topology, &udp_capture_settings)
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
 
     // Same contract for the NodeWaypoint transparent inbound capture listener
@@ -11815,6 +12031,31 @@ fn prepare_mesh_runtime_before_owner(
         proxy_state,
         health_check_handles,
     ))
+}
+
+/// Delay only the incoming Ambient UDP producer until stale host readiness can
+/// no longer be retracted. Unrelated mesh/admin listeners continue startup while
+/// the predecessor datapath stays installed and fail-closed.
+async fn await_host_udp_retraction(
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(mut ready) = ready else {
+        return !*shutdown.borrow();
+    };
+    loop {
+        if *shutdown.borrow() {
+            return false;
+        }
+        tokio::select! {
+            result = &mut ready => return result.is_ok(),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
@@ -12007,11 +12248,51 @@ async fn arm_mesh_runtime_startup(
         let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
             anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
         })?;
+        // Reap host-namespace UDP state whenever THIS process is not the one that
+        // owns it. Host capture's own manager recovers (and then rebuilds) its
+        // state at startup, but a node that switched to the pod-netns placement or
+        // disabled UDP entirely would otherwise keep a `PREROUTING` jump into a
+        // chain no socket serves — captured egress diverted into a black hole with
+        // no remaining code path to clean it up.
+        //
+        // The reap is SEQUENCED behind the durable readiness handshake for two
+        // reasons that both concern the producer started below:
+        //
+        // * the node-agent still holds a BPF UDP gate open for every pod the
+        //   previous host generation readied, so removing that generation's rules
+        //   before those gates are acknowledged closed would release the pods'
+        //   UDP egress in plaintext; and
+        // * the retraction must land BEFORE the incoming per-pod-netns producer
+        //   starts publishing readiness of its own, so the two never fight over
+        //   the shared `.udp-ready` markers.
+        //
+        // One bounded recovery pass runs here. If discovery/retraction cannot
+        // complete, only the incoming UDP producer waits on its returned barrier;
+        // unrelated mesh/admin listeners continue startup. Once retraction is
+        // complete, the incoming producer may safely republish readiness while
+        // stale host-state reaping continues in the background.
+        let mut host_udp_retraction_ready = None;
+        if !settings.udp_host_netns_enabled {
+            let host_ready_dir =
+                std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                    .join(".udp-ready");
+            let recovery = crate::proxy::host_udp_capture::recover_and_reap_stale_host_udp_state(
+                Some(host_ready_dir),
+                std::time::Duration::from_secs(2),
+                shutdown_tx.subscribe(),
+            )
+            .await;
+            host_udp_retraction_ready = recovery.retraction_ready;
+            if let Some(handle) = recovery.retry_task {
+                owner.push_mesh_background(handle);
+            }
+        }
         if settings.udp_capture_enabled {
             if !cfg!(target_os = "linux") {
                 warn!(
-                    "Ambient UDP capture is enabled but the per-pod-netns producer is Linux-only; \
-                     not starting it (UDP egress passes through un-captured)"
+                    "Ambient UDP capture is enabled but both the per-pod-netns producer and the \
+                     host-network capture path are Linux-only; not starting either (UDP egress \
+                     passes through un-captured)"
                 );
             } else {
                 // Fail closed on a malformed capture config (codex): an invalid
@@ -12023,14 +12304,17 @@ async fn arm_mesh_runtime_startup(
                             "Ambient UDP capture is enabled but the capture config is invalid: {e}"
                         )
                     })?;
-                // Producer posture: UDP enabled, POD netns (never host-netns — the
-                // producer installs rules INSIDE each pod netns), on the resolved
-                // capture port/mark. The include/exclude scope is node-level (from
-                // the proxy's `FERRUM_MESH_CAPTURE_*` env); per-pod
-                // `includeOutboundPorts` annotation scoping is a documented
-                // follow-up (it would ride the registry).
+                // Producer posture: UDP enabled, on the resolved capture
+                // port/mark. `host_netns` selects WHICH rule generator is valid —
+                // the pod-netns producer installs rules INSIDE each pod netns
+                // (`false`), while the host-network path installs interface-scoped
+                // rules in the proxy's own namespace (`true`). The
+                // include/exclude scope is node-level (from the proxy's
+                // `FERRUM_MESH_CAPTURE_*` env); per-pod `includeOutboundPorts`
+                // annotation scoping is a documented follow-up (it would ride the
+                // registry).
                 capture_config.udp_capture_enabled = true;
-                capture_config.host_netns = false;
+                capture_config.host_netns = settings.udp_host_netns_enabled;
                 capture_config.udp_outbound_port = settings.udp_outbound_port;
                 capture_config.tproxy_mark = settings.tproxy_mark;
                 // The sidecar default excludes (15001/15006/15008/15020) only make
@@ -12062,34 +12346,86 @@ async fn arm_mesh_runtime_startup(
                 let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                     env_config.mesh_node_waypoint_pod_registry_dir.clone(),
                 ));
-                let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
-                    Arc::new(proxy_state.clone()),
-                    capture_config,
-                    settings.udp_outbound_port,
-                    env_config.udp_max_sessions,
-                    env_config.udp_cleanup_interval_seconds,
-                    env_config.udp_recvmmsg_batch_size,
-                    env_config.pool_shard_amount,
-                );
-                let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
-                    settings.udp_outbound_port,
-                    source,
-                    backend,
-                    std::time::Duration::from_secs(2),
-                )
-                .with_ready_dir(Some(
+                let ready_dir =
                     std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
-                        .join(".udp-ready"),
-                ));
+                        .join(".udp-ready");
                 let manager_shutdown = shutdown_tx.subscribe();
-                info!(
-                    registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
-                    capture_port = settings.udp_outbound_port,
-                    "Ambient per-pod-netns UDP capture producer enabled"
-                );
-                owner.push_mesh_background(tokio::spawn(async move {
-                    manager.run(manager_shutdown).await;
-                }));
+                if settings.udp_host_netns_enabled {
+                    // Host-network capture (issue #3288). The proxy already runs
+                    // in the host namespace, so this needs no `setns` and no
+                    // `hostPID`/`SYS_ADMIN`/`SYS_PTRACE` — only `NET_ADMIN` for
+                    // the mangle rules and the transparent binds. Direction is
+                    // split by INGRESS INTERFACE, and each datagram is attributed
+                    // to a pod by that interface plus its registered source
+                    // address, so node traffic is never captured and one pod can
+                    // never be relayed under another's identity.
+                    //
+                    // Placement migration: this path reaps only HOST-namespace
+                    // state. Rules a previous per-pod-netns generation installed
+                    // live inside each pod's own namespace and are destroyed with
+                    // that namespace, so switching placement on a running node
+                    // leaves already-running pods diverting UDP to a socket that
+                    // no longer exists there — fail-closed (dropped, never
+                    // plaintext), but not captured either. Roll the workloads, or
+                    // do one transitional rollout with UDP capture disabled so the
+                    // pod-netns cleanup manager reaps them first. Documented in
+                    // docs/node_agent.md.
+                    let backend = crate::proxy::host_udp_capture::ProxyHostUdpBackend::new(
+                        Arc::new(proxy_state.clone()),
+                        capture_config,
+                        settings.udp_outbound_port,
+                        env_config.udp_max_sessions,
+                        env_config.udp_cleanup_interval_seconds,
+                        env_config.udp_recvmmsg_batch_size,
+                        env_config.pool_shard_amount,
+                    );
+                    let manager = crate::proxy::host_udp_capture::HostUdpCaptureManager::new(
+                        source,
+                        backend,
+                        std::time::Duration::from_secs(2),
+                    )
+                    .with_ready_dir(Some(ready_dir));
+                    info!(
+                        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                        capture_port = settings.udp_outbound_port,
+                        "Ambient host-network UDP capture enabled (per-pod ingress-interface \
+                         scoping; no pod-netns entry)"
+                    );
+                    owner.push_mesh_background(tokio::spawn(async move {
+                        manager.run(manager_shutdown).await;
+                    }));
+                } else {
+                    let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
+                        Arc::new(proxy_state.clone()),
+                        capture_config,
+                        settings.udp_outbound_port,
+                        env_config.udp_max_sessions,
+                        env_config.udp_cleanup_interval_seconds,
+                        env_config.udp_recvmmsg_batch_size,
+                        env_config.pool_shard_amount,
+                    );
+                    let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
+                        settings.udp_outbound_port,
+                        source,
+                        backend,
+                        std::time::Duration::from_secs(2),
+                    )
+                    .with_ready_dir(Some(ready_dir));
+                    info!(
+                        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                        capture_port = settings.udp_outbound_port,
+                        "Ambient per-pod-netns UDP capture producer enabled"
+                    );
+                    let retraction_ready = host_udp_retraction_ready.take();
+                    owner.push_mesh_background(tokio::spawn(async move {
+                        let mut manager_shutdown = manager_shutdown;
+                        if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await
+                        {
+                            return;
+                        }
+                        manager.run(manager_shutdown).await;
+                    }));
+                }
             }
         } else if cfg!(target_os = "linux") {
             let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
@@ -12110,7 +12446,12 @@ async fn arm_mesh_runtime_startup(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
                 "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
             );
+            let retraction_ready = host_udp_retraction_ready.take();
             owner.push_mesh_background(tokio::spawn(async move {
+                let mut manager_shutdown = manager_shutdown;
+                if !await_host_udp_retraction(retraction_ready, &mut manager_shutdown).await {
+                    return;
+                }
                 manager.run(manager_shutdown).await;
             }));
         }
@@ -13130,7 +13471,7 @@ fn selectable_inbound_peer_auth_ports(
             .local_ingress_listeners
             .iter()
             .filter(|listener| {
-                listener.endpoint_is_valid()
+                listener.endpoint_shape_is_valid()
                     && !listener.owner_namespace.is_empty()
                     && !listener.owner_service.is_empty()
             })
@@ -13180,7 +13521,11 @@ fn selectable_inbound_peer_auth_ports(
         }
     }
     for listener in &slice.local_ingress_listeners {
-        if listener.endpoint_is_valid()
+        // A Unix-socket listener carries no backend PORT (`endpoint_port == 0`),
+        // so it contributes nothing to the app-port PeerAuthentication domain —
+        // the same `port != 0` filter the identity-less branch above applies.
+        if listener.endpoint_shape_is_valid()
+            && listener.endpoint_port != 0
             && !listener.owner_namespace.is_empty()
             && !listener.owner_service.is_empty()
         {
@@ -13304,10 +13649,16 @@ fn resolve_inbound_app_ports_by_orig_dst_port(
         // Match the ingress materializer's carried-value boundary checks. A
         // malformed listener that cannot become a route must not influence the
         // TLS policy table.
-        if !listener.endpoint_is_valid()
+        if !listener.endpoint_shape_is_valid()
             || listener.owner_namespace.is_empty()
             || listener.owner_service.is_empty()
         {
+            continue;
+        }
+        // A Unix-socket listener has no backend PORT to alias to (its
+        // `endpoint_port` is 0), so it contributes no alias: the listener port
+        // resolves its own posture directly.
+        if listener.endpoint_port == 0 {
             continue;
         }
         // Native Sidecar resolution already deduplicates by listener port and
@@ -16741,6 +17092,8 @@ pub mod startup_rollback_test_seams {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -18151,6 +18504,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -18271,6 +18626,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
+            unix_socket_allowed_roots: Vec::new(),
+            unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
@@ -20054,6 +20411,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -20372,6 +20730,7 @@ mod tests {
             proxy_id: Some("operator-udp".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -20430,6 +20789,7 @@ mod tests {
             proxy_id: Some("shared".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -25974,6 +26334,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -26012,6 +26373,7 @@ mod tests {
                     proxy_id: None,
                     enabled: true,
                     priority_override: None,
+                    trigger: None,
                     api_spec_id: None,
                     created_at: now,
                     updated_at: now,
@@ -26025,6 +26387,7 @@ mod tests {
                     proxy_id: None,
                     enabled: true,
                     priority_override: None,
+                    trigger: None,
                     api_spec_id: None,
                     created_at: now,
                     updated_at: now,
@@ -26069,6 +26432,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -26126,6 +26490,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -26275,6 +26640,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -27614,6 +27980,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: generation,
             updated_at: generation,
@@ -27722,6 +28089,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: generation,
                 updated_at: generation,
@@ -29525,6 +29893,7 @@ mod tests {
                     proxy_id: None,
                     enabled: true,
                     priority_override: Some(2005),
+                    trigger: None,
                     api_spec_id: None,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
@@ -29572,6 +29941,7 @@ mod tests {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -35150,6 +35520,8 @@ mod tests {
             port,
             endpoint_host: host.to_string(),
             endpoint_port,
+            endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: "default".to_string(),
             owner_service: "reviews".to_string(),
         }
@@ -35237,6 +35609,386 @@ mod tests {
             .expect("ingress route");
         assert_eq!(route.backend_host, "::1");
         assert_eq!(route.backend_port, 9000);
+    }
+
+    fn unix_ingress_listener(
+        port: u16,
+        socket_path: &str,
+    ) -> crate::modes::mesh::config::ResolvedIngressListener {
+        unix_ingress_listener_with_protocol(port, socket_path, false)
+    }
+
+    fn unix_ingress_listener_with_protocol(
+        port: u16,
+        socket_path: &str,
+        h2c: bool,
+    ) -> crate::modes::mesh::config::ResolvedIngressListener {
+        crate::modes::mesh::config::ResolvedIngressListener {
+            port,
+            // Vacant host:port is the Unix shape's invariant — a both-shapes
+            // carrier is refused by `endpoint_is_valid`.
+            endpoint_host: String::new(),
+            endpoint_port: 0,
+            endpoint_unix_path: Some(socket_path.to_string()),
+            endpoint_unix_h2c: h2c,
+            owner_namespace: "default".to_string(),
+            owner_service: "reviews".to_string(),
+        }
+    }
+
+    /// Containment root the unix-ingress tests admit sockets under. Nothing is
+    /// created on disk here — materialization is lexical; the filesystem checks
+    /// live at the dial (`util::unix_socket::admit_socket_for_connect`).
+    const TEST_UNIX_ROOT: &str = "/var/run/ferrum-test";
+
+    fn unix_ingress_runtime(spiffe: &str) -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            unix_socket_allowed_roots: vec![TEST_UNIX_ROOT.to_string()],
+            ..test_mesh_runtime_config()
+        }
+    }
+
+    fn unix_ingress_slice(
+        spiffe: &str,
+        listeners: Vec<crate::modes::mesh::config::ResolvedIngressListener>,
+    ) -> MeshSlice {
+        MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: listeners,
+            ..MeshSlice::default()
+        }
+    }
+
+    /// Issue #3261: a `unix://` `defaultEndpoint` materializes a ROUTABLE
+    /// Unix-stream backend instead of being dropped as unrepresentable. The
+    /// socket path rides the reserved `mesh.unix_socket` tag on a single-target
+    /// upstream — the same transport-marker mechanism `mesh.hbone`/`mesh.mtls`
+    /// use — and the proxy's `host:port` is a never-dialed placeholder.
+    #[test]
+    fn sidecar_ingress_unix_listener_materializes_tagged_upstream() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let slice = unix_ingress_slice(
+            spiffe,
+            vec![unix_ingress_listener(8443, "/var/run/ferrum-test/app.sock")],
+        );
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id.starts_with("__mesh-ingress-"))
+            .expect("a unix ingress listener materializes a route");
+        assert_eq!(route.id, "__mesh-ingress-default-reviews-8443");
+        assert_eq!(route.listen_path.as_deref(), Some("/"));
+        let upstream_id = route
+            .upstream_id
+            .as_deref()
+            .expect("a unix-backed ingress route is upstream-backed");
+        assert_eq!(upstream_id, "__mesh-ingress-unix-default-reviews-8443");
+        // The dialable identity is the TAG, never the placeholder authority.
+        assert_eq!(route.backend_host, "127.0.0.1");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == upstream_id)
+            .expect("the tagged upstream is installed");
+        assert_eq!(upstream.namespace, "default");
+        assert_eq!(upstream.targets.len(), 1);
+        assert_eq!(
+            upstream.targets[0]
+                .tags
+                .get(crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG)
+                .map(String::as_str),
+            Some("/var/run/ferrum-test/app.sock")
+        );
+        // An `http`-declared listener carries NO h2c marker, so dispatch dials
+        // HTTP/1.1 — the protocol is carried, never inferred.
+        assert!(
+            !crate::proxy::unix_backend::target_unix_backend_is_h2c(&upstream.targets[0]),
+            "an http-declared unix listener must not be marked h2c"
+        );
+        assert!(
+            upstream.health_checks.is_none(),
+            "an active probe would dial the placeholder host:port and eject the only target"
+        );
+        // Ingress still REPLACES the service-port default inbound routes.
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "ingress[] present → no service-port default inbound routes"
+        );
+    }
+
+    /// Reload/update/delete, not just first-start construction: re-pointing the
+    /// socket must rewrite the tag in place, and withdrawing the listener must
+    /// leave neither a stale route nor an orphaned tagged upstream behind.
+    #[test]
+    fn sidecar_ingress_unix_listener_update_and_delete_rebuild_cleanly() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let tagged_path = |config: &GatewayConfig| -> Option<String> {
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX))
+                .and_then(|u| u.targets.first())
+                .and_then(|t| {
+                    t.tags
+                        .get(crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG)
+                        .cloned()
+                })
+        };
+
+        let first = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/ferrum-test/a.sock")],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("first slice → config");
+        assert_eq!(
+            tagged_path(&first).as_deref(),
+            Some("/var/run/ferrum-test/a.sock")
+        );
+
+        // UPDATE: the same listener port re-pointed at a different socket.
+        let updated = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/ferrum-test/b.sock")],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("updated slice → config");
+        assert_eq!(
+            tagged_path(&updated).as_deref(),
+            Some("/var/run/ferrum-test/b.sock")
+        );
+        assert_eq!(
+            updated
+                .upstreams
+                .iter()
+                .filter(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX))
+                .count(),
+            1,
+            "an update replaces the tagged upstream rather than appending a second copy"
+        );
+
+        // DELETE: the listener is withdrawn entirely.
+        let deleted = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(spiffe, Vec::new()),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("withdrawn slice → config");
+        assert!(
+            tagged_path(&deleted).is_none(),
+            "a withdrawn unix listener leaves no orphaned tagged upstream"
+        );
+        assert!(
+            !deleted
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "a withdrawn unix listener leaves no stale ingress route"
+        );
+    }
+
+    /// A carrier that sets BOTH backend shapes (a socket path AND a loopback
+    /// `host:port`) is refused fail-closed at materialization: admitting it
+    /// would let a TCP fallback ride alongside the Unix backend.
+    #[test]
+    fn sidecar_ingress_unix_listener_with_a_smuggled_tcp_fallback_is_dropped() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let mut hostile = unix_ingress_listener(8443, "/var/run/ferrum-test/app.sock");
+        hostile.endpoint_host = "127.0.0.1".to_string();
+        hostile.endpoint_port = 8080;
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(spiffe, vec![hostile]),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("hostile slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "a both-shapes carrier is dropped, never materialized"
+        );
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX)),
+            "a dropped listener installs no tagged upstream"
+        );
+    }
+
+    /// A traversal-like socket path decoded straight from an untrusted carrier
+    /// never reaches a dial, even though CP-side translation would have
+    /// refused it first.
+    #[test]
+    fn sidecar_ingress_unix_listener_with_a_traversal_path_is_dropped() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(
+                    8443,
+                    "/var/run/ferrum-test/../../etc/passwd",
+                )],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("hostile slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "an inadmissible carried socket path is dropped fail-closed"
+        );
+    }
+
+    /// The containment allowlist is the whole local-privilege boundary, so its
+    /// DEFAULT (unset) must refuse every Unix listener. Without this, an
+    /// operator-authored `Sidecar` could point the proxy at
+    /// `/var/run/docker.sock`.
+    #[test]
+    fn sidecar_ingress_unix_listener_is_refused_when_containment_is_unconfigured() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        // NOTE: `test_mesh_runtime_config()` leaves `unix_socket_allowed_roots`
+        // empty, which is the shipped default.
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        assert!(
+            runtime.unix_socket_allowed_roots.is_empty(),
+            "the default posture under test is an EMPTY allowlist"
+        );
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener(8443, "/var/run/docker.sock")],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "no containment roots configured → every unix listener is refused"
+        );
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX)),
+            "a refused listener installs no tagged upstream"
+        );
+    }
+
+    /// A configured allowlist must not admit a privileged socket outside it —
+    /// and must not be defeated by a sibling directory that merely shares a
+    /// textual prefix with an allowed root.
+    #[test]
+    fn sidecar_ingress_unix_listener_outside_allowed_roots_is_refused() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        for hostile in [
+            // A genuinely privileged local socket.
+            "/var/run/docker.sock",
+            // Prefix-sibling: `/var/run/ferrum-testing` is NOT inside
+            // `/var/run/ferrum-test`, so a byte-prefix check would wrongly
+            // admit it.
+            "/var/run/ferrum-testing/app.sock",
+            // The allowed root itself is not a socket path (no component below
+            // it).
+            "/var/run/ferrum-test",
+        ] {
+            let config = gateway_config_from_mesh_slice(
+                &unix_ingress_slice(spiffe, vec![unix_ingress_listener(8443, hostile)]),
+                &runtime,
+                None,
+                None,
+            )
+            .expect("slice → config");
+            assert!(
+                !config
+                    .proxies
+                    .iter()
+                    .any(|p| p.id.starts_with("__mesh-ingress-")),
+                "{hostile} must be refused by the containment allowlist"
+            );
+        }
+    }
+
+    /// The declared listener protocol decides the socket's wire protocol, and it
+    /// is CARRIED on its own reserved tag so dispatch never guesses. An
+    /// `http2`/`grpc` listener is marked h2c, which is what carries gRPC
+    /// streaming, deadlines, and trailers over the socket.
+    #[test]
+    fn sidecar_ingress_unix_listener_carries_the_declared_h2c_protocol() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = unix_ingress_runtime(spiffe);
+        let config = gateway_config_from_mesh_slice(
+            &unix_ingress_slice(
+                spiffe,
+                vec![unix_ingress_listener_with_protocol(
+                    8443,
+                    "/var/run/ferrum-test/grpc.sock",
+                    true,
+                )],
+            ),
+            &runtime,
+            None,
+            None,
+        )
+        .expect("slice → config");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id.starts_with(MESH_INGRESS_UNIX_UPSTREAM_ID_PREFIX))
+            .expect("an h2c unix listener materializes a tagged upstream");
+        assert!(
+            crate::proxy::unix_backend::target_unix_backend_is_h2c(&upstream.targets[0]),
+            "a grpc/http2-declared unix listener must carry the h2c marker"
+        );
+        assert_eq!(
+            upstream.targets[0]
+                .tags
+                .get(crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG)
+                .map(String::as_str),
+            Some("/var/run/ferrum-test/grpc.sock")
+        );
     }
 
     #[test]
@@ -35342,6 +36094,8 @@ mod tests {
             port: 8443,
             endpoint_host: "127.0.0.1".to_string(),
             endpoint_port: 8080,
+            endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: String::new(),
             owner_service: String::new(),
         };
@@ -35385,6 +36139,8 @@ mod tests {
             port: 9443,
             endpoint_host: "127.0.0.1".to_string(),
             endpoint_port: 9090,
+            endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
             owner_namespace: String::new(),
             owner_service: String::new(),
         };

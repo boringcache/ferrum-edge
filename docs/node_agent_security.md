@@ -148,6 +148,54 @@ Ferrum does not call `ptrace(2)`, but a compromised proxy process with that
 capability should be treated as capable of same-node process inspection unless
 an LSM profile blocks those syscalls.
 
+### Host-network UDP capture drops the setns privilege set (issue #3288)
+
+Ambient UDP capture has two placements, and they have materially different
+privilege footprints:
+
+| Placement | `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED` | Proxy capabilities | Host access |
+|---|---|---|---|
+| Per-pod-netns producer (default) | `false` | `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE` | `hostNetwork`, `hostPID`, host cgroup (ro), registry hostPath |
+| Host-network capture | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath |
+
+The host placement installs its `mangle` rules and binds its transparent socket
+in the proxy's own namespace, so it calls no `setns(CLONE_NEWNET)` and never opens
+another workload's `/proc/{pid}/ns/net`. That removes both the `ptrace_may_access`
+requirement and `hostPID` from the ambient DaemonSet, which is the main reason to
+choose it: it is the UDP capture path available on clusters whose Pod Security
+posture will not grant `SYS_ADMIN`/`SYS_PTRACE`. The chart derives this
+automatically — enabling the placement narrows the rendered capabilities rather
+than adding to them.
+
+What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
+an `ip rule`, and an `ip route` in the host namespace, and still binds
+`IP_TRANSPARENT` sockets. The chart also retains the ambient container's existing
+`CAP_NET_RAW`; the host UDP implementation itself adds no raw-socket operation.
+Treat a compromised proxy in this placement as able to rewrite host netfilter
+state, exactly as in the default placement.
+
+Dropping `hostPID` means the pod's own `/proc` view is unavailable, so interface
+resolution falls through to the host route table for **both** address families
+(`/proc/net/route` and `/proc/net/ipv6_route`). That parsing is treated as
+hostile input: bounded reads, strict field decoding, and only an unambiguous
+`RTF_UP` host route (`/32` or `/128`), followed by a sysfs check that the device
+has a distinct non-zero peer `iflink` and is not a bridge. A broader route or a
+self-linked device is not ownership evidence and is refused; two devices
+claiming the host route also resolve to nothing. A crafted or degenerate route
+table can therefore make a pod *unresolvable* (refused, egress stays closed) but
+never deliberately select a covering shared device.
+
+Two properties bound the blast radius of the rules it installs. It emits **no
+`mangle OUTPUT` chain**, so the node's own traffic (kubelet, CNI, DNS, every
+`hostNetwork` pod) is structurally outside the capture set rather than excluded by
+a filter. And every capture rule is scoped `-i <one enrolled pod's host-side
+interface>`, with the interface name validated before it reaches the generated
+`sh -c` script: only `[A-Za-z0-9._-]` up to the 15-character kernel limit, no
+leading `-`, and no `+` (which `iptables` reads as a **prefix wildcard** and would
+silently widen capture to every interface sharing a prefix). A registry entry that
+resolves to a rejected name fails the whole plan rather than being skipped, so a
+corrupt or hostile entry cannot yield a partially-scoped ruleset.
+
 ### Capabilities deliberately NOT requested
 
 - **`CAP_SYS_RESOURCE`** — `raise_fd_limit()` in [`src/main.rs`](../src/main.rs)

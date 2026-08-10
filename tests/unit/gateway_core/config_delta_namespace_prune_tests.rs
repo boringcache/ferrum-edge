@@ -141,6 +141,7 @@ fn make_plugin_config(namespace: &str, id: &str) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,

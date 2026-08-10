@@ -221,6 +221,7 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
     );
 
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),
@@ -448,6 +449,7 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     );
 
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),
@@ -543,6 +545,7 @@ async fn observe_prometheus_stream(ctx: &mut StreamConnectionContext) {
 
 fn stream_summary_from(metadata: HashMap<String, String>) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),

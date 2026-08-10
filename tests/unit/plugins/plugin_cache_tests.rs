@@ -14,6 +14,7 @@ use ferrum_edge::_test_support::{
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
 use ferrum_edge::config::db_backend::NamespacedResourceId;
+use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
@@ -363,7 +364,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     }
 }
 
-fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
+pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -500,6 +501,7 @@ fn make_plugin_config(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -684,6 +686,7 @@ fn cors_config(
     methods: &[&str],
     headers: &[&str],
     priority_override: Option<u16>,
+    trigger: Option<PluginTrigger>,
 ) -> PluginConfig {
     let mut config = make_plugin_config_with_json(
         id,
@@ -697,6 +700,7 @@ fn cors_config(
         Some("p1"),
     );
     config.priority_override = priority_override;
+    config.trigger = trigger;
     config
 }
 
@@ -710,8 +714,9 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
                 &["GET", "DELETE"],
                 &["X-Shared", "Authorization"],
                 None,
+                None,
             ),
-            cors_config("strict", &["GET"], &["X-Shared"], None),
+            cors_config("strict", &["GET"], &["X-Shared"], None, None),
         ],
     );
     let cache = PluginCache::new(&config).expect("composed CORS cache");
@@ -847,11 +852,12 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
     let reversed = make_config(
         vec![make_proxy("p1", "/api", vec!["strict", "permissive"])],
         vec![
-            cors_config("strict", &["GET"], &["X-Shared"], None),
+            cors_config("strict", &["GET"], &["X-Shared"], None, None),
             cors_config(
                 "permissive",
                 &["GET", "DELETE"],
                 &["X-Shared", "Authorization"],
+                None,
                 None,
             ),
         ],
@@ -883,9 +889,9 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
     let three = make_config(
         vec![make_proxy("p1", "/api", vec!["wide", "middle", "narrow"])],
         vec![
-            cors_config("wide", &["GET", "POST"], &["X-A", "X-B"], None),
-            cors_config("middle", &["GET", "POST"], &["X-B"], None),
-            cors_config("narrow", &["GET"], &["X-B"], None),
+            cors_config("wide", &["GET", "POST"], &["X-A", "X-B"], None, None),
+            cors_config("middle", &["GET", "POST"], &["X-B"], None, None),
+            cors_config("narrow", &["GET"], &["X-B"], None, None),
         ],
     );
     let three_cache = PluginCache::new(&three).expect("three-instance CORS cache");
@@ -899,9 +905,9 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
     );
 
     for ids in [vec!["origin-a", "origin-b"], vec!["origin-b", "origin-a"]] {
-        let mut origin_a = cors_config("origin-a", &["GET"], &["X-Test"], None);
+        let mut origin_a = cors_config("origin-a", &["GET"], &["X-Test"], None, None);
         origin_a.config["allowed_origins"] = json!(["https://a.example"]);
-        let mut origin_b = cors_config("origin-b", &["GET"], &["X-Test"], None);
+        let mut origin_b = cors_config("origin-b", &["GET"], &["X-Test"], None, None);
         origin_b.config["allowed_origins"] = json!(["https://b.example"]);
         let disjoint = make_config(
             vec![make_proxy("p1", "/api", ids)],
@@ -929,10 +935,10 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
 
 #[tokio::test]
 async fn mixed_native_and_istio_empty_lists_apply_only_to_preflight() {
-    let mut native = cors_config("native", &["GET"], &["Authorization"], None);
+    let mut native = cors_config("native", &["GET"], &["Authorization"], None, None);
     native.config["exposed_headers"] = json!(["X-Shared", "X-Native"]);
     native.config["allow_credentials"] = json!(true);
-    let mut istio = cors_config("istio", &[], &[], None);
+    let mut istio = cors_config("istio", &[], &[], None, None);
     istio.config["exposed_headers"] = json!(["X-Shared"]);
     istio.config["unmatched_preflights"] = json!("forward");
 
@@ -1006,7 +1012,7 @@ fn multiple_cors_instances_must_remain_contiguous() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "ip", "cors-b"])],
         vec![
-            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "ip",
                 "ip_restriction",
@@ -1014,8 +1020,9 @@ fn multiple_cors_instances_must_remain_contiguous() {
                 Some("p1"),
                 true,
                 Some(150),
+                None,
             ),
-            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200), None),
         ],
     );
     let err = PluginCache::new(&config)
@@ -1032,7 +1039,7 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
-            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
                 "udp_rate_limiting",
@@ -1040,8 +1047,9 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
                 Some("p1"),
                 true,
                 Some(150),
+                None,
             ),
-            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200), None),
         ],
     );
     let cache = PluginCache::new(&config).expect("stream-only CORS interloper is valid");
@@ -1071,7 +1079,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
     let initial = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "udp"])],
         vec![
-            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
                 "udp_rate_limiting",
@@ -1079,6 +1087,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
                 Some("p1"),
                 true,
                 Some(150),
+                None,
             ),
         ],
     );
@@ -1086,7 +1095,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
     let stream_interleaved = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
-            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
                 "udp_rate_limiting",
@@ -1094,8 +1103,9 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
                 Some("p1"),
                 true,
                 Some(150),
+                None,
             ),
-            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200), None),
         ],
     );
     let stream_delta = ConfigDelta::compute(&initial, &stream_interleaved);
@@ -1121,7 +1131,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
     let http_interleaved = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "ip", "cors-b"])],
         vec![
-            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "ip",
                 "ip_restriction",
@@ -1129,8 +1139,9 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
                 Some("p1"),
                 true,
                 Some(150),
+                None,
             ),
-            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200), None),
         ],
     );
     let http_delta = ConfigDelta::compute(&stream_interleaved, &http_interleaved);
@@ -1158,8 +1169,8 @@ fn rejected_cors_reload_retains_the_last_good_snapshot() {
     let valid = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-wide", "cors-narrow"])],
         vec![
-            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None),
-            cors_config("cors-narrow", &["GET"], &["X-Test"], None),
+            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None, None),
+            cors_config("cors-narrow", &["GET"], &["X-Test"], None, None),
         ],
     );
     let cache = PluginCache::new(&valid).expect("initial CORS cache");
@@ -1184,6 +1195,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
             &["GET", "DELETE"],
             &["X-Test"],
             None,
+            None,
         )],
     );
     let cache = PluginCache::new(&initial).expect("initial single-CORS cache");
@@ -1199,8 +1211,8 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
     let composed = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-wide", "cors-narrow"])],
         vec![
-            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None),
-            cors_config("cors-narrow", &["GET"], &["X-Test"], None),
+            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None, None),
+            cors_config("cors-narrow", &["GET"], &["X-Test"], None, None),
         ],
     );
     let composed_delta = ConfigDelta::compute(&initial, &composed);
@@ -1226,7 +1238,13 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
 
     let reduced = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-narrow"])],
-        vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None)],
+        vec![cors_config(
+            "cors-narrow",
+            &["GET"],
+            &["X-Test"],
+            None,
+            None,
+        )],
     );
     let reduced_delta = ConfigDelta::compute(&composed, &reduced);
     let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&composed, &reduced);
@@ -1533,8 +1551,9 @@ async fn cache_internal_finalizers_declare_response_body_never() {
                 &["GET", "DELETE"],
                 &["X-Shared", "Authorization"],
                 None,
+                None,
             ),
-            cors_config("strict", &["GET"], &["X-Shared"], None),
+            cors_config("strict", &["GET"], &["X-Shared"], None, None),
         ],
     );
     let cors_cache = PluginCache::new(&cors_config).expect("composed CORS chain");
@@ -4762,6 +4781,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("cors-no-body".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4775,6 +4795,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("graphql-guarded".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4788,6 +4809,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("response-only".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4801,6 +4823,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("request-xml".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4910,6 +4933,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4923,6 +4947,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5011,6 +5036,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -5163,6 +5189,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5216,6 +5243,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -5569,6 +5597,7 @@ fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
             proxy_id: Some("p1".to_string()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -7281,7 +7310,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     }
 }
 
-fn make_plugin_config_with_json(
+pub(crate) fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,
     config: serde_json::Value,
@@ -7297,6 +7326,7 @@ fn make_plugin_config_with_json(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -8116,6 +8146,7 @@ fn make_plugin_config_with_priority(
     proxy_id: Option<&str>,
     enabled: bool,
     priority_override: Option<u16>,
+    trigger: Option<PluginTrigger>,
 ) -> PluginConfig {
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {
@@ -8127,6 +8158,7 @@ fn make_plugin_config_with_priority(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
         priority_override,
+        trigger,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -8175,6 +8207,7 @@ async fn correlation_id_priority_overrides_select_canonical_without_collapsing_i
             Some("p1"),
             true,
             Some(internal_priority),
+            None,
         );
         internal.config = json!({"header_name": "x-internal-request-id"});
         let mut external = make_plugin_config_with_priority(
@@ -8184,6 +8217,7 @@ async fn correlation_id_priority_overrides_select_canonical_without_collapsing_i
             Some("p1"),
             true,
             Some(external_priority),
+            None,
         );
         external.config = json!({"header_name": "x-external-request-id"});
         let config = make_config(
@@ -8320,6 +8354,7 @@ fn test_priority_override_changes_sort_order() {
                 Some("p1"),
                 true,
                 Some(9200), // higher = runs later
+                None,
             ),
             make_plugin_config_with_priority(
                 "ps2",
@@ -8328,6 +8363,7 @@ fn test_priority_override_changes_sort_order() {
                 Some("p1"),
                 true,
                 Some(9000), // lower = runs first
+                None,
             ),
         ],
     );
@@ -8352,6 +8388,7 @@ fn test_priority_override_applied_correctly() {
             Some("p1"),
             true,
             Some(100),
+            None,
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -8806,6 +8843,7 @@ fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
             Some("p1"),
             true,
             Some(300),
+            None,
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -8843,6 +8881,7 @@ async fn test_priority_override_delegates_response_stream_termination_hook() {
             Some("p1"),
             true,
             Some(100),
+            None,
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -11336,6 +11375,7 @@ fn test_priority_override_reverses_default_order() {
                 Some("p1"),
                 true,
                 Some(50), // lower than cors's default
+                None,
             ),
             make_plugin_config_with_priority(
                 "ps2",
@@ -11344,6 +11384,7 @@ fn test_priority_override_reverses_default_order() {
                 Some("p1"),
                 true,
                 Some(5000), // higher than key_auth's override
+                None,
             ),
         ],
     );
