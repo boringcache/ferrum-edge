@@ -1512,12 +1512,9 @@ async fn test_plugin_config_sets_registry_tunables() {
         "mesh_series_budget_per_family": 2500
     });
     let registry = Arc::new(MetricsRegistry::new());
-    let plugin = PrometheusMetrics::new_with_registry_for_test(
-        &config,
-        "ferrum",
-        Arc::clone(&registry),
-    )
-    .unwrap();
+    let plugin =
+        PrometheusMetrics::new_with_registry_for_test(&config, "ferrum", Arc::clone(&registry))
+            .unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
 
     // Exercise the same constructor wire-through as production without
