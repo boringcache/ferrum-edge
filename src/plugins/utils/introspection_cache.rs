@@ -719,7 +719,7 @@ mod tests {
             for worker in 0..8 {
                 let cache = Arc::clone(&cache);
                 scope.spawn(move || {
-                    for token in 0..100 {
+                    for token in 0_u64..100 {
                         let name = format!("worker-{worker}-token-{token}");
                         if token.is_multiple_of(2) {
                             cache.insert_active(&name, authorization(64), Instant::now(), None);
