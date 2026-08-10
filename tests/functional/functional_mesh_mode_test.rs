@@ -5050,6 +5050,10 @@ plugin_configs: []
     );
 
     gateway.shutdown().await;
+    // In-process `TrustedProjectedGateway` keeps `ProxyState` (and its pooled
+    // backend h2 client) alive until dropped; release it before joining the
+    // fixture so the secured connection closes and the backend task can exit.
+    drop(gateway);
     tokio::time::timeout(Duration::from_secs(5), backend_task)
         .await
         .expect("mesh retry backend teardown timed out")
