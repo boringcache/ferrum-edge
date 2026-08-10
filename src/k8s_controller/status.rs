@@ -3625,14 +3625,14 @@ fn gateway_listener_programmed(
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("listener");
-    translation
-        .materialized_gateway_listeners
-        .contains(&crate::config_sources::k8s::GatewayApiListenerKey {
+    translation.materialized_gateway_listeners.contains(
+        &crate::config_sources::k8s::GatewayApiListenerKey {
             namespace: object.metadata.namespace.clone(),
             parent_kind: GatewayApiListenerParentKind::Gateway,
             gateway: object.metadata.name.clone(),
             listener: listener_name.to_string(),
-        })
+        },
+    )
 }
 
 fn route_unresolved_backend_ref_reason(

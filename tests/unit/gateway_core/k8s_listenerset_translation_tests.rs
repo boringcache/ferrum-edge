@@ -1157,11 +1157,7 @@ fn core_service_with_gateway_synthetic_name_cannot_spoof_programmed_status() {
             }]
         }),
     );
-    let objects = vec![
-        gateway_class(),
-        gateway,
-        service("gateway-edge-public"),
-    ];
+    let objects = vec![gateway_class(), gateway, service("gateway-edge-public")];
     let opts = options().with_pod_discovery_enabled(true);
     let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
