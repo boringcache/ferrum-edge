@@ -54,7 +54,10 @@
 {{- if and $ambientUdpHostNetns (ne $ambientTopology "ambient") -}}
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient" -}}
 {{- end -}}
-{{- $ambientUdpMigrationPhase := default "stable" (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE") | toString | trim -}}
+{{- $ambientUdpMigrationPhase := "stable" -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" -}}
+{{- $ambientUdpMigrationPhase = index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" | toString | trim -}}
+{{- end -}}
 {{- $ambientUdpMigrationFrom := default "" (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM") | toString | trim -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,

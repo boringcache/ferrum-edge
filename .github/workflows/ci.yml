@@ -2261,6 +2261,29 @@ jobs:
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
             --set ambient.enabled=true --set nodeAgent.enabled=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE= \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.err"; then
+            echo "::error title=Empty UDP migration phase defaulted by Helm::an explicitly empty setting must be rejected like the runtime rejects it"
+            exit 1
+          fi
+          grep -F 'FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string 'ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION= ci-case ' \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.err"; then
+            echo "::error title=UDP migration generation trimmed by Helm::generation bytes must match the runtime's exact durable marker value"
+            exit 1
+          fi
+          grep -F 'ambient UDP migration generation must be 1..=64 ASCII' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-case \
