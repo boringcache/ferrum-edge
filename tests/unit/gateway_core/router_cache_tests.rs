@@ -1869,19 +1869,56 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     refused.hosts = vec!["app.example.com".into()];
     refused.listen_port = Some(80);
 
+    let mut refused_exact = test_proxy("refused-exact", "=/exact");
+    refused_exact.hosts = vec!["exact.example.com".into()];
+    refused_exact.listen_port = Some(80);
+
+    let mut refused_regex = test_proxy("refused-regex", "~/items/[0-9]+");
+    refused_regex.hosts = vec!["regex.example.com".into()];
+    refused_regex.listen_port = Some(80);
+
     let mut sibling = test_proxy("sibling", "/api");
     sibling.hosts = vec!["other.example.com".into()];
     sibling.listen_port = Some(8080);
 
-    let cache = RouterCache::new(&test_config(vec![refused, sibling]), 100);
+    let cache = RouterCache::new(
+        &test_config(vec![refused, refused_exact, refused_regex, sibling]),
+        100,
+    );
 
     // Warm positive cache entries before the refusal is published.
     let before = cache
         .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
         .expect("Service remap reaches the sole nontls listener before refusal");
     assert_eq!(before.proxy.id, "refused");
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(
+                Some("exact.example.com"),
+                "/exact",
+                Some(80),
+                false,
+            )
+            .expect("exact path before refusal")
+            .proxy
+            .id,
+        "refused-exact"
+    );
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(
+                Some("regex.example.com"),
+                "/items/42",
+                Some(80),
+                false,
+            )
+            .expect("regex path before refusal")
+            .proxy
+            .id,
+        "refused-regex"
+    );
 
-    cache.set_refused_listener_ports(BTreeSet::from([80]));
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
 
     assert!(
         cache
@@ -1894,6 +1931,28 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
             .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(80), false)
             .is_none(),
         "refused listener must not match its own listen_port either"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(
+                Some("exact.example.com"),
+                "/exact",
+                Some(80),
+                false,
+            )
+            .is_none(),
+        "refused listener must reject exact-path cache hits"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(
+                Some("regex.example.com"),
+                "/items/42",
+                Some(80),
+                false,
+            )
+            .is_none(),
+        "refused listener must reject regex cache hits"
     );
 
     let sibling_hit = cache
@@ -1920,7 +1979,7 @@ fn refused_listener_withdrawal_restores_remap_and_resists_stale_cache() {
         "baseline remap"
     );
 
-    cache.set_refused_listener_ports(BTreeSet::from([80]));
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
     assert!(
         cache
             .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
@@ -1935,7 +1994,7 @@ fn refused_listener_withdrawal_restores_remap_and_resists_stale_cache() {
             .is_none()
     );
 
-    cache.set_refused_listener_ports(BTreeSet::new());
+    cache.publish_listener_admission_for_test(false, BTreeSet::new());
     let restored = cache
         .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
         .expect("withdrawing refusal must restore remap");
@@ -1960,7 +2019,7 @@ fn refused_listener_invalidates_positive_cache_hits() {
     assert_eq!(warm.proxy.id, "scoped");
     assert!(cache.cache_len() >= 1, "positive entry must be cached");
 
-    cache.set_refused_listener_ports(BTreeSet::from([80]));
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
     assert!(
         cache
             .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)

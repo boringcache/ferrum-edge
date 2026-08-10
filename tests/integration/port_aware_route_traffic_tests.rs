@@ -13,7 +13,9 @@
 //! - reload that **withdraws** a listener port — routing must fail closed
 //!   immediately, before the socket finishes draining,
 //! - reuse of a matching process-global proxy frontend without a duplicate
-//!   bind, and refusal of a Gateway listener that collides with admin.
+//!   bind, and refusal of a Gateway listener that collides with admin, and
+//! - generation-bound admission before listener reconcile acknowledgement,
+//!   including the ordinary-bind-failure Service remap distinction.
 
 use std::time::Duration;
 
@@ -611,6 +613,116 @@ async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+}
+
+/// Listener routing admission is part of the exact request/config generation:
+/// publication starts fail-closed, an admission refusal stays unreachable, and
+/// only the matching reconcile may enable the intentional Service remap for an
+/// ordinary OS bind failure. The held socket makes the bind failure
+/// deterministic; no timing sleep gates any assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+
+    let global_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let global_proxy_port = global_proxy_listener.local_addr().unwrap().port();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = admin_listener.local_addr().unwrap().port();
+    let busy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy_port = busy_listener.local_addr().unwrap().port();
+
+    let state = ProxyState::new(
+        config_with(vec![]),
+        DnsCache::new(DnsConfig::default()),
+        test_env_config(global_proxy_port, admin_port),
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0;
+    let manager = GatewayListenerManager::new(
+        state.clone(),
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        GatewayListenerTls::default(),
+    );
+    manager.reconcile().await;
+
+    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+        "admission-refused",
+        1,
+        Some(admin_port),
+    )]));
+    assert!(outcome.applied(), "refused generation must publish: {outcome:?}");
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(
+                Some(HOST),
+                "/api/window",
+                Some(global_proxy_port),
+                false,
+            )
+            .is_none(),
+        "a newly published listener-scoped route must fail closed before reconcile"
+    );
+    let refused_failures = manager.reconcile().await;
+    assert!(
+        refused_failures
+            .iter()
+            .any(|failure| failure.port == admin_port),
+        "the exact-generation admission refusal must be surfaced"
+    );
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(
+                Some(HOST),
+                "/api/window",
+                Some(global_proxy_port),
+                false,
+            )
+            .is_none(),
+        "acknowledging a refused port must keep every remap path unreachable"
+    );
+
+    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+        "ordinary-bind-failure",
+        1,
+        Some(busy_port),
+    )]));
+    assert!(outcome.applied(), "allowed generation must publish: {outcome:?}");
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(
+                Some(HOST),
+                "/api/window",
+                Some(global_proxy_port),
+                false,
+            )
+            .is_none(),
+        "the replacement generation must be pending before its own reconcile"
+    );
+    let bind_failures = manager.reconcile().await;
+    assert!(
+        bind_failures
+            .iter()
+            .any(|failure| failure.port == busy_port),
+        "the held socket must force an ordinary OS bind failure"
+    );
+    let remapped = state
+        .find_proxy_on_frontend_for_test(
+            Some(HOST),
+            "/api/window",
+            Some(global_proxy_port),
+            false,
+        )
+        .expect("matching-generation acknowledgement enables Service remap");
+    assert_eq!(remapped.proxy.id, "ordinary-bind-failure");
+
+    drop(global_proxy_listener);
+    drop(admin_listener);
+    drop(busy_listener);
+    manager.shutdown_all().await;
 }
 
 /// An HTTP↔HTTPS class flip must never leave the retiring plaintext accept
