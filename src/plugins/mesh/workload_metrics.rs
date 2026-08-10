@@ -69,9 +69,9 @@ const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
 const MAX_METRIC_TAG_OVERRIDES: usize = 128;
 const MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES: usize = 16 * 1024;
-const MESH_REQUEST_HOST_METADATA: &str = "mesh.request.host";
-const MESH_REQUEST_METHOD_METADATA: &str = "mesh.request.method";
-const MESH_DESTINATION_PORT_METADATA: &str = "mesh.destination.port";
+const MESH_REQUEST_HOST_METADATA: &str = "mesh.metrics.cel.request_host";
+const MESH_REQUEST_METHOD_METADATA: &str = "mesh.metrics.cel.request_method";
+const MESH_DESTINATION_PORT_METADATA: &str = "mesh.metrics.cel.destination_port";
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
     match direction {

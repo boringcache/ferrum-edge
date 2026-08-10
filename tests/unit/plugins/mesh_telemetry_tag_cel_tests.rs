@@ -73,12 +73,12 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(
-        ctx.metadata.get("mesh.request.host").map(String::as_str),
+        ctx.metadata.get("mesh.metrics.cel.request_host").map(String::as_str),
         Some("reviews.default.svc.cluster.local")
     );
     assert_eq!(
         ctx.metadata
-            .get("mesh.destination.port")
+            .get("mesh.metrics.cel.destination_port")
             .map(String::as_str),
         Some("9080")
     );
@@ -179,7 +179,7 @@ async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     // No request_authority / Host header → request.host missing.
     let mut headers = HashMap::new();
     workload_metrics.before_proxy(&mut ctx, &mut headers).await;
-    ctx.metadata.remove("mesh.request.host");
+    ctx.metadata.remove("mesh.metrics.cel.request_host");
 
     let registry = MetricsRegistry::new();
     let summary = TransactionSummary {
@@ -593,15 +593,15 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     let mut headers = HashMap::new();
     no_cel.before_proxy(&mut ctx, &mut headers).await;
     assert!(
-        !ctx.metadata.contains_key("mesh.request.host"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_host"),
         "no-CEL config must not stamp request.host"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.request.method"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_method"),
         "no-CEL config must not stamp request.method"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.destination.port"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.destination_port"),
         "no-CEL config must not stamp destination.port"
     );
 
@@ -621,21 +621,21 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
     // Plant stale values that must be cleared when not required.
     ctx.metadata
-        .insert("mesh.request.method".into(), "STALE".into());
+        .insert("mesh.metrics.cel.request_method".into(), "STALE".into());
     ctx.metadata
-        .insert("mesh.destination.port".into(), "9999".into());
+        .insert("mesh.metrics.cel.destination_port".into(), "9999".into());
     let mut headers = HashMap::new();
     host_only.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(
-        ctx.metadata.get("mesh.request.host").map(String::as_str),
+        ctx.metadata.get("mesh.metrics.cel.request_host").map(String::as_str),
         Some("checkout.default.svc")
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.request.method"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_method"),
         "host-only CEL must clear unused method stamp"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.destination.port"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.destination_port"),
         "host-only CEL must clear unused destination.port stamp"
     );
 
@@ -654,21 +654,21 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     ctx.mesh_outbound_destination_authz_port = Some(9080);
     ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
     ctx.metadata
-        .insert("mesh.request.host".into(), "stale-host".into());
+        .insert("mesh.metrics.cel.request_host".into(), "stale-host".into());
     let mut headers = HashMap::new();
     port_only.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(
         ctx.metadata
-            .get("mesh.destination.port")
+            .get("mesh.metrics.cel.destination_port")
             .map(String::as_str),
         Some("9080")
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.request.host"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_host"),
         "port-only CEL must not stamp request.host"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.request.method"),
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_method"),
         "port-only CEL must not stamp request.method"
     );
 
@@ -687,7 +687,7 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     assert_eq!(
         ingress
             .metadata
-            .get("mesh.destination.port")
+            .get("mesh.metrics.cel.destination_port")
             .map(String::as_str),
         Some("8443"),
         "ingress metrics must use the declared listener port, not backend port 8080"
@@ -701,7 +701,7 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     assert_eq!(
         ingress
             .metadata
-            .get("mesh.destination.port")
+            .get("mesh.metrics.cel.destination_port")
             .map(String::as_str),
         Some("15006"),
         "missing ingress stamp must not fall back to backend port 8080"
@@ -720,16 +720,16 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     );
     stream.destination_port = Some(15001);
     stream.metadata = Some(HashMap::from([
-        ("mesh.request.host".into(), "leak".into()),
-        ("mesh.request.method".into(), "GET".into()),
-        ("mesh.destination.port".into(), "1".into()),
+        ("mesh.metrics.cel.request_host".into(), "leak".into()),
+        ("mesh.metrics.cel.request_method".into(), "GET".into()),
+        ("mesh.metrics.cel.destination_port".into(), "1".into()),
     ]));
     no_cel.on_stream_connect(&mut stream).await;
     let meta = stream.metadata.as_ref().expect("metadata");
-    assert!(!meta.contains_key("mesh.request.host"));
-    assert!(!meta.contains_key("mesh.request.method"));
+    assert!(!meta.contains_key("mesh.metrics.cel.request_host"));
+    assert!(!meta.contains_key("mesh.metrics.cel.request_method"));
     assert!(
-        !meta.contains_key("mesh.destination.port"),
+        !meta.contains_key("mesh.metrics.cel.destination_port"),
         "static stream config must not stamp destination.port"
     );
 
@@ -747,10 +747,10 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     port_only.on_stream_connect(&mut stream).await;
     let meta = stream.metadata.as_ref().expect("metadata");
     assert_eq!(
-        meta.get("mesh.destination.port").map(String::as_str),
+        meta.get("mesh.metrics.cel.destination_port").map(String::as_str),
         Some("9080"),
         "stream metrics must prefer the trusted original destination used by authz"
     );
-    assert!(!meta.contains_key("mesh.request.host"));
-    assert!(!meta.contains_key("mesh.request.method"));
+    assert!(!meta.contains_key("mesh.metrics.cel.request_host"));
+    assert!(!meta.contains_key("mesh.metrics.cel.request_method"));
 }

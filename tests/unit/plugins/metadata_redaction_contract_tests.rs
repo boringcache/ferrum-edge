@@ -59,6 +59,9 @@ const MESH_METRICS_COORDINATION_KEYS: &[&str] = &[
     MESH_METRICS_DISABLED_METADATA,
     "mesh.metrics.prometheus_metrics_observed",
     MESH_REQUEST_COUNT_OVERRIDES_METADATA,
+    "mesh.metrics.cel.request_host",
+    "mesh.metrics.cel.request_method",
+    "mesh.metrics.cel.destination_port",
     "Mesh.Metrics.Request_Duration.Tag_Overrides",
 ];
 

@@ -18,10 +18,10 @@
 //! | `request.protocol` | string | `MeshRequestKey.request_protocol` |
 //! | `response.flags` | string | `MeshRequestKey.response_flags` |
 //! | `connection.security_policy` | string | `MeshRequestKey.connection_security_policy` |
-//! | `request.method` | string | HTTP/gRPC summary `http_method` / `mesh.request.method` |
-//! | `request.host` | string | stamped `mesh.request.host` (request authority) |
+//! | `request.method` | string | HTTP/gRPC summary `http_method` / internal metric CEL stamp |
+//! | `request.host` | string | internal metric CEL request-authority stamp |
 //! | `response.code` | int | HTTP/gRPC response status |
-//! | `destination.port` | int | stamped `mesh.destination.port` (same resolution as mesh authz) |
+//! | `destination.port` | int | internal metric CEL stamp (same resolution as mesh authz) |
 //!
 //! HTTP-only attributes (`request.method`, `request.host`, `response.code`) are
 //! rejected when the override targets a TCP metric family or `ALL_METRICS`
@@ -463,14 +463,14 @@ pub fn sanitize_metric_tag_value(value: &str) -> String {
 /// Resolve `destination.port` from stamped metadata when present.
 pub fn metadata_destination_port(metadata: &HashMap<String, String>) -> Option<u16> {
     metadata
-        .get("mesh.destination.port")
+        .get("mesh.metrics.cel.destination_port")
         .and_then(|value| value.parse::<u16>().ok())
 }
 
 /// Resolve `request.host` from stamped metadata when present.
 pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str> {
     metadata
-        .get("mesh.request.host")
+        .get("mesh.metrics.cel.request_host")
         .map(String::as_str)
         .filter(|value| !value.is_empty())
 }
@@ -478,7 +478,7 @@ pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str>
 /// Resolve `request.method` from stamped metadata when present.
 pub fn metadata_request_method(metadata: &HashMap<String, String>) -> Option<&str> {
     metadata
-        .get("mesh.request.method")
+        .get("mesh.metrics.cel.request_method")
         .map(String::as_str)
         .filter(|value| !value.is_empty())
 }
