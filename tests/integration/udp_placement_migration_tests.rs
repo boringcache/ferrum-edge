@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
+use ferrum_edge::proxy::netns_capture::{
+    DirectoryCaptureSource, PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget,
+};
 use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpCleanupManager};
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement, UdpPlacementDecision,
@@ -411,6 +413,33 @@ async fn partial_pod_cleanup_retries_and_pod_churn_invalidates_completion_snapsh
         churned.registry_fingerprint, complete.registry_fingerprint,
         "the supervisor's repeated-pass proof must restart when a pod appears"
     );
+}
+
+#[tokio::test]
+async fn malformed_registry_entry_blocks_migration_cleanup_proof() {
+    let registry = tempfile::tempdir().expect("registry");
+    std::fs::write(registry.path().join("pod-a"), b"").expect("malformed entry");
+    let source = DirectoryCaptureSource::new(registry.path());
+    assert!(source.list_targets().is_empty());
+    assert!(source.list_targets_for_migration().is_err());
+    let source = Arc::new(source);
+    let backend = PartialCleanupBackend {
+        fail_once: Mutex::new(HashSet::new()),
+        cleaned: Mutex::new(Vec::new()),
+    };
+    let mut manager =
+        NetnsUdpCleanupManager::new(source, backend, std::time::Duration::from_secs(2));
+
+    let blocked = manager.migration_cleanup_once().await;
+    assert_eq!(blocked.outstanding, 1);
+    assert_eq!(
+        blocked.failure_reason,
+        Some(UdpMigrationFailureReason::RegistryNotSynchronized)
+    );
+    std::fs::write(registry.path().join("pod-a"), b"/cg/1\n").expect("repaired entry");
+    let complete = manager.migration_cleanup_once().await;
+    assert_eq!(complete.outstanding, 0);
+    assert_eq!(complete.failure_reason, None);
 }
 
 #[tokio::test]

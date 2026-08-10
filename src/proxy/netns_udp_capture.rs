@@ -1314,7 +1314,19 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
     /// passes after the node-agent's generation-bound registry relist marker
     /// before it persists completion.
     pub async fn migration_cleanup_once(&mut self) -> NetnsUdpCleanupProgress {
-        self.cleanup_once().await;
+        let targets = match self.source.list_targets_for_migration() {
+            Ok(targets) => targets,
+            Err(_) => {
+                return NetnsUdpCleanupProgress {
+                    outstanding: 1,
+                    registry_fingerprint: 0,
+                    failure_reason: Some(
+                        super::udp_placement_migration::UdpMigrationFailureReason::RegistryNotSynchronized,
+                    ),
+                };
+            }
+        };
+        self.cleanup_targets(targets).await;
         let outstanding = self
             .last_target_netns_count
             .saturating_sub(self.cleaned_netns.len())
@@ -1344,6 +1356,10 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 
     async fn cleanup_once(&mut self) -> usize {
         let targets = self.source.list_targets();
+        self.cleanup_targets(targets).await
+    }
+
+    async fn cleanup_targets(&mut self, targets: Vec<PodCaptureTarget>) -> usize {
         let registry_uids: HashSet<String> = targets.iter().map(|t| t.pod_uid.clone()).collect();
         if registry_uids != self.last_registry_uids {
             info!(
