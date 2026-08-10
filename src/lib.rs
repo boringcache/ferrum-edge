@@ -8281,6 +8281,16 @@ pub mod _test_support {
         (monitor.outcomes, monitor.task)
     }
 
+    pub fn apply_bounded_node_topology_sequence_for_test(
+        snapshot: Vec<k8s_openapi::api::core::v1::Node>,
+        incremental: Option<k8s_openapi::api::core::v1::Node>,
+    ) -> Result<(usize, usize), crate::ebpf::ingress_topology::IngressTopologyReason> {
+        crate::ebpf::ingress_topology::apply_bounded_node_topology_sequence_for_test(
+            snapshot,
+            incremental,
+        )
+    }
+
     pub async fn run_with_pod_stream_for_test<S, I>(
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,

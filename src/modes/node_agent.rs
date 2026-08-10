@@ -1532,14 +1532,16 @@ fn apply_ingress_topology_outcome(
 ) -> bool {
     let previous_snapshot = metrics.snapshot();
     let previous = previous_snapshot.ingress_topology;
-    let requested_ready = outcome.status.is_ready();
-    let datapath_update_ok = backend
-        .update_capture_config(
-            &config
-                .capture_contract
-                .bpf_capture_config_for_topology(requested_ready),
-        )
-        .is_ok();
+    let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
+    let requested_ready = !ingress_redirect_enabled || outcome.status.is_ready();
+    let datapath_update_ok = !ingress_redirect_enabled
+        || backend
+            .update_capture_config(
+                &config
+                    .capture_contract
+                    .bpf_capture_config_for_topology(requested_ready),
+            )
+            .is_ok();
     let (status, diagnostic) = if datapath_update_ok {
         (outcome.status, outcome.diagnostic.as_str())
     } else {

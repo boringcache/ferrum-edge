@@ -26,6 +26,11 @@ pub const MAX_NODES: usize = 256;
 // One IPv4 and one IPv6 PodCIDR plus one authoritative InternalIP in each
 // family is the supported dual-stack worst case for every bounded Node.
 const MAX_REQUIREMENTS: usize = MAX_NODES * 4;
+const MAX_NODE_NAME_BYTES: usize = 253;
+// Long enough for a fully expanded IPv6 literal plus `/128`, while preventing
+// hostile or malformed Node objects from retaining arbitrarily large strings
+// in the long-lived projected cache.
+const MAX_TOPOLOGY_VALUE_BYTES: usize = 64;
 const MAX_ROUTE_LINES: usize = 4_096;
 const MAX_ROUTE_FILE_BYTES: u64 = 1_048_576;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
@@ -793,11 +798,15 @@ pub(crate) struct IngressTopologyMonitor {
 #[derive(Default)]
 struct BoundedNodeSet {
     nodes: BTreeMap<String, NodeTopologyEvidence>,
+    evidence_entries: usize,
     failure: Option<IngressTopologyReason>,
 }
 
 impl BoundedNodeSet {
     fn insert(&mut self, node: Node) {
+        if self.failure.is_some() {
+            return;
+        }
         let evidence = match NodeTopologyEvidence::from_node(&node) {
             Ok(evidence) => evidence,
             Err(reason) => {
@@ -810,6 +819,23 @@ impl BoundedNodeSet {
             self.failure = Some(IngressTopologyReason::NodeSetTooLarge);
             return;
         }
+        let previous_entries = self
+            .nodes
+            .get(&name)
+            .map_or(0, NodeTopologyEvidence::entry_count);
+        let Some(evidence_entries) = self
+            .evidence_entries
+            .checked_sub(previous_entries)
+            .and_then(|retained| retained.checked_add(evidence.entry_count()))
+        else {
+            self.failure = Some(IngressTopologyReason::RequirementSetTooLarge);
+            return;
+        };
+        if evidence_entries > MAX_REQUIREMENTS {
+            self.failure = Some(IngressTopologyReason::RequirementSetTooLarge);
+            return;
+        }
+        self.evidence_entries = evidence_entries;
         self.nodes.insert(name, evidence);
     }
 }
@@ -822,6 +848,21 @@ fn update_active_node(
     let name = evidence.name.clone();
     if !nodes.contains_key(&name) && nodes.len() >= MAX_NODES {
         return Err(IngressTopologyReason::NodeSetTooLarge);
+    }
+    let current_entries = nodes.values().try_fold(0_usize, |total, node| {
+        total
+            .checked_add(node.entry_count())
+            .ok_or(IngressTopologyReason::RequirementSetTooLarge)
+    })?;
+    let previous_entries = nodes
+        .get(&name)
+        .map_or(0, NodeTopologyEvidence::entry_count);
+    let replacement_entries = current_entries
+        .checked_sub(previous_entries)
+        .and_then(|retained| retained.checked_add(evidence.entry_count()))
+        .ok_or(IngressTopologyReason::RequirementSetTooLarge)?;
+    if replacement_entries > MAX_REQUIREMENTS {
+        return Err(IngressTopologyReason::RequirementSetTooLarge);
     }
     if nodes.get(&name) == Some(&evidence) {
         return Ok(false);
@@ -1240,12 +1281,20 @@ struct NodeTopologyEvidence {
 }
 
 impl NodeTopologyEvidence {
+    fn entry_count(&self) -> usize {
+        self.pod_cidrs.len().saturating_add(self.internal_ips.len())
+    }
+
     fn from_node(node: &Node) -> Result<Self, IngressTopologyReason> {
         let name = node
             .metadata
             .name
-            .clone()
+            .as_deref()
             .ok_or(IngressTopologyReason::NodeTopologyIncomplete)?;
+        if name.len() > MAX_NODE_NAME_BYTES {
+            return Err(IngressTopologyReason::RequirementSetTooLarge);
+        }
+        let name = name.to_string();
         let ready = node
             .status
             .as_ref()
@@ -1259,15 +1308,24 @@ impl NodeTopologyEvidence {
         let mut pod_cidrs = Vec::new();
         if let Some(spec) = node.spec.as_ref() {
             if let Some(cidrs) = spec.pod_cidrs.as_ref() {
-                pod_cidrs.extend(cidrs.iter().take(MAX_REQUIREMENTS + 1).cloned());
+                for cidr in cidrs.iter().take(MAX_REQUIREMENTS + 1) {
+                    if cidr.len() > MAX_TOPOLOGY_VALUE_BYTES {
+                        return Err(IngressTopologyReason::RequirementSetTooLarge);
+                    }
+                    pod_cidrs.push(cidr.clone());
+                }
             } else if let Some(cidr) = spec.pod_cidr.as_ref() {
+                if cidr.len() > MAX_TOPOLOGY_VALUE_BYTES {
+                    return Err(IngressTopologyReason::RequirementSetTooLarge);
+                }
                 pod_cidrs.push(cidr.clone());
             }
         }
         if pod_cidrs.len() > MAX_REQUIREMENTS {
             return Err(IngressTopologyReason::RequirementSetTooLarge);
         }
-        let internal_ips = node
+        let mut internal_ips = Vec::new();
+        for address in node
             .status
             .as_ref()
             .and_then(|status| status.addresses.as_ref())
@@ -1275,8 +1333,12 @@ impl NodeTopologyEvidence {
             .flatten()
             .filter(|address| address.type_ == "InternalIP")
             .take(MAX_REQUIREMENTS + 1)
-            .map(|address| address.address.clone())
-            .collect::<Vec<_>>();
+        {
+            if address.address.len() > MAX_TOPOLOGY_VALUE_BYTES {
+                return Err(IngressTopologyReason::RequirementSetTooLarge);
+            }
+            internal_ips.push(address.address.clone());
+        }
         if internal_ips.len() > MAX_REQUIREMENTS {
             return Err(IngressTopologyReason::RequirementSetTooLarge);
         }
@@ -1287,6 +1349,28 @@ impl NodeTopologyEvidence {
             internal_ips,
         })
     }
+}
+
+pub(crate) fn apply_bounded_node_topology_sequence_for_test(
+    snapshot: Vec<Node>,
+    incremental: Option<Node>,
+) -> Result<(usize, usize), IngressTopologyReason> {
+    let mut bounded = BoundedNodeSet::default();
+    for node in snapshot {
+        bounded.insert(node);
+    }
+    if let Some(reason) = bounded.failure {
+        return Err(reason);
+    }
+    if let Some(node) = incremental {
+        update_active_node(&mut bounded.nodes, node)?;
+    }
+    let evidence_entries = bounded.nodes.values().try_fold(0_usize, |total, node| {
+        total
+            .checked_add(node.entry_count())
+            .ok_or(IngressTopologyReason::RequirementSetTooLarge)
+    })?;
+    Ok((bounded.nodes.len(), evidence_entries))
 }
 
 fn requirements_from_evidence<'a>(

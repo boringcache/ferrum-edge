@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
+    apply_bounded_node_topology_sequence_for_test,
     apply_node_agent_ingress_topology_outcome_for_test,
     node_agent_cni_topology_readiness_rejection_for_test,
     run_with_node_agent_topology_outcome_stream_for_test,
@@ -15,10 +16,10 @@ use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::rpc::RpcVerb;
 use ferrum_edge::ebpf::ingress_topology::{
     IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState,
-    IngressTopologyValidator, IpCidr, LinkState, NodeWatchCacheDecision, NodeWatchCacheRecovery,
-    RouteEntry, TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file,
-    read_link_state_from_root, requirements_from_nodes, validate_host_topology_from_roots,
-    validate_topology_snapshot,
+    IngressTopologyStatus, IngressTopologyValidator, IpCidr, LinkState, NodeWatchCacheDecision,
+    NodeWatchCacheRecovery, RouteEntry, TopologyRequirements, parse_ipv4_route_file,
+    parse_ipv6_route_file, read_link_state_from_root, requirements_from_nodes,
+    validate_host_topology_from_roots, validate_topology_snapshot,
 };
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NODE_AGENT_CAPTURE_STATE_READY,
@@ -1108,6 +1109,114 @@ fn topology_outcome_application_arms_and_quarantines_the_bpf_redirect() {
     assert_eq!(
         metrics.snapshot().ingress_topology.reason,
         IngressTopologyReason::KubernetesUnavailable,
+    );
+}
+
+#[test]
+fn disabled_ingress_topology_skips_map_republication_and_does_not_gate_readiness() {
+    let mut config = node_waypoint_config();
+    config.capture_contract.ingress_redirect_ifaces.clear();
+    let metrics = NodeAgentMetrics::default();
+    let mut backend = MockEbpfBackend {
+        fail_update_capture_config: true,
+        ..Default::default()
+    };
+    let outcome = IngressTopologyOutcome {
+        status: IngressTopologyStatus::disabled(),
+        diagnostic: "inbound ingress redirect is disabled".to_string(),
+    };
+
+    let flags = apply_node_agent_ingress_topology_outcome_for_test(
+        &mut backend,
+        &config,
+        &metrics,
+        true,
+        false,
+        true,
+        &outcome,
+    );
+
+    assert_eq!(flags, (true, true));
+    assert!(backend.capture_config_updates.is_empty());
+    assert_eq!(
+        metrics.snapshot().ingress_topology.state,
+        IngressTopologyState::Disabled,
+    );
+}
+
+#[test]
+fn aggregate_node_snapshot_evidence_is_bounded_before_cache_commit() {
+    let cidrs = vec!["10.0.0.0/24"; 512];
+    let snapshot = vec![
+        node(
+            "local",
+            &cidrs,
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.2")],
+        ),
+        node(
+            "remote",
+            &cidrs,
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
+    ];
+
+    assert_eq!(
+        apply_bounded_node_topology_sequence_for_test(snapshot, None),
+        Err(IngressTopologyReason::RequirementSetTooLarge),
+    );
+}
+
+#[test]
+fn aggregate_node_cache_rejects_an_oversized_incremental_replacement() {
+    let replacement_cidrs = vec!["10.0.0.0/24"; 1024];
+    let snapshot = vec![
+        node(
+            "local",
+            &["10.244.1.0/24"],
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.2")],
+        ),
+        node(
+            "remote",
+            &["10.244.2.0/24"],
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
+    ];
+    let replacement = node(
+        "remote",
+        &replacement_cidrs,
+        Some("True"),
+        false,
+        &[("InternalIP", "172.18.0.3")],
+    );
+
+    assert_eq!(
+        apply_bounded_node_topology_sequence_for_test(snapshot, Some(replacement)),
+        Err(IngressTopologyReason::RequirementSetTooLarge),
+    );
+}
+
+#[test]
+fn projected_node_cache_rejects_oversized_topology_strings() {
+    let oversized_address = "a".repeat(65);
+    let snapshot = vec![node(
+        "remote",
+        &["10.244.2.0/24"],
+        Some("False"),
+        false,
+        &[("InternalIP", oversized_address.as_str())],
+    )];
+
+    assert_eq!(
+        apply_bounded_node_topology_sequence_for_test(snapshot, None),
+        Err(IngressTopologyReason::RequirementSetTooLarge),
     );
 }
 
