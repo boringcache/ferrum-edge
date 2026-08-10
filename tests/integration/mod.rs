@@ -120,6 +120,7 @@ mod tcp_frontend_tls_order_tests;
 mod transformer_runtime_overlay_generation_tests;
 mod udp_fault_injection_tests;
 mod udp_hook_concurrency_tests;
+mod udp_placement_migration_tests;
 mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

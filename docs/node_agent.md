@@ -415,8 +415,30 @@ device as a distinct peer rather than a self-linked bridge/uplink. A broader
 route through a shared bridge is refused because it is not per-pod interface
 ownership evidence. It requires a CNI that gives each pod its own host-side
 interface.
-Full behaviour, ownership, and the placement-migration constraint are in
-[`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
+Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
+workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
+During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
+atomically republishes a bounded proof containing the requested generation and a
+fresh publication identity only after `InitDone`; the proxy will not prove
+predecessor cleanup from an incomplete registry view. After the relist, every
+pod/CNI capture mutation retracts the marker before changing ownership and
+republishes a new identity only after registry persistence and retry state
+converge. Cleanup compares the exact identity across its repeated passes, so a
+same-generation clear/mutate/republish cycle resets accumulated completion. The
+generation is bounded operator input and neither it nor the publication identity
+is used as a metric label or log field.
+
+Marker publication failures are migration-local: the watcher stays alive,
+withholds readiness and proof, and retries. Retraction failures are stricter.
+The node-agent keeps the control loop alive but fences watcher Apply/Delete,
+CNI ADD/DEL/GC, and capture retry mutations until the stale marker is securely
+absent; watcher events are deferred and CNI calls fail retryably rather than
+being acknowledged without capture. Shutdown likewise preserves registry
+entries instead of running the ordered pod-detach mutation if proof retraction
+fails; the backend owner still performs its process-exit cleanup. Publication is bounded in the steady state:
+each pod registry entry is atomically file+directory synced when it changes,
+while marker publication validates the snapshot and performs one directory
+sync instead of fsyncing every live pod on every event.
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

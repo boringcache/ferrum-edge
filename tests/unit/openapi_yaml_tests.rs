@@ -6300,6 +6300,9 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
         OverloadSnapshot, PressureSnapshot, ReqPressure,
     };
+    use ferrum_edge::proxy::udp_placement_migration::{
+        UdpMigrationFailureReason, UdpMigrationStatusPhase, UdpMigrationStatusSnapshot,
+    };
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -6362,6 +6365,12 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         missing_destination_metadata: 1,
         plaintext_fallback_attempts: 1,
     };
+    let udp_placement_migration = UdpMigrationStatusSnapshot {
+        enabled: true,
+        phase: UdpMigrationStatusPhase::CleaningPodNetns,
+        outstanding: 2,
+        failure_reason: UdpMigrationFailureReason::GateAcknowledgementMissing,
+    };
     assert_component_validity(
         &spec,
         "HealthResponse",
@@ -6371,6 +6380,20 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "mesh": {
                 "egress_scope": health,
                 "node_waypoint_observability": node_waypoint_observability
+            }
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": health,
+                "node_waypoint_observability": node_waypoint_observability,
+                "udp_placement_migration": udp_placement_migration
             }
         }),
         true,
