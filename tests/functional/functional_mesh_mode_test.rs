@@ -14263,7 +14263,6 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    let hits_before_withdrawal = updated_backend.hits();
     loop {
         match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
             Ok((status, body)) if status != 200 && !body.contains("unix-http1-b") => break,
@@ -14280,9 +14279,23 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
             }
         }
     }
+
+    // The polling request that observes the reload may be preceded by requests
+    // served from the old atomic snapshot. Measure only after withdrawal is
+    // visible, then prove a fresh request cannot reach the removed backend.
+    let hits_after_withdrawal = updated_backend.hits();
+    let (withdrawn_status, withdrawn_body) =
+        plaintext_inbound_http1(inbound_port, authority_8443, "/", &[])
+            .await
+            .expect("post-withdrawal request must complete");
+    assert!(
+        withdrawn_status != 200 && !withdrawn_body.contains("unix-http1-b"),
+        "a fresh request after withdrawal must remain unroutable; status {withdrawn_status} body \
+         {withdrawn_body:?}"
+    );
     assert_eq!(
         updated_backend.hits(),
-        hits_before_withdrawal,
+        hits_after_withdrawal,
         "no request may reach the socket after its listener was withdrawn"
     );
 
