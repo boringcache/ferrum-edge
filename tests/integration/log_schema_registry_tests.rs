@@ -72,6 +72,7 @@ fn fully_populated_http() -> TransactionSummary {
 
 fn fully_populated_stream() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".into(),
         proxy_id: "p2".into(),
         proxy_lifecycle_generation: None,

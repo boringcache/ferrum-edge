@@ -95,6 +95,7 @@ fn make_trace_metadata_without_sampling() -> HashMap<String, String> {
 
 fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_lifecycle_generation: None,

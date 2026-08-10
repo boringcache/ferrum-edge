@@ -122,6 +122,7 @@ pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod transaction_debugger;
 pub mod transaction_log_schema;
+pub mod trigger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
@@ -154,7 +155,7 @@ use std::time::Duration;
 
 use self::utils::runtime_bool_gate::GatePolicyStamp;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, HttpWireTransport, Proxy,
     ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
@@ -198,6 +199,19 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
+}
+
+/// Client-facing transport that accepted a stream connection.
+///
+/// This is deliberately independent of [`BackendScheme`]: a DTLS frontend may
+/// forward to a plain UDP backend, and a plain UDP frontend may originate DTLS
+/// to its backend. Request triggers match this frontend fact, never the selected
+/// backend transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamFrontendTransport {
+    Tcp,
+    Udp,
+    Dtls,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -1828,18 +1842,17 @@ pub enum ResponsePresentationPolicy {
     /// equivalent configuration derive the same value, so a retained
     /// representation can be proven compatible anywhere.
     Static([u8; 32]),
-    /// The client-visible rewrite is derived from live runtime state — data
-    /// this gateway refreshes from upstream on its own schedule, per session,
-    /// after the plugin was constructed — so no digest computed at construction
-    /// describes it, and no digest of *any* fixed size could without persisting
-    /// the runtime state itself.
+    /// The client-visible rewrite depends on state a construction-time digest
+    /// and the finalized-replay partition do not prove. This includes live data
+    /// the gateway refreshes after construction and a per-request execution
+    /// trigger whose pristine inputs are not all bound by replay keys.
     ///
     /// A proxy carrying such a plugin has no provable presentation policy at
     /// all: the per-proxy fold collapses to `None` and every consumer that
     /// would retain a finalized representation must fail closed. Config
-    /// admission rejects the composition outright
-    /// (`request_deduplication::validate_composition`); this variant is the
-    /// runtime backstop for the paths that only warn.
+    /// admission rejects known intrinsically dynamic compositions outright
+    /// (`request_deduplication::validate_composition`); this variant is also the
+    /// runtime fail-closed path for request-dependent wrapper policy.
     Dynamic,
 }
 
@@ -2277,6 +2290,28 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot forge origin success for
     /// invalidation or similar origin-success boundaries.
     origin_http_response_status: Option<u16>,
+    /// Client-visible HTTP wire transport stamped once at frontend intake
+    /// (H1/H2 in `crate::proxy`, H3 in `crate::http3::server`).
+    ///
+    /// Private: it is authoritative transport provenance for declarative plugin
+    /// execution triggers, so a plugin or a client header must never be able to
+    /// restate it. `None` for direct plugin callers and tests that never went
+    /// through a frontend.
+    request_wire_transport: Option<HttpWireTransport>,
+    /// Whether the frontend classified this request as recognized gRPC-Web.
+    /// Stamped beside `request_wire_transport` from the same pre-routing
+    /// classification the dispatchers already computed.
+    request_is_grpc_web: bool,
+    /// Memoized per-instance execution-trigger decisions, keyed by the opaque
+    /// process-local token the plugin cache assigned to each triggered
+    /// instance.
+    ///
+    /// One request evaluates a given instance's trigger at most once, so every
+    /// phase of that instance agrees even after a later plugin rewrites the
+    /// path, headers, or query. Empty (and non-allocating) unless some
+    /// effective instance actually carries a trigger; bounded by the number of
+    /// triggered instances on the published chain.
+    plugin_trigger_decisions: Vec<(u64, bool)>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -3101,6 +3136,21 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Local (destination) IP of the frontend connection this request arrived
+    /// on, stamped once at accept from the listener's bound address or the
+    /// accepted socket's own local address. For a mesh sidecar this is the
+    /// receiving pod IP; behind a wildcard bind it is the address the kernel
+    /// actually delivered the connection to.
+    ///
+    /// `mesh_authz` uses it for Istio's `destination.ip` condition, preferring
+    /// [`Self::orig_dst`] when the listener captured a pre-NAT original
+    /// destination. It is a transport fact only — never derived from
+    /// `Host`, `X-Forwarded-*`, or any other client-settable input, because a
+    /// client that could choose it would choose which destination-scoped
+    /// AuthorizationPolicy rule judges it. `None` when the accept path could
+    /// not resolve one; `mesh_authz` then fails a `destination.ip` condition
+    /// closed rather than treating the attribute as absent.
+    pub destination_ip: Option<std::net::IpAddr>,
     /// Mesh outbound service port selected by the router after host/path
     /// routing and optional original-destination disambiguation. Used by
     /// `mesh_authz` for Istio `destination.port` when an outbound request has
@@ -3108,15 +3158,17 @@ pub struct RequestContext {
     /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
     pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
-    /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
-    /// the request handler from `select_mesh_inbound_port_route` when the matched
-    /// route is an ingress group. `mesh_authz` uses this so an
-    /// `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
-    /// listener port matches — the route forwards to a different
-    /// `defaultEndpoint` backend port, and authorizing on that backend port
-    /// would let a DENY on the listener port fail OPEN. `None` for service-port
-    /// default inbound routes (which authorize on the container/backend port,
-    /// matching Istio inbound authz) and for all non-ingress traffic.
+    /// or synthesized inbound HBONE relay (TCP ambient/Waypoint or UDP
+    /// EgressGateway). For ingress (F6 §6.2), this is the operator-declared
+    /// LISTENER port (e.g. `8443`), stamped by the request handler from
+    /// `select_mesh_inbound_port_route`. For HBONE relays this is the CONNECT
+    /// authority port (the ServiceEntry port for UDP egress), kept separate
+    /// from a targetPort-remapped socket dial port. `mesh_authz` uses this so
+    /// an `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
+    /// declared port matches — authorizing on the dial/backend port would let
+    /// a DENY on the declared port fail OPEN. `None` for service-port default
+    /// inbound routes (which authorize on the container/backend port, matching
+    /// Istio inbound authz) and outside ingress/HBONE-relay synthesis.
     pub mesh_inbound_listener_authz_port: Option<u16>,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
@@ -3192,6 +3244,9 @@ impl RequestContext {
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
+            request_wire_transport: None,
+            request_is_grpc_web: false,
+            plugin_trigger_decisions: Vec::new(),
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -3308,6 +3363,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            destination_ip: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             finalized_request_egress_dispatched: false,
@@ -4256,6 +4312,14 @@ impl RequestContext {
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
+            request_wire_transport: self.request_wire_transport,
+            request_is_grpc_web: self.request_is_grpc_web,
+            // Carried, not dropped: the memoized trigger decisions ARE the
+            // authority for whether an instance runs. Re-deriving them on this
+            // clone would let a `before_proxy` header/path/query rewrite flip a
+            // decision between the request hooks and the final-body hooks, which
+            // is exactly the asymmetric-skip class the memo exists to prevent.
+            plugin_trigger_decisions: self.plugin_trigger_decisions.clone(),
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -4454,6 +4518,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            destination_ip: self.destination_ip,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             // The finalized-request-egress phase always runs against the REAL
@@ -4566,6 +4631,53 @@ impl RequestContext {
     pub(crate) fn set_request_http_flavor(&mut self, flavor: HttpFlavor) {
         self.request_http_flavor = flavor;
         self.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    }
+
+    /// Client-visible request flavor recorded at frontend intake.
+    pub(crate) fn request_http_flavor(&self) -> HttpFlavor {
+        self.request_http_flavor
+    }
+
+    /// Stamp the client-visible HTTP wire transport and the frontend's
+    /// gRPC-Web classification. Called once per request by the H1/H2 and H3
+    /// dispatchers, from the same pre-routing classification they already
+    /// computed for protocol policy selection.
+    pub(crate) fn set_request_wire_protocol(
+        &mut self,
+        transport: HttpWireTransport,
+        is_grpc_web: bool,
+    ) {
+        self.request_wire_transport = Some(transport);
+        self.request_is_grpc_web = is_grpc_web;
+    }
+
+    /// Client-visible HTTP wire transport, or `None` for a context that never
+    /// passed through a frontend (direct plugin callers, tests).
+    pub fn request_wire_transport(&self) -> Option<HttpWireTransport> {
+        self.request_wire_transport
+    }
+
+    /// Whether the frontend classified this request as recognized gRPC-Web.
+    pub fn request_is_grpc_web(&self) -> bool {
+        self.request_is_grpc_web
+    }
+
+    /// Previously memoized execution-trigger decision for `token`, if any.
+    pub(crate) fn plugin_trigger_decision(&self, token: u64) -> Option<bool> {
+        self.plugin_trigger_decisions
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
+    }
+
+    /// Memoize an execution-trigger decision. Write-once per token: the first
+    /// evaluation is the authority for every later phase of that instance.
+    pub(crate) fn record_plugin_trigger_decision(&mut self, token: u64, run: bool) -> bool {
+        if let Some(existing) = self.plugin_trigger_decision(token) {
+            return existing;
+        }
+        self.plugin_trigger_decisions.push((token, run));
+        run
     }
 
     pub(crate) fn is_native_grpc_request(&self) -> bool {
@@ -7118,6 +7230,13 @@ pub struct StreamConnectionContext {
     /// When PROXY protocol is disabled or the peer is not trusted, this equals
     /// `direct_client_ip` (the raw socket peer).
     pub client_ip: String,
+    /// Client TCP port paired with [`Self::client_ip`].
+    ///
+    /// When inbound PROXY protocol supplies a forwarded source address this is
+    /// the port from that header; otherwise it is the accept-time socket peer
+    /// port. Used when emitting outbound PROXY v2 headers so backends see the
+    /// same client 4-tuple Ferrum resolved for stream plugins.
+    pub client_port: u16,
     /// Immediate socket-peer IP captured at accept(), before any PROXY-protocol
     /// header is applied. For stream proxies without inbound PROXY protocol
     /// this is always equal to `client_ip`. For proxies behind a trusted L4
@@ -7153,6 +7272,10 @@ pub struct StreamConnectionContext {
     #[doc(hidden)]
     pub proxy_lifecycle_generation: Option<u64>,
     pub listen_port: u16,
+    /// Authoritative client-facing stream transport stamped by the listener.
+    /// Independent of [`Self::backend_scheme`], which describes the outbound
+    /// backend connection.
+    pub frontend_transport: StreamFrontendTransport,
     /// Wire-level scheme the proxy uses to talk to its backend.
     /// Always one of the stream variants (`Tcp`, `Tcps`, `Udp`, `Dtls`) —
     /// validation guarantees stream proxies have a scheme set before any
@@ -7211,14 +7334,40 @@ pub struct StreamConnectionContext {
     /// record that the transport was terminated even when no application bytes
     /// were read.
     pub first_bytes_kind: Option<StreamBytesKind>,
-    /// Original destination IP from `SO_ORIGINAL_DST` / capture metadata when
-    /// available. Used by VirtualService L4 `destinationSubnets` matching.
-    /// Never inferred from client-controlled headers.
+    /// Original destination IP from a trusted inbound PROXY tuple,
+    /// `SO_ORIGINAL_DST`, or capture metadata when available. Used by
+    /// VirtualService L4 `destinationSubnets` matching. Never inferred from an
+    /// untrusted direct client's application data.
     pub destination_ip: Option<std::net::IpAddr>,
+    /// TCP port paired with [`Self::destination_ip`]. For a trusted inbound
+    /// PROXY header this is the forwarded destination port; otherwise it comes
+    /// from `SO_ORIGINAL_DST` / node-waypoint capture metadata. Kept separate
+    /// from `listen_port` because transparent capture listeners commonly bind
+    /// a fixed interception port that is not the connection's original port.
+    pub destination_port: Option<u16>,
+    /// Destination IP of the accepted transport connection. This prefers the
+    /// same trusted original-destination evidence as [`Self::destination_ip`]
+    /// and otherwise falls back to the accepted socket's local address.
+    ///
+    /// Mesh authorization uses this connection fact for Istio
+    /// `destination.ip`. L4 `stream_match.destination_subnets` deliberately
+    /// does not: routing may use only [`Self::destination_ip`], so an ordinary
+    /// listener's bind address cannot masquerade as captured original-
+    /// destination evidence.
+    pub connection_destination_ip: Option<std::net::IpAddr>,
+    /// TCP port paired with [`Self::connection_destination_ip`]. For a direct
+    /// listener this is the accepted socket's local port; for capture and
+    /// trusted PROXY paths it is the original destination port. Mesh authz uses
+    /// it ahead of `listen_port`, while L4 route selection ignores it.
+    pub connection_destination_port: Option<u16>,
     /// Listener-configured gateway binding for VirtualService L4 `gateways`
     /// matching (`mesh` or `namespace/name`). Never inferred from untrusted
     /// wire data.
     pub trusted_gateway_ref: Option<Arc<str>>,
+    /// Memoized per-instance execution-trigger decisions for this connection.
+    /// Mirrors `RequestContext::plugin_trigger_decisions`; private so a plugin
+    /// cannot restate another instance's admission decision.
+    plugin_trigger_decisions: Vec<(u64, bool)>,
 }
 
 impl StreamConnectionContext {
@@ -7248,6 +7397,14 @@ impl StreamConnectionContext {
             proxy_name,
             proxy_lifecycle_generation: None,
             listen_port,
+            // Preserve the natural direct mapping for ordinary constructors;
+            // a UDP listener whose frontend and backend transports differ
+            // overwrites this from its listener-owned fact before hooks run.
+            frontend_transport: match backend_scheme {
+                BackendScheme::Dtls => StreamFrontendTransport::Dtls,
+                BackendScheme::Udp => StreamFrontendTransport::Udp,
+                _ => StreamFrontendTransport::Tcp,
+            },
             backend_scheme,
             consumer_index,
             identified_consumer: None,
@@ -7263,7 +7420,14 @@ impl StreamConnectionContext {
             first_bytes: None,
             first_bytes_kind: None,
             destination_ip: None,
+            destination_port: None,
+            connection_destination_ip: None,
+            connection_destination_port: None,
             trusted_gateway_ref: None,
+            // Callers that know the peer/forwarded port (TCP accept path) set
+            // this after construction; UDP/DTLS leave it at 0.
+            client_port: 0,
+            plugin_trigger_decisions: Vec::new(),
         }
     }
 
@@ -7290,6 +7454,35 @@ impl StreamConnectionContext {
         if publish_canonical {
             metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
         }
+    }
+
+    /// Previously memoized execution-trigger decision for `token`, if any.
+    pub(crate) fn plugin_trigger_decision(&self, token: u64) -> Option<bool> {
+        self.plugin_trigger_decisions
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
+    }
+
+    /// Memoize an execution-trigger decision for this connection. Write-once
+    /// per token so connect and disconnect always agree.
+    pub(crate) fn record_plugin_trigger_decision(&mut self, token: u64, run: bool) -> bool {
+        if let Some(existing) = self.plugin_trigger_decision(token) {
+            return existing;
+        }
+        self.plugin_trigger_decisions.push((token, run));
+        run
+    }
+
+    /// Snapshot the connection's execution-trigger decisions for the disconnect
+    /// summary.
+    ///
+    /// `on_stream_disconnect` sees only a [`StreamTransactionSummary`], so this
+    /// is how a connect-time skip reaches it. Every production summary-building
+    /// path must carry it; the carrier is opaque and crate-constructed so a
+    /// plugin cannot author or erase another instance's admission decision.
+    pub(crate) fn plugin_trigger_decisions(&self) -> StreamTriggerDecisions {
+        StreamTriggerDecisions(self.plugin_trigger_decisions.clone())
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -7345,6 +7538,29 @@ impl StreamConnectionContext {
         while let Some(permit) = self.admission_permits.pop() {
             drop(permit);
         }
+    }
+}
+
+/// Opaque carrier for the per-instance execution-trigger decisions taken during
+/// `on_stream_connect`, so `on_stream_disconnect` can agree with them.
+///
+/// Deliberately not constructible with real content outside this crate: the only
+/// public way to make one is [`Default`] (no decisions, which fails closed to
+/// "the instance runs"). The tokens inside are process-local, opaque, and never
+/// serialized, so this can carry an admission authority that a plugin can
+/// neither read as configuration nor forge — unlike the summary's public
+/// `metadata` map.
+#[derive(Debug, Clone, Default)]
+pub struct StreamTriggerDecisions(Vec<(u64, bool)>);
+
+impl StreamTriggerDecisions {
+    /// The decision recorded for `token`, or `None` when this connection never
+    /// evaluated that instance's trigger.
+    pub(crate) fn decision(&self, token: u64) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map(|(_, decision)| *decision)
     }
 }
 
@@ -7415,6 +7631,17 @@ pub struct StreamTransactionSummary {
     #[doc(hidden)]
     #[serde(skip)]
     pub proxy_lifecycle_generation: Option<u64>,
+    /// Per-instance execution-trigger decisions taken during
+    /// `on_stream_connect`, carried so the wrapped disconnect hook agrees with
+    /// the connect hook. Not serialized, so the log/schema output is unchanged.
+    ///
+    /// The value is opaque: outside this crate the only constructible form is
+    /// the empty [`StreamTriggerDecisions::default()`], which fails closed to
+    /// "the instance runs". A plugin therefore cannot restate, forge, or erase
+    /// another instance's admission decision here.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub plugin_trigger_decisions: StreamTriggerDecisions,
 }
 
 /// Plugin execution priority bands.
@@ -7749,6 +7976,34 @@ pub trait Plugin: Send + Sync {
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
         None
+    }
+
+    /// Cold-path: encoded per-family tag-override plans this instance stamps
+    /// into request/stream metadata.
+    ///
+    /// Plugin-cache admission composes surviving plans across effective
+    /// `workload_metrics` instances (later same-family plans replace; other
+    /// families survive) and rejects chains whose aggregate stamped bytes
+    /// exceed the publication budget. Ordinary plugins retain the empty
+    /// default. Must not run on the request hot path.
+    fn metric_tag_override_plans(
+        &self,
+    ) -> &[(
+        crate::plugins::mesh::prometheus_helpers::MeshMetricFamily,
+        String,
+    )] {
+        &[]
+    }
+
+    /// Cold-path: whether this instance may be skipped by an execution gate.
+    ///
+    /// A conditional later plan cannot unconditionally retire an earlier plan
+    /// from PluginCache's worst-case publication budget: when the gate skips,
+    /// the earlier same-family plan remains in request metadata. Ordinary and
+    /// unwrapped plugin instances always execute and retain the `false`
+    /// default. Must not run on the request hot path.
+    fn metric_tag_override_plans_are_conditional(&self) -> bool {
+        false
     }
 
     /// Cold-path scrape exporter for `__mesh_bpf_metrics`.
@@ -9534,6 +9789,17 @@ pub trait Plugin: Send + Sync {
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
+    }
+
+    /// Whether this authentication instance applies to the current request.
+    ///
+    /// Ordinary authentication plugins are always applicable. Instance
+    /// wrappers use this request-time predicate to remove a trigger-skipped
+    /// mechanism from the effective authentication chain, so an intentionally
+    /// public path is not rejected merely because the configured chain contains
+    /// an auth instance that does not govern that path.
+    fn authentication_applies(&self, _ctx: &RequestContext) -> bool {
+        self.is_auth_plugin()
     }
 
     /// Returns the challenge advertised when the full authentication chain

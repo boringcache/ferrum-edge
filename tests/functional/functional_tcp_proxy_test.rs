@@ -1289,3 +1289,191 @@ plugin_configs: []
     heavy.abort();
     light.abort();
 }
+
+type ObservedProxyV2Tuple = (std::net::SocketAddr, std::net::SocketAddr);
+
+/// Start a TCP backend that requires a PROXY v2 header, then echoes the remainder.
+/// Captures the parsed source/destination tuple for assertions.
+async fn start_proxy_v2_expecting_echo_server_on(
+    listener: TcpListener,
+    observed_tuple: Arc<tokio::sync::Mutex<Option<ObservedProxyV2Tuple>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            let observed_tuple = Arc::clone(&observed_tuple);
+            tokio::spawn(async move {
+                match ferrum_edge::proxy::proxy_protocol::read_proxy_header(&mut stream, Some(2))
+                    .await
+                {
+                    Ok(ferrum_edge::proxy::proxy_protocol::ProxyProtocolResult::Forwarded {
+                        src,
+                        dst,
+                    }) => {
+                        *observed_tuple.lock().await = Some((src, dst));
+                    }
+                    Ok(_) | Err(_) => {
+                        return;
+                    }
+                }
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    })
+}
+
+fn v2_header_tcp4_bytes(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut h = Vec::new();
+    h.extend_from_slice(b"\r\n\r\n\x00\r\nQUIT\n");
+    h.push(0x21);
+    h.push(0x11);
+    h.extend_from_slice(&12u16.to_be_bytes());
+    h.extend_from_slice(&src);
+    h.extend_from_slice(&dst);
+    h.extend_from_slice(&src_port.to_be_bytes());
+    h.extend_from_slice(&dst_port.to_be_bytes());
+    h
+}
+
+/// Test: outbound PROXY v2 advertises the direct client IP to the backend.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_outbound_proxy_protocol_v2_direct_client() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
+    let backend =
+        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_tuple))
+            .await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-outbound-pp"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    backend_proxy_protocol: v2
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let mut stream = connect_tcp_proxy(proxy_port).await;
+    let payload = b"outbound-pp-direct";
+    stream.write_all(payload).await.expect("send payload");
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .expect("read error");
+    assert_eq!(&buf[..n], payload);
+
+    let (src, dst) = (*observed_tuple.lock().await).expect("backend must observe PROXY header");
+    assert_eq!(
+        src.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        "outbound PROXY src must be the direct client IP"
+    );
+    assert_ne!(src.port(), 0);
+    assert_eq!(
+        dst.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_eq!(dst.port(), proxy_port);
+
+    shutdown_gateway(&mut gateway);
+    backend.abort();
+}
+
+/// Test: outbound PROXY v2 re-advertises the inbound PROXY-forwarded client IP.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_outbound_proxy_protocol_v2_chained_inbound() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
+    let backend =
+        start_proxy_v2_expecting_echo_server_on(backend_listener, Arc::clone(&observed_tuple))
+            .await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-outbound-pp-chained"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    stream_proxy_protocol: true
+    backend_proxy_protocol: v2
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+        &[("FERRUM_TRUSTED_PROXIES", "127.0.0.0/8")],
+    )
+    .await;
+
+    let mut stream = connect_tcp_proxy(proxy_port).await;
+    // Pretend to be an LB: advertise a distinct public client identity.
+    let inbound = v2_header_tcp4_bytes([203, 0, 113, 50], [192, 0, 2, 10], 40000, 15432);
+    stream
+        .write_all(&inbound)
+        .await
+        .expect("send inbound PROXY header");
+    let payload = b"outbound-pp-chained";
+    stream.write_all(payload).await.expect("send payload");
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .expect("read error");
+    assert_eq!(&buf[..n], payload);
+
+    let (src, dst) =
+        (*observed_tuple.lock().await).expect("backend must observe outbound PROXY header");
+    assert_eq!(
+        src.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50)),
+        "outbound PROXY must advertise the inbound-forwarded client IP"
+    );
+    assert_eq!(src.port(), 40000);
+    assert_eq!(
+        dst,
+        std::net::SocketAddr::from(([192, 0, 2, 10], 15432)),
+        "trusted inbound destination tuple must be re-advertised unchanged"
+    );
+
+    shutdown_gateway(&mut gateway);
+    backend.abort();
+}

@@ -200,6 +200,7 @@ pub fn create_test_proxy() -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),
@@ -251,6 +252,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
 #[allow(dead_code)]
 pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamTransactionSummary {
     ferrum_edge::plugins::StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "test-stream-proxy".to_string(),
         proxy_lifecycle_generation: None,

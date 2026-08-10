@@ -76,6 +76,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),
@@ -145,6 +146,7 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -199,6 +201,47 @@ fn test_proxy_stream_proxy_protocol_accepted_on_tcp_proxy() {
     assert!(
         proxy.validate_fields().is_ok(),
         "tcp stream proxy must accept stream_proxy_protocol: {:?}",
+        proxy.validate_fields()
+    );
+}
+
+#[test]
+fn test_proxy_backend_proxy_protocol_rejected_on_http_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_proxy_protocol = Some(ferrum_edge::config::types::BackendProxyProtocol::V2);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_proxy_protocol") && e.contains("tcp")),
+        "expected TCP-only rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_backend_proxy_protocol_rejected_on_udp_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Udp);
+    proxy.listen_port = Some(5353);
+    proxy.backend_proxy_protocol = Some(ferrum_edge::config::types::BackendProxyProtocol::V2);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_proxy_protocol") && e.contains("TCP-borne")),
+        "expected TCP-borne rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_backend_proxy_protocol_accepted_on_tcp_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.listen_port = Some(5432);
+    proxy.backend_proxy_protocol = Some(ferrum_edge::config::types::BackendProxyProtocol::V2);
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "tcp stream proxy must accept backend_proxy_protocol: {:?}",
         proxy.validate_fields()
     );
 }
@@ -2846,6 +2889,7 @@ fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
         proxy_id: Some("p1".to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

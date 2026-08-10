@@ -22,6 +22,7 @@ mod mesh_config_transport;
 mod mesh_multicluster_federation;
 mod mesh_spiffe_identity;
 mod mesh_topology_matrix;
+mod stock_xds_interop;
 mod xds_type_urls;
 
 // `emit_coverage_artifacts` is the last test in the suite — it forces a flush

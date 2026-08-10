@@ -16,8 +16,15 @@ rules:
       - grpcroutes
       - tlsroutes
       - tcproutes
+      - udproutes
       - referencegrants
       - backendtlspolicies
+      - listenersets
+    verbs: ["get", "list", "watch"]
+  # GEP-1748: MCS ServiceImport backendRef targets (skipped when CRD absent).
+  - apiGroups: ["multicluster.x-k8s.io"]
+    resources:
+      - serviceimports
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
@@ -38,10 +45,12 @@ rules:
       - grpcroutes/status
       - tlsroutes/status
       - tcproutes/status
+      - udproutes/status
       # BackendTLSPolicy status is a Gateway API PolicyStatus
       # (`status.ancestors[]`). The writer reads live status first so
       # third-party controllers' ancestors are preserved.
       - backendtlspolicies/status
+      - listenersets/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API

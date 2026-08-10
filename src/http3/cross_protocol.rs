@@ -1240,18 +1240,19 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west dispatch path.
-    // A direct dial to a mesh-tagged target would bypass the secured mesh
-    // transport, so fail closed before backend admission or body relay.
+    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west / Unix dispatch
+    // path. A direct network dial would either bypass the secured mesh
+    // transport or hit a Unix target's schema-only loopback placeholder, so
+    // fail closed before backend admission or body relay.
     if let Some(reason) =
-        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(current_target)
+        crate::proxy::backend_dispatch::direct_network_http_transport_refusal(current_target)
     {
         warn!(
             proxy_id = %dispatch_proxy.id,
             target_host = current_target.map(|target| target.host.as_str()).unwrap_or(""),
             target_port = current_target.map(|target| target.port).unwrap_or(0),
             reason,
-            "cross-protocol H3→HTTP: refusing direct dial to a mesh-transport-tagged target"
+            "cross-protocol H3→HTTP: refusing direct dial to a target requiring another transport"
         );
         record_backend_outcome_no_conn_end(
             state,
@@ -4466,45 +4467,51 @@ where
     })
 }
 
-/// Mesh-transport fail-closed guard for the H3→gRPC bridge (issue #2003).
+/// Resolve the gRPC dispatch transport for the H3→gRPC bridge's selected target
+/// (issues #2003, #3284).
 ///
-/// Both `dispatch_grpc` and `dispatch_grpc_streaming` dial the LB-selected
-/// `target.host:target.port` directly via `GrpcConnectionPool`, and the H3
-/// cross-protocol bridge has NO HBONE / mesh-mTLS dispatch path. A
-/// mesh-transport-tagged target must therefore fail closed with a clear gRPC
-/// UNAVAILABLE — a direct dial would silently bypass the secured mesh
-/// transport (unauthenticated under PERMISSIVE PeerAuthentication, a
-/// confusing capture-listener failure under STRICT). The H1/H2 frontend path
-/// routes same-cluster `mesh.mtls` gRPC over the mesh-mTLS pool; extending
-/// that to the H3 bridge is a documented residual (docs/mesh.md).
-fn grpc_mesh_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'static str> {
-    let target = target?;
-    match grpc_proxy::classify_grpc_mesh_dispatch(target) {
-        grpc_proxy::GrpcMeshDispatch::Direct => None,
-        // The H3 bridge has no mesh-mTLS dispatch path, so BOTH the same-cluster
-        // and cross-cluster sidecar mesh-mTLS classes fail closed here — gRPC
-        // over cross-cluster east-west is supported only on the H1/H2 frontend
-        // (issue #2010); H3 mesh dispatch is a separate documented residual.
-        grpc_proxy::GrpcMeshDispatch::MeshMtls
-        | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => Some(
-            "gRPC over the sidecar mesh mTLS transport is not supported on the HTTP/3 frontend",
-        ),
-        grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
-            "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
-             (HBONE inner protocol cannot carry gRPC trailers)",
-        ),
-        grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
-            "gRPC over cross-cluster east-west routing requires a destination SNI \
-             override and a remote trust domain",
-        ),
-        grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
-            Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
-        }
-        grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
-            "gRPC over the Ambient HBONE mesh transport is not supported \
-             (HBONE inner protocol cannot carry gRPC trailers)",
-        ),
-    }
+/// The bridge used to refuse EVERY mesh-transport-tagged target, because both
+/// `dispatch_grpc` and `dispatch_grpc_streaming` could only dial
+/// `target.host:target.port` directly through `GrpcConnectionPool` — and a
+/// direct dial silently bypasses the secured mesh transport (unauthenticated
+/// under PERMISSIVE PeerAuthentication, a confusing capture-listener failure
+/// under STRICT).
+///
+/// Both paths now hand the shared `GrpcBody` to whichever authenticated
+/// transport [`grpc_proxy::GrpcDispatchTransport::for_target`] materializes:
+///
+/// * A Sidecar `mesh.mtls` target — same-cluster (pinned peer SVID) or
+///   cross-cluster east-west (trust-domain scope + destination-FQDN SNI
+///   override) — rides the SVID-mTLS HTTP/2 pool.
+/// * An Ambient `mesh.hbone` target — same-cluster (pinned peer SVID) or
+///   cross-cluster east-west — rides a NESTED hyper HTTP/2 connection inside
+///   the authenticated HBONE CONNECT byte tunnel. The destination relay
+///   byte-copies the tunnel to the app socket, so the gRPC server sees an
+///   ordinary h2c connection.
+///
+/// Either way it is HTTP/2 end to end, so framing, `grpc-status` trailers, flow
+/// control, deadline propagation, and cancellation behave exactly as they do on
+/// the direct gRPC pool.
+///
+/// Everything undispatchable still FAILS CLOSED with a gRPC UNAVAILABLE and
+/// never falls back to a direct dial: a cross-cluster target with no transport
+/// tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust
+/// domain, a corrupted target declaring BOTH mesh transports, and any target
+/// whose pinned identity / dial metadata cannot be resolved are all refused
+/// before any dial. A Sidecar `ingress[]` **Unix-socket** target (issue #3261)
+/// is refused for the same reason: this bridge has no Unix transport, and its
+/// `target.host:target.port` is a schema-only loopback placeholder, so a direct
+/// dial would reach an unrelated listener instead of the socket.
+fn resolve_h3_grpc_transport<'a>(
+    state: &'a ProxyState,
+    target: Option<&'a UpstreamTarget>,
+) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
+    grpc_proxy::GrpcDispatchTransport::for_target(
+        &state.grpc_pool,
+        &state.mesh_mtls_pool,
+        &state.hbone_pool,
+        target,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4576,35 +4583,47 @@ where
     let mut current_url = backend_url.to_string();
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
 
-    // FAIL CLOSED on a mesh-transport-tagged target BEFORE reading the request
-    // body or dialing (issue #2003, see `grpc_mesh_transport_refusal`). The
-    // probe slot a HALF_OPEN breaker may have admitted is released, mirroring
-    // the pre-dispatch rejects below.
-    if let Some(message) = grpc_mesh_transport_refusal(current_target.as_deref()) {
-        warn!(
-            proxy_id = %proxy.id,
-            target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
-            message,
-            "cross-protocol H3→gRPC: refusing direct dial to a mesh-transport-tagged target; \
-             failing closed with gRPC UNAVAILABLE"
-        );
-        release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-            state,
-            proxy,
-            current_cb_target_key.as_deref(),
-            cb_retry_probe_slot_available,
-        );
-        return write_grpc_error_for_request(
-            stream,
-            ctx,
-            grpc_proxy::grpc_status::UNAVAILABLE,
-            message,
-            backend_start,
-            0,
-            initial_response_header_policy_plugins,
-        )
-        .await;
-    }
+    // FAIL CLOSED on a target whose mesh transport this bridge cannot dispatch
+    // over, BEFORE reading the request body or dialing (issues #2003, #3284,
+    // see `resolve_h3_grpc_transport`). A `mesh.mtls` target resolves to the
+    // SVID-mTLS transport and a `mesh.hbone` target to the nested-HTTP/2 HBONE
+    // transport, both of which continue; a malformed cross-cluster,
+    // ambiguous-transport, or unmaterializable-identity target is refused here.
+    // The probe slot a HALF_OPEN breaker may have admitted is released,
+    // mirroring the pre-dispatch rejects below.
+    let initial_grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+        Ok(transport) => transport,
+        Err(transport_error) => {
+            let message = transport_error.message();
+            let diagnostic = transport_error.diagnostic().as_str();
+            warn!(
+                proxy_id = %proxy.id,
+                target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
+                target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                diagnostic,
+                refusal = ?transport_error,
+                message,
+                "cross-protocol H3→gRPC: no dispatchable mesh transport for the selected target; \
+                 failing closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
+            );
+            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
+            );
+            return write_grpc_error_for_request(
+                stream,
+                ctx,
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                message,
+                backend_start,
+                0,
+                initial_response_header_policy_plugins,
+            )
+            .await;
+        }
+    };
 
     // This path is intentionally replayable: body-mutating plugins and retry
     // policy require a complete request before the first upstream attempt.
@@ -4675,11 +4694,11 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                // Request-aware writer with halt_recv=false: mid-recv_data cancel
-                // leaves h3-quinn's recv slot None, so STOP_SENDING would
-                // unwrap-abort under panic=abort. Quinn Drop still stops the peer
-                // when the stream is released. Keep gRPC-Web trailer-frame shaping
-                // via ctx, and bound the terminal write with the shared grace.
+                // Request-aware writer with halt_recv=false so the bounded
+                // terminal write completes before STOP_SENDING. The vendored
+                // h3-quinn transport keeps the receive stream reachable after
+                // this mid-recv_data cancel, so halt it explicitly once the
+                // shared grace settles. Keep gRPC-Web shaping via ctx.
                 let write = write_grpc_error_for_request_with_recv_halt(
                     stream,
                     ctx,
@@ -4690,36 +4709,39 @@ where
                     initial_response_header_policy_plugins,
                     false,
                 );
-                return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                    write,
-                )
-                .await
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                        // Client reset the response half after rejection was
-                        // selected — keep accounting rather than dropping the
-                        // already-rejected request as a bare transport Err.
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        Ok(terminal_deadline_write_aborted_outcome(
-                            StatusCode::OK.as_u16(),
-                            0,
-                            backend_start,
-                            0,
-                            true,
-                        ))
-                    }
-                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        Ok(terminal_deadline_write_aborted_outcome(
-                            StatusCode::OK.as_u16(),
-                            0,
-                            backend_start,
-                            0,
-                            false,
-                        ))
-                    }
-                };
+                let result =
+                    match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                        write,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => Ok(outcome),
+                        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                            // Client reset the response half after rejection was
+                            // selected — keep accounting rather than dropping the
+                            // already-rejected request as a bare transport Err.
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            Ok(terminal_deadline_write_aborted_outcome(
+                                StatusCode::OK.as_u16(),
+                                0,
+                                backend_start,
+                                0,
+                                true,
+                            ))
+                        }
+                        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            Ok(terminal_deadline_write_aborted_outcome(
+                                StatusCode::OK.as_u16(),
+                                0,
+                                backend_start,
+                                0,
+                                false,
+                            ))
+                        }
+                    };
+                crate::http3::stream_util::halt_request_body(stream);
+                return result;
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
                 ctx.mark_gateway_deadline_response_selected();
@@ -4753,7 +4775,6 @@ where
                 )
                 .await;
                 outcome.rejection_logged = true;
-                // Do not STOP_SENDING here: the drain was cancelled mid-recv_data.
                 return Ok(outcome);
             }
         }
@@ -4862,7 +4883,7 @@ where
         crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
         grpc_dispatch_proxy,
         &current_url,
-        &state.grpc_pool,
+        &initial_grpc_transport,
         &state.dns_cache,
         &merge_proxy_headers,
         stream_grpc_response,
@@ -4990,32 +5011,47 @@ where
                 current_url = next_url;
             }
 
-            // Re-screen the rotated target for mesh transport tags (issue
-            // #2003): the pre-dispatch guard above only classified the FIRST
-            // selected target, and a rotation onto a mesh-tagged target (mixed
-            // mesh/non-mesh upstream) must fail closed, never direct-dial past
-            // the secured transport. The prior attempt's failure was already
-            // recorded and the probe slot released above, so only the refusal
-            // is written here.
-            if let Some(message) = grpc_mesh_transport_refusal(current_target.as_deref()) {
-                warn!(
-                    proxy_id = %proxy.id,
-                    target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
-                    message,
-                    "cross-protocol H3→gRPC: retry rotated onto a mesh-transport-tagged target; \
-                     refusing the direct dial and failing closed with gRPC UNAVAILABLE"
-                );
-                return write_grpc_error_for_request(
-                    stream,
-                    ctx,
-                    grpc_proxy::grpc_status::UNAVAILABLE,
-                    message,
-                    backend_start,
-                    bytes_sent,
-                    initial_response_header_policy_plugins,
-                )
-                .await;
-            }
+            // Re-resolve the transport for the ROTATED target (issues #2003,
+            // #3284): the pre-dispatch resolution above only classified the
+            // FIRST selected target, so a mixed mesh/non-mesh upstream can
+            // rotate onto a target with a different transport. Rotation onto a
+            // `mesh.mtls` target re-dials over ITS mesh transport (a fresh
+            // pinned peer / east-west plan, never the previous target's
+            // session); rotation onto an undispatchable one still fails closed
+            // rather than direct-dialing past the secured transport. The prior
+            // attempt's failure was already recorded and the probe slot
+            // released above, so only the refusal is written here.
+            let grpc_retry_transport =
+                match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+                    Ok(transport) => transport,
+                    Err(transport_error) => {
+                        let message = transport_error.message();
+                        let diagnostic = transport_error.diagnostic().as_str();
+                        warn!(
+                            proxy_id = %proxy.id,
+                            target_host = current_target
+                                .as_deref()
+                                .map(|t| t.host.as_str())
+                                .unwrap_or(""),
+                            target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                            diagnostic,
+                            refusal = ?transport_error,
+                            message,
+                            "cross-protocol H3→gRPC: retry rotated onto a target with no \
+                             dispatchable mesh transport; failing closed with gRPC UNAVAILABLE"
+                        );
+                        return write_grpc_error_for_request(
+                            stream,
+                            ctx,
+                            grpc_proxy::grpc_status::UNAVAILABLE,
+                            message,
+                            backend_start,
+                            bytes_sent,
+                            initial_response_header_policy_plugins,
+                        )
+                        .await;
+                    }
+                };
 
             warn!(
                 proxy_id = %proxy.id,
@@ -5070,7 +5106,7 @@ where
                 crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_retry_dispatch_proxy,
                 &current_url,
-                &state.grpc_pool,
+                &grpc_retry_transport,
                 &state.dns_cache,
                 &retry_merge_proxy_headers,
                 stream_grpc_response,
@@ -6102,36 +6138,51 @@ pub(crate) async fn dispatch_grpc_streaming(
     let current_target = upstream_target.cloned().map(Arc::new);
     let current_cb_target_key = cb_target_key.map(str::to_owned);
 
-    // FAIL CLOSED on a mesh-transport-tagged target BEFORE dialing (issue
-    // #2003, see `grpc_mesh_transport_refusal`). No retry / rotation exists on
-    // this path, so the single pre-dispatch check covers it. The probe slot a
-    // HALF_OPEN breaker may have admitted is released, mirroring the buffered
+    // Resolve the dispatch transport BEFORE dialing (issues #2003, #3284, see
+    // `resolve_h3_grpc_transport`). A `mesh.mtls` target streams over the
+    // SVID-mTLS HTTP/2 pool and a `mesh.hbone` target over the nested HTTP/2
+    // connection inside its CONNECT tunnel — the channel-backed `GrpcBody`
+    // rides both unchanged, so request DATA still commits incrementally for
+    // client-streaming / bidi RPCs and the peer can respond before the H3
+    // client half-closes. Anything undispatchable FAILS CLOSED rather than
+    // direct-dialing past the secured transport. No retry / rotation exists on
+    // this path, so the single pre-dispatch resolution covers it. The probe slot
+    // a HALF_OPEN breaker may have admitted is released, mirroring the buffered
     // path's pre-dispatch rejects.
-    if let Some(message) = grpc_mesh_transport_refusal(current_target.as_deref()) {
-        warn!(
-            proxy_id = %proxy.id,
-            target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
-            message,
-            "cross-protocol H3→gRPC streaming: refusing direct dial to a \
-             mesh-transport-tagged target; failing closed with gRPC UNAVAILABLE"
-        );
-        release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-            state,
-            proxy,
-            current_cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
-        return write_grpc_error_for_request(
-            &mut stream,
-            ctx,
-            grpc_proxy::grpc_status::UNAVAILABLE,
-            message,
-            backend_start,
-            0,
-            initial_response_header_policy_plugins,
-        )
-        .await;
-    }
+    let grpc_transport = match resolve_h3_grpc_transport(state, current_target.as_deref()) {
+        Ok(transport) => transport,
+        Err(transport_error) => {
+            let message = transport_error.message();
+            let diagnostic = transport_error.diagnostic().as_str();
+            warn!(
+                proxy_id = %proxy.id,
+                target_host = current_target.as_deref().map(|t| t.host.as_str()).unwrap_or(""),
+                target_port = current_target.as_deref().map(|t| t.port).unwrap_or(0),
+                diagnostic,
+                refusal = ?transport_error,
+                message,
+                "cross-protocol H3→gRPC streaming: no dispatchable mesh transport for the \
+                 selected target; failing closed with gRPC UNAVAILABLE instead of an \
+                 unauthenticated direct dial"
+            );
+            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return write_grpc_error_for_request(
+                &mut stream,
+                ctx,
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                message,
+                backend_start,
+                0,
+                initial_response_header_policy_plugins,
+            )
+            .await;
+        }
+    };
 
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
@@ -6329,6 +6380,10 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         // STOP_SENDING(H3_NO_ERROR): a bare recv-half drop surfaces as
         // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
+        // Unconditional even when shutdown cancelled a frontend `recv_data` /
+        // `recv_trailers` mid-poll — reaching the QUIC stream while a read is in
+        // flight is exactly what the vendored `h3-quinn` patch provides. See
+        // `docs/upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/`.
         crate::http3::stream_util::halt_request_body(&mut recv_half);
     });
     let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(
@@ -6357,7 +6412,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         rx,
         grpc_dispatch_proxy,
         backend_url,
-        &state.grpc_pool,
+        &grpc_transport,
         &merge_proxy_headers,
         effective_max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
@@ -7889,8 +7944,9 @@ where
     // not park forever on exhausted QUIC flow-control credit. Already-selected
     // deadline rejections use the shared post-deadline grace (not the expired
     // absolute deadline) so HEADERS can become visible without unbounded
-    // retention; grace expiry aborts the send half without STOP_SENDING after
-    // a mid-recv_data cancel.
+    // retention. The send-only inner writer keeps response-before-teardown
+    // ordering; the full-stream branch halts the request direction after the
+    // bounded write settles, including after a mid-recv_data cancel.
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         if terminal_gateway_deadline {
@@ -7904,33 +7960,34 @@ where
                 false,
                 RejectBodyDisposition::WireBody,
             );
-            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                write,
-            )
-            .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    Ok(terminal_deadline_write_aborted_outcome(
-                        StatusCode::OK.as_u16(),
-                        0,
-                        backend_start,
-                        bytes_sent,
-                        true,
-                    ))
-                }
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    Ok(terminal_deadline_write_aborted_outcome(
-                        StatusCode::OK.as_u16(),
-                        0,
-                        backend_start,
-                        bytes_sent,
-                        false,
-                    ))
-                }
-            };
+            let result =
+                match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                    .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            true,
+                        ))
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            false,
+                        ))
+                    }
+                };
+            crate::http3::stream_util::halt_request_body(stream);
+            return result;
         }
         write_reject_with_headers(
             stream,
@@ -7944,13 +8001,54 @@ where
         .await
     } else if matches!(flavor, HttpFlavor::Grpc) {
         if terminal_gateway_deadline {
-            // Send-only: skip STOP_SENDING after mid-recv_data cancel.
+            // Send-only while the bounded terminal write is in flight; this
+            // full-stream caller halts the receive direction afterward.
             let write =
                 write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
-            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                write,
-            )
-            .await
+            let result =
+                match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                    .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            normalized.http_status.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            true,
+                        ))
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            normalized.http_status.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            false,
+                        ))
+                    }
+                };
+            crate::http3::stream_util::halt_request_body(stream);
+            return result;
+        }
+        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+    } else if terminal_gateway_deadline {
+        let write = write_reject_with_headers_and_recv_halt(
+            stream,
+            normalized.http_status,
+            normalized.body,
+            &normalized.headers,
+            backend_start,
+            bytes_sent,
+            false,
+            normalized.body_disposition,
+        );
+        let result =
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                .await
             {
                 Ok(outcome) => Ok(outcome),
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
@@ -7974,42 +8072,8 @@ where
                     ))
                 }
             };
-        }
-        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
-    } else if terminal_gateway_deadline {
-        let write = write_reject_with_headers_and_recv_halt(
-            stream,
-            normalized.http_status,
-            normalized.body,
-            &normalized.headers,
-            backend_start,
-            bytes_sent,
-            false,
-            normalized.body_disposition,
-        );
-        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
-            Ok(outcome) => Ok(outcome),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    normalized.http_status.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    true,
-                ))
-            }
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    normalized.http_status.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    false,
-                ))
-            }
-        }
+        crate::http3::stream_util::halt_request_body(stream);
+        result
     } else {
         write_reject_with_headers(
             stream,
@@ -8318,8 +8382,9 @@ where
 }
 
 /// Request-aware gRPC error writer with explicit recv-half control.
-/// Mid-`recv_data` cancel paths pass `halt_recv=false` so STOP_SENDING cannot
-/// unwrap-abort h3-quinn's empty recv slot under `panic = "abort"`.
+/// Mid-`recv_data` cancel paths pass `halt_recv=false` so their post-deadline
+/// wrapper can preserve response-before-teardown ordering, then halt the full
+/// stream explicitly once the bounded write settles.
 #[allow(clippy::too_many_arguments)]
 async fn write_grpc_error_for_request_with_recv_halt<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -9362,9 +9427,10 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
         };

@@ -10,6 +10,7 @@ use ferrum_edge::_test_support::{
     run_after_proxy_hooks_for_test, run_before_proxy_hooks_for_test,
 };
 use ferrum_edge::PluginCache;
+use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DEFAULT_NAMESPACE, DispatchKind, GatewayConfig, PluginAssociation,
     PluginConfig, PluginScope, Proxy, default_namespace,
@@ -86,6 +87,7 @@ fn make_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),
@@ -98,6 +100,7 @@ fn plugin_config(
     plugin_name: &str,
     config: serde_json::Value,
     priority_override: Option<u16>,
+    trigger: Option<PluginTrigger>,
 ) -> PluginConfig {
     PluginConfig {
         id: id.to_string(),
@@ -108,6 +111,7 @@ fn plugin_config(
         proxy_id: Some("p1".to_string()),
         enabled: true,
         priority_override,
+        trigger,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -180,6 +184,7 @@ async fn cache_backed_stable_order_route_remove_survives_later_request_rename() 
                 }]
             }),
             None,
+            None,
         ),
         plugin_config(
             "rt-b",
@@ -192,6 +197,7 @@ async fn cache_backed_stable_order_route_remove_survives_later_request_rename() 
                     "new_key": "X-Internal-Role"
                 }]
             }),
+            None,
             None,
         ),
     ]);
@@ -246,6 +252,7 @@ async fn cache_backed_priority_override_order_route_set_survives_later_static_up
                 }]
             }),
             Some(3010),
+            None,
         ),
         plugin_config(
             "rt-early",
@@ -259,6 +266,7 @@ async fn cache_backed_priority_override_order_route_set_survives_later_static_up
                 }]
             }),
             Some(2990),
+            None,
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
@@ -300,6 +308,7 @@ async fn cache_backed_auto_emit_consumer_then_operator_keeps_route_final() {
                 "apply_route_overrides": true
             }),
             None,
+            None,
         ),
         plugin_config(
             "rt-op",
@@ -320,6 +329,7 @@ async fn cache_backed_auto_emit_consumer_then_operator_keeps_route_final() {
                     }
                 ]
             }),
+            None,
             None,
         ),
     ]);
@@ -365,6 +375,7 @@ async fn cache_backed_disabled_rtds_instance_does_not_suppress_route_final() {
                 "runtime_overlay_resolved_enabled": false
             }),
             None,
+            None,
         ),
         plugin_config(
             "rt-enabled",
@@ -377,6 +388,7 @@ async fn cache_backed_disabled_rtds_instance_does_not_suppress_route_final() {
                     "value": "yes"
                 }]
             }),
+            None,
             None,
         ),
     ]);
@@ -427,6 +439,7 @@ async fn cache_backed_response_route_remove_survives_later_backend_rename() {
                 }]
             }),
             None,
+            None,
         ),
         plugin_config(
             "resp-b",
@@ -439,6 +452,7 @@ async fn cache_backed_response_route_remove_survives_later_backend_rename() {
                     "new_key": "X-Internal-Debug"
                 }]
             }),
+            None,
             None,
         ),
     ]);
@@ -490,6 +504,7 @@ async fn cache_backed_response_route_set_and_add_apply_exactly_once() {
                 }]
             }),
             None,
+            None,
         ),
         plugin_config(
             "resp-b",
@@ -498,6 +513,7 @@ async fn cache_backed_response_route_set_and_add_apply_exactly_once() {
                 "apply_route_overrides": true,
                 "rules": []
             }),
+            None,
             None,
         ),
     ]);
@@ -536,6 +552,7 @@ async fn cache_backed_synthetic_rejection_path_applies_response_route_final() {
                 }]
             }),
             None,
+            None,
         ),
         plugin_config(
             "resp-b",
@@ -548,6 +565,7 @@ async fn cache_backed_synthetic_rejection_path_applies_response_route_final() {
                     "new_key": "X-Internal-Debug"
                 }]
             }),
+            None,
             None,
         ),
     ]);
@@ -601,6 +619,7 @@ async fn no_eligible_consumer_leaves_route_override_unused() {
             "runtime_overlay_scope": "gate",
             "runtime_overlay_resolved_enabled": false
         }),
+        None,
         None,
     )]);
     let cache = PluginCache::new(&config).expect("cache");

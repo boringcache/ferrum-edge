@@ -72,6 +72,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),
@@ -1005,6 +1006,7 @@ fn mtls_plugin(
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1320,6 +1322,7 @@ fn test_unique_listen_paths_valid() {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
                 created_at: Utc::now(),
@@ -1384,6 +1387,7 @@ fn test_unique_listen_paths_valid() {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
                 created_at: Utc::now(),
@@ -1464,6 +1468,7 @@ fn test_unique_listen_paths_duplicate() {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
                 created_at: Utc::now(),
@@ -1528,6 +1533,7 @@ fn test_unique_listen_paths_duplicate() {
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
                 stream_proxy_protocol: None,
+                backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
                 created_at: Utc::now(),
@@ -2740,6 +2746,7 @@ fn sni_plugin_config(
         enabled: true,
         config,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3448,6 +3455,7 @@ fn retry_proxy_allows_mesh_route_dispatch_override_upstream() {
         proxy_id: Some("p1".into()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3698,6 +3706,7 @@ fn retry_proxy_allows_same_upstream_dispatch_rule_that_adds_retry() {
         proxy_id: Some("p1".into()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3746,6 +3755,7 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3764,6 +3774,7 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
         proxy_id: Some("p1".into()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3810,6 +3821,7 @@ fn retry_proxy_allows_unshadowed_global_dispatch_to_mesh() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3851,6 +3863,7 @@ fn retry_proxy_allows_foreign_namespace_global_dispatch() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3897,6 +3910,7 @@ fn route_dispatch_association_resolves_same_namespace_plugin_id() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3940,6 +3954,7 @@ fn test_plugin_config_priority_override_valid() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(5000),
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3958,6 +3973,7 @@ fn test_plugin_config_priority_override_none_valid() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3976,6 +3992,7 @@ fn test_plugin_config_priority_override_too_high() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(10001),
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -3995,6 +4012,7 @@ fn test_plugin_config_priority_override_boundary() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(10000),
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4013,6 +4031,7 @@ fn test_plugin_config_priority_override_zero() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(0),
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4031,6 +4050,7 @@ fn test_plugin_config_priority_override_serde_roundtrip() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(42),
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4082,6 +4102,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4111,6 +4132,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
         proxy_id: Some("other-proxy".into()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4142,6 +4164,7 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4168,6 +4191,7 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4198,6 +4222,7 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
         proxy_id: Some("p1".into()), // Invalid: proxy_group must not have proxy_id
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4222,6 +4247,7 @@ fn test_plugin_scope_proxy_group_serde_round_trip() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4426,6 +4452,7 @@ fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_differen
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -4695,6 +4722,33 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Overlapping"));
+}
+
+#[test]
+fn test_unique_listen_paths_allows_same_host_path_on_distinct_listen_ports() {
+    let mut plain = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
+    plain.listen_port = Some(80);
+    let mut tls = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
+    tls.listen_port = Some(443);
+    let mut config = empty_config();
+    config.proxies = vec![plain, tls];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "port-scoped siblings must not collide"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_allows_port_agnostic_alongside_port_scoped() {
+    let agnostic = make_proxy_with_hosts("fallback", "/api", vec!["api.example.com"]);
+    let mut scoped = make_proxy_with_hosts("scoped", "/api", vec!["api.example.com"]);
+    scoped.listen_port = Some(8080);
+    let mut config = empty_config();
+    config.proxies = vec![agnostic, scoped];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "port-agnostic and port-scoped routes coexist; scoped wins at request time"
+    );
 }
 
 #[test]
@@ -5359,19 +5413,28 @@ fn test_stream_proxy_shared_port_validation_keeps_same_id_namespaces_distinct() 
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("all proxies sharing a port must have passthrough: true")),
+            .any(|error| error.contains("mixes passthrough and non-passthrough proxies")),
         "the non-passthrough staging proxy must not be replaced by prod's same-ID entry"
     );
 }
 
 #[test]
-fn test_http_proxy_must_not_set_listen_port() {
+fn test_http_proxy_may_set_listen_port_for_port_scoped_routing() {
     let mut proxy = make_proxy("p1", "/api");
     proxy.listen_port = Some(8080);
     let mut config = empty_config();
     config.proxies = vec![proxy];
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_http_proxy_rejects_listen_port_zero() {
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.listen_port = Some(0);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
     let err = config.validate_stream_proxies().unwrap_err();
-    assert!(err[0].contains("must not set listen_port"));
+    assert!(err[0].contains("invalid listen_port"));
 }
 
 // ---- Restore pre-deletion validation tests ----
@@ -5878,6 +5941,7 @@ fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> Plug
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -5894,6 +5958,7 @@ fn prometheus_metrics_pc(id: &str, scope: PluginScope, proxy_id: Option<&str>) -
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -6050,6 +6115,7 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
             proxy_id: Some("p1".into()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6066,6 +6132,7 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
             proxy_id: Some("p1".into()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6108,6 +6175,7 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
             proxy_id: Some("p1".into()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6125,6 +6193,7 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
             proxy_id: Some("p2".into()),
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6162,6 +6231,7 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6204,6 +6274,7 @@ fn dedup_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> 
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -6231,6 +6302,7 @@ fn mcp_gateway_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -6464,6 +6536,7 @@ fn a2a_gateway_plugin_config(
         proxy_id: proxy_id.map(str::to_string),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

@@ -2921,20 +2921,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 50 resource columns + `created_at` + `updated_at` = 52.
+    /// 51 resource columns + `created_at` + `updated_at` = 53.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 52;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 53;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 52 base + 1 (api_spec_id) = 53.
+    /// 53 base + 1 (api_spec_id) = 54.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 53;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 54;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -2959,12 +2959,12 @@ impl DatabaseStore {
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-         stream_proxy_protocol, stream_match, \
+         stream_proxy_protocol, backend_proxy_protocol, stream_match, \
          upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -3092,6 +3092,7 @@ impl DatabaseStore {
                     .stream_proxy_protocol
                     .map(|v| if v { 1i32 } else { 0 }),
             )
+            .bind(proxy.backend_proxy_protocol.map(|v| v.as_str()))
             .bind(&stream_match_json)
             .bind(&proxy.upstream_subset)
             .bind(proxy.created_at.to_rfc3339())
@@ -3170,7 +3171,7 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -3219,6 +3220,7 @@ impl DatabaseStore {
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
         .bind(proxy.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+        .bind(proxy.backend_proxy_protocol.map(|v| v.as_str()))
         .bind(&stream_match_json)
         .bind(proxy.updated_at.to_rfc3339())
         .bind(&proxy.id)
@@ -3790,7 +3792,7 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&pc.id)
         .bind(&pc.namespace)
@@ -3800,6 +3802,7 @@ impl DatabaseStore {
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.priority_override.map(|v| v as i32))
+        .bind(plugin_config_trigger_json(pc)?)
         .bind(pc.created_at.to_rfc3339())
         .bind(pc.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -3854,7 +3857,7 @@ impl DatabaseStore {
             return Ok(false);
         }
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
         .bind(&config_json)
@@ -3862,6 +3865,7 @@ impl DatabaseStore {
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.priority_override.map(|v| v as i32))
+        .bind(plugin_config_trigger_json(pc)?)
         .bind(pc.updated_at.to_rfc3339())
         .bind(&pc.id)
         .bind(&pc.namespace)
@@ -4973,37 +4977,6 @@ impl DatabaseStore {
         }
     }
 
-    /// Check if a listen_port is unique across all stream proxies.
-    /// Returns `true` if the port is unique (no conflicts found).
-    pub async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(
-                &self.q(
-                    "SELECT id FROM proxies WHERE namespace = ? AND listen_port = ? AND id != ?",
-                ),
-            )
-            .bind(namespace)
-            .bind(port as i32)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?
-        } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND listen_port = ?"))
-                .bind(namespace)
-                .bind(port as i32)
-                .fetch_all(&self.pool())
-                .await?
-        };
-        self.check_slow_query("check_listen_port_unique", start);
-        Ok(rows.is_empty())
-    }
-
     /// Check if an upstream with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace.
     ///
@@ -5986,6 +5959,7 @@ impl DatabaseStore {
                         .stream_proxy_protocol
                         .map(|v| if v { 1i32 } else { 0 }),
                 )
+                .bind(proxy.backend_proxy_protocol.map(|v| v.as_str()))
                 .bind(&stream_match_json)
                 .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
@@ -6274,7 +6248,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -6294,6 +6268,7 @@ impl DatabaseStore {
                 .bind(&pc.proxy_id)
                 .bind(if pc.enabled { 1i32 } else { 0 })
                 .bind(pc.priority_override.map(|v| v as i32))
+                .bind(plugin_config_trigger_json(pc)?)
                 .bind(pc.created_at.to_rfc3339())
                 .bind(pc.updated_at.to_rfc3339())
                 .execute(&mut **tx)
@@ -7588,11 +7563,11 @@ impl DatabaseStore {
                   listen_port, frontend_tls, passthrough, \
                   udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-                  stream_proxy_protocol, stream_match, \
+                  stream_proxy_protocol, backend_proxy_protocol, stream_match, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?)"))
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -7667,6 +7642,7 @@ impl DatabaseStore {
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
             .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+            .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
             .bind(&stream_match_json)
             .bind(&spec.id)
             .bind(p.created_at.to_rfc3339())
@@ -7695,8 +7671,8 @@ impl DatabaseStore {
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
                  (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
-                  priority_override, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  priority_override, trigger_json, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -7705,6 +7681,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
+            .bind(plugin_config_trigger_json(pc)?)
             .bind(api_spec_id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
@@ -8044,7 +8021,7 @@ impl DatabaseStore {
                  websocket_idle_timeout_seconds = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
                  udp_max_response_amplification_factor = ?, \
-                 stream_proxy_protocol = ?, stream_match = ?, \
+                 stream_proxy_protocol = ?, backend_proxy_protocol = ?, stream_match = ?, \
                  api_spec_id = ?, updated_at = ? \
                  WHERE id = ? AND namespace = ?"))
             .bind(&p.namespace)
@@ -8120,6 +8097,7 @@ impl DatabaseStore {
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
             .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+            .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
             .bind(&stream_match_json)
             .bind(&spec.id)
             .bind(p.updated_at.to_rfc3339())
@@ -8140,8 +8118,8 @@ impl DatabaseStore {
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
                  (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
-                  priority_override, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  priority_override, trigger_json, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -8150,6 +8128,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
+            .bind(plugin_config_trigger_json(pc)?)
             .bind(&spec.id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
@@ -9729,15 +9708,6 @@ impl DatabaseBackend for DatabaseStore {
             .await
     }
 
-    async fn check_listen_port_unique(
-        &self,
-        namespace: &str,
-        port: u16,
-        exclude_proxy_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
-    }
-
     async fn check_upstream_exists(
         &self,
         upstream_id: &str,
@@ -10315,6 +10285,26 @@ fn row_to_proxy_inner(
         stream_proxy_protocol: row
             .try_get::<Option<i32>, _>("stream_proxy_protocol")?
             .map(|v| v != 0),
+        backend_proxy_protocol: match optional_utf8_text_column(row, "backend_proxy_protocol")? {
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Proxy {}: invalid backend_proxy_protocol value",
+                                    pid
+                                )
+                            },
+                        )?,
+                    )
+                }
+            }
+            None => None,
+        },
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
             Some(s) => Some(
                 serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|_| {
@@ -10451,6 +10441,18 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
     })
 }
 
+/// Serialize the optional per-instance execution trigger for the
+/// `plugin_configs.trigger_json` column.
+///
+/// `None` is stored as SQL `NULL` so an untriggered instance keeps exactly the
+/// historical row shape and the loader cannot mistake `"null"` for a trigger.
+fn plugin_config_trigger_json(pc: &PluginConfig) -> Result<Option<String>, anyhow::Error> {
+    match pc.trigger.as_ref() {
+        Some(trigger) => Ok(Some(serde_json::to_string(trigger)?)),
+        None => Ok(None),
+    }
+}
+
 /// Parse a plugin_config row into a PluginConfig struct.
 fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let id_preview: String = row
@@ -10488,6 +10490,27 @@ fn row_to_plugin_config_inner(
         )
     })?;
 
+    let trigger = optional_utf8_text_column(row, "trigger_json").map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to read trigger_json column: {}",
+            id_preview,
+            e
+        )
+    })?;
+    let trigger = match trigger {
+        // A stored trigger that no longer parses is a fail-closed error, not a
+        // silently untriggered instance: dropping it would run a plugin the
+        // operator scoped away.
+        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "PluginConfig {}: failed to parse trigger JSON: {}",
+                id_preview,
+                e
+            )
+        })?),
+        None => None,
+    };
+
     Ok(PluginConfig {
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
@@ -10505,6 +10528,7 @@ fn row_to_plugin_config_inner(
             .ok()
             .flatten()
             .map(|v| v.clamp(0, 10_000) as u16),
+        trigger,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
@@ -10943,7 +10967,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?)";
+                                     ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

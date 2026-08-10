@@ -1275,19 +1275,21 @@ pub(crate) fn cas_publish_incremental_partitions(
         // committed. Each partition carries its namespace's durable cursor;
         // a rejected far-future partition must not advance the published
         // watermark past content the CP never accepted.
+        //
+        // Issue #3611: `advance_change_log_sequence` refuses a Kubernetes-domain
+        // revision. A K8s-controller CP's mesh block comes wholly from the K8s
+        // overlay, so a database change cursor describes none of it and must
+        // never move its sequence — in either direction.
         if let Some(current_revision) = old_config.mesh_revision.as_ref() {
+            let mut revision = current_revision.clone();
             let accepted_sequence = outcome
                 .accepted
                 .values()
                 .map(|delta| delta.sequence_cursor)
                 .max()
-                .unwrap_or(current_revision.sequence)
-                .max(current_revision.sequence);
-            stamp_mesh_revision(
-                &mut outcome.config,
-                Some(&current_revision.authority),
-                accepted_sequence,
-            );
+                .unwrap_or(0);
+            revision.advance_change_log_sequence(accepted_sequence);
+            outcome.config.mesh_revision = Some(revision);
         }
         let new_config = Arc::new(outcome.config.clone());
         let previous = config_arc.compare_and_swap(&*old_config, new_config);
@@ -1536,22 +1538,14 @@ pub(crate) fn publish_cp_incremental(
 /// backup, migration to a new store) be published as a NEW domain instead of
 /// silently rewinding sequence numbers inside the old one.
 ///
-/// Returns `None` when the CP has no single sequenced authority, which today
-/// means the Kubernetes CRD controller is enabled: it reconciles CRDs straight
-/// into the in-memory snapshot on its own cadence, with no cross-replica
-/// monotonic sequence to order against (a max-over-live-objects
-/// `metadata.resourceVersion` decreases when the highest-versioned object is
-/// deleted, and per-replica high-water marks diverge). Mixing sequenced DB
-/// snapshots with unsequenced controller snapshots in one authority would make
-/// the data-plane gate flap, so such a CP publishes NO revision at all and the
-/// gate stays inert — the pre-#2473 behavior, documented in `docs/mesh.md`.
+/// Returns `None` when the Kubernetes CRD controller is enabled. That CP still
+/// publishes a revision — see [`resolve_k8s_mesh_config_authority`] — but from
+/// the Kubernetes ordering domain, not from the change log: on such a CP the
+/// mesh block is authored ENTIRELY by the K8s overlay (database full loads clear
+/// `mesh` and re-merge it from the overlay slot, #2982), so the change-log
+/// cursor describes no part of the mesh snapshot and must not stamp it.
 fn resolve_mesh_config_authority(env_config: &EnvConfig) -> Option<String> {
     if env_config.k8s_controller_enabled {
-        info!(
-            "K8s CRD controller is enabled — this CP publishes no authoritative mesh \
-             config revision, so mesh data planes apply no cross-CP freshness \
-             ordering (see docs/mesh.md)"
-        );
         return None;
     }
     let authority = env_config.mesh_config_authority_id.as_str();
@@ -1559,6 +1553,35 @@ fn resolve_mesh_config_authority(env_config: &EnvConfig) -> Option<String> {
         return None;
     }
     Some(authority.to_string())
+}
+
+/// Resolve the Kubernetes mesh config ORDERING DOMAIN this control plane
+/// advertises (issue #3611).
+///
+/// The domain is the Kubernetes API server's `resourceVersion` space — etcd's
+/// cluster-global revision counter — which every CP replica watching the same
+/// cluster observes identically. It is deliberately a DIFFERENT domain from the
+/// change-log one: a database `config_changes` sequence and an etcd revision are
+/// unrelated numbers, and a data plane must never compare them. The reserved
+/// `k8s` name is enforced at both ends by `EnvConfig::validate`, which refuses a
+/// change-log CP that claims it.
+///
+/// `FERRUM_MESH_CONFIG_AUTHORITY_ID` stays the single disable switch (empty
+/// disables revision publication on either domain);
+/// `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` qualifies the Kubernetes domain so an
+/// operator can name a NEW one after an etcd restore-from-backup — the one event
+/// that can rewind `resourceVersion` inside a cluster — or distinguish two
+/// clusters whose CPs one data plane lists in `FERRUM_DP_CP_GRPC_URLS`.
+fn resolve_k8s_mesh_config_authority(env_config: &EnvConfig) -> Option<String> {
+    if !env_config.k8s_controller_enabled {
+        return None;
+    }
+    if env_config.mesh_config_authority_id.is_empty() {
+        return None;
+    }
+    Some(crate::modes::mesh::revision::kubernetes_authority(
+        env_config.mesh_config_k8s_authority_id.as_str(),
+    ))
 }
 
 /// Stamp the derived, CP-in-memory-only mesh config revision onto a snapshot.
@@ -2654,6 +2677,11 @@ pub async fn run(
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
             watch_idle_relist_secs: env_config.k8s_watch_idle_relist_secs,
             kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),
+            // Authoritative mesh config revision domain for this CP (#3611).
+            // Distinct from `mesh_config_authority` above, which stays `None`
+            // here: on a K8s-controller CP the mesh block is authored wholly by
+            // the K8s overlay, so the change-log cursor stamps nothing.
+            mesh_config_authority: resolve_k8s_mesh_config_authority(&env_config),
         };
         match crate::k8s_controller::start_k8s_controller(
             controller_config,
@@ -3985,6 +4013,7 @@ mod tests {
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
             stream_proxy_protocol: None,
+            backend_proxy_protocol: None,
             stream_match: None,
             compiled_stream_match: None,
             created_at: Utc::now(),

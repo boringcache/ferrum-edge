@@ -17,6 +17,12 @@ use ferrum_edge::modes::mesh::config::{
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+/// The SHIPPED DEFAULT Unix-socket containment allowlist: empty, which refuses
+/// every `unix://` ingress `defaultEndpoint`. Passed explicitly wherever a test
+/// asserts the default posture, and to loopback-TCP assertions to prove
+/// containment governs Unix sockets only (issue #3261).
+const NO_ROOTS: &[String] = &[];
+
 fn fresh_workload() -> Workload {
     let td = TrustDomain::new("prod.example.com").unwrap();
     Workload {
@@ -1965,16 +1971,27 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
         protocol: AppProtocol::Http,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
-    assert!(valid.endpoint_is_valid(), "loopback v4 host:port is valid");
+    // An EMPTY containment allowlist is the shipped default. A loopback-TCP
+    // listener must be completely unaffected by it — containment governs unix
+    // sockets only.
+    assert!(
+        valid.endpoint_is_valid(NO_ROOTS),
+        "loopback v4 host:port is valid regardless of unix containment"
+    );
 
     let v6 = ResolvedIngressListener {
         endpoint_host: "::1".to_string(),
         ..valid.clone()
     };
-    assert!(v6.endpoint_is_valid(), "loopback v6 host:port is valid");
+    assert!(
+        v6.endpoint_is_valid(NO_ROOTS),
+        "loopback v6 host:port is valid"
+    );
 
     // Codex round-2 P2: a carried OFF-BOX host must fail re-validation.
     let off_box = ResolvedIngressListener {
@@ -1982,7 +1999,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         ..valid.clone()
     };
     assert!(
-        !off_box.endpoint_is_valid(),
+        !off_box.endpoint_is_valid(NO_ROOTS),
         "an off-box backend host must fail re-validation"
     );
 
@@ -1991,28 +2008,209 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         endpoint_port: 0,
         ..valid.clone()
     };
-    assert!(!zero_backend.endpoint_is_valid());
+    assert!(!zero_backend.endpoint_is_valid(NO_ROOTS));
 
     // A carried `:0` listener port fails.
     let zero_listener = ResolvedIngressListener {
         port: 0,
         ..valid.clone()
     };
-    assert!(!zero_listener.endpoint_is_valid());
+    assert!(!zero_listener.endpoint_is_valid(NO_ROOTS));
 
     // A non-IP / unparseable host fails.
     let bogus_host = ResolvedIngressListener {
         endpoint_host: "example.com".to_string(),
         ..valid.clone()
     };
-    assert!(!bogus_host.endpoint_is_valid());
+    assert!(!bogus_host.endpoint_is_valid(NO_ROOTS));
 }
 
 #[test]
-fn ingress_resolve_rejects_unix_socket_endpoint() {
+fn ingress_resolve_accepts_admissible_unix_socket_endpoint() {
+    // Issue #3261: a `unix://` defaultEndpoint materializes a routable
+    // Unix-stream backend instead of being deferred as unrepresentable.
+    //
+    // `resolve()` is the CP-side, syntax-only half of the gate: a control plane
+    // does not share the workload's filesystem, so containment is a DATA-PLANE
+    // policy applied by `endpoint_is_valid`/`backend` at materialization and
+    // again at the dial.
+    let resolved = ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock")
+        .resolve()
+        .expect("an absolute unix socket path resolves");
+    assert_eq!(resolved.port, 8443);
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock").resolve(),
-        Err(IngressListenerUnsupported::UnixSocketEndpoint)
+        resolved.endpoint_unix_path.as_deref(),
+        Some("/var/run/app.sock")
+    );
+    // The host:port pair stays VACANT so the carrier re-validation can reject a
+    // both-shapes carrier (a smuggled TCP fallback).
+    assert_eq!(resolved.endpoint_host, "");
+    assert_eq!(resolved.endpoint_port, 0);
+    // An `http` listener is HTTP/1.1: no h2c marker.
+    assert!(!resolved.endpoint_unix_h2c);
+
+    // With NO containment roots configured (the default) the listener is refused
+    // outright — this is the whole local-privilege boundary.
+    assert!(
+        !resolved.endpoint_is_valid(NO_ROOTS),
+        "an unconfigured containment allowlist must refuse every unix listener"
+    );
+    assert_eq!(resolved.unix_socket_path(NO_ROOTS), None);
+    assert_eq!(resolved.backend(NO_ROOTS), None);
+
+    // Inside a configured root it resolves to a routable Unix backend.
+    let allowed = vec!["/var/run".to_string()];
+    assert!(resolved.endpoint_is_valid(&allowed));
+    assert_eq!(
+        resolved.unix_socket_path(&allowed),
+        Some("/var/run/app.sock")
+    );
+    assert_eq!(
+        resolved.backend(&allowed),
+        Some(ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+            path: "/var/run/app.sock".to_string(),
+            h2c: false,
+        })
+    );
+
+    // A root that does not contain the socket refuses it, even though the path
+    // is perfectly well-formed.
+    assert_eq!(resolved.backend(&["/run/ferrum".to_string()]), None);
+}
+
+/// The declared listener protocol — not the endpoint string — decides the wire
+/// protocol on the socket, and `http2`/`grpc` must resolve to h2c so gRPC gets
+/// real trailers, streaming, and deadlines rather than an HTTP/1.1 downgrade.
+#[test]
+fn ingress_resolve_maps_declared_protocol_to_the_unix_wire_protocol() {
+    let allowed = vec!["/var/run".to_string()];
+    for (protocol, expected_h2c) in [
+        (AppProtocol::Http, false),
+        (AppProtocol::Http2, true),
+        (AppProtocol::Grpc, true),
+    ] {
+        let resolved = ingress_entry(8443, protocol, "unix:///var/run/app.sock")
+            .resolve()
+            .unwrap_or_else(|e| panic!("{protocol:?} must resolve over a unix socket: {e:?}"));
+        assert_eq!(
+            resolved.endpoint_unix_h2c, expected_h2c,
+            "{protocol:?} must map to h2c={expected_h2c}"
+        );
+        assert_eq!(
+            resolved.backend(&allowed),
+            Some(ferrum_edge::modes::mesh::config::MeshIngressBackend::Unix {
+                path: "/var/run/app.sock".to_string(),
+                h2c: expected_h2c,
+            })
+        );
+    }
+}
+
+/// A carrier that marks a loopback-TCP listener as h2c is internally
+/// inconsistent — the marker is Unix-only — and is refused rather than reused
+/// to reinterpret the transport.
+#[test]
+fn ingress_carrier_rejects_an_h2c_marker_on_a_tcp_listener() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let hostile = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        protocol: AppProtocol::Http,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: true,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(!hostile.endpoint_is_valid(NO_ROOTS));
+    assert!(!hostile.endpoint_shape_is_valid());
+}
+
+#[test]
+fn ingress_resolve_rejects_hostile_unix_socket_paths() {
+    // Every rejection is FIELD-SPECIFIC: the operator learns which rule the
+    // path broke, not just that it was refused.
+    use ferrum_edge::util::unix_socket::UnixSocketPathRejection as R;
+    let cases: &[(&str, R)] = &[
+        ("unix://", R::Empty),
+        ("unix://relative/app.sock", R::NotAbsolute),
+        ("unix://@abstract", R::NotAbsolute),
+        ("unix:///var/../../etc/passwd", R::TraversalComponent),
+        ("unix:///var/./app.sock", R::TraversalComponent),
+        ("unix:///var//run/app.sock", R::EmptyComponent),
+        ("unix:///var/run/", R::TrailingSlash),
+        ("unix:///", R::TrailingSlash),
+        ("unix:///var/run/app.sock ", R::SurroundingWhitespace),
+        ("unix:///var/run/a\u{0}b.sock", R::InteriorNul),
+        ("unix:///var/run/a\u{7}b.sock", R::ControlCharacter),
+    ];
+    for (endpoint, expected) in cases {
+        assert_eq!(
+            ingress_entry(8443, AppProtocol::Http, endpoint).resolve(),
+            Err(IngressListenerUnsupported::InvalidUnixSocketPath(*expected)),
+            "endpoint {endpoint:?} must fail closed with its specific reason"
+        );
+    }
+    // Over the portable `sockaddr_un` budget.
+    let long = format!("unix:///{}", "a".repeat(200));
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, &long).resolve(),
+        Err(IngressListenerUnsupported::InvalidUnixSocketPath(
+            R::TooLong
+        ))
+    );
+}
+
+#[test]
+fn ingress_carrier_revalidates_unix_socket_shape() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    // `/var/run` is the configured containment root for this carrier fixture.
+    let unix_roots = vec!["/var/run".to_string()];
+    let base = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: String::new(),
+        endpoint_port: 0,
+        protocol: AppProtocol::Http,
+        endpoint_unix_path: Some("/var/run/app.sock".to_string()),
+        endpoint_unix_h2c: false,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(
+        base.endpoint_is_valid(&unix_roots),
+        "an admitted unix carrier is valid"
+    );
+
+    // A hostile carrier that sets BOTH shapes is refused outright: accepting it
+    // would let a TCP fallback ride alongside the socket path.
+    let both = ResolvedIngressListener {
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        ..base.clone()
+    };
+    assert!(!both.endpoint_is_valid(&unix_roots));
+    assert_eq!(both.unix_socket_path(&unix_roots), None);
+
+    // A traversal-like path decoded straight from wire JSON never reaches a dial.
+    let traversal = ResolvedIngressListener {
+        endpoint_unix_path: Some("/var/../etc/passwd".to_string()),
+        ..base.clone()
+    };
+    assert!(!traversal.endpoint_is_valid(&unix_roots));
+
+    // A zero LISTENER port is invalid on the unix shape too.
+    let zero_listener = ResolvedIngressListener {
+        port: 0,
+        ..base.clone()
+    };
+    assert!(!zero_listener.endpoint_is_valid(&unix_roots));
+
+    // And a socket OUTSIDE the configured roots is refused even though the
+    // carrier itself is well-formed — containment is re-applied here, not just
+    // at translation.
+    assert!(
+        !base.endpoint_is_valid(&["/run/ferrum".to_string()]),
+        "an out-of-root carried socket path must be refused"
     );
 }
 
@@ -2060,11 +2258,13 @@ fn ingress_resolved_listener_rejects_unknown_protocol_on_revalidation() {
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
         protocol: AppProtocol::Unknown,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
     };
     assert!(
-        !hostile.endpoint_is_valid(),
+        !hostile.endpoint_is_valid(NO_ROOTS),
         "a carried Unknown protocol must fail re-validation"
     );
 }
@@ -3070,4 +3270,447 @@ fn mesh_config_validate_accepts_failover_priority_only() {
         "failover_priority-only locality LB must validate, got: {:?}",
         mesh.validate()
     );
+}
+
+/// Issue #3236: `destination.ip` is a documented Istio condition key and its
+/// values are CIDR blocks, so malformed entries must be rejected on the native
+/// `MeshConfig` surface too — a CIDR that can never match is fail-open for a
+/// DENY.
+#[test]
+fn mesh_policy_validates_destination_ip_when_condition_cidrs() {
+    let mut valid = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    valid.rules[0].when.push(ConditionMatch {
+        key: "destination.ip".into(),
+        values: vec!["10.96.0.0/12".into()],
+        not_values: vec!["10.96.5.5".into()],
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[valid], &[], &[], &[], None).is_empty(),
+        "a well-formed destination.ip condition must validate"
+    );
+
+    let mut malformed = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    malformed.rules[0].when.push(ConditionMatch {
+        key: "destination.ip".into(),
+        values: Vec::new(),
+        not_values: vec!["10.0.0.0/40".into()],
+    });
+    let errors = validate_mesh_config(&[], &[], &[malformed], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].not_values[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected a field-specific destination.ip notValues error, got: {errors:?}"
+    );
+}
+
+/// Istio validates `destination.port` conditions with a strict numeric parse.
+/// A non-numeric or out-of-range value could never match a port, which is
+/// fail-open for a DENY.
+#[test]
+fn mesh_policy_rejects_non_numeric_destination_port_when_condition() {
+    for value in ["http", "70000", "8*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "destination.port".into(),
+            values: vec![value.into()],
+            not_values: Vec::new(),
+        });
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].when[0].values[0]")
+                    && e.contains("must be a numeric port in 0..=65535")
+            }),
+            "expected a numeric-port diagnostic for '{value}', got: {errors:?}"
+        );
+    }
+}
+
+/// `experimental.envoy.filters.<filter>[<key>]` is a documented Istio key, so
+/// the policy must install (dropping it is fail-OPEN for a DENY). A bare
+/// experimental key with no bracketed metadata name is still rejected.
+#[test]
+fn mesh_policy_admits_experimental_envoy_filter_key_and_rejects_the_bare_form() {
+    let mut admitted = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    admitted.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy[db.table]".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[admitted], &[], &[], &[], None).is_empty(),
+        "a documented experimental condition key must not reject the policy"
+    );
+
+    let mut admitted_with_bracket = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    admitted_with_bracket.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy[db]table]".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[admitted_with_bracket], &[], &[], &[], None).is_empty(),
+        "Istio treats the first '[' and final ']' as delimiters, so an interior bracket remains part of the metadata key"
+    );
+
+    let mut bare = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    bare.rules[0].when.push(ConditionMatch {
+        key: "experimental.envoy.filters.network.mysql_proxy".into(),
+        values: vec!["books".into()],
+        not_values: Vec::new(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[bare], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("rules[0].when[0].key") && e.contains("unsupported")),
+        "a bare experimental key with no bracketed metadata name must fail closed, got: {errors:?}"
+    );
+}
+
+/// Istio compiles `source.serviceAccount` to an EXACT matcher
+/// (`pkg/config/security/security.go::CheckServiceAccount` +
+/// `serviceAccountRegex`), so a wildcard or multi-slash value would install a
+/// condition that can never fire — fail-OPEN for a DENY. Both `values` and
+/// `notValues` are checked; a bound on only one direction leaves the other open.
+#[test]
+fn mesh_policy_enforces_istio_source_service_account_value_grammar() {
+    for accepted in ["checkout", "payments/checkout"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.serviceAccount".into(),
+            values: vec![accepted.into()],
+            not_values: vec![accepted.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "'{accepted}' is a valid Istio source.serviceAccount value"
+        );
+    }
+
+    // Every rejected value embeds a distinctive token so the assertions can
+    // prove the diagnostic never echoes operator-supplied text.
+    let rejected: Vec<(String, &str)> = vec![
+        ("*".to_string(), "must not contain '*'"),
+        (format!("{ECHO_PROBE}*"), "must not contain '*'"),
+        (format!("ns/{ECHO_PROBE}/extra"), "at most one '/'"),
+        (format!("/{ECHO_PROBE}"), "non-empty namespace"),
+        (format!("{ECHO_PROBE}/"), "non-empty namespace"),
+    ];
+    for (value, reason) in &rejected {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("source.serviceAccount", direction, value);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]")) && e.contains(reason)
+                }),
+                "expected a '{reason}' diagnostic on {direction} for '{value}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a source.serviceAccount diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+}
+
+/// Distinctive token embedded in hostile condition values so a diagnostic that
+/// echoed operator-supplied text would be caught.
+const ECHO_PROBE: &str = "zzprobezz";
+
+fn errors_for_condition(key: &str, direction: &str, value: &str) -> Vec<String> {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    let entries = vec![value.to_string()];
+    policy.rules[0].when.push(ConditionMatch {
+        key: key.into(),
+        values: if direction == "values" {
+            entries.clone()
+        } else {
+            Vec::new()
+        },
+        not_values: if direction == "values" {
+            Vec::new()
+        } else {
+            entries
+        },
+    });
+    validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None)
+}
+
+/// Istio's stricter `CheckServiceAccount` bounds (16 entries, 320 bytes) apply
+/// on top of the common condition caps, on both value directions.
+#[test]
+fn mesh_policy_applies_istio_service_account_condition_bounds() {
+    let mut too_many = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_many.rules[0].when.push(ConditionMatch {
+        key: "source.serviceAccount".into(),
+        values: Vec::new(),
+        not_values: (0..20).map(|index| format!("sa{index}")).collect(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[too_many], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].not_values") && e.contains("at most 16 entries")
+        }),
+        "source.serviceAccount notValues must carry Istio's 16-entry bound, got: {errors:?}"
+    );
+
+    let mut too_long = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_long.rules[0].when.push(ConditionMatch {
+        key: "source.serviceAccount".into(),
+        values: vec!["a".repeat(400)],
+        not_values: Vec::new(),
+    });
+    let errors = validate_mesh_config(&[], &[], &[too_long], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]") && e.contains("at most 320 UTF-8 bytes")
+        }),
+        "source.serviceAccount values must carry Istio's 320-byte bound, got: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains(&"a".repeat(400))),
+        "an oversized service-account value must never be echoed, got: {errors:?}"
+    );
+
+    // The common 512-byte / 256-entry caps still govern every other key.
+    let mut generic = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    generic.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: vec!["a".repeat(400)],
+        not_values: Vec::new(),
+    });
+    assert!(
+        validate_mesh_config(&[], &[], &[generic], &[], &[], &[], None).is_empty(),
+        "the stricter service-account bound must not leak onto other condition keys"
+    );
+}
+
+/// Istio's `CheckTrustDomainValues` allows an exact value, presence `*`, one
+/// leading `*`, or one trailing `*`. A mid-string / repeated `*` would degrade
+/// to a literal exact match at runtime and a `/` is not a trust domain at all —
+/// both silently never match, which is fail-OPEN for a DENY.
+#[test]
+fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
+    for accepted in ["cluster.local", "*", "*.local", "cluster.*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.trustDomain".into(),
+            values: vec![accepted.into()],
+            not_values: vec![accepted.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "'{accepted}' is a valid Istio source.trustDomain value"
+        );
+    }
+
+    let rejected: Vec<(String, &str)> = vec![
+        (
+            format!("{ECHO_PROBE}*local"),
+            "leading or trailing wildcard",
+        ),
+        (format!("*{ECHO_PROBE}*"), "at most one '*'"),
+        (format!("{ECHO_PROBE}/ns"), "must not contain '/'"),
+    ];
+    for (value, reason) in &rejected {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("source.trustDomain", direction, value);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]")) && e.contains(reason)
+                }),
+                "expected a '{reason}' diagnostic on {direction} for '{value}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a source.trustDomain diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+}
+
+/// `source.namespace` keeps Istio's `srcNamespaceGenerator` grammar, where every
+/// `*` is an arbitrary substring. A mid-string or repeated star is therefore
+/// valid input and must not be rejected as it is for `source.trustDomain`.
+#[test]
+fn mesh_policy_admits_arbitrary_star_placement_in_source_namespace_conditions() {
+    for value in ["prod", "*", "pr*d", "*pay*ments*", "team-*"] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: "source.namespace".into(),
+            values: vec![value.into()],
+            not_values: vec![value.into()],
+        });
+        assert!(
+            validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None).is_empty(),
+            "Istio accepts '{value}' as a source.namespace condition value"
+        );
+    }
+}
+
+/// Hostile / unbounded condition input is rejected with field-specific
+/// diagnostics, and an oversized key is never echoed back into logs or
+/// Kubernetes status.
+#[test]
+fn mesh_policy_bounds_and_sanitizes_when_condition_input() {
+    let oversized_key = format!("request.headers[{}]", "a".repeat(400));
+    let cases: Vec<(ConditionMatch, &str, &str)> = vec![
+        (
+            ConditionMatch {
+                key: oversized_key.clone(),
+                values: vec!["x".into()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].key",
+            "at most 256 UTF-8 bytes",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec![String::new()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "must not be empty",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec!["a\u{7}b".into()],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "control characters",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: vec!["a".repeat(600)],
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values[0]",
+            "at most 512 UTF-8 bytes",
+        ),
+        (
+            ConditionMatch {
+                key: "connection.sni".into(),
+                values: (0..300).map(|index| format!("v{index}")).collect(),
+                not_values: Vec::new(),
+            },
+            "rules[0].when[0].values",
+            "at most 256 entries",
+        ),
+    ];
+
+    for (condition, path, reason) in cases {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(condition.clone());
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains(path) && e.contains(reason)),
+            "expected '{path}' / '{reason}' for key '{}', got: {errors:?}",
+            condition.key
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains(&"a".repeat(400))),
+            "an oversized condition key must never be echoed back, got: {errors:?}"
+        );
+    }
+
+    let mut too_many = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    too_many.rules[0].when = (0..100)
+        .map(|index| ConditionMatch {
+            key: format!("request.headers[x-{index}]"),
+            values: vec!["v".into()],
+            not_values: Vec::new(),
+        })
+        .collect();
+    let errors = validate_mesh_config(&[], &[], &[too_many], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("rules[0].when must have at most 64 entries")),
+        "an unbounded when[] list must fail closed, got: {errors:?}"
+    );
+}
+
+/// Istio validates dynamic `when:` map keys by their first `[` and final `]`
+/// only. Native/file admission must preserve the same loose framing instead of
+/// rejecting a policy shape the Kubernetes source accepts.
+#[test]
+fn mesh_policy_admits_istio_dynamic_map_key_shapes() {
+    for key in [
+        "request.headers[:authority]",
+        "request.headers[x env]",
+        "request.headers[x-team][nested]",
+        "request.headers[x:invalid]",
+        "request.auth.claims[realm_access[roles]",
+        "request.auth.claims[realm_access][]",
+    ] {
+        let mut policy = policy_with_request_match(RequestMatch {
+            methods: vec!["GET".into()],
+            ..RequestMatch::default()
+        });
+        policy.rules[0].when.push(ConditionMatch {
+            key: key.into(),
+            values: vec!["x".into()],
+            not_values: Vec::new(),
+        });
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors.is_empty(),
+            "Istio-admitted dynamic map key '{key}' must validate: {errors:?}"
+        );
+    }
 }

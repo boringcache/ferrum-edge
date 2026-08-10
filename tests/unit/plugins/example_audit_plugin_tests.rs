@@ -657,6 +657,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     plugin.log(&http).await;
 
     let stream = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
         proxy_lifecycle_generation: None,
@@ -865,6 +866,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     ] {
         plugin
             .on_stream_disconnect(&StreamTransactionSummary {
+                plugin_trigger_decisions: Default::default(),
                 proxy_lifecycle_generation: None,
 
                 namespace: "ferrum".to_string(),

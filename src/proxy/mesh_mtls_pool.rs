@@ -20,14 +20,17 @@
 //! stream, so the dispatch error mapping stays single-sourced.
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::Either;
+use http_body::Frame;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -109,9 +112,64 @@ pub const MESH_EASTWEST_SNI_TAG: &str = "mesh.eastwest_sni";
 pub const MESH_CROSS_CLUSTER_TAG: &str = "mesh.cross_cluster";
 
 /// Request representation accepted by the multiplexed sidecar H2 pool.
-/// Streaming requests retain the existing inline size limiter; retry-enabled
-/// requests use immutable bytes finalized once before the first attempt.
-pub type MeshMtlsRequestBody = Either<SizeLimitedIncoming, ReplayableRequestBody>;
+///
+/// * [`Streaming`](MeshMtlsRequestBody::Streaming) — generic HTTP-family
+///   requests, retaining the inline size limiter.
+/// * [`Replayable`](MeshMtlsRequestBody::Replayable) — retry-enabled requests
+///   whose bytes were finalized once before the first attempt.
+/// * [`Grpc`](MeshMtlsRequestBody::Grpc) — a gRPC dispatch handing the SHARED
+///   [`GrpcBody`](crate::proxy::grpc_proxy::GrpcBody) through unchanged, so the
+///   direct-dial gRPC pool and the mesh transport cannot drift on request
+///   framing: buffered DATA, buffered DATA plus a terminal TRAILERS frame, a
+///   hyper `Incoming`, or the H3 bridge's channel source all keep their inline
+///   receive-limit accounting, upload-termination observer, and gRPC message
+///   counting when they ride the mesh (issue #3284).
+///
+/// A manual [`http_body::Body`] impl (rather than nested `Either`s) keeps the
+/// arms named at every construction site and boxes each arm's error into the
+/// one shared error type hyper needs.
+pub enum MeshMtlsRequestBody {
+    Streaming(SizeLimitedIncoming),
+    Replayable(ReplayableRequestBody),
+    Grpc(crate::proxy::grpc_proxy::GrpcBody),
+}
+
+impl http_body::Body for MeshMtlsRequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::poll_frame(Pin::new(body), cx),
+            // `ReplayableRequestBody` is infallible; the `match never {}` keeps
+            // that provable rather than boxing an impossible error.
+            MeshMtlsRequestBody::Replayable(body) => {
+                http_body::Body::poll_frame(Pin::new(body), cx)
+                    .map(|polled| polled.map(|frame| frame.map_err(|never| match never {})))
+            }
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::poll_frame(Pin::new(body), cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::is_end_stream(body),
+            MeshMtlsRequestBody::Replayable(body) => http_body::Body::is_end_stream(body),
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::is_end_stream(body),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            MeshMtlsRequestBody::Streaming(body) => http_body::Body::size_hint(body),
+            MeshMtlsRequestBody::Replayable(body) => http_body::Body::size_hint(body),
+            MeshMtlsRequestBody::Grpc(body) => http_body::Body::size_hint(body),
+        }
+    }
+}
 
 /// Multiplexed hyper H2 sender over the SVID-mTLS session.
 pub type MeshMtlsSender = http2::SendRequest<MeshMtlsRequestBody>;
@@ -904,6 +962,12 @@ impl MeshMtlsConnectionPool {
     /// byte-relaying to a TCP backend. The returned [`H2ConnectTunnel`] carries
     /// length-delimited datagrams, NOT a raw byte stream.
     ///
+    /// `source_identity` is the Ambient per-pod capture evidence (principal +
+    /// pod UID) when the producer enrolled an attested workload. Sidecar /
+    /// default callers pass `None` and keep the gateway-SVID principal baggage.
+    /// Destination authorization still applies the existing trusted-assertor /
+    /// trust-domain gates before treating either assertion as authoritative.
+    ///
     /// Like [`Self::open_connect_tunnel`] each UDP session gets its OWN
     /// mesh-mTLS H2 connection carrying exactly ONE CONNECT stream (1:1, dropped
     /// when the session ends), NOT multiplexed over the pooled
@@ -929,24 +993,13 @@ impl MeshMtlsConnectionPool {
         expected_peer: Option<&SpiffeId>,
         expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
+        source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         // Fail closed when no gateway SVID is loaded — never dial a mesh peer
         // identity-less (parity with `open_connect_tunnel` and `get_sender`).
         // This also drives the rotation/retired-fingerprint bookkeeping.
         let _ = self.current_svid_fingerprint_cached()?;
-        // The datagram path (unlike the byte-stream / WS mesh-mTLS paths) carries
-        // the W3C source-identity baggage, so read the source SPIFFE id from the
-        // current SVID bundle. `current_svid_fingerprint_cached` above already
-        // proved a bundle is present, but the slot can rotate to empty between the
-        // two loads, so this re-checks and fails closed rather than dialing
-        // identity-less. The `MeshMtlsConnectionPool` identity cache stores only
-        // the fingerprint (no SPIFFE id — the other transports need none), so the
-        // id is read directly off the bundle here.
-        let source_identity = {
-            let snapshot = self.gateway_svid.load_full();
-            let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
-            bundle.spiffe_id.clone()
-        };
+        let baggage = datagram_tunnel_baggage(&self.gateway_svid, source_identity)?;
         let pool_config = self.pool_config.for_proxy(proxy);
         // Per-port DestinationRule overrides are resolved for the destination's
         // APP port (`target_port`, the DR keying port), not the transport
@@ -982,7 +1035,6 @@ impl MeshMtlsConnectionPool {
             conn_admission.as_ref(),
         )
         .await?;
-        let baggage = crate::modes::mesh::hbone::baggage_header_for_source(&source_identity);
         tokio::time::timeout(
             connect_timeout,
             open_h2_connect_stream(
@@ -1642,6 +1694,32 @@ fn write_mesh_mtls_pool_key(
     write_pool_config_key(buf, pool_config);
 }
 
+/// Build CONNECT baggage for a mesh-mTLS datagram tunnel.
+///
+/// Ambient capture supplies workload + pod evidence. Sidecar / default callers
+/// pass `None`, so the gateway SVID principal remains the source. Destination
+/// authorization still validates either assertion through the shared trusted
+/// assertor / trust-domain gates before using it.
+fn datagram_tunnel_baggage(
+    gateway_svid: &SharedSvidBundle,
+    source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
+) -> Result<String, HbonePoolError> {
+    // Re-read the bundle after `current_svid_fingerprint_cached`: rotation can
+    // clear the slot between those loads. Ambient source evidence selects the
+    // baggage principal, but it must never replace the gateway SVID required
+    // to authenticate the tunnel itself.
+    let snapshot = gateway_svid.load_full();
+    let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
+    if let Some(source) = source_identity {
+        return Ok(crate::modes::mesh::hbone::baggage_header_for_udp_source(
+            source,
+        ));
+    }
+    Ok(crate::modes::mesh::hbone::baggage_header_for_source(
+        &bundle.spiffe_id,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1899,6 +1977,7 @@ mod tests {
                 Some(&peer),
                 None,
                 None,
+                None,
             )
             .await
         {
@@ -1906,6 +1985,116 @@ mod tests {
             Err(other) => panic!("expected NoSvid, got {other:?}"),
             Ok(_) => panic!("a missing gateway SVID must fail the datagram dial closed"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_datagram_tunnel_fails_closed_without_svid_even_with_asserted_source() {
+        // Ambient evidence cannot skip the gateway-SVID dial gate: the tunnel
+        // still presents this proxy's client certificate.
+        let pool = MeshMtlsConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "10.0.0.1",
+            "backend_port": 8080,
+        }))
+        .expect("minimal proxy");
+        let peer = test_peer();
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+        match pool
+            .open_datagram_tunnel(
+                &proxy,
+                "10.0.0.1",
+                "10.0.0.1",
+                53,
+                53,
+                ISTIO_SIDECAR_INBOUND_PORT,
+                Some(&peer),
+                None,
+                None,
+                Some(&asserted),
+            )
+            .await
+        {
+            Err(HbonePoolError::NoSvid) => {}
+            Err(other) => panic!("expected NoSvid, got {other:?}"),
+            Ok(_) => panic!("asserted Ambient identity must not bypass a missing gateway SVID"),
+        }
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_propagates_ambient_principal_and_pod_uid() {
+        let gateway = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle(b"gateway-leaf")))));
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+
+        let header = datagram_tunnel_baggage(&gateway, Some(&asserted)).expect("baggage");
+        let identity = crate::modes::mesh::hbone::HboneIdentity::from_baggage_header(&header);
+
+        assert_eq!(identity.source_principal, Some(asserted.principal.clone()));
+        assert_eq!(
+            identity.source_pod_uid,
+            crate::modes::mesh::node_waypoint::parse_pod_uid(&asserted.pod_uid).ok()
+        );
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_falls_back_to_gateway_svid_without_asserted_source() {
+        let gateway_bundle = svid_bundle(b"gateway-leaf");
+        let gateway_id = gateway_bundle.spiffe_id.clone();
+        let gateway = Arc::new(ArcSwap::new(Arc::new(Some(gateway_bundle))));
+
+        let header = datagram_tunnel_baggage(&gateway, None).expect("gateway baggage");
+        let identity = crate::modes::mesh::hbone::HboneIdentity::from_baggage_header(&header);
+
+        assert_eq!(identity.source_principal, Some(gateway_id));
+        assert!(
+            identity.source_pod_uid.is_none(),
+            "Sidecar/default fallback must not invent a pod UID"
+        );
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_fails_closed_without_svid() {
+        let gateway = Arc::new(ArcSwap::new(Arc::new(None)));
+        let asserted = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid Ambient source evidence");
+
+        assert!(matches!(
+            datagram_tunnel_baggage(&gateway, None),
+            Err(HbonePoolError::NoSvid)
+        ));
+        assert!(matches!(
+            datagram_tunnel_baggage(&gateway, Some(&asserted)),
+            Err(HbonePoolError::NoSvid)
+        ));
+    }
+
+    #[test]
+    fn datagram_tunnel_baggage_rejects_malformed_pod_uid_at_construction() {
+        // Capture managers never stamp malformed evidence: `UdpSourceIdentity::new`
+        // fails closed so open_datagram_tunnel never sees a forgeable/malformed UID.
+        assert!(
+            crate::modes::mesh::hbone::UdpSourceIdentity::new(
+                SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+                "not-a-uid",
+            )
+            .is_none(),
+            "malformed pod UID must be rejected before CONNECT baggage is built"
+        );
     }
 
     #[test]

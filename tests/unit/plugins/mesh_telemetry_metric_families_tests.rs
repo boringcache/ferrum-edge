@@ -12,7 +12,7 @@ use ferrum_edge::plugins::mesh::prometheus_helpers::{
     GrpcLengthPrefixedScanner, count_grpc_length_prefixed_messages,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
-use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
+use ferrum_edge::plugins::prometheus_metrics::{MetricsRegistry, PrometheusMetrics};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
 };
@@ -174,6 +174,11 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
     let registry = MetricsRegistry::new();
     let mut metadata = HashMap::from([
         (
+            ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
+                .into(),
+            "1".into(),
+        ),
+        (
             ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
                 .into(),
             "1".into(),
@@ -216,6 +221,7 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
     );
 
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),
@@ -321,14 +327,27 @@ fn grpc_length_prefixed_scanner_counts_spanning_frames() {
     );
 }
 
-#[test]
-fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
+#[tokio::test]
+async fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
     use ferrum_edge::plugins::mesh::prometheus_helpers::{
         metadata_observes_grpc_messages, record_complete_grpc_message_count,
     };
 
-    let mut metadata = HashMap::new();
-    metadata.insert("request_protocol".into(), "grpc".into());
+    let prometheus = PrometheusMetrics::new(&serde_json::Value::Null, "default")
+        .expect("prometheus_metrics instance");
+    let mut request = RequestContext::new("10.0.0.1".into(), "POST".into(), "/grpc".into());
+    request
+        .metadata
+        .insert("request_protocol".into(), "grpc".into());
+    assert!(
+        !metadata_observes_grpc_messages(&request.metadata),
+        "protocol alone must not enable scanners without prometheus_metrics observation"
+    );
+    assert!(matches!(
+        prometheus.on_request_received(&mut request).await,
+        PluginResult::Continue
+    ));
+    let mut metadata = request.metadata;
     assert!(metadata_observes_grpc_messages(&metadata));
     metadata.insert("request_protocol".into(), "http".into());
     assert!(!metadata_observes_grpc_messages(&metadata));
@@ -371,6 +390,11 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut metadata = ctx.metadata.clone();
+    metadata.insert(
+        ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
+            .into(),
+        "1".into(),
+    );
     metadata.insert(
         ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
             .into(),
@@ -425,6 +449,7 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
     );
 
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),
@@ -482,6 +507,8 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
 
 const FINALIZED_MARKER: &str =
     ferrum_edge::plugins::mesh::prometheus_helpers::MESH_TCP_OPENED_FINALIZED_METADATA;
+const PROMETHEUS_OBSERVED_MARKER: &str =
+    ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA;
 const OBSERVED_MARKER: &str =
     ferrum_edge::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA;
 
@@ -507,8 +534,18 @@ fn workload_metrics_instance(metrics: serde_json::Value) -> WorkloadMetrics {
     .expect("workload_metrics instance")
 }
 
+async fn observe_prometheus_stream(ctx: &mut StreamConnectionContext) {
+    let prometheus = PrometheusMetrics::new(&serde_json::Value::Null, "default")
+        .expect("prometheus_metrics instance");
+    assert!(matches!(
+        prometheus.on_stream_connect(ctx).await,
+        PluginResult::Continue
+    ));
+}
+
 fn stream_summary_from(metadata: HashMap<String, String>) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "default".into(),
         proxy_id: "db".into(),
         proxy_name: Some("db".into()),
@@ -563,6 +600,7 @@ async fn multiple_workload_metrics_applications_record_one_tcp_opened_under_fina
     }));
 
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     assert!(matches!(
         first.on_stream_connect(&mut ctx).await,
         PluginResult::Continue
@@ -622,6 +660,7 @@ async fn disabled_final_tcp_opened_policy_records_no_opened_but_keeps_closed() {
         "disabled_metrics": ["TCP_OPENED_CONNECTIONS"]
     }));
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
 
     let registry = MetricsRegistry::new();
@@ -657,6 +696,7 @@ async fn rejected_stream_chain_finalizes_balanced_tcp_lifecycle() {
     // authorization-success counter.
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
 
     let registry = MetricsRegistry::new();
@@ -704,6 +744,7 @@ async fn rejected_stream_chain_finalizes_balanced_tcp_lifecycle() {
 async fn mesh_tcp_finalize_is_idempotent_per_connection() {
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
     let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
 
@@ -724,8 +765,8 @@ async fn mesh_tcp_finalize_is_idempotent_per_connection() {
     );
 }
 
-#[test]
-fn mesh_tcp_finalize_requires_workload_metrics_observation() {
+#[tokio::test]
+async fn mesh_tcp_finalize_requires_prometheus_and_workload_metrics_observation() {
     let registry = MetricsRegistry::new();
     let mut metadata = HashMap::from([
         ("mesh.request_protocol".to_string(), "tcp".to_string()),
@@ -748,6 +789,29 @@ fn mesh_tcp_finalize_requires_workload_metrics_observation() {
             .contains("ferrum_mesh_tcp_connections_opened_total{"),
         "a stream rejected before workload_metrics ran must not emit its metric family"
     );
+
+    let workload_metrics = workload_metrics_instance(json!({}));
+    let mut ctx = mesh_stream_ctx();
+    workload_metrics.on_stream_connect(&mut ctx).await;
+    let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+    assert!(
+        !metadata.contains_key(FINALIZED_MARKER),
+        "workload_metrics alone must stay silent when prometheus_metrics is not configured"
+    );
+    assert!(
+        !metadata.contains_key(PROMETHEUS_OBSERVED_MARKER),
+        "the finalizer must never forge prometheus_metrics observation"
+    );
+
+    observe_prometheus_stream(&mut ctx).await;
+    let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
+    registry.finalize_mesh_tcp_opened(metadata, "db", Some("db"));
+    assert_eq!(
+        metadata.get(FINALIZED_MARKER).map(String::as_str),
+        Some("1"),
+        "both plugin observations must enable exactly-once lifecycle finalization"
+    );
 }
 
 #[tokio::test]
@@ -757,6 +821,7 @@ async fn captured_egress_tcp_opened_closed_share_destination_principal() {
     // that insertion keeps opened and closed on the same label set.
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
     let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
     metadata.insert(
@@ -806,6 +871,7 @@ async fn captured_egress_no_target_setup_failure_finalizes_balanced_lifecycle() 
     // metadata available at teardown (no destination principal).
     let plugin = workload_metrics_instance(json!({}));
     let mut ctx = mesh_stream_ctx();
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
     let metadata = ctx.metadata.as_mut().expect("mesh stream metadata");
     metadata.insert(
@@ -868,6 +934,7 @@ async fn udp_stream_finalize_records_no_tcp_series() {
         BackendScheme::Udp,
         Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
     );
+    observe_prometheus_stream(&mut ctx).await;
     plugin.on_stream_connect(&mut ctx).await;
 
     let registry = MetricsRegistry::new();

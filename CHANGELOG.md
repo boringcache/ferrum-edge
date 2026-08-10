@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Port-aware Gateway API HTTP-family route representation and real listener
+  binding (issue #3612). Materialized proxies carry the admitting listener's
+  `listen_port` plus a namespace-qualified TLS class, and a new
+  `GatewayListenerManager` binds a socket for every declared Gateway listener
+  port in `file`, `database`, and `dp` mode alongside the global proxy ports —
+  so two same-protocol listeners such as `:80` and `:8080`, and HTTP/HTTPS
+  listeners on distinct ports, all serve through the real binary. The listener
+  set is reconciled on every config publication (reload / update / delete /
+  withdrawal); a withdrawn listener stops routing at the config swap and its
+  socket then drains, and an unbindable port is reported on
+  `GatewayListenerManager::bind_failures` and retried rather than being fatal.
+  Cross-kind arbitration is keyed by the resolved Gateway listener identity, not
+  by port number, so it retains healthy sibling claims and sibling listeners
+  sharing a port cannot suppress or TLS-taint one another. A numeric port
+  claimed by physically incompatible listener shapes — plaintext vs an
+  effective TLS-serving claim, or complete TLS certificate sets from more than
+  one Gateway namespace that disagree on the physical socket — is
+  refused at admission on every conflicting side,
+  reported on the Gateway's `status.listeners[]` as `Conflicted=True` /
+  `Accepted=False` (`PortUnavailable`) / `Programmed=False`. Differing raw
+  `certificateRefs` alone are not a conflict: Gateway API v1.5.1 excludes the
+  `tls` field from listener distinctness, so same-port HTTPS siblings with
+  disjoint hostnames stay Accepted and each retains its listener-owned SNI
+  certificate set. Same-kind route merging keys on the
+  exact admitting listener, so two Gateways sharing a port never have their
+  dispatch rules combined, and a host+path claimed by two different listeners on
+  one port is refused on both sides — in Route status as well as in the data
+  plane: the affected `status.parents[]` entries report `Conflicted=True`, and
+  `Accepted=False` / `Programmed=False` with `reason: Conflicted` once no claim
+  under that parentRef survives, while surviving parents and listeners keep
+  reporting programmed. When HTTP/3 is enabled, every TLS-class
+  listener port also gets its own QUIC socket and `Alt-Svc` advertises HTTP/3
+  only where one exists. Listener supervision reaps and rebinds a listener whose
+  accept loop dies, and an HTTP↔HTTPS class flip retires the old accept loops
+  before rebinding so the two classes never coexist on one port.
+
+- Gateway API `UDPRoute` support (issue #3275). The K8s controller watches
+  `gateway.networking.k8s.io/v1alpha2` `UDPRoute`, translates it onto the shared
+  L4 materialization path as a Ferrum UDP stream proxy bound to the attached
+  `protocol: UDP` Gateway listener port, and writes `Accepted` / `ResolvedRefs` /
+  `Programmed` parent status. Per pinned Gateway API v1.5.1, `backendRefs` is a
+  weighted **set**: one serviceable leg dispatches directly, two or more
+  non-zero-weight legs materialize a namespaced Ferrum upstream that preserves
+  the declared relative weights (omitted weight defaults to `1`, `weight: 0` is
+  withdrawn, and the set is bounded at 16 legs). A leg naming a missing Service
+  or a Service without the referenced port keeps its declared weight and is
+  pointed at an unresolvable blackhole target, so its share of sessions fails
+  closed and is never renormalized onto the resolvable legs. Selection is
+  per UDP session (client 5-tuple), not per datagram. Admission is strict and
+  fail closed: a numeric `backendRefs[].port` is required on every entry
+  including zero-weight ones, only core `Service` backends are accepted,
+  cross-namespace backendRefs need an exact `UDPRoute` ReferenceGrant,
+  cross-namespace `parentRefs` are refused, a `UDPRoute` never attaches to a
+  non-UDP listener, and `spec.hostnames` (not a Gateway API `UDPRoute` field,
+  and unmatchable on a datagram) is rejected rather than silently ignored.
+  `spec.rules` is supported at exactly one rule: the pinned CRD accepts
+  `1..=16`, but a `UDPRouteRule` carries only `name` and `backendRefs` and so
+  has no match predicate, leaving N rules as N indistinguishable matches on one
+  port with no standards-defined precedence and no cross-rule weight
+  comparison. Rather than invent an aggregate or let listener bind order pick a
+  winner, a multi-rule `UDPRoute` is refused with a `spec.rules` diagnostic that
+  names the upstream bound, and — because the object is upstream-valid — status
+  reports `Accepted=False` with the upstream `UnsupportedValue` reason instead
+  of the generic `Invalid`, while `ResolvedRefs` is still evaluated on its own
+  terms. A `UDPRoute` whose `parentRefs` name only non-Gateway parents (a GAMMA
+  `Service` parent, a mistyped `kind`, an unrecognized `group`) opens nothing
+  either: Ferrum implements no non-Gateway `UDPRoute` parent and such a route is
+  not a status candidate, so the backend-port fallback would be an unannounced
+  north-south UDP listener. Present but malformed or explicitly empty
+  `parentRefs` fail closed too. Only a `UDPRoute` with no `parentRefs` field at
+  all keeps that fallback; `TCPRoute`/`TLSRoute` keep their historical
+  Gateway-parent-only gate. Update and delete regenerate live stream listeners
+  and upstreams.
+  Attachment, weighted backend sets, ReferenceGrant fail-closed behavior,
+  status, update, and deletion are gated by CI Unit Tests
+  (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the **live
+  UDP data path** by CI Integration Tests
+  (`tests/integration/gateway_api_udproute_datapath_tests.rs`), which bind the
+  translator's own listener port with the production `start_udp_listener` and
+  assert a datagram round-trips to the backend the route named, that two
+  `UDPRoute`s on two UDP listeners do not cross-talk, that a weighted set is
+  served from its generated upstream one leg per session, and that a leg naming
+  an absent `Service` is dropped rather than answered. The Gateway API
+  conformance lab does not add a UDPRoute black-box step. The upstream profiles
+  stay `GATEWAY-HTTP,GATEWAY-GRPC` and no `GATEWAY-UDP` profile is claimed.
 - `ai_federation` incremental provider response streaming behind a new root
   `streaming` block (issue #3298). With `streaming.enabled`, an OpenAI Chat
   Completions request carrying `"stream": true` is claimed in `before_proxy`,
@@ -785,6 +870,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gateway API HTTPRoute / GRPCRoute no longer fall back to a listener-less,
+  port-agnostic claim when they declare Gateway `parentRefs` that resolve to no
+  concrete, materializable listener (issue #3612). An absent, mismatched, or
+  otherwise ineligible declared parent previously could expose the backend on
+  unrelated frontends while status correctly reported `NoMatchingParent` /
+  `NotAllowedByListeners`; it now emits no proxy, upstream, plugin, or
+  materialized-parent record for that parent, and contributes no HTTP/gRPC
+  conflict key or cross-kind arbitration claim either — so two routes naming
+  the same unmaterializable parent keep the attachment-failure status rather
+  than inventing `Conflicted`. The parentless legacy shape (`spec.parentRefs`
+  absent) and resolved listener port/TLS stamping are unchanged.
+- Gateway API L4 routes (`TCPRoute`, `TLSRoute`, `UDPRoute`) no longer fall back
+  to opening a listener on the **backend** port when they declare Gateway
+  `parentRefs` that resolve to no materializable listener. An unknown,
+  mismatched, protocol-incompatible, or disallowed declared parent previously
+  bound an unintended OS listener while status correctly reported
+  `NoMatchingParent`; it now materializes nothing and warns. The backend-port
+  fallback is retained only for the parentless legacy shape.
 - Applied DestinationRule subset-scoped
   `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
   with per-port > selected-subset > top-level precedence, target-rotation-safe

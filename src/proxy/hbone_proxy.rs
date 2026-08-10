@@ -21,7 +21,7 @@ use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
     build_response, build_response_from_normalized_reject,
     finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_allowed,
-    log_rejected_request, record_request, tcp_proxy,
+    log_rejected_request, mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
 };
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
@@ -368,6 +368,49 @@ fn effective_hbone_backend_target<'a>(
     upstream_target
         .map(|target| (target.host.as_str(), target.port))
         .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port))
+}
+
+/// Process-wide count of live EXTERNAL UDP egress relay sessions (issue #3263).
+///
+/// One counter for the whole gateway, not one per listener or per peer: the
+/// resource being bounded (open sockets + relay tasks) is process-wide, so a cap
+/// applied per listener would multiply with the number of mesh listeners.
+static MESH_EGRESS_UDP_ACTIVE_SESSIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// RAII slot released when an external UDP egress relay session ends. Held by
+/// the relay task for the tunnel's lifetime, so a leaked/aborted task cannot
+/// keep the slot: dropping the task drops the slot.
+struct MeshEgressUdpSessionSlot;
+
+impl Drop for MeshEgressUdpSessionSlot {
+    fn drop(&mut self) {
+        MESH_EGRESS_UDP_ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reserve one external UDP egress relay slot under `max_sessions`, or `None`
+/// when the cap is already reached. The optimistic `fetch_add` + rollback keeps
+/// the admission a single atomic RMW on the accept path (no lock, no scan).
+fn reserve_mesh_egress_udp_session(max_sessions: usize) -> Option<MeshEgressUdpSessionSlot> {
+    if !try_reserve_mesh_egress_udp_session(&MESH_EGRESS_UDP_ACTIVE_SESSIONS, max_sessions) {
+        return None;
+    }
+    Some(MeshEgressUdpSessionSlot)
+}
+
+/// Atomic admission core kept separate so the cap and rollback behavior can be
+/// tested without mutating the process-wide live-session counter.
+fn try_reserve_mesh_egress_udp_session(
+    active_sessions: &std::sync::atomic::AtomicU64,
+    max_sessions: usize,
+) -> bool {
+    let previous = active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if previous >= max_sessions as u64 {
+        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 
 fn inbound_hbone_relay_effective_destination_allowed(
@@ -1067,7 +1110,20 @@ pub(super) async fn handle_hbone_udp_request(
     // ride a route override to open a local `UdpSocket` to a host/port outside
     // the loopback / slice-declared-workload allowlist. The un-overridden relay
     // destination was already guarded at build time, so this is a no-op for it.
-    if !inbound_hbone_relay_destination_allowed(app_host, app_port, epoch.config.mesh.as_deref()) {
+    //
+    // The EgressGateway external-UDP allowlist (issue #3263) is the SECOND
+    // admissible source and is checked with the same post-override rigor, but
+    // only against precomputed dial endpoints: a STATIC ServiceEntry hostname
+    // is a valid CONNECT authority, yet must never become an effective socket
+    // target (that would DNS-bypass the declared endpoints[]). DNS/NONE and
+    // STATIC endpoint-IP dial targets remain usable because they are themselves
+    // dial endpoints. Anything a route override rewrote off that set is refused.
+    let mesh_config = epoch.config.mesh.as_deref();
+    let local_relay_allowed =
+        inbound_hbone_relay_destination_allowed(app_host, app_port, mesh_config);
+    let external_egress_allowed = !local_relay_allowed
+        && mesh_egress_udp_destination_allowed(app_host, app_port, mesh_config);
+    if !local_relay_allowed && !external_egress_allowed {
         warn!(
             proxy_id = %proxy.id,
             app_host,
@@ -1099,6 +1155,59 @@ pub(super) async fn handle_hbone_udp_request(
         record_request(state, reject.http_status.as_u16());
         return build_response_from_normalized_reject(reject);
     }
+
+    // Bound concurrent EXTERNAL UDP egress relays (issue #3263). Each admitted
+    // CONNECT costs a local `UdpSocket` plus a relay task for as long as the
+    // tunnel stays open, so without a cap an authenticated but misbehaving (or
+    // compromised) mesh peer could open sockets until the gateway exhausts its
+    // file descriptors. The reservation is process-wide and reuses the existing
+    // `FERRUM_UDP_MAX_SESSIONS` ceiling — the same knob that bounds captured UDP
+    // sessions — rather than adding a second, divergent budget. The slot is an
+    // RAII guard: it is released when the relay task ends, and also on every
+    // early-return path below (socket open failure, missing upgrade handle),
+    // because it simply drops out of scope.
+    //
+    // Local (loopback / slice-known workload) relays are deliberately NOT
+    // metered here: they predate this cap and their destination set is already
+    // bounded by the slice.
+    let egress_session_slot = if external_egress_allowed {
+        match reserve_mesh_egress_udp_session(state.env_config.udp_max_sessions) {
+            Some(slot) => Some(slot),
+            None => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    app_host,
+                    app_port,
+                    max_sessions = state.env_config.udp_max_sessions,
+                    "Rejected external UDP egress CONNECT: relay session cap reached"
+                );
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    plugins,
+                    ctx,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Bytes::from_static(
+                        br#"{"error":"UDP egress relay session capacity exhausted"}"#,
+                    ),
+                    HashMap::new(),
+                    false,
+                )
+                .await;
+                log_rejected_request(
+                    plugins,
+                    ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "hbone_udp_egress_session_cap",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(state, reject.http_status.as_u16());
+                return build_response_from_normalized_reject(reject);
+            }
+        }
+    } else {
+        None
+    };
 
     // Extract the upgrade handle BEFORE building the 200 (the framed datagrams
     // ride the upgraded CONNECT body). Same invariant as the byte-stream relay:
@@ -1256,6 +1365,9 @@ pub(super) async fn handle_hbone_udp_request(
     // `udp_idle_timeout_seconds == 0` disables the idle window (None).
     let idle = relay_timeout(proxy.udp_idle_timeout_seconds);
     tokio::spawn(async move {
+        // Hold the external-egress session slot for the tunnel's whole lifetime
+        // (issue #3263); dropping this task releases it.
+        let _egress_session_slot = egress_session_slot;
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
@@ -1694,7 +1806,7 @@ mod tests {
         build_hbone_relay_summary, hbone_relay_body_outcome,
         inbound_hbone_relay_effective_destination_allowed,
         inbound_ingress_relay_effective_destination_allowed,
-        registered_pod_target_for_udp_destination,
+        registered_pod_target_for_udp_destination, try_reserve_mesh_egress_udp_session,
     };
     use crate::config::types::{Proxy, UpstreamTarget};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -1729,6 +1841,23 @@ mod tests {
             locality: None,
             path: None,
         }
+    }
+
+    #[test]
+    fn external_udp_session_admission_enforces_cap_and_rolls_back_refusal() {
+        let active = std::sync::atomic::AtomicU64::new(0);
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert!(!try_reserve_mesh_egress_udp_session(&active, 2));
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a refused reservation must roll its optimistic increment back"
+        );
+
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(try_reserve_mesh_egress_udp_session(&active, 2));
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     fn mesh_with_workload_port(port: u16) -> MeshConfig {
@@ -1800,6 +1929,8 @@ mod tests {
                 endpoint_host: "127.0.0.1".to_string(),
                 endpoint_port: 6379,
                 protocol: AppProtocol::Redis,
+                endpoint_unix_path: None,
+                endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "redis".to_string(),
             }],

@@ -224,7 +224,55 @@ force-run on every `main` push). PRs outside those curated path sets skip the
 downstream job before GitHub allocates a runner. Pushes to `main` and manual
 runs force all of these gates on. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
-runner allocations. The required `Tests` aggregate runs the first-party
+runner allocations.
+
+The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
+runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
+after proving the working-tree `.github/actions/setup-kubernetes-tools` matches
+the trusted revision and installing that pinned Helm binary. The proof runs
+before `uses:` can execute the action: the workflow takes a `git archive`
+tarball of the action directory at the trusted revision (the pull request base,
+the merge-group base, or the checkout itself on `push`/`workflow_dispatch`)
+while `PATH` is still the pristine runner one, and
+`.github/scripts/verify_trusted_local_action.py` decides regular-file,
+no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
+constraints entirely from that manifest, spawning no process of its own.
+Anything it cannot answer fails closed. Keeping the proof in Python rather than
+inline shell also keeps `helm-chart` free of the opaque-inline-shell and Cross
+surfaces that `Trusted Cross Build Policy` freezes per job.
+On pull requests and merge groups the checker is extracted from the base revision when
+one exists, then self-tested and executed against the proposed chart tree. That
+prevents the step from executing a checker replaced by the same pull request and
+prevents a PR-modified local installer from substituting a fake `helm` renderer
+for the authoritative scan; the workflow wiring remains a reviewed pull request
+surface and the required aggregate checks its expected shape. `FERRUM_TRUSTED_HELM`
+pins the scan to the installer output so a later `PATH` prepend cannot swap the
+renderer, and the checker rejects a `helm` path that is a symlink, is not a
+regular file, or is not executable. A separate, clearly non-authoritative step
+then exercises the proposed in-tree checker (self-test + scan) so syntax/render
+behavior at the PR head is hosted-validated before merge without becoming the
+security authority — without it, a checker change would get no hosted execution
+at all on its own pull request. The
+checker rejects Docker/containerd/CRI-O socket mounts, a `runtime.sock` host
+path, or a true/dynamic `privileged` assignment. The scan walks every regular,
+non-symlink chart template, values file, example values file, and chart fragment
+rather than trusting a fixed pair of workload filenames. It also invokes Helm
+and scans the default, node-agent/ambient-enabled, and example-values rendered
+manifests (YAML/YML/JSON, including nested example paths), so helper expansion
+or a path assembled by a Helm expression cannot hide dangerous workload output
+from the gate.
+
+It lives in `Helm Chart` rather than in `CI Plan` or a new standalone job for
+two reasons. First, `Trusted Cross Build Policy` freezes the per-job digest of
+every Cross-sensitive `ci.yml` job — `ci-plan` and `test` are both
+Cross-sensitive — and compares the `test` aggregate byte for byte, so a pull
+request cannot add a step to either. Second, `Helm Chart` is already an enforced
+gate: it is a `needs` of the required `Tests` aggregate and is asserted there by
+`require_planned_gate "Helm chart"`, which makes the lint blocking today with no
+branch-protection change and no new required check. Its `run_helm` path gate
+fires on `^charts/`, a strict superset of the `charts/**` tree the checker
+scans, so a pull request that skips the job cannot contain a violation for it to
+find. The required `Tests` aggregate runs the first-party
 Markdown link checker through its CI contract verifier
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
@@ -338,8 +386,11 @@ sequential shell script:
 
 ```bash
 # test-unit: inline lib first, then the unchanged four-test plugin-hardening
-# exact gate, then the complete external unit suite in the same job.
+# exact gate, then the kTLS live-kernel proof, then the complete external unit
+# suite in the same job.
 cargo test --lib
+FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
+  proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
 
 # test-integration-{admin-platform,mesh-protocols}
@@ -361,6 +412,30 @@ cargo nextest run --archive-file functional-tests-*.tar.zst \
   --no-fail-fast \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
+
+The kTLS step is a **live-kernel** gate, not a unit test: it drives a real
+rustls TLS 1.2 ChaCha20-Poly1305 client through `try_ktls_accept`, installs
+kernel TLS keys on the runner's own kernel with `setsockopt(SOL_TLS, ...)`,
+relays application bytes through `splice(2)`, and asserts the TLS close
+handshake (authenticated `close_notify` → clean EOF, bare FIN → truncation,
+backend EOF → reciprocal alert, unauthenticated record → attributed failure)
+plus the unlimited ChaCha confidentiality posture the handoff hands to the
+relay (`u64::MAX`, no guard, no pinned receive window). The same first test
+also proves an AES-GCM-only offer is refused with the socket still pristine
+before any install. Those assertions are folded into the first test rather
+than added as a fourth, because the step's expected pass count of three is
+part of the gate. It lives in
+`test-unit`
+because that job is `require_success "Unit and inline lib"` in the required
+`Tests` aggregate, so the live path is blocking today without touching the
+byte-frozen aggregate wiring. `FERRUM_KTLS_LIVE_REQUIRED=1` turns an
+unavailable ChaCha20-Poly1305 kernel capability into a failure rather than a
+skip, and the step additionally fails on any `SKIP:` line or on a pass count
+other than three, so a green check cannot mean "the live path did not run". A
+capability failure prints every cipher's probe verdict *with its install
+`errno`*, because a bare `chacha20=false` cannot distinguish a kernel without
+the cipher from a gateway-side `tls12_crypto_info` layout error. See
+[tcp_udp_proxy.md](tcp_udp_proxy.md#hosted-live-kernel-coverage).
 
 The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
 PostgreSQL load-stress test run weekly and on manual dispatch in the

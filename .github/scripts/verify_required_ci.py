@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 
 from check_markdown_links import check_repository, run_self_test
+from check_node_agent_chart_runtime import (
+    check_repository as check_node_agent_chart_runtime,
+    main as node_agent_chart_runtime_main,
+)
 from live_suite_path_filter import (
     LIVE_SUITE_DOCUMENTATION_PATHS,
     SUITE_PATTERNS,
@@ -905,6 +909,173 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
+    # Issue #3615: the node-agent/ambient chart runtime lint must run the checker
+    # extracted from the trusted base, so a pull request cannot replace its own
+    # gate. It lives in the `helm-chart` job, NOT in `ci-plan`: the trusted ARM64
+    # Cross build policy freezes the per-job digest of every Cross-sensitive
+    # `ci.yml` job and `ci-plan` is one of them, while `helm-chart` carries no
+    # Cross executable, configuration, ARM64 target, or opaque inline shell and
+    # so contributes no surface to that contract.
+    #
+    # `helm-chart` rather than a new standalone job because it is already an
+    # enforced gate: it is a `needs` of the required `test` aggregate and is
+    # asserted there by `require_planned_gate "Helm chart"`. That makes the lint
+    # blocking today with no branch-protection change and without touching the
+    # aggregate wiring, which the same policy compares byte for byte. Its
+    # `run_helm` path gate fires on `^charts/`, a strict superset of the
+    # `charts/**` tree the checker scans, so a pull request that skips the job
+    # cannot contain a violation for it to find.
+    if "check_node_agent_chart_runtime.py" in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must not carry the chart runtime lint; the trusted "
+            "Cross build policy freezes its per-job digest"
+        )
+    chart_runtime_lint_body = extract_job_body(ci_yml, "helm-chart")
+    if "fetch-depth: 0" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must check out full history so the trusted "
+            "base chart runtime checker is reachable"
+        )
+    # The chart runtime lint renders with the Helm binary the local composite
+    # action installs, so that action must be proven identical to the trusted
+    # revision BEFORE `uses:` executes it. The proof itself stays in Python
+    # (`verify_trusted_local_action.py`) so this job keeps contributing no
+    # opaque inline shell to the trusted Cross build policy's surface contract.
+    if "Verify trusted Kubernetes tools installer" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must verify the trusted Kubernetes tools "
+            "installer before installing Helm for the chart runtime lint"
+        )
+    if "Install Kubernetes tools" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must install pinned Kubernetes tools before the "
+            "chart runtime lint"
+        )
+    verify_installer_at = chart_runtime_lint_body.find(
+        "Verify trusted Kubernetes tools installer"
+    )
+    install_at = chart_runtime_lint_body.find("Install Kubernetes tools")
+    trusted_check_at = chart_runtime_lint_body.find(
+        "Check node-agent chart runtime mounts"
+    )
+    proposed_check_at = chart_runtime_lint_body.find(
+        "Validate proposed chart runtime lint (non-authoritative)"
+    )
+    if not (
+        0 <= verify_installer_at < install_at < trusted_check_at < proposed_check_at
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must order trusted Kubernetes tools installer "
+            "verification, Kubernetes tools install, trusted chart runtime "
+            "lint, then non-authoritative proposed checker validation"
+        )
+    if "verify_trusted_local_action.py" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must invoke verify_trusted_local_action.py before "
+            "executing the local Kubernetes tools installer"
+        )
+    if 'python3 -I "$verifier" --self-test' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must self-test the trusted local action verifier"
+        )
+    if not re.search(
+        r'(?m)^\s*git archive --format=tar --output="\$archive" '
+        r'"\$trusted_ref" -- "\$action_dir"\s*$',
+        chart_runtime_lint_body,
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must materialize the trusted setup-kubernetes-tools "
+            "tree with git archive rather than trusting the checkout"
+        )
+    if not re.search(
+        r'(?m)^\s*python3 -I "\$verifier" --action-path "\$action_dir" '
+        r'--trusted-archive "\$archive"\s*$',
+        chart_runtime_lint_body,
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must compare the local setup-kubernetes-tools tree "
+            "against the trusted archive before the action executes"
+        )
+    if 'action_dir=.github/actions/setup-kubernetes-tools' not in (
+        chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must verify exactly the setup-kubernetes-tools "
+            "local action directory"
+        )
+    if "uses: ./.github/actions/setup-kubernetes-tools" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must invoke ./.github/actions/setup-kubernetes-tools"
+        )
+    if "FERRUM_TRUSTED_HELM" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must pin FERRUM_TRUSTED_HELM for authoritative "
+            "rendered-manifest checks"
+        )
+    if "ferrum-k8s-tools/bin/helm" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must point FERRUM_TRUSTED_HELM at the pinned "
+            "installer helm binary"
+        )
+    if "check_node_agent_chart_runtime.py" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must invoke check_node_agent_chart_runtime.py"
+        )
+    if "Check node-agent chart runtime mounts" not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must keep the node-agent chart runtime "
+            "mounts step"
+        )
+    if (
+        "Validate proposed chart runtime lint (non-authoritative)"
+        not in chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must validate the proposed chart runtime checker "
+            "in a clearly non-authoritative step"
+        )
+    if 'proposed=.github/scripts/check_node_agent_chart_runtime.py' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must run the proposed in-tree chart runtime "
+            "checker for non-authoritative validation"
+        )
+    if 'python3 -I "$proposed" --self-test' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must self-test the proposed chart runtime checker"
+        )
+    if not re.search(r'(?m)^\s*python3 -I "\$proposed"\s*$', chart_runtime_lint_body):
+        planner_errors.append(
+            "jobs.helm-chart must execute the proposed chart runtime checker "
+            "against the checkout during non-authoritative validation"
+        )
+    if 'python3 -I "$checker" --self-test' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must run the chart runtime lint self-test "
+            "via isolated python3 -I"
+        )
+    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', chart_runtime_lint_body):
+        planner_errors.append(
+            "jobs.helm-chart must run the chart runtime lint against the "
+            "checkout"
+        )
+    if 'git show "${base_ref}:${checker}"' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must extract check_node_agent_chart_runtime.py "
+            "from the trusted base on pull requests"
+        )
+    if 'git show "${MERGE_BASE_SHA}:${checker}"' not in chart_runtime_lint_body:
+        planner_errors.append(
+            "jobs.helm-chart must extract check_node_agent_chart_runtime.py "
+            "from the merge-group base"
+        )
+    if (
+        'trusted_checker="$RUNNER_TEMP/check-node-agent-chart-runtime.py"'
+        not in chart_runtime_lint_body
+    ):
+        planner_errors.append(
+            "jobs.helm-chart must stage the trusted chart runtime checker "
+            "under RUNNER_TEMP"
+        )
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane
     # validation only: this verifier publishes no planner outputs and cannot
@@ -921,6 +1092,18 @@ def main() -> int:
         planner_errors.append(
             f"live-assertion artifact validator self-test failed: {error}"
         )
+    if node_agent_chart_runtime_main(["--self-test"]) != 0:
+        planner_errors.append(
+            "proposed node-agent chart runtime lint self-test failed"
+        )
+    try:
+        chart_runtime_findings = check_node_agent_chart_runtime()
+    except (OSError, ValueError, NotADirectoryError, FileNotFoundError) as error:
+        planner_errors.append(
+            f"proposed node-agent chart runtime lint failed closed: {error}"
+        )
+    else:
+        planner_errors.extend(chart_runtime_findings)
     planner_errors.extend(validate_artifact_gate_wiring())
     planner_errors.extend(error.format() for error in check_repository())
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")

@@ -783,6 +783,7 @@ fn auto_inject_openapi_validator(
         proxy_id: Some(proxy.id.clone()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,

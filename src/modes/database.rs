@@ -1632,6 +1632,58 @@ pub async fn run(
         info!("TLS not configured - HTTPS listener disabled");
     }
 
+    // ── Gateway API listener ports ───────────────────────────────────────
+    // Bind a real socket for every HTTP-family proxy carrying a `listen_port`
+    // (Gateway API listener identity), alongside the global proxy ports. The
+    // supervisor reconciles on each config publication, so database polling —
+    // add, update, delete, and Gateway/Route withdrawal — reaches the socket
+    // set without a restart.
+    let gateway_listener_manager = crate::proxy::gateway_listener::GatewayListenerManager::new(
+        proxy_state.clone(),
+        env_config.proxy_socket_addr(0).ip(),
+        crate::proxy::gateway_listener::GatewayListenerTls {
+            static_config: tls_config.clone(),
+            reload_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+        },
+    );
+    // Every TLS-class Gateway listener port also gets its own QUIC socket, so
+    // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
+    // HTTP/1.1 and HTTP/2.
+    let gateway_listener_manager = if env_config.enable_http3 && tls_config.is_some() {
+        gateway_listener_manager.with_http3(crate::proxy::gateway_listener::GatewayListenerHttp3 {
+            config: crate::http3::config::Http3ServerConfig::from_env_config(&env_config),
+            tls_policy: tls_policy.clone(),
+            client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
+            client_crls: crls.clone(),
+            tls_slot: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone()),
+            tls_revision_rx: proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.revision_rx.clone()),
+        })
+    } else {
+        gateway_listener_manager
+    };
+    let gateway_listeners = Arc::new(gateway_listener_manager);
+    gateway_listeners.reconcile().await;
+    {
+        let sh = shutdown_tx.subscribe();
+        let manager = gateway_listeners.clone();
+        let gateway_listener_handle = tokio::spawn(async move {
+            manager
+                .run(sh)
+                .await
+                .context("Gateway API listener supervisor failed")
+        });
+        handles.push((
+            "Gateway API listener supervisor".to_string(),
+            gateway_listener_handle,
+        ));
+    }
+
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
     let mut h3_listener_started = false;
     if env_config.enable_http3 {
@@ -3556,6 +3608,7 @@ mod tests {
                 proxy_id: None,
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -3783,7 +3836,7 @@ mod tests {
     #[test]
     fn prometheus_registry_renders_database_delta_poll_metrics() {
         let registry = crate::plugins::prometheus_metrics::MetricsRegistry::new();
-        registry.configure(5, 3600, 0, "ops");
+        registry.configure(5, 3600, 0, 10_000, "ops");
         assert!(registry.database_delta_poll_metrics_snapshot().is_none());
 
         let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
@@ -3862,7 +3915,7 @@ mod tests {
     #[test]
     fn prometheus_registry_invalidates_cached_database_delta_poll_metrics() {
         let registry = crate::plugins::prometheus_metrics::global_registry();
-        registry.configure(3600, 3600, 0, "ops-cache");
+        registry.configure(3600, 3600, 0, 10_000, "ops-cache");
 
         let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
         let mut tracker = RejectedDeltaTracker::new(

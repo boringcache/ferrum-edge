@@ -5899,6 +5899,22 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
     assert!(value_description.contains("256 UTF-8 bytes"));
     assert!(value_description.contains("counts Unicode characters"));
 
+    let tag_overrides = properties
+        .pointer("/metrics/properties/tag_overrides")
+        .expect("metric tag overrides schema exists");
+    assert_eq!(tag_overrides["maxItems"], json!(128));
+    let override_description = tag_overrides["description"]
+        .as_str()
+        .expect("metric tag overrides description");
+    assert!(override_description.contains("16384 encoded bytes"));
+
+    let cel_description = tag_overrides
+        .pointer("/items/properties/operation/properties/cel/description")
+        .and_then(|value| value.as_str())
+        .expect("metric tag CEL description");
+    assert!(cel_description.contains("512-byte UTF-8 limit"));
+    assert!(cel_description.contains("counts Unicode characters"));
+
     let ascii_256 = "x".repeat(256);
     let ascii_257 = "x".repeat(257);
     let metric_config = |value: &str| {

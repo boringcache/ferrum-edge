@@ -15,6 +15,9 @@ use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 
 /// Fibonacci / golden-ratio hash for fast pseudo-random distribution of sequential counters.
 /// Maps sequential u64 inputs to well-distributed outputs across the full u64 range.
@@ -2008,12 +2011,43 @@ pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
 
 /// Domain-separation prefix for backend-bound sticky-session tokens. Bumping
 /// this string invalidates every outstanding token (clients transparently
-/// re-pin on their next request), so it doubles as a format version — `v2` is
-/// the full-target identity below, replacing a `v1` that digested only the
-/// health-check `host:port` key.
-const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v2";
+/// re-pin on their next request), so it doubles as a format version — `v3`
+/// authenticates the full-target `v2` identity, which replaced a `v1` that
+/// digested only the health-check `host:port` key.
+const STICKY_SESSION_TOKEN_DOMAIN: &str = "ferrum-sticky-session-v3";
 
-/// A sticky-session token is a lowercase hex SHA-256 digest: 64 characters.
+/// Process-local authentication key for sticky-session bindings.
+///
+/// Keeping the key out of the token input prevents clients from computing a
+/// valid target binding from predictable route and endpoint metadata. A reload
+/// in the same process retains the key; a restart or another replica naturally
+/// treats the old cookie as stale and re-pins the client through normal
+/// selection.
+static STICKY_SESSION_TOKEN_KEY: LazyLock<Option<crate::fips::approved::HmacSha256Key>> =
+    LazyLock::new(|| {
+        let mut key = [0u8; 32];
+        if SystemRandom::new().fill(&mut key).is_err() {
+            tracing::error!(
+                event = "sticky_session_auth_disabled",
+                reason = "secure_random_unavailable",
+                "Sticky-session token authentication disabled"
+            );
+            return None;
+        }
+        match crate::fips::approved::HmacSha256Key::new_from_slice(&key) {
+            Ok(key) => Some(key),
+            Err(_) => {
+                tracing::error!(
+                    event = "sticky_session_auth_disabled",
+                    reason = "hmac_key_rejected",
+                    "Sticky-session token authentication disabled"
+                );
+                None
+            }
+        }
+    });
+
+/// A sticky-session token is a lowercase hex HMAC-SHA-256 tag: 64 characters.
 pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 
 /// Derive the opaque sticky-session token that binds a client to one concrete
@@ -2039,30 +2073,32 @@ pub const STICKY_SESSION_TOKEN_LEN: usize = 64;
 /// and silently resolved a later target's cookie onto the first one, crossing
 /// Service and per-port policy semantics inside the route.
 ///
-/// The digest discloses no backend address, port, credential, or secret. It is
-/// unkeyed on purpose: stickiness must survive a gateway restart and must be
-/// identical across every replica of a horizontally scaled gateway, and there
-/// is no cluster-wide shared secret available in every operating mode. The
-/// value is therefore an obfuscated — not authenticated — binding: presenting
-/// a forged token can only steer a client to a target the same upstream would
-/// already have selected for some other client, never outside the
-/// health/subset/port-scoped candidate pool (see [`LoadBalancer::select_sticky`]).
+/// The HMAC discloses no backend address, port, credential, or secret and makes
+/// a binding infeasible to forge from predictable route and endpoint metadata.
+/// The authentication key is process-local: tokens survive config reloads, but
+/// a restart or another replica treats them as stale and transparently re-pins
+/// the client through ordinary selection. Pool and health gates remain defense
+/// in depth (see [`LoadBalancer::select_sticky`]).
 ///
 /// `target` must be a CONFIGURED target of that upstream, not a per-request
 /// dial clone. Callers minting a response cookie resolve the served backend
 /// through [`LoadBalancer::configured_sticky_identity_target`] first; the
 /// binding index is built from the configured targets, so a token derived from
 /// anything else cannot resolve.
-pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> String {
-    let mut hasher = StickyHasher::new();
+///
+/// Returns `None` when the cryptographic provider cannot initialize the
+/// process-local key. Callers fail closed by building no binding and emitting
+/// no cookie; the lazy initializer records one fixed diagnostic.
+pub fn sticky_session_token(upstream_runtime_key: &str, target: &UpstreamTarget) -> Option<String> {
+    let mut hasher = STICKY_SESSION_TOKEN_KEY.as_ref()?.begin();
     hasher.update(STICKY_SESSION_TOKEN_DOMAIN.as_bytes());
     hasher.update([0x1fu8]);
     write_sticky_target_identity(&mut hasher, upstream_runtime_key, target);
-    hex::encode(hasher.finalize())
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// The incremental hasher the sticky-identity encoder feeds.
-type StickyHasher = crate::fips::approved::Sha256;
+type StickyHasher = crate::fips::approved::HmacSha256;
 
 /// Absorb the canonical, unambiguous encoding of a target's sticky identity.
 ///
@@ -3289,8 +3325,9 @@ impl LoadBalancer {
         if mints_sticky_tokens {
             sticky_token_index.reserve(targets.len());
             for (i, target) in targets.iter().enumerate() {
-                let token = sticky_session_token(upstream_id, target);
-                sticky_token_index.entry(token).or_insert(i);
+                if let Some(token) = sticky_session_token(upstream_id, target) {
+                    sticky_token_index.entry(token).or_insert(i);
+                }
             }
         }
         // A wildcard-hosted target is dialed through a per-request concretized

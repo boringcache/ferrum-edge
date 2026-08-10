@@ -217,6 +217,7 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
@@ -893,9 +894,9 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_succeeds_on_clienthello() {
 
 /// Regression for issue #2962 on the NO-DEADLINE path: an oversized (>4 KiB)
 /// ClientHello whose SNI is serialized after fat extensions must still yield
-/// SNI when `handshake_timeout` is `None`. Sizing the single peek at the 4 KiB
-/// lazy floor would truncate the parse and silently misroute the connection to
-/// the catch-all proxy whenever
+/// SNI when `handshake_timeout` is `None`. Sizing that path's peek buffer at the
+/// 4 KiB lazy floor would truncate the parse and silently misroute the
+/// connection to the catch-all proxy whenever
 /// `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`.
 #[tokio::test]
 async fn test_extract_sni_from_tcp_stream_no_timeout_recovers_oversized_clienthello() {
@@ -921,8 +922,11 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_recovers_oversized_clienthe
 
     let accept_task = tokio::spawn(async move {
         let (server_stream, _) = listener.accept().await.expect("accept");
-        // Let the whole hello land in the receive buffer: the no-deadline path
-        // peeks the wire exactly once and never loops for more bytes.
+        // Let the whole hello land in the receive buffer before the first peek.
+        // The no-deadline path does re-peek, but only on a small fixed budget
+        // (one initial peek plus at most `MAX_PEEK_READINESS_RETRIES` more, a
+        // few milliseconds apart), so this test does not lean on that budget:
+        // the hostname must be readable from the very first peek.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         extract_sni_from_tcp_stream(&server_stream, None).await
     });
@@ -972,14 +976,15 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_waits_on_readiness_when_pee
     );
 }
 
-/// Sizing seam for the no-deadline path: its single peek uses the full hard
-/// cap, not the lazy-growth floor that the deadline-driven loop starts from.
+/// Sizing seam for the no-deadline path: every one of its bounded peeks uses the
+/// full hard cap, not the lazy-growth floor that the deadline-driven loop starts
+/// from.
 #[test]
 fn no_deadline_peek_uses_hard_cap_not_lazy_floor() {
     assert_eq!(
         no_deadline_peek_capacity(),
         16 * 1024,
-        "the no-deadline single peek must be able to inspect a standards-valid \
+        "each no-deadline peek must be able to inspect a standards-valid \
          oversized ClientHello up to the hard cap"
     );
     assert!(
@@ -1393,4 +1398,655 @@ fn test_resolve_proxy_exact_beats_wildcard_listed_first() {
         resolve_proxy_by_sni(Some("other.org"), &ids, &config),
         Some("fallback")
     );
+}
+
+// ── Issue #3264: typed ClientHello classification + opaque-TLS SNI admission ──
+//
+// The historical `Option<String>` collapsed "well-formed hello with no
+// server_name", "not TLS at all", "hello never finished arriving", and
+// "malformed hello" into one `None`, and SNI route selection sent all four to
+// the listener's catch-all proxy. These tests lock the typed replacement: the
+// a complete valid hostname still routes identically, while incomplete or
+// malformed hellos are now distinguishable and fail closed even if the lenient
+// raw-slice extractor could read an early SNI.
+
+use ferrum_edge::proxy::sni::{
+    ClientHelloSni, SniAdmission, SniPeekFailure, SniRefusal, admit_opaque_tls_sni,
+    classify_client_hello, peek_client_hello_sni,
+};
+
+/// Frame an arbitrary ClientHello extension block into a complete, otherwise
+/// well-formed TLS record + handshake message.
+fn build_client_hello_with_extension_block(extensions: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0); // session_id_len
+    body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites_len
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(1); // compression_methods_len
+    body.push(0); // null compression
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    let body_len = body.len();
+    handshake.push((body_len >> 16) as u8);
+    handshake.push((body_len >> 8) as u8);
+    handshake.push(body_len as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&[0x16, 0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// One complete, non-SNI extension (`status_request`, type 0x0005).
+fn non_sni_extension_block() -> Vec<u8> {
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0x0005u16.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    ext
+}
+
+/// One complete RFC 6066 `server_name` extension containing a DNS hostname.
+fn sni_extension_block(hostname: &str) -> Vec<u8> {
+    let hostname = hostname.as_bytes();
+    let hostname_len = u16::try_from(hostname.len()).expect("test hostname fits in u16");
+    let server_name_list_len = hostname_len
+        .checked_add(3)
+        .expect("test ServerNameList length fits in u16");
+    let extension_len = server_name_list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&extension_len.to_be_bytes());
+    ext.extend_from_slice(&server_name_list_len.to_be_bytes());
+    ext.push(0x00); // host_name
+    ext.extend_from_slice(&hostname_len.to_be_bytes());
+    ext.extend_from_slice(hostname);
+    ext
+}
+
+#[test]
+fn classify_reports_hostname_for_a_valid_client_hello() {
+    let hello = build_tls_client_hello("tenant-a.example.com");
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Sni("tenant-a.example.com".to_string())
+    );
+    // Parity with the historical extractor: every `Sni` is a `Some`.
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("tenant-a.example.com".to_string())
+    );
+}
+
+#[test]
+fn classify_reports_no_sni_for_a_complete_hello_without_server_name() {
+    let hello = build_client_hello_with_extension_block(&non_sni_extension_block());
+    assert_eq!(classify_client_hello(&hello), ClientHelloSni::NoSni);
+    assert_eq!(extract_sni_from_client_hello(&hello), None);
+}
+
+#[test]
+fn classify_reports_no_sni_for_a_hello_with_no_extension_block() {
+    // A TLS 1.0-era hello with an empty extension vector cannot name a host.
+    let hello = build_client_hello_with_extension_block(&[]);
+    assert_eq!(classify_client_hello(&hello), ClientHelloSni::NoSni);
+}
+
+#[test]
+fn classify_reports_not_tls_for_plaintext_application_bytes() {
+    assert_eq!(
+        classify_client_hello(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+        ClientHelloSni::NotTls
+    );
+    // A SOCKS5 greeting, an SMTP banner — anything whose first byte is not a
+    // TLS handshake record — is determinately not TLS.
+    assert_eq!(
+        classify_client_hello(&[0x05, 0x01, 0x00]),
+        ClientHelloSni::NotTls
+    );
+}
+
+#[test]
+fn classify_reports_not_tls_for_a_handshake_record_that_is_not_a_client_hello() {
+    // Handshake record carrying msg_type 0x02 (ServerHello).
+    let record = [0x16, 0x03, 0x01, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
+    assert_eq!(classify_client_hello(&record), ClientHelloSni::NotTls);
+}
+
+#[test]
+fn classify_reports_truncated_for_a_partial_client_hello() {
+    let hello = build_tls_client_hello("slow.example.com");
+    // Cut inside the random bytes, well before the SNI extension.
+    let prefix = &hello[..20.min(hello.len() - 1)];
+    assert_eq!(
+        classify_client_hello(prefix),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Truncated)
+    );
+    // An empty buffer is likewise indeterminate, never "no SNI".
+    assert_eq!(
+        classify_client_hello(&[]),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Truncated)
+    );
+}
+
+#[test]
+fn classify_reports_malformed_for_a_complete_but_invalid_extension_block() {
+    // Two bytes of extension block: an extension type with no length field.
+    // The lenient walker stops (no SNI) and the strict whole-hello parser
+    // refuses, so this must be indeterminate rather than "no SNI".
+    let hello = build_client_hello_with_extension_block(&[0x00, 0x0f]);
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed)
+    );
+}
+
+#[test]
+fn classify_rejects_malformed_data_after_an_early_valid_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    // A second extension begins but omits its length. The historical lenient
+    // extractor has already found the first SNI by this point, which is why
+    // classification must validate the entire declared ClientHello first.
+    extensions.extend_from_slice(&[0x00, 0x0f]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "a valid early SNI must not hide malformed trailing extension data"
+    );
+}
+
+#[test]
+fn classify_rejects_duplicate_server_name_extensions() {
+    let mut extensions = sni_extension_block("first.example.com");
+    extensions.extend_from_slice(&sni_extension_block("second.example.com"));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("first.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "duplicate SNI extensions are malformed and must never select the first tenant"
+    );
+}
+
+#[test]
+fn classify_rejects_duplicate_host_names_inside_one_server_name_extension() {
+    let first = sni_extension_block("first.example.com");
+    let second = sni_extension_block("second.example.com");
+    let first_entry = &first[6..];
+    let second_entry = &second[6..];
+    let list_len = u16::try_from(first_entry.len() + second_entry.len())
+        .expect("test ServerNameList fits in u16");
+    let extension_len = list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0x0000u16.to_be_bytes());
+    extensions.extend_from_slice(&extension_len.to_be_bytes());
+    extensions.extend_from_slice(&list_len.to_be_bytes());
+    extensions.extend_from_slice(first_entry);
+    extensions.extend_from_slice(second_entry);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("first.example.com".to_string())
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "RFC 6066 permits at most one host_name in a ServerNameList"
+    );
+}
+
+/// One complete extension of an arbitrary type carrying an empty body.
+fn empty_extension_block(ext_type: u16) -> Vec<u8> {
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&ext_type.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    ext
+}
+
+/// One `server_name` extension whose `ServerNameList` carries the given
+/// `(name_type, name_length)` entries, each filled with placeholder bytes.
+fn server_name_extension_with_name_types(entries: &[(u8, usize)]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for &(name_type, name_len) in entries {
+        list.push(name_type);
+        let encoded_len = u16::try_from(name_len).expect("test name length fits in u16");
+        list.extend_from_slice(&encoded_len.to_be_bytes());
+        list.extend(std::iter::repeat_n(b'x', name_len));
+    }
+    let server_name_list_len =
+        u16::try_from(list.len()).expect("test ServerNameList length fits in u16");
+    let extension_len = server_name_list_len
+        .checked_add(2)
+        .expect("test extension length fits in u16");
+
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&extension_len.to_be_bytes());
+    ext.extend_from_slice(&server_name_list_len.to_be_bytes());
+    ext.extend_from_slice(&list);
+    ext
+}
+
+/// RFC 8446 §4.2 forbids repeating ANY extension type, not only the two the
+/// strict whole-hello scan interprets. The lenient extractor returns from the
+/// FIRST `server_name` it sees, so without a general duplicate check a hello
+/// with a valid early SNI followed by a duplicated generic extension would still
+/// be admitted and select a tenant route off a structure the TLS grammar
+/// forbids.
+#[test]
+fn classify_rejects_a_duplicate_generic_extension_after_a_valid_early_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    // `status_request` (0x0005), twice. Neither copy is `server_name` nor
+    // `supported_versions`, and each is individually well formed.
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early.example.com".to_string()),
+        "the lenient extractor still reads the early SNI — which is exactly why \
+         classification has to validate the entire declared ClientHello"
+    );
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "a duplicate extension of ANY type makes the hello malformed, even when \
+         an earlier valid server_name is readable"
+    );
+}
+
+/// Control for the general duplicate check: distinct extension types after the
+/// SNI are ordinary and must still classify as a routable hostname.
+#[test]
+fn classify_accepts_distinct_generic_extensions_after_a_valid_early_sni() {
+    let mut extensions = sni_extension_block("early.example.com");
+    extensions.extend_from_slice(&empty_extension_block(0x0005));
+    extensions.extend_from_slice(&empty_extension_block(0x0017));
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Sni("early.example.com".to_string()),
+        "distinct extension types are not duplicates and must not be refused"
+    );
+}
+
+/// RFC 6066 §3: "The ServerNameList MUST NOT contain more than one name of the
+/// same name_type." That is not a `host_name`-only rule — a list repeating an
+/// unknown future type is malformed too.
+#[test]
+fn classify_rejects_duplicate_unknown_server_name_types() {
+    let extensions = server_name_extension_with_name_types(&[(0x7f, 4), (0x7f, 4)]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        "two ServerName entries sharing a name_type are malformed for every \
+         name_type, not just host_name"
+    );
+}
+
+/// The conservative classifier contract for unknown future name types, pinned
+/// exactly: DISTINCT unknown types stay structurally valid, so the hello is NOT
+/// `Malformed`. It is still refused, because a `server_name` extension is
+/// present yet yields no representable `host_name` — `UnrepresentableName` is
+/// the fail-closed answer an SNI-routing listener needs, and it must not decay
+/// into `NoSni` (which would silently take the catch-all route).
+#[test]
+fn classify_treats_distinct_unknown_server_name_types_as_unrepresentable_not_malformed() {
+    let extensions = server_name_extension_with_name_types(&[(0x7f, 4), (0x80, 4)]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+
+    assert_eq!(extract_sni_from_client_hello(&hello), None);
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName),
+        "distinct unknown name types are structurally accepted; the present but \
+         unreadable server_name is what fails the hello closed"
+    );
+}
+
+#[test]
+fn classify_reports_unrepresentable_when_server_name_is_present_but_unreadable() {
+    // Underscore labels are accepted by rustls's `DnsName` but deliberately
+    // refused by this parser (see `.claude/rules/tls-security.md` — the kTLS
+    // handoff depends on the stricter validator). The client still NAMED a
+    // host, so an SNI listener must refuse rather than default it to the
+    // catch-all.
+    let hello = build_tls_client_hello("foo_bar.example.com");
+    assert_eq!(extract_sni_from_client_hello(&hello), None);
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName)
+    );
+
+    // A trailing root dot is the same story: RFC 6066 forbids it in SNI, and
+    // this parser rejects it, but the extension was present.
+    let dotted = build_tls_client_hello("trailing.example.com.");
+    assert_eq!(extract_sni_from_client_hello(&dotted), None);
+    assert_eq!(
+        classify_client_hello(&dotted),
+        ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName)
+    );
+}
+
+#[test]
+fn classify_normalizes_case_the_same_way_the_extractor_does() {
+    let hello = build_tls_client_hello("Tenant-A.EXAMPLE.com");
+    assert_eq!(
+        classify_client_hello(&hello),
+        ClientHelloSni::Sni("tenant-a.example.com".to_string()),
+        "wire SNI is ASCII-lowercased so it compares against normalized config hosts"
+    );
+}
+
+#[test]
+fn classify_resolves_a_record_fragmented_client_hello() {
+    let hello = build_tls_client_hello("fragmented.example.com");
+    let split = split_tls_client_hello_into_records(&hello, 25);
+    assert_eq!(
+        classify_client_hello(&split),
+        ClientHelloSni::Sni("fragmented.example.com".to_string()),
+        "record fragmentation is protocol-valid and must not read as malformed"
+    );
+}
+
+#[test]
+fn admission_routes_determinate_outcomes_and_refuses_indeterminate_ones() {
+    // A named host routes by that host.
+    assert_eq!(
+        admit_opaque_tls_sni(ClientHelloSni::Sni("a.example.com".into()), false),
+        SniAdmission::Route(Some("a.example.com".to_string()))
+    );
+    // A well-formed hello with no server_name uses the catch-all tier.
+    assert_eq!(
+        admit_opaque_tls_sni(ClientHelloSni::NoSni, false),
+        SniAdmission::Route(None)
+    );
+    // Non-TLS bytes are refused unless the operator authorized a fallback.
+    assert_eq!(
+        admit_opaque_tls_sni(ClientHelloSni::NotTls, false),
+        SniAdmission::Refuse(SniRefusal::NotTls)
+    );
+    assert_eq!(
+        admit_opaque_tls_sni(ClientHelloSni::NotTls, true),
+        SniAdmission::Route(None)
+    );
+}
+
+/// Security regression: the plaintext-fallback authorization must NOT extend to
+/// any indeterminate outcome. Such a connection may have declared any tenant's
+/// hostname, so routing it to the catch-all is a cross-tenant downgrade.
+#[test]
+fn admission_never_lets_the_plaintext_fallback_rescue_an_indeterminate_hello() {
+    for failure in [
+        SniPeekFailure::Timeout,
+        SniPeekFailure::Oversized,
+        SniPeekFailure::Eof,
+        SniPeekFailure::Truncated,
+        SniPeekFailure::Malformed,
+        SniPeekFailure::UnrepresentableName,
+        SniPeekFailure::Io,
+    ] {
+        for authorized in [false, true] {
+            assert_eq!(
+                admit_opaque_tls_sni(ClientHelloSni::Indeterminate(failure), authorized),
+                SniAdmission::Refuse(SniRefusal::Indeterminate(failure)),
+                "{failure:?} must fail closed regardless of plaintext-fallback authorization"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn peek_reports_timeout_for_a_silent_peer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_millis(150))).await
+    });
+
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert_eq!(
+        accept_task.await.expect("accept_task"),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Timeout),
+        "a slow-loris peer must be attributed to the handshake deadline, not routed"
+    );
+}
+
+#[tokio::test]
+async fn peek_unrepresentable_timeout_fails_closed_without_panicking() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::MAX)).await
+    });
+
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), accept_task)
+        .await
+        .expect("an unrepresentable deadline must fail immediately")
+        .expect("accept task");
+
+    assert_eq!(
+        outcome,
+        ClientHelloSni::Indeterminate(SniPeekFailure::Timeout)
+    );
+}
+
+#[tokio::test]
+async fn peek_reports_oversized_when_the_hello_exceeds_the_hard_bound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello_with_padding_before_sni("overcap.example.com", 20_000);
+    assert!(hello.len() > 16 * 1024);
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    assert_eq!(
+        accept_task.await.expect("accept_task"),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Oversized),
+        "a hello past the 16 KiB peek bound must be attributed, never defaulted"
+    );
+}
+
+#[tokio::test]
+async fn peek_rejects_an_oversized_hello_with_sni_before_the_hard_bound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let mut extensions = sni_extension_block("early-overcap.example.com");
+    extensions.extend_from_slice(&0x0015u16.to_be_bytes()); // padding
+    extensions.extend_from_slice(&20_000u16.to_be_bytes());
+    extensions.extend_from_slice(&vec![0u8; 20_000]);
+    let hello = build_client_hello_with_extension_block(&extensions);
+    assert!(hello.len() > 16 * 1024);
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("early-overcap.example.com".to_string()),
+        "the regression requires the lenient extractor to see SNI before the cap"
+    );
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    assert_eq!(
+        accept_task.await.expect("accept_task"),
+        ClientHelloSni::Indeterminate(SniPeekFailure::Oversized),
+        "an early SNI must not make an oversized ClientHello routable"
+    );
+}
+
+#[tokio::test]
+async fn peek_reports_not_tls_for_plaintext_bytes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .expect("write");
+    client.flush().await.expect("flush");
+
+    assert_eq!(
+        accept_task.await.expect("accept_task"),
+        ClientHelloSni::NotTls
+    );
+}
+
+/// A ClientHello split across TCP segments must resolve to the SAME hostname
+/// (not a truncated refusal), and every peeked byte must still be readable
+/// afterwards — peeking is what makes opaque relay byte-exact.
+#[tokio::test]
+async fn peek_resolves_a_segmented_hello_and_consumes_nothing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello("segmented.example.com");
+    let split_at = 20.min(hello.len() - 1);
+    let (first, rest) = hello.split_at(split_at);
+    let (first, rest) = (first.to_vec(), rest.to_vec());
+    let expected = hello.clone();
+
+    let accept_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut server_stream, _) = listener.accept().await.expect("accept");
+        let outcome =
+            peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5))).await;
+        // Replay: everything the peek inspected must still be on the socket.
+        let mut relayed = vec![0u8; expected.len()];
+        server_stream
+            .read_exact(&mut relayed)
+            .await
+            .expect("peeked bytes must still be readable");
+        (outcome, relayed)
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&first).await.expect("write first");
+    client.flush().await.expect("flush first");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    client.write_all(&rest).await.expect("write rest");
+    client.flush().await.expect("flush rest");
+
+    let (outcome, relayed) = accept_task.await.expect("accept_task");
+    assert_eq!(
+        outcome,
+        ClientHelloSni::Sni("segmented.example.com".to_string())
+    );
+    assert_eq!(
+        relayed, hello,
+        "the peek must not consume: the backend receives the ClientHello verbatim"
+    );
+}
+
+/// `extract_sni_from_tcp_stream` must keep its exact historical contract: it is
+/// now a projection of the typed peek, and every non-`Sni` outcome is `None`.
+#[tokio::test]
+async fn extractor_stays_a_projection_of_the_typed_peek() {
+    for (label, payload) in [
+        ("not tls", b"PLAINTEXT-BYTES".to_vec()),
+        (
+            "no sni",
+            build_client_hello_with_extension_block(&non_sni_extension_block()),
+        ),
+        (
+            "malformed",
+            build_client_hello_with_extension_block(&[0x00, 0x0f]),
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let accept_task = tokio::spawn(async move {
+            let (server_stream, _) = listener.accept().await.expect("accept");
+            let typed =
+                peek_client_hello_sni(&server_stream, Some(std::time::Duration::from_secs(5)))
+                    .await;
+            let flat = extract_sni_from_tcp_stream(
+                &server_stream,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .await;
+            (typed, flat)
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        use tokio::io::AsyncWriteExt;
+        client.write_all(&payload).await.expect("write");
+        client.flush().await.expect("flush");
+
+        let (typed, flat) = accept_task.await.expect("accept_task");
+        assert!(
+            !matches!(typed, ClientHelloSni::Sni(_)),
+            "{label}: fixture must not yield a hostname"
+        );
+        assert_eq!(flat, None, "{label}: the flat extractor still reports None");
+    }
 }

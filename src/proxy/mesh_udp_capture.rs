@@ -181,14 +181,18 @@ pub struct MeshUdpCaptureConfig {
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-/// Session key: a captured flow is identified by the client's source address
-/// and the datagram's original (pre-TPROXY) destination. Two pods dialing the
-/// same upstream, or one pod dialing two upstreams, are distinct sessions.
+/// Session key: a captured flow is identified by the client's source address,
+/// the datagram's original (pre-TPROXY) destination, and the kernel-reported
+/// ingress interface when the shared host-network capture socket is used. The
+/// interface is required because two network tenants may use the same source
+/// IP:port tuple; collapsing them into one session would relay the second pod's
+/// datagrams under the first pod's identity. Fixed-evidence placements use `0`.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CaptureSessionKey {
     pub client: SocketAddr,
     pub orig_dst: SocketAddr,
+    pub ingress_ifindex: u32,
 }
 
 /// Whether `e` indicates IPv6 is unavailable on this host (so the dual-stack
@@ -298,6 +302,71 @@ impl ReplySocketFactory for PodNetnsReplySocketFactory {
     }
 }
 
+/// Where a captured datagram's source evidence comes from.
+///
+/// The two capture placements differ in exactly this: a pod-netns (or Sidecar)
+/// socket serves ONE workload, so its evidence is fixed for the socket's whole
+/// lifetime; the host-namespace socket (issue #3288) serves every enrolled pod on
+/// the node, so evidence has to be derived per datagram from kernel-reported
+/// facts. Everything downstream — session keying, DoS bounds, the relay, the
+/// return path — is identical.
+#[cfg(target_os = "linux")]
+pub(crate) enum CapturedSourceEvidence {
+    /// Fixed per producer. `None` keeps the mesh-wide authorization posture for
+    /// the Sidecar listener and for old/malformed registry entries.
+    Fixed(Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>),
+    /// Resolved per datagram from the ingress interface index plus the source
+    /// address, both kernel-provided. Fails closed: a datagram that cannot be
+    /// attributed to exactly one enrolled pod is dropped, never relayed under an
+    /// absent or neighbouring identity.
+    HostIngress(std::sync::Arc<super::host_udp_capture::HostUdpIdentityIndex>),
+}
+
+/// Evidence retained from the exact snapshot that authorized one datagram.
+/// Fixed-evidence listeners borrow their already-owned identity without cloning
+/// on refreshes; host listeners retain the binding `Arc` from the one ArcSwap
+/// load used for authorization.
+#[cfg(target_os = "linux")]
+enum AuthorizedCapturedSource<'a> {
+    Fixed(Option<&'a std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>),
+    Host(std::sync::Arc<super::host_udp_capture::HostUdpPodBinding>),
+}
+
+#[cfg(target_os = "linux")]
+impl AuthorizedCapturedSource<'_> {
+    /// Materialize the identity only for a newly admitted session. The host arm
+    /// can never produce `None`: host authorization requires an attested binding
+    /// and this value retains that exact binding generation.
+    fn into_session_identity(
+        self,
+    ) -> Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>> {
+        match self {
+            Self::Fixed(identity) => identity.cloned(),
+            Self::Host(binding) => Some(std::sync::Arc::new(binding.identity.clone())),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedSourceEvidence {
+    /// Per-datagram admission. The `Fixed` arm is clone-free; the `HostIngress`
+    /// arm costs one lock-free snapshot load, one hash lookup, and one `Arc`
+    /// retain so a later generation swap cannot change the admitted evidence.
+    fn authorize<'a>(
+        &'a self,
+        ingress_ifindex: Option<u32>,
+        client: SocketAddr,
+    ) -> Result<AuthorizedCapturedSource<'a>, &'static str> {
+        match self {
+            Self::Fixed(identity) => Ok(AuthorizedCapturedSource::Fixed(identity.as_ref())),
+            Self::HostIngress(index) => index
+                .authorized_binding(ingress_ifindex, client.ip())
+                .map(AuthorizedCapturedSource::Host)
+                .map_err(super::host_udp_capture::HostUdpDatagramRefusal::as_str),
+        }
+    }
+}
+
 /// Bind the transparent UDP capture socket on `addr` in the CURRENT network
 /// namespace, preferring the dual-stack `[::]` bind and falling back to the v4
 /// wildcard only when IPv6 is genuinely unavailable. Returns the bound std
@@ -307,6 +376,25 @@ impl ReplySocketFactory for PodNetnsReplySocketFactory {
 #[cfg(target_os = "linux")]
 pub(crate) fn bind_mesh_udp_capture_socket(
     addr: SocketAddr,
+) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
+    bind_mesh_udp_capture_socket_with_pktinfo(addr, false)
+}
+
+/// As [`bind_mesh_udp_capture_socket`], additionally requesting the ingress
+/// interface cmsg (`IP_PKTINFO` / `IPV6_RECVPKTINFO`) when `require_pktinfo` is
+/// set.
+///
+/// The host-namespace capture socket (issue #3288) attributes each datagram to a
+/// pod BY that interface index, so the option is FATAL there: a socket that
+/// cannot report the ingress interface could only deliver unattributable
+/// datagrams, and the correct response is to refuse the bind rather than to run a
+/// capture path whose identity checks would refuse every datagram. The
+/// pod-netns/Sidecar placements pass `false` — their evidence is fixed per
+/// socket, so they neither need the cmsg nor should pay to parse it.
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_mesh_udp_capture_socket_with_pktinfo(
+    addr: SocketAddr,
+    require_pktinfo: bool,
 ) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
@@ -366,6 +454,37 @@ pub(crate) fn bind_mesh_udp_capture_socket(
                 ));
             }
 
+            if require_pktinfo {
+                // IP(v6)_PKTINFO surfaces the INGRESS interface index per
+                // datagram, which is the host-namespace placement's identity key.
+                // Both families are requested (the dual-stack socket sees v4 and
+                // v6 datagrams) and at least one must succeed for the family this
+                // socket actually binds; a kernel that supports neither cannot
+                // attribute anything, so refuse the bind instead of coming up as
+                // a capture path that drops every datagram.
+                let v4_pktinfo = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
+                let v6_pktinfo = match bind_addr.ip() {
+                    IpAddr::V4(_) => false,
+                    IpAddr::V6(_) => crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok(),
+                };
+                let sufficient = match bind_addr.ip() {
+                    IpAddr::V4(_) => v4_pktinfo,
+                    // A dual-stack `[::]` socket needs BOTH: the v6 option covers
+                    // native IPv6 datagrams and the v4 option covers the
+                    // v4-mapped ones, and an unattributable family would be
+                    // dropped wholesale at the identity check.
+                    IpAddr::V6(_) => v4_pktinfo && v6_pktinfo,
+                };
+                if !sufficient {
+                    return Err(anyhow::anyhow!(
+                        "mesh UDP capture: IP_PKTINFO/IPV6_RECVPKTINFO setsockopt failed \
+                         (v4={v4_pktinfo}, v6={v6_pktinfo}); the host-network capture path \
+                         attributes each datagram by its ingress interface and cannot run \
+                         without it"
+                    ));
+                }
+            }
+
             socket.bind(&bind_addr.into())?;
             Ok((socket.into(), v4_origdst, v6_origdst))
         };
@@ -403,10 +522,10 @@ pub(crate) struct MeshUdpCaptureRuntime {
     pub recvmmsg_batch_size: usize,
     pub session_shard_amount: usize,
     pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
-    /// Per-pod evidence fixed by the Ambient capture manager. `None` for the
-    /// Sidecar current-netns listener and for old/malformed registry entries;
-    /// those sessions retain the mesh-wide authorization posture.
-    pub source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
+    /// Where each captured datagram's source evidence comes from: fixed per
+    /// producer for the pod-netns/Sidecar placements, or resolved per datagram
+    /// from the ingress interface for the host-network placement.
+    pub source_identity: CapturedSourceEvidence,
     /// Builds each session's transparent reply socket in the SAME netns as the
     /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
@@ -446,7 +565,7 @@ pub async fn start_mesh_udp_capture_listener(
             recvmmsg_batch_size,
             session_shard_amount,
             session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
-            source_identity: None,
+            source_identity: CapturedSourceEvidence::Fixed(None),
             reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
         },
         shutdown,
@@ -577,6 +696,12 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                             for i in 0..n {
                                 let (data, client) = recv_batch.datagram(i);
                                 let orig_dst = recv_batch.orig_dst(i);
+                                // Ingress interface index from the IP(v6)_PKTINFO
+                                // cmsg. `None` for placements that did not enable
+                                // pktinfo (pod-netns / Sidecar), which is fine —
+                                // their evidence is fixed and ignores it.
+                                let ingress_ifindex =
+                                    recv_batch.local_addr(i).map(|local| local.ifindex);
                                 let gro = recv_batch.gro_segment_size(i);
                                 // GRO may coalesce many datagrams into one buffer;
                                 // frame EACH segment separately (a coalesced
@@ -590,8 +715,9 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                                 &state,
                                                 client,
                                                 orig_dst,
+                                                ingress_ifindex,
                                                 chunk,
-                                                source_identity.as_ref(),
+                                                &source_identity,
                                                 &reply_socket_factory,
                                                 &session_stop_rx,
                                                 &mut session_tasks,
@@ -605,8 +731,9 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                             &state,
                                             client,
                                             orig_dst,
+                                            ingress_ifindex,
                                             data,
-                                            source_identity.as_ref(),
+                                            &source_identity,
                                             &reply_socket_factory,
                                             &session_stop_rx,
                                             &mut session_tasks,
@@ -766,8 +893,9 @@ fn handle_captured_datagram(
     state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
+    ingress_ifindex: Option<u32>,
     data: &[u8],
-    source_identity: Option<&std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
+    source_identity: &CapturedSourceEvidence,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
     session_shutdown: &watch::Receiver<bool>,
     session_tasks: &mut tokio::task::JoinSet<()>,
@@ -779,6 +907,29 @@ fn handle_captured_datagram(
     // orig-dst family on the reply path AND keys the session consistently (codex
     // r2 P1). Genuine IPv6 clients are unchanged.
     let client = canonicalize_socket_addr(client);
+
+    // Source attribution runs BEFORE routing, keying, or slot reservation, and on
+    // EVERY datagram — not only at admission. On the host-network capture socket
+    // one workload's unenrollment or a spoofed source must stop being relayed
+    // immediately, not when the session happens to idle out; and a refused
+    // datagram must never reserve a session slot, so an unattributable flood
+    // cannot evict attributable flows. The `Fixed` placements short-circuit to
+    // `Ok(())` with no work.
+    let authorized_source = match source_identity.authorize(ingress_ifindex, client) {
+        Ok(authorized) => authorized,
+        Err(reason) => {
+            debug!(
+                client = %client,
+                // `0` is the kernel's "unspecified interface" value, so it doubles as
+                // the absent-cmsg marker without logging an `Option`.
+                ingress_ifindex = ingress_ifindex.unwrap_or(0),
+                reason,
+                "Mesh UDP capture: dropping datagram whose source could not be attributed to an \
+                 enrolled workload"
+            );
+            return false;
+        }
+    };
 
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
@@ -796,7 +947,14 @@ fn handle_captured_datagram(
     // `key.orig_dst`), so `send_to(client)` never trips a family mismatch.
     let orig_dst = canonicalize_socket_addr(orig_dst);
 
-    let key = CaptureSessionKey { client, orig_dst };
+    let key = CaptureSessionKey {
+        client,
+        orig_dst,
+        // `0` is reserved by the kernel as "unspecified" and is never admitted
+        // by HostIngress, so it is an unambiguous scope for fixed-evidence
+        // pod-netns and Sidecar listeners.
+        ingress_ifindex: ingress_ifindex.unwrap_or(0),
+    };
 
     // Routability is resolved ONCE per (potentially new) flow via a closure so
     // the cap/keying bookkeeping (`admit_or_refresh_session`) stays a pure,
@@ -856,7 +1014,7 @@ fn handle_captured_datagram(
                 queued_bytes,
                 outcome_signal,
                 epoch,
-                source_identity.cloned(),
+                authorized_source.into_session_identity(),
                 reply_factory.clone(),
                 session_shutdown.clone(),
                 session_tasks,
@@ -1485,6 +1643,7 @@ async fn run_udp_egress_session(
                 dial_plan.expected_peer.as_ref(),
                 dial_plan.expected_trust_domain.as_ref(),
                 dial_plan.sni_override,
+                source_identity,
             )
             .await
         {
@@ -1984,6 +2143,7 @@ mod tests {
         CaptureSessionKey {
             client: client.parse().unwrap(),
             orig_dst: dst.parse().unwrap(),
+            ingress_ifindex: 0,
         }
     }
 
@@ -2125,6 +2285,31 @@ listen_port: 15011
             other => panic!("expected Admitted, got {}", admission_name(&other)),
         }
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn host_ingress_interface_scopes_the_session_key() {
+        let sessions = new_sessions(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
+        let mut first = key("10.0.0.5:40000", "10.96.0.10:53");
+        first.ingress_ifindex = 11;
+        let mut second = first;
+        second.ingress_ifindex = 12;
+        let mut keepalive = Vec::new();
+
+        for session_key in [first, second] {
+            match admit_or_refresh_session(&sessions, &limiter, session_key, b"x", routable) {
+                SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            }
+        }
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "overlapping tenant source tuples on different ingress interfaces must never share \
+             a session or source identity"
+        );
     }
 
     #[test]
@@ -2517,6 +2702,13 @@ listen_port: 15011
 /// - That a reply can be SOURCED from the captured original destination on an
 ///   `IP_TRANSPARENT` socket (`build_transparent_reply_socket`'s recipe), the
 ///   return-path primitive the egress session uses.
+/// - The host-network placement's distinct live boundary: a veth-side datagram
+///   re-enters a throwaway host namespace on the peer interface, matches a real
+///   `PREROUTING -i <peer> -j TPROXY` rule, reaches the production
+///   pktinfo-enabled transparent socket, preserves its original destination, and
+///   reports that exact peer ifindex for per-pod attribution. The test also runs
+///   the production dedicated-peer sysfs check against the live veth and rejects
+///   the self-linked loopback device.
 ///
 /// ## What this does NOT cover (deliberately — a thin smoke test)
 /// - No full two-gateway loop: no HBONE / mesh-mTLS tunnel, no egress relay, no
@@ -2630,6 +2822,74 @@ mod live_netns_tests {
         );
         Command::new("unshare")
             .args(["--net", "sh", "-c", &script])
+            .spawn()
+            .ok()
+    }
+
+    /// Spawn a throwaway host-shaped network + mount namespace with both ends of
+    /// a veth pair in that network namespace. The private sysfs mount is
+    /// load-bearing: a sysfs superblock is bound to the network namespace it was
+    /// mounted from, so the runner's original `/sys` cannot expose a veth created
+    /// after `unshare --net`. The parent reaches this mount through
+    /// `/proc/<pid>/root/sys` when it exercises the production sysfs validator.
+    ///
+    /// A locally generated client datagram leaves `pod0`, re-enters through its
+    /// peer `vethhost`, and therefore traverses the same
+    /// `mangle PREROUTING -i <pod host interface>` hook as real pod egress. The
+    /// host-network capture rule then TPROXY-delivers it to the production
+    /// transparent socket while preserving both the original destination and
+    /// the ingress-interface pktinfo cmsg.
+    fn spawn_host_tproxy_veth_child() -> Option<Child> {
+        let mark = crate::capture::DEFAULT_TPROXY_MARK;
+        let mask = crate::capture::TPROXY_MARK_MASK;
+        let table = crate::capture::TPROXY_HOST_ROUTE_TABLE;
+        let prio = crate::capture::TPROXY_HOST_ROUTE_RULE_PRIORITY;
+        let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        // Pin the host peer's locally administered MAC before bringing it up so
+        // neighbour setup uses an explicit fixture value rather than consulting
+        // sysfs while the namespace is still being assembled. The scenario
+        // separately validates the production sysfs lookup through the child's
+        // namespace-local mount after the exact readiness marker is observed.
+        // Both veth ends intentionally live in this one throwaway namespace, so
+        // the packet entering `vethhost` has a source address locally assigned
+        // to `pod0`. Disable reverse-path filtering before sending it; otherwise
+        // a strict runner default can discard that fixture-only local-source
+        // shape before PREROUTING. Real host-veth capture has the pod address
+        // routed back through the same peer, and the repository's other live
+        // veth harness likewise makes the rp_filter prerequisite explicit.
+        let script = format!(
+            "set -e; \
+             command -v iptables >/dev/null 2>&1 || exit 97; \
+             command -v ip >/dev/null 2>&1 || exit 97; \
+             command -v mount >/dev/null 2>&1 || exit 97; \
+             mount -t sysfs sysfs /sys || exit 98; \
+             ip link set lo up 2>/dev/null || true; \
+             ip link add pod0 type veth peer name vethhost || exit 98; \
+             ip link set vethhost address 02:00:00:00:00:01 || exit 98; \
+             ip link set pod0 up || exit 98; \
+             ip link set vethhost up || exit 98; \
+             ip address add 10.0.0.2/32 dev pod0 || exit 98; \
+             printf '0\n' > /proc/sys/net/ipv4/conf/all/rp_filter || exit 98; \
+             printf '0\n' > /proc/sys/net/ipv4/conf/vethhost/rp_filter || exit 98; \
+             printf '1\n' > /proc/sys/net/ipv4/conf/vethhost/accept_local || exit 98; \
+             ip neigh add {REMOTE_DST} lladdr 02:00:00:00:00:01 dev pod0 nud permanent || exit 98; \
+             ip route add {REMOTE_DST}/32 dev pod0 src 10.0.0.2 || exit 98; \
+             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 98; \
+             ip route add local 0.0.0.0/0 dev lo table {table} || exit 98; \
+             iptables -t mangle -A PREROUTING -i vethhost -p udp \
+               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 98; \
+             exec sleep 30"
+        );
+        Command::new("unshare")
+            .args([
+                "--mount",
+                "--net",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                &script,
+            ])
             .spawn()
             .ok()
     }
@@ -2793,6 +3053,162 @@ mod live_netns_tests {
             Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
             "a TPROXY-captured datagram must recover its pre-TPROXY (original) \
              destination from the IP_RECVORIGDSTADDR cmsg"
+        );
+
+        run_host_veth_capture_scenario();
+    }
+
+    /// Exercise the host-network veth-ingress capture boundary as the second
+    /// half of [`captured_udp_recovers_pre_tproxy_destination`]. Keeping both
+    /// scenarios in one ignored test preserves the trusted hosted live-test
+    /// count while extending that test's datapath coverage.
+    fn run_host_veth_capture_scenario() {
+        if !is_root() {
+            skip_or_fail("not root; cannot create a veth / TPROXY namespace");
+            return;
+        }
+        let Some(mut child) = spawn_host_tproxy_veth_child() else {
+            skip_or_fail("`unshare --net` unavailable");
+            return;
+        };
+
+        let pid = child.id();
+        let mut setup_exit: Option<std::process::ExitStatus> = None;
+        let mut setup_status_unknown = false;
+        let mut setup_ready = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    setup_exit = Some(status);
+                    break;
+                }
+                Err(_) => {
+                    setup_status_unknown = true;
+                    break;
+                }
+                Ok(None) => {
+                    // The setup script ends with `exec sleep 30`; seeing that
+                    // executable is an exact readiness signal that the private
+                    // sysfs mount, veth, routes, sysctl, and TPROXY rule all
+                    // completed. Merely seeing the child alive races the setup
+                    // sequence on a loaded host.
+                    setup_ready = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .is_ok_and(|comm| comm.trim() == "sleep");
+                    if setup_ready {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(status) = setup_exit {
+            if status.code() == Some(98) {
+                panic!(
+                    "host-veth UDP TPROXY setup failed (exit 98): the private sysfs mount, veth, \
+                     route, fwmark, or interface-scoped TPROXY rule did not install"
+                );
+            }
+            skip_or_fail(&format!(
+                "host-veth capture prerequisites unavailable (setup child exited {:?})",
+                status.code()
+            ));
+            return;
+        }
+        if setup_status_unknown {
+            let _ = child.kill();
+            let _ = child.wait();
+            skip_or_fail("could not determine host-veth setup-child status");
+            return;
+        }
+        if !setup_ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            skip_or_fail("host-veth setup did not reach its steady-state readiness marker");
+            return;
+        }
+        let _guard = ChildGuard(child);
+
+        // `/proc/<pid>/root` resolves through the child's private mount
+        // namespace, whose `/sys` was mounted after entering its new network
+        // namespace. Reading the runner's own `/sys/class/net` here would always
+        // inspect the original network namespace, even after a thread-level
+        // `setns`, and would make the live validator fail for the wrong reason.
+        let child_sysfs = std::path::PathBuf::from(format!("/proc/{pid}/root/sys/class/net"));
+        let expected_ifindex =
+            super::super::host_udp_capture::dedicated_host_ifindex(&child_sysfs, "vethhost")
+                .unwrap_or_else(|error| panic!("validate live host-side veth: {error}"));
+        if super::super::host_udp_capture::dedicated_host_ifindex(&child_sysfs, "lo").is_ok() {
+            panic!("self-linked loopback device passed the dedicated-peer check");
+        }
+
+        let observed = std::thread::spawn(move || -> Result<_, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open host-shaped netns handle: {e}"))?;
+            // Safety: `ns` is an open netns handle owned for this throwaway
+            // thread, which exits without returning to the test runtime.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+
+            let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
+            let (capture, _, v4_origdst, _) =
+                super::bind_mesh_udp_capture_socket_with_pktinfo(bind, true)
+                    .map_err(|error| format!("bind production host capture socket: {error}"))?;
+            if !v4_origdst {
+                return Err("production socket did not enable IPv4 orig-dst recovery".to_string());
+            }
+            let capture_fd = capture.as_raw_fd();
+
+            let client = std::net::UdpSocket::bind("10.0.0.2:0")
+                .map_err(|error| format!("bind veth-side client: {error}"))?;
+            let dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            client
+                .send_to(b"host-veth-capture", dst)
+                .map_err(|error| format!("send veth-side datagram to {dst}: {error}"))?;
+
+            let mut batch = super::super::udp_batch::RecvMmsgBatch::new(8, true);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match batch.recv(capture_fd, 8) {
+                    Ok(n) if n > 0 => {
+                        let (payload, source) = batch.datagram(0);
+                        let local = batch.local_addr(0).ok_or_else(|| {
+                            "captured datagram carried no IP_PKTINFO cmsg".to_string()
+                        })?;
+                        return Ok((
+                            payload.to_vec(),
+                            source,
+                            batch.orig_dst(0),
+                            local.ifindex,
+                            expected_ifindex,
+                        ));
+                    }
+                    _ if Instant::now() >= deadline => {
+                        return Err(
+                            "host capture socket received no veth-ingress datagram within the \
+                             deadline"
+                                .to_string(),
+                        );
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        })
+        .join()
+        .expect("host-veth capture scenario thread must not panic")
+        .expect("live host-veth UDP capture scenario must complete");
+
+        assert_eq!(observed.0, b"host-veth-capture");
+        assert_eq!(observed.1.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            observed.2,
+            Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
+            "the host capture socket must recover the pre-TPROXY destination"
+        );
+        assert_eq!(
+            observed.3, observed.4,
+            "IP_PKTINFO must report the pod's host-side ingress interface, which is the \
+             production attribution key"
         );
     }
 

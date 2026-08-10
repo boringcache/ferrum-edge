@@ -10,6 +10,7 @@
 //! - **Control character rejection**: Resource IDs, hostnames, and paths reject
 //!   control characters to prevent log injection attacks.
 
+use crate::config::plugin_trigger::PluginTrigger;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -2105,6 +2106,21 @@ pub enum HttpFlavor {
     WebSocket,
 }
 
+/// Client-visible HTTP wire transport that accepted a request.
+///
+/// Independent of [`HttpFlavor`]: an HTTP/2 native-gRPC request is
+/// `Http2` + `HttpFlavor::Grpc`. Stamped once at frontend intake and never
+/// derived from a client-supplied header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpWireTransport {
+    /// HTTP/1.0 or HTTP/1.1 (including TLS).
+    Http1,
+    /// HTTP/2 over TCP (h2 or h2c), including RFC 8441 Extended CONNECT.
+    Http2,
+    /// HTTP/3 over QUIC.
+    Http3,
+}
+
 /// Pre-computed dispatch classification for a proxy. Populated once at
 /// config-load time in `GatewayConfig::resolve_dispatch_kind()` so the
 /// request hot path is a single match on a 1-byte enum instead of a
@@ -2197,6 +2213,37 @@ pub enum ResponseBodyMode {
     #[default]
     Stream,
     Buffer,
+}
+
+/// Outbound PROXY protocol version written on backend TCP connects.
+///
+/// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
+/// protocol v2 binary header to every backend connection **before** any
+/// relayed application bytes (and before backend TLS handshake when
+/// originating TLS). UDP/DTLS are rejected at validation — PROXY is
+/// TCP-borne. See `docs/tcp_udp_proxy.md`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendProxyProtocol {
+    /// PROXY protocol v2 binary (HAProxy / AWS NLB compatible).
+    V2,
+}
+
+impl BackendProxyProtocol {
+    /// Wire / SQL form (`"v2"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Parse a stored wire / SQL value. Unknown values fail closed.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
 }
 
 /// Plugin scope (global, per-proxy, or proxy-group).
@@ -2449,9 +2496,16 @@ pub struct Proxy {
     /// of this setting.
     #[serde(default)]
     pub response_body_mode: ResponseBodyMode,
-    /// Port the gateway listens on for this TCP/UDP proxy.
-    /// Required when backend_scheme is Tcp/Tcps/Udp/Dtls.
-    /// Not used for HTTP-based protocols.
+    /// Listen-port identity for this proxy.
+    ///
+    /// - Stream family (`tcp`/`tcps`/`udp`/`dtls`): **required**. The proxy
+    ///   binds this port and routes by it (not by path).
+    /// - HTTP family: **optional**. When set, the proxy is port-scoped — it
+    ///   only matches requests accepted on that frontend port (or the
+    ///   protocol-class remap when a single HTTP/HTTPS listener port is
+    ///   projected onto `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`).
+    ///   When omitted, the proxy remains port-agnostic and matches any
+    ///   HTTP-family frontend (manual / non-Kubernetes default).
     #[serde(default)]
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
@@ -2507,6 +2561,20 @@ pub struct Proxy {
     /// Default: `false` (PROXY protocol disabled; socket peer is always used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_proxy_protocol: Option<bool>,
+    /// Opt-in outbound PROXY protocol written on backend TCP connects for this
+    /// stream proxy. When set to [`BackendProxyProtocol::V2`], Ferrum prepends
+    /// a PROXY v2 header carrying the trusted stream `client_ip` (and port)
+    /// immediately after the backend TCP connect — before any relayed bytes
+    /// and before backend TLS handshake when originating TLS. Compatible with
+    /// passthrough (header precedes the client's encrypted ClientHello).
+    ///
+    /// Only valid for `tcp` / `tcps` stream proxies. Setting it on UDP,
+    /// DTLS, or HTTP proxies produces a validation error. UDP outbound PROXY
+    /// is intentionally out of scope (session semantics differ).
+    ///
+    /// Default: `None` (disabled — backends see the gateway egress IP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_proxy_protocol: Option<BackendProxyProtocol>,
     /// Optional VirtualService L4 (`tcp[]`/`tls[]`) match predicates evaluated
     /// from trustworthy connection / workload metadata before the stream route
     /// is selected. `None` / empty arms = port (and SNI for passthrough) alone.
@@ -2608,6 +2676,20 @@ pub struct PluginConfig {
     /// and you need to control their relative execution order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_override: Option<u16>,
+    /// Optional declarative execution trigger for this one instance.
+    ///
+    /// `None` (the default) preserves the historical behavior exactly: the
+    /// instance runs whenever scope merge, protocol filtering, and priority say
+    /// it should. When set, the compiled predicate tree decides — once per
+    /// request/connection — whether this instance's hooks run at all. Patterns
+    /// are compiled and validated at config load / admin write / plugin-cache
+    /// publication; the request path only walks precompiled matchers.
+    ///
+    /// See [`crate::config::plugin_trigger`] and
+    /// `docs/plugin_execution_order.md` for the phase model and the
+    /// fail-closed composition rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PluginTrigger>,
     /// ID of the `ApiSpec` that created this plugin config via the spec-import admin API.
     /// `None` for hand-crafted plugin configs. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -2750,12 +2832,18 @@ pub struct GatewayConfig {
     /// source URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_tls_source_namespace: Option<String>,
-    /// Gateway-managed frontend TLS material indexed by owning Gateway
-    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
-    /// the per-DP namespace filter projects the matching entry into
-    /// `frontend_tls_*`.
+    /// Every Gateway-managed frontend TLS certificate, keyed by owning
+    /// **listener** identity (issues #3267 / #3268).
+    ///
+    /// This is deliberately NOT a per-namespace singleton: one listener may
+    /// carry several `certificateRefs`, and several Gateways in one namespace
+    /// may each own their own certificate. A multi-namespace CP keeps every
+    /// namespace's entries here; the per-DP namespace filter retains only the
+    /// subscribing namespace's entries and projects the deterministic default
+    /// one into `frontend_tls_*` (which stays the fallback certificate served
+    /// when a ClientHello carries no usable SNI).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
+    pub frontend_tls_certificate_sources: Vec<FrontendTlsCertificateSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2765,6 +2853,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
+    /// TLS on the frontend.
+    ///
+    /// An HTTP-family proxy whose `(namespace, listen_port)` is in this set
+    /// matches TLS frontends; any other port-scoped HTTP proxy matches
+    /// plaintext frontends. Empty for non-Kubernetes / manually authored
+    /// configs.
+    ///
+    /// The key is **namespace-qualified on purpose**: two namespaces may each
+    /// own a `:443` listener, one terminating and one not, and a bare port set
+    /// would let either one silently reclassify the other's routes. The router
+    /// resolves the class once per candidate at route-table build time, so this
+    /// set is never consulted on the request path.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub http_tls_listen_ports: BTreeSet<(String, u16)>,
     /// Authoritative mesh config revision for this snapshot (issue #2473).
     ///
     /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the
@@ -2871,13 +2974,56 @@ impl K8sMeshOverlay {
     }
 }
 
+/// One Gateway-listener-owned frontend TLS certificate.
+///
+/// Identity is `(serving namespace, serialized owner, listener, cert_path)`.
+/// Gateway owners retain their resource name; ListenerSet owners are encoded
+/// as `ListenerSet:<resource namespace>:<resource name>`. Kubernetes Namespace
+/// and Object names cannot contain `:`, so this is injective and cannot
+/// collide with a Gateway resource name. The serving **Gateway** namespace is
+/// what CP/DP tenancy filters on — the Secret itself may live in another
+/// namespace when a ReferenceGrant authorizes it, so the `k8s://secret-ns/...`
+/// source URI must never be read as ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct FrontendTlsNamespaceSource {
+pub struct FrontendTlsCertificateSource {
+    /// Owning Gateway namespace.
     pub namespace: String,
+    /// Serialized owning Gateway or ListenerSet identity.
+    #[serde(default)]
+    pub gateway: String,
+    /// Owning listener name.
+    #[serde(default)]
+    pub listener: String,
+    /// The listener `hostname`, ASCII-lowercased. `None` is a catch-all
+    /// listener, which contributes SNI names from the certificate itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub cert_path: String,
     pub key_path: String,
+    /// Whether this is the deterministic fallback certificate for its
+    /// namespace — the one served when a ClientHello carries no SNI, or an SNI
+    /// no certificate covers.
+    #[serde(default)]
+    pub default_certificate: bool,
 }
+
+impl FrontendTlsCertificateSource {
+    /// `serving-namespace/serialized-owner/listener` — public Kubernetes
+    /// metadata, safe to put in diagnostics. Never derived from certificate or
+    /// key material.
+    pub fn listener_identity(&self) -> String {
+        format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
+    }
+}
+
+/// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
+///
+/// The data plane materializes every entry into a resident rustls
+/// `CertifiedKey` and an SNI index, so the set has to be bounded by config
+/// admission rather than by cluster size. Translation drops the excess with a
+/// field-specific warning and leaves those listeners unserved (fail closed).
+pub const MAX_FRONTEND_TLS_CERTIFICATE_SOURCES: usize = 256;
 
 /// The current config schema version. Increment this when adding config migrations.
 pub const CURRENT_CONFIG_VERSION: &str = "1";
@@ -3108,35 +3254,44 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
 }
 
 impl GatewayConfig {
-    /// Validate that all proxy (host, listen_path) combinations are unique.
+    /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
     /// HTTP-family proxies can conflict in two ways:
-    /// - Path-carrying proxies share a `listen_path` and have overlapping
-    ///   `hosts` (or both use an empty/catch-all host list).
+    /// - Path-carrying proxies share a `listen_path`, the same effective
+    ///   `listen_port` (including both omitted / port-agnostic), and have
+    ///   overlapping `hosts` (or both use an empty/catch-all host list).
     /// - Host-only proxies (`listen_path.is_none()`) share any host with
-    ///   another host-only proxy. Host-only proxies cannot have empty
-    ///   `hosts` — that combination is rejected by `validate_fields_inner`.
+    ///   another host-only proxy on the same effective `listen_port`.
+    ///   Host-only proxies cannot have empty `hosts` — that combination is
+    ///   rejected by `validate_fields_inner`.
+    ///
+    /// Distinct `listen_port` values do not conflict: port-scoped routes are
+    /// independent listeners. A port-agnostic route (`listen_port: None`) does
+    /// not conflict with a port-scoped sibling — at request time the
+    /// port-scoped match wins on that frontend and the agnostic route remains
+    /// the fallback elsewhere.
     ///
     /// Stream proxies are skipped (they route on `listen_port`, not path).
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Split proxies into namespace-scoped buckets: those with an explicit
-        // listen_path and host-only proxies. Only proxies in the same namespace,
-        // the same bucket, AND the same path (for the path bucket) can conflict.
-        let mut by_path: HashMap<(&str, &str), Vec<&Proxy>> = HashMap::new();
-        let mut host_only: HashMap<&str, Vec<&Proxy>> = HashMap::new();
+        // Split proxies into namespace+listen_port-scoped buckets: those with an
+        // explicit listen_path and host-only proxies. Only proxies in the same
+        // namespace, the same listen_port identity, the same bucket, AND the
+        // same path (for the path bucket) can conflict.
+        let mut by_path: HashMap<(&str, Option<u16>, &str), Vec<&Proxy>> = HashMap::new();
+        let mut host_only: HashMap<(&str, Option<u16>), Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
                 Some(path) => by_path
-                    .entry((proxy.namespace.as_str(), path))
+                    .entry((proxy.namespace.as_str(), proxy.listen_port, path))
                     .or_default()
                     .push(proxy),
                 None => host_only
-                    .entry(proxy.namespace.as_str())
+                    .entry((proxy.namespace.as_str(), proxy.listen_port))
                     .or_default()
                     .push(proxy),
             }
@@ -3181,7 +3336,7 @@ impl GatewayConfig {
             add_groups(2, crate::modes::mesh::mesh_ingress_listener_groups(mesh));
         }
 
-        for ((_, path), group) in &by_path {
+        for ((_, _, path), group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -3433,6 +3588,74 @@ impl GatewayConfig {
         }
     }
 
+    /// Project Gateway-delivered frontend TLS onto one namespace's view.
+    ///
+    /// Called by BOTH the CP's per-subscriber filter and the DP's
+    /// defense-in-depth filter, so a data plane can never observe another
+    /// namespace's certificate no matter which side runs first. Retains every
+    /// certificate this namespace owns — a namespace may legitimately own many
+    /// (#3267 / #3268) — re-marks exactly one of them as the fallback, and
+    /// projects that one into the legacy `frontend_tls_*` fields.
+    ///
+    /// Ownership is the *Gateway's* namespace, never the Secret's: a
+    /// ReferenceGrant may authorize a Secret from elsewhere, so reading tenancy
+    /// off a `k8s://secret-ns/...` source URI would leak across namespaces.
+    ///
+    /// Returns how many entries this namespace was not entitled to see.
+    pub fn filter_frontend_tls_to_namespace(&mut self, namespace: &str) -> usize {
+        let before = self.frontend_tls_certificate_sources.len();
+        self.frontend_tls_certificate_sources
+            .retain(|source| source.namespace == namespace);
+        let mut removed = before - self.frontend_tls_certificate_sources.len();
+
+        // Exactly one fallback within the retained set. The CP's marker was
+        // chosen over every namespace, so re-deriving it here is what keeps a
+        // DP that filtered a multi-namespace snapshot from ending up with
+        // zero (or two) fallback certificates.
+        let default_index = self
+            .frontend_tls_certificate_sources
+            .iter()
+            .position(|source| source.default_certificate)
+            .or_else(|| {
+                self.frontend_tls_certificate_sources
+                    .iter()
+                    .position(|source| source.hostname.is_none())
+            })
+            .or(if self.frontend_tls_certificate_sources.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
+            source.default_certificate = Some(index) == default_index;
+        }
+
+        if let Some(default_source) = default_index
+            .and_then(|index| self.frontend_tls_certificate_sources.get(index))
+            .cloned()
+        {
+            self.frontend_tls_cert_path = Some(default_source.cert_path);
+            self.frontend_tls_key_path = Some(default_source.key_path);
+            self.frontend_tls_source_namespace = Some(default_source.namespace);
+            return removed;
+        }
+
+        // No Gateway certificate for this namespace. Material owned by another
+        // namespace is withdrawn; operator/env material (no owning namespace)
+        // is left alone.
+        if self
+            .frontend_tls_source_namespace
+            .as_deref()
+            .is_some_and(|source_namespace| source_namespace != namespace)
+        {
+            self.frontend_tls_cert_path = None;
+            self.frontend_tls_key_path = None;
+            self.frontend_tls_source_namespace = None;
+            removed += 1;
+        }
+        removed
+    }
+
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {
@@ -3443,10 +3666,87 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
-        self.frontend_tls_namespace_sources
-            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-        self.frontend_tls_namespace_sources
-            .dedup_by(|left, right| left.namespace == right.namespace);
+        // Certificate sources are keyed by owning listener, NOT by namespace:
+        // one listener may serve several certificateRefs and one namespace may
+        // hold several independently owned Gateways (#3267 / #3268). Deduping
+        // by namespace here would silently collapse them back into a singleton.
+        // Stable sorting groups listeners deterministically while retaining
+        // certificateRefs order *within* each listener. Candidate order is the
+        // resolver's tie-break when several keys support the same signature
+        // schemes, so sorting by certificate path would silently rewrite it.
+        self.frontend_tls_certificate_sources
+            .sort_by(|left, right| {
+                (
+                    left.namespace.as_str(),
+                    left.gateway.as_str(),
+                    left.listener.as_str(),
+                )
+                    .cmp(&(
+                        right.namespace.as_str(),
+                        right.gateway.as_str(),
+                        right.listener.as_str(),
+                    ))
+            });
+        let mut seen_certificate_sources = HashSet::new();
+        self.frontend_tls_certificate_sources.retain(|source| {
+            // `hostname` is part of the exact serialized claim even though it
+            // is not part of listener identity. Omitting it here would erase a
+            // contradictory claim before the data-plane runtime can reject the
+            // snapshot through `validate_explicit_listener_claims()`.
+            seen_certificate_sources.insert((
+                source.namespace.clone(),
+                source.gateway.clone(),
+                source.listener.clone(),
+                source.hostname.clone(),
+                source.cert_path.clone(),
+                source.key_path.clone(),
+            ))
+        });
+
+        // Serialized/native snapshots are allowed to omit or duplicate fallback
+        // markers. Re-derive exactly one per namespace after deduplication, then
+        // project the lexicographically-first namespace's choice into the legacy
+        // single-certificate fields. This keeps the one-entry path and the SNI
+        // resolver on the same credential even for a hand-authored snapshot.
+        //
+        // Do NOT truncate an oversized set here. Normalization has no listener
+        // route-ownership map, so retaining only a certificate prefix could
+        // leave a dropped listener's routes reachable under an unrelated
+        // fallback certificate. Validation and the runtime resolver reject the
+        // whole oversized snapshot instead; Kubernetes translation applies the
+        // bound earlier, where it can withdraw the listener and its routes
+        // atomically.
+        if !self.frontend_tls_certificate_sources.is_empty() {
+            let mut default_indexes: BTreeMap<String, usize> = BTreeMap::new();
+            for preference in 0..3 {
+                for (index, source) in self.frontend_tls_certificate_sources.iter().enumerate() {
+                    let eligible = match preference {
+                        0 => source.default_certificate,
+                        1 => source.hostname.is_none(),
+                        _ => true,
+                    };
+                    if eligible {
+                        default_indexes
+                            .entry(source.namespace.clone())
+                            .or_insert(index);
+                    }
+                }
+            }
+            for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
+                source.default_certificate =
+                    default_indexes.get(&source.namespace).copied() == Some(index);
+            }
+            if let Some(default_source) = default_indexes
+                .iter()
+                .next()
+                .and_then(|(_, index)| self.frontend_tls_certificate_sources.get(*index))
+                .cloned()
+            {
+                self.frontend_tls_cert_path = Some(default_source.cert_path);
+                self.frontend_tls_key_path = Some(default_source.key_path);
+                self.frontend_tls_source_namespace = Some(default_source.namespace);
+            }
+        }
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();
@@ -4201,6 +4501,15 @@ impl GatewayConfig {
                     plugin.id
                 ));
             }
+            // Compile the declarative execution trigger here so a malformed
+            // regex/CIDR/field shape is a config-load error, not a per-request
+            // surprise. Plugin-cache publication compiles it again (and adds the
+            // fail-closed composition rules that need the constructed plugin).
+            if let Some(trigger) = plugin.trigger.as_ref()
+                && let Err(error) = trigger.validate()
+            {
+                errors.push(format!("PluginConfig '{}': {}", plugin.id, error));
+            }
             match plugin.scope {
                 PluginScope::Global => {
                     if plugin.proxy_id.is_some() {
@@ -4396,11 +4705,17 @@ impl GatewayConfig {
     /// Validate stream proxy (TCP/UDP) configuration.
     ///
     /// - Stream proxies must have a `listen_port` in range 1024-65535.
-    /// - `listen_port` must be unique across all stream proxies, **unless** all
-    ///   proxies sharing the port have `passthrough: true` (SNI-based routing).
-    /// - HTTP proxies must not set `listen_port`.
-    /// - Passthrough proxies sharing a port must have non-overlapping `hosts`
+    /// - `listen_port` must be unique across all stream proxies, **unless** the
+    ///   proxies sharing the port form one shared listener: an opaque-TLS SNI
+    ///   group (all `passthrough: true`, or all ordinary `tcp` listeners with at
+    ///   least one declaring `hosts`) or an L4 `stream_match` group.
+    /// - HTTP-family proxies may set `listen_port` as a port-scoped routing
+    ///   identity; those ports do not participate in stream bind sharing.
+    /// - SNI-routed proxies sharing a port must have non-overlapping `hosts`
     ///   and at most one may have empty `hosts` (catch-all/default).
+    /// - `hosts` on a stream proxy that cannot SNI-route (terminating
+    ///   `frontend_tls`, `tcps`, or non-passthrough `udp`/`dtls`) is rejected
+    ///   with a field-specific error rather than silently ignored.
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         // Retain the exact proxy entries for each shared port. Proxy IDs are
@@ -4429,11 +4744,27 @@ impl GatewayConfig {
                         port_proxies.entry(port).or_default().push(proxy);
                     }
                 }
-            } else if proxy.listen_port.is_some() {
+                // `hosts` on a stream proxy is an SNI route predicate, and it
+                // is only readable on a listener that never terminates or
+                // re-originates crypto. Declaring it anywhere else used to be
+                // silently inert — the operator believed the listener admitted
+                // one hostname while it actually admitted every connection on
+                // the port. Reject with a field-specific diagnostic instead.
+                if !proxy.hosts.is_empty() && !proxy.joins_opaque_tls_sni_plane() {
+                    errors.push(format!(
+                        "Stream proxy '{}' (scheme {}) sets hosts but cannot route by SNI — \
+                         hosts is a TLS server_name predicate and requires an opaque listener \
+                         (passthrough: true, or backend_scheme tcp with frontend_tls: false)",
+                        proxy.id,
+                        proxy.scheme_display()
+                    ));
+                }
+            } else if let Some(port) = proxy.listen_port
+                && port == 0
+            {
                 errors.push(format!(
-                    "HTTP proxy '{}' (scheme {}) must not set listen_port",
-                    proxy.id,
-                    proxy.scheme_display()
+                    "HTTP proxy '{}' has invalid listen_port {} (must be >= 1)",
+                    proxy.id, port
                 ));
             }
             // stream_proxy_protocol is only valid for TCP/TCP-TLS stream
@@ -4453,6 +4784,21 @@ impl GatewayConfig {
                     ));
                 }
             }
+            // Outbound PROXY is likewise TCP-borne only.
+            if proxy.backend_proxy_protocol.is_some() {
+                let is_tcp_stream = matches!(
+                    proxy.dispatch_kind,
+                    DispatchKind::TcpRaw | DispatchKind::TcpTls
+                );
+                if !is_tcp_stream {
+                    errors.push(format!(
+                        "Proxy '{}' (scheme {}) sets backend_proxy_protocol but outbound PROXY \
+                         protocol is only valid for tcp/tcps stream proxies",
+                        proxy.id,
+                        proxy.scheme_display()
+                    ));
+                }
+            }
         }
 
         // Validate port sharing rules
@@ -4462,6 +4808,18 @@ impl GatewayConfig {
             }
 
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
+            // Ordinary opaque TCP listeners (no frontend TLS, no backend TLS
+            // origination) share the passthrough group's routing plane: they
+            // relay the client's ClientHello verbatim, so `hosts` is a readable
+            // SNI predicate. `passthrough` must be homogeneous on the port —
+            // the two shapes differ in first-bytes classification and backend
+            // TLS handling, and the listener socket is built from one
+            // representative before any route is selected.
+            let opaque_sni_group = !all_passthrough
+                && proxies_on_port
+                    .iter()
+                    .all(|p| !p.passthrough && p.joins_opaque_tls_sni_plane())
+                && proxies_on_port.iter().any(|p| !p.hosts.is_empty());
             let stream_match_group = proxies_on_port.iter().all(|p| {
                 !p.passthrough
                     && matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls)
@@ -4469,17 +4827,32 @@ impl GatewayConfig {
                 .iter()
                 .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
 
-            if !all_passthrough && !stream_match_group {
-                let non_pt: Vec<&str> = proxies_on_port
+            if !all_passthrough && !opaque_sni_group && !stream_match_group {
+                let mixed_passthrough = proxies_on_port.iter().any(|p| p.passthrough);
+                if mixed_passthrough {
+                    errors.push(format!(
+                        "Duplicate listen_port {} mixes passthrough and non-passthrough proxies — \
+                         a shared stream listener is built from one representative before any route \
+                         is selected, so every candidate on a port must agree on passthrough",
+                        port
+                    ));
+                    continue;
+                }
+                let non_sni: Vec<&str> = proxies_on_port
                     .iter()
-                    .filter(|p| !p.passthrough)
+                    .filter(|p| !p.joins_opaque_tls_sni_plane())
                     .map(|p| p.id.as_str())
                     .collect();
                 errors.push(format!(
-                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true \
-                     (SNI routing), or participate in an L4 stream_match group, but {} do not",
+                    "Duplicate listen_port {} — proxies sharing a port must form one shared listener: \
+                     all passthrough: true, all opaque tcp listeners with at least one declaring hosts \
+                     (SNI routing), or an L4 stream_match group. Offending: {}",
                     port,
-                    non_pt.join(", ")
+                    if non_sni.is_empty() {
+                        "no candidate declares hosts or stream_match".to_string()
+                    } else {
+                        non_sni.join(", ")
+                    }
                 ));
                 continue;
             }
@@ -4548,7 +4921,7 @@ impl GatewayConfig {
                 }
             }
 
-            if stream_match_group && !all_passthrough {
+            if stream_match_group && !all_passthrough && !opaque_sni_group {
                 // Non-passthrough L4 match groups: at most one catch-all
                 // (empty / absent stream_match) so OR selection stays deterministic.
                 let catch_all = proxies_on_port
@@ -4569,26 +4942,32 @@ impl GatewayConfig {
                 continue;
             }
 
-            // Passthrough SNI groups: at most one empty-hosts catch-all, and
-            // host overlap is forbidden unless both overlapping proxies carry
-            // non-empty stream_match criteria (SNI + L4 AND). In that ordered
-            // route form, equal criteria are valid too: Istio keeps the later
-            // duplicate as an ineffective rule rather than rejecting the
+            // Opaque-TLS SNI groups (all-passthrough, or all-ordinary-tcp with
+            // at least one declaring hosts): at most one empty-hosts catch-all,
+            // and host overlap is forbidden unless both overlapping proxies
+            // carry non-empty stream_match criteria (SNI + L4 AND). In that
+            // ordered route form, equal criteria are valid too: Istio keeps the
+            // later duplicate as an ineffective rule rather than rejecting the
             // VirtualService, and declaration order resolves it safely.
+            //
+            // These two rules are what make the runtime tier ladder (exact →
+            // wildcard → catch-all) unambiguous: a hostname can never be
+            // claimed by two matcher-free candidates, and "anything else" can
+            // never have two owners.
             let catch_all_count = proxies_on_port
                 .iter()
                 .filter(|p| p.hosts.is_empty())
                 .count();
             if catch_all_count > 1 {
                 errors.push(format!(
-                    "Passthrough port {} has {} proxies with empty hosts — at most one catch-all is allowed",
+                    "SNI-routed port {} has {} proxies with empty hosts — at most one catch-all is allowed",
                     port, catch_all_count
                 ));
             }
 
             for (i, a) in proxies_on_port.iter().enumerate() {
                 for b in &proxies_on_port[i + 1..] {
-                    if !hosts_overlap(&a.hosts, &b.hosts) {
+                    if !sni_hosts_conflict(&a.hosts, &b.hosts) {
                         continue;
                     }
                     let a_match = a.stream_match.as_ref().filter(|m| !m.is_empty());
@@ -4599,7 +4978,7 @@ impl GatewayConfig {
                         continue;
                     }
                     errors.push(format!(
-                        "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
+                        "SNI-routed proxies '{}' and '{}' on port {} have overlapping hosts — \
                          each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
                         a.id, b.id, port
                     ));
@@ -4756,6 +5135,59 @@ fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// Whether two SNI route candidates on one stream listener claim the same
+/// hostname at the same **tier**, making route selection ambiguous.
+///
+/// Stream SNI routing resolves in a fixed tier order — exact host, then
+/// wildcard, then the single empty-`hosts` catch-all — so "these two host lists
+/// can both match some name" is NOT the right conflict test. Only a tie inside
+/// one tier is ambiguous:
+///
+/// * exact vs exact — the same hostname would have two owners: **conflict**.
+/// * wildcard vs wildcard — two patterns that can both match some name (equal,
+///   or one matching below the other) would have two owners: **conflict**.
+/// * exact vs wildcard — the exact host wins deterministically: **allowed**,
+///   which is what makes `api.example.com` + `*.example.com` on one port work.
+/// * anything vs catch-all — the catch-all is strictly the last tier and is
+///   already capped at one per port: **allowed**.
+///
+/// Using the HTTP router's [`hosts_overlap`] here instead made the wildcard and
+/// catch-all tiers unreachable in validated shared config, even though the
+/// runtime ladder has always resolved them without ambiguity.
+fn sni_hosts_conflict(a: &[String], b: &[String]) -> bool {
+    // A catch-all occupies the last tier alone; `catch_all_count` bounds it.
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    for host_a in a {
+        for host_b in b {
+            let wildcard_a = host_a.starts_with("*.");
+            let wildcard_b = host_b.starts_with("*.");
+            let conflict = match (wildcard_a, wildcard_b) {
+                (false, false) => host_a == host_b,
+                (true, true) => {
+                    host_a == host_b
+                        // `*.example.com` and `*.a.example.com` both match
+                        // `x.a.example.com`. Compare each pattern against the
+                        // other's suffix domain to catch nesting either way.
+                        || host_b
+                            .strip_prefix("*.")
+                            .is_some_and(|suffix| wildcard_matches(host_a, suffix))
+                        || host_a
+                            .strip_prefix("*.")
+                            .is_some_and(|suffix| wildcard_matches(host_b, suffix))
+                }
+                // Different tiers: exact always wins over wildcard.
+                _ => false,
+            };
+            if conflict {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check whether two host lists overlap.
@@ -6523,6 +6955,30 @@ impl Proxy {
             }
         })
     }
+
+    /// Whether this stream proxy participates in the **opaque-TLS SNI routing
+    /// plane** — the listener group whose route is selected from the client's
+    /// TLS `server_name` without ever terminating TLS.
+    ///
+    /// Two shapes qualify:
+    ///
+    /// * `passthrough: true` on any stream scheme. This is the historical
+    ///   shape (TCP passthrough, DTLS passthrough, east-west SNI passthrough,
+    ///   Gateway API `TLSRoute`, Istio VirtualService `tls[]`).
+    /// * An ordinary `tcp` listener that terminates nothing
+    ///   (`frontend_tls: false`, `backend_scheme: tcp`). Such a proxy already
+    ///   relays client bytes verbatim, so a TLS client's ClientHello reaches
+    ///   the backend untouched; declaring `hosts` makes that relay SNI-routed
+    ///   instead of a port-wide catch-all (issue #3264).
+    ///
+    /// Everything else terminates or re-originates crypto (`frontend_tls`,
+    /// `tcps`) or has no ClientHello to peek (`udp` without passthrough), so
+    /// `hosts` there is not a route predicate and is rejected by
+    /// `validate_stream_proxies` rather than silently ignored.
+    #[inline]
+    pub fn joins_opaque_tls_sni_plane(&self) -> bool {
+        self.passthrough || (!self.frontend_tls && self.effective_scheme() == BackendScheme::Tcp)
+    }
 }
 
 impl Proxy {
@@ -6614,6 +7070,17 @@ impl Proxy {
         {
             errors.push(
                 "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                    .to_string(),
+            );
+        }
+
+        // Outbound PROXY protocol is also TCP-borne only.
+        if self.backend_proxy_protocol.is_some()
+            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        {
+            errors.push(
+                "backend_proxy_protocol is only valid for tcp/tcps stream proxies \
+                 (outbound PROXY protocol is TCP-borne)"
                     .to_string(),
             );
         }
@@ -8513,6 +8980,15 @@ impl PluginConfig {
             errors.push(e);
         }
 
+        // The execution trigger is a generic per-instance field, so it is
+        // compiled on the admin write path too — an unbounded regex or a
+        // malformed CIDR must be a 400 before storage, never a reload failure.
+        if let Some(trigger) = self.trigger.as_ref()
+            && let Err(error) = trigger.validate()
+        {
+            errors.push(error);
+        }
+
         match self.scope {
             PluginScope::Proxy => match self.proxy_id.as_deref() {
                 Some(proxy_id) => {
@@ -9053,6 +9529,13 @@ impl GatewayConfig {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
+            errors.push(format!(
+                "Gateway frontend TLS certificate source set exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+            ));
+        }
 
         // Shared cache: when multiple proxies reference the same TLS file path,
         // each file is opened and parsed only once during batch validation.

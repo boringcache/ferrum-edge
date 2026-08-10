@@ -777,6 +777,7 @@ fn minimum_http_summary() -> TransactionSummary {
 
 fn minimum_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: LOKI_MIN_PROXY_ID.to_string(),
         proxy_id: LOKI_MIN_PROXY_ID.to_string(),
         proxy_lifecycle_generation: None,

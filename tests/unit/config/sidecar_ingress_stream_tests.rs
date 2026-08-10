@@ -36,6 +36,8 @@ fn resolved(
         endpoint_host: endpoint_host.to_string(),
         endpoint_port,
         protocol,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "redis".to_string(),
     }
@@ -158,7 +160,7 @@ fn stream_ingress_maps_instance_ip_wildcard_to_loopback() {
 fn stream_ingress_rejects_unix_and_off_box_endpoints() {
     assert_eq!(
         entry(9000, AppProtocol::Tcp, "unix:///var/run/app.sock").resolve(),
-        Err(IngressListenerUnsupported::UnixSocketEndpoint)
+        Err(IngressListenerUnsupported::UnixProtocolUnsupported)
     );
     assert_eq!(
         entry(9000, AppProtocol::Tcp, "10.0.0.5:6000").resolve(),
@@ -195,7 +197,7 @@ fn carried_listener_without_protocol_decodes_unknown_and_stays_inert() {
         "an omitted carrier protocol must not default to a live HTTP listener"
     );
     assert!(
-        !carried.endpoint_is_valid(),
+        !carried.endpoint_is_valid(&[]),
         "an Unknown-protocol carrier entry must fail the shared validity gate \
          the back-projection chokepoint and the materializer both apply"
     );
@@ -212,7 +214,7 @@ fn carried_listener_without_protocol_decodes_unknown_and_stays_inert() {
 fn carried_listener_with_hostile_protocol_stays_inert() {
     for json in [UDP_CARRIER, UNKNOWN_CARRIER] {
         let carried = decode_carrier(json);
-        assert!(!carried.endpoint_is_valid());
+        assert!(!carried.endpoint_is_valid(&[]));
         let mesh = local_mesh(vec![carried]);
         assert_eq!(remap(&mesh, POD_IP, 16379), Remap::Deny);
         assert!(!endpoint_ok(&mesh, 16379, "127.0.0.1", 6379));
@@ -225,7 +227,7 @@ fn resolved_listener_protocol_round_trips_on_the_carrier() {
     let encoded = serde_json::to_string(&listener).expect("serialize");
     let decoded = decode_carrier(&encoded);
     assert_eq!(decoded, listener, "protocol must survive the carrier");
-    assert!(decoded.endpoint_is_valid());
+    assert!(decoded.endpoint_is_valid(&[]));
 }
 
 // ── Authenticated mesh-mTLS CONNECT remap (issue #3260) ───────────────────

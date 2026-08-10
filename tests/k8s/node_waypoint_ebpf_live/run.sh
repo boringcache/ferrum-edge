@@ -978,8 +978,16 @@ verify_ambient_spire_identity() {
     return
   fi
 
-  log "checking ambient NodeWaypoint Workload API SVIDs"
+  log "checking ambient NodeWaypoint SPIRE Agent SVID metrics"
   local spec_file="$RESULTS_DIR/ambient-spire-pods.json"
+  local metrics_proof="$ROOT_DIR/tests/k8s/lib/spire_ambient_metrics.py"
+  if [[ ! -f "$metrics_proof" && -f "$PWD/tests/k8s/lib/spire_ambient_metrics.py" ]]; then
+    metrics_proof="$PWD/tests/k8s/lib/spire_ambient_metrics.py"
+  fi
+  if [[ ! -f "$metrics_proof" ]]; then
+    echo "missing SPIRE ambient metrics proof helper: $metrics_proof" >&2
+    return 1
+  fi
   mkdir -p "$RESULTS_DIR/ambient-spire-metrics"
   if ! kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
@@ -1079,7 +1087,10 @@ PY
     fetched=false
     for _ in $(seq 1 40); do
       if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
-        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
+        if python3 -I "$metrics_proof" \
+          --metrics-file "$metrics_file" \
+          --expected-spiffe "$expected_spiffe" \
+          --trust-domain "$TRUST_DOMAIN"; then
           fetched=true
           break
         fi
@@ -1090,6 +1101,10 @@ PY
     wait "$pf_pid" 2>/dev/null || true
     if [[ "$fetched" != "true" ]]; then
       echo "ambient pod $pod on $node did not report SPIRE Agent SVID metric for $expected_spiffe" >&2
+      python3 -I "$metrics_proof" \
+        --metrics-file "$metrics_file" \
+        --expected-spiffe "$expected_spiffe" \
+        --trust-domain "$TRUST_DOMAIN" >&2 || true
       cat "$metrics_file" >&2 || true
       collect_spire_diagnostics
       return 1
@@ -1101,7 +1116,7 @@ PY
     pass \
     "" \
     "" \
-    "ambient-nodewaypoints-loaded-per-node-workload-api-svids" \
+    "ambient-nodewaypoints-loaded-per-node-spire-agent-svids" \
     "" \
     "" \
     "ambient-spire-pods.json,ambient-spire-metrics"
@@ -1513,6 +1528,24 @@ uid = sys.argv[2]
 for identity in data.get("identities") or []:
     if identity.get("pod_uid") == uid:
         sys.exit(0)
+sys.exit(1)
+PY
+}
+
+node_waypoint_identity_has_policy_scope() {
+  local identities_file="$1"
+  local uid="$2"
+  python3 - "$identities_file" "$uid" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+
+uid = sys.argv[2]
+for identity in data.get("identities") or []:
+    if identity.get("pod_uid") == uid:
+        sys.exit(0 if identity.get("has_policy_scope") is True else 1)
 sys.exit(1)
 PY
 }
@@ -2264,15 +2297,16 @@ try_wait_for_node_waypoint_admission() {
     curl_code="$(tail -n 1 "$curl_out" 2>/dev/null || true)"
 
     # The in-netns identity registry can become visible before the newly
-    # received mesh slice has finished rebuilding the request router. Do not
-    # declare admission ready on that half-converged state: Ferrum returns its
-    # route-miss 404 there, and the immediately following traffic assertion
-    # would race the rebuild. Every caller of this readiness helper targets a
-    # fixture path whose converged outcome is either the allowed 200 or the
-    # AuthorizationPolicy 403, so require one of those live outcomes in
-    # addition to the exact pod UID.
+    # received mesh slice has installed the exact pod UID's policy scope and
+    # rebuilt the request router. Do not declare admission ready on either
+    # half-converged state: the identity endpoint reports has_policy_scope=false
+    # while authz correctly returns its fail-closed scope_missing 403, and the
+    # router can return a transient route-miss 404. Every caller of this helper
+    # targets a scoped-policy fixture, so require the exact UID's live scope plus
+    # the converged 200 or policy 403 before the following traffic assertion.
     if fetch_node_waypoint_identities_for_node "$node" "$identities_file" &&
       node_waypoint_identities_include_uid "$identities_file" "$uid" &&
+      node_waypoint_identity_has_policy_scope "$identities_file" "$uid" &&
       [[ "$curl_status" -eq 0 ]] &&
       [[ "$curl_code" == "200" || "$curl_code" == "403" ]]; then
       return
@@ -2310,9 +2344,11 @@ expect_allowed() {
   local url="$3"
   local expected_body="$4"
   local family="${5:-}"
+  local retry_route_not_found="${6:-false}"
+  local max_attempts="${7:-8}"
   local output="" code="" body="" status=1 err
   err="$(mktemp)"
-  for attempt in $(seq 1 8); do
+  for attempt in $(seq 1 "$max_attempts"); do
     set +e
     output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
     status=$?
@@ -2331,8 +2367,19 @@ expect_allowed() {
       break
     fi
     if [[ "$status" -eq 0 ]]; then
+      if [[ "$retry_route_not_found" == "true" ]] &&
+        [[ "$code" == "404" ]] &&
+        [[ "$body" == '{"error":"Not Found"}' ]]; then
+        sleep 1
+        continue
+      fi
       break
     fi
+    # A rolling NodeWaypoint restart becomes Kubernetes-Ready before the CP's
+    # updated waypoint inventory has necessarily rematerialized every outbound
+    # route. Only callers that opt into this bounded convergence mode retry the
+    # exact route-missing response above; authorization failures and other HTTP
+    # errors still fail immediately so policy regressions cannot be hidden.
     sleep 1
   done
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
@@ -2784,7 +2831,8 @@ expect_attributed_forged_assertion_blocked() {
   local url="$3"
   local family="${4:-4}"
   local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
-  local out_dir before_file after_file output code body err status before_count after_count
+  local out_dir before_file after_file output code body err status before_count after_count attempt
+  local dispatch_not_ready_body
   from_record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
   destination_record="$(workload_pod_record_for_app "$destination")"
@@ -2807,19 +2855,34 @@ expect_attributed_forged_assertion_blocked() {
   fi
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
-  set +e
-  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
-  status=$?
-  set -e
-  code="${output##*$'\n'}"
-  body="${output%$'\n'*}"
-  printf '%s\n' "$output" >"$out_dir/curl.out"
-  printf '%s\n' "$status" >"$out_dir/curl.status"
-  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+  dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
+  for attempt in $(seq 1 30); do
+    set +e
+    output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+    status=$?
+    set -e
+    code="${output##*$'\n'}"
+    body="${output%$'\n'*}"
+    printf '%s\n' "$output" >"$out_dir/curl.out"
+    printf '%s\n' "$status" >"$out_dir/curl.status"
+    if [[ "$status" -eq 0 ]] && forged_assertion_response_is_policy_rejection "$code" "$body"; then
+      break
+    fi
+
+    # A restarted source NodeWaypoint can report ready after accepting the
+    # slice but before its per-workload HBONE target tags are materialized.
+    # Retry only that explicit convergence response; every other transport or
+    # HTTP outcome remains an immediate failure, and success still requires a
+    # destination policy rejection plus the deny-recorder increment below.
+    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 30 ]]; then
+      sleep 0.5
+      continue
+    fi
+
     echo "expected forged assertion request to fail via destination HBONE policy rejection, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}'" >&2
     cat "$err" >&2 || true
     return 1
-  fi
+  done
 
   for _ in $(seq 1 20); do
     if fetch_policy_denies_for_node "$dst_node" "$after_file"; then
@@ -2885,7 +2948,9 @@ run_forged_assertion_rejection_check() {
       "restored trusted HBONE assertors" \
       "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
       "ok-a" \
-      4; then
+      4 \
+      true \
+      30; then
       recovery_ok=0
     else
       recovery_ok=$?

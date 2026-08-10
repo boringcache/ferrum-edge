@@ -119,6 +119,7 @@ fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
         created_at: Utc::now(),
@@ -138,6 +139,7 @@ fn plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
     }
 }
@@ -188,9 +190,10 @@ fn generation(
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
         frontend_tls_source_namespace: None,
-        frontend_tls_namespace_sources: Vec::new(),
+        frontend_tls_certificate_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         k8s_mesh_overlay: Default::default(),
     };
