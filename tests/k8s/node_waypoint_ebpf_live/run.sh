@@ -1462,6 +1462,7 @@ run_ingress_topology_negative_and_drift_checks() {
   mkdir -p "$RESULTS_DIR/ingress-topology"
   local state_file="$RESULTS_DIR/ingress-topology/routes-before.txt"
   local metrics_file="$RESULTS_DIR/ingress-topology/wrong-startup.prom"
+  local startup_log="$RESULTS_DIR/ingress-topology/wrong-startup.log"
   local old_pod new_pod
   old_pod="$(kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-node-agent \
@@ -1490,8 +1491,8 @@ run_ingress_topology_negative_and_drift_checks() {
   fi
   grep -q 'ferrum_node_agent_capture_state{state="interface_topology_unavailable"} 1' "$metrics_file"
   grep -q 'reason="incomplete_interface_set"' "$metrics_file"
-  if ! kubectl -n "$MESH_NS" logs "pod/$new_pod" \
-    | grep -q 'NodeWaypoint inbound tc ingress redirect attached'; then
+  if ! kubectl -n "$MESH_NS" logs "pod/$new_pod" >"$startup_log" \
+    || ! grep -Fq 'NodeWaypoint inbound tc ingress redirect attached' "$startup_log"; then
     restore_ingress_routes "$NODE_A" "$state_file"
     echo "replacement did not prove tc attach success on the topologically wrong interface" >&2
     exit 1
