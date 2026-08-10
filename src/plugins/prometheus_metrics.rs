@@ -4094,6 +4094,7 @@ impl PrometheusMetrics {
     /// process-global registry when the test harness runs constructors in
     /// parallel.
     #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the lib target; the bin target does not.
     pub fn new_with_registry_for_test(
         config: &Value,
         namespace: &str,
