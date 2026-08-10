@@ -28,6 +28,12 @@ inputs:
       images that package host-built artifacts instead of compiling in Docker.
     required: false
     default: ""
+  install-iproute2:
+    description: >-
+      Install iproute2 in a Debian-family runtime image. Required by the eBPF
+      NodeWaypoint ingress redirect's exact policy-rule lifecycle.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -40,6 +46,7 @@ runs:
         BASE_IMAGE: ${{ inputs.base-image }}
         STRIP_BINARY: ${{ inputs.strip-binary }}
         BPF_ELF_PATH: ${{ inputs.bpf-elf-path }}
+        INSTALL_IPROUTE2: ${{ inputs.install-iproute2 }}
       run: |
         set -euo pipefail
 
@@ -47,6 +54,12 @@ runs:
         image="$IMAGE"
         base_image="$BASE_IMAGE"
         bpf_elf_path="$BPF_ELF_PATH"
+        install_iproute2="$INSTALL_IPROUTE2"
+
+        if [ "$install_iproute2" != "true" ] && [ "$install_iproute2" != "false" ]; then
+          echo "::error title=Invalid install-iproute2 input::expected true or false"
+          exit 1
+        fi
 
         if [ ! -f "$binary_path" ]; then
           echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
@@ -71,6 +84,14 @@ runs:
 
         {
           printf 'FROM %s\n' "$base_image"
+          if [ "$install_iproute2" = "true" ]; then
+            cat <<'DOCKERFILE'
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            ca-certificates \
+            iproute2 \
+            && rm -rf /var/lib/apt/lists/*
+        DOCKERFILE
+          fi
           cat <<'DOCKERFILE'
         # Keep this runtime stage aligned with the release Dockerfile runtime
         # stage. This action only swaps the source of /app/ferrum-edge so CI
@@ -78,16 +99,16 @@ runs:
         # inside Docker.
         WORKDIR /app
 
-        COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
+        COPY --chown=65532:65532 ferrum-edge /app/ferrum-edge
         DOCKERFILE
           if [ -n "$bpf_elf_path" ]; then
             cat <<'DOCKERFILE'
-        COPY --chown=nonroot:nonroot bpf /app/bpf
+        COPY --chown=65532:65532 bpf /app/bpf
         DOCKERFILE
           fi
           cat <<'DOCKERFILE'
 
-        ENV PATH="/app:${PATH}" \
+        ENV PATH="/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             FERRUM_MODE=database \
             FERRUM_LOG_LEVEL=error \
             FERRUM_PROXY_HTTP_PORT=8000 \
@@ -110,6 +131,8 @@ runs:
         LABEL org.opencontainers.image.title="Ferrum Edge" \
               org.opencontainers.image.description="High-performance edge proxy built in Rust" \
               org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
+
+        USER 65532:65532
 
         ENTRYPOINT ["/app/ferrum-edge"]
         CMD ["run"]

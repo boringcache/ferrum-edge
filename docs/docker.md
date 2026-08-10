@@ -36,7 +36,7 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
 2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
-3. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
+3. **Runtime Stage**: Debian 13 slim with `ca-certificates` and `iproute2`; the latter is required by the real eBPF NodeWaypoint ingress policy-rule lifecycle
 
 > **Current eBPF build coupling.** The runtime stage unconditionally copies the
 > eBPF ELF from the `ebpf-builder` stage, so every `docker build` runs that
@@ -49,14 +49,14 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 > stage first.
 
 **Image Features**:
-- **Distroless**: Zero OS packages beyond glibc, libgcc, and ca-certificates. No shell, no curl, no apt — dramatically reduced attack surface
-- Non-root user execution (UID 65532, distroless `nonroot`)
+- **Capture-ready runtime**: The source-build image contains `iproute2` for the supported eBPF path but deliberately omits `iptables`/`ip6tables`; the separately built default release image remains distroless
+- Non-root user execution by default (numeric UID/GID 65532; the node-agent chart overrides this for kernel capture)
 - Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)
 - OpenSSL is vendored (statically linked) — no runtime `libssl` dependency
 - Comprehensive labels for container metadata
 
-**Approximate Image Size**: ~30MB (varies by platform)
+Image size varies by platform and image variant; the prebuilt default release image is smaller than the source-built eBPF runtime.
 
 ## Running with Docker
 
@@ -116,7 +116,7 @@ docker run -v ferrum_data:/data ferrum-edge:latest
 
 ### Health Check
 
-The container includes a built-in health check using the `ferrum-edge health` CLI subcommand (no curl needed in distroless):
+The container includes a built-in health check using the `ferrum-edge health` CLI subcommand (no curl needed):
 
 The image default command is `ferrum-edge run`; override the Docker command with another subcommand such as `validate`, `health`, or `version` when needed.
 
@@ -136,7 +136,7 @@ When the plaintext admin listener is disabled (`FERRUM_ADMIN_HTTP_PORT=0`), the 
 HEALTHCHECK CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
 ```
 
-> **Note**: The distroless image has no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (e.g., Kubernetes `httpGet` probes).
+> **Note**: The default prebuilt release image is distroless and has no shell or curl. The source-built eBPF image is Debian slim, but the built-in health command or orchestrator-level `httpGet` probes remain the portable choices.
 
 ## Running with Docker Compose
 
@@ -491,7 +491,7 @@ docker stop --time=30 ferrum-edge
 
 **In orchestration** (Kubernetes):
 
-> **Note**: The distroless image has no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of a shell-based sleep.
+> **Note**: The default prebuilt release image has no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of relying on a variant-specific shell.
 
 ```yaml
 terminationGracePeriodSeconds: 30
@@ -584,20 +584,20 @@ docker logs ferrum-edge
 
 ### Permission Denied
 
-The container runs as the distroless `nonroot` user (UID 65532). Ensure volume permissions:
+The container runs as numeric UID/GID 65532 by default. Ensure volume permissions:
 
 ```bash
 # Fix volume permissions on the host before starting the container
 sudo chown -R 65532:65532 /path/to/volume
 ```
 
-> **Note**: `docker exec` with shell commands is not available in distroless images (no shell). Fix permissions from the host or use an init container.
+> **Note**: `docker exec` with shell commands is not available in the default distroless release image. Fix permissions from the host or use an init container so the procedure works with every image variant.
 
 ### Health Check Failing
 
 ```bash
 # Debug health endpoint (only when the admin port is published to the host —
-# admin binds loopback by default; distroless has no in-container curl, so use
+# admin binds loopback by default; the default release has no in-container curl, so use
 # `docker compose ps` / the built-in HEALTHCHECK to check health otherwise)
 curl -v http://localhost:9000/health
 

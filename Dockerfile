@@ -45,7 +45,7 @@ RUN cargo +nightly build \
         -Z build-std=core \
     && test -f target/bpfel-unknown-none/release/ferrum-ebpf
 
-# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
+# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching the runtime glibc
 FROM rust:latest AS builder
 ARG FEATURES
 
@@ -89,25 +89,30 @@ COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
 
-# Stage 2: Distroless runtime — no OS packages, no shell, no CVEs
-# Uses nonroot tag (UID 65532) for least-privilege execution.
-# OpenSSL is vendored (statically linked) so libssl is not needed.
-# ca-certificates are included in distroless/cc.
-FROM gcr.io/distroless/cc-debian13:nonroot
+# Stage 2: Linux eBPF capture runtime. The release pipeline uses this root
+# Dockerfile only for the `-ebpf` variant; the default image remains distroless
+# via Dockerfile.release. NodeWaypoint ingress redirect owns an exact policy
+# rule/route and therefore requires the `ip` binary at startup and teardown.
+FROM debian:13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
 
 # Copy the compiled eBPF ELF. The node_agent / node-waypoint mesh mode loads it
 # via aya only when the binary was built with `--features ebpf`; in the default
 # image the file is present but unused (the mock backend attaches nothing).
 # `FERRUM_NODE_AGENT_BPF_ELF_PATH` below points the aya loader at this path
 # (the CARGO_MANIFEST_DIR-relative default in src/ebpf/loader.rs does not exist
-# in the distroless runtime image).
-COPY --from=ebpf-builder --chown=nonroot:nonroot \
+# in the runtime image).
+COPY --from=ebpf-builder --chown=65532:65532 \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 
 # Set environment variables
@@ -123,7 +128,7 @@ ENV PATH="/app:${PATH}" \
 # Expose ports
 EXPOSE 8000 8443 9000 9443 50051
 
-# Health check using built-in CLI subcommand (no curl needed in distroless)
+# Health check using the built-in CLI subcommand (no curl needed)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 
@@ -132,6 +137,10 @@ LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \
       org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
-# Run the gateway (already running as nonroot via distroless tag)
+# Run the gateway as the same numeric nonroot identity as the default
+# distroless image. The mesh/node-agent charts explicitly select UID 0 for
+# kernel capture operations and override this image default.
+USER 65532:65532
+
 ENTRYPOINT ["/app/ferrum-edge"]
 CMD ["run"]
