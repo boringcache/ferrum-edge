@@ -343,6 +343,10 @@ impl IngressTopologyValidator {
     /// API latency nor procfs/sysfs reads occupy the pod/CNI select loop. The
     /// worker owns at most `MAX_NODES` cached objects, performs one initial
     /// paged LIST followed by a watch, and stops on the supplied shutdown.
+    ///
+    /// Authoritative cache-invalid outcomes (for example `NodeSetTooLarge`)
+    /// withdraw readiness immediately and schedule a paced fresh LIST/watch
+    /// snapshot. Incremental Apply/Delete events never repair an invalid cache.
     pub(crate) fn spawn_monitor(
         self,
         client: Client,
@@ -356,151 +360,349 @@ impl IngressTopologyValidator {
         let task = tokio::spawn(async move {
             let nodes: Api<Node> = Api::all(client);
             let watcher_config = kube_watcher::Config::default().page_size((MAX_NODES + 1) as u32);
-            let mut stream = Box::pin(kube_watcher::watcher(nodes, watcher_config));
-            let mut active_nodes = BTreeMap::<String, Node>::new();
-            let mut initializing: Option<BoundedNodeSet> = None;
-            let mut cache_failure: Option<IngressTopologyReason> = None;
-            let mut requirements: Option<TopologyRequirements> = None;
+            let mut recovery = NodeWatchCacheRecovery::new();
             let mut interval = tokio::time::interval(REVALIDATE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
 
-            loop {
+            'relist: loop {
                 if *shutdown_rx.borrow() {
                     break;
                 }
-                tokio::select! {
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            break;
-                        }
+                let mut stream = Box::pin(kube_watcher::watcher(nodes.clone(), watcher_config.clone()));
+                let mut active_nodes = BTreeMap::<String, Node>::new();
+                let mut initializing: Option<BoundedNodeSet> = None;
+                let mut requirements: Option<TopologyRequirements> = None;
+
+                let watch_end = 'watch: loop {
+                    if *shutdown_rx.borrow() {
+                        break 'watch NodeWatchLoopEnd::Shutdown;
                     }
-                    event = stream.next() => {
-                        let Some(event) = event else {
-                            publish_requirement_failure(
-                                &outcomes_tx,
-                                &self,
-                                IngressTopologyReason::KubernetesUnavailable,
-                            );
-                            break;
-                        };
-                        match event {
-                            Ok(Event::Init) => {
-                                // A relist is not a continuation of the last
-                                // authoritative snapshot. Withdraw any ready
-                                // outcome until InitDone publishes a complete,
-                                // bounded replacement.
-                                if requirements.take().is_some() {
-                                    publish_requirement_failure(
-                                        &outcomes_tx,
-                                        &self,
-                                        IngressTopologyReason::KubernetesUnavailable,
-                                    );
-                                }
-                                cache_failure = Some(
-                                    IngressTopologyReason::KubernetesUnavailable,
-                                );
-                                initializing = Some(BoundedNodeSet::default());
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break 'watch NodeWatchLoopEnd::Shutdown;
                             }
-                            Ok(Event::InitApply(node)) => {
-                                if let Some(nodes) = &mut initializing {
-                                    nodes.insert(node);
-                                }
-                            }
-                            Ok(Event::InitDone) => {
-                                let Some(nodes) = initializing.take() else {
-                                    publish_requirement_failure(
-                                        &outcomes_tx,
-                                        &self,
-                                        IngressTopologyReason::KubernetesUnavailable,
-                                    );
-                                    continue;
-                                };
-                                if let Some(reason) = nodes.failure {
-                                    requirements = None;
-                                    cache_failure = Some(reason);
-                                    publish_requirement_failure(&outcomes_tx, &self, reason);
-                                    continue;
-                                }
-                                active_nodes = nodes.nodes;
-                                cache_failure = None;
-                                requirements = derive_and_publish(
-                                    &outcomes_tx,
-                                    &self,
-                                    active_nodes.values(),
-                                ).await;
-                            }
-                            Ok(Event::Apply(node)) => {
-                                if let Some(reason) = cache_failure {
-                                    publish_requirement_failure(&outcomes_tx, &self, reason);
-                                    continue;
-                                }
-                                match update_active_node(&mut active_nodes, node) {
-                                    Ok(()) => {
-                                        requirements = derive_and_publish(
-                                            &outcomes_tx,
-                                            &self,
-                                            active_nodes.values(),
-                                        ).await;
-                                    }
-                                    Err(reason) => {
-                                        requirements = None;
-                                        cache_failure = Some(reason);
-                                        publish_requirement_failure(&outcomes_tx, &self, reason);
-                                    }
-                                }
-                            }
-                            Ok(Event::Delete(node)) => {
-                                if let Some(reason) = cache_failure {
-                                    publish_requirement_failure(&outcomes_tx, &self, reason);
-                                    continue;
-                                }
-                                if let Some(name) = node.metadata.name {
-                                    active_nodes.remove(&name);
-                                    requirements = derive_and_publish(
-                                        &outcomes_tx,
-                                        &self,
-                                        active_nodes.values(),
-                                    ).await;
-                                } else {
-                                    requirements = None;
-                                    cache_failure = Some(
-                                        IngressTopologyReason::NodeTopologyIncomplete,
-                                    );
-                                    publish_requirement_failure(
-                                        &outcomes_tx,
-                                        &self,
-                                        IngressTopologyReason::NodeTopologyIncomplete,
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                // kube-runtime reconnects and relists, but stale
-                                // Kubernetes evidence must never keep readiness
-                                // true while that recovery is in progress.
-                                requirements = None;
-                                initializing = None;
-                                cache_failure = Some(
-                                    IngressTopologyReason::KubernetesUnavailable,
-                                );
+                        }
+                        event = stream.next() => {
+                            let Some(event) = event else {
                                 publish_requirement_failure(
                                     &outcomes_tx,
                                     &self,
                                     IngressTopologyReason::KubernetesUnavailable,
                                 );
+                                break 'watch NodeWatchLoopEnd::StreamEnded;
+                            };
+                            match event {
+                                Ok(Event::Init) => {
+                                    // A relist is not a continuation of the last
+                                    // authoritative snapshot. Withdraw any ready
+                                    // outcome until InitDone publishes a complete,
+                                    // bounded replacement.
+                                    let _ = recovery.on_init();
+                                    if requirements.take().is_some() {
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            IngressTopologyReason::KubernetesUnavailable,
+                                        );
+                                    }
+                                    initializing = Some(BoundedNodeSet::default());
+                                }
+                                Ok(Event::InitApply(node)) => {
+                                    if let Some(nodes) = &mut initializing {
+                                        nodes.insert(node);
+                                    }
+                                }
+                                Ok(Event::InitDone) => {
+                                    let Some(nodes) = initializing.take() else {
+                                        let decision = recovery.on_missing_snapshot();
+                                        requirements = None;
+                                        active_nodes.clear();
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            IngressTopologyReason::KubernetesUnavailable,
+                                        );
+                                        if let NodeWatchCacheDecision::ForceRelist {
+                                            backoff_secs,
+                                        } = decision
+                                        {
+                                            break 'watch NodeWatchLoopEnd::Relist {
+                                                backoff_secs,
+                                            };
+                                        }
+                                        continue;
+                                    };
+                                    if let Some(reason) = nodes.failure {
+                                        let decision = recovery.on_invalid_snapshot(reason);
+                                        requirements = None;
+                                        active_nodes.clear();
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            reason,
+                                        );
+                                        if let NodeWatchCacheDecision::ForceRelist {
+                                            backoff_secs,
+                                        } = decision
+                                        {
+                                            break 'watch NodeWatchLoopEnd::Relist {
+                                                backoff_secs,
+                                            };
+                                        }
+                                        continue;
+                                    }
+                                    let _ = recovery.on_valid_snapshot();
+                                    active_nodes = nodes.nodes;
+                                    requirements = derive_and_publish(
+                                        &outcomes_tx,
+                                        &self,
+                                        active_nodes.values(),
+                                    ).await;
+                                }
+                                Ok(Event::Apply(node)) => {
+                                    if let NodeWatchCacheDecision::SuppressIncremental {
+                                        reason,
+                                    } = recovery.on_incremental()
+                                    {
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            reason,
+                                        );
+                                        continue;
+                                    }
+                                    match update_active_node(&mut active_nodes, node) {
+                                        Ok(()) => {
+                                            requirements = derive_and_publish(
+                                                &outcomes_tx,
+                                                &self,
+                                                active_nodes.values(),
+                                            ).await;
+                                        }
+                                        Err(reason) => {
+                                            let decision =
+                                                recovery.on_incremental_invalid(reason);
+                                            requirements = None;
+                                            active_nodes.clear();
+                                            publish_requirement_failure(
+                                                &outcomes_tx,
+                                                &self,
+                                                reason,
+                                            );
+                                            if let NodeWatchCacheDecision::ForceRelist {
+                                                backoff_secs,
+                                            } = decision
+                                            {
+                                                break 'watch NodeWatchLoopEnd::Relist {
+                                                    backoff_secs,
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Event::Delete(node)) => {
+                                    if let NodeWatchCacheDecision::SuppressIncremental {
+                                        reason,
+                                    } = recovery.on_incremental()
+                                    {
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            reason,
+                                        );
+                                        continue;
+                                    }
+                                    if let Some(name) = node.metadata.name {
+                                        active_nodes.remove(&name);
+                                        requirements = derive_and_publish(
+                                            &outcomes_tx,
+                                            &self,
+                                            active_nodes.values(),
+                                        ).await;
+                                    } else {
+                                        let reason =
+                                            IngressTopologyReason::NodeTopologyIncomplete;
+                                        let decision =
+                                            recovery.on_incremental_invalid(reason);
+                                        requirements = None;
+                                        active_nodes.clear();
+                                        publish_requirement_failure(
+                                            &outcomes_tx,
+                                            &self,
+                                            reason,
+                                        );
+                                        if let NodeWatchCacheDecision::ForceRelist {
+                                            backoff_secs,
+                                        } = decision
+                                        {
+                                            break 'watch NodeWatchLoopEnd::Relist {
+                                                backoff_secs,
+                                            };
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // kube-runtime reconnects and relists, but stale
+                                    // Kubernetes evidence must never keep readiness
+                                    // true while that recovery is in progress.
+                                    let _ = recovery.on_watch_error();
+                                    requirements = None;
+                                    initializing = None;
+                                    active_nodes.clear();
+                                    publish_requirement_failure(
+                                        &outcomes_tx,
+                                        &self,
+                                        IngressTopologyReason::KubernetesUnavailable,
+                                    );
+                                }
+                            }
+                        }
+                        _ = interval.tick() => {
+                            if let Some(current) = requirements.clone() {
+                                let outcome = validate_with_timeout(&self, current).await;
+                                outcomes_tx.send_replace(outcome);
                             }
                         }
                     }
-                    _ = interval.tick() => {
-                        if let Some(current) = requirements.clone() {
-                            let outcome = validate_with_timeout(&self, current).await;
-                            outcomes_tx.send_replace(outcome);
+                };
+
+                match watch_end {
+                    NodeWatchLoopEnd::Shutdown | NodeWatchLoopEnd::StreamEnded => break,
+                    NodeWatchLoopEnd::Relist { backoff_secs } => {
+                        let delay = crate::util::backoff::jittered_backoff(backoff_secs);
+                        let sleep = tokio::time::sleep(delay);
+                        tokio::pin!(sleep);
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow() {
+                                        break 'relist;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         });
         IngressTopologyMonitor { outcomes, task }
+    }
+}
+
+enum NodeWatchLoopEnd {
+    Shutdown,
+    StreamEnded,
+    Relist { backoff_secs: u64 },
+}
+
+/// Pure controller for bounded Node-watch cache validity and paced recovery.
+///
+/// Ready topology may only be derived from a complete valid replacement
+/// snapshot. Incremental Apply/Delete events never repair an invalid cache, and
+/// repeated invalid snapshots advance a capped backoff instead of spinning.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeWatchCacheRecovery {
+    invalid_reason: Option<IngressTopologyReason>,
+    relist_backoff_secs: u64,
+}
+
+/// Decision emitted by [`NodeWatchCacheRecovery`] for the monitor loop / tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeWatchCacheDecision {
+    /// Begin collecting a replacement Init snapshot; readiness stays withdrawn.
+    StartInitializing,
+    /// Commit a complete bounded snapshot; Ready may be derived from it.
+    CommitSnapshot,
+    /// Incremental mutation may update the active cache and re-derive.
+    AllowIncremental,
+    /// Keep publishing the invalid reason; never become Ready from this event.
+    SuppressIncremental { reason: IngressTopologyReason },
+    /// Authoritative cache is invalid; restart LIST/watch after the paced delay.
+    ForceRelist { backoff_secs: u64 },
+    /// Watch transport recovery is in progress; wait for kube-runtime Init.
+    AwaitReconnect,
+}
+
+impl NodeWatchCacheRecovery {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self {
+            invalid_reason: None,
+            relist_backoff_secs: crate::util::backoff::BACKOFF_INITIAL_SECS,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn invalid_reason(&self) -> Option<IngressTopologyReason> {
+        self.invalid_reason
+    }
+
+    #[doc(hidden)]
+    pub fn relist_backoff_secs(&self) -> u64 {
+        self.relist_backoff_secs
+    }
+
+    #[doc(hidden)]
+    pub fn on_init(&mut self) -> NodeWatchCacheDecision {
+        self.invalid_reason = Some(IngressTopologyReason::KubernetesUnavailable);
+        NodeWatchCacheDecision::StartInitializing
+    }
+
+    #[doc(hidden)]
+    pub fn on_valid_snapshot(&mut self) -> NodeWatchCacheDecision {
+        self.invalid_reason = None;
+        self.relist_backoff_secs = crate::util::backoff::BACKOFF_INITIAL_SECS;
+        NodeWatchCacheDecision::CommitSnapshot
+    }
+
+    #[doc(hidden)]
+    pub fn on_invalid_snapshot(
+        &mut self,
+        reason: IngressTopologyReason,
+    ) -> NodeWatchCacheDecision {
+        self.invalid_reason = Some(reason);
+        self.force_relist()
+    }
+
+    #[doc(hidden)]
+    pub fn on_missing_snapshot(&mut self) -> NodeWatchCacheDecision {
+        self.on_invalid_snapshot(IngressTopologyReason::KubernetesUnavailable)
+    }
+
+    #[doc(hidden)]
+    pub fn on_incremental(&self) -> NodeWatchCacheDecision {
+        if let Some(reason) = self.invalid_reason {
+            NodeWatchCacheDecision::SuppressIncremental { reason }
+        } else {
+            NodeWatchCacheDecision::AllowIncremental
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn on_incremental_invalid(
+        &mut self,
+        reason: IngressTopologyReason,
+    ) -> NodeWatchCacheDecision {
+        self.invalid_reason = Some(reason);
+        self.force_relist()
+    }
+
+    #[doc(hidden)]
+    pub fn on_watch_error(&mut self) -> NodeWatchCacheDecision {
+        self.invalid_reason = Some(IngressTopologyReason::KubernetesUnavailable);
+        NodeWatchCacheDecision::AwaitReconnect
+    }
+
+    fn force_relist(&mut self) -> NodeWatchCacheDecision {
+        let backoff_secs = self.relist_backoff_secs;
+        self.relist_backoff_secs =
+            crate::util::backoff::next_backoff_secs(self.relist_backoff_secs, true);
+        NodeWatchCacheDecision::ForceRelist { backoff_secs }
     }
 }
 

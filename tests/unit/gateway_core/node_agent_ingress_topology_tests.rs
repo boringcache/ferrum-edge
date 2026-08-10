@@ -5,9 +5,10 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ferrum_edge::ebpf::ingress_topology::{
-    IngressTopologyReason, IngressTopologyState, IpCidr, LinkState, RouteEntry,
-    TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file, read_link_state_from_root,
-    requirements_from_nodes, validate_host_topology_from_roots, validate_topology_snapshot,
+    IngressTopologyReason, IngressTopologyState, IpCidr, LinkState, NodeWatchCacheDecision,
+    NodeWatchCacheRecovery, RouteEntry, TopologyRequirements, parse_ipv4_route_file,
+    parse_ipv6_route_file, read_link_state_from_root, requirements_from_nodes,
+    validate_host_topology_from_roots, validate_topology_snapshot,
 };
 use k8s_openapi::api::core::v1::Node;
 use serde_json::json;
@@ -726,5 +727,116 @@ fn node_and_aggregate_requirement_bounds_have_distinct_closed_reasons() {
     assert_eq!(
         requirements_from_nodes(&[local, oversized], "local", true),
         Err(IngressTopologyReason::RequirementSetTooLarge),
+    );
+}
+
+#[test]
+fn invalid_node_cache_never_allows_ready_from_incremental_events() {
+    let mut recovery = NodeWatchCacheRecovery::new();
+    assert_eq!(
+        recovery.on_incremental_invalid(IngressTopologyReason::NodeSetTooLarge),
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+    );
+    assert_eq!(
+        recovery.invalid_reason(),
+        Some(IngressTopologyReason::NodeSetTooLarge),
+    );
+
+    // Deletes/Applies after an authoritative overflow must stay suppressed.
+    // Ready may only return through a later complete valid snapshot.
+    for _ in 0..8 {
+        assert_eq!(
+            recovery.on_incremental(),
+            NodeWatchCacheDecision::SuppressIncremental {
+                reason: IngressTopologyReason::NodeSetTooLarge,
+            },
+        );
+    }
+    assert_ne!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::AllowIncremental,
+    );
+    assert_ne!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::CommitSnapshot,
+    );
+}
+
+#[test]
+fn node_cache_recovery_requires_complete_valid_replacement_snapshot() {
+    let mut recovery = NodeWatchCacheRecovery::new();
+    assert_eq!(
+        recovery.on_init(),
+        NodeWatchCacheDecision::StartInitializing,
+    );
+    assert_eq!(
+        recovery.on_invalid_snapshot(IngressTopologyReason::NodeSetTooLarge),
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+    );
+    assert_eq!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::SuppressIncremental {
+            reason: IngressTopologyReason::NodeSetTooLarge,
+        },
+    );
+
+    // A fresh Init withdraws readiness again but still does not authorize
+    // incremental repair of the previous invalid generation.
+    assert_eq!(
+        recovery.on_init(),
+        NodeWatchCacheDecision::StartInitializing,
+    );
+    assert_eq!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::SuppressIncremental {
+            reason: IngressTopologyReason::KubernetesUnavailable,
+        },
+    );
+
+    assert_eq!(
+        recovery.on_valid_snapshot(),
+        NodeWatchCacheDecision::CommitSnapshot,
+    );
+    assert_eq!(recovery.invalid_reason(), None);
+    assert_eq!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::AllowIncremental,
+    );
+    assert_eq!(recovery.relist_backoff_secs(), 1);
+}
+
+#[test]
+fn repeated_invalid_node_cache_snapshots_stay_bounded_without_spinning() {
+    let mut recovery = NodeWatchCacheRecovery::new();
+    let mut observed = Vec::new();
+    for _ in 0..8 {
+        match recovery.on_invalid_snapshot(IngressTopologyReason::NodeSetTooLarge) {
+            NodeWatchCacheDecision::ForceRelist { backoff_secs } => {
+                observed.push(backoff_secs);
+            }
+            other => panic!("expected paced ForceRelist, got {other:?}"),
+        }
+        // Incremental noise between forced relists must not clear the failure
+        // or authorize Ready from partial state.
+        assert_eq!(
+            recovery.on_incremental(),
+            NodeWatchCacheDecision::SuppressIncremental {
+                reason: IngressTopologyReason::NodeSetTooLarge,
+            },
+        );
+    }
+
+    assert_eq!(observed, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+    assert_eq!(recovery.relist_backoff_secs(), 30);
+
+    // A successful replacement snapshot is the only path that resets pacing.
+    assert_eq!(
+        recovery.on_valid_snapshot(),
+        NodeWatchCacheDecision::CommitSnapshot,
+    );
+    assert_eq!(recovery.relist_backoff_secs(), 1);
+    assert_eq!(
+        recovery.on_invalid_snapshot(IngressTopologyReason::NodeTopologyIncomplete),
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
     );
 }
