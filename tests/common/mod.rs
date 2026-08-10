@@ -85,11 +85,11 @@ pub use gateway_harness::{
     ensure_gateway_built, ephemeral_port, explicit_test_binary, probe_gateway_identity,
     scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
 };
-pub use trusted_projected_gateway::{
-    TrustedProjectedGateway, TrustedProjectedGatewayOptions, trusted_projected_config_from_yaml,
-};
 pub use hmac_helpers::{
     empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
     generate_hmac_signature_with_query, hmac_authority_from_url,
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
+pub use trusted_projected_gateway::{
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, trusted_projected_config_from_yaml,
+};

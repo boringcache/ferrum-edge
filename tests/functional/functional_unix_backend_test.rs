@@ -199,10 +199,9 @@ async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGate
         &config,
         TrustedProjectedGatewayOptions {
             env,
-            mesh_unix_socket_allowed_roots: vec![root
-                .to_str()
-                .expect("utf-8 containment root")
-                .to_string()],
+            mesh_unix_socket_allowed_roots: vec![
+                root.to_str().expect("utf-8 containment root").to_string(),
+            ],
             ..TrustedProjectedGatewayOptions::default()
         },
     )
@@ -315,11 +314,7 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
     let beta_path = beta.path.to_str().expect("utf-8 socket path").to_string();
 
     let mut gateway = spawn_unix_gateway(
-        build_config(
-            &[("unix-route", "/unix", &alpha_path)],
-            placeholder_port,
-            0,
-        ),
+        build_config(&[("unix-route", "/unix", &alpha_path)], placeholder_port, 0),
         &root,
     )
     .await;

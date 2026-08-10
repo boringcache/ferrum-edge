@@ -41,7 +41,6 @@ use tonic::{Request, Response, Status};
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
-use ferrum_edge::proxy::ConfigApplyOutcome;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
@@ -63,6 +62,7 @@ use ferrum_edge::modes::mesh::config::{
     WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::proxy::ConfigApplyOutcome;
 use ferrum_edge::xds::XdsAdsServer;
 
 use crate::common::{
@@ -5020,9 +5020,10 @@ plugin_configs: []
         "x-native-request-trailer",
         hyper::header::HeaderValue::from_static("must-not-disappear"),
     );
-    let rejected = grpc_mesh_retry_request(gateway.proxy_http_port, &payload, Some(native_trailers))
-        .await
-        .expect("native trailer refusal response");
+    let rejected =
+        grpc_mesh_retry_request(gateway.proxy_http_port, &payload, Some(native_trailers))
+            .await
+            .expect("native trailer refusal response");
     assert_eq!(
         rejected.status, 200,
         "gRPC refusal uses Trailers-Only HTTP 200"
@@ -16075,12 +16076,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.mtls_port", peer_a.port.to_string()),
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
-    h3_mesh_reload(
-        &gateway,
-        config_for(&corrupted_tags, 3),
-        &corrupted_tags,
-    )
-    .await;
+    h3_mesh_reload(&gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
     let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
