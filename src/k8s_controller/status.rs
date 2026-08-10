@@ -4993,7 +4993,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_slot_programs_only_winner() {
+    fn same_namespace_gateway_tls_listeners_are_both_programmed() {
         let gateway_class = ferrum_gateway_class();
         let gateway_a = object(
             "Gateway",
@@ -5033,15 +5033,7 @@ mod tests {
             let gateway_update = update_for(&updates, "Gateway", gateway_name);
             let conditions = gateway_update.status["conditions"].as_array().unwrap();
             assert_condition(conditions, "ResolvedRefs", "True");
-            assert_condition(
-                conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
+            assert_condition(conditions, "Programmed", "True");
 
             let listeners = gateway_update.status["listeners"].as_array().unwrap();
             let listener = listener_status_by_name(
@@ -5054,21 +5046,7 @@ mod tests {
             );
             let listener_conditions = listener["conditions"].as_array().unwrap();
             assert_condition(listener_conditions, "ResolvedRefs", "True");
-            assert_condition(
-                listener_conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
-            if gateway_name == "edge-b" {
-                assert_eq!(
-                    find_condition(listener_conditions, "Programmed")["reason"].as_str(),
-                    Some("NoListeners")
-                );
-            }
+            assert_condition(listener_conditions, "Programmed", "True");
         }
     }
 

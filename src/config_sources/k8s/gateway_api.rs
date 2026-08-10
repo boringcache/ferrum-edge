@@ -7988,7 +7988,7 @@ mod tests {
                 "gatewayClassName": "ferrum",
                 "listeners": [{
                     "name": "https",
-                    "port": 443,
+                    "port": 8443,
                     "protocol": "HTTPS",
                     "tls": {"certificateRefs": [{"name": "cert-b"}]}
                 }]
@@ -8164,7 +8164,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("unresolved TLS material and will not be exposed")
+                warning.contains("listener https is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
@@ -8211,7 +8211,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("unresolved TLS material and will not be exposed")
+                warning.contains("listener https is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
@@ -8258,7 +8258,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("unresolved TLS material and will not be exposed")
+                warning.contains("listener https is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
