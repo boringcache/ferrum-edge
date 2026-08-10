@@ -11432,7 +11432,10 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope, node_waypoint_observability]
+      required:
+        - egress_scope
+        - node_waypoint_observability
+        - udp_placement_migration
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
@@ -11444,6 +11447,47 @@ components:
             `enabled` is true only when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
             Counters are process-static and monotonic across config reload and
             SVID rotation; they reset on NodeWaypoint process restart.
+        udp_placement_migration:
+          $ref: "#/components/schemas/UdpPlacementMigrationStatusSnapshot"
+
+    UdpPlacementMigrationStatusSnapshot:
+      type: object
+      required: [enabled, phase, outstanding, failure_reason]
+      properties:
+        enabled:
+          type: boolean
+          description: True when the Ambient UDP placement guard is active.
+        phase:
+          type: string
+          enum:
+            - stable
+            - waiting_for_registry
+            - waiting_for_gate_ack
+            - cleaning_pod_netns
+            - cleaning_host_netns
+            - cleanup_complete
+            - finalize_blocked
+            - failed
+        outstanding:
+          type: integer
+          format: uint64
+          description: Outstanding pod network namespaces or gate acknowledgements.
+        failure_reason:
+          type: string
+          enum:
+            - none
+            - migration_required
+            - finalize_required
+            - generation_mismatch
+            - predecessor_mismatch
+            - registry_not_synchronized
+            - gate_acknowledgement_missing
+            - pod_netns_unresolved
+            - pod_cleanup_failed
+            - host_cleanup_failed
+            - cleanup_proof_missing
+            - state_persistence_failed
+          description: Closed-set node-local failure reason; never includes pod UIDs or generations.
 
     NodeWaypointObservabilitySnapshot:
       type: object
