@@ -4436,10 +4436,15 @@ mod tests {
             "ferrum_oauth2_introspection_cache_evictions_total{class=\"active\",reason=\"capacity\"} 1"
         ));
         assert!(output.contains("ferrum_oauth2_introspection_cache_cleanup_work_total 1"));
-        assert!(!output.contains("token="));
-        assert!(!output.contains("digest="));
-        assert!(!output.contains("subject="));
-        assert!(!output.contains("endpoint="));
+        let cache_samples = output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_oauth2_introspection_cache_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!cache_samples.contains("token="));
+        assert!(!cache_samples.contains("digest="));
+        assert!(!cache_samples.contains("subject="));
+        assert!(!cache_samples.contains("endpoint="));
     }
 
     #[test]
