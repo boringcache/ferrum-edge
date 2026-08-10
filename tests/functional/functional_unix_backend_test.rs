@@ -191,10 +191,7 @@ async fn reserve_placeholder_port() -> (u16, tokio::net::TcpListener) {
     (port, listener)
 }
 
-async fn spawn_unix_gateway(
-    config: String,
-    root: &Path,
-) -> TrustedProjectedGateway {
+async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGateway {
     let mut env = EnvConfig::default();
     env.pool_warmup_enabled = false;
     env.log_level = "warn".into();
@@ -259,7 +256,7 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
         "the gateway forwards a Host header to the unix backend, got {body:?}"
     );
     assert!(backend.hits() >= 1, "the unix socket observed the request");
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 #[tokio::test]
@@ -299,7 +296,7 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
         502,
         "a missing unix socket is a pre-wire backend failure, not a TCP fallback"
     );
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 /// Reload/update/delete via trusted `update_config` (mesh projection boundary),
@@ -351,10 +348,7 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
         1,
     ));
     assert!(
-        matches!(
-            outcome,
-            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
-        ),
+        matches!(outcome, ConfigApplyOutcome::Applied),
         "unix backend retarget must apply via trusted projection, got {outcome:?}"
     );
     wait_for_body(
@@ -374,10 +368,7 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
         2,
     ));
     assert!(
-        matches!(
-            outcome,
-            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
-        ),
+        matches!(outcome, ConfigApplyOutcome::Applied),
         "unix backend route replacement must apply via trusted projection, got {outcome:?}"
     );
     wait_for_body(
@@ -396,5 +387,5 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
         |status, body| status == 200 && body.starts_with("alpha|"),
     )
     .await;
-    gateway.shutdown();
+    gateway.shutdown().await;
 }

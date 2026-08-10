@@ -4913,7 +4913,6 @@ plugin_configs: []
     );
     let mut env = EnvConfig::default();
     env.pool_warmup_enabled = false;
-    env.tls_no_verify = true;
     env.gateway_svid_cert_path = Some(svids.a.cert_path.clone());
     env.gateway_svid_key_path = Some(svids.a.key_path.clone());
     env.gateway_svid_trust_bundle_path = Some(svids.a.trust_bundle_path.clone());
@@ -5039,7 +5038,7 @@ plugin_configs: []
         "native trailer refusal must not create another application stream"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
     tokio::time::timeout(Duration::from_secs(5), backend_task)
         .await
         .expect("mesh retry backend teardown timed out")
@@ -15372,7 +15371,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
         "the H3 request DATA must reach the peer byte-for-byte"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 2. Cross-cluster Sidecar mesh mTLS (east-west) ───────────────────────────
@@ -15451,7 +15450,7 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
          not the gateway address dialed; observed {snis:?}"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 3. Same-cluster Ambient HBONE (nested HTTP/2 in the CONNECT tunnel) ──────
@@ -15533,7 +15532,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
         "the inner request authority must be the destination's own app address"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 4. Cross-cluster Ambient HBONE (east-west gateway) ──────────────────────
@@ -15621,7 +15620,7 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
     );
     assert_eq!(observed.body, payload);
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 5. Streaming + cancellation over a mesh transport ───────────────────────
@@ -15697,7 +15696,7 @@ async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
     stream.cancel_request_upload();
     app.wait_for_request_reset(Duration::from_secs(15)).await;
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 6. Deadline propagation over a mesh transport ───────────────────────────
@@ -15752,7 +15751,7 @@ async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
         "the peer must have received a grpc-timeout on the mesh hop: {observed:?}"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 7. Fail-closed refusal for unmaterializable mesh metadata ───────────────
@@ -15873,7 +15872,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
             );
         }
 
-        gateway.shutdown();
+        gateway.shutdown().await;
     }
 }
 
@@ -15970,7 +15969,7 @@ async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
     );
     assert_eq!(observed.body, payload);
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 9. Configuration update / reload / withdrawal ──────────────────────────
@@ -16097,7 +16096,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         "the fail-closed reload must not dial the peer"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 /// Apply a new trusted projected config via `ProxyState::update_config` and wait
@@ -16115,10 +16114,7 @@ async fn h3_mesh_reload(
 ) {
     let outcome = gateway.apply_projected_yaml(&config_yaml);
     assert!(
-        matches!(
-            outcome,
-            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
-        ),
+        matches!(outcome, ConfigApplyOutcome::Applied),
         "trusted projected H3 mesh reload must apply, got {outcome:?}"
     );
 
@@ -16128,15 +16124,16 @@ async fn h3_mesh_reload(
         .collect();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let live = gateway.live_upstream_tags(H3_MESH_UPSTREAM_ID);
-        if live == expected {
-            return;
+        match gateway.live_upstream_tags(H3_MESH_UPSTREAM_ID) {
+            Some(live) if live == expected => return,
+            live => {
+                assert!(
+                    Instant::now() < deadline,
+                    "trusted projected reload never exposed expected mesh target tags \
+                     {expected:?}; live={live:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "trusted projected reload never exposed expected mesh target tags \
-             {expected:?}; live={live:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

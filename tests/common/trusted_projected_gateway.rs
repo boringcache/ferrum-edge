@@ -28,10 +28,12 @@ use ferrum_edge::modes::file::{ServeOptions, serve};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use crate::scaffolding::ports::reserve_colocated_tcp_udp;
 
 /// Parse fixture YAML into a trusted projected config.
 ///
@@ -89,6 +91,7 @@ impl TrustedProjectedGateway {
         // Hold rejected listeners so the kernel cannot immediately re-offer an
         // excluded port to the next `:0` bind in this process.
         let mut held_rejected: Vec<TcpListener> = Vec::new();
+        let mut held_rejected_udp: Vec<UdpSocket> = Vec::new();
         let proxy_http = bind_ephemeral_excluding(&excluded, &mut held_rejected).await?;
         let admin_http = bind_ephemeral_excluding(&excluded, &mut held_rejected).await?;
         let proxy_http_port = proxy_http.local_addr()?.port();
@@ -115,16 +118,34 @@ impl TrustedProjectedGateway {
 
         let mut proxy_https = None;
         let mut proxy_https_port = None;
+        // When HTTPS+HTTP/3 share a port, hold colocated TCP+UDP until ServeOptions
+        // owns the TCP listener, then release UDP immediately before `file::serve`
+        // binds QUIC (same pattern as RunningH3Gateway / MCP aggregate harnesses).
+        let mut https_udp_reservation = None;
         if options.enable_https {
-            let listener = bind_ephemeral_excluding(&excluded, &mut held_rejected).await?;
-            let https_port = listener.local_addr()?.port();
-            proxy_https_port = Some(https_port);
-            env_config.proxy_https_port = https_port;
-            proxy_https = Some(listener);
+            if env_config.enable_http3 {
+                let (listener, https_port, udp) = bind_colocated_https_excluding(
+                    &excluded,
+                    &mut held_rejected,
+                    &mut held_rejected_udp,
+                )
+                .await?;
+                proxy_https_port = Some(https_port);
+                env_config.proxy_https_port = https_port;
+                proxy_https = Some(listener);
+                https_udp_reservation = Some(udp);
+            } else {
+                let listener = bind_ephemeral_excluding(&excluded, &mut held_rejected).await?;
+                let https_port = listener.local_addr()?.port();
+                proxy_https_port = Some(https_port);
+                env_config.proxy_https_port = https_port;
+                proxy_https = Some(listener);
+            }
         } else {
             env_config.proxy_https_port = 0;
         }
         drop(held_rejected);
+        drop(held_rejected_udp);
 
         let jwt_manager = JwtManager::new(JwtConfig {
             secret: jwt_secret.clone(),
@@ -143,6 +164,8 @@ impl TrustedProjectedGateway {
             skip_initial_capability_refresh: !env_config.pool_warmup_enabled,
             background_drain_timeout: Some(Duration::from_millis(500)),
         };
+        // Release the UDP reservation immediately before serve binds QUIC.
+        drop(https_udp_reservation);
 
         let (shutdown_tx, _) = watch::channel(false);
         let handles = serve(env_config, config, opts, shutdown_tx.clone())
@@ -224,7 +247,12 @@ impl TrustedProjectedGateway {
     }
 
     /// Live upstream target tags from the applied admin/config projection.
-    pub fn live_upstream_tags(&self, upstream_id: &str) -> HashMap<String, String> {
+    ///
+    /// Returns `None` when the named upstream is missing or has no targets, so
+    /// withdrawal / convergence checks cannot treat absence as empty tags.
+    /// `Some(map)` requires the exact upstream and its first target to exist
+    /// (an empty map then means the target is present with no tags).
+    pub fn live_upstream_tags(&self, upstream_id: &str) -> Option<HashMap<String, String>> {
         self.proxy_state
             .config
             .load_full()
@@ -233,7 +261,6 @@ impl TrustedProjectedGateway {
             .find(|upstream| upstream.id == upstream_id)
             .and_then(|upstream| upstream.targets.first())
             .map(|target| target.tags.clone())
-            .unwrap_or_default()
     }
 
     pub async fn wait_for_proxy_port(
@@ -288,17 +315,44 @@ impl TrustedProjectedGateway {
         }
     }
 
-    pub fn shutdown(&mut self) {
+    /// Signal shutdown and await listener / background cleanup with a bounded
+    /// timeout (same posture as `RunningH3Gateway` / in-process file-mode
+    /// harnesses). On timeout, abort the still-owned join task so ports cannot
+    /// leak across tests.
+    pub async fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        let _ = self.join.take();
+        if let Some(join) = self.join.take() {
+            let abort_handle = join.abort_handle();
+            match tokio::time::timeout(Duration::from_secs(5), join).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    eprintln!("TrustedProjectedGateway join task panicked: {err}");
+                }
+                Err(_) => {
+                    abort_handle.abort();
+                    eprintln!("TrustedProjectedGateway shutdown timed out; aborted join task");
+                }
+            }
+        }
+    }
+
+    fn signal_shutdown_and_abort_join(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
     }
 }
 
 impl Drop for TrustedProjectedGateway {
     fn drop(&mut self) {
-        self.shutdown();
+        // Non-async fallback: signal shutdown and abort any still-owned join
+        // task. Do not silently detach — a panic path must not leak tasks/ports.
+        self.signal_shutdown_and_abort_join();
     }
 }
 
@@ -316,4 +370,27 @@ async fn bind_ephemeral_excluding(
         return Ok(listener);
     }
     Err("exhausted ephemeral binds while avoiding excluded fixture ports".into())
+}
+
+/// Reserve a colocated HTTPS TCP+UDP pair outside `excluded`, holding any
+/// rejected sockets so the kernel cannot re-offer those ports.
+async fn bind_colocated_https_excluding(
+    excluded: &std::collections::HashSet<u16>,
+    held_rejected: &mut Vec<TcpListener>,
+    held_rejected_udp: &mut Vec<UdpSocket>,
+) -> Result<(TcpListener, u16, UdpSocket), Box<dyn std::error::Error + Send + Sync>> {
+    for _ in 0..64 {
+        let (tcp, udp) = reserve_colocated_tcp_udp()
+            .await
+            .map_err(|e| format!("colocated HTTPS TCP/UDP reservation failed: {e}"))?;
+        let port = tcp.port;
+        if excluded.contains(&port) {
+            held_rejected.push(tcp.into_listener());
+            held_rejected_udp.push(udp.into_socket());
+            continue;
+        }
+        assert_eq!(port, udp.port, "colocated TCP/UDP ports must match");
+        return Ok((tcp.into_listener(), port, udp.into_socket()));
+    }
+    Err("exhausted colocated HTTPS binds while avoiding excluded fixture ports".into())
 }
