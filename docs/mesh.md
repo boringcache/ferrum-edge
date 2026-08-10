@@ -3443,7 +3443,8 @@ Every placement or enabled-state change uses one operator-chosen generation and
 two explicit releases. The placements are `pod-netns`, `host-netns`, and
 `disabled`; the destination must agree with
 `FERRUM_MESH_CAPTURE_UDP_ENABLED` and
-`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`.
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`. A later transition must choose a
+new generation rather than reusing the most recently completed value.
 
 1. Render the destination switches plus
    `FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup`, a new
@@ -3504,7 +3505,9 @@ host-netns rules. Initial installs are unaffected.
 
 **Recovery and churn contract.** Cleanup persists `(generation, from, to)`
 before touching rules. A proxy restart resumes only that tuple; a different or
-stale generation is rejected. Each node-agent restart/relist first retracts its
+stale generation is rejected, and a completed generation cannot bind a later
+transition to a registry marker left by the earlier rollout. Each node-agent
+restart/relist first retracts its
 generation acknowledgement, closes UDP gates, reconstructs the registry from
 the Kubernetes pod list, and then atomically publishes `.udp-registry-synced`
 containing that generation. Every later pod/CNI capture mutation retracts the

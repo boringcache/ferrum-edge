@@ -348,6 +348,17 @@ pub fn prepare_placement(
                 }
                 pending.cleanup_both
             } else {
+                if state
+                    .completed
+                    .as_ref()
+                    .is_some_and(|completed| completed.generation == transition.generation)
+                {
+                    set_failure(UdpMigrationFailureReason::GenerationMismatch);
+                    return Err(
+                        "Ambient UDP migration generation was already completed; choose a new generation for the next transition"
+                            .to_string(),
+                    );
+                }
                 if state.active != transition.from {
                     set_failure(UdpMigrationFailureReason::PredecessorMismatch);
                     return Err(format!(

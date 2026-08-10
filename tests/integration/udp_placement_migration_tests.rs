@@ -359,6 +359,45 @@ fn interrupted_cleanup_rejects_stale_generation_and_predecessor() {
 }
 
 #[test]
+fn completed_generation_cannot_authorize_a_later_cleanup_transition() {
+    let registry = tempfile::tempdir().expect("registry");
+    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .expect("bootstrap placement");
+    let first = transition(
+        UdpMigrationPhase::Cleanup,
+        "generation-once",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    cleanup_context(registry.path(), &first)
+        .mark_cleanup_complete()
+        .expect("first cleanup proof");
+    prepare_placement(
+        registry.path(),
+        &transition(
+            UdpMigrationPhase::Finalize,
+            "generation-once",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+    )
+    .expect("first finalize");
+
+    let error = prepare_placement(
+        registry.path(),
+        &transition(
+            UdpMigrationPhase::Cleanup,
+            "generation-once",
+            UdpPlacement::HostNetns,
+            UdpPlacement::PodNetns,
+        ),
+    )
+    .err()
+    .expect("a completed generation must not bind a later registry proof");
+    assert!(error.contains("already completed"));
+}
+
+#[test]
 fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
     let registry = tempfile::tempdir().expect("registry");
     let context = cleanup_context(
