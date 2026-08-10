@@ -1023,13 +1023,10 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
-        && config
-            .plugin_configs
-            .iter()
-            .all(|plugin| {
-                plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
-                    && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
-            })
+        && config.plugin_configs.iter().all(|plugin| {
+            plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+        })
 }
 
 fn gateway_hbone_mtls_observed(
