@@ -95,13 +95,23 @@ jobs:
       - name: Build eBPF program
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
-      - name: Package eBPF image
+      - name: Package eBPF base image
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
           binary-path: target/pr-build/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-base
           bpf-elf-path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
-          install-iproute2: "true"
+
+      - name: Add distroless iproute2 runtime closure
+        env:
+          BASE_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-base
+          FINAL_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --file Dockerfile.iproute2-layer \
+            --tag "$FINAL_IMAGE" \
+            .
 
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools

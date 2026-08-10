@@ -28,14 +28,6 @@ inputs:
       images that package host-built artifacts instead of compiling in Docker.
     required: false
     default: ""
-  install-iproute2:
-    description: >-
-      Copy the iproute2 `ip` executable and its resolved Debian 13 runtime
-      library closure into the image. Required by the eBPF NodeWaypoint ingress
-      redirect's exact policy-rule lifecycle; no shell or package manager is
-      copied into the final image.
-    required: false
-    default: "false"
 
 runs:
   using: composite
@@ -48,7 +40,6 @@ runs:
         BASE_IMAGE: ${{ inputs.base-image }}
         STRIP_BINARY: ${{ inputs.strip-binary }}
         BPF_ELF_PATH: ${{ inputs.bpf-elf-path }}
-        INSTALL_IPROUTE2: ${{ inputs.install-iproute2 }}
       run: |
         set -euo pipefail
 
@@ -56,12 +47,6 @@ runs:
         image="$IMAGE"
         base_image="$BASE_IMAGE"
         bpf_elf_path="$BPF_ELF_PATH"
-        install_iproute2="$INSTALL_IPROUTE2"
-
-        if [ "$install_iproute2" != "true" ] && [ "$install_iproute2" != "false" ]; then
-          echo "::error title=Invalid install-iproute2 input::expected true or false"
-          exit 1
-        fi
 
         if [ ! -f "$binary_path" ]; then
           echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
@@ -85,28 +70,7 @@ runs:
         fi
 
         {
-          if [ "$install_iproute2" = "true" ]; then
-            cat <<'DOCKERFILE'
-        FROM debian:13-slim AS ferrum-iproute2
-        RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-            && mkdir -p /iproute2-root \
-            && cp --parents /usr/sbin/ip /iproute2-root \
-            && ldd /usr/sbin/ip > /tmp/iproute2-ldd \
-            && awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
-                /tmp/iproute2-ldd > /tmp/iproute2-libraries \
-            && test -s /tmp/iproute2-libraries \
-            && while IFS= read -r library; do \
-                cp -L --parents "$library" /iproute2-root || exit 1; \
-            done < /tmp/iproute2-libraries \
-            && rm -rf /var/lib/apt/lists/*
-        DOCKERFILE
-          fi
           printf 'FROM %s\n' "$base_image"
-          if [ "$install_iproute2" = "true" ]; then
-            cat <<'DOCKERFILE'
-        COPY --from=ferrum-iproute2 /iproute2-root/ /
-        DOCKERFILE
-          fi
           cat <<'DOCKERFILE'
         # Keep this runtime stage aligned with the release Dockerfile runtime
         # stage. This action only swaps the source of /app/ferrum-edge so CI
@@ -114,16 +78,16 @@ runs:
         # inside Docker.
         WORKDIR /app
 
-        COPY --chown=65532:65532 ferrum-edge /app/ferrum-edge
+        COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
         DOCKERFILE
           if [ -n "$bpf_elf_path" ]; then
             cat <<'DOCKERFILE'
-        COPY --chown=65532:65532 bpf /app/bpf
+        COPY --chown=nonroot:nonroot bpf /app/bpf
         DOCKERFILE
           fi
           cat <<'DOCKERFILE'
 
-        ENV PATH="/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        ENV PATH="/app:${PATH}" \
             FERRUM_MODE=database \
             FERRUM_LOG_LEVEL=error \
             FERRUM_PROXY_HTTP_PORT=8000 \
@@ -146,8 +110,6 @@ runs:
         LABEL org.opencontainers.image.title="Ferrum Edge" \
               org.opencontainers.image.description="High-performance edge proxy built in Rust" \
               org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
-
-        USER 65532:65532
 
         ENTRYPOINT ["/app/ferrum-edge"]
         CMD ["run"]
