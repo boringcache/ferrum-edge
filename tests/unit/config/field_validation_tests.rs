@@ -1151,8 +1151,7 @@ fn test_upstream_mesh_target_tags_rejected_in_operator_config() {
         .expect_err("operator-provided targets must not forge reserved mesh tags");
     assert_eq!(errors.len(), 1, "ordinary target tags must remain allowed");
     assert!(
-        errors[0].contains("targets[0].tags")
-            && errors[0].contains("reserved mesh.* namespace"),
+        errors[0].contains("targets[0].tags") && errors[0].contains("reserved mesh.* namespace"),
         "expected a redacted reserved-tag rejection, got: {errors:?}"
     );
     assert!(!errors[0].contains("mesh.unix_socket"), "{errors:?}");
