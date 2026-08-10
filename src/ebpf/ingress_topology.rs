@@ -877,11 +877,7 @@ async fn derive_and_publish<'a>(
     nodes: impl Iterator<Item = &'a NodeTopologyEvidence>,
     previous: Option<&TopologyRequirements>,
 ) -> Option<TopologyRequirements> {
-    match requirements_from_evidence(
-        nodes,
-        &validator.node_name,
-        validator.capture_supports_ipv6,
-    ) {
+    match requirements_from_evidence(nodes, &validator.node_name, validator.capture_supports_ipv6) {
         Ok(requirements) => {
             // Node heartbeats generate frequent Apply events. The projected
             // evidence is cheap to rebuild, but procfs/sysfs validation is not:
@@ -1410,9 +1406,8 @@ fn requirements_from_evidence<'a>(
             node_observed_ipv6 |= cidr.family() == IpFamily::Ipv6;
             if cidr.family() == IpFamily::Ipv4 || capture_supports_ipv6 {
                 if !remote_pod_cidrs.contains(&cidr) {
-                    let total = remote_pod_cidrs.len()
-                        + remote_node_addresses.len()
-                        + node_cidrs.len();
+                    let total =
+                        remote_pod_cidrs.len() + remote_node_addresses.len() + node_cidrs.len();
                     push_unique_bounded(&mut node_cidrs, cidr, total)?;
                 }
             }
@@ -1870,9 +1865,11 @@ fn classify_watch_error(error: &kube_watcher::Error) -> (&'static str, &'static 
             let (class, code) = classify_client_error(error);
             ("watch_start", class, code)
         }
-        kube_watcher::Error::WatchError(status) => {
-            ("watch_event", classify_status_code(status.code), status.code)
-        }
+        kube_watcher::Error::WatchError(status) => (
+            "watch_event",
+            classify_status_code(status.code),
+            status.code,
+        ),
         kube_watcher::Error::WatchFailed(error) => {
             let (class, code) = classify_client_error(error);
             ("watch_stream", class, code)

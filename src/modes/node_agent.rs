@@ -2147,9 +2147,9 @@ fn cni_topology_readiness_rejection(
         RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !initial_sync_complete => {
             Some("node-agent initial pod sync is incomplete; capture is not ready")
         }
-        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !startup_ready => Some(
-            "NodeWaypoint ingress interface topology is unproved; enrollment is quarantined",
-        ),
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !startup_ready => {
+            Some("NodeWaypoint ingress interface topology is unproved; enrollment is quarantined")
+        }
         _ => None,
     }
 }

@@ -15,15 +15,15 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::rpc::RpcVerb;
 use ferrum_edge::ebpf::ingress_topology::{
-    IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState,
-    IngressTopologyStatus, IngressTopologyValidator, IpCidr, LinkState, NodeWatchCacheDecision,
-    NodeWatchCacheRecovery, RouteEntry, TopologyRequirements, parse_ipv4_route_file,
-    parse_ipv6_route_file, read_link_state_from_root, requirements_from_nodes,
-    validate_host_topology_from_roots, validate_topology_snapshot,
+    IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState, IngressTopologyStatus,
+    IngressTopologyValidator, IpCidr, LinkState, NodeWatchCacheDecision, NodeWatchCacheRecovery,
+    RouteEntry, TopologyRequirements, parse_ipv4_route_file, parse_ipv6_route_file,
+    read_link_state_from_root, requirements_from_nodes, validate_host_topology_from_roots,
+    validate_topology_snapshot,
 };
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NODE_AGENT_CAPTURE_STATE_READY,
-    NodeAgentMetrics, NodeAgentProxyMode, NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NodeAgentMetrics, NodeAgentProxyMode,
 };
 use ferrum_edge::modes::node_agent::NodeAgentConfig;
 use futures::{StreamExt, stream};
@@ -118,8 +118,7 @@ fn node_waypoint_config() -> NodeAgentConfig {
     )
     .expect("valid NodeWaypoint capture contract");
     capture_contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
-    capture_contract.node_waypoint_ingress_redirect_mark =
-        NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+    capture_contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
     capture_contract.ingress_capture_port = 15006;
     capture_contract.ingress_capture_supports_ipv6 = true;
     NodeAgentConfig {
@@ -649,7 +648,13 @@ fn node_requirements_use_complete_topology_evidence_without_admitting_peer_healt
     assert!(!requirements.require_ipv6);
 
     for incomplete in [
-        node("remote", &[], Some("True"), false, &[("InternalIP", "172.18.0.3")]),
+        node(
+            "remote",
+            &[],
+            Some("True"),
+            false,
+            &[("InternalIP", "172.18.0.3")],
+        ),
         node(
             "remote",
             &["10.244.2.0/24"],
@@ -680,12 +685,9 @@ fn joining_rebooting_and_draining_nodes_do_not_poison_cluster_topology_proof() {
         node("rebooting", &[], Some("Unknown"), false, &[]),
         node("draining", &[], Some("False"), true, &[]),
     ] {
-        let requirements = requirements_from_nodes(
-            &[local.clone(), ready.clone(), transient],
-            "local",
-            false,
-        )
-        .expect("peer health must not invalidate unchanged route evidence");
+        let requirements =
+            requirements_from_nodes(&[local.clone(), ready.clone(), transient], "local", false)
+                .expect("peer health must not invalidate unchanged route evidence");
         assert_eq!(requirements.remote_pod_cidrs, [cidr("10.244.2.0/24")]);
     }
 
@@ -700,7 +702,11 @@ fn joining_rebooting_and_draining_nodes_do_not_poison_cluster_topology_proof() {
     );
     let requirements = requirements_from_nodes(&[local, ready, allocated], "local", false)
         .expect("complete non-Ready topology evidence");
-    assert!(requirements.remote_pod_cidrs.contains(&cidr("10.244.9.0/24")));
+    assert!(
+        requirements
+            .remote_pod_cidrs
+            .contains(&cidr("10.244.9.0/24"))
+    );
 }
 
 #[test]
@@ -803,10 +809,7 @@ fn node_and_aggregate_requirement_bounds_have_distinct_closed_reasons() {
         &cidr_refs,
         Some("True"),
         false,
-        &[
-            ("InternalIP", "fd00::fffe"),
-            ("InternalIP", "fd00::ffff"),
-        ],
+        &[("InternalIP", "fd00::fffe"), ("InternalIP", "fd00::ffff")],
     );
     assert_eq!(
         requirements_from_nodes(&[local, oversized], "local", true),
@@ -819,7 +822,9 @@ fn invalid_node_cache_never_allows_ready_from_incremental_events() {
     let mut recovery = NodeWatchCacheRecovery::new();
     assert_eq!(
         recovery.on_incremental_invalid(IngressTopologyReason::NodeSetTooLarge),
-        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1_200 },
+        NodeWatchCacheDecision::ForceRelist {
+            backoff_secs: 1_200
+        },
     );
     assert_eq!(
         recovery.invalid_reason(),
@@ -855,7 +860,9 @@ fn node_cache_recovery_requires_complete_valid_replacement_snapshot() {
     );
     assert_eq!(
         recovery.on_invalid_snapshot(IngressTopologyReason::NodeSetTooLarge),
-        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1_200 },
+        NodeWatchCacheDecision::ForceRelist {
+            backoff_secs: 1_200
+        },
     );
     assert_eq!(
         recovery.on_incremental(),
@@ -951,11 +958,8 @@ async fn production_topology_monitor_processes_synthetic_node_events_and_skips_h
     let event_stream = stream::unfold(event_rx, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     });
-    let (mut outcomes, task) = spawn_node_agent_ingress_topology_monitor_for_test(
-        validator,
-        shutdown_rx,
-        event_stream,
-    );
+    let (mut outcomes, task) =
+        spawn_node_agent_ingress_topology_monitor_for_test(validator, shutdown_rx, event_stream);
 
     let local = node("local", &[], Some("True"), false, &[]);
     let remote = node(
@@ -1006,13 +1010,7 @@ async fn production_topology_monitor_processes_synthetic_node_events_and_skips_h
     // derived requirements, so it must neither poison readiness nor force a
     // host revalidation.
     event_tx
-        .send(Ok(Event::Apply(node(
-            "joining",
-            &[],
-            None,
-            false,
-            &[],
-        ))))
+        .send(Ok(Event::Apply(node("joining", &[], None, false, &[]))))
         .await
         .expect("send joining Node");
     assert!(
@@ -1224,8 +1222,7 @@ fn projected_node_cache_rejects_oversized_topology_strings() {
 fn cni_add_check_and_status_withhold_capture_ready_during_topology_loss() {
     for verb in [RpcVerb::Add, RpcVerb::Check, RpcVerb::Status] {
         assert!(
-            node_agent_cni_topology_readiness_rejection_for_test(verb, true, false)
-                .is_some(),
+            node_agent_cni_topology_readiness_rejection_for_test(verb, true, false).is_some(),
             "{verb:?} must be rejected while topology is quarantined",
         );
         assert_eq!(
@@ -1256,10 +1253,10 @@ async fn production_select_loop_applies_synthetic_ready_to_unavailable_transitio
     let mut backend = MockEbpfBackend::default();
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let pod_events = stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)])
-        .chain(stream::pending());
-    let transitions = stream::iter(vec![ready_outcome(), unavailable_outcome()])
-        .then(|outcome| async move {
+    let pod_events =
+        stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]).chain(stream::pending());
+    let transitions =
+        stream::iter(vec![ready_outcome(), unavailable_outcome()]).then(|outcome| async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             outcome
         });
@@ -1280,7 +1277,10 @@ async fn production_select_loop_applies_synthetic_ready_to_unavailable_transitio
     )
     .await;
 
-    assert!(result.is_ok(), "synthetic transition loop failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "synthetic transition loop failed: {result:?}"
+    );
     assert!(
         backend
             .capture_config_updates
