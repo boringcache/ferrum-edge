@@ -16,7 +16,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum total received gRPC payload size in bytes. For unary RPCs this is effectively a per-message limit. For streaming RPCs it caps the cumulative body size. Set to `0` for unlimited. |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `usize` | `16777216` (16MB) | Maximum WebSocket frame size in bytes. Also sets max message size to 4x frame size. |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `usize` | `131072` (128KB) | WebSocket write buffer size. Data is buffered up to this size before flushing to the transport. Default (128 KB) is optimal for 10KB-100KB payloads. Increase to `4194304` (4 MB) for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active; without plugins, the gateway uses zero-overhead raw TCP tunneling. |
-| `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum bytes admitted from any TLS material source before whole-value buffering. Default and hard maximum are both 4 MiB; `0` is not unlimited. See [TLS Material Source Ceiling](#tls-material-source-ceiling). |
+| `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum bytes admitted from any TLS material source before whole-value buffering. Default and hard maximum are both 4 MiB; `0` is rejected (not unlimited). See [TLS Material Source Ceiling](#tls-material-source-ceiling). |
 
 ## Enforcement Layers
 
@@ -114,9 +114,10 @@ Enforcement rules:
 
 - **Before or during allocation.** Provider strings and Kubernetes `ByteString` values are length-checked before `into_bytes()` / clone. Inline PEM is checked before copying. Managed and ACME material are validated at persistence/admission and again at the common loader boundary so corrupted existing state cannot bypass the ceiling.
 - **Files.** Metadata size is only an optimization. Reads always use a bounded reader through `limit + 1`, so growth after metadata inspection, non-regular files, and TOCTOU races cannot force an unbounded buffer. There is no unbounded fallback read.
-- **Finite only.** `0` is not unlimited; values outside `[1, 4194304]` are clamped. A malformed value fails closed.
+- **Finite only.** `0` is rejected (not unlimited). Values above `4194304` clamp down. A malformed value fails closed.
 - **Diagnostics.** Oversized input returns a stable, source-redacted `MaterialError::Oversized` classification. Public diagnostics never include filesystem paths, provider IDs, secret names/values, PEM fragments, or credentials.
 - **Live rotation.** An oversized watched source records a bounded `load_error`, retains the last-known-good TLS generation, and continues the existing watcher retry policy.
+- **One runtime policy.** `EnvConfig` validates and snapshots the ceiling for the process/config generation; loaders and free helpers consume that snapshot (or the same pure parser) so they cannot diverge.
 
 See also [configuration.md](configuration.md) and [frontend_tls.md](frontend_tls.md).
 

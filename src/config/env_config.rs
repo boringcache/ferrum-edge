@@ -119,23 +119,26 @@ pub const DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 pub const MIN_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 1;
 /// Hard maximum TLS material source byte ceiling (4 MiB).
 ///
-/// This is intentionally finite and equal to the default: `0` never means
-/// unlimited, and the ceiling cannot be raised past the shared PEM parse
+/// This is intentionally finite and equal to the default: `0` is rejected (never
+/// unlimited), and the ceiling cannot be raised past the shared PEM parse
 /// admission bound.
 pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Effective TLS material source byte ceiling
 /// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
 ///
-/// Read directly rather than only through `EnvConfig` because
-/// `load_material_blocking`, managed/ACME store admission, and live-reload
-/// watchers can run before or without a fully built `EnvConfig`.
+/// Prefer the immutable runtime snapshot installed by [`EnvConfig`] when
+/// present. Otherwise parse through the same pure helper EnvConfig uses so
+/// free/helper parsing cannot disagree with the configured field.
 ///
-/// Absent selects the documented default. A valid number outside
-/// `[MIN, HARD_MAX]` is clamped. A malformed value is an error (never a silent
-/// fallback to unlimited or to the default). `0` is not unlimited — it clamps
-/// to the minimum.
+/// Absent selects the documented default. Values above the hard maximum clamp
+/// down. `0` and other values below the minimum are rejected with a stable,
+/// setting-named, secret-free error. A malformed value is an error (never a
+/// silent fallback to unlimited or to the default).
 pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
+    if let Some(max_bytes) = crate::tls::source::installed_tls_max_material_size_bytes() {
+        return Ok(max_bytes);
+    }
     parse_tls_max_material_size_bytes(
         crate::config::conf_file::resolve_ferrum_var(TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
     )
@@ -147,7 +150,7 @@ pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
 /// helper so they do not race other suites on the process environment.
 pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, String> {
     let value = match raw {
-        None => DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+        None => return Ok(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES),
         Some(value) => value.trim().parse::<usize>().map_err(|_| {
             format!(
                 "{TLS_MAX_MATERIAL_SIZE_BYTES_KEY} must be a whole number of bytes; \
@@ -155,10 +158,13 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
             )
         })?,
     };
-    Ok(value.clamp(
-        MIN_TLS_MAX_MATERIAL_SIZE_BYTES,
-        HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES,
-    ))
+    if value < MIN_TLS_MAX_MATERIAL_SIZE_BYTES {
+        return Err(format!(
+            "{TLS_MAX_MATERIAL_SIZE_BYTES_KEY} must be at least \
+             {MIN_TLS_MAX_MATERIAL_SIZE_BYTES} byte; 0 is not unlimited"
+        ));
+    }
+    Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
 /// SQL connection target for secondary consumers that must track the gateway
@@ -2374,7 +2380,7 @@ pub struct EnvConfig {
     /// Maximum bytes admitted from any TLS material source before whole-value
     /// buffering (local files, inline PEM, external secret providers,
     /// Kubernetes Secrets, managed store, and ACME store). Default and hard
-    /// maximum are both 4 MiB; `0` is not unlimited. (default: 4194304)
+    /// maximum are both 4 MiB; `0` is rejected (not unlimited). (default: 4194304)
     pub tls_max_material_size_bytes: usize,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
@@ -3669,10 +3675,17 @@ impl EnvConfig {
             tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
             tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
-            tls_max_material_size_bytes: usize = "FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES" => DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES, clamp(MIN_TLS_MAX_MATERIAL_SIZE_BYTES, HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES);
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
+
+        // Same pure parser as free-helper / loader paths. Snapshot the validated
+        // limit so later loaders cannot independently re-resolve a mutable env
+        // value and diverge from this EnvConfig generation.
+        let tls_max_material_size_bytes = parse_tls_max_material_size_bytes(
+            resolve_var(conf, TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
+        )?;
+        crate::tls::source::install_tls_max_material_size_bytes(tls_max_material_size_bytes);
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it

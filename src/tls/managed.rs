@@ -216,10 +216,24 @@ impl VersionedStoreFile for ManagedTlsStoreFile {
 #[derive(Debug)]
 pub struct ManagedTlsStore {
     file: SharedStoreFile<ManagedTlsStoreFile>,
+    max_material_bytes: usize,
 }
 
 impl ManagedTlsStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, ManagedTlsError> {
+        let max_material_bytes = managed_material_max_bytes()?;
+        Self::open_with_material_limit(dir, max_material_bytes)
+    }
+
+    /// Open a managed store with an explicit material byte ceiling.
+    ///
+    /// Production callers should prefer [`Self::open`], which snapshots the
+    /// validated runtime policy. Tests inject a small finite limit here instead
+    /// of mutating process-global policy state.
+    pub fn open_with_material_limit(
+        dir: impl Into<PathBuf>,
+        max_material_bytes: usize,
+    ) -> Result<Self, ManagedTlsError> {
         let dir = dir.into();
         if dir.as_os_str().is_empty() {
             return Err(ManagedTlsError::InvalidPath(
@@ -229,6 +243,7 @@ impl ManagedTlsStore {
         std::fs::create_dir_all(&dir).map_err(|error| ManagedTlsError::Write(error.to_string()))?;
         Ok(Self {
             file: SharedStoreFile::open(dir.join(STORE_FILE_NAME))?,
+            max_material_bytes: max_material_bytes.max(1),
         })
     }
 
@@ -267,7 +282,7 @@ impl ManagedTlsStore {
         allow_overwrite: bool,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
-        validate_managed_record_material_size(&record)?;
+        validate_managed_record_material_size(&record, self.max_material_bytes)?;
         // Existence, kind conflicts, and `created_at` preservation are all
         // decided under the exclusive lock against the authoritative document,
         // so a record another instance committed is neither invisible nor
@@ -311,9 +326,22 @@ impl ManagedTlsStore {
         identifier: &str,
         fallback_kind: MaterialKind,
     ) -> Result<ManagedMaterial, ManagedTlsError> {
+        self.material_with_limit(identifier, fallback_kind, self.max_material_bytes)
+    }
+
+    /// Load material while applying an explicit byte ceiling.
+    ///
+    /// Used by the common TLS source loader so a caller-held snapshot cannot
+    /// diverge from store admission, and by tests that inject a finite limit.
+    pub fn material_with_limit(
+        &self,
+        identifier: &str,
+        fallback_kind: MaterialKind,
+        max_bytes: usize,
+    ) -> Result<ManagedMaterial, ManagedTlsError> {
         let reference = ManagedSourceReference::parse(identifier, fallback_kind)?;
         let record = self.get(&reference.id)?;
-        reference.material_from(record)
+        reference.material_from(record, max_bytes)
     }
 }
 
@@ -483,14 +511,8 @@ impl ManagedTlsRecord {
     fn public_material_bytes(&self) -> Option<Vec<u8>> {
         match self.kind {
             ManagedTlsMaterialKind::Certificate => {
-                let mut pem = self.cert_pem.clone()?;
-                if let Some(chain) = self.chain_pem.as_deref() {
-                    if !pem.ends_with('\n') {
-                        pem.push('\n');
-                    }
-                    pem.push_str(chain);
-                }
-                Some(pem.into_bytes())
+                let cert = self.cert_pem.as_deref()?;
+                Some(combine_cert_and_chain(cert, self.chain_pem.as_deref()).into_bytes())
             }
             ManagedTlsMaterialKind::CaBundle => self
                 .ca_bundle_pem
@@ -585,7 +607,11 @@ impl ManagedSourceReference {
         Ok(Self { id, part })
     }
 
-    fn material_from(&self, record: ManagedTlsRecord) -> Result<ManagedMaterial, ManagedTlsError> {
+    fn material_from(
+        &self,
+        record: ManagedTlsRecord,
+        max_bytes: usize,
+    ) -> Result<ManagedMaterial, ManagedTlsError> {
         let expected_kind = match self.part {
             ManagedMaterialPart::Cert | ManagedMaterialPart::Key => {
                 ManagedTlsMaterialKind::Certificate
@@ -605,14 +631,13 @@ impl ManagedSourceReference {
 
         let bytes = match self.part {
             ManagedMaterialPart::Cert => {
-                let Some(bytes) = record.public_material_bytes() else {
-                    return Err(ManagedTlsError::MissingMaterial {
-                        id: record.id,
+                let cert = record.cert_pem.as_deref().ok_or_else(|| {
+                    ManagedTlsError::MissingMaterial {
+                        id: record.id.clone(),
                         kind: self.part.source_suffix(),
-                    });
-                };
-                ensure_managed_bytes_within_limit(bytes.len())?;
-                bytes
+                    }
+                })?;
+                combine_cert_and_chain_checked(cert, record.chain_pem.as_deref(), max_bytes)?
             }
             ManagedMaterialPart::Key => {
                 let pem = record.key_pem.as_ref().ok_or_else(|| {
@@ -621,7 +646,7 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
-                ensure_managed_bytes_within_limit(pem.len())?;
+                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
                 pem.as_bytes().to_vec()
             }
             ManagedMaterialPart::CaBundle => {
@@ -631,7 +656,7 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
-                ensure_managed_bytes_within_limit(pem.len())?;
+                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
                 pem.as_bytes().to_vec()
             }
             ManagedMaterialPart::Crl => {
@@ -641,7 +666,7 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
-                ensure_managed_bytes_within_limit(pem.len())?;
+                ensure_managed_bytes_within_limit(pem.len(), max_bytes)?;
                 pem.as_bytes().to_vec()
             }
             ManagedMaterialPart::Ocsp => {
@@ -651,11 +676,12 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
-                let bytes = decode_base64(encoded).map_err(|_| ManagedTlsError::MissingMaterial {
-                    id: record.id.clone(),
-                    kind: self.part.source_suffix(),
-                })?;
-                ensure_managed_bytes_within_limit(bytes.len())?;
+                let bytes =
+                    decode_base64(encoded).map_err(|_| ManagedTlsError::MissingMaterial {
+                        id: record.id.clone(),
+                        kind: self.part.source_suffix(),
+                    })?;
+                ensure_managed_bytes_within_limit(bytes.len(), max_bytes)?;
                 bytes
             }
             ManagedMaterialPart::Jwks => {
@@ -665,7 +691,7 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
-                ensure_managed_bytes_within_limit(json.len())?;
+                ensure_managed_bytes_within_limit(json.len(), max_bytes)?;
                 json.as_bytes().to_vec()
             }
         };
@@ -754,45 +780,93 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("invalid base64 material: {error}"))
 }
 
+fn combine_cert_and_chain(cert_pem: &str, chain_pem: Option<&str>) -> String {
+    let Some(chain_pem) = chain_pem else {
+        return cert_pem.to_string();
+    };
+    let mut combined = cert_pem.to_string();
+    if !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(chain_pem);
+    combined
+}
+
+fn combined_cert_chain_len(cert_pem: &str, chain_pem: Option<&str>) -> Result<usize, ManagedTlsError> {
+    let Some(chain_pem) = chain_pem else {
+        return Ok(cert_pem.len());
+    };
+    let newline = usize::from(!cert_pem.ends_with('\n'));
+    cert_pem
+        .len()
+        .checked_add(newline)
+        .and_then(|n| n.checked_add(chain_pem.len()))
+        .ok_or(ManagedTlsError::MaterialTooLarge)
+}
+
+fn combine_cert_and_chain_checked(
+    cert_pem: &str,
+    chain_pem: Option<&str>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ManagedTlsError> {
+    let total = combined_cert_chain_len(cert_pem, chain_pem)?;
+    ensure_managed_bytes_within_limit(total, max_bytes)?;
+    Ok(combine_cert_and_chain(cert_pem, chain_pem).into_bytes())
+}
+
 fn managed_material_max_bytes() -> Result<usize, ManagedTlsError> {
-    // Honor the same effective ceiling as `load_material_blocking`, including
-    // any test override, so admission and load cannot disagree.
-    crate::tls::source::effective_tls_max_material_size_bytes().map_err(|error| {
-        ManagedTlsError::Write(error.to_string())
+    // Honor the same effective ceiling as `load_material_blocking` so admission
+    // and load cannot disagree for a process/config generation.
+    crate::tls::source::effective_tls_max_material_size_bytes().map_err(|error| match error {
+        crate::tls::source::MaterialError::InvalidSource { details, .. } => {
+            ManagedTlsError::InvalidConfiguration(details)
+        }
+        other => ManagedTlsError::InvalidConfiguration(other.to_string()),
     })
 }
 
-fn ensure_managed_bytes_within_limit(len: usize) -> Result<(), ManagedTlsError> {
-    let max_bytes = managed_material_max_bytes()?;
+fn ensure_managed_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), ManagedTlsError> {
     if len > max_bytes {
         return Err(ManagedTlsError::MaterialTooLarge);
     }
     Ok(())
 }
 
-fn validate_managed_record_material_size(record: &ManagedTlsRecord) -> Result<(), ManagedTlsError> {
-    ensure_managed_field_within_limit(record.cert_pem.as_deref())?;
-    ensure_managed_field_within_limit(record.key_pem.as_deref())?;
-    ensure_managed_field_within_limit(record.chain_pem.as_deref())?;
-    ensure_managed_field_within_limit(record.ca_bundle_pem.as_deref())?;
-    ensure_managed_field_within_limit(record.crl_pem.as_deref())?;
-    ensure_managed_field_within_limit(record.jwks_json.as_deref())?;
+fn validate_managed_record_material_size(
+    record: &ManagedTlsRecord,
+    max_bytes: usize,
+) -> Result<(), ManagedTlsError> {
+    ensure_managed_field_within_limit(record.cert_pem.as_deref(), max_bytes)?;
+    ensure_managed_field_within_limit(record.key_pem.as_deref(), max_bytes)?;
+    ensure_managed_field_within_limit(record.chain_pem.as_deref(), max_bytes)?;
+    ensure_managed_field_within_limit(record.ca_bundle_pem.as_deref(), max_bytes)?;
+    ensure_managed_field_within_limit(record.crl_pem.as_deref(), max_bytes)?;
+    ensure_managed_field_within_limit(record.jwks_json.as_deref(), max_bytes)?;
     if let Some(encoded) = record.ocsp_der_base64.as_deref() {
         // Encoded length is an upper bound; also check decoded size when valid.
-        ensure_managed_bytes_within_limit(encoded.len())?;
+        ensure_managed_bytes_within_limit(encoded.len(), max_bytes)?;
         if let Ok(decoded) = decode_base64(encoded) {
-            ensure_managed_bytes_within_limit(decoded.len())?;
+            ensure_managed_bytes_within_limit(decoded.len(), max_bytes)?;
         }
     }
-    if let Some(combined) = record.public_material_bytes() {
-        ensure_managed_bytes_within_limit(combined.len())?;
+    if record.kind == ManagedTlsMaterialKind::Certificate
+        && let Some(cert) = record.cert_pem.as_deref()
+    {
+        // Checked combined length before constructing cert+chain bytes.
+        let total = combined_cert_chain_len(cert, record.chain_pem.as_deref())?;
+        ensure_managed_bytes_within_limit(total, max_bytes)?;
+    } else if let Some(combined) = record.public_material_bytes() {
+        ensure_managed_bytes_within_limit(combined.len(), max_bytes)?;
     }
     Ok(())
 }
 
-fn ensure_managed_field_within_limit(value: Option<&str>) -> Result<(), ManagedTlsError> {
+fn ensure_managed_field_within_limit(
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ManagedTlsError> {
     if let Some(value) = value {
-        ensure_managed_bytes_within_limit(value.len())?;
+        ensure_managed_bytes_within_limit(value.len(), max_bytes)?;
     }
     Ok(())
 }
