@@ -6163,11 +6163,13 @@ struct RequestConnectionMetadata {
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached and binds a Sidecar ingress CONNECT to this replica.
     ///
-    /// Populated only on MESH listeners (`mesh_direction.is_some()`), like
-    /// `orig_dst`, and only after the accept loop's overload / connection-permit
-    /// fast-reject arms — the `getsockname` must not be charged to every
-    /// non-mesh accept or to a flood of connections the gateway is about to RST.
-    /// `None` everywhere else; its one consumer fails closed without it.
+    /// Populated only on the INBOUND mesh listener
+    /// (`mesh_direction == Some(Inbound)`, the only direction its consumer
+    /// `build_inbound_hbone_relay_proxy` runs on), and only after the accept
+    /// loop's overload / connection-permit fast-reject arms — the `getsockname`
+    /// must not be charged to every non-mesh or captured-egress accept, or to a
+    /// flood of connections the gateway is about to RST. `None` everywhere
+    /// else; its one consumer fails closed without it.
     accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
@@ -17405,12 +17407,21 @@ async fn run_accept_loop(
                         };
                         // Concrete local address of the accepted connection —
                         // the pod IP the peer actually reached, even when the
-                        // listener is bound to a wildcard address. Gated on a
-                        // mesh listener exactly like `orig_dst` above (its only
-                        // consumer is the mesh-inbound CONNECT boundary), and
-                        // read only AFTER the overload/permit fast-reject arms
-                        // so a connection flood still costs zero extra syscalls.
-                        let accepted_local_addr = if mesh_direction.is_some() {
+                        // listener is bound to a wildcard address. Read only
+                        // AFTER the overload/permit fast-reject arms so a
+                        // connection flood still costs zero extra syscalls.
+                        //
+                        // Gated to the INBOUND mesh listener, the only direction
+                        // its consumer runs on: `build_inbound_hbone_relay_proxy`
+                        // is synthesized solely when `mesh_direction == Inbound`.
+                        // Computing it on the outbound capture listener would add
+                        // a `getsockname()` to every captured egress connection —
+                        // whose `orig_dst` is already present, so the value would
+                        // never be read. `connection_destination_ip` below keeps
+                        // its own LAZY wildcard fallback for that direction.
+                        let accepted_local_addr = if mesh_direction
+                            == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                        {
                             frontend_bound_addr
                                 .filter(|addr| !addr.ip().is_unspecified())
                                 .or_else(|| {
@@ -17434,6 +17445,12 @@ async fn run_accept_loop(
                         let connection_destination_ip = orig_dst
                             .map(|addr| addr.ip())
                             .or_else(|| accepted_local_addr.map(|addr| addr.ip()))
+                            .or(frontend_bound_ip)
+                            .or_else(|| {
+                                resolve_connection_destination_ip
+                                    .then(|| stream.local_addr().ok().map(|addr| addr.ip()))
+                                    .flatten()
+                            })
                             .map(crate::util::client_identity::canonical_ip);
                         let tls_selection = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
