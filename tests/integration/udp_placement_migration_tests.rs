@@ -229,11 +229,7 @@ fn marker_publication_reaps_only_owned_exact_prefix_temporary_files() {
     std::fs::write(&foreign_prefix, b"foreign").expect("foreign file");
 
     assert_eq!(
-        publish_registry_sync_marker_for_pods(
-            registry.path(),
-            "temp-reap",
-            &HashSet::new(),
-        ),
+        publish_registry_sync_marker_for_pods(registry.path(), "temp-reap", &HashSet::new(),),
         Ok(true)
     );
     assert!(!owned.exists());
@@ -255,16 +251,15 @@ fn marker_temp_reaper_refuses_symlinks_and_directories() {
     std::fs::create_dir(&directory_temp).expect("directory temp");
 
     assert_eq!(
-        publish_registry_sync_marker_for_pods(
-            registry.path(),
-            "temp-reap-safe",
-            &HashSet::new(),
-        ),
+        publish_registry_sync_marker_for_pods(registry.path(), "temp-reap-safe", &HashSet::new(),),
         Ok(true)
     );
     assert!(symlink_temp.symlink_metadata().is_ok());
     assert!(directory_temp.is_dir());
-    assert_eq!(std::fs::read(&foreign).expect("foreign survives"), b"foreign");
+    assert_eq!(
+        std::fs::read(&foreign).expect("foreign survives"),
+        b"foreign"
+    );
 }
 
 #[test]

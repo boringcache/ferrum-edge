@@ -12400,12 +12400,10 @@ async fn arm_mesh_runtime_startup(
             crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(target).map_err(
                 |error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"),
             )?;
-        let placement_decision = match
-            crate::proxy::udp_placement_migration::prepare_placement(
-                registry_dir,
-                &migration_request,
-            )
-        {
+        let placement_decision = match crate::proxy::udp_placement_migration::prepare_placement(
+            registry_dir,
+            &migration_request,
+        ) {
             Ok(decision) => Some(decision),
             Err(error) => {
                 use crate::proxy::udp_placement_migration::{
@@ -12434,9 +12432,9 @@ async fn arm_mesh_runtime_startup(
         };
         let run_stable_placement = match placement_decision {
             Some(crate::proxy::udp_placement_migration::UdpPlacementDecision::RunStable) => true,
-            Some(
-                crate::proxy::udp_placement_migration::UdpPlacementDecision::RunCleanup(context),
-            ) => {
+            Some(crate::proxy::udp_placement_migration::UdpPlacementDecision::RunCleanup(
+                context,
+            )) => {
                 udp_migration_blocks_readiness = true;
                 if context.cleanup_pod_netns() {
                     crate::proxy::netns_udp_capture::preflight_capture_tools(true)
@@ -17611,15 +17609,14 @@ mod tests {
             from: Some(UdpPlacement::PodNetns),
             to: Some(UdpPlacement::HostNetns),
         };
-        let context = match prepare_placement(registry.path(), &cleanup)
-            .expect("cleanup placement")
+        let context = match prepare_placement(registry.path(), &cleanup).expect("cleanup placement")
         {
             UdpPlacementDecision::RunCleanup(context) => context,
             UdpPlacementDecision::RunStable => panic!("cleanup must not run a producer"),
         };
-        let source = Arc::new(
-            crate::proxy::netns_capture::DirectoryCaptureSource::new(registry.path()),
-        );
+        let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+            registry.path(),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_ambient_udp_placement_cleanup(
             context,
@@ -17628,7 +17625,10 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        assert_eq!(snapshot().phase, UdpMigrationStatusPhase::WaitingForRegistry);
+        assert_eq!(
+            snapshot().phase,
+            UdpMigrationStatusPhase::WaitingForRegistry
+        );
         assert!(
             publish_registry_sync_marker_for_pods(
                 registry.path(),

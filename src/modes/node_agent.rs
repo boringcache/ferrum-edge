@@ -14935,10 +14935,7 @@ mod tests {
         let startup_ready = Arc::new(AtomicBool::new(false));
         let readiness = startup_ready.clone();
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        let events = futures_util::stream::iter(vec![
-            Ok(Event::Init),
-            Ok(Event::InitDone),
-        ]);
+        let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]);
 
         let error = run_with_pod_stream(
             &mut owner,
@@ -14988,11 +14985,8 @@ mod tests {
         let readiness = startup_ready.clone();
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let stop = shutdown_tx.clone();
-        let events = futures_util::stream::iter(vec![
-            Ok(Event::Init),
-            Ok(Event::InitDone),
-        ])
-        .chain(futures_util::stream::pending());
+        let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)])
+            .chain(futures_util::stream::pending());
 
         let run = run_with_pod_stream(
             &mut owner,
