@@ -17498,6 +17498,10 @@ components:
                           forms: attribute reads,
                           `string(<int attribute>)`, and
                           `has(<string attribute>) ? <then> : <else>`.
+                          OpenAPI `maxLength` counts Unicode characters;
+                          runtime admission separately enforces the 512-byte
+                          UTF-8 limit, so a multibyte expression can be rejected
+                          below 512 characters.
                       expression:
                         type: object
                         description: |

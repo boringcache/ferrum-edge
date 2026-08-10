@@ -5908,6 +5908,13 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .expect("metric tag overrides description");
     assert!(override_description.contains("16384 encoded bytes"));
 
+    let cel_description = tag_overrides
+        .pointer("/items/properties/operation/properties/cel/description")
+        .and_then(Value::as_str)
+        .expect("metric tag CEL description");
+    assert!(cel_description.contains("512-byte UTF-8 limit"));
+    assert!(cel_description.contains("counts Unicode characters"));
+
     let ascii_256 = "x".repeat(256);
     let ascii_257 = "x".repeat(257);
     let metric_config = |value: &str| {
