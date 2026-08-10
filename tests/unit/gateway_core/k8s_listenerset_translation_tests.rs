@@ -1073,6 +1073,7 @@ fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
             "allowedListeners": {"namespaces": {"from": "Same"}},
             "listeners": [{
                 "name": "same",
+                "port": 80,
                 "protocol": "HTTP",
                 "allowedRoutes": {"namespaces": {"from": "Same"}}
             }]
@@ -1080,7 +1081,7 @@ fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
     );
     let set = listenerset(
         "shared",
-        "shared",
+        "listenerset-shared",
         json!([{
             "name": "same",
             "port": 8080,
@@ -1090,13 +1091,29 @@ fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
     );
     let objects = vec![gateway_class(), gateway, set];
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let mesh = translation
+        .config
+        .mesh
+        .as_ref()
+        .expect("collision regression should materialize mesh listener services");
     assert!(
-        translation.config.mesh.as_ref().is_some_and(|mesh| {
-            mesh.services
-                .iter()
-                .any(|service| service.name == "listenerset-shared-same")
+        mesh.services
+            .iter()
+            .any(|service| service.name == "gateway-listenerset-shared-same"),
+        "the Gateway must emit gateway-{{name}}-{{listener}} even when its name starts with listenerset-"
+    );
+    assert!(
+        mesh.services
+            .iter()
+            .any(|service| service.name == "listenerset-shared-same"),
+        "the ListenerSet should still emit its own listenerset-{{name}}-{{listener}} identity"
+    );
+    assert!(
+        mesh.services.iter().all(|service| {
+            service.name != "listenerset-shared-same"
+                || service.ports.iter().any(|port| port.port == 8080)
         }),
-        "the ListenerSet should emit a kind-scoped service"
+        "the ListenerSet-prefixed colliding name must remain ListenerSet-owned, not a Gateway identity"
     );
 
     let updates =
@@ -1112,8 +1129,17 @@ fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
         .find(|condition| condition["type"] == "Programmed")
         .expect("Gateway Programmed condition");
     assert_eq!(
-        programmed["status"], "False",
-        "a ListenerSet-owned service must not program a Gateway whose name collides with the ListenerSet identity"
+        programmed["status"], "True",
+        "Gateway Programmed must follow the gateway- kind-scoped identity, not the ListenerSet-prefixed colliding name"
+    );
+    let set_status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.kind == "ListenerSet" && status.resource.name == "shared")
+        .expect("ListenerSet translation status");
+    assert!(
+        set_status.programmed && set_status.programmed_listeners == ["same"],
+        "the ListenerSet listener should stay programmed on its own kind-scoped identity"
     );
 }
 
