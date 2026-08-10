@@ -38,8 +38,10 @@ use tokio_stream::wrappers::{
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
+use ferrum_edge::proxy::ConfigApplyOutcome;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
@@ -63,7 +65,9 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
 
-use crate::common::{TestGateway, ensure_gateway_built};
+use crate::common::{
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, ensure_gateway_built,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
 use crate::scaffolding::ports::reserve_port;
@@ -4495,7 +4499,7 @@ fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
         .find("arm_application_phase")
         .expect("live fixture must arm application phase before the request");
     let request = live
-        .find("grpc_mesh_retry_request(gateway.proxy_port, &payload, None)")
+        .find("grpc_mesh_retry_request(gateway.proxy_http_port, &payload, None)")
         .expect("live fixture application request not found");
     assert!(
         arm < request,
@@ -4874,6 +4878,9 @@ async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_
         )
         .await;
 
+    // Trusted projection: mesh.* transport tags are stamped the way slice
+    // materialization does, then fed to in-process `file::serve`. Operator
+    // file-mode YAML must continue rejecting these tags.
     let config = format!(
         r#"version: "1"
 proxies:
@@ -4904,20 +4911,22 @@ consumers: []
 plugin_configs: []
 "#
     );
-    let mut gateway = TestGateway::builder()
-        .mode_file(config)
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_GATEWAY_SVID_CERT_PATH", &svids.a.cert_path)
-        .env("FERRUM_GATEWAY_SVID_KEY_PATH", &svids.a.key_path)
-        .env(
-            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-            &svids.a.trust_bundle_path,
-        )
-        .capture_output()
-        .reserve_listener_port(backend_port)
-        .spawn()
-        .await
-        .expect("spawn retry-enabled mesh gateway");
+    let mut env = EnvConfig::default();
+    env.pool_warmup_enabled = false;
+    env.tls_no_verify = true;
+    env.gateway_svid_cert_path = Some(svids.a.cert_path.clone());
+    env.gateway_svid_key_path = Some(svids.a.key_path.clone());
+    env.gateway_svid_trust_bundle_path = Some(svids.a.trust_bundle_path.clone());
+    let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config,
+        TrustedProjectedGatewayOptions {
+            env,
+            excluded_ports: vec![backend_port],
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("spawn retry-enabled mesh gateway via trusted projection");
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -4931,7 +4940,7 @@ plugin_configs: []
         .expect("mesh retry backend application phase receiver dropped");
 
     let payload = grpc_framed_payload(b"mesh-replay-body");
-    let response = grpc_mesh_retry_request(gateway.proxy_port, &payload, None)
+    let response = grpc_mesh_retry_request(gateway.proxy_http_port, &payload, None)
         .await
         .expect("secured mesh retry request");
     assert_eq!(
@@ -5012,7 +5021,7 @@ plugin_configs: []
         "x-native-request-trailer",
         hyper::header::HeaderValue::from_static("must-not-disappear"),
     );
-    let rejected = grpc_mesh_retry_request(gateway.proxy_port, &payload, Some(native_trailers))
+    let rejected = grpc_mesh_retry_request(gateway.proxy_http_port, &payload, Some(native_trailers))
         .await
         .expect("native trailer refusal response");
     assert_eq!(
@@ -15047,8 +15056,10 @@ fn h3_mesh_frontend_certs() -> H3MeshFrontendCerts {
 }
 
 /// One upstream-target YAML block (indented for `upstreams[].targets`) carrying
-/// `tags` verbatim, so a test declares the exact mesh metadata the runtime
-/// transport materialization has to consume — no in-process target construction.
+/// `tags` verbatim. The block is deserialized into a trusted projected
+/// [`GatewayConfig`] and fed to in-process serve / `update_config` — the same
+/// runtime boundary production mesh materialization uses — rather than being
+/// written through the operator file-loader (which must keep rejecting `mesh.*`).
 fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String {
     let mut block = String::new();
     block.push_str(&format!("      - host: \"{host}\"\n"));
@@ -15063,20 +15074,20 @@ fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String
 }
 
 /// The upstream id every H3 mesh gRPC config declares. Shared with
-/// `h3_mesh_reload`, which polls the admin projection of THIS upstream to prove a
-/// SIGHUP reload has been applied.
+/// `h3_mesh_reload`, which waits until the applied projection exposes these
+/// upstream tags after a trusted `update_config`.
 const H3_MESH_UPSTREAM_ID: &str = "h3-mesh-grpc-upstream";
 
-/// File-mode YAML for ONE gRPC-serving proxy whose upstream carries the supplied
-/// target blocks. `dead_backend_port` is the proxy's own (unlistened) backend, so
-/// only a mesh dispatch can reach anything at all.
+/// Trusted-projected fixture YAML for ONE gRPC-serving proxy whose upstream
+/// carries the supplied target blocks. `dead_backend_port` is the proxy's own
+/// (unlistened) backend, so only a mesh dispatch can reach anything at all.
 fn h3_mesh_grpc_config(dead_backend_port: u16, targets: &str, retry: bool) -> String {
     h3_mesh_grpc_config_with_generation(dead_backend_port, targets, retry, 0)
 }
 
 /// Like [`h3_mesh_grpc_config`], but stamps an advancing `updated_at` on the
-/// proxy and upstream so file-mode `ConfigDelta` sees a real modification even
-/// when only mesh target tags change (host/port stay fixed across reloads).
+/// proxy and upstream so `ConfigDelta` sees a real modification even when only
+/// mesh target tags change (host/port stay fixed across projected reloads).
 fn h3_mesh_grpc_config_with_generation(
     dead_backend_port: u16,
     targets: &str,
@@ -15118,44 +15129,48 @@ plugin_configs: []
     )
 }
 
-/// Spawn a file-mode gateway with a QUIC/HTTP-3 frontend and a real SPIFFE SVID
-/// loaded from files. Returns the gateway plus the HTTPS/QUIC port to drive.
+/// Spawn an in-process gateway with a QUIC/HTTP-3 frontend and a real SPIFFE
+/// SVID, feeding a **trusted projected** config (may carry reserved `mesh.*`
+/// tags) through `file::serve` — the same boundary mesh materialization uses.
+/// Returns the gateway plus the HTTPS/QUIC port to drive.
 ///
-/// `reserved_ports` are ports this test's fixtures already own, so the harness's
-/// own admin/proxy allocation cannot land on one of them.
+/// `reserved_ports` are ports this test's fixtures already own; the HTTPS port
+/// is allocated from the mesh-port set so it cannot collide with them.
 async fn spawn_h3_mesh_gateway(
     config_yaml: String,
     svid: &GeneratedGatewaySvid,
     frontend: &H3MeshFrontendCerts,
     reserved_ports: &[u16],
-) -> (TestGateway, u16) {
-    let https_port = reserve_unique_mesh_port().await;
-    let mut builder = TestGateway::builder()
-        .mode_file(config_yaml)
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", frontend.cert_path.clone())
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", frontend.key_path.clone())
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        // gRPC always rides the cross-protocol bridge, never the native-H3
-        // backend pool, so the capability warmup probe has nothing to prove and
-        // would only add an unrelated dial to the fixtures.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_GATEWAY_SVID_CERT_PATH", svid.cert_path.clone())
-        .env("FERRUM_GATEWAY_SVID_KEY_PATH", svid.key_path.clone())
-        .env(
-            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-            svid.trust_bundle_path.clone(),
-        );
-    for port in reserved_ports {
-        builder = builder.reserve_listener_port(*port);
-    }
-    let gateway = builder.spawn().await.expect("spawn H3 mesh gRPC gateway");
+) -> (TrustedProjectedGateway, u16) {
+    let mut env = EnvConfig::default();
+    env.enable_http3 = true;
+    env.pool_warmup_enabled = false;
+    env.tls_no_verify = true;
+    env.frontend_tls_cert_path = Some(frontend.cert_path.clone());
+    env.frontend_tls_key_path = Some(frontend.key_path.clone());
+    env.gateway_svid_cert_path = Some(svid.cert_path.clone());
+    env.gateway_svid_key_path = Some(svid.key_path.clone());
+    env.gateway_svid_trust_bundle_path = Some(svid.trust_bundle_path.clone());
+    env.log_level = "warn".into();
+
+    let gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config_yaml,
+        TrustedProjectedGatewayOptions {
+            env,
+            enable_https: true,
+            excluded_ports: reserved_ports.to_vec(),
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("spawn H3 mesh gRPC gateway via trusted projection");
     gateway
         .wait_for_proxy_port(Duration::from_secs(15))
         .await
         .expect("H3 mesh gRPC gateway proxy port");
+    let https_port = gateway
+        .proxy_https_port
+        .expect("H3 mesh gateway must expose an HTTPS/QUIC port");
     (gateway, https_port)
 }
 
@@ -15961,8 +15976,8 @@ async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
 // ── 9. Configuration update / reload / withdrawal ──────────────────────────
 
 /// The live transport follows configuration TRANSITIONS, not just first-start
-/// construction. One gateway process is driven through three SIGHUP file-mode
-/// reloads:
+/// construction. One trusted-projected gateway is driven through three
+/// in-process `update_config` applications (the mesh materialization boundary):
 ///
 /// 1. the mesh target is RE-POINTED at a second peer with a different pinned
 ///    workload identity — the RPC must move to that peer over its own dial plan;
@@ -16018,7 +16033,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
 
     // 1. UPDATE: re-point the mesh target at peer B (different pinned identity).
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
-    h3_mesh_reload(&mut gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
+    h3_mesh_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
     let retargeted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         retargeted.grpc_status().as_deref(),
@@ -16036,7 +16051,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     // 2. WITHDRAWAL: drop the mesh transport tags entirely. The target becomes an
     //    ordinary direct-dial one, so the mesh listener must stop being reached.
     let peer_b_accepts = peer_b.accept_count();
-    h3_mesh_reload(&mut gateway, config_for(&[], 2), &[]).await;
+    h3_mesh_reload(&gateway, config_for(&[], 2), &[]).await;
     let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_ne!(
         withdrawn.grpc_status().as_deref(),
@@ -16062,7 +16077,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
     h3_mesh_reload(
-        &mut gateway,
+        &gateway,
         config_for(&corrupted_tags, 3),
         &corrupted_tags,
     )
@@ -16085,102 +16100,43 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     gateway.shutdown();
 }
 
-/// Rewrite the running file-mode gateway's config, SIGHUP it, and WAIT until the
-/// gateway's OWN read-only admin projection proves the new upstream targets are
-/// the live ones.
+/// Apply a new trusted projected config via `ProxyState::update_config` and wait
+/// until the live projection exposes the expected upstream target tags.
 ///
-/// A fixed sleep is not proof: on a loaded hosted runner the reload can land
-/// after it, and the very next RPC then exercises the PREVIOUS target — which
-/// reads as "the re-pointed peer was never dialed" instead of "the reload had
-/// not landed yet". Polling the applied config observes convergence directly and
-/// spends no datapath RPC, so each step's authoritative protocol / fail-closed
-/// observation is still made exactly once, against a known-converged gateway.
-/// The child is polled between probes so a gateway that died on the reload fails
-/// as itself rather than being waited out for the whole window.
-///
-/// Publish via write-temp → rename (the file loader's stability contract) and
-/// assert `kill -HUP` succeeded — discarding the signal status previously hid
-/// delivery failures behind a 20s admin-poll timeout.
+/// This is the mesh materialization reload boundary — not SIGHUP / file-loader
+/// reload, which must keep rejecting operator-authored `mesh.*` tags. Polling
+/// the applied projection observes convergence directly without spending a
+/// datapath RPC, so each step's authoritative protocol / fail-closed observation
+/// is still made exactly once against a known-converged gateway.
 async fn h3_mesh_reload(
-    gateway: &mut TestGateway,
+    gateway: &TrustedProjectedGateway,
     config_yaml: String,
     expected_tags: &[(&'static str, String)],
 ) {
-    let config_path = gateway
-        .config_path
-        .as_ref()
-        .expect("file-mode harness must populate config_path")
-        .clone();
-    let tmp_path = config_path.with_extension("yaml.tmp");
-    std::fs::write(&tmp_path, &config_yaml).expect("stage H3 mesh config rewrite");
-    std::fs::rename(&tmp_path, &config_path).expect("atomically publish H3 mesh config rewrite");
-    #[cfg(unix)]
-    {
-        let pid = gateway.pid().expect("gateway still running");
-        let signal = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
-            .output()
-            .expect("invoke kill -HUP for H3 mesh reload");
-        assert!(
-            signal.status.success(),
-            "kill -HUP {pid} failed with status {}; stderr={}",
-            signal.status,
-            String::from_utf8_lossy(&signal.stderr)
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = config_yaml;
-        panic!("H3 mesh file-mode SIGHUP reload requires Unix");
-    }
+    let outcome = gateway.apply_projected_yaml(&config_yaml);
+    assert!(
+        matches!(
+            outcome,
+            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
+        ),
+        "trusted projected H3 mesh reload must apply, got {outcome:?}"
+    );
 
-    let expected: serde_json::Map<String, serde_json::Value> = expected_tags
+    let expected: HashMap<String, String> = expected_tags
         .iter()
-        .map(|(key, value)| ((*key).to_string(), serde_json::Value::String(value.clone())))
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
         .collect();
-    let url = gateway.admin_url(&format!("/upstreams/{H3_MESH_UPSTREAM_ID}"));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("admin client");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let last = match client
-            .get(&url)
-            .header("Authorization", gateway.auth_header())
-            .send()
-            .await
-        {
-            Ok(response) => match response.json::<serde_json::Value>().await {
-                Ok(upstream) => {
-                    let tags = upstream
-                        .get("targets")
-                        .and_then(|targets| targets.as_array())
-                        .and_then(|targets| targets.first())
-                        .and_then(|target| target.get("tags"))
-                        .and_then(|tags| tags.as_object())
-                        .cloned()
-                        .unwrap_or_default();
-                    if tags == expected {
-                        return;
-                    }
-                    format!("live target tags {tags:?}")
-                }
-                Err(error) => format!("unreadable admin response: {error}"),
-            },
-            Err(error) => format!("admin request failed: {error}"),
-        };
-        let logs = gateway.diagnostic_captured_output();
-        assert!(
-            gateway.is_running(),
-            "the gateway died while reloading the H3 mesh config ({last})\n\
-             --- captured gateway output ---\n{logs}"
-        );
+        let live = gateway.live_upstream_tags(H3_MESH_UPSTREAM_ID);
+        if live == expected {
+            return;
+        }
         assert!(
             Instant::now() < deadline,
-            "the SIGHUP reload never applied the expected mesh target tags \
-             {expected:?} ({last})\n--- captured gateway output ---\n{logs}"
+            "trusted projected reload never exposed expected mesh target tags \
+             {expected:?}; live={live:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

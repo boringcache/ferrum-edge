@@ -63,6 +63,7 @@ pub mod gateway_harness;
 pub mod hmac_helpers;
 pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
+pub mod trusted_projected_gateway;
 
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
@@ -83,6 +84,9 @@ pub use gateway_harness::{
     captured_output_reports_listener_addr_in_use, configure_coverage_gateway_command,
     ensure_gateway_built, ephemeral_port, explicit_test_binary, probe_gateway_identity,
     scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
+};
+pub use trusted_projected_gateway::{
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, trusted_projected_config_from_yaml,
 };
 pub use hmac_helpers::{
     empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
