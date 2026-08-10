@@ -697,7 +697,7 @@ pub fn publish_registry_sync_marker_for_pods(
 
 fn registry_sync_proof(registry_dir: &Path) -> Option<UdpRegistrySyncProof> {
     let path = registry_dir.join(REGISTRY_SYNC_FILE);
-    let mut file = open_owned_regular_file(&path, MAX_REGISTRY_SYNC_MARKER_BYTES).ok()?;
+    let file = open_owned_regular_file(&path, MAX_REGISTRY_SYNC_MARKER_BYTES).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_REGISTRY_SYNC_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)
