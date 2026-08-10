@@ -2,6 +2,7 @@
 # already-packaged Debian 13 distroless Ferrum image. Only the executable and
 # its loader-resolved shared-object closure cross into the final image; no shell,
 # package manager, or iptables fallback tools are shipped.
+ARG BASE_IMAGE
 FROM debian:13-slim AS iproute2-runtime
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && mkdir -p /iproute2-root \
@@ -15,6 +16,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     done < /tmp/iproute2-libraries \
     && rm -rf /var/lib/apt/lists/*
 
-ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 COPY --from=iproute2-runtime /iproute2-root/ /
