@@ -1,6 +1,7 @@
 //! Integration coverage for Gateway API status concurrency and typed route
 //! materialization records.
 
+use ferrum_edge::config::types::MAX_FRONTEND_TLS_CERTIFICATE_SOURCES;
 use ferrum_edge::config_sources::k8s::{
     GatewayApiListenerKey, GatewayApiListenerParentKind, K8sMetadata, K8sObject,
     K8sTranslationOptions, translate_k8s_objects,
@@ -1114,6 +1115,306 @@ fn physically_refused_hostname_winner_does_not_conflict_the_surviving_listener()
             .any(|source| source.gateway == "edge-new")
     );
     assert!(translation.frontend_tls_hostname_conflicts.is_empty());
+}
+
+#[test]
+fn oversized_cap_loser_does_not_reserve_hostname_from_healthy_listener() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let oversized_refs = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+        .map(|index| json!({"name": format!("oversized-cert-{index}")}))
+        .collect::<Vec<_>>();
+    let mut oversized = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-oversized",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "https",
+                "port": 8443,
+                "protocol": "HTTPS",
+                "hostname": "shop.example.com",
+                "tls": {"mode": "Terminate", "certificateRefs": oversized_refs},
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    );
+    oversized.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut healthy = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-healthy",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "https",
+                "port": 9443,
+                "protocol": "HTTPS",
+                "hostname": "shop.example.com",
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "healthy-cert"}]},
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    );
+    healthy.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+    let healthy_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "healthy-route",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge-healthy", "sectionName": "https"}],
+            "rules": [{"backendRefs": [{"name": "backend", "port": 8080}]}]
+        }),
+    );
+    let oversized_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "oversized-route",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge-oversized", "sectionName": "https"}],
+            "rules": [{"backendRefs": [{"name": "backend", "port": 8080}]}]
+        }),
+    );
+    let mut objects = vec![
+        class,
+        oversized,
+        healthy,
+        healthy_route,
+        oversized_route,
+        tls_secret_object("healthy-cert"),
+    ];
+    objects.extend(
+        (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1)
+            .map(|index| tls_secret_object(&format!("oversized-cert-{index}"))),
+    );
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert_eq!(translation.config.frontend_tls_certificate_sources.len(), 1);
+    assert_eq!(
+        translation.config.frontend_tls_certificate_sources[0].gateway,
+        "edge-healthy"
+    );
+    assert!(translation.frontend_tls_hostname_conflicts.is_empty());
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("edge-oversized")
+            && warning.contains("Gateway frontend TLS certificate limit")
+    }));
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("healthy-route")),
+        "the capacity-fitting listener must retain its route"
+    );
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.id.contains("oversized-route")),
+        "the cap loser must not retain its route"
+    );
+
+    let healthy_update = gateway_update(&objects, "edge-healthy");
+    let healthy_listener = listener_status(&healthy_update, "https");
+    assert_eq!(
+        listener_condition(healthy_listener, "Conflicted")["status"].as_str(),
+        Some("False")
+    );
+    assert_eq!(
+        listener_condition(healthy_listener, "Programmed")["status"].as_str(),
+        Some("True")
+    );
+    let oversized_update = gateway_update(&objects, "edge-oversized");
+    let oversized_listener = listener_status(&oversized_update, "https");
+    assert_eq!(
+        listener_condition(oversized_listener, "Conflicted")["status"].as_str(),
+        Some("False"),
+        "a cap refusal is not a hostname collision"
+    );
+    assert_eq!(
+        listener_condition(oversized_listener, "Programmed")["status"].as_str(),
+        Some("False")
+    );
+}
+
+#[test]
+fn non_fitting_hostname_claim_after_cap_fill_does_not_suppress_later_claim() {
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let fill_listeners = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
+        .map(|index| {
+            json!({
+                "name": format!("fill-{index:03}"),
+                "port": 10000 + index,
+                "protocol": "HTTPS",
+                "hostname": format!("fill-{index}.example.com"),
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "fill-cert"}]},
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut fill = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-fill",
+        "default",
+        json!({"gatewayClassName": "ferrum", "listeners": fill_listeners}),
+    );
+    fill.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut non_fitting = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-non-fitting",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "https",
+                "port": 20000,
+                "protocol": "HTTPS",
+                "hostname": "shop.example.com",
+                "tls": {
+                    "mode": "Terminate",
+                    "certificateRefs": [{"name": "blocked-a"}, {"name": "blocked-b"}]
+                },
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    );
+    non_fitting.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+    let mut healthy = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-healthy",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "https",
+                "port": 20001,
+                "protocol": "HTTPS",
+                "hostname": "shop.example.com",
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "healthy-cert"}]},
+                "allowedRoutes": {"namespaces": {"from": "All"}}
+            }]
+        }),
+    );
+    healthy.metadata.creation_timestamp = Some("2026-03-01T00:00:00Z".to_string());
+    let healthy_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "healthy-route",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge-healthy", "sectionName": "https"}],
+            "rules": [{"backendRefs": [{"name": "backend", "port": 8080}]}]
+        }),
+    );
+    let blocked_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "blocked-route",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge-non-fitting", "sectionName": "https"}],
+            "rules": [{"backendRefs": [{"name": "backend", "port": 8080}]}]
+        }),
+    );
+    let objects = vec![
+        class,
+        healthy,
+        non_fitting,
+        fill,
+        healthy_route,
+        blocked_route,
+        tls_secret_object("fill-cert"),
+        tls_secret_object("blocked-a"),
+        tls_secret_object("blocked-b"),
+        tls_secret_object("healthy-cert"),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert_eq!(
+        translation.config.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .any(|source| {
+                source.gateway == "edge-healthy"
+                    && source.hostname.as_deref() == Some("shop.example.com")
+            })
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .all(|source| source.gateway != "edge-non-fitting")
+    );
+    assert!(translation.frontend_tls_hostname_conflicts.is_empty());
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("edge-non-fitting")
+            && warning.contains("Gateway frontend TLS certificate limit")
+    }));
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("healthy-route")),
+        "the later one-certificate claim must materialize its route"
+    );
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.id.contains("blocked-route")),
+        "the non-fitting listener must not retain its route"
+    );
+
+    let healthy_update = gateway_update(&objects, "edge-healthy");
+    let healthy_listener = listener_status(&healthy_update, "https");
+    assert_eq!(
+        listener_condition(healthy_listener, "Conflicted")["status"].as_str(),
+        Some("False")
+    );
+    assert_eq!(
+        listener_condition(healthy_listener, "Programmed")["status"].as_str(),
+        Some("True")
+    );
+    let non_fitting_update = gateway_update(&objects, "edge-non-fitting");
+    let non_fitting_listener = listener_status(&non_fitting_update, "https");
+    assert_eq!(
+        listener_condition(non_fitting_listener, "Conflicted")["status"].as_str(),
+        Some("False"),
+        "the cap loser must not own status conflict precedence"
+    );
+    assert_eq!(
+        listener_condition(non_fitting_listener, "Programmed")["status"].as_str(),
+        Some("False")
+    );
 }
 
 /// Physically refused same-port listeners must not be advertised as

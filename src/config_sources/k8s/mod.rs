@@ -18,15 +18,7 @@ pub(crate) use gateway_api::{
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
     merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
-// Shared with the Gateway status writer (`crate::k8s_controller::status`) so
-// the translator's "which listener owns this SNI hostname" decision and the
-// status writer's `Conflicted`/`ResolvedRefs` reporting are one predicate
-// (#3267 / #3268). A listener the translator withdrew must not be reported as
-// serving, and one it kept must not be reported as conflicted.
-pub(crate) use gateway_api::{
-    FrontendTlsHostnameClaim, frontend_tls_hostname_conflict_losers, normalize_gateway_hostname,
-    parse_k8s_timestamp, sort_frontend_tls_hostname_claims,
-};
+pub(crate) use gateway_api::normalize_gateway_hostname;
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
 // must observe the same constants the translator enforces rather than

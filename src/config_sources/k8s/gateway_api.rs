@@ -121,27 +121,25 @@ struct RouteBackendResolution {
     valid_weight: u32,
 }
 
-/// One Gateway listener's claim on an SNI hostname, used to decide which
-/// listener owns a hostname when several claim it with different certificates.
+/// One Gateway listener's claim on an SNI hostname, used by the shared
+/// certificate-cap/hostname admission decision.
 ///
-/// Built by BOTH the translator and the Gateway status writer so the two
-/// surfaces cannot disagree about which listener lost a collision. The
-/// per-certificate identity is opaque and only ever compared for equality, so
-/// each side may key it however it can (the translator uses the full
-/// `k8s://…?sha256=…` source URI, the status writer the `(namespace, name)` of
-/// the Secret) — within one snapshot the two orderings agree.
+/// Translation publishes that decision's exact loser map in
+/// `K8sTranslation::frontend_tls_hostname_conflicts`; Gateway status consumes
+/// the map and does not rebuild claims from raw objects. The per-certificate
+/// identity is opaque and only ever compared for equality.
 #[derive(Debug, Clone)]
-pub(crate) struct FrontendTlsHostnameClaim {
-    pub key: GatewayApiListenerKey,
+struct FrontendTlsHostnameClaim {
+    key: GatewayApiListenerKey,
     /// Namespace of the physical Gateway TLS plan. This normally matches the
     /// resource namespace, but a cross-namespace ListenerSet serves through
     /// its attached Gateway's namespace.
-    pub serving_namespace: String,
+    serving_namespace: String,
     /// Listener `hostname`, ASCII-lowercased. `None` (a catch-all listener)
     /// never collides: it claims no specific SNI name.
-    pub hostname: Option<String>,
-    pub creation_timestamp: Option<DateTime<Utc>>,
-    pub certificate_identity: Vec<String>,
+    hostname: Option<String>,
+    creation_timestamp: Option<DateTime<Utc>>,
+    certificate_identity: Vec<String>,
 }
 
 /// Deterministic claim order: Gateway owners before ListenerSet extensions,
@@ -164,45 +162,74 @@ fn compare_frontend_tls_claims(
         .then_with(|| left.key.cmp(&right.key))
 }
 
-pub(crate) fn sort_frontend_tls_hostname_claims(claims: &mut [FrontendTlsHostnameClaim]) {
+fn sort_frontend_tls_hostname_claims(claims: &mut [FrontendTlsHostnameClaim]) {
     claims.sort_by(compare_frontend_tls_claims);
 }
 
-/// Listeners that lost an SNI hostname collision, plus the winner they lost to.
-///
-/// A collision is *only* two different listeners in the same physical Gateway
-/// namespace claiming the same explicit `hostname` with **different**
-/// certificate sets.
-/// Several `certificateRefs` on one listener are not a collision (that is the
-/// ordinary RSA+ECDSA / SAN-split case), and two catch-all listeners are not a
-/// collision either — they claim no name, so both stay served and SNI
-/// selection falls back to each certificate's own SANs.
-///
-/// Losers fail closed and serve no route traffic, so a hostname is never
-/// answered by an ambiguous certificate. Each owning resource's status layer
-/// reports the withdrawal under its own condition contract.
-pub(crate) fn frontend_tls_hostname_conflict_losers(
-    sorted_claims: &[FrontendTlsHostnameClaim],
-) -> BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey> {
+/// One deterministic decision for resident-certificate capacity and explicit
+/// SNI ownership. Physical-port preview and final certificate materialization
+/// both consume this result, so a listener the cap refused can never reserve a
+/// hostname in either phase.
+#[derive(Debug, Default)]
+struct FrontendTlsListenerAdmission {
+    ordered_listener_keys: Vec<GatewayApiListenerKey>,
+    admitted_listeners: BTreeSet<GatewayApiListenerKey>,
+    certificate_cap_losers: BTreeSet<GatewayApiListenerKey>,
+    hostname_conflict_losers: BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
+}
+
+fn frontend_tls_listener_admission(
+    acc: &K8sAccumulator,
+    listeners: &[PendingFrontendTlsListener],
+) -> FrontendTlsListenerAdmission {
+    let mut claims: Vec<FrontendTlsHostnameClaim> = listeners
+        .iter()
+        .filter(|listener| {
+            acc.gateway_api_listener_policies
+                .get(&listener.key)
+                .is_some_and(|policy| policy.materializable)
+        })
+        .map(|listener| listener.hostname_claim(acc))
+        .collect();
+    sort_frontend_tls_hostname_claims(&mut claims);
+
+    let mut admission = FrontendTlsListenerAdmission {
+        ordered_listener_keys: claims.iter().map(|claim| claim.key.clone()).collect(),
+        ..FrontendTlsListenerAdmission::default()
+    };
     let mut winners: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut losers = BTreeMap::new();
-    for (index, claim) in sorted_claims.iter().enumerate() {
-        let Some(hostname) = claim.hostname.as_deref() else {
+    let mut source_count = 0usize;
+    for (index, claim) in claims.iter().enumerate() {
+        // A listener's complete certificateRefs group must fit before its
+        // explicit hostname can become visible to collision arbitration.
+        if source_count.saturating_add(claim.certificate_identity.len())
+            > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+        {
+            admission.certificate_cap_losers.insert(claim.key.clone());
             continue;
-        };
-        match winners.get(&(claim.serving_namespace.as_str(), hostname)) {
-            None => {
-                winners.insert((claim.serving_namespace.as_str(), hostname), index);
-            }
-            Some(&winner_index) => {
-                let winner = &sorted_claims[winner_index];
-                if winner.certificate_identity != claim.certificate_identity {
-                    losers.insert(claim.key.clone(), winner.key.clone());
+        }
+
+        if let Some(hostname) = claim.hostname.as_deref() {
+            match winners.get(&(claim.serving_namespace.as_str(), hostname)) {
+                None => {
+                    winners.insert((claim.serving_namespace.as_str(), hostname), index);
+                }
+                Some(&winner_index) => {
+                    let winner = &claims[winner_index];
+                    if winner.certificate_identity != claim.certificate_identity {
+                        admission
+                            .hostname_conflict_losers
+                            .insert(claim.key.clone(), winner.key.clone());
+                        continue;
+                    }
                 }
             }
         }
+
+        source_count += claim.certificate_identity.len();
+        admission.admitted_listeners.insert(claim.key.clone());
     }
-    losers
+    admission
 }
 
 /// A resolved listener TLS claim awaiting snapshot-wide finalization.
@@ -1640,41 +1667,8 @@ fn plan_gateway_frontend_tls_namespace_slots(
 fn planned_frontend_tls_admitted_listeners(
     acc: &K8sAccumulator,
 ) -> BTreeSet<GatewayApiListenerKey> {
-    let mut pending: Vec<&PendingFrontendTlsListener> = acc
-        .gateway_api_frontend_tls_listeners
-        .iter()
-        .filter(|listener| {
-            acc.gateway_api_listener_policies
-                .get(&listener.key)
-                .is_some_and(|policy| policy.materializable)
-        })
-        .collect();
-    let mut claims: Vec<FrontendTlsHostnameClaim> = pending
-        .iter()
-        .map(|listener| listener.hostname_claim(acc))
-        .collect();
-    sort_frontend_tls_hostname_claims(&mut claims);
-    let losers = frontend_tls_hostname_conflict_losers(&claims);
-    pending.retain(|listener| !losers.contains_key(&listener.key));
-    let order: HashMap<&GatewayApiListenerKey, usize> = claims
-        .iter()
-        .enumerate()
-        .map(|(index, claim)| (&claim.key, index))
-        .collect();
-    pending.sort_by_key(|listener| order.get(&listener.key).copied().unwrap_or(usize::MAX));
-
-    let mut admitted = BTreeSet::new();
-    let mut source_count = 0usize;
-    for listener in pending {
-        if source_count.saturating_add(listener.certificates.len())
-            > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-        {
-            continue;
-        }
-        source_count += listener.certificates.len();
-        admitted.insert(listener.key.clone());
-    }
-    admitted
+    frontend_tls_listener_admission(acc, &acc.gateway_api_frontend_tls_listeners)
+        .admitted_listeners
 }
 
 fn listener_is_effective_tls_serving_claim(
@@ -1723,8 +1717,11 @@ fn listener_is_effective_tls_serving_claim(
 /// Refusals are order-independent: they are decided from the fully collected
 /// listener-policy set and complete namespace credential plan, and every
 /// physically competing effective claim is refused rather than guessing a
-/// winner. Translation and Gateway status both call this helper so they share
-/// one decision.
+/// winner. Canonical translation publishes this helper's conflicts in
+/// `K8sTranslation`; the status-only conflict context also runs it solely to
+/// keep route-conflict indexing aligned. Gateway listener status consumes the
+/// published physical and hostname conflict maps instead of independently
+/// recomputing ownership from raw objects.
 ///
 /// Listeners that are already non-materializable contribute no claim and are
 /// ignored, so a broken sibling cannot take down a healthy listener.
@@ -1965,12 +1962,11 @@ pub(crate) fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8
 ///
 /// 1. Order claims deterministically (Gateway before ListenerSet, then oldest
 ///    resource, then key).
-/// 2. Withdraw listeners that lost an SNI hostname collision — fail closed, so
-///    a hostname is never answered by an ambiguous certificate.
-/// 3. Cap the snapshot at [`MAX_FRONTEND_TLS_CERTIFICATE_SOURCES`], dropping
-///    the excess with a field-specific warning rather than letting the data
-///    plane's resident SNI index grow with the cluster.
-/// 4. Mark one deterministic default certificate per namespace (a catch-all
+/// 2. Walk that order once, reserving each complete `certificateRefs` group
+///    under [`MAX_FRONTEND_TLS_CERTIFICATE_SOURCES`] before it may claim an SNI
+///    hostname. Cap losers and hostname losers consume neither capacity nor
+///    hostname ownership.
+/// 3. Mark one deterministic default certificate per namespace (a catch-all
 ///    listener when one exists, otherwise the first claim), and project the
 ///    lexicographically-first namespace's default into the legacy
 ///    `frontend_tls_*` fields for single-namespace deployments.
@@ -1987,70 +1983,63 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
     if pending.is_empty() {
         return;
     }
-    let mut claims: Vec<FrontendTlsHostnameClaim> = pending
-        .iter()
-        .map(|listener| listener.hostname_claim(acc))
-        .collect();
-    sort_frontend_tls_hostname_claims(&mut claims);
-    let losers = frontend_tls_hostname_conflict_losers(&claims);
-    acc.gateway_api_frontend_tls_hostname_conflicts = losers.clone();
-    for (loser, winner) in &losers {
-        acc.warnings.push(format!(
-            "Gateway API {} {}/{} listener {} field spec.listeners[].hostname '{}' is already served with a different certificate by {} {}/{} listener {}; reporting the conflict and leaving route traffic on this listener unmaterialized",
-            loser.parent_kind.as_str(),
-            loser.namespace,
-            loser.gateway,
-            loser.listener,
-            claims
+    let admission = frontend_tls_listener_admission(acc, &pending);
+    acc.gateway_api_frontend_tls_hostname_conflicts =
+        admission.hostname_conflict_losers.clone();
+    for key in &admission.ordered_listener_keys {
+        if let Some(winner) = admission.hostname_conflict_losers.get(key) {
+            let hostname = pending
                 .iter()
-                .find(|claim| &claim.key == loser)
-                .and_then(|claim| claim.hostname.clone())
-                .unwrap_or_default(),
-            winner.parent_kind.as_str(),
-            winner.namespace,
-            winner.gateway,
-            winner.listener,
-        ));
-        if let Some(policy) = acc.gateway_api_listener_policies.get_mut(loser) {
-            policy.routes_materializable = false;
-            if loser.parent_kind == GatewayApiListenerParentKind::ListenerSet {
-                policy.materializable = false;
-                policy.conflict_reason = Some("HostnameConflict");
+                .find(|listener| &listener.key == key)
+                .and_then(|listener| listener.hostname.as_deref())
+                .unwrap_or("");
+            acc.warnings.push(format!(
+                "Gateway API {} {}/{} listener {} field spec.listeners[].hostname '{}' is already served with a different certificate by {} {}/{} listener {}; reporting the conflict and leaving route traffic on this listener unmaterialized",
+                key.parent_kind.as_str(),
+                key.namespace,
+                key.gateway,
+                key.listener,
+                hostname,
+                winner.parent_kind.as_str(),
+                winner.namespace,
+                winner.gateway,
+                winner.listener,
+            ));
+            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) {
+                policy.routes_materializable = false;
+                if key.parent_kind == GatewayApiListenerParentKind::ListenerSet {
+                    policy.materializable = false;
+                    policy.conflict_reason = Some("HostnameConflict");
+                }
+            }
+        } else if admission.certificate_cap_losers.contains(key) {
+            acc.warnings.push(format!(
+                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for one config snapshot; leaving this listener's certificate set and route traffic unmaterialized",
+                key.parent_kind.as_str(),
+                key.namespace,
+                key.gateway,
+                key.listener,
+                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+            ));
+            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) {
+                policy.routes_materializable = false;
             }
         }
     }
-    pending.retain(|listener| !losers.contains_key(&listener.key));
+    pending.retain(|listener| admission.admitted_listeners.contains(&listener.key));
 
-    let order: HashMap<&GatewayApiListenerKey, usize> = claims
+    let order: HashMap<&GatewayApiListenerKey, usize> = admission
+        .ordered_listener_keys
         .iter()
         .enumerate()
-        .map(|(index, claim)| (&claim.key, index))
+        .map(|(index, key)| (key, index))
         .collect();
     pending.sort_by_key(|listener| order.get(&listener.key).copied().unwrap_or(usize::MAX));
 
     let mut sources: Vec<FrontendTlsCertificateSource> = Vec::new();
     for listener in &pending {
-        // certificateRefs are one listener-scoped contract: never retain the
-        // prefix that happened to fit and silently drop the tail. A partial
-        // set could select one certificate for the SNI name while the routes
-        // are withdrawn, or answer with a different key algorithm than the
-        // operator declared. Reserve the whole group before adding any entry.
-        if sources.len().saturating_add(listener.certificates.len())
-            > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-        {
-            acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for one config snapshot; leaving this listener's certificate set and route traffic unmaterialized",
-                listener.key.parent_kind.as_str(),
-                listener.key.namespace,
-                listener.key.gateway,
-                listener.key.listener,
-                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-            ));
-            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&listener.key) {
-                policy.routes_materializable = false;
-            }
-            continue;
-        }
+        // The shared admission decision already reserved this complete group;
+        // preview and finalization therefore cannot disagree at this bound.
         for (cert_path, key_path) in &listener.certificates {
             let Some(policy) = acc.gateway_api_listener_policies.get(&listener.key) else {
                 continue;
