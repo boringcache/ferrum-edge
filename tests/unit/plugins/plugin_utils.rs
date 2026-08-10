@@ -252,6 +252,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
 #[allow(dead_code)]
 pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamTransactionSummary {
     ferrum_edge::plugins::StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "test-stream-proxy".to_string(),
         proxy_lifecycle_generation: None,

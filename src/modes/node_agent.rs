@@ -281,10 +281,15 @@ impl NodeAgentConfig {
         // UDP TPROXY `addrtype --dst-type LOCAL` direction split (valid only in a
         // pod netns) is suppressed for the iptables fallback — see
         // `CaptureConfig::host_netns` and `udp_tproxy_commands_for_family`.
-        // Node-agent host-netns UDP capture is unsupported in this stage; eBPF does
-        // not cover UDP either (TCP-only connect()-cgroup hooks). UDP capture lives
-        // in the injector's pod-netns path (node-agent/node-waypoint UDP is a future
-        // stage).
+        //
+        // The node-agent itself never emits UDP rules: it has no UDP listener, and
+        // rules without a socket are a black hole. UDP capture is owned by the mesh
+        // proxy — the injector's pod-netns init container for Sidecar, and for
+        // Ambient either the per-pod-netns producer or the host-network capture
+        // path (issue #3288), both of which install and consume their own rules.
+        // eBPF does not cover UDP either (TCP-only connect()-cgroup hooks). The
+        // node-agent's UDP role is publishing the pod registry and gating the tc
+        // UDP guard on the producer's readiness marker.
         capture_config.host_netns = true;
         // Both the node-agent and the mesh proxy read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
         // (default 127.0.0.1:15001), so the eBPF connect4 rewrite port and the
@@ -7341,17 +7346,15 @@ where
             // node-waypoint UDP capture is a future stage.
             if udp_capture_enabled && config.capture_config.host_netns {
                 warn!(
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true but the node-agent iptables \
-                     fallback runs in the host network namespace, where the UDP TPROXY \
-                     direction split (addrtype --dst-type LOCAL) cannot distinguish \
-                     inbound-to-pod from outbound traffic. No UDP TPROXY rules will be \
-                     installed (TCP capture is unaffected). Node-agent host-netns UDP \
-                     capture is NOT supported in this stage (the direction split is \
-                     pod-netns-only); eBPF capture does NOT cover UDP either (the \
-                     connect()-cgroup hooks are TCP-only). For UDP capture, use the \
-                     injector's pod-netns path (an iptables init container that runs in \
-                     the pod netns where the pod IP is LOCAL); node-agent / node-waypoint \
-                     UDP capture is a future stage."
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true, but the node-agent installs no UDP \
+                     TPROXY rules: it has no UDP listener, and capture rules without a socket \
+                     are a black hole. This is expected — UDP capture is owned by the mesh \
+                     proxy. For Ambient, set FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+                     on the ambient proxy to use the host-network capture path (per-pod \
+                     ingress-interface scoping), or leave it unset to use the per-pod-netns \
+                     producer; for Sidecar, the injector's init container installs the \
+                     pod-netns rules. eBPF capture does NOT cover UDP either (the \
+                     connect()-cgroup hooks are TCP-only). TCP capture is unaffected."
                 );
             }
 

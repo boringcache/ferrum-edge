@@ -45,6 +45,7 @@ mod mysql_collation_probe_tests;
 mod peer_auth_mtls_tests;
 mod plugin_migration_split_tests;
 mod plugin_migration_tests;
+mod plugin_trigger_tests;
 mod pool_config_tests;
 mod separate_listeners_tests;
 mod sidecar_outbound_policy_tests;

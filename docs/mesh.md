@@ -14,6 +14,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [Configuration Consumption](#configuration-consumption)
   - [Native MeshSubscribe (default)](#native-meshsubscribe-default)
   - [xDS ADS](#xds-ads)
+  - [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability)
   - [Ferrum mesh-slice ECDS carriers (full parity over xDS)](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds)
   - [ECDS DestinationRule carrier (full DR semantics over xDS)](#ecds-destinationrule-carrier-full-dr-semantics-over-xds)
   - [Bootstrap Behavior](#bootstrap-behavior)
@@ -78,7 +79,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. Enrolled in the conformance GA contract as `mesh.config_transport.native_subscribe` (semantics: `tests/conformance/mesh_config_transport.rs`; live: `sidecar.config.native_subscribe_delivered` via the `mesh-e2e-sidecar` CP + native-subscribe leg). |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`), including `ProxyConfig` on `ProxyConfigsCarrier`. **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
 | Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load; SIGHUP reload (Unix) keeps the last good slice on error. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
-| Stock Envoy / third-party Istio xDS interop | **Not supported** | See [Limitations](#limitations-and-not-supported). Use native or a Ferrum CP. |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
 
 ### Topology maturity
 
@@ -122,7 +123,7 @@ This section consolidates every known residual gap so operators do not have to r
 
 ### Not interoperable / not planned
 
-- **Stock Envoy / third-party Istio xDS interop** — Ferrum's `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path. It follows the Envoy ADS gRPC contract, but CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names, and all security/policy fields ride Ferrum-defined ECDS carriers. A stock Envoy/Istio CP does not emit these, so pointing Ferrum's xDS client at a non-Ferrum CP is unsupported and may be NACKed. Use native, or a Ferrum CP over xDS.
+- **Stock Envoy / third-party Istio xDS interop** — `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path and stays that way: CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names, and all security/policy fields ride Ferrum-defined ECDS carriers, so pointing *that* client at a non-Ferrum CP remains unsupported. For a third-party control plane use the separate `FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` profile, which consumes standard v3 CDS/EDS/LDS/RDS for **discovery only** — see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability) for the exact capability boundary. Enforcement policy is never sourced from a stock CP.
 - **`EnvoyFilter`** — not planned. Use Ferrum custom plugins (`custom_plugins/`).
 - **`WasmPlugin`** — not planned. Use Ferrum custom plugins.
 - **Per-node ADS stream ceiling** — `FERRUM_XDS_MAX_STREAMS_PER_NODE` (default `4`, `0`=unbounded) bounds concurrent ADS streams under one node id; excess streams are rejected with gRPC `RESOURCE_EXHAUSTED` and counted by `ferrum_xds_streams_rejected_total`. (Resource warming / make-before-break across types is now implemented — see [xDS ADS Compatibility](#xds-ads-compatibility).)
@@ -374,6 +375,171 @@ Aggregated Discovery Service client over the Envoy ADS gRPC service path. Consum
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
 - **DestinationRule support across xDS**: standard CDS/EDS bakes DR traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS alone. The Ferrum CP ships the full DR via its own ECDS carrier (see [ECDS DestinationRule carrier](#ecds-destinationrule-carrier-full-dr-semantics-over-xds)); native protocol carries it too. Both produce identical DR semantics on the DP.
 - **RTDS subscription** (`type.googleapis.com/envoy.service.runtime.v3.Runtime`): subscribed alongside CDS/EDS/LDS/RDS/SDS/ECDS so operators can flip runtime knobs without churning the entire slice. The xDS client decodes every layer through `translate_rtds_layer`, sorts Runtime resources lexicographically by name, and merges top-level fields into a single `MeshRuntimeOverlay` carried on `MeshSlice.runtime_overlay` (later names win; duplicate names NACK). Supported value kinds: numeric (`f64`), string, bool, and Envoy `FractionalPercent`-shaped structs (`{numerator, denominator: HUNDRED | TEN_THOUSAND | MILLION}`). Other struct, list, and null values are silently dropped. The overlay is exposed via `GET /mesh/runtime-overlay`; fault percentages and transformer gates both publish with their request epoch (so a request never straddles a gate change), while the gateway-wide tracing filter and the transformer gate *provenance* maps publish after slice acceptance. See the reserved-key table under [xDS ADS Compatibility](#xds-ads-compatibility) for the full contract.
+
+#### Stock Envoy / third-party Istio xDS interoperability
+
+`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` (issue #3317) is a **separate protocol
+name** from `xds`, not a mode of it. Everything described above about the
+Ferrum-private profile — name-only resources, `ferrum.config.extension.v3.*`
+ECDS carriers, the required-type version-coherence gate — is unchanged and is
+never reached by this path.
+
+**Split of authority.** Two config sources, and the split is the whole security
+story:
+
+| Half | Source | Owns |
+|---|---|---|
+| Discovery | the stock ADS server (`FERRUM_MESH_STOCK_XDS_URLS`) | `MeshService` (namespace/name/ports/protocol/cluster VIPs) and `Workload` (endpoint addresses + peer identity) |
+| Policy | the local mesh document (`FERRUM_MESH_FILE_CONFIG_PATH`, **mandatory**) | authorization policies, PeerAuthentication, RequestAuthentication, trust bundles, DestinationRules, ServiceEntries, Sidecar scope, ProxyConfig, telemetry |
+
+A third-party control plane Ferrum does not otherwise trust can therefore add or
+remove **reachability**, but it can never author or weaken Ferrum's
+**enforcement posture**. Startup fails closed if the policy document is missing,
+invalid, or declares `services` / `workloads` — those belong to the control
+plane, and two authorities for one field would make "which endpoint is
+reachable" ambiguous. The document is re-read on SIGHUP (Unix); a failed reload
+keeps the last good policy baseline, and a successful one rebuilds the slice
+from the current discovery view.
+
+Ferrum **never mints a CP/DP JWT for a stock control plane**. The only
+credential it presents is an externally issued bearer token at
+`FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (typically a projected Kubernetes
+service-account token), re-read on every connection attempt so rotation is
+picked up on reconnect. `FERRUM_MESH_STOCK_XDS_URLS` is deliberately separate
+from `FERRUM_DP_CP_GRPC_URLS` so a Ferrum CP is never dialed as a stock server
+and a stock server never receives Ferrum CP/DP credentials.
+
+**What is consumed.**
+
+| Resource | Mapped to |
+|---|---|
+| `Cluster` (`outbound\|<port>\|\|<svc>.<ns>.svc.<domain>`, `EDS` or `STATIC`) | a `MeshService` port in `<ns>/<svc>` |
+| `Cluster.transport_socket` → `UpstreamTlsContext` URI SAN matcher | the pinned peer SPIFFE identity for that service port |
+| `ClusterLoadAssignment` | `Workload` entries (address, container port → `targetPort`, weight, locality); `UNHEALTHY` / `DRAINING` / `TIMEOUT` endpoints are excluded |
+| `Listener` filter chains | per-port protocol classification (HCM → HTTP/HTTP2, TcpProxy → TCP) and, for a concrete-bind listener, the service VIP |
+| `RouteConfiguration` virtual hosts | IP-literal domains become `MeshService.cluster_ips` |
+
+**Namespace narrowing applies unchanged.** Discovered services flow through the
+same `MeshSlice::from_gateway_config` projection as native/file config, so a
+workload sees only its own namespace's services unless the local policy document
+declares an Istio `Sidecar` with a wider `egress.hosts` (for example `*/*`).
+That is existing mesh behaviour, not a stock-profile restriction, but it is the
+first thing to check when a discovered service in another namespace does not
+appear in the slice.
+
+Peer identity comes from the control plane's **own** SAN pin, never from
+endpoint metadata. A cluster with no pinned SPIFFE, or with more than one
+candidate, publishes the service shape with **no dialable endpoint** plus an
+explicit `no_pinned_peer_identity` / `ambiguous_peer_identity` diagnostic —
+Ferrum will not dial a peer whose identity the control plane did not assert.
+
+**Protocol behaviour.** State-of-the-world ADS with per-type nonces, ACK/NACK
+carrying a field-specific `error_detail`, dependency-ordered subscriptions (EDS
+follows the accepted CDS clusters by resource name, RDS follows the accepted LDS
+listeners), a 25 ms debounce capped at 500 ms before a
+make-before-break `install_slice`, a
+five-consecutive-NACK circuit breaker, jittered 1–30 s backoff, and multi-server
+failover. There is deliberately **no** cross-type version-coherence gate: a
+stock CP versions each type independently and carries no Ferrum security
+carriers a skew could leave stale. Warming waits for CDS, and for EDS only when
+some accepted cluster actually needs it. Convergence is visible on the
+JWT-gated `GET /mesh/config-drift`.
+
+**Deletion follows the SotW rule for each type, not the response contents.**
+`Cluster` and `Listener` are the two types a state-of-the-world server must send
+as complete state, so those responses replace what is held and a resource absent
+from one is deleted. `ClusterLoadAssignment` and `RouteConfiguration` are
+subscribed by name and a response for them may legitimately carry only the
+subset a push touched (istiod skips recomputing a cluster its update did not
+change), so those responses are **merged**, and an assignment or route
+configuration is dropped only once no accepted cluster/listener references it
+any more. Reading an omitted assignment as "this service has no endpoints" would
+blackhole every service an ordinary endpoint update did not mention.
+
+On reconnect the client re-subscribes with an **empty** `response_nonce` (nonces
+are stream-scoped) and with the last version it actually ACCEPTED — a NACKed
+version is never re-asserted, so a control plane that suppresses a resource
+whose version the client already claims cannot leave the data plane
+unconverged.
+
+**Two failure outcomes, and the difference matters.** A *structural* error —
+bytes that are not a well-formed resource of the announced type, an empty or
+duplicated name, or a declared bound exceeded — NACKs the whole response and
+rolls the accumulator back, so the last good slice keeps serving. A *capability
+refusal* — a well-formed resource using something Ferrum does not model — drops
+that resource with a field-specific diagnostic and ACKs, because a stock CP
+legitimately programs Envoy features Ferrum has no counterpart for and NACKing
+would leave the data plane permanently unconverged. A refusal always narrows:
+it contributes no route, no endpoint, and no identity, so the worst case is
+traffic that is not routed. Refusals are logged (bounded, and only when the set
+changes) with a stable reason code and the offending field path — never a
+resource payload.
+
+**The extension-escape closure.** Every field through which an Envoy extension,
+a filesystem path, credential material, an enforcement filter, or a second
+delivery channel could enter is refused:
+
+- Cluster `cluster_type`, `filters`, `load_balancing_policy`,
+  `lb_subset_config`, and any `typed_extension_protocol_options` key other than
+  `envoy.extensions.upstreams.http.v3.HttpProtocolOptions`.
+- Any transport socket that is not `UpstreamTlsContext` or `RawBuffer`; inline
+  `tls_certificates`; a `trusted_ca` `DataSource` naming a `filename` or
+  `environment_variable`; `custom_validator_config`; `custom_handshaker`; a
+  non-`exact` (regex/prefix/suffix) peer-identity matcher.
+- Listener `api_listener`, `filter_chain_matcher`, `additional_addresses`; any
+  listener filter outside `original_dst` / `tls_inspector` / `http_inspector` /
+  `workload_metadata` (notably `proxy_protocol` and `original_src`, which
+  rewrite an authorization input); any network filter outside
+  `http_connection_manager` / `tcp_proxy` plus the metadata-exchange/stats
+  telemetry filters.
+- **Any HTTP filter other than `envoy.filters.http.router`** and a small
+  observability allowlist (`istio.metadata_exchange`, `istio.stats`,
+  `istio.alpn`, `grpc_stats`, `grpc_web`, `fault`). `rbac`, `jwt_authn`,
+  `ext_authz`, `cors`, `local_ratelimit`, `lua`, and `wasm` refuse the whole
+  listener — silently reducing an Istio listener that carries an RBAC or JWT
+  filter to plain routing would turn the control plane's DENY into an ALLOW.
+  This holds even when the filter is marked `disabled` or `is_optional`,
+  because either can be re-enabled per route.
+- HCM `scoped_routes`; route `typed_per_filter_config`, `redirect`,
+  `direct_response`, `filter_action`, `non_forwarding_action`; `safe_regex` /
+  header / query-parameter / gRPC / dynamic-metadata route matchers;
+  `weighted_clusters`, `cluster_header`, and cluster specifier plugins;
+  virtual-host `matcher` and a non-zero `require_tls`; `vhds`.
+- Any `ConfigSource` that is not `ads`.
+- Every SDS `Secret`. The profile does not subscribe to SDS at all — workload
+  identity and trust anchors come from Ferrum's own SPIFFE/SVID configuration —
+  and an unsolicited push closes the ADS stream without sending an SDS request
+  (a NACK for an unrequested type would itself subscribe under SotW semantics).
+  Each key-bearing variant is refused **by field name without being decoded**,
+  so control-plane-delivered private key material is never parsed, stored, or
+  logged.
+
+**Bounds.** `FERRUM_MESH_STOCK_XDS_MAX_RESOURCES` (per response, default 10000),
+`FERRUM_MESH_STOCK_XDS_MAX_RESOURCE_BYTES` (per resource, default 1 MiB), and
+`FERRUM_MESH_STOCK_XDS_MAX_ENDPOINTS` (per cluster, default 4096), plus internal
+ceilings on filter chains, virtual hosts, routes, domains, and pinned identities
+per cluster. `0` is rejected at startup — a bound of `0` would disable the
+fail-closed ceiling, not lift it.
+
+**Declared residuals.** Not driven by a stock control plane through this
+profile: VirtualService-equivalent traffic shaping (weighted clusters,
+header/regex matching, retries, timeouts, fault injection, mirroring),
+DestinationRule subsets and traffic policy, external
+`STRICT_DNS` / `LOGICAL_DNS` / `ORIGINAL_DST` clusters (so third-party egress
+still needs a local `ServiceEntry`), inbound listener materialization (Ferrum
+builds its own from the policy document), SDS, ECDS/RTDS, and delta xDS. The
+decode surface is a field-exact **projection** of the upstream Envoy v3 messages
+(`proto/envoy/stock/v3/stock_xds.proto`), not the vendored upstream proto tree;
+every field number is taken from Envoy `v1.31.0` and a field that can change
+routing, trust, or identity is either consumed or refused.
+
+**Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
+projection onto the typed mesh model) and
+`src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
+the policy/discovery merge). Tests:
+`tests/unit/gateway_core/stock_xds_tests.rs`,
+`tests/integration/mesh_stock_xds_tests.rs`, and
+`tests/conformance/stock_xds_interop.rs`.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)
 
@@ -951,7 +1117,65 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Request principal matching**: `request_principals` glob patterns matched against the `{issuer}/{subject}` composite extracted by `jwks_auth`. When `request_principals` is non-empty and no JWT is present, the rule does not match (Istio semantics: anonymous requests fail the principal check). An empty `request_principals` list matches any request including unauthenticated ones.
 - **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notServiceAccounts`, `notNamespaces`, `notTrustDomains`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers. Negative identity matchers fail the rule only when the corresponding source/JWT identity is present and matches an excluded pattern; if the identity is absent, the negative matcher succeeds, so `DENY notPrincipals: ["*"]` and `DENY notRequestPrincipals: ["*"]` catch anonymous traffic. IP block matchers fail closed when the IP they test is absent, so a positive `ipBlocks`/`remoteIpBlocks` constraint with no resolved IP does not match. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource or direct plugin config.
 - **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY rules follow Istio and treat missing HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
-- **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Conditions are evaluated against attributes sourced from the request: `source.principal` (Istio form without the `spiffe://` scheme), `source.namespace` (from the resolved peer SPIFFE ID), `request.auth.principal`, `request.auth.presenter` (JWT `azp`), `request.auth.audiences`, `request.auth.claims[<name>]` and nested `request.auth.claims[<name>][<nested>]` string or string-list leaf values (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, `destination.port`, `connection.sni` (frontend TLS/QUIC and stream connections when SNI is available), `source.ip`, and `remote.ip`. Unsupported condition keys are rejected at translation/config validation time so DENY conditions cannot silently fail open. DENY conditions treat missing HTTP-only attributes (`request.headers[...]`, `request.auth.*`) as matches; other missing attributes never satisfy a `values` check. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost.
+- **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Values follow Istio's `StringMatcherWithPrefix` grammar for most keys: `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is a suffix match, and anything else — including a mid-string `*` — is an exact match on the literal text. **Three keys have their own Istio grammar and do not use that matcher** — `source.ip` / `remote.ip` / `destination.ip` are CIDR blocks, `source.serviceAccount` is an exact namespace-relative match, and `source.namespace` accepts a `*` at any position (see [Value grammars](#value-grammars-per-key) below). **Ferrum represents the complete documented Istio condition-key set** (see [Condition keys](#condition-keys) below): `source.principal` (Istio form without the `spiffe://` scheme), `source.namespace`, `source.serviceAccount`, and `source.trustDomain` (all from the resolved peer SPIFFE ID), `source.ip`, `remote.ip`, `destination.ip`, `destination.port`, `connection.sni`, `request.auth.principal`, `request.auth.presenter` (JWT `azp`), `request.auth.audiences`, `request.auth.claims[<name>]` and nested `request.auth.claims[<name>][<nested>]` string or string-list leaf values (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, and `experimental.envoy.filters.<filter>[<key>]`. Dynamic header/claim keys follow Istio's loose `validateMapKey` framing: the first `[` and final `]` delimit a non-empty interior, without an extra HTTP-header-name parse at policy admission. Known HTTP pseudo-headers (`:authority`, `:method`, `:path`, `:scheme`) come from typed request facts; unusual admitted interiors that no request or validated claim can materialize remain absent. Keys outside the documented prefixes are **rejected** at translation/config validation time with a field-specific diagnostic, so a DENY condition on an unmodelled attribute cannot silently fail open. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost.
+
+#### Condition keys
+
+Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.io/latest/docs/reference/config/security/conditions/) reference is represented. The table below is the authoritative Ferrum support matrix; `MeshConditionKeyKind` in `src/modes/mesh/config.rs` is the typed classification behind it.
+
+| `when[].key` | Value form | HTTP-family | TCP / TLS passthrough | UDP / DTLS | Source of truth |
+| --- | --- | --- | --- | --- | --- |
+| `source.principal` | Istio string match | yes | yes | yes | verified peer SPIFFE ID (post-baggage rewrite), scheme-less Istio form |
+| `source.namespace` | wildcard, `*` at any position | yes | yes | yes | `ns` segment of the verified peer SPIFFE ID |
+| `source.serviceAccount` | exact `<namespace>/<sa>` or bare `<sa>` | yes | yes | yes | `<namespace>/<service-account>` from the verified peer SPIFFE ID |
+| `source.trustDomain` | Istio string match, restricted grammar | yes | yes | yes | trust domain of the verified peer SPIFFE ID |
+| `source.ip` | CIDR / bare IP | yes | yes | yes | immediate socket peer (`direct_client_ip`), pre-PROXY-protocol |
+| `remote.ip` | CIDR / bare IP | yes | yes | yes | resolved client IP after trusted XFF / PROXY protocol |
+| `destination.ip` | CIDR / bare IP | yes | yes | no (see below) | captured pre-NAT original destination, else the connection's local address |
+| `destination.port` | numeric `0..=65535` | yes | yes | yes | mesh inbound app port / captured outbound port / listener port |
+| `connection.sni` | Istio string match | yes | yes | yes | frontend TLS / QUIC / DTLS ClientHello SNI |
+| `request.auth.principal` | Istio string match | yes | HTTP only | HTTP only | validated JWT `iss/sub` |
+| `request.auth.presenter` | Istio string match | yes | HTTP only | HTTP only | validated JWT scalar `azp` |
+| `request.auth.audiences` | Istio string match | yes | HTTP only | HTTP only | validated JWT `aud` |
+| `request.auth.claims[<name>]`, `request.auth.claims[<a>][<b>]` | Istio string match | yes | HTTP only | HTTP only | validated JWT scalar / string-list leaf claims |
+| `request.headers[<name>]` | Istio string match | yes | HTTP only | HTTP only | request headers, matched case-insensitively; `:authority`, `:method`, `:path`, and `:scheme` use typed request facts |
+| `experimental.envoy.filters.<filter>[<key>]` | Istio string match | never sourceable | never sourceable | never sourceable | Envoy dynamic metadata; Ferrum has no Envoy filter chain |
+
+##### Value grammars (per key)
+
+Istio does **not** compile every condition key to the same matcher, and Ferrum follows it key by key. Treating them uniformly is not a cosmetic simplification: a value that silently never matches is fail-OPEN for a DENY.
+
+| Key | Grammar | Istio source |
+| --- | --- | --- |
+| `source.ip`, `remote.ip`, `destination.ip` | CIDR block or bare IP; containment, never string matching | `ValidateIPs` |
+| `destination.port` | strict decimal `0..=65535` | port validation |
+| `source.serviceAccount` | **exact** `<namespace>/<service-account>`, or a bare `<service-account>` resolved against the namespace of the `AuthorizationPolicy` that declared it. `*` is **rejected** at admission — Istio compiles this key to an exact matcher, so a wildcard would install a condition that can never fire | `CheckServiceAccount`, `serviceAccountRegex` |
+| `source.namespace` | wildcard match where **every** `*` is an arbitrary substring, at any position — a leading, trailing, mid-string, or repeated `*` all behave as wildcards | `srcNamespaceGenerator` |
+| `source.trustDomain` | exact, presence `*`, one **leading** `*`, or one **trailing** `*`. A mid-string or repeated `*`, and any `/`, are **rejected** at admission | `CheckTrustDomainValues` |
+| everything else (`source.principal`, `connection.sni`, `request.auth.*`, `request.headers[...]`, `experimental.envoy.filters.*`) | `StringMatcherWithPrefix`: `*` presence, `<prefix>*`, `*<suffix>`, otherwise exact — a mid-string `*` is **literal text** | `matcher.StringMatcherWithPrefix` |
+
+A bare `source.serviceAccount` is namespace-relative, so the same policy text means different things in different namespaces:
+
+```yaml
+# In namespace `payments`: matches only payments/checkout.
+# The same YAML applied to namespace `web` matches only web/checkout.
+- key: source.serviceAccount
+  values: ["checkout"]
+# Explicit form, namespace-independent.
+- key: source.serviceAccount
+  values: ["payments/checkout"]
+```
+
+**Absent vs unsourceable.** These are different facts and Istio gives them different semantics, so Ferrum models them separately.
+
+- *Absent* — the path CAN source the attribute and this request simply does not carry it (a header the client omitted, an SNI-less plaintext connection, no validated JWT). Ordinary Istio rules apply: a `values` check fails, and a `notValues`-only check passes.
+- *Unsourceable* — the path can NEVER carry the attribute, or required transport evidence could not be recovered. That is an HTTP-only key on a raw TCP / TLS-passthrough / UDP / DTLS connection (anything authorized through the L4 `on_stream_connect` hook, which has no header map and no JWT context at all), `source.ip`, `remote.ip`, `destination.ip`, or `destination.port` with no typed transport evidence, or any `experimental.envoy.filters.*` key. A mesh / HBONE CONNECT relay is deliberately NOT in this class: it is authorized on the request path, where Ferrum has parsed the CONNECT's own header map and can genuinely source `request.headers[...]` from it. Ferrum applies Istio's documented non-HTTP-port behavior, which is fail-closed in both directions: a **DENY** rule ignores the field and still matches on its remaining constraints, and an **ALLOW** or **AUDIT** rule can never match. Access is never granted on an attribute the gateway cannot read, and an unevaluable condition can never disarm a DENY.
+
+`destination.ip` evidence comes only from the transport — a trusted inbound PROXY-protocol tuple, `SO_ORIGINAL_DST`, node-waypoint eBPF capture metadata, the listener's specific bind address, or the accepted socket's local address. It is never derived from `Host`, `X-Forwarded-*`, or any other client-settable input: a client that could choose its own `destination.ip` could choose which destination-scoped rule judges it. UDP and DTLS sessions carry no such evidence today, so a `destination.ip` condition there is unsourceable and fails closed as described above. A captured original destination always wins over the socket's local address, because on a capture listener the socket's local address is the interception port rather than the address the client dialled. This mesh-authz connection fact is separate from VirtualService L4 `destinationSubnets` evidence: stream routing accepts only the trusted PROXY/capture original destination, never an ordinary listener's bind/local address.
+
+**A documented-but-unsourceable key does not reject the policy.** Rejecting the resource would drop the whole `AuthorizationPolicy`, which is fail-OPEN for a DENY, so `experimental.envoy.filters.*` conditions install normally and are enforced with the unsourceable semantics above.
+
+**Validation and bounds.** Every configuration surface — the Kubernetes Istio translator, `MeshConfig` file/native validation, and the `mesh_authz` construction gate — runs the same `validate_mesh_condition` contract and reports field-specific diagnostics (`rules[].when[2].values[0] …`). It rejects: an unsupported or empty key, a key over 256 UTF-8 bytes or containing control characters, a condition with neither `values` nor `notValues`, an empty value, a value over 512 UTF-8 bytes or containing control characters, a malformed `source.ip` / `remote.ip` / `destination.ip` CIDR, a non-numeric or out-of-range `destination.port`, a `source.serviceAccount` containing `*` or more than one `/` (or with an empty namespace / service-account half), and a `source.trustDomain` containing `/`, more than one `*`, or a mid-string `*`. Whitespace or other unusual printable bytes inside a dynamic header/claim map key are admitted because Istio's `validateMapKey` admits them; if the request path cannot materialize that exact key, it remains absent. Every rule applies identically to `values` and `notValues` — a bound or grammar enforced on only one direction would leave the other fail-open. Collections are bounded at 64 `when[]` entries per rule and 256 entries per `values` / `notValues` list; `source.serviceAccount` carries Istio's stricter caps of 16 entries per list and 320 UTF-8 bytes per value. An externally supplied policy therefore cannot grow unbounded per-request matching work, and no diagnostic echoes an operator-supplied value except an IP block, whose exact text is required to fix the CIDR.
 
 ### SPIFFE Identity
 
@@ -1452,7 +1676,7 @@ Column key: **Sidecar same-cluster** = Sidecar egress over plain SVID-mTLS HTTP/
 |---|---|---|---|---|---|
 | HTTP/1.1 | **Supported** — per-service/per-port SVID-mTLS routes, identity-pinned; fail-closed, never plaintext [1] | **Supported** — per-service HBONE routes, capability-probe-gated, identity-pinned [1] | **Supported** — all HTTP-family service ports (per-port `p<port>` SNI alias, issue #2010 phase 3); fail-closed (502) on missing SNI override / trust domain / gateway [2] | **Supported** — all HTTP-family service ports (per-port SNI alias); per-remote-pod targets via the gateway dial-override [3] | **Supported** — `mesh.mtls` (+ authority host/port tags) or `mesh.hbone` targets; poll-interval refresh; sidecar and ambient paths bridge remote-cluster workloads through east-west gateway targets when bridgeable (all HTTP-family ports via per-port SNI alias; otherwise fail-closed) [4] |
 | HTTP/2 | **Supported** — same HTTP-family egress; both frontend flavors dispatch over the topology's HTTP/2-based transport [1] | **Supported** [1] | **Supported** — same all-HTTP-family-ports / per-port-SNI-alias bounds [2] | **Supported** [3] | **Supported** [4] |
-| gRPC | **Supported** — native gRPC skips the direct-dial gRPC pool and rides the SVID-mTLS HTTP/2 egress path: identity-pinned, `te: trailers` re-synthesized, response streamed so `grpc-status` trailers relay end-to-end; replayable requests may retry on mesh-mTLS; fails closed with gRPC UNAVAILABLE (never a plaintext dial) when the transport cannot dispatch [5] | **Fail-closed** — refused before any dial with gRPC UNAVAILABLE: the HBONE inner protocol is HTTP/1.1 over a byte tunnel and cannot carry the HTTP/2 trailers gRPC requires (native gRPC-over-HBONE is explicitly out of scope; use Sidecar mesh-mTLS for native gRPC, or gRPC-Web pass-through when Ambient transport is required) [5] | **Supported** — native gRPC rides the cross-cluster mesh-mTLS branch (east-west gateway dial + destination-FQDN SNI override + trust-domain-only verification) across **all HTTP-family service ports** (per-port SNI alias, phase 3), HTTP/2 end-to-end so `grpc-status` trailers relay across the two-trust-domain hop; replayable requests may retry on mesh-mTLS; fail-closed (gRPC UNAVAILABLE, never a plaintext dial) on a missing SNI override / trust domain or unsupported transport [5] | **Fail-closed** — HBONE has no HTTP/2 trailer path, cross-cluster or not; refused pre-dial like same-cluster Ambient [5] | **Supported for `topology: sidecar`** (`mesh.mtls` targets dispatch exactly like the Sidecar column, same-cluster and cross-cluster); **fail-closed for `topology: ambient`** (`mesh.hbone` targets refuse native gRPC pre-dial); the HTTP/3 frontend's gRPC bridge fails closed for ANY mesh-tagged target [5] |
+| gRPC | **Supported** — native gRPC skips the direct-dial gRPC pool and rides the SVID-mTLS HTTP/2 egress path: identity-pinned, `te: trailers` re-synthesized, response streamed so `grpc-status` trailers relay end-to-end; replayable requests may retry on mesh-mTLS; fails closed with gRPC UNAVAILABLE (never a plaintext dial) when the transport cannot dispatch [5] | **Supported on the HTTP/3 frontend** (issue #3284) — native gRPC rides a NESTED hyper HTTP/2 connection inside the authenticated HBONE CONNECT byte tunnel, identity-pinned, so `grpc-status` trailers, flow control, deadlines, and cancellation relay end-to-end; **fail-closed on the H1/H2 frontend**, whose generic HTTP-family HBONE dispatch runs HTTP/1.1 inside the tunnel and cannot carry those trailers (use the H3 frontend, Sidecar mesh-mTLS, or gRPC-Web pass-through there) [5] | **Supported** — native gRPC rides the cross-cluster mesh-mTLS branch (east-west gateway dial + destination-FQDN SNI override + trust-domain-only verification) across **all HTTP-family service ports** (per-port SNI alias, phase 3), HTTP/2 end-to-end so `grpc-status` trailers relay across the two-trust-domain hop; replayable requests may retry on mesh-mTLS; fail-closed (gRPC UNAVAILABLE, never a plaintext dial) on a missing SNI override / trust domain or unsupported transport [5] | **Supported on the HTTP/3 frontend** — the same nested-HTTP/2 HBONE transport over the cross-cluster dial (remote east-west gateway + destination-FQDN SNI override + trust-domain-only verification; the CONNECT authority is the real remote pod from `mesh.hbone_authority_host`); **fail-closed on the H1/H2 frontend**, like same-cluster Ambient [5] | **Supported for `topology: sidecar`** (`mesh.mtls` targets dispatch exactly like the Sidecar column, same-cluster and cross-cluster); **fail-closed for `topology: ambient`** on the H1/H2 frontend (`mesh.hbone` targets refuse native gRPC pre-dial there); the HTTP/3 frontend's gRPC bridge dispatches BOTH transports — `mesh.mtls` over the SAME SVID-mTLS HTTP/2 pool and `mesh.hbone` over a nested HTTP/2 connection inside the HBONE CONNECT tunnel, same-cluster and cross-cluster alike — and fails closed for malformed cross-cluster, ambiguous-transport, and unresolvable-identity targets (issue #3284) [5] |
 | WebSocket | **Supported** — RFC 8441 Extended CONNECT over SVID-mTLS to `:15006`; fail-closed, never plaintext [6] | **Supported** — bare HBONE CONNECT byte tunnel + inner HTTP/1.1 upgrade through the tunnel [6] | **Supported** — RFC 8441 Extended CONNECT over the cross-cluster mesh-mTLS dial (shared `MeshMtlsDialPlan`: east-west gateway dial + destination-FQDN SNI override + trust-domain-only verification) across **all HTTP-family service ports** (per-port SNI alias, phase 3); fail-closed on missing SNI/trust-domain or a failed upgrade, never a plaintext/wrong-SNI dial [7] | **Supported** — the upgrade rides the cross-cluster HBONE byte tunnel (dial the remote east-west gateway with a destination-FQDN SNI override + trust-domain-only verification; inner CONNECT `:authority` = the destination pod addr:app-port) + an inner HTTP/1.1 upgrade through the tunnel, mirroring the HBONE HTTP path via `get_ws_byte_tunnel`; fail-closed **before any dial** on a missing SNI override / trust domain / authority host, or on a failed upgrade [7] | **Supported** — the WebSocket-over-mesh dispatch keys on the same `mesh.mtls`/`mesh.hbone` target tags; a Sidecar OR Ambient SD-bridged east-west failover target now upgrades through the east-west gateway (cross-cluster) [6] [7] |
 | Raw TCP | **Supported (Experimental)** — captured orig-dst matched strictly against `(service VIP, service port)`; fresh mesh-mTLS H2 CONNECT tunnel per captured stream; unmatched / unmaterialized pairs fail closed [8] | **Supported (Experimental)** — same strict orig-dst matching, relayed over the shared HBONE pool (capability-probe-gated) [8] | **Supported (Experimental)** — per-pod bare CONNECT over the east-west mesh-mTLS dial; `p<port>.<fqdn>` SNI + trust-domain-only verification; missing dial/authority metadata fails closed [2] [8] | **Supported (Experimental)** — per-pod HBONE byte tunnel through the east-west dial with the same per-port SNI/trust-domain scope [3] [8] | **Not part of the bridge** — SD targets feed HTTP-family dispatch only [9] |
 | UDP | **Supported (Experimental)** — TPROXY capture → `udp`-marked mesh CONNECT over mesh-mTLS; unroutable datagrams dropped fail-closed [10] | **Supported (Experimental)** — per-pod-netns TPROXY producer captures source UDP inside each enrolled pod's netns, stamps trusted per-pod evidence on the HBONE CONNECT, and lets destination `mesh_authz` apply namespace/selector scope when the assertor and live workload binding validate; enrolled destination pod replies use a destination pod-netns relay socket when the registry maps the destination IP [10] [12] | **Supported (Experimental)** — the same cross-cluster Sidecar dial carries `udp`-marked, length-delimited datagrams [2] [10] | **Supported (Experimental)** — `get_datagram_tunnel` carries SNI/trust-domain overrides through the east-west gateway; full live TPROXY fixture remains as described in [10] [12] | **Not part of the bridge** [9] |
@@ -1464,7 +1688,7 @@ Notes (authoritative sections):
 2. [Client-Side Cross-Cluster Egress (Sidecar)](#client-side-cross-cluster-egress-sidecar): HTTP-family traffic keeps the phase-3 base/per-port scheme. Raw-TCP and UDP use per-pod tunnel targets and explicit per-port aliases (`-tcp` / `-udp` when both share a number), with separate gateway dial and real-pod CONNECT-authority tags. All use trust-domain-scoped verification and fail closed without complete metadata.
 3. [Client-Side Cross-Cluster Egress (Ambient / HBONE)](#client-side-cross-cluster-egress-ambient--hbone): per-remote-pod targets cover HTTP-family, raw-TCP, and UDP; L4 uses an explicit per-port SNI alias and the existing byte/datagram tunnel framing.
 4. [Gateway Mesh Service Discovery](#gateway-mesh-service-discovery) and [Gateway-to-Mesh Bridge](#gateway-to-mesh-bridge): `topology: ambient` targets carry `mesh.hbone`, `topology: sidecar` targets carry `mesh.mtls` + `mesh.mtls_authority_host` (and `mesh.mtls_authority_port` for multi-port destinations). The two transports are not interchangeable — a topology mismatch fails closed with a 502 at dispatch. Target lists refresh on the provider's poll interval (default 30s). Sidecar-path remote-cluster workloads bridge to east-west gateway failover targets through the same shared core as the mesh-mode Sidecar cross-cluster column [2] (plus the SD-bridge `mesh.mtls_authority_host` tag), for the upstream's **selected** HTTP-family port — any HTTP-family port, via its per-port SNI alias (a single-HTTP-port service uses the base FQDN); a **non-HTTP-family** selected port, a snapshot without `mesh.multi_cluster`, or a remote group with no matching east-west gateway stays skipped fail-closed. Ambient-path remote-cluster workloads bridge through the mesh-mode Ambient per-pod HBONE core [3] when a gateway is declared for the workload network (or a catch-all gateway applies): the target identity is synthetic, the inner CONNECT authority stays the remote pod addr, and `mesh.hbone_dial_host` / `mesh.hbone_port` carry the gateway. Direct remote pod-IP Ambient targets remain only as a flat-network fallback when no gateway is declared for that workload network and no applicable catch-all gateway (a candidate whose `sni_hosts` claim the base FQDN **or** the dialed per-port alias, plus a trust-domain match, for the destination) exists — an exact-network declaration is authoritative fail-closed even when it cannot route the destination, while a non-candidate catch-all leaves the fallback in place.
-5. **Same-cluster Sidecar**: a native-gRPC request (content-type `application/grpc*`) whose LB-selected target carries `mesh.mtls` skips the direct-dial gRPC branch in `src/proxy/mod.rs` and dispatches through the generic mesh-mTLS gate + pool (`proxy_to_backend_mesh_mtls`): hyper HTTP/2 end-to-end with pinned peer SVID, a streamed or once-finalized replayable request body, `te: trailers` re-synthesized after the hop-by-hop strip (the gRPC HTTP/2 mapping mandates it), and the streaming H2 response arm relays backend trailers (`grpc-status`) after hop-by-hop filtering — the same trailer semantics as the direct gRPC pool. The gRPC receive limit (`FERRUM_MAX_GRPC_RECV_SIZE_BYTES`) caps the request body — declared content-length and streamed bytes alike — with the direct pool's Trailers-Only RESOURCE_EXHAUSTED on overflow, and a `grpc-status` trailer maps into circuit-breaker / passive-health / adaptive-concurrency outcome recording at body EOF exactly like the direct pool (an HTTP 200 + `grpc-status: 14` records as the mapped 503, not a success; Trailers-Only errors are mapped from the header-borne status; a translated gRPC-Web stream is classified from the native trailer before it is body-framed). The client `grpc-timeout` is honored with the direct pool's regimes: for streaming native gRPC and translated gRPC-Web it bounds the response body by an absolute deadline anchored at request receipt; if another response policy explicitly selects the compatible buffered gRPC-Web fallback, the deadline is capped by `backend_read_timeout_ms` and shared across send + body collection. Timeouts return the Trailers-Only DEADLINE_EXCEEDED shape before client-visible translation. Native-gRPC responses are **never buffered** on this path (a buffered mesh response cannot re-emit wire trailers): if buffering is still demanded after the content-type refinement (explicit `response_body_mode: buffer`, or a plugin that needs the response body for this content-type) the request fails closed with a Trailers-Only gRPC UNAVAILABLE — the direct (non-mesh) gRPC path keeps its buffer-with-trailers behavior unchanged. Retry and request-body policy may prebuffer the upload; only an unavailable gateway SVID, malformed identity/SNI/trust metadata, or an unsupported secured transport blocks dispatch. **Same-cluster Ambient**: the HBONE inner protocol is HTTP/1.1 through a CONNECT byte tunnel (no trailer path — see the WebSocket-over-HBONE inner-HTTP/1.1 note [6]), so native gRPC to a `mesh.hbone` target is refused **pre-dial** with gRPC UNAVAILABLE; native gRPC-over-HBONE is explicitly out of scope for Ambient; Ferrum does not run a nested HTTP/2 client inside the HBONE byte tunnel. Use Sidecar mesh-mTLS for native gRPC, or gRPC-Web pass-through when Ambient transport is required. **Cross-cluster**: for **Sidecar** (`mesh.mtls`), a WELL-FORMED cross-cluster target (carrying the `mesh.eastwest_sni` override AND `mesh.trust_domain`) now falls through onto the mesh-mTLS pool's cross-cluster branch exactly like a same-cluster `mesh.mtls` target (issue #2010), so `grpc-status` trailers relay across the east-west hop; a MALFORMED one (missing SNI / trust domain) fails closed with a clean gRPC UNAVAILABLE rather than reaching a 502. For **Ambient** (`mesh.hbone`) it stays refused pre-dial per the guard at [Client-Side Cross-Cluster Egress (Ambient / HBONE)](#client-side-cross-cluster-egress-ambient--hbone) (HBONE's HTTP/1.1 inner tunnel has no trailer path). The classifier (`classify_grpc_mesh_dispatch`) is the single predicate every gRPC surface consults. A native-gRPC request initially selected onto mesh-mTLS may retry with the same trailer-preserving transport; the separate direct gRPC pool still fails closed if rotation lands on a mesh target. **Pass-through gRPC-Web** frames its trailers inside the response body (no HTTP/2 trailers needed), so it falls through and rides every mesh transport like plain HTTP. gRPC-Web the `grpc_web` plugin **translated** is wire-native gRPC by dispatch time, so to an Ambient `mesh.hbone` target (same-cluster or cross-cluster HBONE) it is refused pre-dial with the same Trailers-Only gRPC UNAVAILABLE as native gRPC (the HTTP/1.1 inner tunnel would drop its trailers); with the `grpc_web` translation plugin on a Sidecar mesh-mTLS route (same-cluster or cross-cluster), binary- and text-mode gRPC-Web use the same trailer-preserving path after any required request decoding/finalization, and the shared adapter converts terminal HTTP/2 trailers into the client-visible gRPC-Web frame. If another response policy explicitly requires buffering, the existing whole-body transform remains the compatible fallback and preserves the folded terminal metadata. **HTTP/3 frontend**: the H3 frontend has no mesh transport dispatch, so H3→gRPC bridge requests, H3→HTTP plain-bridge requests, and plain requests selected for the native-H3 backend pool all fail closed before any direct dial when the selected target requires HBONE, mesh-mTLS, or cross-cluster east-west mesh transport; gRPC gets Trailers-Only UNAVAILABLE, plain HTTP gets a 502 with `gateway-error-reason`, and the H3 WebSocket bridge refuses the upgrade with the same 502 shape (note [6]).
+5. **Same-cluster Sidecar**: a native-gRPC request (content-type `application/grpc*`) whose LB-selected target carries `mesh.mtls` skips the direct-dial gRPC branch in `src/proxy/mod.rs` and dispatches through the generic mesh-mTLS gate + pool (`proxy_to_backend_mesh_mtls`): hyper HTTP/2 end-to-end with pinned peer SVID, a streamed or once-finalized replayable request body, `te: trailers` re-synthesized after the hop-by-hop strip (the gRPC HTTP/2 mapping mandates it), and the streaming H2 response arm relays backend trailers (`grpc-status`) after hop-by-hop filtering — the same trailer semantics as the direct gRPC pool. The gRPC receive limit (`FERRUM_MAX_GRPC_RECV_SIZE_BYTES`) caps the request body — declared content-length and streamed bytes alike — with the direct pool's Trailers-Only RESOURCE_EXHAUSTED on overflow, and a `grpc-status` trailer maps into circuit-breaker / passive-health / adaptive-concurrency outcome recording at body EOF exactly like the direct pool (an HTTP 200 + `grpc-status: 14` records as the mapped 503, not a success; Trailers-Only errors are mapped from the header-borne status; a translated gRPC-Web stream is classified from the native trailer before it is body-framed). The client `grpc-timeout` is honored with the direct pool's regimes: for streaming native gRPC and translated gRPC-Web it bounds the response body by an absolute deadline anchored at request receipt; if another response policy explicitly selects the compatible buffered gRPC-Web fallback, the deadline is capped by `backend_read_timeout_ms` and shared across send + body collection. Timeouts return the Trailers-Only DEADLINE_EXCEEDED shape before client-visible translation. Native-gRPC responses are **never buffered** on this path (a buffered mesh response cannot re-emit wire trailers): if buffering is still demanded after the content-type refinement (explicit `response_body_mode: buffer`, or a plugin that needs the response body for this content-type) the request fails closed with a Trailers-Only gRPC UNAVAILABLE — the direct (non-mesh) gRPC path keeps its buffer-with-trailers behavior unchanged. Retry and request-body policy may prebuffer the upload; only an unavailable gateway SVID, malformed identity/SNI/trust metadata, or an unsupported secured transport blocks dispatch. **Same-cluster Ambient**: on the H1/H2 frontend the generic HTTP-family HBONE dispatch speaks HTTP/1.1 through the CONNECT byte tunnel (no trailer path — see the WebSocket-over-HBONE inner-HTTP/1.1 note [6]), so native gRPC to a `mesh.hbone` target is refused **pre-dial** there with gRPC UNAVAILABLE; use the HTTP/3 frontend, Sidecar mesh-mTLS, or gRPC-Web pass-through. The **HTTP/3 frontend does** run a nested HTTP/2 client inside the HBONE byte tunnel for native gRPC (issue #3284) — see the HTTP/3-frontend paragraph at the end of this note. **Cross-cluster**: for **Sidecar** (`mesh.mtls`), a WELL-FORMED cross-cluster target (carrying the `mesh.eastwest_sni` override AND `mesh.trust_domain`) now falls through onto the mesh-mTLS pool's cross-cluster branch exactly like a same-cluster `mesh.mtls` target (issue #2010), so `grpc-status` trailers relay across the east-west hop; a MALFORMED one (missing SNI / trust domain) fails closed with a clean gRPC UNAVAILABLE rather than reaching a 502. For **Ambient** (`mesh.hbone`) it stays refused pre-dial on the H1/H2 frontend per the guard at [Client-Side Cross-Cluster Egress (Ambient / HBONE)](#client-side-cross-cluster-egress-ambient--hbone) (that path's HTTP/1.1 inner tunnel has no trailer path); the HTTP/3 frontend dispatches it over the nested-HTTP/2 HBONE transport's cross-cluster dial. The classifier (`classify_grpc_mesh_dispatch`) is the single predicate every gRPC surface consults. A native-gRPC request initially selected onto mesh-mTLS may retry with the same trailer-preserving transport; the separate direct gRPC pool still fails closed if rotation lands on a mesh target. **Pass-through gRPC-Web** frames its trailers inside the response body (no HTTP/2 trailers needed), so it falls through and rides every mesh transport like plain HTTP. gRPC-Web the `grpc_web` plugin **translated** is wire-native gRPC by dispatch time, so to an Ambient `mesh.hbone` target (same-cluster or cross-cluster HBONE) it is refused pre-dial with the same Trailers-Only gRPC UNAVAILABLE as native gRPC (the HTTP/1.1 inner tunnel would drop its trailers); with the `grpc_web` translation plugin on a Sidecar mesh-mTLS route (same-cluster or cross-cluster), binary- and text-mode gRPC-Web use the same trailer-preserving path after any required request decoding/finalization, and the shared adapter converts terminal HTTP/2 trailers into the client-visible gRPC-Web frame. If another response policy explicitly requires buffering, the existing whole-body transform remains the compatible fallback and preserves the folded terminal metadata. **HTTP/3 frontend**: the H3→gRPC bridge dispatches BOTH mesh transports, same-cluster and cross-cluster, on both the buffered/retryable path and the channel-backed streaming path (issue #3284). A Sidecar `mesh.mtls` target rides the SAME SVID-mTLS HTTP/2 pool as the H1/H2 frontend (pinned peer same-cluster; east-west gateway dial + destination-FQDN SNI override + trust-domain scope cross-cluster), and its request `:authority` is resolved by the same shared resolver the generic mesh-mTLS path uses, so the peer sidecar's materialized inbound route (including the multi-port service-port rewrite) matches identically. An Ambient `mesh.hbone` target rides a NESTED hyper HTTP/2 connection run over the authenticated HBONE CONNECT byte tunnel: the outer hop is the ordinary pooled Ambient dial (`:15008` / `mesh.hbone_port`, identity-pinned same-cluster; remote east-west gateway + SNI override + trust-domain scope cross-cluster), the destination's transparent relay byte-copies the tunnel to the local app socket, and the inner connection is therefore an ordinary h2c connection to the gRPC server. This is why HBONE gRPC works on the H3 bridge but not on the H1/H2 frontend: the generic HTTP-family HBONE dispatch runs `hyper::client::conn::http1` inside the tunnel and would drop the trailers, whereas the gRPC transport runs `hyper::client::conn::http2` over the same bytes. The inner connection is 1:1 with the CONNECT stream (one per RPC, like the WebSocket-over-HBONE and raw-TCP-over-HBONE egress paths), so there is no inner-connection cache to poison across SVID rotation; its inner request `:authority` is the destination's own app address:port (or a preserved client `Host`), matching the HBONE inner-request Host fallback, and its CONNECT baggage asserts this gateway's own SVID (an H3 client is a north-south caller, not an authenticated mesh peer whose principal could be forwarded). Because a cross-cluster Ambient `target.host` is a scoped SYNTHETIC identity that is not a valid URI authority, the transport takes only the path and query from the gateway-built backend URL and rebuilds the request line — the gRPC analogue of the generic path's `rewrite_backend_url_authority_host`. Either way it is HTTP/2 end-to-end, so framing, `grpc-status` trailers, streaming backpressure, `grpc-timeout` deadline propagation, and cancellation all behave exactly as they do on the direct gRPC pool. Retry rotation re-resolves the transport per attempt: rotating onto a mesh-tagged target re-dials over ITS own dial plan, and rotating onto an undispatchable one fails closed. Undispatchable targets still fail closed before any direct dial — a cross-cluster target with no transport tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust domain, a corrupted target declaring BOTH `mesh.mtls` and `mesh.hbone` (mutually exclusive topologies, so either choice would be a guess), and any target whose pinned `mesh.spiffe_id` / HBONE dial-host / CONNECT-authority-host tag is present but unusable — with a Trailers-Only gRPC UNAVAILABLE whose message names the failed contract but never the target's identity metadata. The H3→HTTP plain-bridge, plain requests selected for the native-H3 backend pool, and the H3 WebSocket bridge are unchanged and still fail closed for ANY mesh-tagged target: plain HTTP gets a 502 with `gateway-error-reason` and the WebSocket bridge refuses the upgrade with the same 502 shape (note [6]).
    For the Sidecar mesh-mTLS response path in note 5, the operator `backend_read_timeout_ms` window begins only after pool acquisition and `sender.ready()` complete. The receipt-anchored client RPC deadline still covers acquisition and readiness, so slow pool work cannot evade the client's total ceiling while also no longer consuming the operator's response-read allowance.
 
 6. WebSocket egress bullet under [Topologies → Sidecar](#sidecar) ("WebSocket egress (Ambient and Sidecar)"): the dispatch is keyed on the `mesh.mtls`/`mesh.hbone` target tags, identity is pinned, and a mesh-tagged WebSocket target that cannot dispatch over its secured transport fails the upgrade — it is never dialed in plaintext. The H1/H2 frontend re-evaluates the mesh WebSocket fork per connect attempt (including retry rotations); the HTTP/3 WebSocket bridge has no mesh WebSocket transport at all, so it refuses a mesh-tagged target — on the initial selection and on every connect-retry rotation — before dialing, failing the upgrade with a 502 + `gateway-error-reason`.
@@ -1698,24 +1922,100 @@ Per Istio, when `ingress` is **declared** it **replaces** the workload's default
 
 **Omitted vs. explicit-empty `ingress` (Istio-faithful):** an **omitted** `ingress` block keeps the automatic per-service-port inbound defaults, while a **declared** `ingress` — *including an explicit empty `ingress: []`* — configures the workload's inbound listeners explicitly and replaces those defaults. So `ingress: []` suppresses the default inbound routes (the operator declared "no custom inbound listeners"), the same as a non-empty-but-all-unsupported list; it does **not** fall back to the service-port defaults. The K8s translator records `ingress` presence (mirroring `egress`'s omitted-vs-explicit-empty distinction); on the native source a non-empty list always declares, and an explicit `ingress_declared: true` carries the empty-but-declared case. Only a workload whose applicable `Sidecar` **omits** `ingress` entirely keeps the default service-port inbound behavior. This avoids any silent host+path conflict — the two never coexist for one workload. The "ingress was declared" marker is tracked separately from the resolved-listener list and rides its own ECDS carrier so it survives an empty resolved list on the xDS path.
 
-The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried `endpoint_host`/`endpoint_port` against the same loopback-host + nonzero-port allowlist `MeshSidecarIngress::resolve` enforces. A malformed or hostile carrier pointing a listener at an off-box host or a `:0` backend is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution.
+The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried backend against the same allowlists `MeshSidecarIngress::resolve` enforces — a loopback host + nonzero port for a TCP backend, or an admissible absolute socket path for a `unix://` backend. A malformed or hostile carrier pointing a listener at an off-box host, a `:0` backend, or a traversal-like socket path is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution. A carrier that sets **both** shapes (a `host:port` alongside a socket path) is refused outright, so a TCP fallback can never ride along with a Unix backend.
 
 ### Supported and deferred `defaultEndpoint` forms
 
-`defaultEndpoint` is resolved fail-closed; an entry that does not map cleanly onto a loopback `host:port` HTTP route is **not** materialized and is reported in the `Sidecar` `status.ferrum.translation.deferred_fields` (the resource is still accepted):
+`defaultEndpoint` is resolved fail-closed; an entry that does not map cleanly onto a loopback `host:port` HTTP route or an admissible Unix-domain stream socket is **not** materialized and is reported in the `Sidecar` `status.ferrum.translation.deferred_fields` (the resource is still accepted):
 
 | `defaultEndpoint` / listener | Behavior |
 |---|---|
 | `127.0.0.1:PORT`, `[::1]:PORT` (loopback) | Modeled; dials that loopback address + port (address family preserved). |
 | `0.0.0.0:PORT`, `[::]:PORT` (instance IP) | Modeled; mapped to loopback (`127.0.0.1` / `::1`) — the sidecar app shares the pod network namespace. |
 | Recognized HTTP-family `port.protocol` (`http`/`http2`/`grpc`/`grpc-web`/`https`) | Modeled — `https` is a TLS-terminated HTTP-family listener and is materialized. |
-| `unix:///path/to/socket` | **Deferred** — Ferrum's backend model is `host:port` only; not representable. |
+| `unix:///absolute/path.sock` | Modeled **only when the path sits under a configured `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` entry** (default: none, so refused). Dispatched over a `tokio::net::UnixStream` — HTTP/1.1 or h2c per the declared `port.protocol` (see "Unix-socket backends" below). |
+| `unix://` with an inadmissible path (relative, `.`/`..` component, `//`, trailing `/`, NUL / control character, > 103 bytes, surrounding whitespace) | **Deferred** — the `deferred_fields` entry names the exact rule that was broken; the operator-supplied path is never echoed back. A path that is *syntactically* fine but outside the data plane's containment roots is refused at materialization instead (the control plane cannot see the data plane's allowlist). |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
 | Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
 | Missing or **unrecognized** `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — a custom inbound listener routes only *recognized* HTTP-family protocols; a missing protocol (Istio defaults an unset port to TCP) or a mistyped string is **not** guessed as HTTP and is reported as a deferred non-HTTP listener, so it is never exposed on the HTTP request path. (The service-port default path keeps the `unknown → HTTP` convention for auto-discovered ports; this stricter rule applies only to explicitly declared `ingress[]` listeners. On the native source a mistyped `protocol` fails deserialization outright.) |
 | Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it (the native model also accepts an omitted field, defaulting to empty); with no forward target there is nothing to route. |
 
 The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. The HTTP-family classification is shared by translation/resolution and the status writer (one predicate), so a modeled listener is never falsely reported as a deferred non-HTTP listener (and vice-versa). A listener `port` of `0` is a hard validation error (rejected), not a deferral.
+
+### Unix-socket backends
+
+A `unix://` `defaultEndpoint` names a Unix-domain **stream** socket the co-located application listens on. Ferrum admits the path, then dispatches matching requests over a fresh `tokio::net::UnixStream` instead of a TCP connection. Its schema-compatible loopback `host:port` carrier is never resolved or dialed and is not evaluated by `FERRUM_BACKEND_ALLOW_IPS`; the socket-specific containment, ownership, inode, and peer-credential gates below are the authoritative egress policy for this local transport.
+
+#### Containment is mandatory and off by default
+
+A `Sidecar` is operator-authored config, and the socket path names a local filesystem object the Ferrum process — often the most privileged process in the pod — would connect to. An unconstrained path is therefore a **local privilege boundary**: `unix:///var/run/docker.sock` would hand every request-path client the container runtime's API.
+
+So the feature is gated on an explicit allowlist with **no default**:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` | *empty* | Absolute directories a socket may live under. **Empty refuses every `unix://` endpoint.** No built-in `/run` or `/var/run` allowance. |
+| `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` | *empty* | Admitted owner uids. Empty admits **only** the Ferrum process's own effective uid. |
+
+A root must be absolute, normalized, and not bare `/` (which would contain everything and make the allowlist a no-op); a malformed entry **fails startup** rather than being silently skipped. Containment is a whole-**component** match and requires a strict descendant, so `/var/runner/app.sock` is *not* inside `/var/run`, and the root directory itself is never dialable.
+
+#### The two-stage gate
+
+**Translation / materialization** (`crate::util::unix_socket::admit_configured_path`) applies syntax plus containment, with no filesystem I/O — a control plane does not share the workload's filesystem, so the *syntax* half runs CP-side (`MeshSidecarIngress::resolve`, and the `Sidecar` status writer's `deferred_fields` classification) while **containment is a data-plane policy** applied by `ResolvedIngressListener::endpoint_is_valid`/`backend` when the slice is materialized. A path is syntactically admitted only when it is absolute; free of `.`, `..`, and empty (`//`) components; not a directory (no trailing `/`); free of NUL bytes, ASCII control characters, and surrounding whitespace; and at most **103 bytes** — the usable `sockaddr_un.sun_path` budget on the smallest supported platform (macOS/BSD reserve 104 including the terminating NUL; Linux allows 108), so a path admitted on one platform always dials on another. Nothing is normalized or trimmed: the byte sequence dialed is exactly the one written. Abstract (Linux `\0`-prefixed) and `@`-prefixed sockets are refused — Istio does not define them for `defaultEndpoint`.
+
+Because the CP-side `ingress_modeled` count cannot see the data plane's allowlist, a listener reported as modeled by the `Sidecar` status writer is still subject to data-plane containment; a refusal there is logged by the data plane and the listener simply never materializes.
+
+**Dial time** (`admit_socket_for_connect`) re-runs the whole gate — the value may have crossed a CP/DP, file, or xDS boundary since — and adds the facts that only exist at connect. It does **not** return a yes/no: it returns the **checked identity** (`AdmittedUnixSocket` — the canonical path, the owner uid, and the `(dev, ino)` of the exact object inspected), and that identity, not the configured pathname, is what gets dialed.
+
+- the path is `canonicalize`d, which fully resolves symlinks, `..`, and mount points; the **resolved** path must itself be syntactically dialable and must land inside an allowed root. This is what stops a symlink planted inside an allowed directory from redirecting the dial to `/var/run/docker.sock`; a symlink that stays *inside* a root is fine;
+- the resolved object must be a Unix-domain **socket** (a regular file, directory, or FIFO is refused);
+- its owner uid must be admitted — `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` when set, otherwise the Ferrum process's own effective uid;
+- the socket must not be group- or world-writable;
+- **every directory from the socket's parent up to and including the matched containment root** must be a real directory (not a symlink, not another file type), owned by a trusted uid, and not group/world-writable without the sticky bit. Checking only the immediate parent is not enough: a writable ancestor lets an attacker rename or replace a whole checked subtree without ever touching the parent that was inspected. Above the matched root the walk stops — the root is the operator's declared trust boundary, and whoever can rewrite it can also rewrite the configuration that named it.
+
+The **trusted directory owners** are uid 0 (root can rewrite any of these checks regardless, so treating it as untrusted would only produce false refusals), the Ferrum process's own effective uid, and every uid in `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` (those name the co-located application, which is the intended peer). Nothing else.
+
+**The sticky bit, stated exactly.** Sticky (`/tmp` semantics) only stops a user from renaming or unlinking an entry they do *not* own; the directory's owner and the entry's owner are always exempt. Sticky is therefore accepted **only** in combination with the two ownership rules above — every directory on the chain is trusted-owned and the socket entry itself is owned by an admitted uid — which together are what proves no untrusted directory owner and no untrusted group member can rename or replace a checked descendant. Sticky alone never admits anything.
+
+**TOCTOU.** A filesystem check and the subsequent `connect(2)` cannot be made atomic through the POSIX path API. Ferrum closes the gap on the *identity* side instead of leaving the window open: the dial targets the canonical path from the checked identity, and then — after `connect(2)` returns and **before a single request byte is written** — the transport asserts both of:
+
+1. the **connected peer's uid equals the checked socket owner's uid, exactly**. Not "some uid in the allowlist": the allowlist decides which sockets may be admitted at all, this decides that the connection reached the very socket that was admitted. The credential is the kernel's, taken from the established connection (`SO_PEERCRED` on Linux — a `struct ucred` captured when the connection was established and never updated afterwards, so on the connecting side it is the credential set of the process that called `listen(2)`);
+2. the checked path still names the same `(dev, ino)`, file type, and owner. Unlinking and re-binding a socket always produces a new inode, so a swap inside the window is visible even when the replacement is owned by the same uid.
+
+Either failure — and an *unavailable* credential, which is identity ambiguity and therefore also a failure — closes the connection unused. There is no fallback to TCP, to the placeholder `host:port`, or to a weaker check.
+
+**Platform contract.** The connected-peer check is enforced on Linux/Android (`SO_PEERCRED`), Apple/FreeBSD/DragonFly (`getpeereid(3)`), NetBSD (`LOCAL_PEERCRED`), and illumos/Solaris (`getpeerucred(3)`). Any other Unix target — and any non-Unix target — **refuses Unix backends outright** rather than dialing with a weaker guarantee than Linux enforces. Sidecar mesh deployments are Linux-only in practice, so this is a compile-time posture rather than a live limitation.
+
+Every refusal is a pre-wire, gateway-side policy decision: `ErrorClass::DispatchPolicyRejected` (health-neutral, not retried), surfaced as a `502` whose body never echoes the operator-supplied path. A genuine dial failure — missing socket, wedged app, `ECONNREFUSED` — stays an ordinary backend-down signal (`ConnectionRefused` / `ConnectionTimeout`), so the circuit breaker and passive health see it.
+
+#### Protocol matrix
+
+The wire protocol is resolved **once at translation** from the declared `port.protocol` and carried on its own reserved tag (`mesh.unix_socket_h2c`) as the explicit string `"true"` or `"false"`. Dispatch never infers it: a missing or malformed marker is refused so a partially stripped h2c carrier cannot silently downgrade to HTTP/1.1.
+
+| Declared `port.protocol` | Socket wire protocol | Status |
+|---|---|---|
+| `http` | HTTP/1.1 | Supported. Streaming request and response bodies, size ceilings, and timeouts are the loopback-TCP path's. |
+| `http2`, `https` | h2c prior-knowledge HTTP/2 | Supported. (`https` is mapped to `Http2` by the Istio translator; a `defaultEndpoint` is a plaintext hop to a co-located app, so TLS is not re-originated onto the socket and the request `:scheme` is `http`.) |
+| `grpc` | h2c prior-knowledge HTTP/2 | Supported, natively: full request/response streaming, the receipt-anchored client deadline, upstream cancellation on deadline expiry, `te: trailers` regeneration, and terminal `grpc-status`/`grpc-message` **trailers**. |
+| gRPC request to an `http`-declared socket | — | **Refused** with gRPC `UNAVAILABLE` (14). HTTP/1.1 cannot carry gRPC trailers, and a downgrade would silently corrupt the RPC. Declare the listener `GRPC` or `HTTP2`. |
+| WebSocket upgrade to any Unix-backed listener | — | **Refused** `502`. The WebSocket dial machinery is written against TCP/TLS and the mesh CONNECT tunnels and has no Unix transport; the target's `host:port` is the gateway's own inbound listener port, so a fallback would loop the proxy into itself. |
+| Retry dispatch (reqwest-backed) | — | **Refused** `502`. The materialized ingress proxies configure no retry policy, so this is a defensive gate, not a live limitation. |
+| HTTP/3 frontend | — | **Refused.** The H3 bridge has no Unix transport; mesh capture is TCP-only, so an H3 frontend cannot reach a Sidecar ingress listener in practice. |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/…) | — | Deferred before any listener exists (raw-TCP inbound has no Host/route). |
+
+The h2c path is not a second implementation of the gRPC-over-HTTP/2 contract: it reuses `proxy_to_backend_mesh_mtls`'s dispatch body with the pooled SVID-mTLS sender swapped for a 1:1 h2c `UnixStream` sender, so gRPC flavor detection, deadline handling, the never-buffer-native-gRPC rule, and streaming trailer forwarding are literally the same code on both transports and cannot drift. Every h2c buffer is bounded: a 1 MiB initial stream window, a 2 MiB connection window, a 16 KiB max frame size, and a capped reset-stream table, on top of the request/response body ceilings the caller already applies.
+
+#### Timeouts, lifecycle, and the transport gate
+
+The connect is bounded by the proxy's `backend_connect_timeout_ms` (5s for a materialized ingress listener), falling back to 5s if unset; exceeding it yields a `504` with `ErrorClass::ConnectionTimeout`. Read/write bounds and request/response body ceilings are the same ones the loopback-TCP path applies.
+
+On an h2c socket that one budget is **end-to-end over establishment**, and establishment means the **peer's** HTTP/2 connection preface, not the client's. Hyper's h2c `handshake()` writes the client preface and never reads, so it completes against a peer that merely accepted the socket; the dial therefore also waits for the peer's own initial `SETTINGS` frame (RFC 9113 §3.4) — the same observation the gRPC pool's h2c path uses — before the sender is handed to dispatch. Admission, `connect(2)`, the client handshake, and that wait share the single budget captured before the connect, so a slow connect cannot re-arm a fresh one. This is what stops a co-located app that accepts and then wedges from pinning a request task indefinitely when the client supplied no gRPC deadline and no backend read timeout is configured. A peer that hangs up before completing its preface is a `502` with `ErrorClass::ConnectionPoolError` (evidence about the app, health-affecting, pre-wire and therefore replay-safe); exceeding the budget is the `504` above.
+
+Connections are **not pooled** — each request dials its own socket and closes it when the response completes. The destination is a local app reached by a plain `connect(2)` with no DNS, TCP handshake, or TLS, so pooling is a performance follow-up rather than a correctness requirement.
+
+A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing (leaving no orphaned upstream) and a re-pointed one dials the new socket with no restart.
+
+**Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
 ### `bind` and `captureMode` limitations
 
@@ -2348,14 +2648,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   netns), where pod IPs are **FORWARDED, not `LOCAL`**, so inbound UDP to a pod
   would match the OUTBOUND chain's `! --dst-type LOCAL` discriminator and be
   mis-captured as egress. There is no host-netns-safe `addrtype`-style
-  discriminator without per-pod IP knowledge the iptables fallback does not carry,
-  so the **node-agent's host-netns iptables fallback emits NO UDP TPROXY rules**
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family`) and
-  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **Node-agent
-  host-netns UDP capture is unsupported in this stage**, and **eBPF does not cover
-  UDP either** — the eBPF capture programs are `connect()`-cgroup-hooked and
-  TCP-only (no UDP hooks; see the node-waypoint UDP/DTLS limitation above). UDP
-  capture lives in the **injector's pod-netns path** (its iptables init container
+  discriminator, so the **node-agent's host-netns iptables fallback emits NO UDP
+  TPROXY rules** (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family`) and logs the limitation when
+  `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. The node-agent has no UDP listener
+  either, and rules without a socket are a black hole, so it stays out of the UDP
+  datapath entirely; **eBPF does not cover UDP** — the eBPF capture programs are
+  `connect()`-cgroup-hooked and TCP-only (no UDP hooks; see the node-waypoint
+  UDP/DTLS limitation above). What DOES capture UDP in the host namespace is the
+  mesh proxy's **host-network UDP capture path**
+  (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`, issue #3288), which replaces the
+  `addrtype` split with an **ingress-interface** split — see "Host-network UDP
+  capture" below. UDP capture otherwise lives in the **injector's pod-netns path**
+  (its iptables init container
   runs in the pod netns, where the pod IP is `LOCAL` so the direction split holds);
   node-agent / node-waypoint UDP capture is a **future stage**.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
@@ -2413,14 +2718,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `FERRUM_MESH_CAPTURE_UDP_PORT`, and `FERRUM_MESH_TPROXY_MARK` from the **same**
   injector config that drives the init container's TPROXY rules (these are not in
   `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env). The
-  **node-agent / ambient host-netns** path still installs no UDP TPROXY rules
-  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family` —
-  the `--dst-type LOCAL` direction split is unsafe in the host netns). Ambient's
-  UDP source-capture instead rides the **per-pod-netns producer** (#2013, see the
-  end-to-end status bullet under Stages 3–4): it installs the UDP TPROXY rules and
-  binds the transparent sockets INSIDE each enrolled pod's netns via `setns`, so
-  the host-netns "no UDP rules" invariant is **preserved** while Ambient still
-  captures UDP. eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
+  **pod-netns rule generator** still installs no UDP TPROXY rules for
+  `host_netns` (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family` — the `--dst-type LOCAL` direction split is
+  unsafe in the host netns). Ambient's UDP source-capture rides one of two
+  placements, both consuming the same relay/session machinery:
+
+  * **Per-pod-netns producer** (#2013, the default; see the end-to-end status
+    bullet under Stages 3–4): installs the UDP TPROXY rules and binds the
+    transparent sockets INSIDE each enrolled pod's netns via `setns`.
+  * **Host-network capture** (#3288, `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true`;
+    see "Host-network UDP capture" below): installs interface-scoped rules and one
+    transparent socket in the proxy's own namespace, entering no pod namespace.
+
+  eBPF UDP capture (#1803) stays a non-goal. **Fail-closed on
   malformed settings:** on a capture-relay
   runtime (Ambient or Sidecar), when the flag is set but a UDP capture var is
   malformed, mesh startup aborts (`serve_mesh_runtime` validates the env before
@@ -2505,10 +2816,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   a lock-free atomic count so a spoofed-source flood never walks every DashMap
   shard), an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the
   recvmmsg batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`); GRO-coalesced reads are
-  framed **per segment**, not as one superblock. When capture is enabled the
-  capture port is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream
-  proxy or ServiceEntry declaring the same listen port is rejected at validation
-  rather than racing the capture listener at startup. The listener carries
+  framed **per segment**, not as one superblock. When the mesh proxy itself binds
+  the capture port (Sidecar, or Ambient with the host-netns placement), that port
+  is added to `reserved_gateway_ports()`, so a mesh UDP/DTLS stream proxy or
+  ServiceEntry declaring the same listen port is rejected at validation rather
+  than racing the capture listener at startup. Ambient's default per-pod-netns
+  placement binds inside each pod and therefore does not reserve the host port.
+  The listener carries
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. With the flag off there is no
@@ -2944,6 +3258,157 @@ nodeAgent:
 
 Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` for kernel-backcompat on 5.7.x and for every `node_waypoint` deployment's pod-netns `setns()`/veth discovery. Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`, `hostPID: true`. See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
 
+### Host-network UDP capture (issue #3288)
+
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` (default `false`, requires
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true` and `FERRUM_MESH_TOPOLOGY=ambient`) moves
+Ambient's UDP source-capture from each pod's network namespace into the mesh
+proxy's own. Setting it without the capture switch, or on any topology but
+Ambient, is a **startup error**, not a silent no-op — both halves are enforced in
+the process (the capture-switch half in `capture::udp_capture_settings_from_env`,
+the topology half in `modes::mesh::validate_udp_host_netns_placement` on the
+serving path), so a direct-env or hand-rolled-manifest deployment that never
+renders the chart still fails closed rather than starting with no producer. It
+captures the same traffic and feeds the same session, relay, overload, and
+return-path machinery as the per-pod-netns producer — only the placement differs.
+
+**Why the host namespace needed a different mechanism.** The pod-netns generator
+splits inbound from outbound with `-m addrtype --dst-type LOCAL`, which is only
+true inside a pod. In the host namespace pod IPs are forwarded, not local, so
+inbound-to-pod UDP would match the outbound chain's `! --dst-type LOCAL` and be
+mis-captured. The host path therefore does not use `addrtype` at all.
+
+**The discriminator is the ingress interface.** In `mangle PREROUTING`, every
+capture rule carries `-i <that pod's host-side interface>`:
+
+| Traffic | Where it appears in the host namespace | Captured? |
+|---|---|---|
+| An enrolled pod's egress | `PREROUTING` on **that pod's** interface | **Yes** — this is the whole capture set |
+| Traffic destined for a pod | `PREROUTING` on the **node uplink**, then forwarded | No — never matches a pod interface |
+| The node's own traffic (kubelet, CNI, DNS, `hostNetwork` pods, the proxy's own relay egress) | `OUTPUT` only | No — **the host path installs no `mangle OUTPUT` chain at all** |
+
+That last row is structural, not a filter: there is no OUTPUT chain, no `-j MARK`,
+and no loopback reinjection loop, so node traffic cannot be captured even by
+misconfiguration.
+
+**Per-datagram identity.** One transparent socket serves every enrolled pod, so
+evidence is resolved per datagram from two kernel-provided facts — the original
+destination (`IP_RECVORIGDSTADDR`, un-rewritten by TPROXY) and the ingress
+interface index (`IP_PKTINFO`/`IPV6_PKTINFO`, a fatal `setsockopt` for this path).
+The interface index must map to exactly one enrolled pod **and** the datagram's
+source address must be one that pod published in the registry. Neither fact comes
+from the datagram payload, so forging a source address does not change which
+interface a packet entered on. A datagram failing either check is dropped; the
+path never falls back to an unattested or mesh-wide identity.
+
+**Requires per-pod host interfaces.** Two enrolled pods resolving to one interface
+(a shared-bridge CNI, or a stale registry entry on a recycled veth) make
+attribution ambiguous, so **both** are refused — first-wins would be a
+cross-tenant identity bug. Refused pods are not captured and their readiness
+marker is withheld, so the node-agent's tc guard keeps their UDP egress closed
+rather than letting it bypass the mesh. A pod is also refused when it has no
+attested SPIFFE identity, no published address, an unresolvable interface, or a
+name this path will not place in an `iptables -i` argument (notably a `+` suffix,
+which would be a prefix wildcard).
+
+**Privileges.** The host UDP path needs `NET_ADMIN` plus `iproute2`/`iptables` in
+the image — but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no
+namespace is entered. The chart narrows those capabilities automatically when
+this placement is selected while retaining the ambient container's baseline
+`NET_RAW`. The registry hostPath and read-only host cgroup mount stay (the
+enrolled-pod set and interface resolution use them); interface resolution falls
+back to the host route table keyed on the registry-published pod IP when `/proc`
+is not shared. That fallback covers **both families** — `/proc/net/route` for a
+v4 address and `/proc/net/ipv6_route` for a v6 one — which is what lets an
+IPv6-only enrolled pod use this placement at all: without `hostPID` the route
+table is the only resolver, so a v4-only fallback would refuse every such pod
+while the path claimed dual-stack support. Route fallback accepts only an
+unambiguous `RTF_UP` host route (`/32` for IPv4 or `/128` for IPv6), and the
+resolved sysfs device must expose a distinct non-zero peer `iflink`: a broader
+subnet route commonly names a shared CNI bridge, while a self-linked device is
+not a dedicated pod peer. Using either in `iptables -i` could capture enrolled
+and unenrolled neighbours alike. Two devices claiming the same host route
+resolve to nothing rather than to a guess, an oversized table refuses instead
+of answering from a truncated view, and malformed rows are ignored unless a
+valid, unambiguous host route remains.
+
+**Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
+guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
+priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
+node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
+the other's state. Startup reaps the previous generation before installing
+anything — but only **after** discharging its durable readiness handshake (next
+paragraph); a deployment that is **not** using this placement runs the same
+recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
+socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
+DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
+socket bind, or guard release failing all leave the node dropping enrolled UDP
+egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
+the node-agent to acknowledge that its BPF gates closed, and only then removes
+everything; without the acknowledgement it retains the DROP guard.
+
+**A restart is a handshake too.** Readiness is durable and shared with the
+node-agent, so a generation that dies — a crash, a restart, a rollout that
+switches placement or turns UDP capture off — leaves behind BOTH its `mangle`
+state and an open BPF UDP gate for every pod it readied. Leaving the rules is
+safe (a capture path whose socket died with its process drops), but removing them
+while those gates are open is exactly a plaintext window, and the stale interface
+set does not bound the damage: a pod that restarted onto a new veth has no stale
+rule at all and an open gate regardless. So the first thing a new generation does
+is **not** a teardown. It reads the durable `.udp-ready` and `.udp-ack-required`
+directories, puts every pod they name back through the ordinary close handshake
+(persist a fresh `.udp-ack-required`, delete any `.udp-not-ready` so a stale
+acknowledgement cannot authorize this handoff, then retract `.udp-ready`), and
+waits for the node-agent to republish `.udp-not-ready`. Nothing is applied and
+nothing is removed until that settles, and a reap that fails is retried rather
+than logged once — an abandoned `PREROUTING` jump would otherwise black-hole the
+node's UDP with no code path left to clean it up. A pod also settles when
+readiness REAPPEARS for it: this recovery's own retraction removed the marker, so
+a marker that exists again was published by the incoming per-pod-netns producer,
+which publishes only once it is capturing that pod inside its namespace — its
+egress no longer reaches the host namespace at all. Without that clause the two
+halves of a placement switch would deadlock, each waiting on the other. On a node
+whose placement is now the pod-netns producer, mesh startup runs one bounded
+recovery pass before returning to unrelated listener startup. If safe retraction
+is still incomplete, recovery continues in the background and only the incoming
+UDP producer waits on that boundary, so it cannot fight recovery over the shared
+markers; admin, HBONE, and other proxy listeners still start. Until the boundary
+resolves, predecessor rules remain installed and enrolled UDP stays fail-closed.
+Stale-state reaping can continue after the incoming producer starts because
+discovery/retraction is then frozen, and republished readiness is the
+acknowledgement that settles a placement switch.
+
+**A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
+`.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,
+so a pod that is removed or becomes refused keeps its capture rule until the
+node-agent publishes the matching `.udp-not-ready` acknowledgement — the same
+durable `.udp-ack-required` handshake shutdown and the pod-netns cleanup manager
+use. Until then the guard installed for the rebuild covers the **union** of the
+interfaces the new generation captures and the interfaces of every pod still
+owing an acknowledgement, so the departing pod's egress is dropped rather than
+released in plaintext; a failed persistence or an acknowledgement timeout keeps
+that posture and retries on the next poll. A pod that re-enters capture before
+its acknowledgement arrives cancels the handshake and is readied again by the
+ordinary apply path. Withdrawing (or re-attributing) a binding also **restarts
+the shared capture listener** before the new evidence generation goes live: a
+session admitted earlier still holds the old workload identity and its
+transparent reply socket, so a one-way return stream would otherwise keep
+reaching a removed — or recycled — pod address until it idled out. A pure
+addition is not disruptive and leaves live sessions alone. The capture loop is
+supervised on every reconcile: one that exits on its own (a socket error, a
+panicked task) is detected, the datapath is guarded, stale evidence is cleared,
+and the loop is restarted through the normal guarded apply path instead of the
+node black-holing captured traffic while readiness stays published. An
+operator-requested shutdown is never mistaken for such an exit.
+
+**Placement migration.** This path reaps only host-namespace state. Rules a
+previous per-pod-netns generation installed live inside each pod's namespace and
+are destroyed with it, so switching placement on a running node leaves
+already-running pods diverting UDP to a socket that no longer exists there —
+fail-closed (dropped), but not captured. Roll the workloads, or do one
+transitional rollout with UDP capture disabled so the pod-netns cleanup manager
+reaps them first.
+
 ### Ambient UDP upgrade notes
 
 Ambient topology now keeps the per-pod registry and stale-rule cleanup lifecycle
@@ -3125,6 +3590,8 @@ VirtualService L4 routing is materialized into Ferrum stream proxies, reusing th
 - **`spec.tls[]`** → a **passthrough TCP** proxy keyed by SNI: `match[].sniHosts` become the proxy's `hosts`, `match[].port` (or the destination port) the listen port, and the proxy forwards the **encrypted** bytes to the destination without terminating TLS. Multiple `tls[]` matches sharing a port are SNI-routed (`resolve_proxy_by_sni`), then filtered by any compiled L4 `stream_match`.
 - **`spec.tcp[]`** → a plain **TCP** proxy keyed by `listen_port` (`match[].port`, or the destination port), forwarding to the destination. Multiple matches sharing a port with L4 predicates share one listener and resolve by first-match `stream_match` evaluation.
 
+SNI routing is not exclusive to `passthrough: true`: the same plane admits any stream listener that terminates nothing, including an ordinary `tcp` listener with `frontend_tls: false` that declares `hosts` (issue #3264). The peek, precedence ladder, normalization rules, and fail-closed admission for indeterminate ClientHellos are documented once in [TCP/UDP stream proxy → Opaque TLS SNI routing](tcp_udp_proxy.md#opaque-tls-sni-routing) and apply identically to mesh-materialized `tls[]` proxies, Gateway API `TLSRoute`, east-west passthrough, and hand-authored stream proxies.
+
 Optional L4 match predicates compile onto `Proxy.stream_match` (AND within one match arm; OR across match candidates) and are evaluated from trustworthy evidence before the stream route is selected:
 
 | Predicate | Evidence | Deny-by-absence |
@@ -3177,7 +3644,7 @@ spec:
 
 ## Gateway API Status
 
-When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, the controller watches `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`, `ReferenceGrant`, `BackendTLSPolicy`, `BackendLBPolicy` (historical `v1alpha2`, when installed), and `XBackendTrafficPolicy` (pinned `v1.5.1` experimental successor), plus MCS `ServiceImport` (`multicluster.x-k8s.io`, when that CRD is installed) for GEP-1748 backendRefs, resources and writes status subresources for the GatewayClass, Gateway, route, `BackendTLSPolicy`, and BackendLB/`XBackendTrafficPolicy` kinds. `BackendTLSPolicy` is translated onto Service-backed HTTPRoute/GRPCRoute backends and receives Gateway API `PolicyStatus` (`status.ancestors[]`) patches: its ancestor is the targeted Service itself rather than the managed Gateways that route to it — Ferrum's overlay decision and its `Accepted`/`ResolvedRefs` verdict take no Gateway as input, so the verdict provably cannot vary per Gateway, and Ferrum's own contribution is bounded at one entry no matter how many Gateways route to the Service. Ferrum still writes status only for a policy whose targeted Service a managed Gateway *effectively* routes to (a route that materialized on an accepted parentRef, not merely one naming a Gateway). If third-party controllers have already filled the CRD's 16-entry `ancestors` maximum, Gateway API forbids adding another entry, so Ferrum publishes none — but the policy still translates and still governs backend TLS. That ceiling is an output constraint on the status writer alone: `status.ancestors` is mutable state owned by other controllers, and gating translation on it would let any controller holding status-write access disable backend TLS origination and fault covered traffic. A full ancestor map therefore costs reporting fidelity for that policy, not traffic. Each Ferrum ancestor carries Ferrum-authored `Accepted` and `ResolvedRefs` conditions using the portable `PolicyConditionReason` vocabulary (`Accepted` / `Conflicted` / `Invalid` / `NoValidCACertificate` / `TargetNotFound`; `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted`). Like route `status.parents`, `status.ancestors` is an atomic array in the upstream CRD, so it follows the same read-modify-write mandate: preserve fresh non-Ferrum ancestors, replace Ferrum-owned ones within the remaining 16-entry budget, guard with `metadata.resourceVersion`, and refetch/re-merge/retry after `409 Conflict`. When Istio status writing is also enabled, both writers observe the same immutable Kubernetes object generation for that reconcile (one shared snapshot; no second full deep copy), while retaining independent update plans and failure handling. Status planning builds immutable indexes (managed classes/gateways, parent refs, a precomputed ReferenceGrant from×to permission index, services/secrets, conflicts) once per reconcile, reuses the primary translation/materialization result (plus per-object skip errors keyed with exact-or-versionless identity) instead of retranslating a filtered snapshot once per status object, and borrows included `K8sObject` values during translation rather than deep-cloning `spec`/`status` JSON. Gateway API status planning alone applies a fair deterministic work budget of 256 candidates *before* expensive per-object status computation so the cap bounds CPU as well as API writes. All eligible Gateway API status kinds — including GatewayClass and Gateway — share that deterministic window (planning itself can be expensive, so these kinds are not exempted), and therefore enter it within at most `ceil(eligible_candidates / 256)` successful planning/patch rounds for a stable candidate set. The rotating cursor advances after an empty successful plan or a successful patch batch; patch errors and batch timeouts leave the cursor unchanged so the same bounded window retries on the next serialized reconcile. Istio status planning reuses the same translation/index snapshot path but remains unlimited. Each writer's complete Kubernetes status-patch batch has a 60-second wall-clock ceiling: a stalled API request is cancelled so it cannot retain the reconcile loop indefinitely, and unfinished updates are retried by a later watch event or periodic full sync. GatewayClass and Gateway status use Kubernetes server-side apply with the stable `ferrum.io/gateway-controller` field manager and `force=true`; their structural condition/listener arrays are keyed list-maps, so Ferrum applies only the fields it owns. Route `status.parents` is atomic in the upstream CRDs and therefore cannot be safely split by SSA ownership. Route writes instead follow the Gateway API read-modify-write mandate: preserve fresh non-Ferrum parents, replace Ferrum-owned parents, guard the merge patch with `metadata.resourceVersion`, and refetch/re-merge/retry up to five times with jitter after `409 Conflict`. Ferrum manages only `GatewayClass` objects whose `spec.controllerName` is `ferrum.io/gateway-controller`. `Gateway.status.conditions` and route `status.parents[].conditions` include Ferrum-authored `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted` entries with that controller name. The status writer is driven by the same translation inputs as the control-plane config: accepted routes report programmed from typed route-to-parent materialization records captured when Ferrum generates proxies (never by parsing proxy IDs), rejected routes report unresolved references for cases such as missing `ReferenceGrant` authorization or unsupported backend target kinds, and route collisions report `Conflicted=True`. Live `TCPRoute` attachment/traffic/status/update/deletion evidence is release-gated by the Gateway API conformance black-box lab (see [`docs/gateway_api_conformance.md`](gateway_api_conformance.md)); Ferrum does not advertise an upstream `GATEWAY-TCP` profile on the pinned Gateway API `v1.5.1` channel.
+When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, the controller watches `GatewayClass`, `Gateway`, `ListenerSet` (optional; discovery skips when the CRD is absent), `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`, `ReferenceGrant`, `BackendTLSPolicy`, `BackendLBPolicy` (historical `v1alpha2`, when installed), and `XBackendTrafficPolicy` (pinned `v1.5.1` experimental successor), plus MCS `ServiceImport` (`multicluster.x-k8s.io`, when that CRD is installed) for GEP-1748 backendRefs, resources and writes status subresources for the GatewayClass, Gateway, ListenerSet, route, `BackendTLSPolicy`, and BackendLB/`XBackendTrafficPolicy` kinds. `BackendTLSPolicy` is translated onto Service-backed HTTPRoute/GRPCRoute backends and receives Gateway API `PolicyStatus` (`status.ancestors[]`) patches: its ancestor is the targeted Service itself rather than the managed Gateways that route to it — Ferrum's overlay decision and its `Accepted`/`ResolvedRefs` verdict take no Gateway as input, so the verdict provably cannot vary per Gateway, and Ferrum's own contribution is bounded at one entry no matter how many Gateways route to the Service. Ferrum still writes status only for a policy whose targeted Service a managed Gateway *effectively* routes to (a route that materialized on an accepted parentRef, not merely one naming a Gateway). If third-party controllers have already filled the CRD's 16-entry `ancestors` maximum, Gateway API forbids adding another entry, so Ferrum publishes none — but the policy still translates and still governs backend TLS. That ceiling is an output constraint on the status writer alone: `status.ancestors` is mutable state owned by other controllers, and gating translation on it would let any controller holding status-write access disable backend TLS origination and fault covered traffic. A full ancestor map therefore costs reporting fidelity for that policy, not traffic. Each Ferrum ancestor carries Ferrum-authored `Accepted` and `ResolvedRefs` conditions using the portable `PolicyConditionReason` vocabulary (`Accepted` / `Conflicted` / `Invalid` / `NoValidCACertificate` / `TargetNotFound`; `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted`). Like route `status.parents`, `status.ancestors` is an atomic array in the upstream CRD, so it follows the same read-modify-write mandate: preserve fresh non-Ferrum ancestors, replace Ferrum-owned ones within the remaining 16-entry budget, guard with `metadata.resourceVersion`, and refetch/re-merge/retry after `409 Conflict`. When Istio status writing is also enabled, both writers observe the same immutable Kubernetes object generation for that reconcile (one shared snapshot; no second full deep copy), while retaining independent update plans and failure handling. Status planning builds immutable indexes (managed classes/gateways, parent refs, a precomputed ReferenceGrant from×to permission index, services/secrets, conflicts) once per reconcile, reuses the primary translation/materialization result (plus per-object skip errors keyed with exact-or-versionless identity) instead of retranslating a filtered snapshot once per status object, and borrows included `K8sObject` values during translation rather than deep-cloning `spec`/`status` JSON. Gateway API status planning alone applies a fair deterministic work budget of 256 candidates *before* expensive per-object status computation so the cap bounds CPU as well as API writes. All eligible Gateway API status kinds — including GatewayClass and Gateway — share that deterministic window (planning itself can be expensive, so these kinds are not exempted), and therefore enter it within at most `ceil(eligible_candidates / 256)` successful planning/patch rounds for a stable candidate set. The rotating cursor advances after an empty successful plan or a successful patch batch; patch errors and batch timeouts leave the cursor unchanged so the same bounded window retries on the next serialized reconcile. Istio status planning reuses the same translation/index snapshot path but remains unlimited. Each writer's complete Kubernetes status-patch batch has a 60-second wall-clock ceiling: a stalled API request is cancelled so it cannot retain the reconcile loop indefinitely, and unfinished updates are retried by a later watch event or periodic full sync. GatewayClass, Gateway, and ListenerSet status use Kubernetes server-side apply with the stable `ferrum.io/gateway-controller` field manager and `force=true`; their structural condition/listener arrays are keyed list-maps, so Ferrum applies only the fields it owns. Route `status.parents` is atomic in the upstream CRDs and therefore cannot be safely split by SSA ownership. Route writes instead follow the Gateway API read-modify-write mandate: preserve fresh non-Ferrum parents, replace Ferrum-owned parents, guard the merge patch with `metadata.resourceVersion`, and refetch/re-merge/retry up to five times with jitter after `409 Conflict`. Ferrum manages only `GatewayClass` objects whose `spec.controllerName` is `ferrum.io/gateway-controller`. `Gateway.status.conditions` and route `status.parents[].conditions` include Ferrum-authored `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted` entries with that controller name. The status writer is driven by the same translation inputs as the control-plane config: accepted routes report programmed from typed route-to-parent materialization records captured when Ferrum generates proxies (never by parsing proxy IDs), rejected routes report unresolved references for cases such as missing `ReferenceGrant` authorization or unsupported backend target kinds, and route collisions report `Conflicted=True`. Live `TCPRoute` attachment/traffic/status/update/deletion evidence is release-gated by the Gateway API conformance black-box lab (see [`docs/gateway_api_conformance.md`](gateway_api_conformance.md)); Ferrum does not advertise an upstream `GATEWAY-TCP` profile on the pinned Gateway API `v1.5.1` channel.
 
 MCS backendRefs match only objects from the exact `multicluster.x-k8s.io` API group. Ferrum admits TCP ports (an omitted `ServiceImport.spec.ports[].protocol` uses the Kubernetes `TCP` default) and reports `UnsupportedProtocol` for UDP, SCTP, unknown, or malformed protocols. An omitted backendRef port is derived only when the import exposes exactly one valid TCP port; zero or multiple TCP candidates fail closed. HTTPRoute/GRPCRoute backends can expand across ready MCS-labeled EndpointSlice addresses when pod discovery is enabled, while TCPRoute/TLSRoute always retain the stable ClusterSet DNS name rather than selecting and discarding all but one EndpointSlice address. A `ServiceImport` carries no `targetPort`, so expansion never assumes the ClusterSet port number is also the container port: a **named** `ServiceImport.spec.ports[]` entry resolves against the like-named MCS EndpointSlice port (the same name-based mapping a core Service uses for a named `targetPort`), and an **unnamed** entry resolves against a single-port slice. A slice that offers no unambiguous mapping is skipped and the backend falls back to the ClusterSet DNS name instead of dialing the ClusterSet port number on a pod address. `UDPRoute` does not claim `ServiceImport` backendRefs and keeps core `Service` legs only.
 
@@ -3201,7 +3668,7 @@ materialization. Listener status reports `Accepted=False` and
 path. Valid `All`, `Same`, empty-selector, and well-formed selector behavior is
 unchanged, and valid sibling listeners reconcile independently.
 
-Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
+Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, and `backendtlspolicies`, plus `get/list/watch` on MCS `serviceimports`, plus `get/list/watch` on core `secrets`/`configmaps`/`services`/`endpointslices` for certificate, BackendTLSPolicy CA, and optional EndpointSlice backend resolution, plus `patch` on Gateway/ListenerSet/route/`backendtlspolicies` `status` subresources. `GatewayClass` is cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
 ## Istio CRD Status
 
@@ -3211,7 +3678,7 @@ Each resource gets a single Ferrum-owned `FerrumAccepted` condition (field manag
 
 - **Accepted** — successful translation writes `FerrumAccepted=True` with a per-kind reason (`Accepted`, plus `AllowNothing`/`NoOp` for AuthorizationPolicy empty-rule semantics). The detail block carries kind-specific context: rule/host/route counts, the resolved PeerAuthentication mTLS mode and port overrides, ServiceEntry `resolution`/`location`, RequestAuthentication scope and permissive-by-default note, the WorkloadEntry service account plus attached `service`/`service_namespace` (and `cross_namespace_service` when the host targets another namespace), the Sidecar egress scope, the Telemetry sections present, or the ProxyConfig scope plus concurrency/image/environment/tracing.sampling fields.
 - **Rejected** — a translator error (`K8sTranslateError`) writes `FerrumAccepted=False`, reason `Invalid`, with the error text in both the condition message and `status.ferrum.translation.error`. This is the gap this surface closes: a hard rejection of any translated kind is now visible to operators instead of being silently dropped from the slice.
-- **Deferred fields** — fields Ferrum parses but does not yet enforce are listed in `status.ferrum.translation.deferred_fields` (and summarized in the condition message) so operators see the gap. DestinationRule `connectionPool.http.maxRequestsPerConnection` is deferred at top-level, `portLevelSettings`, and subset scope because backend close-after-N-requests is unsupported. `connectionPool.http.idleTimeout` and `connectionPool.http.http2MaxRequests` are applied at top-level and `portLevelSettings` scope but deferred at **subset** scope (the subset apply layer projects neither into `ResolvedSubsetTrafficPolicy`), so a subset-scoped value produces both a translator warning and a `subsets[].trafficPolicy.connectionPool.http.*` entry in `deferred_fields` rather than a silently inert knob. The subset-scoped `h2UpgradePolicy`, `maxRetries`, and `http1MaxPendingRequests` fields are applied and are therefore absent from deferred status and translator ignored-field warnings. Invalid or unrepresentable values still reject with a field-specific, value-redacted diagnostic. VirtualService `http[].corsPolicy` is deferred only when it is unrepresentable — an un-compilable `regex`, a malformed/unknown matcher, an `exact` (or legacy `allowOrigin` entry) that is empty/whitespace-only or beyond the 512-byte matcher bound (uncredentialed exact `*` is supported; credentialed exact `*` is deferred to preserve the source credential behavior; wildcard-shaped and noncanonical exacts are now projected LITERALLY rather than deferred), an `allowOrigins[]` list beyond 64 entries, an over-complex regex, or an `allowMethods`/`allowHeaders`/`exposeHeaders` entry that is padded or not a valid HTTP method / header name, or an unknown `unmatchedPreflights` value; Sidecar `ingress[]` listeners are deferred only when Ferrum cannot model them (Unix-socket / non-loopback `defaultEndpoint`, non-HTTP-family protocol, omitted `defaultEndpoint`). Sidecar `outboundTrafficPolicy` is translated and enforced (see [Sidecar Outbound Traffic Policy](#sidecar-outbound-traffic-policy)); an omitted/null `mode` in a present object uses Istio's documented `ALLOW_ANY` default and defers nothing. A `deferred_fields` entry appears only when a present block is not exactly representable — an unrecognized/non-string `mode`, a non-object block, or an unsupported `egressProxy` — and always names the fail-closed `REGISTRY_ONLY` outcome Ferrum enforces instead.
+- **Deferred fields** — fields Ferrum parses but does not yet enforce are listed in `status.ferrum.translation.deferred_fields` (and summarized in the condition message) so operators see the gap. DestinationRule `connectionPool.http.maxRequestsPerConnection` is deferred at top-level, `portLevelSettings`, and subset scope because backend close-after-N-requests is unsupported. `connectionPool.http.idleTimeout` and `connectionPool.http.http2MaxRequests` are applied at top-level and `portLevelSettings` scope but deferred at **subset** scope (the subset apply layer projects neither into `ResolvedSubsetTrafficPolicy`), so a subset-scoped value produces both a translator warning and a `subsets[].trafficPolicy.connectionPool.http.*` entry in `deferred_fields` rather than a silently inert knob. The subset-scoped `h2UpgradePolicy`, `maxRetries`, and `http1MaxPendingRequests` fields are applied and are therefore absent from deferred status and translator ignored-field warnings. Invalid or unrepresentable values still reject with a field-specific, value-redacted diagnostic. VirtualService `http[].corsPolicy` is deferred only when it is unrepresentable — an un-compilable `regex`, a malformed/unknown matcher, an `exact` (or legacy `allowOrigin` entry) that is empty/whitespace-only or beyond the 512-byte matcher bound (uncredentialed exact `*` is supported; credentialed exact `*` is deferred to preserve the source credential behavior; wildcard-shaped and noncanonical exacts are now projected LITERALLY rather than deferred), an `allowOrigins[]` list beyond 64 entries, an over-complex regex, or an `allowMethods`/`allowHeaders`/`exposeHeaders` entry that is padded or not a valid HTTP method / header name, or an unknown `unmatchedPreflights` value; Sidecar `ingress[]` listeners are deferred only when Ferrum cannot model them (an inadmissible Unix-socket path, non-loopback `defaultEndpoint`, non-HTTP-family protocol, or omitted `defaultEndpoint`). An admissible Unix-socket path is modeled and remains subject to the data plane's explicit containment-root policy. Sidecar `outboundTrafficPolicy` is translated and enforced (see [Sidecar Outbound Traffic Policy](#sidecar-outbound-traffic-policy)); an omitted/null `mode` in a present object uses Istio's documented `ALLOW_ANY` default and defers nothing. A `deferred_fields` entry appears only when a present block is not exactly representable — an unrecognized/non-string `mode`, a non-object block, or an unsupported `egressProxy` — and always names the fail-closed `REGISTRY_ONLY` outcome Ferrum enforces instead.
 
 Ferrum merges its `FerrumAccepted` condition into the live `status.conditions[]` array, preserving conditions written by Istio (`pilot-discovery`/`galley`) and any other controller. `lastTransitionTime` is held stable while the condition's status/reason/message are unchanged. Status writing is read-only with respect to the proxy data plane and never aborts reconcile: if a cluster has stripped the `subresources.status` from a CRD, the writer logs a single warning per resource and no-ops. `ProxyConfig` is modeled, translated, watched via `ISTIO_CRDS` (`networking.istio.io/v1beta1`), transported on native `MeshSubscribe` and Ferrum xDS `ProxyConfigsCarrier`, and receives `FerrumAccepted` status — Istio's authoritative CRD manifests declare `subresources.status` for `proxyconfigs.networking.istio.io`. See [Istio CRD capability dimensions](configuration.md#istio-crd-capability-dimensions).
 
@@ -3368,7 +3835,8 @@ The following Istio mesh surfaces are either deferred or have Ferrum-specific su
 
 | Surface | Status | Workaround |
 |---|---|---|
-| Stock Envoy / third-party Istio xDS interop (point Ferrum's xDS client at a non-Ferrum CP) | Not interoperable | Ferrum's `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path: it follows the Envoy ADS gRPC contract, but CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names and all security/policy fields ride [Ferrum-specific ECDS carriers](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds) with Ferrum-defined inner type URLs. A stock Envoy/Istio CP does not emit these carriers or names, so the response is unsupported and may be NACKed. Use a Ferrum CP (either protocol), or `FERRUM_MESH_CONFIG_PROTOCOL=native` |
+| Stock Envoy / third-party Istio xDS interop (point Ferrum's **Ferrum-private** xDS client at a non-Ferrum CP) | Not interoperable | `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path: CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names and all security/policy fields ride [Ferrum-specific ECDS carriers](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds). A stock CP emits neither, so that response is unsupported and may be NACKed |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | Supported for discovery | Consumes standard v3 CDS/EDS/LDS/RDS from a stock control plane and maps it onto `MeshService` / `Workload`. Enforcement policy (authorization, PeerAuthentication, JWT, trust bundles, DestinationRule, Sidecar scope) comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, never from the stock CP. Traffic shaping, subsets, external DNS clusters, SDS, ECDS/RTDS, and delta xDS are out of scope — see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability) |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only`, the native/CRD slice-supplied mesh-wide `outbound_traffic_policy`, or a workload-scoped `Sidecar.outboundTrafficPolicy` that overrides both (see [Sidecar Outbound Traffic Policy](#sidecar-outbound-traffic-policy)) covers both HTTP-family egress (auto-injected `mesh_outbound_registry` plugin and outbound-capture route misses, both rejecting with `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS`, default 502) and stream-family egress on mesh outbound capture listener ports (TCP / TCP+TLS: graceful close before backend dial; UDP / UDP+DTLS: silent datagram drop). Both surfaces read the same slice-derived registry (services, ServiceEntries including wildcard hosts, workload addresses); resources with no declared ports admit any explicit Host port for that known destination, and empty registries fail closed. HTTP decision metrics use fixed host buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`); stream rejects export `ferrum_mesh_outbound_registry_stream_decisions_total{protocol, decision}` instead. Inbound sidecar/ambient traffic is not gated by this outbound policy |

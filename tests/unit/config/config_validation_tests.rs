@@ -668,6 +668,7 @@ fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

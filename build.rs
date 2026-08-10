@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/ferrum.proto");
     println!("cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto");
     println!("cargo:rerun-if-changed=proto/envoy/service/runtime/v3/rtds.proto");
+    println!("cargo:rerun-if-changed=proto/envoy/stock/v3/stock_xds.proto");
     println!("cargo:rerun-if-changed=proto/health.proto");
     println!("cargo:rerun-if-changed=proto/workload_api.proto");
 
@@ -36,6 +37,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(false)
         .build_client(false)
         .compile_protos(&["proto/envoy/service/runtime/v3/rtds.proto"], &["proto/"])?;
+
+    // Issue #3317: decode-only projections of the upstream Envoy v3 resource
+    // messages consumed by the stock xDS interoperability profile
+    // (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`). Client/server stubs are
+    // deliberately off — these messages only ever ride inside a
+    // `DiscoveryResponse.resources[].value` and Ferrum never encodes them.
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .compile_protos(&["proto/envoy/stock/v3/stock_xds.proto"], &["proto/"])?;
 
     tonic_prost_build::compile_protos("proto/health.proto")?;
 

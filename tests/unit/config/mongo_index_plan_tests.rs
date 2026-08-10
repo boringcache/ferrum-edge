@@ -85,6 +85,28 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
         upstream_opts.partial_filter_expression.as_ref(),
         Some(&doc! { "name": { "$type": "string" } })
     );
+
+    let listen_port_index = plan
+        .iter()
+        .find(|entry| {
+            entry.collection == "proxies"
+                && entry.model.keys == doc! { "namespace": 1, "listen_port": 1 }
+        })
+        .expect("proxies (namespace, listen_port) index");
+    let listen_port_opts = listen_port_index
+        .model
+        .options
+        .as_ref()
+        .expect("listen_port partial index options");
+    assert_ne!(
+        listen_port_opts.unique,
+        Some(true),
+        "validated SNI/L4 listener groups must be persistable"
+    );
+    assert!(
+        listen_port_index.recreate_on_options_conflict,
+        "the former unique baseline index must be replaced"
+    );
 }
 
 #[test]

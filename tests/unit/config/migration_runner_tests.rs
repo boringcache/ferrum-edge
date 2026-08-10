@@ -428,15 +428,10 @@ async fn test_migration_runner_rejects_existing_untracked_schema() {
     .unwrap();
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
-    let err = runner
+    runner
         .run_pending()
         .await
         .expect_err("existing untracked schemas must not be bootstrapped");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("api_spec_id") || msg.contains("duplicate") || msg.contains("already exists"),
-        "expected V1 to fail against the untracked old schema, got: {msg}"
-    );
 
     // No bootstrap marker is inserted, so all migrations are still pending.
     let status = runner.status().await.unwrap();

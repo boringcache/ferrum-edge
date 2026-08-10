@@ -52,6 +52,7 @@ mod frontend_tls_live_reload_tests;
 mod gateway_allowed_routes_selector_tests;
 mod gateway_api_backend_ref_kinds_tests;
 mod gateway_api_backend_tls_policy_tests;
+mod gateway_api_listenerset_tests;
 mod gateway_api_udproute_datapath_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_svid_identity_tests;
@@ -84,8 +85,13 @@ mod mesh_dr_service_entry_e2e_tests;
 mod mesh_ew_egress_e2e_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
+mod mesh_grpc_transport_tests;
 mod mesh_hbone_tests;
+// Keep host UDP capture coverage on the existing trusted mesh-platform shard:
+// its filter matches this module-name prefix without changing CI workflow code.
 mod mesh_k8s_pod_discovery_tests;
+#[path = "mesh_k8s_pod_discovery/host_udp_capture_tests.rs"]
+mod mesh_k8s_pod_discovery_tests_host_udp_capture;
 mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;
 mod mesh_multicluster_discovery_tests;
@@ -98,6 +104,7 @@ mod mesh_retry_rotation_tests;
 mod mesh_runtime_overlay_consumers_tests;
 mod mesh_service_waypoint_tests;
 mod mesh_sidecar_e2e_tests;
+mod mesh_stock_xds_tests;
 mod mesh_subscribe_validation_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;

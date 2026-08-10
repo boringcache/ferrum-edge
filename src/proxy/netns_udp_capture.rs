@@ -320,7 +320,7 @@ fn capture_is_still_justified(
     })
 }
 
-fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
+pub(crate) fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
     if pod_uid.is_empty()
         || pod_uid == "."
         || pod_uid == ".."
@@ -332,23 +332,25 @@ fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
     Some(dir.join(pod_uid))
 }
 
-fn write_udp_ready_marker(dir: &Path, pod_uid: &str) {
+pub(crate) fn write_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
-        return;
+        return false;
     };
     if path.is_file() {
-        return;
+        return true;
     }
     if let Err(error) = std::fs::create_dir_all(dir) {
         warn!(pod_uid, dir = %dir.display(), %error, "Failed to create Ambient UDP readiness marker dir");
-        return;
+        return false;
     }
     if let Err(error) = std::fs::write(&path, b"") {
         warn!(pod_uid, path = %path.display(), %error, "Failed to publish Ambient UDP readiness marker");
+        return false;
     }
+    true
 }
 
-fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
+pub(crate) fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
         return false;
     };
@@ -362,8 +364,21 @@ fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     }
 }
 
-fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
     ready_dir.parent().map(|dir| dir.join(".udp-ack-required"))
+}
+
+/// The node-agent's durable proof that a pod's BPF UDP gate is shut.
+///
+/// Shared with the host-network producer so both placements read the same
+/// evidence from the same path; an absent handshake directory means nothing
+/// gated the pod on a readiness marker in the first place.
+pub(crate) fn udp_gate_close_acknowledged(ready_dir: &Path, pod_uid: &str) -> bool {
+    let Some(registry_dir) = ready_dir.parent() else {
+        return false;
+    };
+    let ack_dir = registry_dir.join(".udp-not-ready");
+    udp_ready_marker_path(&ack_dir, pod_uid).is_some_and(|marker| marker.is_file())
 }
 
 fn persist_udp_ack_requirement(ready_dir: &Path, pod_uid: &str) -> bool {
@@ -402,7 +417,7 @@ fn remove_udp_handshake_marker(dir: &Path, pod_uid: &str, marker: &str) -> bool 
 /// before retracting producer readiness. The durable marker lets a replacement
 /// cleanup process recover the handshake after this process exits. A stale ack
 /// is removed before readiness so it can never authorize this new handoff.
-fn request_udp_gate_close(ready_dir: &Path, pod_uids: &HashSet<String>) -> bool {
+pub(crate) fn request_udp_gate_close(ready_dir: &Path, pod_uids: &HashSet<String>) -> bool {
     if !pod_uids
         .iter()
         .all(|uid| persist_udp_ack_requirement(ready_dir, uid))
@@ -423,7 +438,7 @@ fn request_udp_gate_close(ready_dir: &Path, pod_uids: &HashSet<String>) -> bool 
         .all(|uid| remove_udp_ready_marker(ready_dir, uid))
 }
 
-fn clear_udp_ack_requirement(ready_dir: &Path, pod_uids: &HashSet<String>) {
+pub(crate) fn clear_udp_ack_requirement(ready_dir: &Path, pod_uids: &HashSet<String>) {
     let Some(registry_dir) = ready_dir.parent() else {
         return;
     };
@@ -432,7 +447,7 @@ fn clear_udp_ack_requirement(ready_dir: &Path, pod_uids: &HashSet<String>) {
     }
 }
 
-fn udp_ack_requirement_exists(ready_dir: &Path, pod_uid: &str) -> bool {
+pub(crate) fn udp_ack_requirement_exists(ready_dir: &Path, pod_uid: &str) -> bool {
     udp_ack_required_dir(ready_dir)
         .and_then(|dir| udp_ready_marker_path(&dir, pod_uid))
         .is_some_and(|path| path.is_file())
@@ -912,14 +927,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                             let _ = remove_udp_ready_marker(dir, uid);
                         }
                         for uid in pod_uids.difference(&active.pod_uids) {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                     active.pod_uids = pod_uids;
                     active.target = target.clone();
                     if let Some(dir) = &self.ready_dir {
                         for uid in &active.pod_uids {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                 }
@@ -1075,7 +1090,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     );
                     if let Some(dir) = &self.ready_dir {
                         for uid in &pod_uids {
-                            write_udp_ready_marker(dir, uid);
+                            let _ = write_udp_ready_marker(dir, uid);
                         }
                     }
                 }
@@ -2074,7 +2089,11 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             recvmmsg_batch_size: self.recvmmsg_batch_size,
             session_shard_amount: self.session_shard_amount,
             session_limiter: self.session_limiter.clone(),
-            source_identity: target.source_identity.clone().map(Arc::new),
+            // Fixed for this producer's whole lifetime: the socket lives inside
+            // ONE pod netns, so every datagram it receives is that pod's.
+            source_identity: super::mesh_udp_capture::CapturedSourceEvidence::Fixed(
+                target.source_identity.clone().map(Arc::new),
+            ),
             reply_socket_factory,
         };
 

@@ -65,6 +65,7 @@ fn make_summary(
 
 fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_lifecycle_generation: None,
@@ -1760,6 +1761,7 @@ async fn test_namespace_label_with_stream_metrics() {
     registry.configure(5, 3600, 0, "prod");
 
     let summary = StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         proxy_id: "stream-ns".to_string(),
         proxy_lifecycle_generation: None,
         proxy_name: Some("tcp-proxy".to_string()),

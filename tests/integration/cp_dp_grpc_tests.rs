@@ -2081,6 +2081,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

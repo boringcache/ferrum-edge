@@ -1086,6 +1086,10 @@ pub struct TcpListenerConfig {
     pub io_uring_splice_enabled: bool,
     /// Whether frontend TCP TLS handshake failures should increment mesh mTLS metrics.
     pub record_mesh_mtls_metric: bool,
+    /// `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK`: whether an opaque-TLS SNI
+    /// listener may route provably non-TLS opening bytes to its catch-all
+    /// route instead of closing the connection. Snapshotted at listener spawn.
+    pub stream_sni_plaintext_fallback: bool,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement slot. `None`
     /// (Option<Arc<...>> stored inside the ArcSwap) outside mesh mode or
     /// when policy is `AllowAny`. When `Some`, the connect path consults
@@ -1153,6 +1157,7 @@ struct TcpAcceptLoopState {
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     record_mesh_mtls_metric: bool,
+    stream_sni_plaintext_fallback: bool,
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     node_waypoint_identity_resolver:
@@ -1403,6 +1408,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         ktls_enabled,
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
+        stream_sni_plaintext_fallback,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
         stream_gateway_ref,
@@ -1487,6 +1493,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         ktls_enabled,
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
+        stream_sni_plaintext_fallback,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
         node_waypoint_identity_warn_limiter: Arc::new(NodeWaypointIdentityWarnLimiter::new()),
@@ -1654,6 +1661,7 @@ async fn run_tcp_accept_loop(
                 let ktls_enabled = state.ktls_enabled;
                 let io_uring_splice_enabled = state.io_uring_splice_enabled;
                 let record_mesh_mtls_metric = state.record_mesh_mtls_metric;
+                let stream_sni_plaintext_fallback = state.stream_sni_plaintext_fallback;
                 let mesh_outbound_enforcement = state.mesh_outbound_enforcement.clone();
                 // `Some` only in NodeWaypoint topology; used below to resolve
                 // this connection's source pod identity for per-pod policy
@@ -1809,17 +1817,28 @@ async fn run_tcp_accept_loop(
                             .plugin_cache
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
-                    // A trusted inbound PROXY tuple is the earliest
-                    // authoritative destination. Otherwise keep the complete
-                    // kernel/capture socket address; dropping its port would
-                    // mis-advertise fixed capture listeners (for example
-                    // :15001) as the application's original destination.
-                    let original_destination = forwarded_dst
+                    // Keep trusted original-destination routing evidence
+                    // separate from the connection-local fact mesh authz needs.
+                    // A direct listener's bind address is authoritative for
+                    // Istio `destination.ip`, but it must never satisfy a
+                    // VirtualService `destinationSubnets` predicate whose
+                    // contract requires capture/PROXY original-destination
+                    // evidence.
+                    let trusted_original_destination = forwarded_dst
                         .or(node_waypoint_orig_dst)
                         .or_else(|| crate::socket_opts::original_dst(&stream))
                         .map(crate::util::client_identity::canonical_socket_addr);
-                    stream_ctx.destination_ip = original_destination.map(|addr| addr.ip());
-                    stream_ctx.destination_port = original_destination.map(|addr| addr.port());
+                    let connection_destination = trusted_original_destination
+                        .or_else(|| stream.local_addr().ok())
+                        .map(crate::util::client_identity::canonical_socket_addr);
+                    stream_ctx.destination_ip =
+                        trusted_original_destination.map(|addr| addr.ip());
+                    stream_ctx.destination_port =
+                        trusted_original_destination.map(|addr| addr.port());
+                    stream_ctx.connection_destination_ip =
+                        connection_destination.map(|addr| addr.ip());
+                    stream_ctx.connection_destination_port =
+                        connection_destination.map(|addr| addr.port());
                     // Gateway binding is process/listener configuration — never
                     // inferred from wire data. EnvConfig supplies `mesh` only
                     // for mesh Sidecar topology; every other default is no
@@ -1871,6 +1890,7 @@ async fn run_tcp_accept_loop(
                         ktls_enabled,
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
+                        stream_sni_plaintext_fallback,
                         &overload_for_conn,
                         metrics.as_ref(),
                         mesh_enforcement_snapshot.as_ref(),
@@ -2006,6 +2026,9 @@ async fn run_tcp_accept_loop(
                             namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
+                            // Carry the connect-time execution-trigger outcomes so
+                            // a skipped instance stays skipped at disconnect.
+                            plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
                             proxy_name,
                             client_ip,
                             consumer_username,
@@ -2266,6 +2289,7 @@ async fn handle_tcp_connection(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     record_mesh_mtls_metric: bool,
+    stream_sni_plaintext_fallback: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
     mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
@@ -2311,6 +2335,7 @@ async fn handle_tcp_connection(
         ktls_enabled,
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
+        stream_sni_plaintext_fallback,
         overload,
         metrics,
         mesh_outbound_enforcement,
@@ -2540,6 +2565,18 @@ where
     buf
 }
 
+/// Whether this shared-port candidate makes its listener an opaque-TLS SNI
+/// group rather than an L4 `stream_match` group.
+///
+/// An `__l4_{port}` group is only built on a port that carries no passthrough
+/// candidate and no candidate declaring `hosts` — either would have promoted
+/// the port to `__sni_{port}` during reconcile — so this predicate recovers the
+/// grouping decision from the candidate set without extra listener plumbing.
+#[inline]
+fn proxy_uses_sni_routing(proxy: &crate::config::types::Proxy) -> bool {
+    proxy.passthrough || !proxy.hosts.is_empty()
+}
+
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -2566,6 +2603,7 @@ async fn handle_tcp_connection_inner(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     record_mesh_mtls_metric: bool,
+    stream_sni_plaintext_fallback: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
     mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
@@ -2622,20 +2660,50 @@ async fn handle_tcp_connection_inner(
     // Evidence holds `Option<&dyn SourceLabelLookup>`, which is not Sync, so
     // keeping it live across an await would make the spawned connection
     // future !Send. Build and drop evidence only in synchronous match scopes.
+    //
+    // A shared listener resolves by opaque-TLS SNI exactly when the reconciler
+    // built it as an `__sni_{port}` group. That is provable from the candidate
+    // set without extra plumbing: an `__l4_{port}` group can only exist on a
+    // port with no passthrough candidate and no candidate declaring `hosts`
+    // (either would have promoted the port to an SNI group), so "any candidate
+    // is passthrough or declares hosts" is exactly the SNI-group predicate.
+    // Ordinary opaque `tcp` listeners therefore route by SNI on the same plane
+    // as passthrough ones (issue #3264).
     let shared_port_uses_sni = sni_proxy_ids.is_some_and(|candidate_ids| {
         epoch
             .proxy_by_namespaced_id(listener_namespace, proxy_id)
-            .is_some_and(|p| p.passthrough)
+            .is_some_and(proxy_uses_sni_routing)
             || candidate_ids.iter().any(|id| {
                 epoch
                     .proxy_by_namespaced_id(&id.namespace, &id.id)
-                    .is_some_and(|p| p.passthrough)
+                    .is_some_and(proxy_uses_sni_routing)
             })
     });
     let shared_port_sni = if shared_port_uses_sni {
-        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
-        stream_ctx.sni_hostname = sni.clone();
-        sni
+        // One bounded, non-consuming ClientHello peek shared with passthrough,
+        // mesh inbound, and the kTLS gate — `peek()` leaves every inspected
+        // byte queued, so the chosen backend still receives the client's
+        // ClientHello verbatim and TLS is never terminated here.
+        let outcome = super::sni::peek_client_hello_sni(&client_stream, sni_peek_timeout).await;
+        stream_ctx.sni_hostname = outcome.hostname().map(str::to_string);
+        match super::sni::admit_opaque_tls_sni(outcome, stream_sni_plaintext_fallback) {
+            super::sni::SniAdmission::Route(sni) => sni,
+            super::sni::SniAdmission::Refuse(reason) => {
+                // Fail closed BEFORE route resolution, so no backend is
+                // selected, dialed, health-scored, or breaker-charged.
+                tracing::debug!(
+                    port = stream_ctx.listen_port,
+                    client = %remote_addr,
+                    reason = reason.as_str(),
+                    "Refused connection on SNI-routed stream listener"
+                );
+                return Err(anyhow::anyhow!(
+                    "SNI-routed stream listener on port {} refused connection ({})",
+                    stream_ctx.listen_port,
+                    reason.as_str()
+                ));
+            }
+        }
     } else {
         None
     };
@@ -2659,8 +2727,10 @@ async fn handle_tcp_connection_inner(
             )
             .ok_or_else(|| {
                 if shared_port_uses_sni {
+                    // A hostname that no tier claims and no declared catch-all
+                    // absorbs is unroutable: close rather than pick a tenant.
                     anyhow::anyhow!(
-                        "No matching passthrough proxy for connection on port {}",
+                        "No matching SNI route for connection on port {}",
                         stream_ctx.listen_port
                     )
                 } else {

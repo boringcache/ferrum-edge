@@ -5637,6 +5637,8 @@ mod tests {
                         port: 8080,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 5000,
+                        endpoint_unix_path: None,
+                        endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
                     },
@@ -5644,6 +5646,8 @@ mod tests {
                         port: 8443,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 6000,
+                        endpoint_unix_path: None,
+                        endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
                     },
@@ -5711,6 +5715,8 @@ mod tests {
                     port: 8443,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 8080,
+                    endpoint_unix_path: None,
+                    endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
                 }],
@@ -5782,8 +5788,9 @@ mod tests {
     }
 
     /// Codex round-4 P2: a Sidecar that DECLARES two HTTP-family ingress[]
-    /// listeners but where only ONE resolved (the other had an omitted / `unix://`
-    /// / off-box `defaultEndpoint`) must NOT collapse to the single-listener
+    /// listeners but where only ONE resolved (the other had an omitted /
+    /// inadmissible `unix://` / off-box `defaultEndpoint`) must NOT collapse to
+    /// the single-listener
     /// no-signal pass-through. `MeshConfig.declared_ingress_http_ports` (2) carries
     /// the DECLARED count past the resolved set (1), so `mesh_ingress_listener_groups`
     /// reports `declared_http_ports == 2`, keeping the group AMBIGUOUS: an
@@ -5806,6 +5813,8 @@ mod tests {
                     port: 8080,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 5000,
+                    endpoint_unix_path: None,
+                    endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
                 }],

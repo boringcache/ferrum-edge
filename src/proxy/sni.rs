@@ -1,7 +1,29 @@
 //! SNI (Server Name Indication) extraction from TLS/DTLS ClientHello messages.
 //!
-//! Used by passthrough mode to peek at the ClientHello without terminating TLS,
-//! extracting the SNI hostname for logging and routing decisions.
+//! This is the gateway's ONE ClientHello parser. Everything that needs to know
+//! what a client asked for before any TLS state exists goes through it:
+//! passthrough and ordinary opaque TCP stream listeners routing by SNI, mesh
+//! inbound classification, the Linux kTLS handoff gate, and DTLS passthrough.
+//! Do not add a second parser — extend this one.
+//!
+//! Two levels of answer:
+//!
+//! * [`peek_client_hello_sni`] / [`classify_client_hello`] validate the complete
+//!   bounded ClientHello, then answer "what hostname, and why not" as
+//!   [`ClientHelloSni`]. [`extract_sni_from_tcp_stream`] is the `Option<String>`
+//!   projection of that same strict result for non-routing consumers.
+//! * [`extract_sni_from_client_hello`] is the shared lenient raw-slice hostname
+//!   parser. Admission invokes it only after strict whole-hello validation; a
+//!   readable early SNI must not hide an oversized or malformed tail.
+//!
+//! SNI *route selection* needs the typed answer: a hello that timed out,
+//! overran the peek bound, ended early, is malformed, or names something
+//! unrepresentable must fail closed ([`admit_opaque_tls_sni`]) rather than
+//! silently inherit the listener's catch-all route, which would be a
+//! cross-tenant downgrade (issue #3264).
+//!
+//! Peeking never consumes: the ClientHello and every other inspected byte stay
+//! queued on the socket and reach the selected backend verbatim.
 
 /// Maximum bytes to peek from a TCP stream for ClientHello SNI extraction.
 ///
@@ -32,14 +54,171 @@ const SNI_PEEK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_m
 
 /// How many times the no-deadline peek may re-await readiness after a spurious
 /// readiness signal (the socket reported readable but the non-blocking peek
-/// returned `WouldBlock`).
+/// returned `WouldBlock`) or after observing a still-incomplete ClientHello.
 ///
 /// The no-deadline path must never hold the hard-cap buffer across a
 /// suspension, so a spurious wakeup drops the buffer and waits again rather
 /// than parking with it allocated. Each retry costs one readiness event from
-/// the OS — not a busy loop — but the count is still bounded so a socket that
-/// somehow keeps reporting phantom readiness fails closed instead of spinning.
+/// the OS plus one [`SNI_PEEK_RETRY_INTERVAL`] tick — not a busy loop — but the
+/// count is still bounded so a socket that somehow keeps reporting phantom
+/// readiness (or a peer that dribbles a ClientHello forever) fails closed
+/// instead of spinning.
 const MAX_PEEK_READINESS_RETRIES: usize = 3;
+
+/// Why a bounded ClientHello peek could not reach a determinate answer.
+///
+/// Every variant is a **fail-closed** signal for SNI route selection: the
+/// connection may well have declared a tenant hostname that this peek could not
+/// read, so routing it to the listener's catch-all would be a cross-tenant
+/// downgrade. Callers that only need "did we learn a hostname" keep using
+/// [`extract_sni_from_tcp_stream`], which collapses all of these to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniPeekFailure {
+    /// The handshake deadline expired before the ClientHello was fully buffered.
+    Timeout,
+    /// The hard peek bound ([`MAX_CLIENT_HELLO_LEN`]) filled while the
+    /// ClientHello was still incomplete.
+    Oversized,
+    /// The peer closed (or half-closed) before finishing the ClientHello.
+    Eof,
+    /// The buffered prefix is a TLS handshake record but not yet a complete
+    /// ClientHello, and the peek ended with no more specific reason.
+    Truncated,
+    /// A complete ClientHello was buffered but its structure is invalid.
+    Malformed,
+    /// A complete ClientHello carried a `server_name` extension whose value is
+    /// not a representable DNS host name (see [`is_valid_sni_dns_hostname`]).
+    /// The client named *something*; refusing is what keeps an unreadable name
+    /// from silently becoming the catch-all's traffic.
+    UnrepresentableName,
+    /// Peeking the socket failed, or readiness never produced readable bytes.
+    Io,
+}
+
+impl SniPeekFailure {
+    /// Stable, allocation-free label for logs and operator diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Oversized => "oversized",
+            Self::Eof => "eof",
+            Self::Truncated => "truncated",
+            Self::Malformed => "malformed",
+            Self::UnrepresentableName => "unrepresentable_server_name",
+            Self::Io => "io_error",
+        }
+    }
+}
+
+/// Typed outcome of inspecting a TLS ClientHello for SNI.
+///
+/// The historical `Option<String>` collapsed four very different situations
+/// into `None` — "well-formed hello with no `server_name`", "these bytes are
+/// not TLS at all", "the hello never finished arriving", and "the hello is
+/// malformed". SNI route selection then sent all four to the listener's
+/// catch-all proxy, so a slow, fragmented, oversized, or hostile ClientHello
+/// that *did* declare `tenant-a.example.com` landed on whichever tenant owned
+/// the default route. This enum is what lets the routing plane fail closed on
+/// the indeterminate cases while preserving catch-all semantics for the two
+/// determinate ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientHelloSni {
+    /// A ClientHello whose `server_name` yielded a representable, normalized
+    /// (ASCII-lowercased) DNS host name.
+    Sni(String),
+    /// A complete, well-formed ClientHello that carried no `server_name`
+    /// extension. Determinate: the client asked for no host.
+    NoSni,
+    /// The opening bytes are provably not a TLS ClientHello — the first byte is
+    /// not a handshake record (`0x16`), or the first handshake message type is
+    /// not `client_hello` (`0x01`). Determinate.
+    NotTls,
+    /// No determinate answer could be reached. Always fail closed.
+    Indeterminate(SniPeekFailure),
+}
+
+impl ClientHelloSni {
+    /// Borrow the parsed hostname, if any.
+    pub fn hostname(&self) -> Option<&str> {
+        match self {
+            Self::Sni(hostname) => Some(hostname.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Consume into the historical `Option<String>` shape.
+    pub fn into_hostname(self) -> Option<String> {
+        match self {
+            Self::Sni(hostname) => Some(hostname),
+            _ => None,
+        }
+    }
+}
+
+/// Why an opaque-TLS SNI listener refused a connection outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniRefusal {
+    /// The bytes are provably not TLS and the listener does not authorize a
+    /// plaintext fallback.
+    NotTls,
+    /// The ClientHello could not be read to a determinate answer.
+    Indeterminate(SniPeekFailure),
+}
+
+impl SniRefusal {
+    /// Stable, allocation-free label for logs and operator diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotTls => "not_tls",
+            Self::Indeterminate(failure) => failure.as_str(),
+        }
+    }
+}
+
+/// What an opaque-TLS SNI listener does with a peeked ClientHello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniAdmission {
+    /// Continue route selection with this SNI. `None` selects the catch-all
+    /// tier (a proxy with empty `hosts`); when no catch-all is declared,
+    /// resolution itself fails and the connection is still refused.
+    Route(Option<String>),
+    /// Refuse before any backend is resolved, dialed, or health/breaker-charged.
+    Refuse(SniRefusal),
+}
+
+/// Decide whether a peeked ClientHello may proceed to SNI route selection on an
+/// **opaque-TLS SNI listener** (a stream listener that never terminates TLS and
+/// picks its route from `server_name`).
+///
+/// Precedence, deliberately fail-closed:
+///
+/// | peek outcome | admission |
+/// |---|---|
+/// | [`ClientHelloSni::Sni`] | route by that host through exact → wildcard → catch-all |
+/// | [`ClientHelloSni::NoSni`] | route through the catch-all tier only |
+/// | [`ClientHelloSni::NotTls`] | refuse, unless `allow_plaintext_fallback` |
+/// | [`ClientHelloSni::Indeterminate`] | **always** refuse |
+///
+/// `allow_plaintext_fallback` is the operator's explicit authorization
+/// (`FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK`) to keep direct, non-TLS TCP working
+/// on a listener whose route table is keyed by SNI. It deliberately does NOT
+/// extend to the indeterminate cases: "not TLS" is a determinate protocol
+/// mismatch the operator can reason about, whereas a truncated/oversized/
+/// timed-out/malformed hello may have declared any tenant's hostname.
+pub fn admit_opaque_tls_sni(
+    outcome: ClientHelloSni,
+    allow_plaintext_fallback: bool,
+) -> SniAdmission {
+    match outcome {
+        ClientHelloSni::Sni(hostname) => SniAdmission::Route(Some(hostname)),
+        ClientHelloSni::NoSni => SniAdmission::Route(None),
+        ClientHelloSni::NotTls if allow_plaintext_fallback => SniAdmission::Route(None),
+        ClientHelloSni::NotTls => SniAdmission::Refuse(SniRefusal::NotTls),
+        ClientHelloSni::Indeterminate(failure) => {
+            SniAdmission::Refuse(SniRefusal::Indeterminate(failure))
+        }
+    }
+}
 
 /// Initial capacity of the TCP ClientHello peek buffer.
 ///
@@ -49,16 +228,18 @@ pub fn initial_peek_capacity() -> usize {
     INITIAL_CLIENT_HELLO_PEEK_LEN
 }
 
-/// Capacity of the buffer used by the no-deadline (single-peek) path.
+/// Capacity of the buffer used by the no-deadline path.
 ///
-/// The no-deadline path cannot loop on the wire, so its one peek must be able
-/// to see a standards-valid oversized ClientHello in full — it sizes straight
-/// to the hard cap rather than the lazy floor. Lazy growth exists to bound
-/// memory held ACROSS the deadline-driven peek loop while a slow peer dribbles
-/// bytes; it does not apply to a buffer that is allocated only after the socket
-/// is already readable and dropped before the next await. Capping this at the
-/// 4 KiB floor would silently truncate SNI extraction whenever the frontend
-/// handshake timeout is disabled (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`),
+/// That path has no handshake clock to loop against, so it re-peeks only on a
+/// small fixed budget ([`MAX_PEEK_READINESS_RETRIES`]) and every one of those
+/// peeks must be able to see a standards-valid oversized ClientHello in full —
+/// it sizes straight to the hard cap rather than the lazy floor. Lazy growth
+/// exists to bound memory held ACROSS the deadline-driven peek loop while a slow
+/// peer dribbles bytes; it does not apply to a buffer that is allocated only
+/// after the socket is already readable and dropped before the next await.
+/// Capping this at the 4 KiB floor would silently truncate SNI extraction
+/// whenever the frontend handshake timeout is disabled
+/// (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`),
 /// which is the oversized-ClientHello misrouting of issue #2962.
 ///
 /// Pure sizing seam so external tests can lock this without observing live
@@ -98,29 +279,49 @@ async fn poll_peek_once(
     std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_peek(cx, buf))).await
 }
 
-/// Single bounded ClientHello peek for callers that pass no handshake deadline.
+/// Bounded ClientHello peek for callers that pass no handshake deadline.
 ///
-/// Takes one peek of the wire and never loops on it, so a stalled peer cannot
-/// park the task waiting for a record that never completes. Two invariants have
-/// to hold at once, so readiness and the buffer are deliberately separated:
+/// One initial peek plus at most [`MAX_PEEK_READINESS_RETRIES`] further peeks —
+/// a fixed budget rather than a clock — so a stalled peer cannot park the task
+/// waiting for a record that never completes. Two invariants have to hold at
+/// once, so readiness and the buffer are deliberately separated:
 ///
 /// 1. A silent peer must not pin a hard-cap allocation. `readable()` carries no
 ///    buffer, so an idle connection suspends here holding nothing.
-/// 2. Once bytes are actually available, the single peek must still be able to
+/// 2. Once bytes are actually available, each peek must still be able to
 ///    inspect a standards-valid ClientHello up to [`MAX_CLIENT_HELLO_LEN`]
 ///    (issue #2962) — so the buffer is allocated only *after* readiness, at the
-///    full cap.
+///    full cap, and dropped again before the next suspension.
 ///
-/// The peek itself is one non-blocking `poll_peek` wrapped in an always-`Ready`
+/// Each peek is one non-blocking `poll_peek` wrapped in an always-`Ready`
 /// future: it cannot suspend, so the hard-cap buffer is never live across an
 /// await. A spurious readiness signal yields `Pending`; the buffer is dropped
 /// and a fresh readiness event awaited, bounded by
 /// [`MAX_PEEK_READINESS_RETRIES`] so this can never spin. There is no unbounded
 /// read loop and no blocking wait.
-async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> Option<String> {
-    for _ in 0..=MAX_PEEK_READINESS_RETRIES {
+///
+/// A peek that lands mid-ClientHello is retried on the same bounded budget
+/// (one [`SNI_PEEK_RETRY_INTERVAL`] tick apart, buffer dropped in between).
+/// Without the handshake clock there is no deadline to loop against, and a
+/// fragmented hello — routine for post-quantum ClientHellos — would otherwise
+/// be reported as truncated on its first segment and refused by an SNI-routing
+/// listener. Worst case adds `MAX_PEEK_READINESS_RETRIES` ticks.
+async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> ClientHelloSni {
+    let mut last = ClientHelloSni::Indeterminate(SniPeekFailure::Io);
+    for attempt in 0..=MAX_PEEK_READINESS_RETRIES {
+        if attempt > 0 {
+            // `peek()` does not consume, so an immediate re-peek would observe
+            // the same bytes; give the peer one bounded tick to deliver the
+            // rest of a fragmented ClientHello. Nothing is allocated here — the
+            // previous iteration's buffer was dropped at the end of its scope,
+            // which is what preserves the "no hard-cap buffer across a
+            // suspension" invariant.
+            tokio::time::sleep(SNI_PEEK_RETRY_INTERVAL).await;
+        }
         // No buffer is alive across this await: an idle peer pins nothing.
-        stream.readable().await.ok()?;
+        if stream.readable().await.is_err() {
+            return ClientHelloSni::Indeterminate(SniPeekFailure::Io);
+        }
 
         let mut buf = vec![0u8; no_deadline_peek_capacity()];
         let polled = {
@@ -128,15 +329,33 @@ async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> Option<Str
             poll_peek_once(stream, &mut read_buf).await
         };
         match polled {
-            std::task::Poll::Ready(Ok(n)) => return extract_sni_from_client_hello(&buf[..n]),
-            std::task::Poll::Ready(Err(_)) => return None,
+            std::task::Poll::Ready(Ok(n)) => {
+                let outcome = classify_client_hello(&buf[..n]);
+                // A determinate answer is final. An incomplete hello may still
+                // complete — modern post-quantum ClientHellos routinely span
+                // several TCP segments — so re-peek (bounded) rather than fail
+                // closed on the first fragment.
+                if !matches!(
+                    outcome,
+                    ClientHelloSni::Indeterminate(SniPeekFailure::Truncated)
+                ) {
+                    return outcome;
+                }
+                last = outcome;
+            }
+            std::task::Poll::Ready(Err(_)) => {
+                return ClientHelloSni::Indeterminate(SniPeekFailure::Io);
+            }
             // Spurious readiness / `WouldBlock`: drop the buffer, then wait for
             // a fresh readiness event rather than holding it across the await.
-            std::task::Poll::Pending => continue,
+            std::task::Poll::Pending => {
+                last = ClientHelloSni::Indeterminate(SniPeekFailure::Io);
+            }
         }
     }
-    // Readiness kept proving phantom: fail closed rather than spin.
-    None
+    // Readiness kept proving phantom, or the hello never completed within the
+    // bounded retry budget: fail closed rather than spin.
+    last
 }
 
 /// Extract the SNI hostname from a TLS ClientHello by peeking at a TCP stream.
@@ -145,15 +364,19 @@ async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> Option<Str
 /// stream can be forwarded to the backend with the ClientHello intact.
 ///
 /// `handshake_timeout` bounds how long the peek can wait for the ClientHello
-/// before giving up. A `None` value preserves the single-peek behavior used by
-/// internal callers that have already enforced a deadline elsewhere; passthrough
-/// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
-/// so a peer that opens a TCP connection and sends nothing cannot park a
-/// connection-handler task indefinitely. The no-deadline path awaits socket
-/// readiness with no buffer allocated, then takes one non-blocking peek into a
-/// full [`no_deadline_peek_capacity`] buffer that is dropped before any further
-/// await — so an idle peer pins nothing, while a readable peer's oversized
-/// ClientHello is still inspected up to the hard cap.
+/// before giving up. A `None` value is for internal callers that have already
+/// enforced a deadline elsewhere; passthrough listeners pass `Some(d)` (mapped
+/// from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`) so a peer that opens a
+/// TCP connection and sends nothing cannot park a connection-handler task
+/// indefinitely. With no deadline there is no clock to loop against, so the
+/// path is bounded by a fixed retry budget instead: it awaits socket readiness
+/// with no buffer allocated, then takes a non-blocking peek into a full
+/// [`no_deadline_peek_capacity`] buffer that is dropped before any further
+/// await, repeating at most `MAX_PEEK_READINESS_RETRIES` more times (one
+/// `SNI_PEEK_RETRY_INTERVAL` tick apart) while the hello is still incomplete
+/// or readiness proves spurious. So an idle peer pins nothing, a fragmented
+/// hello is not misreported as truncated on its first segment, and a readable
+/// peer's oversized ClientHello is still inspected up to the hard cap.
 ///
 /// When a deadline is set, the peek LOOPS until the full ClientHello handshake
 /// (`5 + record_len` bytes across records, capped at [`MAX_CLIENT_HELLO_LEN`])
@@ -163,29 +386,61 @@ async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> Option<Str
 /// socket receive buffer on every call, so growing between iterations is safe.
 /// `peek()` returns as soon as ≥1 byte is readable, so a single peek sees a
 /// truncated ClientHello whenever it spans multiple TCP segments — routine for
-/// modern ~1.7 KB post-quantum ClientHellos — and a truncated parse silently
-/// misroutes the connection to the catch-all proxy. Mirrors the bounded peek
-/// loop in `tcp_proxy::peek_tcp_first_bytes`.
+/// modern ~1.7 KB post-quantum ClientHellos. Mirrors the bounded peek loop in
+/// `tcp_proxy::peek_tcp_first_bytes`.
 ///
 /// Returns `None` if the data is not a valid TLS ClientHello, has no SNI
-/// extension, the peek fails, or the timeout fires.
+/// extension, the peek fails, or the timeout fires. Callers that must
+/// distinguish those cases — SNI *route selection*, which has to fail closed
+/// rather than default an unreadable hello to its catch-all — use
+/// [`peek_client_hello_sni`] instead.
 pub async fn extract_sni_from_tcp_stream(
     stream: &tokio::net::TcpStream,
     handshake_timeout: Option<std::time::Duration>,
 ) -> Option<String> {
+    peek_client_hello_sni(stream, handshake_timeout)
+        .await
+        .into_hostname()
+}
+
+/// Bounded ClientHello peek that reports **why** no SNI was learned.
+///
+/// Same wire behavior, same parser, and the same hostname answer as
+/// [`extract_sni_from_tcp_stream`] — every `Some(host)` there is
+/// [`ClientHelloSni::Sni`] here and every `None` is one of the other variants.
+/// The extra resolution exists so an SNI-routing listener can fail closed on
+/// the indeterminate cases instead of silently defaulting them to its catch-all
+/// route (issue #3264).
+///
+/// `TcpStream::peek()` never consumes, so every byte inspected here is still
+/// queued on the socket and is replayed verbatim to whichever backend the route
+/// table selects. Opaque TLS stays opaque: nothing is decrypted, rewritten, or
+/// dropped.
+pub async fn peek_client_hello_sni(
+    stream: &tokio::net::TcpStream,
+    handshake_timeout: Option<std::time::Duration>,
+) -> ClientHelloSni {
     let Some(d) = handshake_timeout else {
         return peek_sni_without_deadline(stream).await;
     };
 
     let mut buf = vec![0u8; initial_peek_capacity()];
 
-    let deadline = tokio::time::Instant::now() + d;
+    let now = tokio::time::Instant::now();
+    let deadline = match now.checked_add(d) {
+        Some(deadline) => deadline,
+        // Internal callers can supply a Duration directly. Keep that boundary
+        // panic-free and fail closed if the requested Instant is not
+        // representable instead of accidentally disabling the timeout.
+        None => now,
+    };
     let mut have = 0usize;
     loop {
         match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
-            Ok(Ok(0)) => return None, // EOF before a complete ClientHello
+            // EOF before a complete ClientHello.
+            Ok(Ok(0)) => return terminal_client_hello(&buf[..have], SniPeekFailure::Eof),
             Ok(Ok(n)) => have = n,
-            Ok(Err(_)) => return None,
+            Ok(Err(_)) => return ClientHelloSni::Indeterminate(SniPeekFailure::Io),
             Err(_) => {
                 let peer = stream
                     .peer_addr()
@@ -200,14 +455,16 @@ pub async fn extract_sni_from_tcp_stream(
                 // Parse whatever prefix was observed — a complete-but-slow
                 // record already parsed below, so this only salvages the
                 // (unlikely) case where SNI sits inside the partial prefix.
-                return extract_sni_from_client_hello(&buf[..have]);
+                // Anything short of a readable hostname is `Timeout`, which an
+                // SNI-routing listener refuses instead of defaulting.
+                return terminal_client_hello(&buf[..have], SniPeekFailure::Timeout);
             }
         }
         // Reject non-TLS prefixes as soon as the first byte is visible. Waiting
         // for the full record header would let one malformed byte park this
         // task until the handshake timeout.
         if have >= 1 && buf[0] != 0x16 {
-            return None;
+            return ClientHelloSni::NotTls;
         }
 
         // Determine how many wire bytes cover the full ClientHello handshake
@@ -217,27 +474,31 @@ pub async fn extract_sni_from_tcp_stream(
         // across records — which may take more than the first record when a
         // fragment splits inside that 4-byte header; before that, keep peeking.
         match tls_clienthello_wire_span(&buf[..have], MAX_CLIENT_HELLO_LEN) {
-            WireSpan::Span(want) if have >= want => {
-                // Full ClientHello handshake (across all its records) buffered.
-                return extract_sni_from_client_hello(&buf[..have]);
-            }
             WireSpan::NotClientHello => {
                 // The first handshake byte proved this is not a ClientHello (e.g.
                 // a complete handshake record whose msg_type != 0x01). Reject now
-                // rather than re-peek the same bytes until the handshake timeout —
-                // a no-SNI `None` routes the connection to the catch-all per the
-                // existing non-ClientHello semantics.
-                return None;
+                // rather than re-peek the same bytes until the handshake timeout.
+                // Determinate, so an SNI-routing listener may still honor an
+                // explicitly authorized plaintext fallback.
+                return ClientHelloSni::NotTls;
             }
-            // `Span` with more bytes still to buffer, or `NeedMore`: keep peeking
-            // only while the hard peek bound still has room. A full buffer that
-            // still cannot complete the ClientHello must fail closed immediately —
-            // further peeks cannot grow past `MAX_CLIENT_HELLO_LEN`, and waiting
-            // until the handshake deadline would only prolong the same truncated
-            // parse (which must not invent an SNI from a partial oversized hello).
+            // The hard peek bound is full. Further peeks cannot grow past
+            // `MAX_CLIENT_HELLO_LEN` and waiting until the handshake deadline
+            // would only prolong the same truncated parse (which must not
+            // invent an SNI from a partial oversized hello), so decide now. A
+            // determinate answer that fits inside the bound still stands;
+            // anything else is attributed to the bound. Checked BEFORE the
+            // "span complete" arm because `tls_clienthello_wire_span` clamps
+            // its answer to the cap, which would otherwise report an
+            // over-cap hello as complete and mislabel it.
             WireSpan::Span(_) | WireSpan::NeedMore if have >= MAX_CLIENT_HELLO_LEN => {
-                return extract_sni_from_client_hello(&buf[..have]);
+                return terminal_client_hello(&buf[..have], SniPeekFailure::Oversized);
             }
+            WireSpan::Span(want) if have >= want => {
+                // Full ClientHello handshake (across all its records) buffered.
+                return classify_client_hello(&buf[..have]);
+            }
+            // `Span` with more bytes still to buffer, or `NeedMore`: keep peeking.
             WireSpan::Span(_) | WireSpan::NeedMore => {
                 // Grow lazily only when the current buffer is full and the
                 // parser still needs more wire bytes. `peek()` always re-reads
@@ -256,10 +517,78 @@ pub async fn extract_sni_from_tcp_stream(
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return extract_sni_from_client_hello(&buf[..have]);
+            return terminal_client_hello(&buf[..have], SniPeekFailure::Timeout);
         }
         let wake = (now + SNI_PEEK_RETRY_INTERVAL).min(deadline);
         tokio::time::sleep_until(wake).await;
+    }
+}
+
+/// Classify a buffered ClientHello prefix that the peek loop can no longer
+/// extend, attributing any indeterminate result to the terminal `reason`
+/// (deadline expiry, hard peek cap, or EOF) rather than the generic
+/// "truncated". A determinate answer — a readable hostname, a well-formed
+/// no-SNI hello, or provably non-TLS bytes — is returned unchanged.
+fn terminal_client_hello(data: &[u8], reason: SniPeekFailure) -> ClientHelloSni {
+    match classify_client_hello(data) {
+        ClientHelloSni::Indeterminate(_) => ClientHelloSni::Indeterminate(reason),
+        determinate => determinate,
+    }
+}
+
+/// Classify a buffered TLS ClientHello prefix.
+///
+/// The bounded wire span and strict whole-hello parser run before the lenient
+/// hostname extractor. This ordering is security-sensitive: a prefix can carry
+/// a complete, readable `server_name` and still belong to an oversized hello or
+/// be followed by malformed/duplicate extension data. Routing on that prefix
+/// would let an indeterminate hello select and dial a tenant backend despite
+/// the fail-closed admission contract. Once the whole hello is proven valid,
+/// [`extract_sni_from_client_hello`] supplies the same normalized hostname used
+/// by the other SNI consumers.
+///
+/// * not a handshake record / not `client_hello` → [`ClientHelloSni::NotTls`]
+/// * hello not fully buffered → `Indeterminate(Truncated)`
+/// * complete hello, no `server_name` → [`ClientHelloSni::NoSni`]
+/// * complete hello, `server_name` present but unrepresentable →
+///   `Indeterminate(UnrepresentableName)`
+/// * complete but structurally invalid → `Indeterminate(Malformed)`
+pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
+    let Some(&first) = data.first() else {
+        return ClientHelloSni::Indeterminate(SniPeekFailure::Truncated);
+    };
+    // Content type 0x16 = Handshake. Anything else is provably not TLS.
+    if first != 0x16 {
+        return ClientHelloSni::NotTls;
+    }
+    match tls_clienthello_wire_span(data, MAX_CLIENT_HELLO_LEN) {
+        WireSpan::NotClientHello => ClientHelloSni::NotTls,
+        WireSpan::NeedMore => ClientHelloSni::Indeterminate(SniPeekFailure::Truncated),
+        WireSpan::Span(want) if data.len() < want => {
+            ClientHelloSni::Indeterminate(SniPeekFailure::Truncated)
+        }
+        // The whole ClientHello handshake message is buffered but yielded no
+        // hostname. `client_hello_ktls_facts` is the strict whole-message
+        // parser: it refuses any structural violation and reports whether a
+        // `server_name` extension was present at all.
+        WireSpan::Span(_) => match client_hello_ktls_facts(data) {
+            Some(facts) => match extract_sni_from_client_hello(data) {
+                Some(hostname) => ClientHelloSni::Sni(hostname),
+                None if facts.offers_server_name => {
+                    ClientHelloSni::Indeterminate(SniPeekFailure::UnrepresentableName)
+                }
+                None => ClientHelloSni::NoSni,
+            },
+            // `tls_clienthello_wire_span` clamps its answer to the hard bound,
+            // so a buffer sitting exactly at the bound may hold only a prefix
+            // of a larger hello. At the bound, "oversized" is the actionable
+            // diagnosis; "malformed" would blame the client for framing this
+            // parser deliberately refused to buffer.
+            None if data.len() >= MAX_CLIENT_HELLO_LEN => {
+                ClientHelloSni::Indeterminate(SniPeekFailure::Oversized)
+            }
+            None => ClientHelloSni::Indeterminate(SniPeekFailure::Malformed),
+        },
     }
 }
 
@@ -267,6 +596,9 @@ pub async fn extract_sni_from_tcp_stream(
 ///
 /// Parses the TLS record layer and handshake message to find the
 /// server_name extension (type 0x0000) per RFC 6066 §3.
+/// This helper is intentionally lenient about bytes after a complete SNI entry;
+/// route admission must use [`classify_client_hello`], which validates the
+/// entire declared ClientHello before invoking this extractor.
 ///
 /// Works for both TLS 1.2 and TLS 1.3 ClientHello messages.
 pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
@@ -355,28 +687,22 @@ impl ClientHelloKtlsFacts {
         !self.offers_server_name || parsed_sni.is_some()
     }
 
-    /// Whether rustls could select a suite whose finite confidentiality limit
-    /// requires a kernel-pinned receive window before the handshake begins.
-    ///
-    /// ChaCha20-Poly1305 is unlimited in both pinned providers, while both
-    /// AES-GCM suites have a finite limit. This predicate is deliberately
-    /// conservative: if the ClientHello offers AES alongside ChaCha20, rustls
-    /// may still select AES, so the receive window must already be pinned.
-    pub fn requires_receive_window_pin(&self) -> bool {
-        self.offers_aes128_gcm || self.offers_aes256_gcm
-    }
-
     /// Whether a kTLS handoff may be attempted for this ClientHello, given the
-    /// per-cipher kernel probe results.
+    /// per-cipher handoff-usability results.
     ///
-    /// Fails closed on both axes:
+    /// The three booleans are *handoff usability*, not bare kernel install
+    /// probes: production marks AES-GCM families unusable (finite
+    /// confidentiality limit; Linux cannot establish a race-free receive-record
+    /// bound after accept) and ChaCha20-Poly1305 usable only when that cipher's
+    /// kernel probe passed.
+    ///
+    /// Fails closed on every axis:
     /// * a TLS 1.3 offer disqualifies the connection outright, and
     /// * **every** selectable TLS 1.2 AEAD suite the client offered must be
-    ///   installable in this kernel. Predicting rustls's exact suite choice
-    ///   would mean duplicating its selection logic, so an offer set that
-    ///   contains even one suite the kernel cannot install is declined rather
-    ///   than gambled on. That matters on Linux 4.17–5.10, where AES-GCM kTLS
-    ///   exists but ChaCha20-Poly1305 does not.
+    ///   handoff-usable. Predicting rustls's exact suite choice would mean
+    ///   duplicating its selection logic, so an offer set that contains even
+    ///   one unusable suite (AES-GCM under the confidentiality gate, or any
+    ///   suite this kernel cannot install) is declined rather than gambled on.
     pub fn ktls_eligible(
         &self,
         aes128gcm_available: bool,
@@ -545,6 +871,49 @@ struct ScannedExtensions {
     offers_server_name: bool,
 }
 
+/// Fixed-capacity "have I already seen this code point" bitset for the bounded
+/// TLS enumerations this parser has to de-duplicate (extension types,
+/// `ServerNameList` name types).
+///
+/// Both vectors are attacker-controlled up to [`MAX_CLIENT_HELLO_LEN`], so a
+/// hostile peer can pack thousands of entries into one hello. Rescanning the
+/// already-seen values for each entry would therefore be quadratic in a count
+/// the client chooses. A bitset covering the *whole* code-point space makes
+/// each test O(1) against a fixed, input-independent amount of stack — 8 KiB
+/// for the 2^16 extension types, 32 bytes for the 2^8 name types — with no
+/// allocation and no growth with input size.
+struct SeenCodePoints<const WORDS: usize> {
+    words: [u64; WORDS],
+}
+
+impl<const WORDS: usize> SeenCodePoints<WORDS> {
+    fn empty() -> Self {
+        Self {
+            words: [0u64; WORDS],
+        }
+    }
+
+    /// Record `code_point` and report whether it had already been recorded.
+    ///
+    /// A code point outside the sized space reports `true` (fail closed, so the
+    /// caller refuses the hello) rather than indexing out of bounds; callers
+    /// only pass `u16`/`u8` values that fit their chosen `WORDS`.
+    fn insert_is_duplicate(&mut self, code_point: usize) -> bool {
+        let Some(word) = self.words.get_mut(code_point / 64) else {
+            return true;
+        };
+        let bit = 1u64 << (code_point % 64);
+        let already_seen = *word & bit != 0;
+        *word |= bit;
+        already_seen
+    }
+}
+
+/// Number of `u64` words needed to cover every 16-bit TLS extension type.
+const EXTENSION_TYPE_BITSET_WORDS: usize = (u16::MAX as usize + 1) / 64;
+/// Number of `u64` words needed to cover every 8-bit `ServerNameList` name type.
+const NAME_TYPE_BITSET_WORDS: usize = (u8::MAX as usize + 1) / 64;
+
 /// Walk the extension list for `supported_versions` (0x002b) and `server_name`
 /// (0x0000), reporting whether TLS 1.3 was offered and whether the hello
 /// carried an SNI extension at all.
@@ -553,7 +922,18 @@ struct ScannedExtensions {
 /// "cannot prove this is TLS 1.2", never as "this is TLS 1.2".
 fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
     let mut scanned = ScannedExtensions::default();
-    let mut saw_supported_versions = false;
+    // RFC 8446 §4.2 (and RFC 5246 §7.4.1.4 before it): "There MUST NOT be more
+    // than one extension of the same type in a given extension block." That
+    // holds for EVERY extension type, not only the two this scan interprets —
+    // so the whole-hello gate rejects a repeated arbitrary type as malformed.
+    // Two reasons this has to be general:
+    //   * the lenient hostname extractor returns from the FIRST `server_name`
+    //     it sees, so a hello with a valid early SNI followed by any duplicate
+    //     extension would otherwise still be admitted and select a tenant
+    //     route off a structure the TLS grammar forbids, and
+    //   * for `supported_versions` specifically, an earlier TLS 1.2-only copy
+    //     must never hide a later TLS 1.3 offer from this pre-handshake gate.
+    let mut seen_extension_types = SeenCodePoints::<EXTENSION_TYPE_BITSET_WORDS>::empty();
 
     while !ext.is_empty() {
         if ext.len() < 4 {
@@ -565,20 +945,19 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
         if ext.len() < extension_end {
             return None;
         }
+        if seen_extension_types.insert_is_duplicate(ext_type as usize) {
+            return None;
+        }
         if ext_type == 0x0000 {
-            // Presence only. Whether the name is representable is decided by
-            // `extract_sni_from_client_hello` over the same bytes.
+            if !server_name_extension_is_well_formed(&ext[4..extension_end]) {
+                return None;
+            }
+            // Presence and structure only. Whether the host_name bytes are a
+            // representable DNS name is decided by the extractor over the same
+            // validated hello so it can produce `UnrepresentableName`.
             scanned.offers_server_name = true;
         }
         if ext_type == 0x002b {
-            if saw_supported_versions {
-                // Duplicate extensions are forbidden by the TLS grammar. In
-                // particular, never let an earlier TLS 1.2-only copy hide a
-                // later TLS 1.3 offer from this pre-handshake gate.
-                return None;
-            }
-            saw_supported_versions = true;
-
             let data = &ext[4..extension_end];
             // ClientHello form: list_len (1) + versions (2 each).
             let list_len = *data.first()? as usize;
@@ -596,6 +975,60 @@ fn scan_client_hello_extensions(mut ext: &[u8]) -> Option<ScannedExtensions> {
         ext = &ext[extension_end..];
     }
     Some(scanned)
+}
+
+/// Validate the RFC 6066 `ServerNameList` shape without interpreting DNS bytes.
+///
+/// Unknown future name types remain structurally valid (no length constraint is
+/// imposed on them), but RFC 6066 §3 forbids more than one name of the *same*
+/// `name_type` — for every one of the 256 types, not just `host_name` — and a
+/// `host_name` entry must additionally be non-empty. Representability is
+/// deliberately left to [`parse_sni_hostname`] so the typed classifier can
+/// distinguish an unreadable name from a malformed extension.
+fn server_name_extension_is_well_formed(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let names = &data[2..];
+    if list_len == 0 || names.len() != list_len {
+        return false;
+    }
+
+    let mut pos = 0usize;
+    // RFC 6066 §3: "The ServerNameList MUST NOT contain more than one name of
+    // the same name_type." Tracked across the whole 8-bit name-type space with
+    // the same bounded, non-quadratic detector the extension scan uses, so a
+    // list that repeats an unknown future type is refused just like a repeated
+    // `host_name`.
+    let mut seen_name_types = SeenCodePoints::<NAME_TYPE_BITSET_WORDS>::empty();
+    while pos < names.len() {
+        let Some(header_end) = pos.checked_add(3) else {
+            return false;
+        };
+        let Some(header) = names.get(pos..header_end) else {
+            return false;
+        };
+        let name_type = header[0];
+        let name_len = u16::from_be_bytes([header[1], header[2]]) as usize;
+        pos = header_end;
+        let Some(next) = pos.checked_add(name_len) else {
+            return false;
+        };
+        if next > names.len() {
+            return false;
+        }
+        if seen_name_types.insert_is_duplicate(name_type as usize) {
+            return false;
+        }
+        // `host_name` additionally may not be empty; unknown future types carry
+        // no length contract here and stay structurally valid.
+        if name_type == 0x00 && name_len == 0 {
+            return false;
+        }
+        pos = next;
+    }
+    true
 }
 
 /// Concatenate the handshake-layer payloads of consecutive TLS handshake records
@@ -1095,6 +1528,20 @@ fn u24_to_usize(data: &[u8]) -> usize {
 /// 2. Wildcard host match (e.g., `*.example.com` matches any DNS name below `example.com`)
 /// 3. Fallback: first proxy with empty `hosts` (catch-all/default)
 /// 4. If no match and no fallback: `None`
+///
+/// Tier order is absolute, not declaration order: an exact-host candidate wins
+/// over a wildcard candidate declared before it, and both win over the
+/// catch-all. Within one tier, ambiguity is impossible in validated config —
+/// `GatewayConfig::validate_stream_proxies` rejects overlapping `hosts` and
+/// more than one empty-`hosts` catch-all on a shared SNI port — so config that
+/// reaches this function has exactly one owner per hostname.
+///
+/// Both sides are already normalized when they get here: config `hosts` are
+/// validated ASCII, lowercase, label-checked, and trailing-dot-free
+/// (`validate_host_entry`); the wire SNI is ASCII-lowercased and rejected
+/// outright if it is not a representable DNS name. IDNA is therefore an
+/// A-label (`xn--…`) contract on both sides — a U-label in `hosts` is a config
+/// error, and a non-ASCII `server_name` is not a representable SNI.
 ///
 /// Namespace-agnostic single-namespace helper.
 ///

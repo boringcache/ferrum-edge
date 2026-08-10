@@ -707,3 +707,353 @@ upstreams: []
     gateway.kill().ok();
     gateway.wait().ok();
 }
+
+// ── Issue #3264: general opaque-TLS SNI L4 routing ───────────────────────────
+//
+// These exercise the routing plane OUTSIDE the passthrough special case: an
+// ordinary `tcp` stream listener (`passthrough: false`, `frontend_tls: false`)
+// relays client bytes verbatim, so declaring `hosts` makes it SNI-routed
+// without terminating TLS. They are deliberately H1-independent: the payload is
+// a raw TLS ClientHello and the backends are byte recorders, so nothing here
+// depends on an HTTP frontend.
+
+/// Minimal, standards-shaped TLS 1.2 ClientHello carrying `server_name`.
+///
+/// Hand-built rather than driven through rustls so the test owns the exact
+/// bytes on the wire and can assert the backend received them unmodified.
+fn opaque_client_hello(hostname: &str) -> Vec<u8> {
+    let name = hostname.as_bytes();
+    let mut sni_ext = Vec::new();
+    sni_ext.extend_from_slice(&((1 + 2 + name.len()) as u16).to_be_bytes()); // list len
+    sni_ext.push(0x00); // name_type = host_name
+    sni_ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    sni_ext.extend_from_slice(name);
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0x0000u16.to_be_bytes()); // server_name
+    extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&sni_ext);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    body.extend_from_slice(&[0x2a; 32]); // random
+    body.push(0); // session_id_len
+    body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites_len
+    body.extend_from_slice(&[0x00, 0x2f]);
+    body.push(1); // compression_methods_len
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = vec![0x01];
+    handshake.push((body.len() >> 16) as u8);
+    handshake.push((body.len() >> 8) as u8);
+    handshake.push(body.len() as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// Backend that reports every accepted connection and the first chunk of bytes
+/// it is handed, so a test can prove WHICH backend was dialed (an accept alone
+/// is the fail-closed assertion — a refused connection must never reach one)
+/// and separately that the relayed bytes are exact.
+struct RecordingBackend {
+    accepts: tokio::sync::mpsc::UnboundedReceiver<()>,
+    bytes: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+fn spawn_recording_backend(listener: TcpListener) -> RecordingBackend {
+    let (accept_tx, accepts) = tokio::sync::mpsc::unbounded_channel();
+    let (byte_tx, bytes) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let _ = accept_tx.send(());
+            let byte_tx = byte_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                if let Ok(n) = stream.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = byte_tx.send(buf[..n].to_vec());
+                }
+                // Hold the connection so the gateway does not observe an early
+                // backend EOF while the test is still asserting.
+                sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    RecordingBackend { accepts, bytes }
+}
+
+/// Two ordinary `tcp` listeners (NOT passthrough) sharing one port, separated
+/// only by SNI. Before #3264 this configuration was rejected outright, so an
+/// opaque TLS fanout could only be expressed through `passthrough: true`.
+///
+/// Asserts three things at once: the right backend is chosen, the other backend
+/// sees nothing, and the ClientHello arrives byte-for-byte (the gateway peeks
+/// without consuming and never terminates TLS).
+#[tokio::test]
+#[ignore]
+async fn test_opaque_tcp_sni_fanout_routes_by_sni_and_preserves_bytes() {
+    let backend_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_a_port = backend_a.local_addr().unwrap().port();
+    let backend_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_b_port = backend_b.local_addr().unwrap().port();
+    let mut backend_a = spawn_recording_backend(backend_a);
+    let mut backend_b = spawn_recording_backend(backend_b);
+
+    let (mut gateway, proxy_listen_port, _http, _admin, _dir) =
+        start_gateway_with_retry(move |stream_port, _dir| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "opaque-a"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_a_port}
+    listen_port: {stream_port}
+    hosts:
+      - "tenant-a.example.com"
+  - id: "opaque-b"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_b_port}
+    listen_port: {stream_port}
+    hosts:
+      - "*.tenant-b.example.com"
+
+consumers: []
+plugin_configs: []
+upstreams: []
+"#,
+            )
+        })
+        .await;
+
+    // Exact-host route.
+    let hello_a = opaque_client_hello("tenant-a.example.com");
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+        .await
+        .expect("connect for tenant-a");
+    client.write_all(&hello_a).await.unwrap();
+    client.flush().await.unwrap();
+
+    let received_a = tokio::time::timeout(Duration::from_secs(10), backend_a.bytes.recv())
+        .await
+        .expect("tenant-a backend must be selected by SNI")
+        .expect("backend channel open");
+    assert_eq!(
+        received_a, hello_a,
+        "the peeked ClientHello must reach the backend byte-for-byte"
+    );
+    assert!(
+        backend_b.accepts.try_recv().is_err(),
+        "tenant-b must not observe tenant-a's connection"
+    );
+
+    // Wildcard route on the same listener.
+    let hello_b = opaque_client_hello("shard1.tenant-b.example.com");
+    let mut client_b = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+        .await
+        .expect("connect for tenant-b");
+    client_b.write_all(&hello_b).await.unwrap();
+    client_b.flush().await.unwrap();
+
+    let received_b = tokio::time::timeout(Duration::from_secs(10), backend_b.bytes.recv())
+        .await
+        .expect("wildcard SNI must select the tenant-b backend")
+        .expect("backend channel open");
+    assert_eq!(received_b, hello_b);
+
+    gateway.kill().ok();
+    gateway.wait().ok();
+}
+
+/// Security regression for the core #3264 defect: on an SNI-routed listener,
+/// a ClientHello that never finishes arriving must be REFUSED, not silently
+/// handed to the group's default route. The truncated hello declared
+/// `tenant-a.example.com`; routing it to the catch-all would put one tenant's
+/// connection on another tenant's backend.
+///
+/// Also covers the determinate non-TLS case, which fails closed unless the
+/// operator authorizes a plaintext fallback.
+#[tokio::test]
+#[ignore]
+async fn test_opaque_tls_sni_listener_fails_closed_on_indeterminate_and_non_tls() {
+    let named_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_port = named_backend.local_addr().unwrap().port();
+    let default_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_port = default_backend.local_addr().unwrap().port();
+    let mut named = spawn_recording_backend(named_backend);
+    let mut default_route = spawn_recording_backend(default_backend);
+
+    let (mut gateway, proxy_listen_port, _http, _admin, _dir) = start_gateway_with_retry_env(
+        move |stream_port, _dir| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "named"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {named_port}
+    listen_port: {stream_port}
+    hosts:
+      - "tenant-a.example.com"
+  - id: "default-route"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {default_port}
+    listen_port: {stream_port}
+
+consumers: []
+plugin_configs: []
+upstreams: []
+"#,
+            )
+        },
+        // Short handshake clock so the truncated hello resolves quickly.
+        &[("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "2")],
+    )
+    .await;
+
+    // 1. Truncated ClientHello: cut inside the random bytes, before SNI.
+    let hello = opaque_client_hello("tenant-a.example.com");
+    let mut truncated_client =
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+            .await
+            .expect("connect with truncated hello");
+    truncated_client.write_all(&hello[..20]).await.unwrap();
+    truncated_client.flush().await.unwrap();
+    // 2s handshake deadline + slack for the refusal to land.
+    sleep(Duration::from_secs(5)).await;
+    assert!(
+        default_route.accepts.try_recv().is_err(),
+        "a truncated ClientHello must NOT be downgraded onto the default route"
+    );
+    assert!(
+        named.accepts.try_recv().is_err(),
+        "a truncated ClientHello must not reach a named route either"
+    );
+
+    // 2. Provably non-TLS bytes with no authorized fallback.
+    let mut plaintext_client =
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+            .await
+            .expect("connect with plaintext");
+    plaintext_client
+        .write_all(b"GET / HTTP/1.1\r\nHost: tenant-a.example.com\r\n\r\n")
+        .await
+        .unwrap();
+    plaintext_client.flush().await.unwrap();
+    sleep(Duration::from_secs(2)).await;
+    assert!(
+        default_route.accepts.try_recv().is_err(),
+        "non-TLS bytes must fail closed unless a plaintext fallback is authorized"
+    );
+
+    // 3. A well-formed hello for the named host still routes — the listener is
+    //    fail-closed, not broken.
+    let mut good_client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+        .await
+        .expect("connect with valid hello");
+    good_client.write_all(&hello).await.unwrap();
+    good_client.flush().await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(10), named.bytes.recv())
+        .await
+        .expect("a complete ClientHello must still route")
+        .expect("backend channel open");
+    assert_eq!(received, hello);
+
+    gateway.kill().ok();
+    gateway.wait().ok();
+}
+
+/// The plaintext fallback is opt-in and, when authorized, sends provably
+/// non-TLS bytes to the group's declared default route — the pre-#3264
+/// behavior, now only reachable by explicit configuration.
+#[tokio::test]
+#[ignore]
+async fn test_opaque_tls_sni_listener_honors_authorized_plaintext_fallback() {
+    let named_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_port = named_backend.local_addr().unwrap().port();
+    let default_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_port = default_backend.local_addr().unwrap().port();
+    let mut named = spawn_recording_backend(named_backend);
+    let mut default_route = spawn_recording_backend(default_backend);
+
+    let (mut gateway, proxy_listen_port, _http, _admin, _dir) = start_gateway_with_retry_env(
+        move |stream_port, _dir| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "named"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {named_port}
+    listen_port: {stream_port}
+    hosts:
+      - "tenant-a.example.com"
+  - id: "default-route"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {default_port}
+    listen_port: {stream_port}
+
+consumers: []
+plugin_configs: []
+upstreams: []
+"#,
+            )
+        },
+        &[
+            ("FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK", "true"),
+            ("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "2"),
+        ],
+    )
+    .await;
+
+    let payload = b"PLAIN-TCP-CLIENT".to_vec();
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+        .await
+        .expect("connect with plaintext");
+    client.write_all(&payload).await.unwrap();
+    client.flush().await.unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), default_route.bytes.recv())
+        .await
+        .expect("authorized plaintext fallback must reach the default route")
+        .expect("backend channel open");
+    assert_eq!(received, payload, "plaintext bytes relay unmodified");
+    default_route
+        .accepts
+        .try_recv()
+        .expect("the authorized plaintext connection must record one backend accept");
+
+    // The authorization is scoped to non-TLS bytes only: a truncated hello is
+    // still refused.
+    let hello = opaque_client_hello("tenant-a.example.com");
+    let mut truncated = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
+        .await
+        .expect("connect with truncated hello");
+    truncated.write_all(&hello[..20]).await.unwrap();
+    truncated.flush().await.unwrap();
+    sleep(Duration::from_secs(5)).await;
+    assert!(
+        default_route.accepts.try_recv().is_err(),
+        "the plaintext fallback must not rescue an indeterminate ClientHello"
+    );
+    assert!(named.accepts.try_recv().is_err());
+
+    gateway.kill().ok();
+    gateway.wait().ok();
+}

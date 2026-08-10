@@ -136,7 +136,7 @@ fn tls13_only_client_is_refused() {
 }
 
 #[test]
-fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
+fn tls12_only_client_offering_aes_is_refused_under_production_handoff_usability() {
     let hello = client_hello_for(&[&rustls::version::TLS12]);
     let facts = client_hello_ktls_facts(&hello).expect("complete ClientHello parses");
 
@@ -145,17 +145,23 @@ fn tls12_only_client_is_eligible_when_every_offered_suite_is_installable() {
         "a TLS 1.2-only rustls client must not advertise TLS 1.3"
     );
     assert!(
-        facts.offers_aes128_gcm || facts.offers_aes256_gcm || facts.offers_chacha20_poly1305,
-        "rustls TLS 1.2 always offers at least one AEAD suite"
+        facts.offers_aes128_gcm || facts.offers_aes256_gcm,
+        "rustls TLS 1.2 offers at least one AES-GCM suite"
     );
+    // Production `cipher_handoff_usable` never marks AES-GCM handoff-usable.
     assert!(
-        eligible(&facts, ALL_CIPHERS),
-        "a TLS 1.2 client whose whole offer set is installable is eligible"
+        !eligible(&facts, (false, false, true)),
+        "an offer set containing AES-GCM must decline under production handoff usability"
     );
 }
 
 #[test]
-fn every_aes_offer_requires_the_receive_window_to_be_pinned_before_handshake() {
+fn finite_limit_aes_offers_are_refused_and_chacha_only_remains_eligible() {
+    // Production handoff usability: AES-GCM is never usable; ChaCha20-Poly1305
+    // is usable only when its kernel probe passed.
+    const PRODUCTION_WITH_CHACHA: (bool, bool, bool) = (false, false, true);
+    const PRODUCTION_WITHOUT_CHACHA: (bool, bool, bool) = (false, false, false);
+
     let aes128 = ClientHelloKtlsFacts {
         offers_aes128_gcm: true,
         ..ClientHelloKtlsFacts::default()
@@ -170,11 +176,21 @@ fn every_aes_offer_requires_the_receive_window_to_be_pinned_before_handshake() {
         ..ClientHelloKtlsFacts::default()
     };
 
-    assert!(aes128.requires_receive_window_pin());
-    assert!(aes256_and_chacha.requires_receive_window_pin());
     assert!(
-        !chacha_only.requires_receive_window_pin(),
-        "the unlimited suite must retain receive autotuning"
+        !eligible(&aes128, PRODUCTION_WITH_CHACHA),
+        "AES-only offers must be refused"
+    );
+    assert!(
+        !eligible(&aes256_and_chacha, PRODUCTION_WITH_CHACHA),
+        "any AES offer fails closed even when ChaCha is also selectable"
+    );
+    assert!(
+        eligible(&chacha_only, PRODUCTION_WITH_CHACHA),
+        "ChaCha-only is eligible when the ChaCha kernel capability is available"
+    );
+    assert!(
+        !eligible(&chacha_only, PRODUCTION_WITHOUT_CHACHA),
+        "ChaCha-only declines when the ChaCha kernel capability is unavailable"
     );
 }
 
@@ -661,6 +677,16 @@ fn a_disabled_handshake_clock_yields_no_deadline() {
     assert!(frontend_tls_handshake_deadline(0).is_none());
 }
 
+#[test]
+fn an_unrepresentable_handshake_clock_fails_closed_without_panicking() {
+    let before = tokio::time::Instant::now();
+    let deadline = frontend_tls_handshake_deadline(u64::MAX)
+        .expect("a nonzero timeout must retain a deadline");
+
+    assert!(deadline <= tokio::time::Instant::now());
+    assert!(deadline >= before);
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_fallback_inherits_the_remaining_budget_not_a_fresh_one() {
     // Budget is opened once, then an earlier admission stage (ClientHello peek
@@ -1117,6 +1143,55 @@ mod confidentiality {
                 direction.is_transmit(),
                 direction == KtlsDirection::Transmit
             );
+        }
+    }
+}
+
+/// The kernel-UAPI capability probe must be able to explain itself.
+///
+/// The TLS ULP accepts a cipher install only when `optlen` exactly matches its
+/// own `tls12_crypto_info_*` size, so a gateway-side layout mistake is
+/// indistinguishable from a missing kernel capability if the probe reports
+/// nothing but a boolean. That is not hypothetical: a ChaCha20-Poly1305
+/// crypto-info carrying a 4-byte salt (the UAPI salt is zero-length, making the
+/// struct 56 bytes) is refused with `EINVAL` on every kernel and reads back as
+/// "this kernel has no ChaCha20-Poly1305 kTLS".
+///
+/// The layouts themselves are pinned to `libc`'s definitions by `const`
+/// assertions in `socket_opts::ktls`, so a regression there fails the build
+/// rather than any test. What is asserted here is the other half: the probe
+/// verdict is reported per cipher, with a reason, and can never disagree with
+/// the boolean accessor the admission gate actually reads.
+mod probe_diagnostics {
+    use ferrum_edge::socket_opts::ktls;
+
+    #[test]
+    fn diagnostic_names_every_cipher_and_agrees_with_the_accessors() {
+        let diagnostic = ktls::ktls_availability_diagnostic();
+        for cipher in ["aes128", "aes256", "chacha20"] {
+            assert!(
+                diagnostic.contains(cipher),
+                "the kTLS probe diagnostic must name {cipher}: {diagnostic}"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                diagnostic.contains("install:"),
+                "each cipher must report why its install probe failed: {diagnostic}"
+            );
+            for (name, available) in [
+                ("aes128", ktls::is_ktls_aes128gcm_available()),
+                ("aes256", ktls::is_ktls_aes256gcm_available()),
+                ("chacha20", ktls::is_ktls_chacha20_poly1305_available()),
+            ] {
+                assert!(
+                    diagnostic.contains(&format!("{name}={available}")),
+                    "the diagnostic must not disagree with the {name} accessor \
+                     the admission gate reads: {diagnostic}"
+                );
+            }
         }
     }
 }

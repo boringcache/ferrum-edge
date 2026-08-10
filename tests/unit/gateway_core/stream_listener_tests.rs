@@ -230,6 +230,24 @@ fn create_manager_with_config_arc(
     config_arc: Arc<ArcSwap<GatewayConfig>>,
     config: &GatewayConfig,
 ) -> StreamListenerManager {
+    create_manager_runtime(config_arc, config).manager
+}
+
+/// Runtime pieces needed when a test reloads config the way production does:
+/// publish a new request epoch (backend dial source) and swap the manager's
+/// config ArcSwap (reconcile / SNI-group membership source) together.
+struct StreamManagerRuntime {
+    manager: StreamListenerManager,
+    request_epoch: Arc<RequestEpochStore>,
+    plugin_cache: Arc<PluginCache>,
+    consumer_index: Arc<ConsumerIndex>,
+    lb_cache: Arc<LoadBalancerCache>,
+}
+
+fn create_manager_runtime(
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    config: &GatewayConfig,
+) -> StreamManagerRuntime {
     let dns_cache = DnsCache::new(DnsConfig::default());
     let lb_cache = Arc::new(LoadBalancerCache::new(config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
@@ -242,11 +260,11 @@ fn create_manager_with_config_arc(
     ));
     let cb_cache = Arc::new(CircuitBreakerCache::new());
 
-    StreamListenerManager::new(
+    let manager = StreamListenerManager::new(
         "127.0.0.1".parse::<IpAddr>().unwrap(),
         config_arc,
         dns_cache,
-        request_epoch,
+        request_epoch.clone(),
         cb_cache,
         None, // no frontend TLS
         false,
@@ -275,7 +293,14 @@ fn create_manager_with_config_arc(
         false, // udp_gso_enabled
         false, // udp_pktinfo_enabled
         Arc::new(TrustedProxies::none()),
-    )
+    );
+    StreamManagerRuntime {
+        manager,
+        request_epoch,
+        plugin_cache,
+        consumer_index,
+        lb_cache,
+    }
 }
 
 fn empty_config() -> GatewayConfig {
@@ -499,6 +524,289 @@ async fn passthrough_same_sni_double_digit_ids_preserve_declaration_order() {
     .await
     .unwrap();
     assert_eq!(selected, "match-2");
+    manager.shutdown_all().await;
+}
+
+// ── Issue #3264: opaque-TLS SNI routing on ordinary `tcp` listeners ──────────
+
+/// Two ordinary `tcp` listeners (`passthrough: false`, `frontend_tls: false`)
+/// share one port and are separated only by SNI. Before #3264 this shape was
+/// rejected at config admission, so opaque TLS fanout required `passthrough`.
+///
+/// Exercises the tier ladder end to end on a live listener: exact host, then
+/// wildcard, then the single declared catch-all.
+#[tokio::test]
+async fn opaque_tcp_listeners_route_by_sni_across_every_tier() {
+    let exact_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wildcard_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exact_port = exact_backend.local_addr().unwrap().port();
+    let wildcard_port = wildcard_backend.local_addr().unwrap().port();
+    let default_port = default_backend.local_addr().unwrap().port();
+
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        // Declare the wildcard FIRST so the assertion proves tier order, not
+        // declaration order.
+        let mut wildcard = create_stream_proxy("wildcard", BackendScheme::Tcp, frontend_port);
+        wildcard.backend_port = wildcard_port;
+        wildcard.hosts = vec!["*.example.com".to_string()];
+        let mut exact = create_stream_proxy("exact", BackendScheme::Tcp, frontend_port);
+        exact.backend_port = exact_port;
+        exact.hosts = vec!["tenant-a.example.com".to_string()];
+        let mut default_route = create_stream_proxy("default", BackendScheme::Tcp, frontend_port);
+        default_route.backend_port = default_port;
+        GatewayConfig {
+            proxies: vec![wildcard, exact, default_route],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    for (hostname, expected) in [
+        ("tenant-a.example.com", "exact"),
+        ("tenant-z.example.com", "wildcard"),
+        ("unclaimed.org", "default"),
+    ] {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+            .await
+            .unwrap();
+        client.write_all(&tls_client_hello(hostname)).await.unwrap();
+        let selected = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = exact_backend.accept() => { result.unwrap(); "exact" }
+                result = wildcard_backend.accept() => { result.unwrap(); "wildcard" }
+                result = default_backend.accept() => { result.unwrap(); "default" }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no backend selected for SNI {hostname}"));
+        assert_eq!(selected, expected, "SNI {hostname} selected the wrong tier");
+    }
+
+    manager.shutdown_all().await;
+}
+
+/// Security regression for the core #3264 defect. On an SNI-routed listener a
+/// ClientHello that never finishes arriving used to fall through to the
+/// catch-all, putting one tenant's connection on the default tenant's backend.
+/// It must now be refused before any backend is dialed, while a complete hello
+/// on the same listener still routes.
+#[tokio::test]
+async fn opaque_tcp_sni_listener_refuses_a_truncated_client_hello() {
+    let named_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_port = named_backend.local_addr().unwrap().port();
+    let default_port = default_backend.local_addr().unwrap().port();
+
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        let mut named = create_stream_proxy("named", BackendScheme::Tcp, frontend_port);
+        named.backend_port = named_port;
+        named.hosts = vec!["tenant-a.example.com".to_string()];
+        let mut default_route = create_stream_proxy("default", BackendScheme::Tcp, frontend_port);
+        default_route.backend_port = default_port;
+        GatewayConfig {
+            proxies: vec![named, default_route],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    let hello = tls_client_hello("tenant-a.example.com");
+    let mut truncated = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    // Cut inside the random bytes, before the server_name extension.
+    truncated.write_all(&hello[..20]).await.unwrap();
+    truncated.flush().await.unwrap();
+
+    // The manager's handshake deadline is 10s in tests; assert no backend is
+    // dialed well inside it. A pre-#3264 gateway dials the catch-all as soon as
+    // the first (truncated) peek returns.
+    let leaked = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = named_backend.accept() => { result.unwrap(); "named" }
+            result = default_backend.accept() => { result.unwrap(); "default" }
+        }
+    })
+    .await;
+    assert!(
+        leaked.is_err(),
+        "a truncated ClientHello must not be routed at all, got {leaked:?}"
+    );
+
+    // The listener is fail-closed, not broken.
+    let mut good = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    good.write_all(&hello).await.unwrap();
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = named_backend.accept() => { result.unwrap(); "named" }
+            result = default_backend.accept() => { result.unwrap(); "default" }
+        }
+    })
+    .await
+    .expect("a complete ClientHello must still route");
+    assert_eq!(selected, "named");
+
+    manager.shutdown_all().await;
+}
+
+/// Provably non-TLS opening bytes are refused by default on an SNI-routed
+/// listener even though the group declares a catch-all: the default route is a
+/// TLS default, not an "anything goes" route.
+#[tokio::test]
+async fn opaque_tcp_sni_listener_refuses_non_tls_bytes_by_default() {
+    let default_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_port = default_backend.local_addr().unwrap().port();
+
+    let (manager, frontend_port) = start_manager_on_fresh_tcp_port(|frontend_port| {
+        let mut named = create_stream_proxy("named", BackendScheme::Tcp, frontend_port);
+        named.hosts = vec!["tenant-a.example.com".to_string()];
+        let mut default_route = create_stream_proxy("default", BackendScheme::Tcp, frontend_port);
+        default_route.backend_port = default_port;
+        GatewayConfig {
+            proxies: vec![named, default_route],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: tenant-a.example.com\r\n\r\n")
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let leaked = tokio::time::timeout(Duration::from_secs(2), default_backend.accept()).await;
+    assert!(
+        leaked.is_err(),
+        "non-TLS bytes must fail closed without an authorized plaintext fallback"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Reload atomicity: rehoming an SNI route to a different backend and deleting
+/// a route must both take effect on the shared listener. The listener key is
+/// `__sni_{port}` for the whole group, so a membership or host change has to
+/// restart it rather than keep serving the previous route table.
+///
+/// Production `ProxyState::update_config` publishes the request epoch (the
+/// accept-path dial source) and mirrors it into the shared config ArcSwap
+/// (reconcile's membership source) before restarting the group. This harness
+/// must do the same: swapping only the ArcSwap leaves a rebuilt listener
+/// dialing the previous backend from the stale epoch.
+#[tokio::test]
+async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
+    let first_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_port = first_backend.local_addr().unwrap().port();
+    let second_port = second_backend.local_addr().unwrap().port();
+
+    let frontend_port = ephemeral_port().await;
+    let build = |backend_port: u16, include_default: bool| {
+        let mut named = create_stream_proxy("named", BackendScheme::Tcp, frontend_port);
+        named.backend_port = backend_port;
+        named.hosts = vec!["tenant-a.example.com".to_string()];
+        let mut proxies = vec![named];
+        if include_default {
+            let mut default_route =
+                create_stream_proxy("default", BackendScheme::Tcp, frontend_port);
+            default_route.backend_port = backend_port;
+            proxies.push(default_route);
+        }
+        GatewayConfig {
+            proxies,
+            ..empty_config()
+        }
+    };
+
+    let initial = build(first_port, true);
+    assert!(initial.validate_stream_proxies().is_ok());
+    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+    let runtime = create_manager_runtime(config_arc.clone(), &initial);
+    let manager = &runtime.manager;
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial reconcile failed: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("SNI group listener should start");
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    client
+        .write_all(&tls_client_hello("tenant-a.example.com"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), first_backend.accept())
+        .await
+        .expect("named route must reach the first backend")
+        .unwrap();
+
+    // Reload: rehome the named route AND delete the catch-all. Publish the
+    // request epoch first so accept-path dials see the new backend_port, then
+    // swap the ArcSwap and reconcile so `__sni_{port}` restarts without the
+    // deleted catch-all in its captured candidate list.
+    let updated = build(second_port, false);
+    assert!(updated.validate_stream_proxies().is_ok());
+    runtime
+        .request_epoch
+        .republish_from_runtime_parts_for_test(
+            updated.clone(),
+            &runtime.plugin_cache,
+            &runtime.consumer_index,
+            &runtime.lb_cache,
+        )
+        .expect("request epoch must republish the reloaded stream route table");
+    config_arc.store(Arc::new(updated));
+    let failures = manager.reconcile().await;
+    assert!(failures.is_empty(), "reload reconcile failed: {failures:?}");
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("rebuilt SNI group listener should start");
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    client
+        .write_all(&tls_client_hello("tenant-a.example.com"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), second_backend.accept())
+        .await
+        .expect("the reloaded route table must dial the new backend")
+        .unwrap();
+
+    // The catch-all is gone, so an unclaimed hostname is now unroutable.
+    let mut orphan = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
+        .await
+        .unwrap();
+    orphan
+        .write_all(&tls_client_hello("unclaimed.example.org"))
+        .await
+        .unwrap();
+    let leaked = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = first_backend.accept() => { result.unwrap(); "first" }
+            result = second_backend.accept() => { result.unwrap(); "second" }
+        }
+    })
+    .await;
+    assert!(
+        leaked.is_err(),
+        "a deleted catch-all must not keep absorbing traffic: {leaked:?}"
+    );
+
     manager.shutdown_all().await;
 }
 
