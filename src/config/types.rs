@@ -2976,16 +2976,20 @@ impl K8sMeshOverlay {
 
 /// One Gateway-listener-owned frontend TLS certificate.
 ///
-/// Identity is `(namespace, gateway, listener, cert_path)`. The owning
-/// **Gateway** namespace is what CP/DP tenancy filters on — the Secret itself
-/// may live in another namespace when a ReferenceGrant authorizes it, so the
-/// `k8s://secret-ns/...` source URI must never be read as ownership.
+/// Identity is `(serving namespace, serialized owner, listener, cert_path)`.
+/// Gateway owners retain their resource name; ListenerSet owners are encoded
+/// as `ListenerSet:<resource namespace>:<resource name>`. Kubernetes Namespace
+/// and Object names cannot contain `:`, so this is injective and cannot
+/// collide with a Gateway resource name. The serving **Gateway** namespace is
+/// what CP/DP tenancy filters on — the Secret itself may live in another
+/// namespace when a ReferenceGrant authorizes it, so the `k8s://secret-ns/...`
+/// source URI must never be read as ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FrontendTlsCertificateSource {
     /// Owning Gateway namespace.
     pub namespace: String,
-    /// Owning Gateway name.
+    /// Serialized owning Gateway or ListenerSet identity.
     #[serde(default)]
     pub gateway: String,
     /// Owning listener name.
@@ -3005,8 +3009,9 @@ pub struct FrontendTlsCertificateSource {
 }
 
 impl FrontendTlsCertificateSource {
-    /// `namespace/gateway/listener` — public Kubernetes metadata, safe to put
-    /// in diagnostics. Never derived from certificate or key material.
+    /// `serving-namespace/serialized-owner/listener` — public Kubernetes
+    /// metadata, safe to put in diagnostics. Never derived from certificate or
+    /// key material.
     pub fn listener_identity(&self) -> String {
         format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
     }

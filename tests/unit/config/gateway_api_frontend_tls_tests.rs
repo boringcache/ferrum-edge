@@ -237,6 +237,83 @@ fn independent_gateways_in_one_namespace_each_keep_their_certificate() {
 }
 
 #[test]
+fn cross_namespace_same_named_listenersets_keep_distinct_runtime_identities() {
+    let mut parent = gateway(
+        "serving",
+        "edge",
+        vec![json!({
+            "name": "http",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {"namespaces": {"from": "All"}}
+        })],
+    );
+    parent.spec["allowedListeners"] = json!({"namespaces": {"from": "All"}});
+
+    let listenerset = |namespace: &str, port: u64, hostname: &str, secret: &str| {
+        object(
+            "ListenerSet",
+            namespace,
+            "shared",
+            json!({
+                "parentRef": {
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "serving",
+                    "name": "edge"
+                },
+                "listeners": [https_listener("https", port, Some(hostname), &[secret])]
+            }),
+        )
+    };
+    let result = translate_k8s_objects(
+        &[
+            parent,
+            listenerset("team-a", 8443, "a.example.com", "cert-a"),
+            listenerset("team-b", 9443, "b.example.com", "cert-b"),
+            tls_secret("cert-a", "team-a"),
+            tls_secret("cert-b", "team-b"),
+        ],
+        options().with_source_namespaces(vec![
+            "serving".to_string(),
+            "team-a".to_string(),
+            "team-b".to_string(),
+        ]),
+    )
+    .expect("cross-namespace ListenerSets translate");
+
+    assert_eq!(result.config.frontend_tls_certificate_sources.len(), 2);
+    let sources_by_hostname: HashMap<_, _> = result
+        .config
+        .frontend_tls_certificate_sources
+        .iter()
+        .map(|source| (source.hostname.as_deref(), source))
+        .collect();
+    let team_a = sources_by_hostname
+        .get(&Some("a.example.com"))
+        .expect("team-a hostname provenance");
+    let team_b = sources_by_hostname
+        .get(&Some("b.example.com"))
+        .expect("team-b hostname provenance");
+
+    assert_eq!(team_a.namespace, "serving");
+    assert_eq!(team_b.namespace, "serving");
+    assert_eq!(team_a.gateway, "ListenerSet:team-a:shared");
+    assert_eq!(team_b.gateway, "ListenerSet:team-b:shared");
+    assert_eq!(
+        team_a.listener_identity(),
+        "serving/ListenerSet:team-a:shared/https"
+    );
+    assert_eq!(
+        team_b.listener_identity(),
+        "serving/ListenerSet:team-b:shared/https"
+    );
+    assert_ne!(team_a.listener_identity(), team_b.listener_identity());
+    assert_ne!(team_a.listener_identity(), "serving/shared/https");
+    assert_ne!(team_b.listener_identity(), "serving/shared/https");
+}
+
+#[test]
 fn listener_hostname_and_default_marker_are_deterministic() {
     let result = translate(&[
         gateway(

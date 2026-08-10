@@ -1353,8 +1353,9 @@ fn stage_frontend_tls_snapshot(
 /// plane's deterministic order.
 ///
 /// Sources are already namespace-filtered by `filter_config_to_namespace`, so
-/// nothing here can widen tenancy. Entries are identified only by their owning
-/// `namespace/gateway/listener` — never by certificate or key bytes.
+/// nothing here can widen tenancy. Entries are identified only by their
+/// `serving-namespace/serialized-owner/listener` — never by certificate or key
+/// bytes.
 fn gateway_certificate_inputs(config: &GatewayConfig) -> Vec<GatewayCertificateInput> {
     config
         .frontend_tls_certificate_sources

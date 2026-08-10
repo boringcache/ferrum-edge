@@ -2045,7 +2045,14 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
             let owner = match listener.key.parent_kind {
                 GatewayApiListenerParentKind::Gateway => listener.key.gateway.clone(),
                 GatewayApiListenerParentKind::ListenerSet => {
-                    format!("ListenerSet:{}", listener.key.gateway)
+                    // Namespace and Object names cannot contain `:`.
+                    // The kind prefix is therefore disjoint from every valid
+                    // Gateway name, and the separator preserves the original
+                    // ListenerSet identity components without ambiguity.
+                    format!(
+                        "ListenerSet:{}:{}",
+                        listener.key.namespace, listener.key.gateway
+                    )
                 }
             };
             sources.push(FrontendTlsCertificateSource {

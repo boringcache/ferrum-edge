@@ -12,7 +12,8 @@
 //! parsing, allocation, or locking, and no growth with request volume.
 //!
 //! Nothing here logs or formats key material: an entry is identified by its
-//! owning `namespace/gateway/listener`, which is public Kubernetes metadata.
+//! `serving-namespace/serialized-owner/listener`, which is public Kubernetes
+//! metadata.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -48,8 +49,8 @@ pub struct GatewayCertificateInput {
     /// The owning listener's `hostname`, ASCII-lowercased. `None` is a
     /// catch-all listener: it contributes only the certificate's own SANs.
     pub hostname: Option<String>,
-    /// `namespace/gateway/listener` — public metadata, used for diagnostics.
-    /// Never contains certificate or key bytes.
+    /// `serving-namespace/serialized-owner/listener` — public metadata, used
+    /// for diagnostics. Never contains certificate or key bytes.
     pub identity: String,
     /// Whether this certificate belongs to the snapshot's fallback listener.
     /// Runtime grouping by `identity` retains every RSA/ECDSA alternative on
