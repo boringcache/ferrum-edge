@@ -3496,7 +3496,11 @@ in that release; disabled to enabled names the incoming placement. A `disabled`
 predecessor conservatively reaps both ownership domains, which covers a legacy
 disabled node. Any pre-contract node with no durable owner record also reaps
 both domains, regardless of the declared predecessor, so a mistaken legacy
-placement claim cannot strand Ferrum-owned rules.
+placement claim cannot strand Ferrum-owned rules. Accordingly, the first Helm
+upgrade from any pre-contract release requires an explicit cleanup adoption
+release even when the requested placement appears unchanged or disabled: the
+missing ConfigMap cannot prove whether that older release owned pod- or
+host-netns rules. Initial installs are unaffected.
 
 **Recovery and churn contract.** Cleanup persists `(generation, from, to)`
 before touching rules. A proxy restart resumes only that tuple; a different or

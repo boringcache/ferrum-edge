@@ -8,7 +8,7 @@ use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpClea
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement, UdpPlacementDecision,
     UdpPlacementRequest, clear_registry_sync_marker, prepare_placement,
-    publish_registry_sync_marker,
+    publish_registry_sync_marker, publish_registry_sync_marker_for_pods,
 };
 
 struct MutableSource(Mutex<Vec<PodCaptureTarget>>);
@@ -377,6 +377,25 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
     assert!(context.registry_is_synchronized());
     clear_registry_sync_marker(registry.path()).expect("restart retraction");
     assert!(!context.registry_is_synchronized());
+}
+
+#[test]
+fn registry_relist_ack_requires_every_expected_pod_entry() {
+    let registry = tempfile::tempdir().expect("registry");
+    let expected = HashSet::from(["pod-a".to_string(), "pod-b".to_string()]);
+    std::fs::write(registry.path().join("pod-a"), b"/cg/1\n").expect("first pod entry");
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected),
+        Ok(false)
+    );
+    assert!(!registry.path().join(".udp-registry-synced").exists());
+
+    std::fs::write(registry.path().join("pod-b"), b"/cg/2\n").expect("second pod entry");
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &expected),
+        Ok(true)
+    );
+    assert!(registry.path().join(".udp-registry-synced").is_file());
 }
 
 #[tokio::test]

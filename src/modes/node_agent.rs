@@ -1502,6 +1502,12 @@ where
     let udp_migration_generation =
         crate::proxy::udp_placement_migration::migration_generation_from_env()
             .map_err(anyhow::Error::msg)?;
+    if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
+        anyhow::bail!(
+            "Ambient UDP migration generation requires the node-waypoint pod registry directory"
+        );
+    }
+    let mut udp_registry_sync_published = false;
     if udp_migration_generation.is_some()
         && let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref()
     {
@@ -1599,6 +1605,7 @@ where
                     }
                     Some(Ok(Event::Init)) => {
                         init_seen = Some(HashSet::new());
+                        udp_registry_sync_published = false;
                         if udp_migration_generation.is_some()
                             && let Some(registry_dir) =
                                 config.node_waypoint_pod_registry_dir.as_deref()
@@ -1637,15 +1644,19 @@ where
                                 &seen,
                             );
                         }
-                        if let (Some(generation), Some(registry_dir)) = (
-                            udp_migration_generation.as_deref(),
-                            config.node_waypoint_pod_registry_dir.as_deref(),
-                        ) {
-                            crate::proxy::udp_placement_migration::publish_registry_sync_marker(
-                                registry_dir,
-                                generation,
-                            )
-                            .map_err(anyhow::Error::msg)?;
+                        if let Some(generation) = udp_migration_generation.as_deref() {
+                            udp_registry_sync_published =
+                                publish_udp_migration_registry_sync_if_ready(
+                                    generation,
+                                    &pod_states,
+                                    config,
+                                )
+                                .map_err(anyhow::Error::msg)?;
+                            if !udp_registry_sync_published {
+                                warn!(
+                                    "Withholding Ambient UDP registry synchronization marker until all relisted pod registry entries and cleanup ownership converge"
+                                );
+                            }
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");
@@ -1757,6 +1768,22 @@ where
                     config,
                     metrics.as_ref(),
                 );
+                if startup_ready.load(Ordering::Acquire)
+                    && !udp_registry_sync_published
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    udp_registry_sync_published = publish_udp_migration_registry_sync_if_ready(
+                        generation,
+                        &pod_states,
+                        config,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    if udp_registry_sync_published {
+                        info!(
+                            "Ambient UDP registry synchronization marker published after relist recovery converged"
+                        );
+                    }
+                }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness_with_sync_state(
@@ -1847,6 +1874,31 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
     PENDING_CAPTURE_FAILURES
         .iter()
         .any(|entry| entry.key().starts_with(&key_prefix))
+}
+
+fn publish_udp_migration_registry_sync_if_ready(
+    generation: &str,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+) -> Result<bool, String> {
+    if has_failed_pod_enrollments(pod_states) || has_pending_capture_failures(pod_states) {
+        return Ok(false);
+    }
+    let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+        return Err(
+            "Ambient UDP migration generation requires the node-waypoint pod registry directory"
+                .to_string(),
+        );
+    };
+    let expected_pod_uids: HashSet<String> = pod_states
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    crate::proxy::udp_placement_migration::publish_registry_sync_marker_for_pods(
+        registry_dir,
+        generation,
+        &expected_pod_uids,
+    )
 }
 
 fn clear_partial_capture_state_if_recovered(
@@ -4414,22 +4466,22 @@ fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
 /// Best-effort publish of a single pod's registry entry: ensure `dir` exists,
 /// then write `dir/<pod_uid>` containing `cgroup_path` on one line. The mesh
 /// proxy's in-netns capture listeners poll this directory. Never panics and
-/// never propagates: any I/O error (or an unsafe `pod_uid`) is logged at
-/// `warn!` and swallowed so pod enrollment is never aborted by registry I/O.
+/// returns `false`: any I/O error (or an unsafe `pod_uid`) is logged at `warn!`
+/// so the caller can retain retry state without aborting pod enrollment.
 fn publish_pod_registry(
     dir: &std::path::Path,
     pod_uid: &str,
     cgroup_path: &str,
     pod_source_ips: PodSourceIps,
     source_identity: Option<&crate::identity::SpiffeId>,
-) {
+) -> bool {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
             pod_uid,
             "Refusing to publish node-waypoint pod registry entry: pod UID is empty or contains \
              path separators / '..'"
         );
-        return;
+        return false;
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         warn!(
@@ -4438,7 +4490,7 @@ fn publish_pod_registry(
             error = %e,
             "Failed to create node-waypoint pod registry directory"
         );
-        return;
+        return false;
     }
     let path = dir.join(pod_uid);
     // Line 1: pod cgroup path. Optional keyed lines: same-family source pod IPs
@@ -4461,7 +4513,9 @@ fn publish_pod_registry(
             error = %e,
             "Failed to write node-waypoint pod registry entry"
         );
+        return false;
     }
+    true
 }
 
 /// Best-effort removal of a single pod's registry entry (`dir/<pod_uid>`).
@@ -5256,6 +5310,7 @@ fn handle_pod_added_inner(
                 &event.node_probe_ports,
                 &mut state,
             );
+            let mut registry_publish_succeeded = true;
             if !pod_ip_reconcile.pod_ip_update_failed
                 && !pod_ip6_reconcile.pod_ip_update_failed
                 && let (Some(dir), Some(cgroup)) = (
@@ -5268,7 +5323,7 @@ fn handle_pod_added_inner(
                     event.service_account.unwrap_or("default"),
                     &config.trust_domain,
                 );
-                publish_pod_registry(
+                registry_publish_succeeded = publish_pod_registry(
                     dir,
                     pod_uid,
                     cgroup,
@@ -5355,29 +5410,34 @@ fn handle_pod_added_inner(
                     );
                 }
             }
-            match refresh_cni_owned_cleanup_snapshot(pod_states, pod_uid) {
-                Ok(()) => forget_failed_pod_enrollment(&state_key),
-                Err(error) => {
+            let cleanup_snapshot_result = refresh_cni_owned_cleanup_snapshot(pod_states, pod_uid);
+            if cleanup_snapshot_result.is_ok() && registry_publish_succeeded {
+                forget_failed_pod_enrollment(&state_key);
+            } else {
+                if let Err(error) = cleanup_snapshot_result {
                     warn!(
                         pod_uid,
                         error = %error,
                         "Failed to persist refreshed CNI cleanup ownership; GC will retry after reconciliation"
                     );
                     metrics.record_attach_error();
-                    if let Some(current_state) = pod_states.get(pod_uid) {
-                        remember_failed_pod_enrollment_with_merged_cleanup_state(
-                            &state_key,
-                            pod_enrollment_attempt_signature(
-                                event,
-                                pod_ip,
-                                &cgroup_path,
-                                &veth_iface,
-                            ),
-                            RetryablePodEnrollment::from_event(event),
-                            prior_cleanup_state.as_ref(),
-                            current_state.value(),
-                        );
-                    }
+                }
+                if !registry_publish_succeeded {
+                    metrics.record_attach_error();
+                }
+                if let Some(current_state) = pod_states.get(pod_uid) {
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
+                        &state_key,
+                        pod_enrollment_attempt_signature(
+                            event,
+                            pod_ip,
+                            &cgroup_path,
+                            &veth_iface,
+                        ),
+                        RetryablePodEnrollment::from_event(event),
+                        prior_cleanup_state.as_ref(),
+                        current_state.value(),
+                    );
                 }
             }
             return;
@@ -5835,6 +5895,7 @@ fn handle_pod_added_inner(
         // mesh proxy open a listener for a pod that was never captured. Removal
         // is handled by `handle_pod_removed`. Gated on the registry being
         // configured (in-netns listeners + NodeWaypoint topology).
+        let mut registry_publish_succeeded = true;
         if let (Some(dir), Some(cgroup_path_value)) = (
             &config.node_waypoint_pod_registry_dir,
             cgroup_path.as_deref(),
@@ -5844,13 +5905,25 @@ fn handle_pod_added_inner(
                 event.service_account.unwrap_or("default"),
                 &config.trust_domain,
             );
-            publish_pod_registry(
+            registry_publish_succeeded = publish_pod_registry(
                 dir,
                 pod_uid,
                 cgroup_path_value,
                 event.pod_source_ips,
                 source_identity.as_ref(),
             );
+        }
+        if !registry_publish_succeeded {
+            metrics.record_attach_error();
+            if let Some(current_state) = pod_states.get(pod_uid) {
+                remember_failed_pod_enrollment_with_merged_cleanup_state(
+                    &state_key,
+                    pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface),
+                    RetryablePodEnrollment::from_event(event),
+                    prior_cleanup_state.as_ref(),
+                    current_state.value(),
+                );
+            }
         }
     }
 }
@@ -14357,7 +14430,7 @@ mod tests {
         let source_identity =
             crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/api").unwrap();
 
-        publish_pod_registry(
+        assert!(publish_pod_registry(
             &registry,
             "pod-uid-1",
             "/sys/fs/cgroup/kubepods/poduid1",
@@ -14366,7 +14439,7 @@ mod tests {
                 ipv6: Some("fd00::123".parse().unwrap()),
             },
             Some(&source_identity),
-        );
+        ));
 
         let path = registry.join("pod-uid-1");
         assert!(path.exists(), "registry entry must be written");
@@ -14644,13 +14717,13 @@ mod tests {
     fn remove_pod_registry_removes_entry_and_tolerates_absent() {
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("node-waypoint-pods");
-        publish_pod_registry(
+        assert!(publish_pod_registry(
             &registry,
             "pod-uid-1",
             "/cg/path",
             PodSourceIps::default(),
             None,
-        );
+        ));
         let path = registry.join("pod-uid-1");
         assert!(path.exists());
 
@@ -14671,13 +14744,13 @@ mod tests {
         // None of these may write anything; an escaping UID must be refused
         // before any directory is created or file written.
         for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
-            publish_pod_registry(
+            assert!(!publish_pod_registry(
                 &registry,
                 unsafe_uid,
                 "/cg/path",
                 PodSourceIps::default(),
                 None,
-            );
+            ));
         }
 
         // The guard fires before `create_dir_all`, so nothing was created and

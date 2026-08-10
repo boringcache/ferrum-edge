@@ -54,8 +54,8 @@
 {{- if eq (toString (index $previous "phase")) "cleanup" -}}
 {{- fail "Ambient UDP cleanup phase cannot be skipped; render phase=finalize with the same generation before returning to stable" -}}
 {{- end -}}
-{{- else if eq $target "host-netns" -}}
-{{- fail "pre-contract Ambient UDP upgrade to host-netns requires an explicit cleanup phase before DaemonSet rollout" -}}
+{{- else -}}
+{{- fail "pre-contract Ambient UDP upgrade requires an explicit cleanup phase before DaemonSet rollout, regardless of requested placement" -}}
 {{- end -}}
 {{- end -}}
 {{- else if eq $phase "cleanup" -}}

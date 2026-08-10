@@ -2229,8 +2229,19 @@ jobs:
             echo "::error title=Disabled Ambient UDP capture was armed in iptables mode::lifecycle wiring must not render the producer enable flag"
             exit 1
           fi
-          # Ambient UDP placement migration (#3703): a direct pre-contract
-          # upgrade to host placement is rejected before the DaemonSet renders.
+          # Ambient UDP placement migration (#3703): every pre-contract
+          # upgrade is rejected before the DaemonSet renders. The old release
+          # may own either placement, so an absent contract cannot safely infer
+          # even an apparently unchanged pod-netns or disabled target.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.err"; then
+            echo "::error title=Ambiguous pre-contract UDP placement rendered::a cleanup adoption release must establish durable ownership"
+            exit 1
+          fi
+          grep -F 'pre-contract Ambient UDP upgrade requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.err"
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
             --set ambient.enabled=true --set nodeAgent.enabled=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
@@ -2240,7 +2251,7 @@ jobs:
             echo "::error title=Unsafe Ambient UDP placement flip rendered::host placement must require an explicit cleanup generation"
             exit 1
           fi
-          grep -F 'requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"
+          grep -F 'pre-contract Ambient UDP upgrade requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"
           # The explicit pod->host cleanup phase renders no weaker privilege
           # shape: it keeps setns access and passes the same generation to both
           # node-local DaemonSets for the durable registry-relist acknowledgement.

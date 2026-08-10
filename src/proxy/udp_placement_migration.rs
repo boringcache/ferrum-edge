@@ -6,6 +6,7 @@
 //! process from starting a different producer until an explicit cleanup phase
 //! has retired the predecessor's exact Ferrum-owned state.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -487,19 +488,36 @@ pub fn clear_registry_sync_marker(registry_dir: &Path) -> Result<(), String> {
 }
 
 pub fn publish_registry_sync_marker(registry_dir: &Path, generation: &str) -> Result<(), String> {
+    publish_registry_sync_marker_for_pods(registry_dir, generation, &HashSet::new()).map(|_| ())
+}
+
+/// Publish the generation marker only after every pod UID expected from the
+/// node-agent's authoritative relist is present in the securely synced
+/// registry snapshot. Unexpected entries remain part of cleanup: they may be
+/// stale predecessor ownership and must not be silently omitted. Returns
+/// `false` without publishing when an expected pod is not present yet.
+pub fn publish_registry_sync_marker_for_pods(
+    registry_dir: &Path,
+    generation: &str,
+    expected_pod_uids: &HashSet<String>,
+) -> Result<bool, String> {
     validate_generation(generation)?;
     std::fs::create_dir_all(registry_dir)
         .map_err(|error| format!("could not create Ambient UDP registry directory: {error}"))?;
     let entries = std::fs::read_dir(registry_dir)
         .map_err(|error| format!("could not scan Ambient UDP registry for sync: {error}"))?;
+    let mut registry_pod_uids = HashSet::new();
     for (index, entry) in entries.enumerate() {
         if index >= MAX_REGISTRY_SYNC_ENTRIES {
             return Err("Ambient UDP registry exceeds its synchronization entry limit".to_string());
         }
         let entry =
             entry.map_err(|error| format!("could not read Ambient UDP registry entry: {error}"))?;
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "Ambient UDP registry entry name is not UTF-8")?;
+        if name.starts_with('.') {
             continue;
         }
         open_owned_regular_file(&entry.path(), u64::MAX)
@@ -507,6 +525,10 @@ pub fn publish_registry_sync_marker(registry_dir: &Path, generation: &str) -> Re
             .map_err(|error| {
                 format!("could not securely sync Ambient UDP registry entry: {error}")
             })?;
+        registry_pod_uids.insert(name);
+    }
+    if !expected_pod_uids.is_subset(&registry_pod_uids) {
+        return Ok(false);
     }
     sync_directory(registry_dir)
         .map_err(|error| format!("could not sync Ambient UDP registry directory: {error}"))?;
@@ -516,7 +538,8 @@ pub fn publish_registry_sync_marker(registry_dir: &Path, generation: &str) -> Re
         REGISTRY_SYNC_FILE,
         generation.as_bytes(),
         "Ambient UDP registry sync marker",
-    )
+    )?;
+    Ok(true)
 }
 
 fn registry_sync_generation(registry_dir: &Path) -> Option<String> {
