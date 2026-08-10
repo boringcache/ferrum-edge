@@ -1130,7 +1130,8 @@ mod tests {
             MeshSdTopology::Ambient,
         );
 
-        let mut targets = discoverer.discover().await.expect("discover succeeds");
+        let snapshot = discoverer.discover().await.expect("discover succeeds");
+        let mut targets = snapshot.targets().to_vec();
         targets.sort_by(|a, b| a.host.cmp(&b.host));
 
         assert_eq!(targets.len(), 2);
