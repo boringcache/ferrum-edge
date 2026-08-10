@@ -470,10 +470,12 @@ impl WorkloadMetrics {
                     port.to_string(),
                 );
             } else {
-                ctx.metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
+                ctx.metadata
+                    .remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
             }
         } else {
-            ctx.metadata.remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
+            ctx.metadata
+                .remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
         }
         if let Some(direction) = ctx.mesh_direction {
             ctx.metadata.insert(
@@ -1392,7 +1394,7 @@ fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
         ctx.orig_dst,
         ctx.frontend_listen_port,
     )
-        .filter(|port| *port != 0)
+    .filter(|port| *port != 0)
 }
 
 /// Union the CEL inputs required by the per-family plans that are actually

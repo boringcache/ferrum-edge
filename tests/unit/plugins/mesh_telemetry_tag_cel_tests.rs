@@ -73,7 +73,9 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(
-        ctx.metadata.get("mesh.metrics.cel.request_host").map(String::as_str),
+        ctx.metadata
+            .get("mesh.metrics.cel.request_host")
+            .map(String::as_str),
         Some("reviews.default.svc.cluster.local")
     );
     assert_eq!(
@@ -601,7 +603,8 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
         "no-CEL config must not stamp request.method"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.metrics.cel.destination_port"),
+        !ctx.metadata
+            .contains_key("mesh.metrics.cel.destination_port"),
         "no-CEL config must not stamp destination.port"
     );
 
@@ -627,7 +630,9 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     let mut headers = HashMap::new();
     host_only.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(
-        ctx.metadata.get("mesh.metrics.cel.request_host").map(String::as_str),
+        ctx.metadata
+            .get("mesh.metrics.cel.request_host")
+            .map(String::as_str),
         Some("checkout.default.svc")
     );
     assert!(
@@ -635,7 +640,8 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
         "host-only CEL must clear unused method stamp"
     );
     assert!(
-        !ctx.metadata.contains_key("mesh.metrics.cel.destination_port"),
+        !ctx.metadata
+            .contains_key("mesh.metrics.cel.destination_port"),
         "host-only CEL must clear unused destination.port stamp"
     );
 
@@ -747,7 +753,8 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     port_only.on_stream_connect(&mut stream).await;
     let meta = stream.metadata.as_ref().expect("metadata");
     assert_eq!(
-        meta.get("mesh.metrics.cel.destination_port").map(String::as_str),
+        meta.get("mesh.metrics.cel.destination_port")
+            .map(String::as_str),
         Some("9080"),
         "stream metrics must prefer the trusted original destination used by authz"
     );
@@ -936,8 +943,5 @@ async fn multiple_stream_instances_preserve_surviving_destination_port_need() {
         .lines()
         .find(|line| line.starts_with("ferrum_mesh_tcp_connections_opened_total{"))
         .expect("TCP opened metric");
-    assert!(
-        opened.contains(r#"destination_service="9080""#),
-        "{opened}"
-    );
+    assert!(opened.contains(r#"destination_service="9080""#), "{opened}");
 }
