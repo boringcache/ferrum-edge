@@ -7305,6 +7305,20 @@ components:
             For HTTP-family proxies, either `hosts` or `listen_path` must be
             set (both may be set together). A host-only proxy (hosts set, no
             listen_path) matches any path under the configured hosts.
+
+
+            For stream-family proxies (`tcp`, `tcps`, `udp`, `dtls`), `hosts` is
+            the TLS/DTLS `server_name` (SNI) route predicate. It is accepted
+            only on an opaque listener that terminates nothing — `passthrough:
+            true`, or `backend_scheme: tcp` with `frontend_tls: false` — because
+            only such a listener can read a ClientHello. Setting it on a
+            terminating (`frontend_tls: true`), backend-TLS-originating
+            (`tcps`), or non-passthrough `udp`/`dtls` proxy is rejected with a
+            field-specific 400 rather than silently ignored. Proxies sharing one
+            `listen_port` resolve in a fixed tier order (exact host, wildcard,
+            then the single empty-`hosts` catch-all); admission rejects a tie
+            inside one tier, more than one catch-all, and mixed `passthrough`
+            on a port.
           examples:
             - ["api.example.com", "*.internal.example.com"]
         backend_scheme:
@@ -7549,13 +7563,15 @@ components:
             Listen-port identity for this proxy (must be >= 1 when set).
 
             Stream family (`tcp`/`tcps`/`udp`/`dtls`): required. The proxy binds
-            this port and routes by it (not by path). Duplicate ports across
-            stream proxies are rejected unless every sharer is `passthrough: true`
-            (SNI) or participates in an L4 `stream_match` group. In database mode,
-            the Admin API also rejects ports that conflict with gateway reserved
-            ports (proxy/admin/gRPC listeners) or are already bound on the host.
-            In CP mode, local port checks are skipped since stream proxies run on
-            remote DP nodes.
+            this port and routes by it (not by path). A stream proxy normally binds
+            its own dedicated port; proxies may share one port only by forming a
+            single shared listener — an opaque-TLS SNI group (all `passthrough:
+            true`, or all opaque `tcp` listeners with at least one declaring
+            `hosts`) or an L4 `stream_match` group. Any other duplicate port is
+            rejected. In database mode, the Admin API also rejects ports that
+            conflict with gateway reserved ports (proxy/admin/gRPC listeners) or
+            are already bound on the host. In CP mode, local port checks are
+            skipped since stream proxies run on remote DP nodes.
 
             HTTP family: optional. When set, the proxy is port-scoped and only
             matches requests accepted on that frontend port (or the protocol-class
@@ -7581,6 +7597,13 @@ components:
             ClientHello to extract SNI for logging but does not decrypt traffic.
             Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
             Mutually exclusive with frontend_tls.
+
+            SNI-based routing is not exclusive to this flag: an ordinary
+            `backend_scheme: tcp` listener with `frontend_tls: false` is equally
+            opaque and routes by `hosts` on the same plane. Every candidate
+            sharing one `listen_port` must agree on `passthrough`, because the
+            shared listener socket is built from one representative before any
+            route is selected.
         tcp_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64
@@ -8678,6 +8701,286 @@ components:
         - $ref: "#/components/schemas/MtlsAuthCredential"
 
     # ── Plugin Config ───────────────────────────────────────────────
+    PluginTrigger:
+      type: object
+      additionalProperties: false
+      required: [when]
+      description: |
+        Declarative per-instance plugin execution trigger. The instance runs
+        when `when` evaluates to true for the request or stream connection.
+
+        Bounds enforced at validation time: predicate-tree depth 8, 128 total
+        nodes, 64 entries per list, 1024 bytes per literal value, 256 bytes per
+        field name, 512 bytes of regex source, and a 64 KiB compiled-program /
+        256 KiB lazy-DFA ceiling per regex.
+
+        A trigger is evaluated at most once per request per instance and the
+        outcome is memoized, so every phase of that instance agrees even after a
+        later plugin rewrites the path, headers, or query.
+
+        Plugins that publish fixed core body ceilings or contextless initial-
+        header/response-trailer policy are rejected rather than half-gated. A
+        trigger on a response-presentation transform also makes finalized cache
+        or dedup replay provenance unprovable, so replay consumers fail closed.
+      properties:
+        when:
+          $ref: "#/components/schemas/PluginTriggerNode"
+    PluginTriggerNode:
+      type: object
+      additionalProperties: false
+      description: >-
+        One node of the predicate tree. Exactly one of `all`, `any`, `not`, or
+        `match` must be set; any other combination (including an empty `all` or
+        `any` list) is rejected, because it would have no defined truth value.
+      properties:
+        all:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Logical AND over the child nodes.
+          items:
+            $ref: "#/components/schemas/PluginTriggerNode"
+        any:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Logical OR over the child nodes.
+          items:
+            $ref: "#/components/schemas/PluginTriggerNode"
+        not:
+          description: Logical NOT of the child node.
+          $ref: "#/components/schemas/PluginTriggerNode"
+        match:
+          description: Leaf predicate.
+          $ref: "#/components/schemas/PluginTriggerMatch"
+    PluginTriggerMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        A leaf predicate. Exactly one field must be set; combine predicates with
+        `all` / `any` / `not` so a leaf never needs an implicit combination rule.
+        An input that does not exist for the current context never satisfies a
+        positive predicate: HTTP-only predicates (method, path, host, header,
+        query, cookie) are false on a TCP/UDP/DTLS stream connection.
+      properties:
+        method:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            HTTP methods, compared ASCII-case-insensitively. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        path:
+          description: >-
+            Canonical policy path (the same value every security decision uses),
+            never the raw request target.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        host:
+          description: >-
+            Request authority host, ASCII-lowercased with the trailing DNS dot
+            and any port removed.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        sni:
+          description: >-
+            Frontend TLS/QUIC SNI hostname, when the client supplied one.
+            Available on HTTP and stream connections alike.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        header:
+          description: >-
+            Request header field, evaluated against the pristine inbound wire
+            view. Field names are ASCII-case-insensitive. A non-UTF-8 value
+            remains structurally present but matches no configured text; it is
+            never lossily transcoded.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        query:
+          description: >-
+            Query parameter of the client's original request target. Names and
+            values are compared after percent-decoding, case-sensitively.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        cookie:
+          description: >-
+            Cookie from the request `Cookie` header. Names are case-sensitive
+            per RFC 6265; a quoted cookie-value is unquoted before comparison.
+          $ref: "#/components/schemas/PluginTriggerFieldMatch"
+        protocol:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Authoritative wire-protocol identity. The list is an OR. Transport
+            and flavor are independent, so an HTTP/2 native-gRPC request matches
+            both `http2` and `grpc`.
+          items:
+            $ref: "#/components/schemas/PluginTriggerProtocol"
+        source_cidr:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Exact addresses or CIDRs matched against the gateway-resolved client
+            IP. IPv4-mapped IPv6 rules and peers are normalized onto the IPv4
+            space so one rule matches both forms. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        namespace:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Namespace of the matched proxy. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        proxy_id:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: ID of the matched proxy. The list is an OR.
+          items:
+            type: string
+            maxLength: 1024
+        listen_port:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Frontend listener port that accepted the request or connection.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        consumer:
+          description: >-
+            Authenticated consumer username, falling back to the external
+            authenticated identity. Only authoritative after the authentication
+            boundary — a trigger using it does not gate hooks at or before
+            `authenticate`, never gates a stream connection at all (whose one
+            gated phase, `on_stream_connect`, is also where stream
+            authentication runs), and is rejected outright on an authentication
+            plugin and on a stream-only plugin where it could gate nothing.
+          $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+        auth_method:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Successful authentication mechanism name (for example `jwt_auth`),
+            compared ASCII-case-insensitively. Post-authentication only, with
+            the same stream limitation and the same refusals as `consumer`.
+          items:
+            type: string
+            maxLength: 1024
+        spiffe_id:
+          description: >-
+            Peer SPIFFE ID established by mesh/mTLS identity.
+            Post-authentication only, with the same stream limitation and the
+            same refusals as `consumer`. A stream connection additionally
+            carries no authoritative, non-forgeable peer SPIFFE fact, so the
+            predicate is never evaluated there rather than silently answering
+            "absent".
+          $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+    PluginTriggerStringMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        String comparison. Exactly one of `exact`, `prefix`, or `regex` must be
+        set. `exact` and `prefix` lists are an OR.
+      properties:
+        exact:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 1024
+        prefix:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 1024
+        regex:
+          type: string
+          maxLength: 512
+          description: >-
+            Regular expression, implicitly anchored as `^(?:…)$` so it can never
+            partially match a longer value. Compiled once at validation time
+            under a 64 KiB program and 256 KiB lazy-DFA ceiling; there are no
+            backreferences or lookaround, so matching is linear in input length.
+        case_insensitive:
+          type: boolean
+          default: false
+          description: ASCII case-insensitive comparison.
+    PluginTriggerFieldMatch:
+      type: object
+      additionalProperties: false
+      required: [name]
+      description: >-
+        Header / query / cookie predicate with explicit presence and
+        multi-occurrence semantics.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[!-~]+$"
+          description: >-
+            Field name. Must be printable ASCII with no whitespace; the value is
+            never trimmed, so a padded name is rejected rather than silently
+            normalized into another configured field. Header names must
+            additionally be valid HTTP tokens and are matched
+            case-insensitively; query and cookie names are matched exactly.
+            A named field occurrence remains present even when its value is not
+            valid UTF-8: it satisfies presence but cannot satisfy a textual
+            `value` matcher. A percent-encoded query name that cannot be decoded
+            cannot be attributed to this configured name and is skipped. Invalid
+            bytes are never lossily transcoded, copied, reflected, or logged.
+        presence:
+          type: string
+          enum: [present, absent]
+          default: present
+          description: >-
+            `present` requires at least one occurrence; `absent` requires none
+            and cannot be combined with `value`.
+        value:
+          description: >-
+            Optional value comparison. Requires `presence: present`.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+        multi_value:
+          type: string
+          enum: [any, all]
+          default: any
+          description: >-
+            How `value` applies when the field occurs more than once: `any`
+            requires at least one matching occurrence, `all` requires every
+            occurrence to match (and at least one to exist).
+    PluginTriggerIdentityMatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        Authenticated-identity predicate. An empty identity string is treated as
+        absent.
+      properties:
+        presence:
+          type: string
+          enum: [present, absent]
+          default: present
+        value:
+          description: >-
+            Optional value comparison. Requires `presence: present`.
+          $ref: "#/components/schemas/PluginTriggerStringMatch"
+    PluginTriggerProtocol:
+      type: string
+      enum: [http1, http2, http3, grpc, grpc_web, websocket, tcp, udp, dtls]
+      description: >-
+        Authoritative wire-protocol identity. `http1` / `http2` / `http3` are
+        the accepted frontend transport; `grpc` is a native gRPC request,
+        `grpc_web` a recognized gRPC-Web request, and `websocket` a WebSocket
+        upgrade (HTTP/1.1 Upgrade or RFC 8441 Extended CONNECT). `tcp`, `udp`,
+        and `dtls` are stream-proxy connections.
     PluginConfig:
       type: object
       required: [plugin_name, scope, enabled]
@@ -8762,6 +9065,21 @@ components:
             multiple instances of the same plugin type are attached to a proxy
             (e.g., two http_logging instances shipping to Splunk and Datadog).
             When null (default), the plugin uses its built-in priority.
+        trigger:
+          oneOf:
+            - $ref: "#/components/schemas/PluginTrigger"
+            - type: "null"
+          description: >-
+            Optional declarative execution trigger for this one plugin instance.
+            When omitted (the default) the instance executes exactly as it does
+            today, governed only by scope, protocol filtering, and priority.
+            When present, the compiled predicate tree decides once per
+            request/connection whether this instance's hooks run at all. Patterns
+            are compiled and bounded at write time and at plugin-cache
+            publication; invalid shapes, unbounded regexes, malformed CIDRs, and
+            unsupported plugin/phase combinations are rejected with HTTP 400.
+            See `docs/plugin_execution_order.md` for the phase model and the
+            fail-closed composition rules.
         api_spec_id:
           type: [string, "null"]
           description: |
@@ -16473,20 +16791,52 @@ components:
         `requestPrincipals`) and the conjunctive negative and IP-block
         matchers (`notPrincipals`/`notServiceAccounts`/`notNamespaces`/
         `notTrustDomains`/`notRequestPrincipals`/`ipBlocks`/`notIpBlocks`/
-        `remoteIpBlocks`/`notRemoteIpBlocks`). `when:` conditions are
-        evaluated against
-        request attributes (`source.principal`, `source.namespace`,
-        `request.auth.principal`, `request.auth.presenter`,
-        `request.auth.audiences`,
+        `remoteIpBlocks`/`notRemoteIpBlocks`). `when:` conditions cover the
+        complete documented Istio condition-key set: `source.principal`,
+        `source.namespace`, `source.serviceAccount`, `source.trustDomain`,
+        `source.ip`, `remote.ip`, `destination.ip`,
+        `destination.port`, `connection.sni`, `request.auth.principal`,
+        `request.auth.presenter`, `request.auth.audiences`,
         `request.auth.claims[...]` string or string-list values including
-        nested claim leaf paths,
-        `request.headers[...]`,
-        `destination.port`, `connection.sni`, `source.ip`, `remote.ip`).
-        Unsupported `when:` keys are rejected during translation/config
-        validation so DENY conditions cannot silently fail open.
-        DENY rules treat missing HTTP-only operation/condition attributes as
-        matches, matching Istio's TCP behavior for policies that mention HTTP
-        fields.
+        nested claim leaf paths, `request.headers[...]`, and
+        `experimental.envoy.filters.<filter>[<key>]`.
+        Dynamic header/claim keys follow Istio's loose map-key framing: the
+        first `[` and final `]` delimit a non-empty interior without a separate
+        HTTP-header-name parse. Known HTTP pseudo-headers (`:authority`,
+        `:method`, `:path`, `:scheme`) are sourced from typed request facts;
+        unusual admitted interiors that cannot materialize remain absent.
+        Values follow Istio's string-matcher grammar (`*` presence,
+        `<prefix>*`, `*<suffix>`, otherwise exact — a mid-string `*` is literal
+        text) for every key EXCEPT the ones Istio compiles differently:
+        `source.ip`/`remote.ip`/`destination.ip` are CIDR blocks;
+        `source.serviceAccount` is an exact match over
+        `<namespace>/<service-account>` where a bare `<service-account>` is
+        resolved against the declaring policy's namespace and a `*` is rejected;
+        and `source.namespace` treats every `*` as an arbitrary substring at any
+        position, including mid-string and repeated stars. Keys outside the
+        documented prefixes — and empty/oversized/control-character keys or
+        malformed values, non-numeric
+        `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
+        with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
+        repeated/mid-string `*`, and collections over 64 `when[]` entries per
+        rule or 256 values per list (16 values of at most 320 bytes for
+        `source.serviceAccount`) — are rejected during translation/config
+        validation with a field-specific diagnostic, on both `values` and
+        `notValues`, so DENY conditions cannot silently fail open.
+        An attribute the path CAN source but that this request lacks follows
+        ordinary Istio semantics (a `values` check fails; a `notValues`-only
+        check passes). An attribute the path can NEVER source — an HTTP-only key
+        on a TCP/UDP/DTLS connection, a source/remote/destination IP or
+        destination port with no typed transport evidence, or any
+        `experimental.envoy.filters.*` key — is fail-closed in
+        both directions, matching Istio's non-HTTP-port behavior: a DENY rule
+        ignores the field and still matches, while an ALLOW or AUDIT rule can
+        never match. `destination.ip` is sourced only from the captured pre-NAT
+        original destination or the connection's local address, never from a
+        client-settable header. That mesh-authz connection fact is separate
+        from VirtualService L4 `destinationSubnets`, which accepts only trusted
+        PROXY/capture original-destination evidence and never an ordinary
+        listener's bind/local address.
         Negative identity matchers reject only when the source/JWT identity
         is present and matches an excluded pattern; absent identities satisfy
         the negative matcher so DENY policies such as `notPrincipals: ["*"]`

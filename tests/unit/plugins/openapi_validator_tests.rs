@@ -5072,6 +5072,7 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                trigger: None,
                 api_spec_id: Some("spec-1".to_string()),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

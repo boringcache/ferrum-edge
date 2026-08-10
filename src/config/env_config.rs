@@ -1483,12 +1483,16 @@ pub struct EnvConfig {
     /// clamp or ignore this value.
     pub mesh_cert_ttl_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
-    /// `xds` consumes Envoy-compatible ADS; `file` loads a localized mesh
-    /// config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control plane).
+    /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
+    /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
+    /// plane); `stock_xds` consumes standard v3 CDS/EDS/LDS/RDS from a stock
+    /// Envoy / third-party Istio control plane for discovery only, with the
+    /// enforcement posture supplied by `FERRUM_MESH_FILE_CONFIG_PATH`.
     pub mesh_config_protocol: String,
     /// Path to the localized mesh config document (YAML/JSON) consumed when
-    /// `mesh_config_protocol` is `file`. The document carries only the `mesh`
-    /// section of a gateway config; reloaded on SIGHUP (Unix).
+    /// `mesh_config_protocol` is `file` (the whole slice) or `stock_xds` (the
+    /// mandatory policy half). The document carries only the `mesh` section of
+    /// a gateway config; reloaded on SIGHUP (Unix).
     pub mesh_file_config_path: Option<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -1504,6 +1508,24 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
+    /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket may live (issue #3261). **No default: empty means the
+    /// feature is OFF and every `unix://` endpoint is refused.** There is
+    /// deliberately no built-in `/run` or `/var/run` allowance — a Sidecar is
+    /// operator-authored config, and an unconstrained path would let it point
+    /// the (often privileged) Ferrum process at any local socket, e.g.
+    /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
+    /// bare `/`; the socket must be a STRICT descendant. Pure path syntax is
+    /// checked at translation; the data-plane-only containment policy is
+    /// enforced at materialization and again at dial (where symlink resolution
+    /// must land inside a root too) — see `crate::util::unix_socket`.
+    pub mesh_unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
+    /// (the default) admits ONLY the Ferrum process's own effective uid, so a
+    /// root-owned system socket that happens to sit inside an allowed root is
+    /// still refused for a non-root Ferrum. Set this when the co-located
+    /// application runs as a different uid than the sidecar.
+    pub mesh_unix_socket_allowed_uids: Vec<u32>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -2185,6 +2207,25 @@ pub struct EnvConfig {
     /// enforces per-connection timeouts and per-direction failure attribution
     /// is not consumed by your dashboards/alerts.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Whether an opaque-TLS SNI stream listener may fall back to its catch-all
+    /// route for a connection whose opening bytes are provably **not** TLS.
+    ///
+    /// An SNI-routed stream listener (`passthrough: true`, or an ordinary `tcp`
+    /// listener whose group declares `hosts`) selects its backend from the
+    /// client's TLS `server_name`. A connection that never sends a ClientHello
+    /// has no attributable route, so the default (`false`) closes it before any
+    /// backend is resolved or dialed. Set `true` only when the same port is
+    /// deliberately shared with direct, non-TLS TCP clients that should reach
+    /// the group's catch-all proxy — the pre-#3264 behavior.
+    ///
+    /// This authorizes the **determinate** non-TLS case only. A ClientHello
+    /// that times out, overruns the 16 KiB peek bound, ends early, is malformed,
+    /// or names a host this gateway cannot represent is always refused: such a
+    /// connection may have declared any tenant's hostname, and defaulting it
+    /// would be a cross-tenant downgrade.
+    ///
+    /// Default: `false` (fail closed).
+    pub stream_sni_plaintext_fallback: bool,
 
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
@@ -2824,6 +2865,8 @@ impl Default for EnvConfig {
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
+            mesh_unix_socket_allowed_roots: Vec::new(),
+            mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -2971,6 +3014,7 @@ impl Default for EnvConfig {
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
+            stream_sni_plaintext_fallback: false,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             udp_recvmmsg_batch_size: 64,
@@ -3340,6 +3384,8 @@ impl EnvConfig {
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
+            mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
+            mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -3501,6 +3547,7 @@ impl EnvConfig {
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
+            stream_sni_plaintext_fallback: bool = "FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK" => false;
             udp_max_sessions: usize = "FERRUM_UDP_MAX_SESSIONS" => 10_000usize, max(1usize);
             udp_cleanup_interval_seconds: u64 = "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS" => 10u64;
             udp_recvmmsg_batch_size: usize = "FERRUM_UDP_RECVMMSG_BATCH_SIZE" => 64usize, clamp(1usize, 1024usize);
@@ -4087,6 +4134,8 @@ impl EnvConfig {
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
+            mesh_unix_socket_allowed_roots,
+            mesh_unix_socket_allowed_uids,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -4223,6 +4272,7 @@ impl EnvConfig {
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
+            stream_sni_plaintext_fallback,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             udp_recvmmsg_batch_size,
@@ -4537,20 +4587,17 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // SIDECAR only (#2013): the CURRENT-netns capture listener
+        // SIDECAR and Ambient host placement (#2013/#3288): the CURRENT-netns
+        // capture listener
         // (`MeshRuntimeConfig::udp_capture_listener()`) binds this port in the
         // sidecar's own (pod) netns, so a UDP/DTLS stream proxy or ServiceEntry
         // declaring the same listen port would race that bind at startup —
-        // reserve it. AMBIENT no longer binds a host-netns listener: its
-        // per-pod-netns UDP producer (`NetnsUdpCaptureManager`) binds the capture
-        // socket INSIDE each enrolled pod's netns, so the mesh proxy's OWN (host)
-        // netns leaves this port free and reserving it here would wrongly reject a
-        // valid host-netns UDP/DTLS stream proxy on it. So gate the reservation on
-        // the SAME condition `udp_capture_listener()` now uses: Sidecar emits the
-        // listener; Ambient/other return `None`. UNSET `FERRUM_MESH_TOPOLOGY`
-        // defaults to `sidecar` in `MeshRuntimeConfig::from_env_config` (which
-        // binds the listener), so treat unset as `sidecar` here too, or a UDP/DTLS
-        // stream proxy on it would pass validation then race the sidecar's bind.
+        // reserve it. Ambient's default per-pod-netns producer binds inside each
+        // enrolled pod and leaves the host port free, but the opt-in host-netns
+        // placement binds the shared capture socket in the mesh proxy's own
+        // namespace and therefore needs the same reservation. UNSET
+        // `FERRUM_MESH_TOPOLOGY` defaults to `sidecar` in
+        // `MeshRuntimeConfig::from_env_config`, so treat unset as sidecar here too.
         // MESH MODE ONLY (codex r2): `reserved_gateway_ports()` is shared by
         // file/database/CP/DP validation, where no mesh capture listener ever binds
         // (`MeshRuntimeConfig::listener_plan()` runs only in mesh mode). Reserving
@@ -4564,7 +4611,9 @@ impl EnvConfig {
             && let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && udp_capture_topology.eq_ignore_ascii_case("sidecar")
+            && (udp_capture_topology.eq_ignore_ascii_case("sidecar")
+                || (udp_capture_topology.eq_ignore_ascii_case("ambient")
+                    && udp.udp_host_netns_enabled))
         {
             ports.insert(udp.udp_outbound_port);
         }
@@ -5311,35 +5360,38 @@ impl EnvConfig {
                 // Validate the protocol value before the per-protocol CP
                 // requirements so a typo'd FERRUM_MESH_CONFIG_PROTOCOL fails
                 // with the protocol error, not a misleading missing-CP-URL one.
-                match self
-                    .mesh_config_protocol
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "native" | "xds" | "file" => {}
+                let normalized_mesh_protocol =
+                    self.mesh_config_protocol.trim().to_ascii_lowercase();
+                match normalized_mesh_protocol.as_str() {
+                    "native" | "xds" | "file" | "stock_xds" | "stock-xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
-                             Expected: native, xds, or file",
+                             Expected: native, xds, file, or stock_xds",
                             crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
-                // The localized `file` protocol has no control plane: the CP
-                // URL and CP/DP JWT secret are not required (nor consumed).
+                // The localized `file` protocol has no control plane, and
+                // `stock_xds` dials a THIRD-PARTY ADS server named by
+                // `FERRUM_MESH_STOCK_XDS_URLS` — neither consumes the Ferrum
+                // CP URL or the CP/DP JWT secret, and `stock_xds` must never
+                // present a Ferrum-minted CP/DP JWT to a stock control plane.
+                // Both require the local mesh document instead (`file` for the
+                // whole slice, `stock_xds` for the mandatory policy half).
                 // Native/xDS keep both hard requirements, including the
                 // minimum secret length the env macro used to enforce when
                 // `required_for` still listed "mesh".
-                let file_protocol = self
-                    .mesh_config_protocol
-                    .trim()
-                    .eq_ignore_ascii_case("file");
-                if file_protocol {
+                let local_document_protocol = matches!(
+                    normalized_mesh_protocol.as_str(),
+                    "file" | "stock_xds" | "stock-xds"
+                );
+                if local_document_protocol {
                     if self.mesh_file_config_path.is_none() {
-                        return Err("FERRUM_MESH_FILE_CONFIG_PATH is required when \
-                             FERRUM_MESH_CONFIG_PROTOCOL=file"
-                            .into());
+                        return Err(format!(
+                            "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                             FERRUM_MESH_CONFIG_PROTOCOL={normalized_mesh_protocol}"
+                        ));
                     }
                 } else {
                     if self.dp_cp_grpc_urls.is_empty() {

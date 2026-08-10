@@ -27,8 +27,8 @@ pub struct RequiredMongoIndex {
     pub collection: &'static str,
     pub model: IndexModel,
     /// When `createIndex` raises IndexOptionsConflict / IndexKeySpecsConflict,
-    /// drop the default-named legacy index and recreate. Used for the
-    /// api_specs `(namespace, proxy_id)` unique+partial upgrade path.
+    /// drop the default-named baseline index and recreate. Used when the
+    /// canonical options of an existing build-out index change.
     pub recreate_on_options_conflict: bool,
 }
 
@@ -68,7 +68,9 @@ pub struct MongoMigrationStatus {
 pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     let mut plan = Vec::with_capacity(48);
 
-    // proxies — uniqueness scoped to namespace.
+    // proxies — names remain unique within a namespace. Stream ports are
+    // intentionally non-unique because one validated SNI/L4 listener group is
+    // represented by multiple proxy documents.
     // Intentionally NO unique index on (namespace, listen_path): path uniqueness
     // is host-scoped and enforced at the application layer.
     // No standalone {namespace} index: covered by {namespace, updated_at}.
@@ -80,7 +82,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     plan.push(keys_only("proxies", doc! { "updated_at": 1 }));
     plan.push(keys_only("proxies", doc! { "upstream_id": 1 }));
     plan.push(keys_only("proxies", doc! { "plugins.plugin_config_id": 1 }));
-    plan.push(unique_partial(
+    plan.push(non_unique_partial_recreate(
         "proxies",
         doc! { "namespace": 1, "listen_port": 1 },
         doc! { "listen_port": { "$type": "number" } },
@@ -394,6 +396,29 @@ fn unique_partial(
             )
             .build(),
         recreate_on_options_conflict: false,
+    }
+}
+
+fn non_unique_partial_recreate(
+    collection: &'static str,
+    keys: Document,
+    partial: Document,
+) -> RequiredMongoIndex {
+    RequiredMongoIndex {
+        collection,
+        model: IndexModel::builder()
+            .keys(keys)
+            .options(
+                IndexOptions::builder()
+                    .partial_filter_expression(partial)
+                    .build(),
+            )
+            .build(),
+        // The former baseline used the same default index name with
+        // `unique: true`. Recreate that options-conflicting index so an
+        // initialized build-out database does not keep rejecting valid shared
+        // listener groups after the baseline definition changes.
+        recreate_on_options_conflict: true,
     }
 }
 

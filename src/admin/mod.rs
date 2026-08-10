@@ -391,7 +391,7 @@ pub struct AdminState {
     /// Max request body size in MiB for POST/PUT /api-specs.
     pub admin_spec_max_body_size_mib: usize,
     /// Ports reserved by the gateway's own listeners (proxy, admin, gRPC).
-    /// Stream proxy `listen_port` values must not collide with these.
+    /// Stream proxy listener groups must not collide with these ports.
     pub reserved_ports: std::collections::HashSet<u16>,
     /// Bind address used for stream proxy listeners (for OS port availability checks).
     pub stream_proxy_bind_address: String,
@@ -6121,6 +6121,12 @@ pub(crate) fn validate_plugin_config_definition(
             "Unknown plugin name '{}'. Available plugins: {:?}",
             pc.plugin_name, known_plugins
         ));
+    }
+    // The execution trigger is a generic per-instance field, so it is validated
+    // even for a disabled config: enabling later must not be the first time an
+    // unbounded regex or malformed CIDR is seen.
+    if let Some(trigger) = pc.trigger.as_ref() {
+        trigger.validate()?;
     }
     if !pc.enabled {
         return Ok(());

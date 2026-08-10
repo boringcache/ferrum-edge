@@ -25,6 +25,7 @@ fn body_validator_plugin_config(
         proxy_id: None,
         enabled,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

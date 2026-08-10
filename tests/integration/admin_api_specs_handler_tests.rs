@@ -434,6 +434,7 @@ fn manual_proxy_plugin(
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1442,6 +1443,7 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -1701,6 +1703,7 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1769,6 +1772,7 @@ async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1824,6 +1828,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1855,6 +1860,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1927,6 +1933,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            trigger: None,
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1960,6 +1967,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -5069,6 +5077,63 @@ async fn post_spec_with_stream_proxy_port_collision_returns_422() {
                         .any(|e| e.as_str().unwrap_or("").contains("7777")))
                     .unwrap_or(false)),
         "expected port-collision error in failures; body: {body}"
+    );
+}
+
+/// A persisted opaque-TLS SNI route and a spec-owned route may share one port
+/// when the complete candidate group is unambiguous. This covers both the
+/// API-spec preflight and the SQL baseline that previously enforced unconditional
+/// `(namespace, listen_port)` uniqueness.
+#[tokio::test]
+async fn post_spec_persists_a_valid_shared_sni_listener_group() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    let existing_id = uid("existing-sni-route");
+    let existing: Proxy = serde_json::from_value(json!({
+        "id": existing_id,
+        "namespace": "ferrum",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "backend_scheme": "tcp",
+        "listen_port": 7778,
+        "hosts": ["tenant-a.example.com"]
+    }))
+    .expect("SNI proxy deserialization");
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("create existing SNI route");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("spec-sni-route");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Shared SNI route", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "tenant-b.internal",
+            "backend_port": 443,
+            "backend_scheme": "tcp",
+            "listen_port": 7778,
+            "hosts": ["tenant-b.example.com"]
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "valid shared SNI group was rejected: {body}"
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .expect("read spec proxy")
+            .is_some(),
+        "spec-owned shared SNI route was not persisted"
     );
 }
 
