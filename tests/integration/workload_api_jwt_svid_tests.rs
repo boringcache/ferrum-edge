@@ -675,6 +675,47 @@ async fn the_bound_socket_carries_the_configured_mode_and_is_owned_by_this_proce
     harness.shutdown().await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn listener_retains_the_lifecycle_lock_until_socket_cleanup_finishes() {
+    use std::ffi::OsString;
+    use std::os::fd::AsRawFd;
+
+    let harness = Harness::start("lifecycle-lock", &signing_key_pem()).await;
+    let mut lock_name = OsString::from(".");
+    lock_name.push(harness.path.file_name().expect("socket has a filename"));
+    lock_name.push(".startup.lock");
+    let lock_path = harness
+        .path
+        .parent()
+        .expect("socket has a parent")
+        .join(lock_name);
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lifecycle lock sidecar");
+
+    let locked =
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, -1, "a serving listener must retain the lock");
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the retained listener lock, not an unrelated I/O failure, must block the contender"
+    );
+
+    let path = harness.shutdown().await;
+    assert!(!path.exists(), "socket cleanup completes before lock release");
+    let acquired_after_cleanup =
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        acquired_after_cleanup, 0,
+        "a replacement may acquire the lifecycle boundary only after cleanup"
+    );
+    let _ = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) };
+}
+
 #[tokio::test]
 async fn shutdown_does_not_unlink_an_artifact_that_replaced_our_socket() {
     // The replacement race: if something takes over the path while Ferrum is

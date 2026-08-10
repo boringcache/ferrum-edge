@@ -79,11 +79,13 @@
 //! between is never the thing deleted.
 //!
 //! The check and pathname unlink cannot themselves be made one atomic POSIX
-//! operation. Ferrum therefore holds a per-socket advisory startup lock across
-//! stale cleanup **and** no-clobber publication. Concurrent same-uid Ferrum
-//! processes serialize at that boundary: after the winner publishes, the next
-//! process probes the winner's live socket and refuses it instead of reaching a
-//! stale-unlink race. The lock lives in a private `0600` sidecar file under the
+//! operation. Ferrum therefore holds a per-socket advisory lock across stale
+//! cleanup, no-clobber publication, serving, and identity-checked shutdown
+//! cleanup. Concurrent same-uid Ferrum processes serialize at that boundary:
+//! after the winner publishes, the next process probes the winner's live socket
+//! and refuses it instead of reaching a stale-unlink race; during shutdown a
+//! replacement cannot publish between the old listener's inode check and
+//! pathname unlink. The lock lives in a private `0600` sidecar file under the
 //! already-validated parent, is acquired with a bounded non-blocking loop, and
 //! is deliberately retained across runs so no waiter can ever lock an unlinked
 //! inode while a newcomer locks a replacement inode.
@@ -133,8 +135,9 @@
 //! [`WorkloadApiSocketConfig::validate`] additionally requires the socket's
 //! parent directory to leave [`MAX_STAGING_SUFFIX_BYTES`] of headroom.
 //!
-//! On shutdown the socket file is unlinked **only if Ferrum created it and the
-//! object is still that same socket** — same device and inode, still of socket
+//! On shutdown, while the same per-socket lock is still held, the socket file is
+//! unlinked **only if Ferrum created it and the object is still that same
+//! socket** — same device and inode, still of socket
 //! type, and still owned by this effective uid. Device+inode alone is an
 //! incomplete identity: inode numbers are reused, so a regular file that
 //! happened to land on the freed inode would otherwise satisfy the predicate.
@@ -213,12 +216,14 @@ pub const MAX_STAGING_SUFFIX_BYTES: usize = 26;
 /// `Undetermined` is fatal.
 pub const SOCKET_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum time one Workload API startup waits for another startup using the
-/// same socket path to finish its stale-cleanup/publication critical section.
+/// Maximum time one Workload API startup waits for another process using the
+/// same socket path to finish its serialized listener lifecycle.
 ///
-/// A live listener does not retain this lock; only startup holds it. Expiry is
-/// nevertheless fail-closed because proceeding without serialization would
-/// re-open the same-uid stale-unlink race the lock exists to prevent.
+/// A live listener retains the lock through identity-checked shutdown cleanup.
+/// A contender probes the published endpoint and refuses it immediately when
+/// live; this timeout bounds only a holder that has not published a reachable
+/// listener or completed cleanup. Expiry is fail-closed because proceeding
+/// without serialization would re-open the same-uid pathname-unlink race.
 pub const SOCKET_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
@@ -323,10 +328,29 @@ impl SocketStartupLock {
                     lock_path.display()
                 )));
             }
+            match probe_socket_liveness(socket_path).await {
+                SocketLiveness::Live => {
+                    return Err(WorkloadApiListenerError::Socket(format!(
+                        "'{}' is a SPIFFE Workload API socket that is currently LIVE — another \
+                         process retains the serialized listener boundary; refusing to take over \
+                         the endpoint workloads dial for their identity",
+                        socket_path.display()
+                    )));
+                }
+                SocketLiveness::Undetermined => {
+                    return Err(WorkloadApiListenerError::Socket(format!(
+                        "another process holds the Workload API listener boundary '{}' and the \
+                         socket liveness at '{}' is undetermined; refusing to continue",
+                        lock_path.display(),
+                        socket_path.display()
+                    )));
+                }
+                SocketLiveness::NotListening => {}
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(WorkloadApiListenerError::Socket(format!(
-                    "another Workload API startup still holds '{}'; refusing to continue without \
-                     serialized stale-socket cleanup",
+                    "another Workload API listener lifecycle still holds '{}'; refusing to \
+                     continue without serialized socket cleanup",
                     lock_path.display()
                 )));
             }
@@ -597,6 +621,9 @@ struct ServeExitGuard {
     socket_path: PathBuf,
     bound_identity: Option<(u64, u64)>,
     terminated_tx: watch::Sender<bool>,
+    /// Retained through `Drop`: cleanup must finish before a replacement can
+    /// publish at the same pathname.
+    _socket_lifecycle_lock: SocketStartupLock,
 }
 
 #[cfg(unix)]
@@ -621,17 +648,17 @@ pub async fn serve_workload_api(
 
     config.validate()?;
     let path = config.socket_path.clone();
-    // Hold this across both the pathname unlink and exclusive publication.
-    // Without the shared critical section, another same-uid startup can publish
-    // after our inode recheck but before our pathname unlink, causing us to
-    // delete its live socket despite both individual checks being correct.
+    // Hold this across the whole listener lifecycle. Without the shared
+    // critical section, another same-uid startup can publish after either the
+    // stale-cleanup or shutdown inode recheck but before the pathname unlink,
+    // causing this process to delete its replacement despite both individual
+    // checks being correct.
     let startup_lock = SocketStartupLock::acquire(&path).await?;
     refuse_live_or_clear_stale_socket(&path).await?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let service = service.with_service_shutdown(shutdown_tx.subscribe());
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
-    drop(startup_lock);
 
     let (terminated_tx, terminated_rx) = watch::channel(false);
     // Built here rather than inside the spawned task so the receiver is moved
@@ -649,6 +676,7 @@ pub async fn serve_workload_api(
         socket_path: path.clone(),
         bound_identity: Some(bound_identity),
         terminated_tx,
+        _socket_lifecycle_lock: startup_lock,
     };
     let join = tokio::spawn(async move {
         // Bound first so it drops LAST — after the serve future, and on a panic
