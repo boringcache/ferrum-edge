@@ -4911,11 +4911,13 @@ consumers: []
 plugin_configs: []
 "#
     );
-    let mut env = EnvConfig::default();
-    env.pool_warmup_enabled = false;
-    env.gateway_svid_cert_path = Some(svids.a.cert_path.clone());
-    env.gateway_svid_key_path = Some(svids.a.key_path.clone());
-    env.gateway_svid_trust_bundle_path = Some(svids.a.trust_bundle_path.clone());
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        gateway_svid_cert_path: Some(svids.a.cert_path.clone()),
+        gateway_svid_key_path: Some(svids.a.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(svids.a.trust_bundle_path.clone()),
+        ..Default::default()
+    };
     let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
         &config,
         TrustedProjectedGatewayOptions {
@@ -15142,16 +15144,18 @@ async fn spawn_h3_mesh_gateway(
     frontend: &H3MeshFrontendCerts,
     reserved_ports: &[u16],
 ) -> (TrustedProjectedGateway, u16) {
-    let mut env = EnvConfig::default();
-    env.enable_http3 = true;
-    env.pool_warmup_enabled = false;
-    env.tls_no_verify = true;
-    env.frontend_tls_cert_path = Some(frontend.cert_path.clone());
-    env.frontend_tls_key_path = Some(frontend.key_path.clone());
-    env.gateway_svid_cert_path = Some(svid.cert_path.clone());
-    env.gateway_svid_key_path = Some(svid.key_path.clone());
-    env.gateway_svid_trust_bundle_path = Some(svid.trust_bundle_path.clone());
-    env.log_level = "warn".into();
+    let env = EnvConfig {
+        enable_http3: true,
+        pool_warmup_enabled: false,
+        tls_no_verify: true,
+        frontend_tls_cert_path: Some(frontend.cert_path.clone()),
+        frontend_tls_key_path: Some(frontend.key_path.clone()),
+        gateway_svid_cert_path: Some(svid.cert_path.clone()),
+        gateway_svid_key_path: Some(svid.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(svid.trust_bundle_path.clone()),
+        log_level: "warn".into(),
+        ..Default::default()
+    };
 
     let gateway = TrustedProjectedGateway::spawn_from_yaml(
         &config_yaml,

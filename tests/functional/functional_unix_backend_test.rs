@@ -192,9 +192,11 @@ async fn reserve_placeholder_port() -> (u16, tokio::net::TcpListener) {
 }
 
 async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGateway {
-    let mut env = EnvConfig::default();
-    env.pool_warmup_enabled = false;
-    env.log_level = "warn".into();
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        log_level: "warn".into(),
+        ..Default::default()
+    };
     TrustedProjectedGateway::spawn_from_yaml(
         &config,
         TrustedProjectedGatewayOptions {
