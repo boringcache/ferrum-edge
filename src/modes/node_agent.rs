@@ -1499,6 +1499,15 @@ where
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut init_seen: Option<HashSet<String>> = None;
+    let udp_migration_generation =
+        crate::proxy::udp_placement_migration::migration_generation_from_env()
+            .map_err(anyhow::Error::msg)?;
+    if udp_migration_generation.is_some()
+        && let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref()
+    {
+        crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)
+            .map_err(anyhow::Error::msg)?;
+    }
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
     // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
@@ -1590,6 +1599,15 @@ where
                     }
                     Some(Ok(Event::Init)) => {
                         init_seen = Some(HashSet::new());
+                        if udp_migration_generation.is_some()
+                            && let Some(registry_dir) =
+                                config.node_waypoint_pod_registry_dir.as_deref()
+                        {
+                            crate::proxy::udp_placement_migration::clear_registry_sync_marker(
+                                registry_dir,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                        }
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
@@ -1618,6 +1636,16 @@ where
                                 &metrics,
                                 &seen,
                             );
+                        }
+                        if let (Some(generation), Some(registry_dir)) = (
+                            udp_migration_generation.as_deref(),
+                            config.node_waypoint_pod_registry_dir.as_deref(),
+                        ) {
+                            crate::proxy::udp_placement_migration::publish_registry_sync_marker(
+                                registry_dir,
+                                generation,
+                            )
+                            .map_err(anyhow::Error::msg)?;
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");

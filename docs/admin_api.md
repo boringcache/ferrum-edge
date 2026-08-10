@@ -92,7 +92,9 @@ In mesh mode, authenticated health detail includes
 `mesh.node_waypoint_observability` (ADR counters for HBONE handshake phases,
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
-`node_waypoint` topology). The authenticated `/overload`
+`node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
+outstanding count, and closed-set failure reason for the node-local Ambient UDP
+placement guard; no generation or pod UID is exposed). The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the

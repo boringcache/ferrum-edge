@@ -415,8 +415,12 @@ device as a distinct peer rather than a self-linked bridge/uplink. A broader
 route through a shared bridge is refused because it is not per-pod interface
 ownership evidence. It requires a CNI that gives each pod its own host-side
 interface.
-Full behaviour, ownership, and the placement-migration constraint are in
-[`docs/mesh.md`](mesh.md) → "Host-network UDP capture".
+Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
+workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
+During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
+atomically republishes the requested generation only after `InitDone`; the proxy
+will not prove predecessor cleanup from an incomplete registry view. The
+generation is bounded operator input and is never used as a metric label.
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

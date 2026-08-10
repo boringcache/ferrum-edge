@@ -2228,6 +2228,69 @@ jobs:
             echo "::error title=Disabled Ambient UDP capture was armed in iptables mode::lifecycle wiring must not render the producer enable flag"
             exit 1
           fi
+          # Ambient UDP placement migration (#3703): a direct pre-contract
+          # upgrade to host placement is rejected before the DaemonSet renders.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"; then
+            echo "::error title=Unsafe Ambient UDP placement flip rendered::host placement must require an explicit cleanup generation"
+            exit 1
+          fi
+          grep -F 'requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"
+          # The explicit pod->host cleanup phase renders no weaker privilege
+          # shape: it keeps setns access and passes the same generation to both
+          # node-local DaemonSets for the durable registry-relist acknowledgement.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-pod-host \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          grep -Fq -- '- SYS_ADMIN' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          grep -Fq -- '- SYS_PTRACE' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          if [ "$(grep -c 'name: FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml")" -lt 2 ]; then
+            echo "::error title=UDP migration generation not shared::ambient and node-agent must receive one generation"
+            exit 1
+          fi
+          # Reverse and enabled/disabled cleanup phases are renderable only as
+          # explicit transitions. Finalize without the installed matching
+          # cleanup ConfigMap is rejected, covering a stale/missing Helm ack.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-host-pod \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-host-pod-cleanup.yaml"
+          grep -Fq 'phase: "cleanup"' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-host-pod-cleanup.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-disable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=disabled \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-disable-cleanup.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-pod-host \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.err"; then
+            echo "::error title=UDP finalize without cleanup contract rendered::final placement must require installed cleanup evidence"
+            exit 1
+          fi
+          grep -F 'requires the installed cleanup placement contract' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.err"
           # CNI install lifecycle (#3609): the chained conflist makes the
           # node-agent a node-wide pod-creation dependency, so the chart must
           # render an ownership-stamped install, an in-pod rollback watcher,
@@ -3593,6 +3656,92 @@ jobs:
           for manifest in charts/ferrum-gateway/examples/migrate-job-*.yaml; do
             kubectl apply --dry-run=server -f "$manifest" >/dev/null
           done
+
+      - name: Validate Ambient UDP placement upgrade contract
+        run: |
+          set -euo pipefail
+          namespace=ferrum-udp-contract
+          release=ferrum-udp-contract
+          chart=./charts/ferrum-mesh
+          kubectl create namespace "$namespace"
+          helm install "$release" "$chart" -n "$namespace"
+          apply_contract() {
+            kubectl -n "$namespace" create configmap "ferrum-mesh-udp-placement-${release}" \
+              --from-literal=target="$1" --from-literal=phase="$2" \
+              --from-literal=generation="$3" --from-literal=from="$4" \
+              --from-literal=to="$5" --dry-run=client -o yaml | kubectl apply -f -
+          }
+          render_upgrade() {
+            helm upgrade "$release" "$chart" -n "$namespace" --dry-run=server \
+              --set ambient.enabled=true --set nodeAgent.enabled=true "$@"
+          }
+          apply_contract pod-netns stable '' '' ''
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true; then
+            echo "::error title=Direct UDP placement upgrade admitted::installed pod placement must reject a one-step host rollout"
+            exit 1
+          fi
+          cleanup_args=(
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-pod-host
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+          )
+          render_upgrade "${cleanup_args[@]}" >/dev/null
+          apply_contract host-netns cleanup kind-pod-host pod-netns host-netns
+          render_upgrade "${cleanup_args[@]}" >/dev/null
+          if render_upgrade "${cleanup_args[@]/kind-pod-host/stale-generation}"; then
+            echo "::error title=Stale UDP cleanup generation admitted::an interrupted cleanup must resume only its installed tuple"
+            exit 1
+          fi
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true; then
+            echo "::error title=UDP cleanup skipped::stable must not bypass an installed cleanup phase"
+            exit 1
+          fi
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=wrong \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns; then
+            echo "::error title=Stale UDP finalize admitted::finalize must match the installed cleanup tuple"
+            exit 1
+          fi
+          finalize_args=(
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-pod-host
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+          )
+          render_upgrade "${finalize_args[@]}" >/dev/null
+          apply_contract host-netns finalize kind-pod-host pod-netns host-netns
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-host-pod \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns >/dev/null
+          apply_contract host-netns stable '' '' ''
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-disable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=disabled >/dev/null
+          apply_contract disabled stable '' '' ''
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-enable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns >/dev/null
 
       - name: Default install renders no unusable control plane
         run: |

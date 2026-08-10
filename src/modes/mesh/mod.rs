@@ -12058,6 +12058,135 @@ async fn await_host_udp_retraction(
     }
 }
 
+async fn run_ambient_udp_placement_cleanup(
+    context: crate::proxy::udp_placement_migration::UdpMigrationContext,
+    source: Arc<dyn crate::proxy::netns_capture::PodCaptureSource>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use crate::proxy::udp_placement_migration::{
+        UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure, set_failure,
+        set_phase,
+    };
+
+    let ready_dir = context.registry_dir().join(".udp-ready");
+    let mut pod_cleanup = context.cleanup_pod_netns().then(|| {
+        crate::proxy::netns_udp_capture::NetnsUdpCleanupManager::new(
+            source,
+            crate::proxy::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true),
+            std::time::Duration::from_secs(2),
+        )
+        .with_ready_dir(Some(ready_dir.clone()))
+    });
+    let mut host_recovery = context.cleanup_host_netns().then(|| {
+        crate::proxy::host_udp_capture::HostUdpStaleGenerationRecovery::new(Some(ready_dir))
+    });
+    let mut last_complete_fingerprint = None;
+    let mut host_complete_passes = 0_u8;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if !context.registry_is_synchronized() {
+            set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
+            set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
+        } else {
+            let mut host_complete = host_recovery.is_none();
+            let mut host_outstanding = 0;
+            let mut failure_reason = None;
+            if let Some(recovery) = host_recovery.as_mut() {
+                if crate::proxy::host_udp_capture::recover_and_reap_once(recovery).await {
+                    host_complete_passes = host_complete_passes.saturating_add(1);
+                    host_complete = host_complete_passes >= 2;
+                } else {
+                    host_complete_passes = 0;
+                    failure_reason = Some(if recovery.outstanding() == 0 {
+                        UdpMigrationFailureReason::HostCleanupFailed
+                    } else {
+                        UdpMigrationFailureReason::GateAcknowledgementMissing
+                    });
+                }
+                host_outstanding = recovery.outstanding();
+            }
+
+            let mut pod_complete = pod_cleanup.is_none();
+            let mut pod_outstanding = 0;
+            if let Some(manager) = pod_cleanup.as_mut() {
+                let progress = manager.migration_cleanup_once().await;
+                pod_outstanding = progress.outstanding;
+                if let Some(reason) = progress.failure_reason {
+                    failure_reason = Some(reason);
+                    last_complete_fingerprint = None;
+                } else if progress.outstanding == 0 {
+                    pod_complete = last_complete_fingerprint
+                        == Some(progress.registry_fingerprint);
+                    last_complete_fingerprint = Some(progress.registry_fingerprint);
+                } else {
+                    last_complete_fingerprint = None;
+                }
+            }
+
+            let outstanding = host_outstanding.saturating_add(pod_outstanding);
+            let phase = if failure_reason
+                == Some(UdpMigrationFailureReason::GateAcknowledgementMissing)
+            {
+                UdpMigrationStatusPhase::WaitingForGateAck
+            } else if !pod_complete {
+                UdpMigrationStatusPhase::CleaningPodNetns
+            } else {
+                UdpMigrationStatusPhase::CleaningHostNetns
+            };
+            set_phase(phase, outstanding);
+            if let Some(reason) = failure_reason {
+                set_failure(reason);
+            } else {
+                clear_failure();
+            }
+
+            if host_complete && pod_complete {
+                match context.mark_cleanup_complete() {
+                    Ok(()) => {
+                        set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
+                        clear_failure();
+                        info!(
+                            from = context.from().as_str(),
+                            to = context.to().as_str(),
+                            "Ambient UDP predecessor cleanup is durably complete; phase=finalize with the same generation is now permitted"
+                        );
+                        loop {
+                            if *shutdown.borrow() {
+                                return;
+                            }
+                            if shutdown.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        set_failure(UdpMigrationFailureReason::StatePersistenceFailed);
+                        warn!(
+                            %error,
+                            "Ambient UDP cleanup completed but durable proof publication failed; retrying"
+                        );
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
 /// via [`MeshStartupOwner::fail_with`] so spawned tasks/netns managers drain.
 #[allow(clippy::too_many_arguments)]
@@ -12232,6 +12361,8 @@ async fn arm_mesh_runtime_startup(
         }
     }
 
+    let mut udp_migration_blocks_readiness = false;
+
     // Ambient per-pod-netns UDP capture producer (#2013). Ambient's proxy runs
     // OUTSIDE the workload pods' network namespaces, so a host-netns UDP capture
     // listener would receive nothing (the host-netns iptables fallback emits no
@@ -12248,6 +12379,50 @@ async fn arm_mesh_runtime_startup(
         let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
             anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
         })?;
+        let registry_dir =
+            std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir);
+        let target = crate::proxy::udp_placement_migration::UdpPlacement::from_capture_settings(
+            settings.udp_capture_enabled,
+            settings.udp_host_netns_enabled,
+        );
+        let migration_request =
+            crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(target).map_err(
+                |error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"),
+            )?;
+        crate::proxy::udp_placement_migration::set_enabled(true);
+        let placement_decision = crate::proxy::udp_placement_migration::prepare_placement(
+            registry_dir,
+            &migration_request,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("Ambient UDP placement guard rejected startup: {error}")
+        })?;
+        let run_stable_placement = match placement_decision {
+            crate::proxy::udp_placement_migration::UdpPlacementDecision::RunStable => true,
+            crate::proxy::udp_placement_migration::UdpPlacementDecision::RunCleanup(context) => {
+                udp_migration_blocks_readiness = true;
+                if context.cleanup_pod_netns() {
+                    crate::proxy::netns_udp_capture::preflight_capture_tools(true)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                let source = Arc::new(
+                    crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                        env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+                    ),
+                );
+                let cleanup_shutdown = shutdown_tx.subscribe();
+                info!(
+                    from = context.from().as_str(),
+                    to = context.to().as_str(),
+                    generation = context.generation(),
+                    "Ambient UDP explicit cleanup phase started; no incoming producer will run and readiness remains false"
+                );
+                owner.push_mesh_background(tokio::spawn(async move {
+                    run_ambient_udp_placement_cleanup(context, source, cleanup_shutdown).await;
+                }));
+                false
+            }
+        };
         // Reap host-namespace UDP state whenever THIS process is not the one that
         // owns it. Host capture's own manager recovers (and then rebuilds) its
         // state at startup, but a node that switched to the pod-netns placement or
@@ -12272,7 +12447,7 @@ async fn arm_mesh_runtime_startup(
         // complete, the incoming producer may safely republish readiness while
         // stale host-state reaping continues in the background.
         let mut host_udp_retraction_ready = None;
-        if !settings.udp_host_netns_enabled {
+        if run_stable_placement && !settings.udp_host_netns_enabled {
             let host_ready_dir =
                 std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
                     .join(".udp-ready");
@@ -12287,7 +12462,7 @@ async fn arm_mesh_runtime_startup(
                 owner.push_mesh_background(handle);
             }
         }
-        if settings.udp_capture_enabled {
+        if run_stable_placement && settings.udp_capture_enabled {
             if !cfg!(target_os = "linux") {
                 warn!(
                     "Ambient UDP capture is enabled but both the per-pod-netns producer and the \
@@ -12360,16 +12535,9 @@ async fn arm_mesh_runtime_startup(
                     // address, so node traffic is never captured and one pod can
                     // never be relayed under another's identity.
                     //
-                    // Placement migration: this path reaps only HOST-namespace
-                    // state. Rules a previous per-pod-netns generation installed
-                    // live inside each pod's own namespace and are destroyed with
-                    // that namespace, so switching placement on a running node
-                    // leaves already-running pods diverting UDP to a socket that
-                    // no longer exists there — fail-closed (dropped, never
-                    // plaintext), but not captured either. Roll the workloads, or
-                    // do one transitional rollout with UDP capture disabled so the
-                    // pod-netns cleanup manager reaps them first. Documented in
-                    // docs/node_agent.md.
+                    // The durable placement guard above admits this producer only
+                    // after the explicit cleanup generation has retired any
+                    // predecessor pod-netns rules and persisted that proof.
                     let backend = crate::proxy::host_udp_capture::ProxyHostUdpBackend::new(
                         Arc::new(proxy_state.clone()),
                         capture_config,
@@ -12427,7 +12595,7 @@ async fn arm_mesh_runtime_startup(
                     }));
                 }
             }
-        } else if cfg!(target_os = "linux") {
+        } else if run_stable_placement && cfg!(target_os = "linux") {
             let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                 env_config.mesh_node_waypoint_pod_registry_dir.clone(),
             ));
@@ -13142,8 +13310,14 @@ async fn arm_mesh_runtime_startup(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
-        startup_ready.store(true, std::sync::atomic::Ordering::Release);
-        info!("Mesh runtime startup complete");
+        if udp_migration_blocks_readiness {
+            info!(
+                "Mesh runtime listeners started, but readiness remains false during the explicit Ambient UDP cleanup phase"
+            );
+        } else {
+            startup_ready.store(true, std::sync::atomic::Ordering::Release);
+            info!("Mesh runtime startup complete");
+        }
         Ok(())
     }
     .await;

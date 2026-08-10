@@ -2304,6 +2304,44 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_udp_placement_migration_failures_total",
+    "type": "counter",
+    "help": "Ambient UDP placement migration failures by bounded reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_udp_placement_migration_outstanding",
+    "type": "gauge",
+    "help": "Outstanding pod netns or gate acknowledgements in the current node-local migration.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_udp_placement_migration_phase",
+    "type": "gauge",
+    "help": "Ambient UDP placement migration phase (one bounded phase is 1).",
+    "labels": [
+      "phase",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_attach_errors_total",
     "type": "counter",
     "help": "Node-agent BPF attachment or map update errors.",

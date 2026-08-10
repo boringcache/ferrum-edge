@@ -2014,6 +2014,7 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_udp_placement_migration_prometheus(&mut output);
         output
     }
 
@@ -2051,6 +2052,21 @@ impl MetricsRegistry {
         );
     }
 
+    /// Append the bounded Ambient UDP placement migration state outside the
+    /// render cache so phase/outstanding changes are visible immediately.
+    fn append_udp_placement_migration_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::proxy::udp_placement_migration::render_prometheus(
+            output,
+            &gateway_ns_label,
+        );
+    }
+
     /// Render metrics without caching. Used internally and for testing.
     ///
     /// Includes the process-static mesh observability families so this stays a
@@ -2065,6 +2081,8 @@ impl MetricsRegistry {
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
+        self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_udp_placement_migration_prometheus(&mut output);
         output
     }
 

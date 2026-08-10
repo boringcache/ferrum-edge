@@ -1242,6 +1242,20 @@ pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
     /// yet received a closed-gate acknowledgement. This survives reconcile
     /// retries after the marker itself has been removed.
     pending_ack_netns: HashMap<u64, HashSet<String>>,
+    last_target_netns_count: usize,
+    cleanup_failures_last_pass: usize,
+}
+
+/// Bounded cleanup progress used by the durable UDP placement migration guard.
+/// The registry fingerprint is process-local comparison evidence only; pod UIDs
+/// are never persisted, logged by the migration controller, or exported as
+/// metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetnsUdpCleanupProgress {
+    pub outstanding: usize,
+    pub registry_fingerprint: u64,
+    pub failure_reason:
+        Option<super::udp_placement_migration::UdpMigrationFailureReason>,
 }
 
 impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
@@ -1255,6 +1269,8 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             unresolved_reasons: HashMap::new(),
             ready_dir: None,
             pending_ack_netns: HashMap::new(),
+            last_target_netns_count: 0,
+            cleanup_failures_last_pass: 0,
         }
     }
 
@@ -1291,6 +1307,41 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                     }
                 }
             }
+        }
+    }
+
+    /// Run one exact-name, dual-stack predecessor cleanup pass and return only
+    /// bounded progress. A migration supervisor requires two identical complete
+    /// passes after the node-agent's generation-bound registry relist marker
+    /// before it persists completion.
+    pub async fn migration_cleanup_once(&mut self) -> NetnsUdpCleanupProgress {
+        self.cleanup_once().await;
+        let outstanding = self
+            .last_target_netns_count
+            .saturating_sub(self.cleaned_netns.len())
+            .saturating_add(self.unresolved_reasons.len());
+        let failure_reason = if !self.unresolved_reasons.is_empty() {
+            Some(
+                super::udp_placement_migration::UdpMigrationFailureReason::PodNetnsUnresolved,
+            )
+        } else if !self.pending_ack_netns.is_empty() {
+            Some(
+                super::udp_placement_migration::UdpMigrationFailureReason::GateAcknowledgementMissing,
+            )
+        } else if self.cleanup_failures_last_pass != 0 {
+            Some(super::udp_placement_migration::UdpMigrationFailureReason::PodCleanupFailed)
+        } else {
+            None
+        };
+        let mut uids: Vec<&str> = self.last_registry_uids.iter().map(String::as_str).collect();
+        uids.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        uids.hash(&mut hasher);
+        NetnsUdpCleanupProgress {
+            outstanding,
+            registry_fingerprint: hasher.finish(),
+            failure_reason,
         }
     }
 
@@ -1351,6 +1402,8 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             .retain(|uid, _| unresolved_uids.contains(uid));
 
         let desired_netns: HashSet<u64> = desired.keys().copied().collect();
+        self.last_target_netns_count = desired_netns.len();
+        self.cleanup_failures_last_pass = 0;
         self.cleaned_netns
             .retain(|netns| desired_netns.contains(netns));
         // A transient cgroup/PID lookup miss omits the netns from `desired` but
@@ -1433,6 +1486,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                     "Ambient UDP disabled cleanup: stale pod-netns UDP rules removed"
                 );
             } else {
+                self.cleanup_failures_last_pass += 1;
                 warn!(
                     netns_inode = netns,
                     pod_uid = %target.pod_uid,

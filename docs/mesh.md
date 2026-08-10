@@ -3401,13 +3401,13 @@ and the loop is restarted through the normal guarded apply path instead of the
 node black-holing captured traffic while readiness stays published. An
 operator-requested shutdown is never mistaken for such an exit.
 
-**Placement migration.** This path reaps only host-namespace state. Rules a
-previous per-pod-netns generation installed live inside each pod's namespace and
-are destroyed with it, so switching placement on a running node leaves
-already-running pods diverting UDP to a socket that no longer exists there —
-fail-closed (dropped), but not captured. Roll the workloads, or do one
-transitional rollout with UDP capture disabled so the pod-netns cleanup manager
-reaps them first.
+**Placement migration is runtime-enforced.** Host cleanup cannot enter workload
+network namespaces, and pod cleanup must not guess that host objects are absent.
+Ferrum therefore rejects a stable requested placement that differs from the
+durable node-local owner. The Helm chart also records the rendered target and
+migration tuple in `ferrum-mesh-udp-placement-<release>`; on upgrade it rejects a
+direct target change before accepting a disruptive DaemonSet rollout. The only
+supported change is the explicit cleanup/finalize procedure below.
 
 ### Ambient UDP upgrade notes
 
@@ -3436,6 +3436,90 @@ host-veth UDP gate; producers rewrite readiness on their next registry poll
 reconcile (at most 250 ms). Budget roughly 2.5 seconds of fail-closed UDP
 unavailability per node-agent restart; traffic is dropped during the interval,
 not allowed to bypass capture.
+
+#### Ambient UDP placement migration (enforced hard-upgrade guard)
+
+Every placement or enabled-state change uses one operator-chosen generation and
+two explicit releases. The placements are `pod-netns`, `host-netns`, and
+`disabled`; the destination must agree with
+`FERRUM_MESH_CAPTURE_UDP_ENABLED` and
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`.
+
+1. Render the destination switches plus
+   `FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup`, a new
+   `..._GENERATION`, and exact `..._FROM` / `..._TO` values. Do not use Helm
+   `--wait`: cleanup pods deliberately remain unready. The chart temporarily
+   uses `maxUnavailable: 100%` so that intentional unready state cannot deadlock
+   the DaemonSet rollout. When the predecessor is `pod-netns` (or the conservative
+   `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
+   `SYS_PTRACE`, and `NET_ADMIN`; stable/final host placement drops the setns
+   privilege set.
+2. Wait for every node's authenticated `/health` detail
+   `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
+   status remains 503 because readiness is intentionally false), or for
+   `ferrum_mesh_udp_placement_migration_phase{phase="cleanup_complete"}` to be 1.
+   `ferrum_mesh_udp_placement_migration_outstanding` and the bounded
+   `..._failures_total{reason}` family diagnose progress without generation or
+   pod-UID labels.
+3. Upgrade the same destination with phase `finalize` and the identical
+   generation/from/to tuple. Helm requires the installed cleanup ConfigMap, and
+   each incoming proxy independently requires its node-local durable completion
+   proof before publishing readiness or starting a producer. An early finalize
+   therefore fails closed on only the nodes lacking proof; it never guesses from
+   a missing marker.
+4. After the finalize DaemonSet is ready, remove generation/from/to and return
+   phase to `stable`. The durable active owner remains, so later restarts resume
+   the selected producer without repeating migration. Use a committed values
+   file that omits the three tuple keys for this release; do not carry them
+   forward with `--reuse-values`.
+
+For example, pod-netns to host-netns uses one tuple throughout (replace
+`$GENERATION` with a deployment identifier):
+
+```bash
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION="$GENERATION" \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+
+# After every node reports cleanup_complete:
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize
+```
+
+Host-netns to pod-netns reverses `FROM`/`TO` and sets the host switch false in
+the cleanup release. Enabled to disabled sets `TO=disabled` and disables capture
+in that release; disabled to enabled names the incoming placement. A `disabled`
+predecessor conservatively reaps both ownership domains, which covers a legacy
+disabled node. Any pre-contract node with no durable owner record also reaps
+both domains, regardless of the declared predecessor, so a mistaken legacy
+placement claim cannot strand Ferrum-owned rules.
+
+**Recovery and churn contract.** Cleanup persists `(generation, from, to)`
+before touching rules. A proxy restart resumes only that tuple; a different or
+stale generation is rejected. Each node-agent restart/relist first retracts its
+generation acknowledgement, closes UDP gates, reconstructs the registry from
+the Kubernetes pod list, and then atomically publishes `.udp-registry-synced`
+containing that generation. Pod-netns cleanup starts only after that proof and
+requires two identical complete registry passes, so partial per-pod cleanup,
+temporarily unresolvable netns handles, pod deletion/recreation, and a crash
+between any passes simply retry. Pods created after the predecessor stopped have
+no predecessor rules and join the current registry pass; pods removed during the
+phase lose their namespace and cannot retain rules. Cleanup always probes both
+IPv4 and IPv6 exact Ferrum chain/jump/rule/route names, even when the new config
+disables one family, and never flushes a table or sweeps foreign state.
+
+The existing gate acknowledgement remains load-bearing throughout. A missing or
+stale `.udp-not-ready` cannot authorize cleanup because cleanup writes a fresh
+`.udp-ack-required`, removes the stale acknowledgement, and retracts
+`.udp-ready` in that order. Until a fresh acknowledgement arrives, predecessor
+capture or a scope-exact DROP guard remains and the incoming placement stays
+unready. Thus interruption after readiness retraction, partial netns cleanup,
+host cleanup, durable proof publication, or before final producer publication
+costs availability but never opens plaintext egress.
 
 ### Metrics
 

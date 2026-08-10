@@ -167,6 +167,14 @@ posture will not grant `SYS_ADMIN`/`SYS_PTRACE`. The chart derives this
 automatically — enabling the placement narrows the rendered capabilities rather
 than adding to them.
 
+The narrowing happens only after the enforced UDP placement migration completes.
+An explicit `cleanup` release from `pod-netns` or `disabled` to `host-netns`
+retains `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE` so it can retire exact
+Ferrum-owned rules inside every predecessor pod netns. The incoming host
+producer does not start in that release. `finalize` is admitted only after the
+node-local durable proof exists, and only then does the chart remove the setns
+privilege set. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds
 `IP_TRANSPARENT` sockets. The chart also retains the ambient container's existing
