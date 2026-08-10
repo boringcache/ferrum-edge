@@ -616,8 +616,22 @@ impl GatewayListenerManager {
             .iter()
             .filter_map(|(port, listener)| listener.quic.is_some().then_some(*port))
             .collect();
+        let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
+        refused_route_ports.extend(
+            plan.ports
+                .keys()
+                .filter(|port| !live.contains_key(port))
+                .copied(),
+        );
         drop(live);
 
+        // A bind refusal is a routing admission decision, not just telemetry.
+        // Suppress those port-scoped routes before publishing the result so a
+        // global proxy socket (including the single-listener Service remap)
+        // cannot make an unserved listener reachable.
+        self.state
+            .router_cache
+            .set_refused_listener_ports(refused_route_ports);
         // Advertise HTTP/3 only where a QUIC socket really exists.
         self.state.publish_gateway_h3_alt_svc(&h3_ports);
         self.bind_failures.store(Arc::new(failures.clone()));

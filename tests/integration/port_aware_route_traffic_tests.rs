@@ -415,6 +415,7 @@ async fn gateway_listener_port_colliding_with_admin_is_refused() {
 
     let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let global_proxy_port = proxy_http.local_addr().unwrap().port();
     let admin_port = admin_http.local_addr().unwrap().port();
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -432,6 +433,11 @@ async fn gateway_listener_port_colliding_with_admin_is_refused() {
     assert!(
         failures.iter().any(|failure| failure.port == admin_port),
         "the admin collision must be surfaced: {failures:?}"
+    );
+    assert_eq!(
+        http_get(global_proxy_port, "/api/x").await.0,
+        404,
+        "a refused listener route must not escape through single-listener remapping"
     );
 
     let _ = shutdown_tx.send(true);

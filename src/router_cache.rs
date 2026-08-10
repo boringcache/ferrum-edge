@@ -111,7 +111,7 @@ struct RouteEntry {
 /// ports (`:80` and `:8080`) the remap is off and only an exact match serves —
 /// which is correct, because both ports are bound.
 #[derive(Clone, Copy)]
-struct HttpPortMatchContext {
+struct HttpPortMatchContext<'a> {
     frontend_port: Option<u16>,
     frontend_is_tls: bool,
     /// The one distinct non-TLS HTTP `listen_port` in the table, if there is
@@ -119,6 +119,10 @@ struct HttpPortMatchContext {
     single_nontls_listen_port: Option<u16>,
     /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
     single_tls_listen_port: Option<u16>,
+    /// Listener ports rejected by the listener supervisor. Keeping this in a
+    /// lock-free snapshot makes a refused listener ineligible even when its
+    /// numeric port is also reachable through a process-global socket.
+    refused_listener_ports: &'a BTreeSet<u16>,
 }
 
 /// A route-table candidate with its listener scope resolved at build time.
@@ -168,13 +172,16 @@ impl PortScopedProxy {
 fn port_match_priority(
     listen_port: Option<u16>,
     listen_port_tls: bool,
-    ctx: HttpPortMatchContext,
+    ctx: HttpPortMatchContext<'_>,
 ) -> Option<u8> {
     let Some(port) = listen_port else {
         // Port-agnostic route: serves any HTTP-family frontend, but always
         // loses to a listener-scoped sibling on that listener.
         return Some(2);
     };
+    if ctx.refused_listener_ports.contains(&port) {
+        return None;
+    }
     // A listener is plaintext or TLS, never both: a request whose frontend
     // class disagrees with the listener's did not arrive on that listener.
     if listen_port_tls != ctx.frontend_is_tls {
@@ -1281,6 +1288,7 @@ impl CountMinSketch {
 pub struct RouterCache {
     /// Pre-computed host-based route index and its cache-validation generation.
     route_snapshot: ArcSwap<RouteSnapshot>,
+    refused_listener_ports: ArcSwap<BTreeSet<u16>>,
     /// Bounded cache for prefix route lookups: "host\0path" → matched proxy.
     /// `proxy: None` entries represent negative cache (no route matched from any tier).
     prefix_cache: DashMap<String, PrefixCacheEntry>,
@@ -1385,6 +1393,7 @@ impl RouterCache {
                 table,
                 generation: 1,
             })),
+            refused_listener_ports: ArcSwap::from_pointee(BTreeSet::new()),
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
@@ -1421,6 +1430,17 @@ impl RouterCache {
         if previous_generation != route_generation {
             self.clear_lookup_caches();
         }
+    }
+
+    /// Publish listener ports which the listener supervisor could not serve.
+    /// Cache entries are invalidated because listener admission is part of the
+    /// routing decision, not merely listener lifecycle telemetry.
+    pub(crate) fn set_refused_listener_ports(&self, ports: BTreeSet<u16>) {
+        if self.refused_listener_ports.load().as_ref() == &ports {
+            return;
+        }
+        self.refused_listener_ports.store(Arc::new(ports));
+        self.clear_lookup_caches();
     }
 
     pub(crate) fn clear_lookup_caches(&self) {
@@ -1601,11 +1621,13 @@ impl RouterCache {
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
         let path: &str = &normalized;
+        let refused_listener_ports = self.refused_listener_ports.load();
         let port_ctx = HttpPortMatchContext {
             frontend_port,
             frontend_is_tls,
             single_nontls_listen_port: table.single_nontls_listen_port,
             single_tls_listen_port: table.single_tls_listen_port,
+            refused_listener_ports: &refused_listener_ports,
         };
 
         // Fast path: use thread-local buffer for cache lookup to avoid String
@@ -1617,7 +1639,13 @@ impl RouterCache {
             // Fast path 1: check prefix cache (includes negative entries for total misses)
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
                 let cached = entry.value();
-                if cached.route_generation == route_generation {
+                if cached.route_generation == route_generation
+                    && cached.proxy.as_ref().is_none_or(|proxy| {
+                        proxy
+                            .listen_port
+                            .is_none_or(|port| !refused_listener_ports.contains(&port))
+                    })
+                {
                     self.frequency_sketch.increment(&buf);
                     return Some(cached.proxy.as_ref().map(|proxy| RouteMatch {
                         // Host-only proxies (listen_path == None) match any path and
@@ -1633,7 +1661,12 @@ impl RouterCache {
             // Fast path 2: check regex cache (only contains positive matches)
             if let Some(entry) = self.regex_cache.get(buf.as_str()) {
                 let cached = entry.value();
-                if cached.route_generation == route_generation {
+                if cached.route_generation == route_generation
+                    && cached
+                        .proxy
+                        .listen_port
+                        .is_none_or(|port| !refused_listener_ports.contains(&port))
+                {
                     self.frequency_sketch.increment(&buf);
                     return Some(Some(RouteMatch {
                         proxy: Arc::clone(&cached.proxy),
@@ -1864,6 +1897,7 @@ impl RouterCache {
         frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
+        let refused_listener_ports = self.refused_listener_ports.load();
         Self::search_route_table(
             table,
             host,
@@ -1874,6 +1908,7 @@ impl RouterCache {
                 frontend_is_tls,
                 single_nontls_listen_port: table.single_nontls_listen_port,
                 single_tls_listen_port: table.single_tls_listen_port,
+                refused_listener_ports: &refused_listener_ports,
             },
         )
     }
