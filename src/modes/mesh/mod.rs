@@ -12423,7 +12423,6 @@ async fn arm_mesh_runtime_startup(
                 info!(
                     from = context.from().as_str(),
                     to = context.to().as_str(),
-                    generation = context.generation(),
                     "Ambient UDP explicit cleanup phase started; no incoming producer will run and readiness remains false"
                 );
                 owner.push_mesh_background(tokio::spawn(async move {
