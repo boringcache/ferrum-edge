@@ -650,8 +650,8 @@ fn hostname_coverages_overlap(left: &str, right: &str) -> bool {
 }
 
 fn hostname_matches_suffix(hostname: &str, suffix: &str) -> bool {
-    // Gateway API single-label wildcards match one DNS label under the suffix,
-    // never the bare suffix apex itself (`*.example.com` ⊄ `example.com`).
+    // Gateway API wildcard coverage is a DNS-suffix match below the suffix,
+    // but never includes the bare suffix apex (`*.example.com` ⊄ `example.com`).
     hostname != suffix && suffix_is_within(hostname, suffix)
 }
 
