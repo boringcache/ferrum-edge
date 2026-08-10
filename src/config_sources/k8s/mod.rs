@@ -13,12 +13,12 @@ pub(crate) mod listenerset;
 mod mesh_config;
 
 pub(crate) use core::secret_object_is_valid_tls_certificate;
+pub(crate) use gateway_api::normalize_gateway_hostname;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
     merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
-pub(crate) use gateway_api::normalize_gateway_hostname;
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
 // must observe the same constants the translator enforces rather than

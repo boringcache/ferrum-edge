@@ -1667,8 +1667,7 @@ fn plan_gateway_frontend_tls_namespace_slots(
 fn planned_frontend_tls_admitted_listeners(
     acc: &K8sAccumulator,
 ) -> BTreeSet<GatewayApiListenerKey> {
-    frontend_tls_listener_admission(acc, &acc.gateway_api_frontend_tls_listeners)
-        .admitted_listeners
+    frontend_tls_listener_admission(acc, &acc.gateway_api_frontend_tls_listeners).admitted_listeners
 }
 
 fn listener_is_effective_tls_serving_claim(
@@ -1773,8 +1772,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     if let Some(source) = plan.serving_by_namespace_port.get(&(
                         gateway_frontend_tls_slot_namespace(key, policy).to_string(),
                         port,
-                    ))
-                    {
+                    )) {
                         claims.effective_tls_credentials.insert(source.clone());
                     }
                 }
@@ -1984,8 +1982,7 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
         return;
     }
     let admission = frontend_tls_listener_admission(acc, &pending);
-    acc.gateway_api_frontend_tls_hostname_conflicts =
-        admission.hostname_conflict_losers.clone();
+    acc.gateway_api_frontend_tls_hostname_conflicts = admission.hostname_conflict_losers.clone();
     for key in &admission.ordered_listener_keys {
         if let Some(winner) = admission.hostname_conflict_losers.get(key) {
             let hostname = pending
