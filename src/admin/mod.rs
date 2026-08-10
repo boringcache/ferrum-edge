@@ -6122,6 +6122,12 @@ pub(crate) fn validate_plugin_config_definition(
             pc.plugin_name, known_plugins
         ));
     }
+    // The execution trigger is a generic per-instance field, so it is validated
+    // even for a disabled config: enabling later must not be the first time an
+    // unbounded regex or malformed CIDR is seen.
+    if let Some(trigger) = pc.trigger.as_ref() {
+        trigger.validate()?;
+    }
     if !pc.enabled {
         return Ok(());
     }

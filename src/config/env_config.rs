@@ -1508,6 +1508,24 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
+    /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket may live (issue #3261). **No default: empty means the
+    /// feature is OFF and every `unix://` endpoint is refused.** There is
+    /// deliberately no built-in `/run` or `/var/run` allowance — a Sidecar is
+    /// operator-authored config, and an unconstrained path would let it point
+    /// the (often privileged) Ferrum process at any local socket, e.g.
+    /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
+    /// bare `/`; the socket must be a STRICT descendant. Pure path syntax is
+    /// checked at translation; the data-plane-only containment policy is
+    /// enforced at materialization and again at dial (where symlink resolution
+    /// must land inside a root too) — see `crate::util::unix_socket`.
+    pub mesh_unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
+    /// (the default) admits ONLY the Ferrum process's own effective uid, so a
+    /// root-owned system socket that happens to sit inside an allowed root is
+    /// still refused for a non-root Ferrum. Set this when the co-located
+    /// application runs as a different uid than the sidecar.
+    pub mesh_unix_socket_allowed_uids: Vec<u32>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -2847,6 +2865,8 @@ impl Default for EnvConfig {
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
+            mesh_unix_socket_allowed_roots: Vec::new(),
+            mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -3364,6 +3384,8 @@ impl EnvConfig {
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
+            mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
+            mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -4112,6 +4134,8 @@ impl EnvConfig {
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
+            mesh_unix_socket_allowed_roots,
+            mesh_unix_socket_allowed_uids,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -4563,20 +4587,17 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // SIDECAR only (#2013): the CURRENT-netns capture listener
+        // SIDECAR and Ambient host placement (#2013/#3288): the CURRENT-netns
+        // capture listener
         // (`MeshRuntimeConfig::udp_capture_listener()`) binds this port in the
         // sidecar's own (pod) netns, so a UDP/DTLS stream proxy or ServiceEntry
         // declaring the same listen port would race that bind at startup —
-        // reserve it. AMBIENT no longer binds a host-netns listener: its
-        // per-pod-netns UDP producer (`NetnsUdpCaptureManager`) binds the capture
-        // socket INSIDE each enrolled pod's netns, so the mesh proxy's OWN (host)
-        // netns leaves this port free and reserving it here would wrongly reject a
-        // valid host-netns UDP/DTLS stream proxy on it. So gate the reservation on
-        // the SAME condition `udp_capture_listener()` now uses: Sidecar emits the
-        // listener; Ambient/other return `None`. UNSET `FERRUM_MESH_TOPOLOGY`
-        // defaults to `sidecar` in `MeshRuntimeConfig::from_env_config` (which
-        // binds the listener), so treat unset as `sidecar` here too, or a UDP/DTLS
-        // stream proxy on it would pass validation then race the sidecar's bind.
+        // reserve it. Ambient's default per-pod-netns producer binds inside each
+        // enrolled pod and leaves the host port free, but the opt-in host-netns
+        // placement binds the shared capture socket in the mesh proxy's own
+        // namespace and therefore needs the same reservation. UNSET
+        // `FERRUM_MESH_TOPOLOGY` defaults to `sidecar` in
+        // `MeshRuntimeConfig::from_env_config`, so treat unset as sidecar here too.
         // MESH MODE ONLY (codex r2): `reserved_gateway_ports()` is shared by
         // file/database/CP/DP validation, where no mesh capture listener ever binds
         // (`MeshRuntimeConfig::listener_plan()` runs only in mesh mode). Reserving
@@ -4590,7 +4611,9 @@ impl EnvConfig {
             && let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && udp_capture_topology.eq_ignore_ascii_case("sidecar")
+            && (udp_capture_topology.eq_ignore_ascii_case("sidecar")
+                || (udp_capture_topology.eq_ignore_ascii_case("ambient")
+                    && udp.udp_host_netns_enabled))
         {
             ports.insert(udp.udp_outbound_port);
         }

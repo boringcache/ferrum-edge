@@ -4907,6 +4907,31 @@ fn test_reserved_gateway_ports_extracts_ipv6_grpc_port() {
 }
 
 #[test]
+fn test_reserved_gateway_ports_includes_ambient_host_udp_capture_socket() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_MESH_TOPOLOGY", "ambient"),
+            ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ("FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED", "true"),
+            ("FERRUM_MESH_CAPTURE_UDP_PORT", "15011"),
+        ],
+        || {
+            let mut config = EnvConfig::from_env().unwrap();
+            // `reserved_gateway_ports` is shared by every mode; exercise the
+            // mesh-only branch without requiring a full mesh startup fixture.
+            config.mode = OperatingMode::Mesh;
+            assert!(
+                config.reserved_gateway_ports().contains(&15011),
+                "Ambient host placement binds the shared capture socket in the \
+                 proxy's own namespace and must reserve it from stream listeners"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_db_slow_query_threshold_default() {
     with_env_vars(
         &[

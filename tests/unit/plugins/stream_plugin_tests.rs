@@ -318,6 +318,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_lifecycle_generation: None,
