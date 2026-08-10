@@ -487,10 +487,6 @@ pub fn clear_registry_sync_marker(registry_dir: &Path) -> Result<(), String> {
     }
 }
 
-pub fn publish_registry_sync_marker(registry_dir: &Path, generation: &str) -> Result<(), String> {
-    publish_registry_sync_marker_for_pods(registry_dir, generation, &HashSet::new()).map(|_| ())
-}
-
 /// Publish the generation marker only after every pod UID expected from the
 /// node-agent's authoritative relist is present in the securely synced
 /// registry snapshot. Unexpected entries remain part of cleanup: they may be

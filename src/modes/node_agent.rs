@@ -14541,11 +14541,14 @@ mod tests {
     #[test]
     fn udp_migration_marker_retracts_before_post_relist_mutation() {
         let registry = tempfile::tempdir().unwrap();
-        crate::proxy::udp_placement_migration::publish_registry_sync_marker(
-            registry.path(),
-            "generation-1",
-        )
-        .unwrap();
+        assert!(
+            crate::proxy::udp_placement_migration::publish_registry_sync_marker_for_pods(
+                registry.path(),
+                "generation-1",
+                &HashSet::new(),
+            )
+            .unwrap()
+        );
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -14571,11 +14574,14 @@ mod tests {
         assert!(!published);
         assert!(!registry.path().join(".udp-registry-synced").exists());
 
-        crate::proxy::udp_placement_migration::publish_registry_sync_marker(
-            registry.path(),
-            "generation-1",
-        )
-        .unwrap();
+        assert!(
+            crate::proxy::udp_placement_migration::publish_registry_sync_marker_for_pods(
+                registry.path(),
+                "generation-1",
+                &HashSet::new(),
+            )
+            .unwrap()
+        );
         assert!(
             !retract_udp_migration_registry_sync_for_mutation(
                 Some("generation-1"),

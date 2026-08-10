@@ -620,7 +620,32 @@ fn spawn_mesh_gateway_in_netns_as_uid(
         .args(["--clear-groups", "--"])
         .arg(binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
+    make_mesh_registry_owned_by_uid(temp, uid);
     cmd.spawn().expect("spawn mesh gateway inside pod netns")
+}
+
+#[cfg(target_os = "linux")]
+fn make_mesh_registry_owned_by_uid(temp: &TempDir, uid: u32) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let registry_dir = temp.path().join("node-waypoint-pods");
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711))
+        .expect("make mesh fixture tempdir traversable");
+    let registry_path = CString::new(registry_dir.as_os_str().as_bytes())
+        .expect("mesh fixture registry path has no NUL");
+    // SAFETY: `registry_path` is a live NUL-terminated CString and both IDs
+    // are the numeric uid/gid passed to the immediately following `setpriv`.
+    let result = unsafe { libc::chown(registry_path.as_ptr(), uid, uid) };
+    assert_eq!(
+        result,
+        0,
+        "chown mesh fixture registry: {}",
+        std::io::Error::last_os_error()
+    );
+    std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict mesh fixture registry to gateway uid");
 }
 
 #[cfg(target_os = "linux")]
@@ -10737,6 +10762,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
             return;
         }
     };
+    let disabled_registry = TempDir::new().expect("disabled UDP pod registry tempdir");
+    let _disabled_registry_entry = pod
+        .publish(disabled_registry.path(), POD_UID)
+        .expect("publish disabled UDP pod registry entry");
     let registry = TempDir::new().expect("UDP pod registry tempdir");
     let registry_entry = pod
         .publish(registry.path(), POD_UID)
@@ -10802,8 +10831,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     );
 
     // Disabled-mode negative: the same enrolled pod produces no rules and no
-    // capture socket. The cleanup manager is allowed to run, but it must never
-    // install state while the feature flag is off.
+    // capture socket. This is an independent fixture ownership generation;
+    // reusing its durable state for the enabled producer below would model an
+    // unsafe disabled -> pod-netns rollout, which correctly requires an
+    // explicit cleanup/finalize generation.
     let ports_disabled = reserve_mesh_ports().await;
     let disabled_outbound = ports_disabled.outbound;
     let mut disabled_a = LiveGatewayChild::new(spawn_mesh_gateway(
@@ -10827,7 +10858,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ),
                 (
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
-                    registry.path().display().to_string(),
+                    disabled_registry.path().display().to_string(),
                 ),
                 ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),

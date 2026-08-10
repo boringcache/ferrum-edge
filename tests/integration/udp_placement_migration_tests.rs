@@ -8,7 +8,7 @@ use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpClea
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement, UdpPlacementDecision,
     UdpPlacementRequest, clear_registry_sync_marker, prepare_placement,
-    publish_registry_sync_marker, publish_registry_sync_marker_for_pods,
+    publish_registry_sync_marker_for_pods,
 };
 
 struct MutableSource(Mutex<Vec<PodCaptureTarget>>);
@@ -371,9 +371,23 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
         ),
     );
     assert!(!context.registry_is_synchronized());
-    publish_registry_sync_marker(registry.path(), "generation-b").expect("stale marker");
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "generation-b",
+            &HashSet::new(),
+        ),
+        Ok(true)
+    );
     assert!(!context.registry_is_synchronized());
-    publish_registry_sync_marker(registry.path(), "generation-a").expect("matching marker");
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "generation-a",
+            &HashSet::new(),
+        ),
+        Ok(true)
+    );
     assert!(context.registry_is_synchronized());
     clear_registry_sync_marker(registry.path()).expect("restart retraction");
     assert!(!context.registry_is_synchronized());
