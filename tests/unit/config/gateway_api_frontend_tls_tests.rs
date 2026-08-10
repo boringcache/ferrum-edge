@@ -676,6 +676,72 @@ fn snapshot_certificate_count_is_capped() {
 }
 
 #[test]
+fn cap_promotion_is_rechecked_for_physical_port_conflicts() {
+    let fill_listeners: Vec<Value> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
+        .map(|index| {
+            https_listener(
+                &format!("fill-{index:03}"),
+                (10000 + index) as u64,
+                Some(&format!("fill-{index}.example.com")),
+                &["cert"],
+            )
+        })
+        .collect();
+    let conflicting_gateway = |name: &str, port: u64| {
+        gateway(
+            "ferrum",
+            name,
+            vec![
+                json!({
+                    "name": "plain",
+                    "port": port,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                }),
+                https_listener(
+                    "secure",
+                    port,
+                    Some(&format!("{name}.example.com")),
+                    &["cert"],
+                ),
+            ],
+        )
+    };
+    let result = translate(&[
+        gateway("ferrum", "a-fill", fill_listeners),
+        conflicting_gateway("b-refused", 30000),
+        conflicting_gateway("c-promoted", 30001),
+        tls_secret("cert", "ferrum"),
+    ]);
+
+    assert_eq!(
+        result.config.frontend_tls_certificate_sources.len(),
+        MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1,
+        "neither physically conflicting TLS listener may survive finalization"
+    );
+    assert!(
+        result
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .all(|source| source.gateway == "a-fill")
+    );
+    for gateway in ["b-refused", "c-promoted"] {
+        for listener in ["plain", "secure"] {
+            assert!(
+                result.listener_conflicts.iter().any(|(key, conflict)| {
+                    key.gateway == gateway
+                        && key.listener == listener
+                        && conflict.reason == "ProtocolConflict"
+                }),
+                "{gateway}/{listener} must be refused after cap admission reaches a fixed point: {:?}",
+                result.listener_conflicts
+            );
+        }
+    }
+}
+
+#[test]
 fn snapshot_cap_never_retains_a_partial_listener_certificate_set() {
     let mut listeners: Vec<Value> = (0..MAX_FRONTEND_TLS_CERTIFICATE_SOURCES - 1)
         .map(|index| {

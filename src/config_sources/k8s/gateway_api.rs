@@ -1729,8 +1729,6 @@ fn listener_is_effective_tls_serving_claim(
 /// Listeners that are already non-materializable contribute no claim and are
 /// ignored, so a broken sibling cannot take down a healthy listener.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
-    let plan = plan_gateway_frontend_tls_namespace_slots(acc);
-
     #[derive(Default)]
     struct PortClaims {
         plaintext: Vec<GatewayApiListenerKey>,
@@ -1742,106 +1740,120 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         effective_tls_credentials: BTreeSet<BTreeSet<(String, String)>>,
     }
 
-    let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
-    for (key, policy) in &acc.gateway_api_listener_policies {
-        // Only the HTTP family shares the HTTP-route socket set — the same
-        // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
-        // GRPCRoute on. A TLS-passthrough or L4 listener on the same number is
-        // a different datapath entirely and must not be dragged in here.
-        if !policy.materializable
-            || !matches!(
-                policy.protocol.as_str(),
-                "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
-            )
-        {
-            continue;
-        }
-        let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) else {
-            continue;
-        };
-        let claims = claims_by_port.entry(port).or_default();
-        if policy.requires_frontend_tls {
-            if listener_is_effective_tls_serving_claim(key, policy, &plan) {
-                claims.effective_tls.push(key.clone());
-                claims
-                    .effective_tls_namespaces
-                    .insert(gateway_frontend_tls_slot_namespace(key, policy).to_string());
-                if let Some(source) = plan.serving_by_namespace_port.get(&(
-                    gateway_frontend_tls_slot_namespace(key, policy).to_string(),
-                    port,
-                ))
-                {
-                    claims.effective_tls_credentials.insert(source.clone());
-                }
+    // Certificate-cap admission and physical-port admission depend on one
+    // another. Refusing an earlier TLS listener can free resident-certificate
+    // capacity for a later listener; that newly admitted listener must then be
+    // checked against the plaintext/TLS and cross-namespace shape on its own
+    // port before finalization can materialize it. Iterate to a fixed point.
+    // Every non-terminal pass makes at least one materializable policy false,
+    // so this is bounded by the number of listener policies in the snapshot.
+    loop {
+        let plan = plan_gateway_frontend_tls_namespace_slots(acc);
+        let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            // Only the HTTP family shares the HTTP-route socket set — the same
+            // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
+            // GRPCRoute on. A TLS-passthrough or L4 listener on the same number
+            // is a different datapath entirely and must not be dragged in here.
+            if !policy.materializable
+                || !matches!(
+                    policy.protocol.as_str(),
+                    "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
+                )
+            {
+                continue;
             }
-        } else {
-            claims.plaintext.push(key.clone());
+            let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) else {
+                continue;
+            };
+            let claims = claims_by_port.entry(port).or_default();
+            if policy.requires_frontend_tls {
+                if listener_is_effective_tls_serving_claim(key, policy, &plan) {
+                    claims.effective_tls.push(key.clone());
+                    claims
+                        .effective_tls_namespaces
+                        .insert(gateway_frontend_tls_slot_namespace(key, policy).to_string());
+                    if let Some(source) = plan.serving_by_namespace_port.get(&(
+                        gateway_frontend_tls_slot_namespace(key, policy).to_string(),
+                        port,
+                    ))
+                    {
+                        claims.effective_tls_credentials.insert(source.clone());
+                    }
+                }
+            } else {
+                claims.plaintext.push(key.clone());
+            }
         }
-    }
 
-    let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-    for (port, claims) in claims_by_port {
-        let protocol_conflict = !claims.plaintext.is_empty() && !claims.effective_tls.is_empty();
-        // Compare complete per-namespace serving sets. Multi-certificate SNI
-        // serving inside one namespace is valid and must not create a conflict.
-        let credential_conflict = claims.effective_tls_namespaces.len() > 1
-            && claims.effective_tls_credentials.len() > 1
-            && !protocol_conflict;
-        if !protocol_conflict && !credential_conflict {
-            continue;
+        let mut refused: Vec<(GatewayApiListenerKey, GatewayApiListenerConflict)> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for (port, claims) in claims_by_port {
+            let protocol_conflict =
+                !claims.plaintext.is_empty() && !claims.effective_tls.is_empty();
+            // Compare complete per-namespace serving sets. Multi-certificate SNI
+            // serving inside one namespace is valid and must not create a conflict.
+            let credential_conflict = claims.effective_tls_namespaces.len() > 1
+                && claims.effective_tls_credentials.len() > 1
+                && !protocol_conflict;
+            if !protocol_conflict && !credential_conflict {
+                continue;
+            }
+            let (reason, refused_keys, detail) = if protocol_conflict {
+                (
+                    "ProtocolConflict",
+                    claims
+                        .plaintext
+                        .iter()
+                        .chain(claims.effective_tls.iter())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "both plaintext and an effective TLS-serving claim (one socket is one or the other)",
+                )
+            } else {
+                (
+                    "HostnameConflict",
+                    claims.effective_tls,
+                    "effective TLS serving sets from different Gateway namespaces resolve to \
+                     different credentials on one physical socket",
+                )
+            };
+            let listeners = refused_keys
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = format!(
+                "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend \
+                 shapes: {detail}, so every conflicting claim on this port is refused (Conflicted)."
+            );
+            warnings.push(message.clone());
+            refused.extend(refused_keys.into_iter().map(|key| {
+                (
+                    key,
+                    GatewayApiListenerConflict {
+                        reason,
+                        message: message.clone(),
+                    },
+                )
+            }));
         }
-        let (reason, refused_keys, detail) = if protocol_conflict {
-            (
-                "ProtocolConflict",
-                claims
-                    .plaintext
-                    .iter()
-                    .chain(claims.effective_tls.iter())
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                "both plaintext and an effective TLS-serving claim (one socket is one or the other)",
-            )
-        } else {
-            (
-                "HostnameConflict",
-                claims.effective_tls,
-                "effective TLS serving sets from different Gateway namespaces resolve to \
-                 different credentials on one physical socket",
-            )
-        };
-        let listeners = refused_keys
-            .iter()
-            .map(|key| key.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let message = format!(
-            "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend \
-             shapes: {detail}, so every conflicting claim on this port is refused (Conflicted)."
-        );
-        warnings.push(message.clone());
-        refused.extend(refused_keys.into_iter().map(|key| {
-            (
-                key,
-                GatewayApiListenerConflict {
-                    reason,
-                    message: message.clone(),
-                },
-            )
-        }));
-    }
 
-    acc.warnings.extend(warnings);
-    for (key, conflict) in refused {
-        if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
-            policy.materializable = false;
-            policy.routes_materializable = false;
-            policy.conflict_reason = Some(conflict.reason);
+        if refused.is_empty() {
+            break;
         }
-        // Recorded for `Gateway.status.listeners[]`: a listener refused here
-        // must report `Conflicted=True` / `Programmed=False`, never
-        // `Accepted=True` / `NoConflicts`.
-        acc.gateway_api_listener_conflicts.insert(key, conflict);
+        acc.warnings.extend(warnings);
+        for (key, conflict) in refused {
+            if let Some(policy) = acc.gateway_api_listener_policies.get_mut(&key) {
+                policy.materializable = false;
+                policy.routes_materializable = false;
+                policy.conflict_reason = Some(conflict.reason);
+            }
+            // Recorded for `Gateway.status.listeners[]`: a listener refused
+            // here must report `Conflicted=True` / `Programmed=False`, never
+            // `Accepted=True` / `NoConflicts`.
+            acc.gateway_api_listener_conflicts.insert(key, conflict);
+        }
     }
     // ListenerSet status is first derived during ListenerSet precedence
     // admission. Refresh it after physical port admission as well so a
