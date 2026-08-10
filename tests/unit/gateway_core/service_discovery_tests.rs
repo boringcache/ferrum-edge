@@ -2385,10 +2385,11 @@ async fn mesh_sd_ambient_topology_keeps_direct_remote_fallback_without_gateway()
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(targets.len(), 2);
@@ -2427,10 +2428,11 @@ async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_can
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(targets.len(), 2);
@@ -2472,10 +2474,11 @@ async fn mesh_sd_ambient_keeps_unknown_network_direct_fallback_when_catch_all_ca
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(
@@ -2670,10 +2673,11 @@ async fn mesh_sd_ambient_mixed_networks_bridge_gatewayed_and_keep_gatewayless_di
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(
