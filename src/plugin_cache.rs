@@ -991,6 +991,14 @@ impl Plugin for PluginInstanceWrapper {
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }
+    fn metric_tag_override_plans(
+        &self,
+    ) -> &[(
+        crate::plugins::mesh::prometheus_helpers::MeshMetricFamily,
+        String,
+    )] {
+        self.inner.metric_tag_override_plans()
+    }
     fn priority(&self) -> u16 {
         self.priority
     }
@@ -6957,6 +6965,14 @@ impl PluginCache {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
+            if let Err(e) =
+                crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
+                    &merged,
+                    &proxy.id,
+                )
+            {
+                plugin_errors.push(e);
+            }
             new_map.insert(proxy_runtime_key(proxy), Arc::new(merged));
         }
 
@@ -7700,6 +7716,14 @@ impl PluginCache {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
+            if let Err(e) =
+                crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
+                    &merged,
+                    &proxy.id,
+                )
+            {
+                plugin_errors.push(e);
+            }
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());

@@ -910,10 +910,59 @@ impl WorkloadMetrics {
     }
 }
 
+/// Enforce the aggregate per-proxy metric tag-override plan budget against the
+/// final effective `workload_metrics` chain before a PluginCache generation is
+/// published.
+///
+/// Composition mirrors request/stream stamping: instances run in chain order, a
+/// later plan replaces the same metric family, and untouched family plans
+/// survive. The bound is the sum of the surviving stamped plan strings — the
+/// same 16,384-byte ceiling documented for per-instance construction — never
+/// the sum of every intermediate instance. Diagnostics name the proxy only and
+/// never echo plan bytes, expressions, request data, or secrets.
+pub(crate) fn validate_effective_metric_tag_override_plan_budget(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+) -> Result<(), String> {
+    let mut effective: [Option<&str>; MeshMetricFamily::ALL.len()] =
+        [None; MeshMetricFamily::ALL.len()];
+    let mut saw_workload_metrics = false;
+    for plugin in plugins {
+        if plugin.name() != "workload_metrics" {
+            continue;
+        }
+        saw_workload_metrics = true;
+        for (family, plan) in plugin.metric_tag_override_plans() {
+            effective[family.index()] = Some(plan.as_str());
+        }
+    }
+    if !saw_workload_metrics {
+        return Ok(());
+    }
+    let mut total = 0usize;
+    for plan in effective.into_iter().flatten() {
+        total = total.checked_add(plan.len()).ok_or_else(|| {
+            format!(
+                "proxy_id={proxy_id}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
+            )
+        })?;
+        if total > MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES {
+            return Err(format!(
+                "proxy_id={proxy_id}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for WorkloadMetrics {
     fn name(&self) -> &str {
         "workload_metrics"
+    }
+
+    fn metric_tag_override_plans(&self) -> &[(MeshMetricFamily, String)] {
+        &self.tag_override_plans
     }
 
     fn priority(&self) -> u16 {
