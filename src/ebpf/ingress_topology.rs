@@ -1404,12 +1404,12 @@ fn requirements_from_evidence<'a>(
                 }
             };
             node_observed_ipv6 |= cidr.family() == IpFamily::Ipv6;
-            if cidr.family() == IpFamily::Ipv4 || capture_supports_ipv6 {
-                if !remote_pod_cidrs.contains(&cidr) {
-                    let total =
-                        remote_pod_cidrs.len() + remote_node_addresses.len() + node_cidrs.len();
-                    push_unique_bounded(&mut node_cidrs, cidr, total)?;
-                }
+            if (cidr.family() == IpFamily::Ipv4 || capture_supports_ipv6)
+                && !remote_pod_cidrs.contains(&cidr)
+            {
+                let total =
+                    remote_pod_cidrs.len() + remote_node_addresses.len() + node_cidrs.len();
+                push_unique_bounded(&mut node_cidrs, cidr, total)?;
             }
         }
         if node_cidr_invalid {

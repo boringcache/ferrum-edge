@@ -1519,6 +1519,9 @@ async fn run_with_backend(
     .await
 }
 
+// This publication boundary deliberately receives each independent readiness
+// input explicitly so callers cannot hide capture or startup state in defaults.
+#[allow(clippy::too_many_arguments)]
 fn apply_ingress_topology_outcome(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
