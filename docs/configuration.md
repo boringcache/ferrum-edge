@@ -1237,7 +1237,7 @@ The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` sn
 
 Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
-Consul blocking queries carry an `X-Consul-Index` cursor. Ferrum commits that cursor only for the exact response snapshot that was successfully parsed, passed shared host/egress admission, and was published into the load-balancer cache (or already matched the installed target set). A non-2xx response, malformed body, snapshot rejected by shared admission, or publication failure retains the previously committed cursor so the next poll can retry the same Consul state — including after a Consul restart that legitimately rolls the index backward on an admitted snapshot.
+Consul blocking queries carry an `X-Consul-Index` cursor. Ferrum commits that cursor only for the exact response snapshot that was successfully parsed, passed shared host/egress admission, and was published into the load-balancer cache (or already matched an installed discovered target set after this discovery task has confirmed at least one install). A non-2xx response, malformed body, Consul catalog whose every entry is rejected during provider normalization or shared admission, or publication failure retains the previously committed cursor so the next poll can retry the same Consul state — including after a Consul restart that legitimately rolls the index backward on an admitted snapshot. A legitimate empty Consul catalog (`[]`) is still admissible and may clear prior discovered targets after publication. DNS-SD, Kubernetes, and mesh discovery keep their pre-existing empty-after-filter semantics.
 
 ## Database Schema
 

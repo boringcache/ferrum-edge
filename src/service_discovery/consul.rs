@@ -20,7 +20,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
@@ -63,9 +63,6 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
 
 /// Maximum accepted `X-Consul-Index` header value length (decimal digits of u64).
 const MAX_CONSUL_INDEX_HEADER_LEN: usize = 20;
-
-/// Hard ceiling for Consul health-API response bodies (fail closed).
-const MAX_CONSUL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Consul service discoverer.
 ///
@@ -111,7 +108,11 @@ impl ConsulDiscoverer {
     }
 
     /// Currently committed blocking-query index (`0` means non-blocking).
-    pub fn blocking_query_index(&self) -> u64 {
+    ///
+    /// External unit tests observe cursor advancement through
+    /// `ferrum_edge::_test_support::consul_blocking_query_index_for_test`.
+    #[doc(hidden)]
+    pub(crate) fn blocking_query_index(&self) -> u64 {
         self.last_index.load(Ordering::Relaxed)
     }
 
@@ -190,21 +191,14 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             anyhow::bail!("Consul API returned status {}", response.status().as_u16());
         }
 
-        if let Some(declared) = response.content_length()
-            && declared > MAX_CONSUL_RESPONSE_BYTES as u64
-        {
-            anyhow::bail!("Consul API response exceeds size limit");
-        }
-
-        let bytes = response.bytes().await?;
-        if bytes.len() > MAX_CONSUL_RESPONSE_BYTES {
-            anyhow::bail!("Consul API response exceeds size limit");
-        }
-
-        let body: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|e| {
-            // Do not include body snippets — payloads may carry tokens/PII.
-            anyhow::anyhow!("Consul API returned malformed JSON: {}", e)
-        })?;
+        // Decode via the existing JSON path. Body byte caps for Consul /
+        // Kubernetes discovery are owned by issue #3720; do not include body
+        // snippets in the error (payloads may carry tokens/PII).
+        let body: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
+        let provider_item_count = body.len();
         let mut targets = Vec::new();
         let mut missing_service = 0usize;
         let mut missing_address = 0usize;
@@ -281,10 +275,12 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             targets.len(),
             self.service_name
         );
-        if targets.is_empty() && (!body.is_empty()) {
-            warn!(
+        if targets.is_empty() && provider_item_count > 0 {
+            // Admission emits the operator-facing rejection warn; keep detail here
+            // at debug to avoid duplicate warnings for the same rejection.
+            debug!(
                 service = %self.service_name,
-                records = body.len(),
+                records = provider_item_count,
                 missing_service,
                 missing_address,
                 missing_port,
@@ -293,12 +289,13 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         }
 
         let snapshot = if let Some(index) = candidate_index {
-            DiscoverySnapshot::with_cursor(
+            DiscoverySnapshot::with_atomic_cursor(
                 targets,
+                provider_item_count,
                 DiscoveryCursorCommit::new(Arc::clone(&self.last_index), index),
             )
         } else {
-            DiscoverySnapshot::from_targets(targets)
+            DiscoverySnapshot::with_atomic_targets(targets, provider_item_count)
         };
 
         Ok(snapshot)

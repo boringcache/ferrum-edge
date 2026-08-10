@@ -13,7 +13,8 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
 use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
 use ferrum_edge::service_discovery::{
-    ServiceDiscoverer, ServiceDiscoveryManager, SnapshotAdmission, admit_discovered_snapshot,
+    ServiceDiscoverer, ServiceDiscoveryManager, SnapshotAdmission, SnapshotAdmissionPolicy,
+    admit_discovered_snapshot,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2816,7 +2817,13 @@ async fn mesh_sd_ambient_gateway_declared_non_first_port_bridges_with_alias() {
     );
 }
 
+
 // ── Consul blocking-query cursor admission (issue #3719) ──────────────
+//
+// These tests drive discover() through the exact production
+// admit → publish → cursor-commit pipeline (`apply_service_discovery_snapshot_for_test`),
+// observing LoadBalancerCache state and subsequent Consul request query params.
+// They intentionally do not call a public early-commit helper.
 
 fn consul_health_instance(host: &str, port: u16) -> serde_json::Value {
     serde_json::json!([{
@@ -2830,24 +2837,145 @@ fn consul_health_instance(host: &str, port: u16) -> serde_json::Value {
     }])
 }
 
-fn admit_consul_snapshot(
-    snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
-    backend_allow_ips: ferrum_edge::config::BackendEgressPolicy,
-) -> Result<Vec<UpstreamTarget>, &'static str> {
-    match admit_discovered_snapshot("up-consul", "consul", snapshot, backend_allow_ips) {
-        SnapshotAdmission::Accepted { targets, cursor } => {
-            if let Some(cursor) = cursor {
-                cursor.commit();
-            }
-            Ok(targets)
+fn consul_invalid_entries() -> serde_json::Value {
+    serde_json::json!([
+        {"Node": {"Address": "10.0.0.1"}},
+        {
+            "Node": {"Address": ""},
+            "Service": {"Address": "", "Port": 0, "Tags": [], "Weights": {"Passing": 1}}
         }
-        SnapshotAdmission::Rejected { reason } => Err(reason),
+    ])
+}
+
+fn consul_mixed_entries() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "Node": {"Address": ""},
+            "Service": {"Address": "", "Port": 0, "Tags": [], "Weights": {"Passing": 1}}
+        },
+        {
+            "Node": {"Address": "10.0.0.2"},
+            "Service": {
+                "Address": "10.0.0.2",
+                "Port": 8080,
+                "Tags": [],
+                "Weights": {"Passing": 1, "Warning": 1}
+            }
+        }
+    ])
+}
+
+fn cursor_index(d: &ConsulDiscoverer) -> u64 {
+    ferrum_edge::_test_support::consul_blocking_query_index_for_test(d)
+}
+
+struct ConsulPipelineHarness {
+    upstream_id: String,
+    lb_cache: Arc<LoadBalancerCache>,
+    dns_cache: ferrum_edge::dns::DnsCache,
+    health_checker: Arc<ferrum_edge::health_check::HealthChecker>,
+    request_epoch: Option<Arc<RequestEpochStore>>,
+    static_targets: Vec<UpstreamTarget>,
+    // Kept so the cancel watch sender outlives pipeline cancel checks.
+    #[allow(dead_code)]
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    state: ferrum_edge::_test_support::DiscoveryLoopStateForTest,
+}
+
+impl ConsulPipelineHarness {
+    fn new(upstream_id: &str, seed_targets: Vec<UpstreamTarget>) -> Self {
+        Self::with_dns_policy(
+            upstream_id,
+            seed_targets,
+            ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            None,
+        )
+    }
+
+    fn with_dns_policy(
+        upstream_id: &str,
+        seed_targets: Vec<UpstreamTarget>,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy,
+        request_epoch: Option<Arc<RequestEpochStore>>,
+    ) -> Self {
+        let config = make_config_with_upstreams(vec![make_upstream(
+            upstream_id,
+            seed_targets.clone(),
+            None,
+        )]);
+        let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+        if !seed_targets.is_empty() {
+            // Simulate prior-task dynamic targets already installed in the cache.
+            lb_cache.update_targets(
+                "ferrum",
+                upstream_id,
+                seed_targets,
+                LoadBalancerAlgorithm::RoundRobin,
+                None,
+            );
+        }
+        let mut dns_config = ferrum_edge::dns::DnsConfig::default();
+        dns_config.backend_allow_ips = backend_allow_ips;
+        let dns_cache = ferrum_edge::dns::DnsCache::new(dns_config);
+        // Keep the cancel sender alive so `borrow()` stays meaningful for the
+        // production cancel checks inside the apply pipeline.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        Self {
+            upstream_id: upstream_id.to_string(),
+            lb_cache,
+            dns_cache,
+            health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+            request_epoch,
+            static_targets: Vec::new(),
+            cancel_tx,
+            cancel_rx,
+            state: ferrum_edge::_test_support::DiscoveryLoopStateForTest::new(),
+        }
+    }
+
+    fn lb_hosts(&self) -> Vec<String> {
+        self.lb_cache
+            .get_upstream("ferrum", &self.upstream_id)
+            .map(|u| u.targets.iter().map(|t| t.host.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn apply_snapshot(
+        &mut self,
+        snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
+    ) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
+        ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+            "ferrum",
+            &self.upstream_id,
+            "consul",
+            snapshot,
+            &mut self.state,
+            &self.lb_cache,
+            &self.request_epoch,
+            &self.static_targets,
+            LoadBalancerAlgorithm::RoundRobin,
+            &None,
+            &self.cancel_rx,
+            &None,
+            &self.dns_cache,
+            &self.health_checker,
+        )
+        .await
+    }
+
+    async fn discover_and_apply(
+        &mut self,
+        discoverer: &ConsulDiscoverer,
+    ) -> Result<ferrum_edge::_test_support::DiscoveryApplyControlForTest, anyhow::Error> {
+        let snapshot = discoverer.discover().await?;
+        Ok(self.apply_snapshot(snapshot).await)
     }
 }
 
 #[tokio::test]
 async fn consul_higher_index_http_500_does_not_advance_cursor() {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -2865,6 +2993,7 @@ async fn consul_higher_index_http_500_does_not_advance_cursor() {
 
     Mock::given(method("GET"))
         .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
         .respond_with(
             ResponseTemplate::new(500)
                 .set_body_string("Internal Server Error")
@@ -2883,31 +3012,31 @@ async fn consul_higher_index_http_500_does_not_advance_cursor() {
         None,
         1,
     );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
 
-    let snapshot = discoverer.discover().await.unwrap();
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .expect("first snapshot admitted");
-    assert_eq!(discoverer.blocking_query_index(), 10);
+    harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect("first poll admitted");
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
 
-    let err = discoverer.discover().await.expect_err("500 must fail");
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("500 must fail before admission");
     assert!(err.to_string().contains("status 500"));
     assert!(
         !err.to_string().contains("Internal Server Error"),
         "error path must not leak Consul response bodies"
     );
-    assert_eq!(
-        discoverer.blocking_query_index(),
-        10,
-        "higher-index 500 must retain the previously committed cursor"
-    );
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
 }
 
 #[tokio::test]
 async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -2925,6 +3054,7 @@ async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
 
     Mock::given(method("GET"))
         .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{not-json")
@@ -2943,17 +3073,13 @@ async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
         None,
         1,
     );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
 
-    let snapshot = discoverer.discover().await.unwrap();
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(discoverer.blocking_query_index(), 10);
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
 
-    let err = discoverer
-        .discover()
+    let err = harness
+        .discover_and_apply(&discoverer)
         .await
         .expect_err("malformed JSON must fail");
     assert!(err.to_string().contains("malformed JSON"));
@@ -2961,12 +3087,13 @@ async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
         !err.to_string().contains("{not-json"),
         "error path must not leak Consul response bodies"
     );
-    assert_eq!(discoverer.blocking_query_index(), 10);
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
 }
 
 #[tokio::test]
-async fn consul_shared_admission_rejection_does_not_advance_cursor() {
-    use wiremock::matchers::{method, path};
+async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -2975,7 +3102,7 @@ async fn consul_shared_admission_rejection_does_not_advance_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(&consul_health_instance("203.0.113.10", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -2984,9 +3111,9 @@ async fn consul_shared_admission_rejection_does_not_advance_cursor() {
 
     Mock::given(method("GET"))
         .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
         .respond_with(
             ResponseTemplate::new(200)
-                // Private IP denied by public-only egress policy.
                 .set_body_json(&consul_health_instance("10.0.0.9", 8080))
                 .insert_header("X-Consul-Index", "99"),
         )
@@ -3003,34 +3130,188 @@ async fn consul_shared_admission_rejection_does_not_advance_cursor() {
         None,
         1,
     );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
 
-    let snapshot = discoverer.discover().await.unwrap();
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(discoverer.blocking_query_index(), 10);
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["203.0.113.10".to_string()]);
 
-    let snapshot = discoverer.discover().await.unwrap();
-    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(99));
-    let reason = admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
-            ferrum_edge::config::BackendAllowIps::Public,
-        ),
-    )
-    .expect_err("all private targets must be rejected by shared admission");
-    assert_eq!(reason, "shared_admission_rejected");
+    harness.discover_and_apply(&discoverer).await.unwrap();
     assert_eq!(
-        discoverer.blocking_query_index(),
+        cursor_index(&discoverer),
         10,
-        "rejected snapshot must not commit the higher Consul index"
+        "shared-admission rejection must retain the prior cursor"
+    );
+    assert_eq!(
+        harness.lb_hosts(),
+        vec!["203.0.113.10".to_string()],
+        "shared-admission rejection must retain installed targets"
     );
 }
 
 #[tokio::test]
-async fn consul_successful_higher_index_commits_once() {
+async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_published() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("203.0.113.10", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("backend.example.com", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+    assert_eq!(harness.lb_hosts(), vec!["203.0.113.10".to_string()]);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+    assert_eq!(harness.lb_hosts(), vec!["backend.example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_successful_higher_index_publishes_then_commits() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "42"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    assert_eq!(cursor_index(&discoverer), 0);
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 0, "discover must not commit early");
+    assert_eq!(snapshot.pending_cursor_index(), Some(42));
+    harness.apply_snapshot(snapshot).await;
+    assert_eq!(cursor_index(&discoverer), 42);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+    assert!(harness.state.snapshot_installed());
+}
+
+#[tokio::test]
+async fn consul_successful_lower_index_rollback_publishes_then_commits() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "100"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.2", 8080))
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 100);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 7);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.2".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_publication_failure_does_not_commit_cursor() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3057,170 +3338,33 @@ async fn consul_successful_higher_index_commits_once() {
         1,
     );
 
-    assert_eq!(discoverer.blocking_query_index(), 0);
-    let snapshot = discoverer.discover().await.unwrap();
-    assert_eq!(discoverer.blocking_query_index(), 0, "discover must not commit early");
-    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(42));
-    let targets = admit_consul_snapshot(
-        snapshot,
+    let config = make_config_with_upstreams(vec![make_upstream("up-consul", Vec::new(), None)]);
+    let base_epoch = request_epoch_store(config);
+    let failing_epoch = Arc::new(
+        ferrum_edge::_test_support::request_epoch_store_with_lb_generation_for_test(
+            &base_epoch,
+            u64::MAX,
+        ),
+    );
+    let mut harness = ConsulPipelineHarness::with_dns_policy(
+        "up-consul",
+        Vec::new(),
         ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(discoverer.blocking_query_index(), 42);
+        Some(failing_epoch),
+    );
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        0,
+        "publication failure must not commit the Consul cursor"
+    );
+    assert!(!harness.state.snapshot_installed());
+    assert!(harness.lb_hosts().is_empty());
 }
 
 #[tokio::test]
-async fn consul_successful_lower_index_rollback_commits_new_cursor() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/health/service/api"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
-                .insert_header("X-Consul-Index", "100"),
-        )
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/health/service/api"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.2", 8080))
-                .insert_header("X-Consul-Index", "7"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let discoverer = ConsulDiscoverer::new(
-        reqwest::Client::new(),
-        mock_server.uri(),
-        "api".to_string(),
-        None,
-        None,
-        false,
-        None,
-        1,
-    );
-
-    let snapshot = discoverer.discover().await.unwrap();
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(discoverer.blocking_query_index(), 100);
-
-    let snapshot = discoverer.discover().await.unwrap();
-    assert_eq!(snapshot.cursor.as_ref().map(|c| c.index()), Some(7));
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(
-        discoverer.blocking_query_index(),
-        7,
-        "admitted lower index after Consul restart must become the next request cursor"
-    );
-}
-
-#[tokio::test]
-async fn consul_rejected_same_index_then_valid_same_index_is_admitted() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-
-    // Seed committed cursor at index 50.
-    Mock::given(method("GET"))
-        .and(path("/v1/health/service/api"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
-                .insert_header("X-Consul-Index", "50"),
-        )
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    // Same index, but every target fails shared admission (public-only policy).
-    Mock::given(method("GET"))
-        .and(path("/v1/health/service/api"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
-                .insert_header("X-Consul-Index", "50"),
-        )
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    // Same index again with a routable hostname that shared admission accepts.
-    Mock::given(method("GET"))
-        .and(path("/v1/health/service/api"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("backend.example.com", 8080))
-                .insert_header("X-Consul-Index", "50"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let discoverer = ConsulDiscoverer::new(
-        reqwest::Client::new(),
-        mock_server.uri(),
-        "api".to_string(),
-        None,
-        None,
-        false,
-        None,
-        1,
-    );
-    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
-        ferrum_edge::config::BackendAllowIps::Public,
-    );
-
-    let snapshot = discoverer.discover().await.unwrap();
-    // First seed uses unrestricted so the private seed IP can establish cursor 50.
-    admit_consul_snapshot(
-        snapshot,
-        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
-    assert_eq!(discoverer.blocking_query_index(), 50);
-
-    let rejected = discoverer.discover().await.unwrap();
-    assert_eq!(rejected.cursor.as_ref().map(|c| c.index()), Some(50));
-    let reason = admit_consul_snapshot(rejected, public_only.clone())
-        .expect_err("same-index private targets must be rejected");
-    assert_eq!(reason, "shared_admission_rejected");
-    assert_eq!(
-        discoverer.blocking_query_index(),
-        50,
-        "rejected same-index response must not move or clear the cursor"
-    );
-
-    let accepted = discoverer.discover().await.unwrap();
-    assert_eq!(accepted.cursor.as_ref().map(|c| c.index()), Some(50));
-    let targets = admit_consul_snapshot(accepted, public_only).unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].host, "backend.example.com");
-    assert_eq!(
-        discoverer.blocking_query_index(),
-        50,
-        "valid same-index response after rejection must still be admitted and keep the cursor"
-    );
-}
-
-#[tokio::test]
-async fn consul_legitimate_empty_snapshot_still_commits_cursor() {
+async fn consul_legitimate_empty_first_response_clears_prior_targets_then_commits() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3246,17 +3390,358 @@ async fn consul_legitimate_empty_snapshot_still_commits_cursor() {
         None,
         1,
     );
+    let prior = vec![make_target("10.0.0.55", 8080)];
+    let mut harness = ConsulPipelineHarness::new("up-consul", prior);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.55".to_string()]);
+    assert!(!harness.state.snapshot_installed());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert!(
+        harness.lb_hosts().is_empty(),
+        "first empty admitted snapshot must publish/clear prior dynamic targets"
+    );
+    assert_eq!(cursor_index(&discoverer), 12);
+    assert!(harness.state.snapshot_installed());
+}
+
+#[tokio::test]
+async fn consul_unchanged_snapshot_commits_cursor_only_after_prior_install() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "20"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same targets, higher index — publication may be skipped after install,
+    // but the cursor must still advance.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "20"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "21"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 20);
+    assert!(harness.state.snapshot_installed());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        21,
+        "admitted unchanged snapshot may commit only after a prior install"
+    );
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_all_provider_entries_rejected_retains_targets_and_cursor() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_invalid_entries())
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
 
     let snapshot = discoverer.discover().await.unwrap();
-    assert!(snapshot.targets.is_empty());
-    admit_consul_snapshot(
+    assert!(snapshot.targets().is_empty());
+    assert_eq!(
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AtomicCursor {
+            provider_item_count: 2
+        }
+    );
+    harness.apply_snapshot(snapshot).await;
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_mixed_provider_entries_publish_valid_subset_and_commit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_mixed_entries())
+                .insert_header("X-Consul-Index", "33"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 33);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.2".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_legitimate_empty_json_array_is_admissible() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "5"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AtomicCursor {
+            provider_item_count: 0
+        }
+    );
+    match admit_discovered_snapshot(
+        "up-consul",
+        "consul",
         snapshot,
         ferrum_edge::config::BackendEgressPolicy::unrestricted(),
-    )
-    .unwrap();
+    ) {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            assert!(targets.is_empty());
+            // Cursor remains uncommitted here; only the manager/pipeline commits.
+            assert!(cursor.is_some());
+            drop(cursor);
+        }
+        SnapshotAdmission::Rejected { reason } => {
+            panic!("legitimate [] must be accepted, got {reason}")
+        }
+    }
+    assert_eq!(cursor_index(&discoverer), 0);
+}
+
+#[test]
+fn non_consul_accept_filtered_empty_policy_preserves_pre_pr_semantics() {
+    // DNS-SD / Kubernetes / mesh snapshots use AcceptFilteredEmpty: even when
+    // every normalized target is removed by shared admission, the empty set is
+    // accepted (no atomic cursor rejection).
+    let snapshot = ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![
+        make_target("10.0.0.1", 8080),
+    ]);
     assert_eq!(
-        discoverer.blocking_query_index(),
-        12,
-        "legitimate empty Consul catalog must still commit the blocking-query cursor"
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AcceptFilteredEmpty
     );
+    match admit_discovered_snapshot(
+        "up-dns",
+        "dns_sd",
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+            ferrum_edge::config::BackendAllowIps::Public,
+        ),
+    ) {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            assert!(targets.is_empty());
+            assert!(cursor.is_none());
+        }
+        SnapshotAdmission::Rejected { reason } => {
+            panic!("non-Consul providers must accept filtered-empty, got {reason}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_query() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "12"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // After the empty snapshot commits index=12, the manager's next poll must
+    // use a blocking query with that cursor.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "12"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&consul_health_instance("10.0.0.7", 8080))
+                .insert_header("X-Consul-Index", "13"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let upstream_id = "up-consul-mgr";
+    let config = make_config_with_upstreams(vec![make_upstream(
+        upstream_id,
+        Vec::new(),
+        Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Consul,
+            dns_sd: None,
+            kubernetes: None,
+            consul: Some(ConsulConfig {
+                address: mock_server.uri(),
+                service_name: "api".to_string(),
+                datacenter: None,
+                tag: None,
+                healthy_only: false,
+                token: None,
+                poll_interval_seconds: 1,
+            }),
+            mesh: None,
+            default_weight: 1,
+        }),
+    )]);
+    let cache = Arc::new(LoadBalancerCache::new(&config));
+    cache.update_targets(
+        "ferrum",
+        upstream_id,
+        vec![make_target("10.0.0.55", 8080)],
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
+    assert_eq!(
+        cache
+            .get_upstream("ferrum", upstream_id)
+            .unwrap()
+            .targets
+            .iter()
+            .map(|t| t.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["10.0.0.55"]
+    );
+
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
+    let manager = ServiceDiscoveryManager::new(
+        cache.clone(),
+        dns_cache,
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
+    );
+    manager.start(&config, None);
+
+    // Wait until the empty snapshot publishes (clearing prior targets) and the
+    // follow-up blocking query with index=12 installs the next target.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_cleared = false;
+    loop {
+        let hosts: Vec<String> = cache
+            .get_upstream("ferrum", upstream_id)
+            .map(|u| u.targets.iter().map(|t| t.host.clone()).collect())
+            .unwrap_or_default();
+        if hosts.is_empty() {
+            saw_cleared = true;
+        }
+        if hosts == vec!["10.0.0.7".to_string()] {
+            assert!(
+                saw_cleared,
+                "follow-up publish must be preceded by clearing prior dynamic targets"
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            manager.stop();
+            panic!(
+                "manager did not clear prior targets then publish via index=12 query; hosts={hosts:?}, saw_cleared={saw_cleared}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    manager.stop();
 }
