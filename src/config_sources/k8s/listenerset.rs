@@ -612,14 +612,32 @@ fn conflict_against_accepted(
 }
 
 fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
-    // Pinned Gateway listener distinctness: exact, wildcard, and fallback
-    // (empty/unset hostname) are distinct values. Only equal hostname values
-    // conflict on the same protocol+port; runtime precedence handles overlap.
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => left == right,
-        (None, Some(_)) | (Some(_), None) => false,
+        (Some(left), Some(right)) => {
+            let left_suffix = left.strip_prefix("*.");
+            let right_suffix = right.strip_prefix("*.");
+            match (left_suffix, right_suffix) {
+                (None, None) => left == right,
+                (Some(suffix), None) => hostname_matches_suffix(right, suffix),
+                (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
+                (Some(left), Some(right)) => {
+                    suffix_is_within(left, right) || suffix_is_within(right, left)
+                }
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => true,
     }
+}
+
+fn hostname_matches_suffix(hostname: &str, suffix: &str) -> bool {
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn listenerset_listener_names_are_duplicated(listeners: &[Value]) -> bool {

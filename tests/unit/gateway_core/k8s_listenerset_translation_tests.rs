@@ -1651,6 +1651,54 @@ fn listenerset_identical_hostnames_still_conflict() {
 }
 
 #[test]
+fn listenerset_exact_hostname_conflicts_with_gateway_wildcard() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"][0]["hostname"] = json!("*.example.com");
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        listenerset(
+            "tenant",
+            "edge",
+            json!([{
+                "name": "admin",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "admin.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+        service("backend"),
+        http_route(
+            "admin",
+            json!([{"kind": "ListenerSet", "name": "tenant"}]),
+            "admin.example.com",
+            "/admin",
+        ),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let status = translation
+        .listenerset_statuses
+        .iter()
+        .find(|status| status.resource.name == "tenant")
+        .expect("ListenerSet status");
+    assert!(
+        status
+            .listener_conflicts
+            .iter()
+            .any(|(name, reason)| name == "admin" && reason == "HostnameConflict")
+    );
+    assert!(!translation.config.proxies.iter().any(|proxy| {
+        proxy.hosts.iter().any(|host| host == "admin.example.com")
+            && proxy
+                .listen_path
+                .as_deref()
+                .is_some_and(|path| path.contains("admin"))
+    }));
+}
+
+#[test]
 fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     let missing_fields = vec![
         gateway_class(),
