@@ -3622,7 +3622,8 @@ fn gateway_listener_programmed(
     listener: &Value,
     config: &GatewayConfig,
 ) -> bool {
-    // Mesh services derived from this Gateway are named `{gateway.name}-{listener.name}`
+    // Mesh services derived from this Gateway are named
+    // `gateway-{gateway.name}-{listener.name}`
     // (see `mesh_services_from_gateway` in `gateway_api.rs`). Use exact match against
     // the listener name to avoid a false positive when another Gateway's name is a
     // prefix of this one (e.g. `edge` matching `edge-internal-http`).
@@ -3633,7 +3634,7 @@ fn gateway_listener_programmed(
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("listener");
-    let expected = format!("{}-{}", object.metadata.name, listener_name);
+    let expected = format!("gateway-{}-{}", object.metadata.name, listener_name);
     mesh.services
         .iter()
         .any(|service| service.namespace == object.metadata.namespace && service.name == expected)

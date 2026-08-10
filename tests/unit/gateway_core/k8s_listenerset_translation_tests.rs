@@ -1036,9 +1036,9 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "shared-same")
+                .any(|service| service.name == "gateway-shared-same")
         }),
-        "the winning Gateway listener should emit the colliding synthetic name"
+        "the winning Gateway listener should emit its kind-scoped synthetic name"
     );
     assert!(
         translation.config.mesh.as_ref().is_some_and(|mesh| {
@@ -1064,10 +1064,10 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
 }
 
 #[test]
-fn listenerset_service_cannot_program_same_named_gateway() {
+fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
     let gateway = object(
         "Gateway",
-        "shared",
+        "listenerset-shared",
         json!({
             "gatewayClassName": "ferrum",
             "allowedListeners": {"namespaces": {"from": "Same"}},
@@ -1103,7 +1103,7 @@ fn listenerset_service_cannot_program_same_named_gateway() {
         plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
     let gateway_update = updates
         .iter()
-        .find(|update| update.kind == "Gateway" && update.name == "shared")
+        .find(|update| update.kind == "Gateway" && update.name == "listenerset-shared")
         .expect("Gateway status update");
     let programmed = gateway_update.status["conditions"]
         .as_array()
@@ -1113,7 +1113,7 @@ fn listenerset_service_cannot_program_same_named_gateway() {
         .expect("Gateway Programmed condition");
     assert_eq!(
         programmed["status"], "False",
-        "a ListenerSet-owned service must not program the same-named Gateway"
+        "a ListenerSet-owned service must not program a Gateway whose name collides with the ListenerSet identity"
     );
 }
 
@@ -1254,13 +1254,11 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
         "the parent Gateway must retain the physical TLS serving slot"
     );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
-        mesh.services
-            .iter()
-            .any(|service| service.namespace == "gateway-ns" && service.name == "edge-https")
-            && !mesh.services.iter().any(|service| {
-                service.namespace == "extension-ns"
-                    && service.name == "listenerset-extra-https-extra"
-            })
+        mesh.services.iter().any(|service| {
+            service.namespace == "gateway-ns" && service.name == "gateway-edge-https"
+        }) && !mesh.services.iter().any(|service| {
+            service.namespace == "extension-ns" && service.name == "listenerset-extra-https-extra"
+        })
     }));
 
     let updates = plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);

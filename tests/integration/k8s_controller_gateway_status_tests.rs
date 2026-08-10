@@ -1097,16 +1097,16 @@ fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
     assert!(
         !names
             .iter()
-            .any(|name| *name == "edge-plain" || *name == "edge-secure"),
+            .any(|name| *name == "gateway-edge-plain" || *name == "gateway-edge-secure"),
         "refused same-port listeners must not become MeshServices: {names:?}"
     );
     assert!(
-        names.contains(&"edge-healthy"),
+        names.contains(&"gateway-edge-healthy"),
         "healthy plaintext sibling on another port must remain exposed: {names:?}"
     );
     assert!(
         services.iter().any(|service| {
-            service.name == "edge-healthy"
+            service.name == "gateway-edge-healthy"
                 && service.ports.len() == 1
                 && service.ports[0].port == 8080
         }),
@@ -1317,11 +1317,11 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         .map(|service| service.name.as_str())
         .collect();
     assert!(
-        names.contains(&"edge-https"),
+        names.contains(&"gateway-edge-https"),
         "planned namespace TLS winner must remain exposed: {names:?}"
     );
     assert!(
-        !names.contains(&"reference-grant-edge-https"),
+        !names.contains(&"gateway-reference-grant-edge-https"),
         "non-winning same-namespace Gateway must not advertise a MeshService under the wrong serving slot: {names:?}"
     );
     assert_eq!(
@@ -1356,11 +1356,11 @@ fn only_planned_namespace_tls_winner_is_emitted_as_mesh_service() {
         })
         .unwrap_or_default();
     assert!(
-        reversed_names.contains(&"edge-https"),
+        reversed_names.contains(&"gateway-edge-https"),
         "order-independent winner exposure: {reversed_names:?}"
     );
     assert!(
-        !reversed_names.contains(&"reference-grant-edge-https"),
+        !reversed_names.contains(&"gateway-reference-grant-edge-https"),
         "order-independent non-winner refusal: {reversed_names:?}"
     );
 }

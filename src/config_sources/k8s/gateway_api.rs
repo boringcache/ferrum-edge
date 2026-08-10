@@ -4659,7 +4659,10 @@ fn mesh_services_from_gateway(
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
             let name = listener_name;
             services.push(MeshService {
-                name: format!("{}-{name}", object.metadata.name),
+                // Keep generated listener identities disjoint from ListenerSet
+                // identities, even when a Gateway name starts with
+                // `listenerset-`.
+                name: format!("gateway-{}-{name}", object.metadata.name),
                 namespace: object.metadata.namespace.clone(),
                 ports: vec![ServicePort {
                     port,
@@ -8298,7 +8301,7 @@ mod tests {
             result.config.mesh.as_ref().is_some_and(|mesh| mesh
                 .services
                 .iter()
-                .any(|service| service.name == "edge-a-https-a")),
+                .any(|service| service.name == "gateway-edge-a-https-a")),
             "the planned winning TLS listener should stay materialized"
         );
         assert!(
