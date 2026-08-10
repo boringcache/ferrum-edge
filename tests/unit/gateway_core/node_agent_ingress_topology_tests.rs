@@ -567,7 +567,7 @@ fn node_requirements_are_ready_internal_ip_only_and_fail_closed_when_incomplete(
         .expect("complete Ready Node evidence");
     assert_eq!(
         requirements.remote_node_addresses,
-        ["172.18.0.3".parse().unwrap()]
+        [IpAddr::V4(Ipv4Addr::new(172, 18, 0, 3))]
     );
     assert!(requirements.require_ipv4);
     assert!(!requirements.require_ipv6);
