@@ -1064,7 +1064,7 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
 }
 
 #[test]
-fn listenerset_service_cannot_program_gateway_with_colliding_prefixed_name() {
+fn kind_scoped_service_identities_disambiguate_gateway_with_listenerset_prefix() {
     let gateway = object(
         "Gateway",
         "listenerset-shared",
