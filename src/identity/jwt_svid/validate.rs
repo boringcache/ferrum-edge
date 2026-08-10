@@ -374,9 +374,7 @@ fn numeric_claim(claims: &Map<String, Value>, name: &str) -> Result<Option<i64>,
                 // must therefore be exclusive: including it would admit the
                 // out-of-range JSON integer 9223372036854775808 and Rust's
                 // float-to-int cast would silently saturate it to `i64::MAX`.
-                if value.is_finite()
-                    && (i64::MIN as f64..i64::MAX as f64).contains(&value)
-                {
+                if value.is_finite() && (i64::MIN as f64..i64::MAX as f64).contains(&value) {
                     Ok(Some(value.trunc() as i64))
                 } else {
                     Err(JwtSvidError::InvalidToken(

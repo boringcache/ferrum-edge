@@ -696,8 +696,7 @@ async fn listener_retains_the_lifecycle_lock_until_socket_cleanup_finishes() {
         .open(&lock_path)
         .expect("open lifecycle lock sidecar");
 
-    let locked =
-        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let locked = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(locked, -1, "a serving listener must retain the lock");
     assert_eq!(
         std::io::Error::last_os_error().kind(),
@@ -706,7 +705,10 @@ async fn listener_retains_the_lifecycle_lock_until_socket_cleanup_finishes() {
     );
 
     let path = harness.shutdown().await;
-    assert!(!path.exists(), "socket cleanup completes before lock release");
+    assert!(
+        !path.exists(),
+        "socket cleanup completes before lock release"
+    );
     let acquired_after_cleanup =
         unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(
