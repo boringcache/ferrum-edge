@@ -3510,15 +3510,18 @@ transition to a registry marker left by the earlier rollout. Each node-agent
 restart/relist first retracts its
 generation acknowledgement, closes UDP gates, reconstructs the registry from
 the Kubernetes pod list, and then atomically publishes `.udp-registry-synced`
-containing that generation. Every later pod/CNI capture mutation retracts the
-marker first and republishes it only after the registry and retry state converge;
-the cleanup supervisor rechecks the marker after each cleanup pass before it can
-persist completion. Pod-netns cleanup starts only after that proof and requires
-two identical complete registry passes, so partial per-pod cleanup,
-temporarily unresolvable netns handles, pod deletion/recreation, and a crash
-between any passes simply retry. Pods created after the predecessor stopped have
-no predecessor rules and join the current registry pass; pods removed during the
-phase lose their namespace and cannot retain rules. Cleanup always probes both
+as a bounded, versioned proof containing that generation and a fresh publication
+identity. Every later pod/CNI capture mutation retracts the marker first and
+republishes a new identity only after the registry and retry state converge. The
+cleanup supervisor requires the exact same proof before and after every pass;
+disappearance or replacement resets both repeated-pass counters and the pod
+registry fingerprint. It checks that proof again immediately before persisting
+completion. Pod-netns cleanup starts only after that proof and requires two
+identical complete registry passes under one publication, so partial per-pod
+cleanup, temporarily unresolvable netns handles, pod deletion/recreation, and a
+crash between any passes simply retry. Pods created after the predecessor stopped
+have no predecessor rules and join the current registry pass; pods removed
+during the phase lose their namespace and cannot retain rules. Cleanup always probes both
 IPv4 and IPv6 exact Ferrum chain/jump/rule/route names, even when the new config
 disables one family, and never flushes a table or sweeps foreign state.
 

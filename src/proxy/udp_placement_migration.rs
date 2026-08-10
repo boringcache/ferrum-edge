@@ -20,6 +20,7 @@ const STATE_FILE: &str = ".udp-placement-state-v1.json";
 const REGISTRY_SYNC_FILE: &str = ".udp-registry-synced";
 const MAX_STATE_BYTES: u64 = 4096;
 const MAX_GENERATION_BYTES: usize = 64;
+const MAX_REGISTRY_SYNC_MARKER_BYTES: u64 = 256;
 const MAX_REGISTRY_SYNC_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +214,136 @@ struct DurablePlacementState {
     completed: Option<UdpMigrationTransition>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct UdpRegistrySyncProof {
+    generation: String,
+    publication: uuid::Uuid,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySyncMarker {
+    version: u8,
+    generation: String,
+    publication: String,
+}
+
+/// Accumulates repeated cleanup passes only while one exact inter-process
+/// registry publication remains continuously current.
+pub struct UdpCleanupProofWindow {
+    cleanup_pod_netns: bool,
+    cleanup_host_netns: bool,
+    proof: Option<UdpRegistrySyncProof>,
+    last_complete_fingerprint: Option<u64>,
+    host_complete_passes: u8,
+}
+
+pub struct UdpCleanupProofProgress {
+    proof: Option<UdpRegistrySyncProof>,
+    host_complete: bool,
+    pod_complete: bool,
+}
+
+impl UdpCleanupProofProgress {
+    pub const fn proof_is_valid(&self) -> bool {
+        self.proof.is_some()
+    }
+
+    pub const fn host_complete(&self) -> bool {
+        self.host_complete
+    }
+
+    pub const fn pod_complete(&self) -> bool {
+        self.pod_complete
+    }
+
+    pub fn completion_proof(&self) -> Option<&UdpRegistrySyncProof> {
+        if self.host_complete && self.pod_complete {
+            self.proof.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+impl UdpCleanupProofWindow {
+    pub const fn new(cleanup_pod_netns: bool, cleanup_host_netns: bool) -> Self {
+        Self {
+            cleanup_pod_netns,
+            cleanup_host_netns,
+            proof: None,
+            last_complete_fingerprint: None,
+            host_complete_passes: 0,
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.proof = None;
+        self.last_complete_fingerprint = None;
+        self.host_complete_passes = 0;
+    }
+
+    /// Count one host/pod cleanup pass only when the same proof was visible
+    /// before and after it. A new proof starts a new repeated-pass window; a
+    /// missing or changed after-proof discards every signal from this pass.
+    pub fn observe_pass(
+        &mut self,
+        proof_before: Option<UdpRegistrySyncProof>,
+        proof_after: Option<UdpRegistrySyncProof>,
+        host_pass_complete: bool,
+        pod_complete_fingerprint: Option<u64>,
+    ) -> UdpCleanupProofProgress {
+        let Some(proof_before) = proof_before else {
+            self.invalidate();
+            return self.incomplete_progress();
+        };
+        if self.proof.as_ref() != Some(&proof_before) {
+            self.invalidate();
+            self.proof = Some(proof_before.clone());
+        }
+        if proof_after.as_ref() != Some(&proof_before) {
+            self.invalidate();
+            return self.incomplete_progress();
+        }
+
+        if self.cleanup_host_netns {
+            if host_pass_complete {
+                self.host_complete_passes = self.host_complete_passes.saturating_add(1);
+            } else {
+                self.host_complete_passes = 0;
+            }
+        }
+
+        let pod_complete = if self.cleanup_pod_netns {
+            if let Some(fingerprint) = pod_complete_fingerprint {
+                let complete = self.last_complete_fingerprint == Some(fingerprint);
+                self.last_complete_fingerprint = Some(fingerprint);
+                complete
+            } else {
+                self.last_complete_fingerprint = None;
+                false
+            }
+        } else {
+            true
+        };
+        let host_complete = !self.cleanup_host_netns || self.host_complete_passes >= 2;
+
+        UdpCleanupProofProgress {
+            proof: self.proof.clone(),
+            host_complete,
+            pod_complete,
+        }
+    }
+
+    fn incomplete_progress(&self) -> UdpCleanupProofProgress {
+        UdpCleanupProofProgress {
+            proof: None,
+            host_complete: !self.cleanup_host_netns,
+            pod_complete: !self.cleanup_pod_netns,
+        }
+    }
+}
+
 impl DurablePlacementState {
     fn new(active: UdpPlacement) -> Self {
         Self {
@@ -269,13 +400,12 @@ impl UdpMigrationContext {
             )
     }
 
-    pub fn registry_is_synchronized(&self) -> bool {
-        registry_sync_generation(&self.registry_dir)
-            .as_deref()
-            .is_some_and(|value| value == self.generation())
+    pub fn registry_sync_proof(&self) -> Option<UdpRegistrySyncProof> {
+        let proof = registry_sync_proof(&self.registry_dir)?;
+        (proof.generation.as_str() == self.generation()).then_some(proof)
     }
 
-    pub fn mark_cleanup_complete(&self) -> Result<(), String> {
+    pub fn mark_cleanup_complete(&self, proof: &UdpRegistrySyncProof) -> Result<(), String> {
         let mut state = read_state(&self.registry_dir)?.ok_or_else(|| {
             "Ambient UDP migration state disappeared before cleanup completion".to_string()
         })?;
@@ -285,6 +415,12 @@ impl UdpMigrationContext {
         if pending.transition != self.transition {
             return Err(
                 "Ambient UDP migration ownership/generation changed during cleanup".to_string(),
+            );
+        }
+        if self.registry_sync_proof().as_ref() != Some(proof) {
+            return Err(
+                "Ambient UDP registry synchronization proof changed before cleanup completion"
+                    .to_string(),
             );
         }
         pending.cleanup_complete = true;
@@ -498,8 +634,8 @@ pub fn clear_registry_sync_marker(registry_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Publish the generation marker only after every pod UID expected from the
-/// node-agent's authoritative relist is present in the securely synced
+/// Publish a fresh generation-bound proof only after every pod UID expected
+/// from the node-agent's authoritative relist is present in the securely synced
 /// registry snapshot. Unexpected entries remain part of cleanup: they may be
 /// stale predecessor ownership and must not be silently omitted. Returns
 /// `false` without publishing when an expected pod is not present yet.
@@ -539,23 +675,57 @@ pub fn publish_registry_sync_marker_for_pods(
     }
     sync_directory(registry_dir)
         .map_err(|error| format!("could not sync Ambient UDP registry directory: {error}"))?;
+    let marker = RegistrySyncMarker {
+        version: 1,
+        generation: generation.to_string(),
+        publication: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| format!("could not encode Ambient UDP registry sync marker: {error}"))?;
+    if bytes.len() as u64 > MAX_REGISTRY_SYNC_MARKER_BYTES {
+        return Err("Ambient UDP registry sync marker exceeds its size limit".to_string());
+    }
     atomic_write(
         registry_dir,
         &registry_dir.join(REGISTRY_SYNC_FILE),
         REGISTRY_SYNC_FILE,
-        generation.as_bytes(),
+        &bytes,
         "Ambient UDP registry sync marker",
     )?;
     Ok(true)
 }
 
-fn registry_sync_generation(registry_dir: &Path) -> Option<String> {
+fn registry_sync_proof(registry_dir: &Path) -> Option<UdpRegistrySyncProof> {
     let path = registry_dir.join(REGISTRY_SYNC_FILE);
-    let mut file = open_owned_regular_file(&path, MAX_GENERATION_BYTES as u64).ok()?;
-    let mut value = String::new();
-    file.read_to_string(&mut value).ok()?;
-    validate_generation(&value).ok()?;
-    Some(value)
+    let mut file = open_owned_regular_file(&path, MAX_REGISTRY_SYNC_MARKER_BYTES).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REGISTRY_SYNC_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_REGISTRY_SYNC_MARKER_BYTES {
+        return None;
+    }
+    let marker: RegistrySyncMarker = serde_json::from_slice(&bytes).ok()?;
+    if marker.version != 1 {
+        return None;
+    }
+    validate_generation(&marker.generation).ok()?;
+    if marker.publication.len() != 32
+        || !marker
+            .publication
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    let publication = uuid::Uuid::parse_str(&marker.publication).ok()?;
+    if publication.get_version() != Some(uuid::Version::Random) {
+        return None;
+    }
+    Some(UdpRegistrySyncProof {
+        generation: marker.generation,
+        publication,
+    })
 }
 
 fn open_owned_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<File> {

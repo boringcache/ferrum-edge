@@ -12064,7 +12064,8 @@ async fn run_ambient_udp_placement_cleanup(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use crate::proxy::udp_placement_migration::{
-        UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure, set_failure, set_phase,
+        UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure,
+        set_failure, set_phase,
     };
 
     let ready_dir = context.registry_dir().join(".udp-ready");
@@ -12079,8 +12080,10 @@ async fn run_ambient_udp_placement_cleanup(
     let mut host_recovery = context.cleanup_host_netns().then(|| {
         crate::proxy::host_udp_capture::HostUdpStaleGenerationRecovery::new(Some(ready_dir))
     });
-    let mut last_complete_fingerprint = None;
-    let mut host_complete_passes = 0_u8;
+    let mut proof_window = UdpCleanupProofWindow::new(
+        context.cleanup_pod_netns(),
+        context.cleanup_host_netns(),
+    );
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
@@ -12089,19 +12092,15 @@ async fn run_ambient_udp_placement_cleanup(
         if *shutdown.borrow() {
             return;
         }
-        if !context.registry_is_synchronized() {
-            set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
-            set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
-        } else {
-            let mut host_complete = host_recovery.is_none();
+        if let Some(proof_before) = context.registry_sync_proof() {
+            let mut host_pass_complete = host_recovery.is_none();
             let mut host_outstanding = 0;
             let mut failure_reason = None;
             if let Some(recovery) = host_recovery.as_mut() {
                 if crate::proxy::host_udp_capture::recover_and_reap_once(recovery).await {
-                    host_complete_passes = host_complete_passes.saturating_add(1);
-                    host_complete = host_complete_passes >= 2;
+                    host_pass_complete = true;
                 } else {
-                    host_complete_passes = 0;
+                    host_pass_complete = false;
                     failure_reason = Some(if recovery.outstanding() == 0 {
                         UdpMigrationFailureReason::HostCleanupFailed
                     } else {
@@ -12111,29 +12110,29 @@ async fn run_ambient_udp_placement_cleanup(
                 host_outstanding = recovery.outstanding();
             }
 
-            let mut pod_complete = pod_cleanup.is_none();
+            let mut pod_complete_fingerprint = None;
             let mut pod_outstanding = 0;
             if let Some(manager) = pod_cleanup.as_mut() {
                 let progress = manager.migration_cleanup_once().await;
                 pod_outstanding = progress.outstanding;
                 if let Some(reason) = progress.failure_reason {
                     failure_reason = Some(reason);
-                    last_complete_fingerprint = None;
                 } else if progress.outstanding == 0 {
-                    pod_complete = last_complete_fingerprint == Some(progress.registry_fingerprint);
-                    last_complete_fingerprint = Some(progress.registry_fingerprint);
-                } else {
-                    last_complete_fingerprint = None;
+                    pod_complete_fingerprint = Some(progress.registry_fingerprint);
                 }
             }
 
-            // The node agent retracts this marker before every post-relist pod
-            // or CNI mutation. Recheck after the cleanup work as well as before
-            // it so a concurrent attachment cannot race between the initial
-            // proof check and durable completion publication.
-            if !context.registry_is_synchronized() {
-                last_complete_fingerprint = None;
-                host_complete_passes = 0;
+            // The node agent gives every publication a fresh identity after
+            // retracting the marker for a post-relist mutation. Count this pass
+            // only when that exact identity spans all cleanup work, so a
+            // clear/mutate/republish ABA cycle cannot preserve prior progress.
+            let proof_progress = proof_window.observe_pass(
+                Some(proof_before),
+                context.registry_sync_proof(),
+                host_pass_complete,
+                pod_complete_fingerprint,
+            );
+            if !proof_progress.proof_is_valid() {
                 set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
                 set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
                 ticker.tick().await;
@@ -12144,7 +12143,7 @@ async fn run_ambient_udp_placement_cleanup(
             let phase =
                 if failure_reason == Some(UdpMigrationFailureReason::GateAcknowledgementMissing) {
                     UdpMigrationStatusPhase::WaitingForGateAck
-                } else if !pod_complete {
+                } else if !proof_progress.pod_complete() {
                     UdpMigrationStatusPhase::CleaningPodNetns
                 } else {
                     UdpMigrationStatusPhase::CleaningHostNetns
@@ -12156,8 +12155,8 @@ async fn run_ambient_udp_placement_cleanup(
                 clear_failure();
             }
 
-            if host_complete && pod_complete {
-                match context.mark_cleanup_complete() {
+            if let Some(proof) = proof_progress.completion_proof() {
+                match context.mark_cleanup_complete(proof) {
                     Ok(()) => {
                         set_phase(UdpMigrationStatusPhase::CleanupComplete, 0);
                         clear_failure();
@@ -12176,6 +12175,7 @@ async fn run_ambient_udp_placement_cleanup(
                         }
                     }
                     Err(error) => {
+                        proof_window.invalidate();
                         set_failure(UdpMigrationFailureReason::StatePersistenceFailed);
                         warn!(
                             %error,
@@ -12184,6 +12184,10 @@ async fn run_ambient_udp_placement_cleanup(
                     }
                 }
             }
+        } else {
+            proof_window.invalidate();
+            set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
+            set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
         }
 
         tokio::select! {

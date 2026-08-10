@@ -6,8 +6,9 @@ use ferrum_edge::proxy::netns_capture::{
 };
 use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpCleanupManager};
 use ferrum_edge::proxy::udp_placement_migration::{
-    UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement, UdpPlacementDecision,
-    UdpPlacementRequest, clear_registry_sync_marker, prepare_placement,
+    UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement,
+    UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof, clear_registry_sync_marker,
+    prepare_placement,
     publish_registry_sync_marker_for_pods,
 };
 
@@ -94,6 +95,31 @@ fn cleanup_context(
     }
 }
 
+fn publish_registry_proof(
+    context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
+) -> UdpRegistrySyncProof {
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            context.registry_dir(),
+            context.generation(),
+            &HashSet::new(),
+        ),
+        Ok(true)
+    );
+    context
+        .registry_sync_proof()
+        .expect("current registry publication proof")
+}
+
+fn complete_cleanup(
+    context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
+) {
+    let proof = publish_registry_proof(context);
+    context
+        .mark_cleanup_complete(&proof)
+        .expect("publish cleanup proof");
+}
+
 #[test]
 fn direct_pod_to_host_flip_is_rejected_before_host_producer_admission() {
     let registry = tempfile::tempdir().expect("registry");
@@ -139,9 +165,7 @@ fn pod_to_host_cleanup_resumes_and_finalize_requires_durable_completion() {
         UdpPlacement::HostNetns,
     );
     assert!(prepare_placement(registry.path(), &finalize).is_err());
-    resumed
-        .mark_cleanup_complete()
-        .expect("publish cleanup proof");
+    complete_cleanup(&resumed);
     let completed_restart = cleanup_context(registry.path(), &cleanup);
     assert_eq!(completed_restart.generation(), "rollout-42");
     assert!(matches!(
@@ -220,9 +244,7 @@ fn host_to_pod_cleanup_and_finalize_are_symmetric() {
         UdpPlacement::HostNetns,
     );
     let context = cleanup_context(registry.path(), &bootstrap_cleanup);
-    context
-        .mark_cleanup_complete()
-        .expect("host bootstrap proof");
+    complete_cleanup(&context);
     prepare_placement(
         registry.path(),
         &transition(
@@ -242,7 +264,7 @@ fn host_to_pod_cleanup_and_finalize_are_symmetric() {
     );
     let context = cleanup_context(registry.path(), &reverse);
     assert!(prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns)).is_err());
-    context.mark_cleanup_complete().expect("host cleanup proof");
+    complete_cleanup(&context);
     prepare_placement(
         registry.path(),
         &transition(
@@ -286,7 +308,7 @@ fn enabled_disabled_transitions_also_require_cleanup_and_finalize() {
                     UdpPlacement::HostNetns,
                 ),
             );
-            bootstrap.mark_cleanup_complete().expect("bootstrap proof");
+            complete_cleanup(&bootstrap);
             prepare_placement(
                 registry.path(),
                 &transition(
@@ -305,7 +327,7 @@ fn enabled_disabled_transitions_also_require_cleanup_and_finalize() {
             registry.path(),
             &transition(UdpMigrationPhase::Cleanup, generation, from, to),
         );
-        context.mark_cleanup_complete().expect("cleanup proof");
+        complete_cleanup(&context);
         prepare_placement(
             registry.path(),
             &transition(UdpMigrationPhase::Finalize, generation, from, to),
@@ -369,9 +391,7 @@ fn completed_generation_cannot_authorize_a_later_cleanup_transition() {
         UdpPlacement::PodNetns,
         UdpPlacement::HostNetns,
     );
-    cleanup_context(registry.path(), &first)
-        .mark_cleanup_complete()
-        .expect("first cleanup proof");
+    complete_cleanup(&cleanup_context(registry.path(), &first));
     prepare_placement(
         registry.path(),
         &transition(
@@ -409,19 +429,89 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
             UdpPlacement::HostNetns,
         ),
     );
-    assert!(!context.registry_is_synchronized());
+    assert!(context.registry_sync_proof().is_none());
     assert_eq!(
         publish_registry_sync_marker_for_pods(registry.path(), "generation-b", &HashSet::new(),),
         Ok(true)
     );
-    assert!(!context.registry_is_synchronized());
+    assert!(context.registry_sync_proof().is_none());
     assert_eq!(
         publish_registry_sync_marker_for_pods(registry.path(), "generation-a", &HashSet::new(),),
         Ok(true)
     );
-    assert!(context.registry_is_synchronized());
+    assert!(context.registry_sync_proof().is_some());
     clear_registry_sync_marker(registry.path()).expect("restart retraction");
-    assert!(!context.registry_is_synchronized());
+    assert!(context.registry_sync_proof().is_none());
+}
+
+#[test]
+fn same_generation_registry_republication_has_a_distinct_proof() {
+    let registry = tempfile::tempdir().expect("registry");
+    let context = cleanup_context(
+        registry.path(),
+        &transition(
+            UdpMigrationPhase::Cleanup,
+            "generation-a",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+    );
+    let first = publish_registry_proof(&context);
+    let second = publish_registry_proof(&context);
+    assert!(
+        first != second,
+        "each publication must identify a new registry snapshot even for the same generation"
+    );
+}
+
+#[test]
+fn registry_proof_change_resets_repeated_passes_and_blocks_finalize() {
+    let registry = tempfile::tempdir().expect("registry");
+    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .expect("bootstrap placement");
+    let cleanup = transition(
+        UdpMigrationPhase::Cleanup,
+        "generation-a",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    let first_proof = publish_registry_proof(&context);
+    let mut window = UdpCleanupProofWindow::new(true, true);
+    let first_pass = window.observe_pass(
+        Some(first_proof.clone()),
+        Some(first_proof.clone()),
+        true,
+        Some(7),
+    );
+    assert!(!first_pass.host_complete());
+    assert!(!first_pass.pod_complete());
+
+    let replacement_proof = publish_registry_proof(&context);
+    let changed_pass = window.observe_pass(
+        Some(first_proof.clone()),
+        Some(replacement_proof.clone()),
+        true,
+        Some(7),
+    );
+    assert!(!changed_pass.proof_is_valid());
+    let first_replacement_pass = window.observe_pass(
+        Some(replacement_proof.clone()),
+        Some(replacement_proof),
+        true,
+        Some(7),
+    );
+    assert!(!first_replacement_pass.host_complete());
+    assert!(!first_replacement_pass.pod_complete());
+    assert!(context.mark_cleanup_complete(&first_proof).is_err());
+
+    let finalize = transition(
+        UdpMigrationPhase::Finalize,
+        "generation-a",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    assert!(prepare_placement(registry.path(), &finalize).is_err());
 }
 
 #[test]

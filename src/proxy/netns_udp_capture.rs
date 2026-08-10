@@ -1311,8 +1311,8 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
 
     /// Run one exact-name, dual-stack predecessor cleanup pass and return only
     /// bounded progress. A migration supervisor requires two identical complete
-    /// passes after the node-agent's generation-bound registry relist marker
-    /// before it persists completion.
+    /// passes under one exact node-agent registry publication proof before it
+    /// persists completion.
     pub async fn migration_cleanup_once(&mut self) -> NetnsUdpCleanupProgress {
         let targets = match self.source.list_targets_for_migration() {
             Ok(targets) => targets,
