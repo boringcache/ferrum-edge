@@ -743,11 +743,13 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
         std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
     );
     stream.destination_port = Some(15001);
+    stream.connection_destination_port = Some(9080);
     port_only.on_stream_connect(&mut stream).await;
     let meta = stream.metadata.as_ref().expect("metadata");
     assert_eq!(
         meta.get("mesh.destination.port").map(String::as_str),
-        Some("15001")
+        Some("9080"),
+        "stream metrics must prefer the trusted original destination used by authz"
     );
     assert!(!meta.contains_key("mesh.request.host"));
     assert!(!meta.contains_key("mesh.request.method"));

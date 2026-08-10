@@ -22,7 +22,8 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
-    mesh_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
+    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
+    parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -1098,7 +1099,12 @@ impl Plugin for WorkloadMetrics {
         metadata.remove(MESH_REQUEST_HOST_METADATA);
         metadata.remove(MESH_REQUEST_METHOD_METADATA);
         if self.cel_stamp_needs.destination_port {
-            if let Some(port) = ctx.destination_port.filter(|port| *port != 0) {
+            let port = mesh_stream_authz_destination_port(
+                ctx.connection_destination_port,
+                ctx.destination_port,
+                ctx.listen_port,
+            );
+            if port != 0 {
                 metadata.insert(MESH_DESTINATION_PORT_METADATA.to_string(), port.to_string());
             } else {
                 metadata.remove(MESH_DESTINATION_PORT_METADATA);
