@@ -1802,7 +1802,7 @@
   {
     "name": "ferrum_mesh_metric_series_overflow_total",
     "type": "counter",
-    "help": "Mesh metric series admissions dropped because the per-family live-series budget was exhausted (exact CEL values retained until the budget; overflow has fixed family labels only).",
+    "help": "Mesh metric series admissions dropped because the per-family live-series budget (prometheus_metrics.mesh_series_budget_per_family) was exhausted. The budget is shared by ordinary identity series and CEL-derived keys; overflow has fixed family labels only.",
     "labels": [
       "family",
       "gateway_namespace"

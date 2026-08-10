@@ -15071,6 +15071,20 @@ components:
           type: integer
           default: 3600
           description: How long idle metric entries live before eviction (seconds). Prevents unbounded memory growth from deleted/recreated proxies
+        mesh_series_budget_per_family:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 1000000
+          default: 10000
+          description: >
+            Hard ceiling on live MeshRequestKey series retained per mesh metric
+            family in the process-wide MetricsRegistry. Shared by ordinary mesh
+            identity dimensions and CEL-derived dimensions: newly observed keys
+            beyond the budget are dropped until stale_entry_ttl_seconds eviction
+            frees capacity, and counted on
+            ferrum_mesh_metric_series_overflow_total{family}. 0 is rejected —
+            there is no unlimited mode.
         cache_invalidation_min_age_ms:
           type: integer
           default: 500
@@ -17760,9 +17774,11 @@ components:
                       `workload_metrics` instances, inputs are stamped from the
                       union required by the final composed per-family plans;
                       replacing one family also replaces that family's input
-                      requirements. Exact CEL label values are
-                      admitted under a finite per-family live-series budget
-                      (default 10_000 distinct keys); further distinct keys are
+                      requirements. Exact CEL label values and ordinary mesh
+                      identity series share a finite per-family live-series
+                      budget configured on the global `prometheus_metrics`
+                      plugin as `mesh_series_budget_per_family` (default
+                      10_000, range 1–1_000_000); further distinct keys are
                       dropped and counted on
                       `ferrum_mesh_metric_series_overflow_total{family}` with
                       fixed family labels only. Stale TTL eviction releases

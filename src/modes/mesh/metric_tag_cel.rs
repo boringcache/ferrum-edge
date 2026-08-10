@@ -23,6 +23,11 @@
 //! | `response.code` | int | HTTP/gRPC response status |
 //! | `destination.port` | int | internal metric CEL stamp (same resolution as mesh authz) |
 //!
+//! `has(<string attribute>)` tests presence in the evaluation context. Mesh-key
+//! string attributes default to the sentinel `unknown` and are therefore always
+//! present — `has(source.workload)` does not test attribution resolution. Only
+//! `request.method` and `request.host` can be absent.
+//!
 //! HTTP-only attributes (`request.method`, `request.host`, `response.code`) are
 //! rejected when the override targets a TCP metric family or `ALL_METRICS`
 //! (TCP families cannot authoritatively observe them). Headers, body bytes,

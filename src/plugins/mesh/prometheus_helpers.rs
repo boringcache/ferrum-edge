@@ -1507,7 +1507,13 @@ fn apply_metric_override_plan(
         let Some(op) = plan.as_bytes().first().copied() else {
             return;
         };
-        plan = &plan[1..];
+        // Defensive: a hostile/corrupt plan may place a multibyte UTF-8 lead
+        // byte where an ASCII opcode is expected. `str::get` fails closed
+        // instead of panicking on a non-char-boundary index.
+        let Some(rest) = plan.get(1..) else {
+            return;
+        };
+        plan = rest;
         match op {
             b'r' => {
                 let Some((index, rest)) = take_number_until(plan, b';') else {
@@ -1611,13 +1617,11 @@ fn apply_metric_override_plan(
                         connection_security_policy: attribution.connection_security_policy.as_ref(),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
-                        response_code: extras.response_code.or((attribution
-                            .response_code_override
-                            .is_none()
-                            && attribution.removed_labels
-                                & (1u16 << MeshMetricLabel::ResponseCode.index())
-                                == 0)
-                            .then_some(attribution.response_code)),
+                        // HTTP/gRPC summaries stamp extras.response_code.
+                        // Stream/TCP paths leave it None: TCP families reject
+                        // HTTP-only `response.code` at admission, so there is
+                        // no stream-side response-code evaluation path.
+                        response_code: extras.response_code,
                         destination_port: extras.destination_port,
                     };
                     let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {
@@ -1669,7 +1673,8 @@ fn skip_compact_metric_tag_cel_prefix(
     }
     *nodes += 1;
     let op = body.as_bytes().first().copied()?;
-    *body = &body[1..];
+    // Fail closed on non-char-boundary indexes (malformed multibyte lead byte).
+    *body = body.get(1..)?;
     match op {
         b'L' => {
             let (length, rest) = take_number_until(body, b':')?;
@@ -1706,7 +1711,8 @@ fn evaluate_compact_metric_tag_cel_prefix(
     ctx: MetricTagCelContext<'_>,
 ) -> Option<String> {
     let op = body.as_bytes().first().copied()?;
-    *body = &body[1..];
+    // Fail closed on non-char-boundary indexes (malformed multibyte lead byte).
+    *body = body.get(1..)?;
     match op {
         b'L' => {
             let (length, rest) = take_number_until(body, b':')?;
@@ -2376,6 +2382,63 @@ mod tests {
         base_c.source_workload = Arc::from("checkout");
         let key_c = mesh_request_key_for_family(&summary, &base_c, MeshMetricFamily::RequestCount);
         assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn malformed_multibyte_override_opcode_fails_closed_without_panic() {
+        // `é` is UTF-8 C3 A9. Reading the lead byte then slicing at index 1
+        // would panic on a char-boundary check; defensive parsing must return.
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                "m0;é".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+        let base = mesh_key();
+        let key = mesh_request_key_for_family(&summary, &base, MeshMetricFamily::RequestCount);
+        assert_eq!(key, base);
+    }
+
+    #[test]
+    fn malformed_multibyte_compact_cel_body_fails_closed_without_panic() {
+        // UPSERT CEL body whose first byte is a multibyte lead (`é` = C3 A9).
+        // Length is UTF-8 bytes so the body slice is well-formed as a str, but
+        // opcode consumption must not panic mid-character.
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                "m0;x0,2:é;".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+        let base = mesh_key();
+        let key = mesh_request_key_for_family(&summary, &base, MeshMetricFamily::RequestCount);
+        assert_eq!(key, base);
+        assert!(!compact_metric_tag_cel_is_valid("é"));
+        assert!(evaluate_compact_metric_tag_cel(
+            "é",
+            MetricTagCelContext {
+                source_workload: "frontend",
+                source_namespace: "default",
+                source_principal: "source-principal",
+                source_app: "frontend",
+                source_service: "frontend",
+                destination_workload: "backend",
+                destination_namespace: "default",
+                destination_principal: "destination-principal",
+                destination_app: "backend",
+                destination_service: "backend",
+                request_protocol: "http",
+                response_flags: "-",
+                connection_security_policy: "mutual_tls",
+                request_method: Some("GET"),
+                request_host: Some("example"),
+                response_code: Some(200),
+                destination_port: Some(8080),
+            }
+        )
+        .is_none());
     }
 
     #[test]

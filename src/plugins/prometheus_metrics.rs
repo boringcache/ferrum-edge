@@ -561,12 +561,21 @@ const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
 /// Default live-series budget per mesh metric family (`MeshRequestKey` entries
-/// retained in that family's DashMap). Exact CEL UPSERT label values are
-/// admitted until this live count; further distinct keys are dropped and
-/// counted on the fixed-cardinality overflow series. Stale TTL eviction
-/// releases capacity. Sized for large meshes while bounding attacker-controlled
-/// CEL cardinality (`request.host` / custom methods rewritten into labels).
+/// retained in that family's DashMap). Shared by ordinary mesh identity
+/// dimensions and CEL-derived dimensions: newly observed keys are admitted
+/// until this live count; further distinct keys are dropped and counted on the
+/// fixed-cardinality overflow series. Stale TTL eviction releases capacity.
+/// Sized for large meshes while bounding attacker-controlled CEL cardinality
+/// (`request.host` / custom methods rewritten into labels).
 pub const DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY: usize = 10_000;
+
+/// Inclusive lower bound for [`DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY`] /
+/// `mesh_series_budget_per_family`. `0` is rejected — there is no unlimited mode.
+pub const MIN_MESH_SERIES_BUDGET_PER_FAMILY: usize = 1;
+
+/// Inclusive upper bound for `mesh_series_budget_per_family`. Keeps the
+/// process-wide DashMap footprint finite even if every family is filled.
+pub const MAX_MESH_SERIES_BUDGET_PER_FAMILY: usize = 1_000_000;
 
 /// Exact per-family live-series accounting for mesh RED/TCP/gRPC maps.
 ///
@@ -767,7 +776,10 @@ pub struct MetricsRegistry {
     /// Per-family live `MeshRequestKey` series budget (exact atomic accounting).
     mesh_series_budget_per_family: AtomicUsize,
     /// Live count + overflow totals for each [`prometheus_helpers::MeshMetricFamily`].
-    mesh_series_budgets: [CachePadded<MeshFamilySeriesBudget>; 10],
+    /// Length is tied to [`prometheus_helpers::MeshMetricFamily::ALL`] so a new
+    /// family cannot silently leave the budget array short.
+    mesh_series_budgets:
+        [CachePadded<MeshFamilySeriesBudget>; prometheus_helpers::MeshMetricFamily::ALL.len()],
 }
 
 impl Default for MetricsRegistry {
@@ -861,6 +873,7 @@ impl MetricsRegistry {
         render_cache_ttl_secs: u64,
         stale_entry_ttl_secs: u64,
         cache_invalidation_min_age_ms: u64,
+        mesh_series_budget_per_family: usize,
         namespace: &str,
     ) {
         self.render_cache_ttl_secs
@@ -872,6 +885,13 @@ impl MetricsRegistry {
         self.cache_invalidation_min_age_nanos.store(
             cache_invalidation_min_age_ms.saturating_mul(1_000_000),
             Ordering::Relaxed,
+        );
+        self.mesh_series_budget_per_family.store(
+            mesh_series_budget_per_family.clamp(
+                MIN_MESH_SERIES_BUDGET_PER_FAMILY,
+                MAX_MESH_SERIES_BUDGET_PER_FAMILY,
+            ),
+            Ordering::Release,
         );
         // Set namespace label fragment for every namespace.
         if let Ok(mut ns_label) = self.namespace_label.write() {
@@ -1780,11 +1800,24 @@ impl MetricsRegistry {
     }
 
     /// Lower the per-family mesh series budget for focused cardinality tests.
+    /// Clamps into the same nonzero bounded range as production config.
     #[doc(hidden)]
     #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn set_mesh_series_budget_per_family_for_test(&self, budget: usize) {
-        self.mesh_series_budget_per_family
-            .store(budget.max(1), Ordering::Release);
+        self.mesh_series_budget_per_family.store(
+            budget.clamp(
+                MIN_MESH_SERIES_BUDGET_PER_FAMILY,
+                MAX_MESH_SERIES_BUDGET_PER_FAMILY,
+            ),
+            Ordering::Release,
+        );
+    }
+
+    /// Current per-family mesh series budget (exact admission ceiling).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn mesh_series_budget_per_family_for_test(&self) -> usize {
+        self.mesh_series_budget_per_family.load(Ordering::Acquire)
     }
 
     /// Live admitted series for one mesh family (exact reservation count).
@@ -2586,7 +2619,7 @@ impl MetricsRegistry {
             .sum();
         if mesh_overflow_total > 0 {
             output.push_str(
-                "# HELP ferrum_mesh_metric_series_overflow_total Mesh metric series admissions dropped because the per-family live-series budget was exhausted (exact CEL values retained until the budget; overflow has fixed family labels only).\n",
+                "# HELP ferrum_mesh_metric_series_overflow_total Mesh metric series admissions dropped because the per-family live-series budget (prometheus_metrics.mesh_series_budget_per_family) was exhausted. The budget is shared by ordinary identity series and CEL-derived keys; overflow has fixed family labels only.\n",
             );
             output.push_str("# TYPE ferrum_mesh_metric_series_overflow_total counter\n");
             for family in prometheus_helpers::MeshMetricFamily::ALL {
@@ -3983,6 +4016,29 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
     }
 }
 
+/// Read `mesh_series_budget_per_family`, rejecting `0` and values above the
+/// documented ceiling. There is no unlimited mode: the budget always remains a
+/// nonzero finite cap shared by ordinary identity series and CEL-derived keys.
+fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, String> {
+    let value = optional_u64(
+        config,
+        "mesh_series_budget_per_family",
+        DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY as u64,
+    )?;
+    let min = MIN_MESH_SERIES_BUDGET_PER_FAMILY as u64;
+    let max = MAX_MESH_SERIES_BUDGET_PER_FAMILY as u64;
+    if !(min..=max).contains(&value) {
+        return Err(format!(
+            "prometheus_metrics: 'mesh_series_budget_per_family' must be between \
+             {min} and {max} (inclusive); 0 is rejected because the mesh series \
+             budget has no unlimited mode"
+        ));
+    }
+    usize::try_from(value).map_err(|_| {
+        format!("prometheus_metrics: 'mesh_series_budget_per_family' ({value}) exceeds this platform's usize")
+    })
+}
+
 impl PrometheusMetrics {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
         if !(config.is_object() || config.is_null()) {
@@ -4014,11 +4070,13 @@ impl PrometheusMetrics {
             "cache_invalidation_min_age_ms",
             DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
         )?;
+        let mesh_series_budget_per_family = optional_mesh_series_budget_per_family(config)?;
 
         registry.configure(
             render_cache_ttl_secs,
             stale_entry_ttl_secs,
             cache_invalidation_min_age_ms,
+            mesh_series_budget_per_family,
             namespace,
         );
 
