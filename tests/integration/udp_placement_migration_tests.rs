@@ -290,6 +290,22 @@ fn malformed_or_non_regular_durable_state_fails_closed() {
     assert!(error.contains("unsupported version"));
 }
 
+#[test]
+fn semantically_inconsistent_durable_state_fails_closed() {
+    let registry = tempfile::tempdir().expect("registry");
+    let state = registry.path().join(".udp-placement-state-v1.json");
+    std::fs::write(
+        state,
+        br#"{"version":1,"active":"pod-netns","pending":null,"completed":{"generation":"completed-host","from":"pod-netns","to":"host-netns"}}"#,
+    )
+    .expect("inconsistent state fixture");
+
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .err()
+        .expect("inconsistent completed ownership must not admit a producer");
+    assert!(error.contains("inconsistent completed ownership"));
+}
+
 #[cfg(unix)]
 #[test]
 fn linked_durable_state_is_rejected_without_guessing_ownership() {

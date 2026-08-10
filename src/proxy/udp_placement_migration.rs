@@ -595,7 +595,38 @@ fn read_state(registry_dir: &Path) -> Result<Option<DurablePlacementState>, Stri
     if state.version != 1 {
         return Err("Ambient UDP migration state has an unsupported version".to_string());
     }
+    validate_durable_state(&state)?;
     Ok(Some(state))
+}
+
+fn validate_durable_state(state: &DurablePlacementState) -> Result<(), String> {
+    let validate_transition = |transition: &UdpMigrationTransition| {
+        validate_generation(&transition.generation)
+            .map_err(|_| "Ambient UDP migration state has an invalid generation".to_string())?;
+        if transition.from == transition.to {
+            return Err(
+                "Ambient UDP migration state has an invalid no-op transition".to_string(),
+            );
+        }
+        Ok(())
+    };
+
+    if let Some(pending) = &state.pending {
+        validate_transition(&pending.transition)?;
+        if state.active != pending.transition.from || state.completed.is_some() {
+            return Err(
+                "Ambient UDP migration state has inconsistent pending ownership".to_string(),
+            );
+        }
+    } else if let Some(completed) = &state.completed {
+        validate_transition(completed)?;
+        if state.active != completed.to {
+            return Err(
+                "Ambient UDP migration state has inconsistent completed ownership".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_state(registry_dir: &Path, state: &DurablePlacementState) -> Result<(), String> {
