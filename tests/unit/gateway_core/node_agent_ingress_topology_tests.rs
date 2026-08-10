@@ -11,8 +11,7 @@ use ferrum_edge::_test_support::{
     node_agent_cni_capture_readiness_rejection_for_test,
     node_agent_cni_topology_readiness_rejection_for_test,
     run_with_node_agent_topology_outcome_stream_for_test,
-    set_node_agent_startup_readiness_for_test,
-    spawn_node_agent_ingress_topology_monitor_for_test,
+    set_node_agent_startup_readiness_for_test, spawn_node_agent_ingress_topology_monitor_for_test,
 };
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::rpc::RpcVerb;
@@ -1278,22 +1277,12 @@ fn cni_add_check_and_status_require_the_udp_migration_proof() {
         );
     }
     assert_eq!(
-        node_agent_cni_capture_readiness_rejection_for_test(
-            RpcVerb::Del,
-            true,
-            false,
-            false,
-        ),
+        node_agent_cni_capture_readiness_rejection_for_test(RpcVerb::Del, true, false, false,),
         None,
         "cleanup must remain available while either readiness proof is unavailable",
     );
     assert_eq!(
-        node_agent_cni_capture_readiness_rejection_for_test(
-            RpcVerb::Gc,
-            true,
-            false,
-            false,
-        ),
+        node_agent_cni_capture_readiness_rejection_for_test(RpcVerb::Gc, true, false, false,),
         None,
         "post-sync GC must remain available while either readiness proof is unavailable",
     );
