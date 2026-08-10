@@ -10604,7 +10604,11 @@ components:
           default: {}
           additionalProperties:
             type: string
-          description: Arbitrary key-value tags
+          description: |
+            Operator-defined key-value tags. Keys beginning with `mesh.` are
+            reserved for Ferrum's trusted mesh projection and are rejected on
+            upstream create/update, API-spec import, restore, and file-config
+            admission; ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
