@@ -16246,7 +16246,36 @@ components:
                 default: 5000
               max_cache_entries:
                 type: integer
+                format: uint64
                 default: 10000
+                minimum: 100
+                maximum: 100000
+                description: >-
+                  Per-provider hard entry ceiling. Active and negative entries
+                  receive independent 75/25 count partitions, so one result
+                  class cannot evict the other class.
+              max_cache_entry_bytes:
+                type: integer
+                format: uint64
+                default: 16384
+                minimum: 256
+                maximum: 65536
+                description: >-
+                  Maximum normalized active authorization-result bytes retained
+                  for one token. A larger valid result is used for the current
+                  request but is not cached.
+              max_cache_total_bytes:
+                type: integer
+                format: uint64
+                default: 16777216
+                minimum: 1048576
+                maximum: 67108864
+                description: >-
+                  Per-provider hard retained-byte ceiling covering fixed
+                  eviction indexes, token digests, entry state, and normalized
+                  authorization data. Must be at least the constructor-reported
+                  minimum footprint for max_cache_entries plus one
+                  max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
               required_scopes:
