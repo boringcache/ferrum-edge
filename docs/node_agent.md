@@ -83,7 +83,10 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_attach_errors_total` | BPF attachment or map update failures. |
 | `ferrum_node_agent_pod_annotation_updates_applied_total` | Mid-life `includeOutboundPorts` annotation changes successfully re-applied to the BPF map (excludes initial enrollment, excludes diff-skipped Modified events). |
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | Mid-life `includeOutboundPorts` annotation changes that failed to re-apply (annotation parse error or BPF map write error). The pod retains its previous policy. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are not counted here — they are retried on the next Apply event. |
-| `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge is attached. |
+| `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, `interface_topology_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge and any configured ingress-interface topology are proved. |
+| `ferrum_node_agent_ingress_interface_topology{state,reason}` | Gauge for the optional NodeWaypoint ingress-interface proof. `state` and `reason` are closed sets; configured interface names, route destinations, node addresses, and other host/Kubernetes values are never labels. |
+| `ferrum_node_agent_ingress_interface_{configured,expected}_count` | Bounded counts for the explicit operator set and the complete route-derived set. Names are deliberately omitted. |
+| `ferrum_node_agent_ingress_interface_family_{required,covered}{family}` | Closed `ipv4`/`ipv6` gauges showing which families the capture listener requires and whether the current topology proof covers them. |
 | `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
 
 The NodeWaypoint proxy's authenticated `/metrics` additionally exposes
@@ -484,6 +487,42 @@ kubelet health checking never depends on the relay being up. A pod that declares
 no inbound TCP port is never flagged, and traffic to an enrolled pod on an
 undeclared port is left to the direct-pod guard.
 
+#### Interface topology proof and drift handling
+
+A successful tc attach is necessary but is not readiness evidence. Before the
+initial pod relist can advertise readiness, the node-agent lists a bounded Node
+set (maximum 256), reads each remote Node's PodCIDRs and Internal/External IPs,
+and resolves the complete required interface set from the host IPv4/IPv6 route
+tables. The configured set must equal that proved set exactly for every family
+served by the transparent capture listener. This covers a single uplink,
+dual-stack, and multiple route-selected uplinks without choosing an interface
+on the operator's behalf.
+
+The supported topology is symmetric routed node/CNI traffic: each remote
+PodCIDR and its Node address must resolve into the same proved ingress set. A
+split route, equal-cost ambiguity, missing family, overlay shape whose inner and
+outer devices diverge, or a route table above the fixed ingestion bounds is
+unproved and therefore unavailable. Ferrum never guesses which side of an
+overlay owns the hook and never broadens attachment to every interface.
+
+Every explicitly configured and route-selected device must exist, have a safe
+Linux interface name, be administratively and operationally up with carrier,
+be non-loopback, and have a supported L3 link shape. Linux bridges, bonds,
+self-linked virtual devices such as dummy links, and tun/tap devices are refused
+by this routed-topology implementation. An existing management device that has
+no proved remote PodCIDR route role is also refused as an unexpected/wrong
+interface rather than accepted because tc can attach to it.
+
+The same proof reruns every five seconds with a two-second per-pass timeout,
+bounded Node/route/interface work, and no request-path locks. Link-down, route
+replacement, family loss, or Node topology drift withdraws `/health` readiness
+on the next bounded pass and changes capture state to
+`interface_topology_unavailable`; recovery restores readiness only after both
+the topology and the initial pod relist are proved. The classifier remains
+scoped to the explicit configured set throughout, so drift cannot trigger
+implicit direct-pod fallback or broader node capture. CNI STATUS shares the
+same readiness bit and fails closed while the proof is unavailable.
+
 Fragmented IPv4 datagrams are declined outright, before any port is read: only
 the first fragment carries the TCP ports at all, and a *non-first* fragment's
 payload begins with arbitrary application bytes that would otherwise be parsed
@@ -753,12 +792,11 @@ skip-or-fail gate as the rest of the live suite, so under
 `FERRUM_LIVE_TESTS_REQUIRED=1` a runner or kernel that cannot support the
 mechanism fails the gate rather than reporting the feature ready.
 
-Residual risks: the `ip rule` priority is evaluated ahead of `main` and the table is
-Ferrum-owned, but a cluster running its own low-priority rules could still order
-ahead of it (verified only by the rule-shape unit tests); and the attach point is
-operator-supplied, so naming the wrong interface yields no redirect (traffic
-simply never reaches the hook) rather than a wrong one, with no auto-detection
-or validation.
+Residual risk: the `ip rule` priority is evaluated ahead of `main` and the table
+is Ferrum-owned, but a cluster running its own lower-numbered rules could still
+order ahead of it (verified only by the rule-shape unit tests). The attach point
+remains operator-supplied; the node-agent proves that exact set or withholds
+readiness, but deliberately does not auto-select or rewrite it.
 
 Because the relay dials backend pods from a node-local source address, at least
 one trusted node source IP (`FERRUM_NODE_AGENT_NODE_IP` /
@@ -896,7 +934,7 @@ STATUS reports whether that node-agent + Kubernetes API dependency is ready for 
 
 - **Version gate.** `STATUS` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on STATUS with an unsupported-version error.
 - **No attachment fields.** STATUS does not carry `CNI_CONTAINERID` / `CNI_IFNAME` / `CNI_NETNS` / `CNI_ARGS`, and must not include `cni.dev/valid-attachments` or other reserved `cni.dev/` keys.
-- **Fail-closed readiness.** Success (exit 0, empty stdout) means the node-agent CNI socket answered, the main loop has completed initial pod sync, **and** a live read-only Kubernetes API readiness probe succeeded (node-scoped pods `list` with `limit=1`, bounded by the same 750ms budget as CNI ADD metadata fetch, well under the 5s CNI RPC timeout). That probe proves the ADD dependency can reach the API with the node-agent's existing get/list/watch permissions; it does not mutate enrollment, BPF, ownership, or GC state. Socket/IPC failure, incomplete initial sync, or a failed/timed-out Kubernetes probe maps to CNI error code 50 (`plugin is not available`) without echoing socket paths, Kubernetes errors, URLs, tokens, namespaces, or other raw dependency detail.
+- **Fail-closed readiness.** Success (exit 0, empty stdout) means the node-agent CNI socket answered, the main loop has completed initial pod sync, any configured NodeWaypoint ingress-interface topology is currently proved, **and** a live read-only Kubernetes API readiness probe succeeded (node-scoped pods `list` with `limit=1`, bounded by the same 750ms budget as CNI ADD metadata fetch, well under the 5s CNI RPC timeout). That probe proves the ADD dependency can reach the API with the node-agent's existing get/list/watch permissions; it does not mutate enrollment, BPF, ownership, or GC state. Socket/IPC failure, incomplete initial sync, an unproved ingress topology, or a failed/timed-out Kubernetes probe maps to CNI error code 50 (`plugin is not available`) without echoing socket paths, Kubernetes errors, URLs, tokens, namespaces, or other raw dependency detail.
 - **Informational only.** Per the CNI 1.1.0 spec, STATUS does not prevent ADD/DEL/CHECK/GC; those verbs remain independently handled.
 
 ### CNI 1.1 GC semantics

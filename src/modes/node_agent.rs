@@ -44,11 +44,16 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
+use crate::ebpf::ingress_topology::{
+    IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState, IngressTopologyStatus,
+    IngressTopologyValidator, MAX_CONFIGURED_INTERFACE_BYTES, MAX_CONFIGURED_INTERFACES,
+};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
     NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
@@ -76,6 +81,8 @@ const CNI_STATUS_KUBE_UNAVAILABLE_REASON: &str =
 const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
     "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const INGRESS_TOPOLOGY_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
+const INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
 // Verified handshakes need longer than the ordinary orphan grace for producer
@@ -352,7 +359,7 @@ impl NodeAgentConfig {
         // node-global iptables REDIRECT for enrolled workloads and needs an
         // explicit attach point, and silently guessing the uplink would be a
         // node-wide datapath change made on the node-agent's own initiative.
-        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env();
+        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env()?;
         capture_contract.node_waypoint_ingress_redirect_mark =
             if capture_contract.ingress_redirect_ifaces.is_empty() {
                 0
@@ -479,18 +486,43 @@ impl NodeAgentConfig {
 /// entirely. Entries are deduplicated because attaching the same classifier
 /// twice to one interface would install two filters that both try to
 /// `bpf_sk_assign` the same packet.
-fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
+fn node_agent_ingress_redirect_ifaces_from_env() -> Result<Vec<String>, String> {
     let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if raw.len() > MAX_CONFIGURED_INTERFACE_BYTES {
+        return Err(format!(
+            "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES exceeds the supported {}-byte bound",
+            MAX_CONFIGURED_INTERFACE_BYTES
+        ));
+    }
     let mut ifaces: Vec<String> = Vec::new();
     for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if name.len() > 15
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES contains an invalid interface name; \
+                 names must be 1..=15 bytes and use only ASCII letters, digits, '_', '-', '.', \
+                 or ':'"
+                    .to_string(),
+            );
+        }
         let name = name.to_string();
         if !ifaces.contains(&name) {
+            if ifaces.len() == MAX_CONFIGURED_INTERFACES {
+                return Err(format!(
+                    "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES exceeds the supported limit of {} \
+                     explicitly configured interfaces",
+                    MAX_CONFIGURED_INTERFACES
+                ));
+            }
             ifaces.push(name);
         }
     }
-    ifaces
+    Ok(ifaces)
 }
 
 /// Whether this node is configured for the NodeWaypoint inbound tc ingress
@@ -508,7 +540,13 @@ fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
 ///
 /// Evaluated once per listener plan / startup, never on a request path.
 pub fn node_waypoint_ingress_redirect_configured() -> bool {
-    !node_agent_ingress_redirect_ifaces_from_env().is_empty()
+    node_agent_ingress_redirect_ifaces_from_env()
+        .map(|interfaces| !interfaces.is_empty())
+        // Invalid non-empty input must not suppress the proxy listener while
+        // the node-agent rejects the same configuration. Returning true keeps
+        // the two-process contract fail-closed rather than silently disabling
+        // one half.
+        .unwrap_or(true)
 }
 
 /// Declared inbound TCP application ports for a pod, derived from its
@@ -1175,8 +1213,9 @@ async fn start_node_agent_admin_listeners(
         admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready),
-        // node_agent mode has no post-start listener supervision that flips
-        // readiness; readiness is governed by `startup_ready` alone.
+        // Node-agent readiness is governed by this shared flag. The pod relist
+        // raises it only while the ingress-interface topology proof is valid;
+        // the bounded drift monitor may lower it after startup.
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
@@ -1397,6 +1436,15 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
+    let topology_validator = IngressTopologyValidator::new(
+        config.capture_contract.ingress_redirect_ifaces.clone(),
+        config.node_name.clone(),
+        config.capture_contract.ingress_capture_supports_ipv6,
+    );
+    let topology_ready = Arc::new(AtomicBool::new(
+        !config.capture_contract.ingress_redirect_enabled(),
+    ));
+
     // `initialize_backend` is transactional: any post-`load_programs` failure
     // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
     // function owns cleanup exactly once through `InitializedBackendOwner`
@@ -1405,15 +1453,49 @@ async fn run_with_backend(
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
     let mut owner =
         InitializedBackendOwner::new(backend, config.capture_contract.ingress_redirect_enabled());
-
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
         Err(err) => return Err(owner.fail_with(err)),
     };
+    // A tc attach proves only that the configured link accepted the program.
+    // Keep startup readiness false until Kubernetes Node evidence and the host
+    // route/link snapshot prove that the complete explicit set is supported.
+    let initial_topology = if config.capture_contract.ingress_redirect_enabled() {
+        match tokio::time::timeout(
+            INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT,
+            topology_validator.validate(&client),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => topology_timeout_outcome(
+                topology_validator.configured_interfaces().len(),
+                config.capture_contract.ingress_capture_supports_ipv6,
+            ),
+        }
+    } else {
+        IngressTopologyOutcome {
+            status: IngressTopologyStatus::disabled(),
+            diagnostic: "inbound ingress redirect is disabled".to_string(),
+        }
+    };
+    apply_ingress_topology_outcome(
+        metrics.as_ref(),
+        topology_ready.as_ref(),
+        startup_ready.as_ref(),
+        false,
+        false,
+        &initial_topology,
+        "startup",
+    );
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    let topology_validator = config
+        .capture_contract
+        .ingress_redirect_enabled()
+        .then_some(topology_validator);
     run_with_pod_stream(
         &mut owner,
         config,
@@ -1422,10 +1504,92 @@ async fn run_with_backend(
         startup_ready,
         cni_config,
         Some(client),
+        topology_validator,
+        topology_ready,
         pod_stream,
         std::iter::empty(),
     )
     .await
+}
+
+fn topology_timeout_outcome(
+    configured_interfaces: usize,
+    require_ipv6: bool,
+) -> IngressTopologyOutcome {
+    IngressTopologyOutcome {
+        status: IngressTopologyStatus {
+            state: IngressTopologyState::Unavailable,
+            reason: IngressTopologyReason::ValidationTimeout,
+            configured_interfaces: u16::try_from(configured_interfaces).unwrap_or(u16::MAX),
+            expected_interfaces: 0,
+            ipv4_required: true,
+            ipv4_covered: false,
+            ipv6_required: require_ipv6,
+            ipv6_covered: false,
+        },
+        diagnostic: "NodeWaypoint ingress topology validation exceeded its two-second budget"
+            .to_string(),
+    }
+}
+
+fn apply_ingress_topology_outcome(
+    metrics: &NodeAgentMetrics,
+    topology_ready: &AtomicBool,
+    startup_ready: &AtomicBool,
+    initial_sync_complete: bool,
+    capture_failures_pending: bool,
+    outcome: &IngressTopologyOutcome,
+    phase: &'static str,
+) {
+    let previous = metrics.snapshot().ingress_topology;
+    metrics.set_ingress_topology(outcome.status);
+    let ready = outcome.status.is_ready();
+    topology_ready.store(ready, Ordering::Release);
+    if ready {
+        if initial_sync_complete {
+            startup_ready.store(true, Ordering::Release);
+        }
+        if metrics.snapshot().capture_state
+            == NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
+        {
+            metrics.set_capture_state(if capture_failures_pending {
+                NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+            } else {
+                NODE_AGENT_CAPTURE_STATE_READY
+            });
+        }
+        if previous.state != outcome.status.state || previous.reason != outcome.status.reason {
+            info!(
+                phase,
+                state = outcome.status.state.label(),
+                reason = outcome.status.reason.label(),
+                configured_interfaces = outcome.status.configured_interfaces,
+                expected_interfaces = outcome.status.expected_interfaces,
+                ipv4_covered = outcome.status.ipv4_covered,
+                ipv6_required = outcome.status.ipv6_required,
+                ipv6_covered = outcome.status.ipv6_covered,
+                "NodeWaypoint ingress interface topology is proved"
+            );
+        }
+    } else {
+        startup_ready.store(false, Ordering::Release);
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
+        if previous.state != outcome.status.state || previous.reason != outcome.status.reason {
+            warn!(
+                phase,
+                state = outcome.status.state.label(),
+                reason = outcome.status.reason.label(),
+                configured_interfaces = outcome.status.configured_interfaces,
+                expected_interfaces = outcome.status.expected_interfaces,
+                ipv4_required = outcome.status.ipv4_required,
+                ipv6_required = outcome.status.ipv6_required,
+                diagnostic = %outcome.diagnostic,
+                "NodeWaypoint ingress interface topology is unproved; readiness withdrawn. \
+                 Correct the explicit interface set or restore the node routes/link state; \
+                 Ferrum will not guess or broaden capture."
+            );
+        }
+    }
 }
 
 /// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
@@ -1455,6 +1619,7 @@ where
         enabled: false,
         socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
     };
+    let topology_ready = Arc::new(AtomicBool::new(true));
     run_with_pod_stream(
         &mut owner,
         config,
@@ -1463,6 +1628,8 @@ where
         startup_ready,
         cni_config,
         None,
+        None,
+        topology_ready,
         pod_stream,
         seed_pods,
     )
@@ -1478,6 +1645,8 @@ async fn run_with_pod_stream<S, I>(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
+    topology_validator: Option<IngressTopologyValidator>,
+    topology_ready: Arc<AtomicBool>,
     mut pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -1486,8 +1655,10 @@ where
     I: IntoIterator<Item = PodAttachmentState>,
 {
     // Caller must have already initialized the backend (`run_with_backend` or
-    // `run_with_pod_stream_for_test`) so production keeps init → kube-client
-    // ordering for cleanup-ownership compatibility with PR #3142.
+    // `run_with_pod_stream_for_test`). Production preserves the established
+    // init → Kubernetes-client cleanup ownership, then takes the initial
+    // topology snapshot before entering this loop. This loop owns only
+    // periodic revalidation and pod reconciliation.
     if cni_config.enabled && kube_client.is_none() {
         anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
     }
@@ -1499,6 +1670,7 @@ where
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut init_seen: Option<HashSet<String>> = None;
+    let mut initial_sync_complete = false;
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
     // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
@@ -1553,6 +1725,9 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    let mut ingress_topology_interval =
+        tokio::time::interval(INGRESS_TOPOLOGY_REVALIDATE_INTERVAL);
+    ingress_topology_interval.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
@@ -1619,8 +1794,20 @@ where
                                 &seen,
                             );
                         }
-                        startup_ready.store(true, Ordering::Release);
-                        info!("Node agent initial pod sync complete; /health now reports ready");
+                        initial_sync_complete = true;
+                        let ready = topology_ready.load(Ordering::Acquire);
+                        startup_ready.store(ready, Ordering::Release);
+                        if ready {
+                            info!(
+                                "Node agent initial pod sync and ingress topology proof complete; \
+                                 /health now reports ready"
+                            );
+                        } else {
+                            warn!(
+                                "Node agent initial pod sync complete, but the NodeWaypoint ingress \
+                                 interface topology is unproved; /health remains not ready"
+                            );
+                        }
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "Pod watcher error; kube-rs will retry");
@@ -1646,19 +1833,26 @@ where
                             });
                             continue;
                         };
-                        if matches!(work.request.verb, RpcVerb::Gc | RpcVerb::Status)
-                            && !startup_ready.load(Ordering::Acquire)
-                        {
+                        let maintenance_not_ready = match work.request.verb {
+                            RpcVerb::Gc => !initial_sync_complete,
+                            RpcVerb::Status => !startup_ready.load(Ordering::Acquire),
+                            _ => false,
+                        };
+                        if maintenance_not_ready {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
                             // pod_states is not authoritative enough to prove
                             // those keys unowned, so GC must retry later.
-                            // STATUS is fail-closed on the same gate: the
-                            // node-agent is not yet ready to authoritatively
-                            // service ADD against a complete local view.
+                            // STATUS additionally shares the topology readiness
+                            // gate and fails closed while either prerequisite is
+                            // unavailable for ADD.
                             let reason = match work.request.verb {
-                                RpcVerb::Status => {
+                                RpcVerb::Status if !initial_sync_complete => {
                                     "node-agent initial pod sync is incomplete; not ready for ADD"
+                                        .to_string()
+                                }
+                                RpcVerb::Status => {
+                                    "NodeWaypoint ingress interface topology is unproved; not ready for ADD"
                                         .to_string()
                                 }
                                 _ => {
@@ -1728,6 +1922,34 @@ where
                     &pod_states,
                     config,
                     metrics.as_ref(),
+                );
+            }
+            _ = ingress_topology_interval.tick(), if topology_validator.is_some() => {
+                let Some(validator) = topology_validator.as_ref() else {
+                    continue;
+                };
+                let Some(client) = kube_client.as_ref() else {
+                    continue;
+                };
+                let outcome = match tokio::time::timeout(
+                    INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT,
+                    validator.validate(client),
+                ).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => topology_timeout_outcome(
+                        validator.configured_interfaces().len(),
+                        config.capture_contract.ingress_capture_supports_ipv6,
+                    ),
+                };
+                apply_ingress_topology_outcome(
+                    metrics.as_ref(),
+                    topology_ready.as_ref(),
+                    startup_ready.as_ref(),
+                    initial_sync_complete,
+                    has_failed_pod_enrollments(&pod_states)
+                        || has_pending_capture_failures(&pod_states),
+                    &outcome,
+                    "runtime_revalidation",
                 );
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
@@ -1829,7 +2051,12 @@ fn clear_partial_capture_state_if_recovered(
         && !has_pending_capture_failures(pod_states)
         && metrics.snapshot().capture_state == NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
     {
-        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+        let topology = metrics.snapshot().ingress_topology;
+        metrics.set_capture_state(if topology.is_ready() {
+            NODE_AGENT_CAPTURE_STATE_READY
+        } else {
+            NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
+        });
     }
 }
 
@@ -7878,8 +8105,19 @@ fn initialize_backend_after_load(
         anyhow::bail!("node-agent eBPF startup validation failed: {e}");
     }
 
-    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
-    info!("BPF programs loaded and maps initialized");
+    if ingress_redirect_enabled {
+        metrics.set_ingress_topology(IngressTopologyStatus::validating(
+            config.capture_contract.ingress_redirect_ifaces.len(),
+            config.capture_contract.ingress_capture_supports_ipv6,
+        ));
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
+        info!(
+            "BPF programs loaded and maps initialized; NodeWaypoint ingress topology proof pending"
+        );
+    } else {
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+        info!("BPF programs loaded and maps initialized");
+    }
     Ok(())
 }
 
@@ -8966,7 +9204,11 @@ mod tests {
     fn ingress_redirect_ifaces_parse_dedupes_and_defaults_to_disabled() {
         // Unset is the default and must disable the redirect entirely.
         with_env_vars(&[], || {
-            assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            assert!(
+                node_agent_ingress_redirect_ifaces_from_env()
+                    .expect("unset interface list")
+                    .is_empty()
+            );
             assert!(!node_waypoint_ingress_redirect_configured());
         });
 
@@ -8980,7 +9222,8 @@ mod tests {
                 // classifier twice to one interface would install two filters both
                 // trying to assign the same packet.
                 assert_eq!(
-                    node_agent_ingress_redirect_ifaces_from_env(),
+                    node_agent_ingress_redirect_ifaces_from_env()
+                        .expect("valid interface list"),
                     vec!["eth0".to_string(), "eth1".to_string()]
                 );
                 assert!(node_waypoint_ingress_redirect_configured());
@@ -8992,7 +9235,11 @@ mod tests {
         with_env_vars(
             &[("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", " , ")],
             || {
-                assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+                assert!(
+                    node_agent_ingress_redirect_ifaces_from_env()
+                        .expect("whitespace-only interface list")
+                        .is_empty()
+                );
             },
         );
     }

@@ -2132,7 +2132,7 @@ impl MetricsRegistry {
                 0
             }
             + if self.node_agent_metrics.load().is_some() {
-                512
+                2600
             } else {
                 0
             }
@@ -3544,6 +3544,90 @@ impl MetricsRegistry {
                     output.push_str(&format!(
                         "ferrum_node_agent_capture_state{{state=\"{}\"{}}} {}\n",
                         state, ns_label, value,
+                    ));
+                }
+            }
+
+            // Ingress-interface topology proof. State and reason are closed
+            // enums; configured/expected interface names are deliberately
+            // absent from labels and values to keep cardinality bounded and
+            // avoid exposing operator- or host-controlled strings.
+            let topology = snapshot.ingress_topology;
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_topology NodeWaypoint ingress-interface topology validation state and bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_topology gauge\n");
+            if ns_label.is_empty() {
+                output.push_str(&format!(
+                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"}} 1\n",
+                    topology.state.label(),
+                    topology.reason.label(),
+                ));
+            } else {
+                output.push_str(&format!(
+                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"{}}} 1\n",
+                    topology.state.label(),
+                    topology.reason.label(),
+                    ns_label,
+                ));
+            }
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_configured_count Number of explicitly configured ingress interfaces (names are never labels).\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_configured_count gauge\n",
+            );
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_ingress_interface_configured_count",
+                u64::from(topology.configured_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_expected_count Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_expected_count gauge\n",
+            );
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_ingress_interface_expected_count",
+                u64::from(topology.expected_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n",
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n",
+            );
+            for (family, required, covered) in [
+                ("ipv4", topology.ipv4_required, topology.ipv4_covered),
+                ("ipv6", topology.ipv6_required, topology.ipv6_covered),
+            ] {
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"}} {}\n",
+                        u64::from(required),
+                    ));
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"}} {}\n",
+                        u64::from(covered),
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"{ns_label}}} {}\n",
+                        u64::from(required),
+                    ));
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"{ns_label}}} {}\n",
+                        u64::from(covered),
                     ));
                 }
             }

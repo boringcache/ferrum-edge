@@ -359,6 +359,12 @@ nodeAgent:
   # enrolled workloads a fully eBPF-owned inbound capture path instead of
   # node-global iptables REDIRECT semantics.
   #
+  # The node-agent does not infer this value. It proves at startup and on a
+  # fixed revalidation interval that this exact set equals the complete set of
+  # up, supported devices selected by remote Node PodCIDR/address routes for
+  # every required family. Wrong, extra, incomplete, ambiguous, loopback, down,
+  # unsupported, or drifted sets keep readiness false; capture is never widened.
+  #
   # NodeWaypoint proxy mode only (a startup error in local_pod mode), and it
   # requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint:
   # the redirect fails closed, so without a capture listener on the node it would
