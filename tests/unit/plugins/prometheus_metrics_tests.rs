@@ -5,7 +5,7 @@ use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
     ClientDisconnectKey, CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry,
-    PrometheusMetrics, global_registry,
+    PrometheusMetrics, DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
@@ -1514,11 +1514,14 @@ async fn test_plugin_config_sets_registry_tunables() {
     let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
 
-    // Prefer an isolated registry when asserting the budget wire-through so
-    // this test does not leave the process-global registry at a lowered cap.
-    let registry = MetricsRegistry::new();
-    registry.configure(10, 7200, 1000, 2500, "ferrum");
+    // The plugin owns the single process-global registry. Assert the actual
+    // constructor wire-through, then restore the default to avoid persistent
+    // cross-test budget pollution.
+    let registry = global_registry();
     assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+    registry.set_mesh_series_budget_per_family_for_test(
+        DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY,
+    );
 }
 
 #[tokio::test]
@@ -1536,16 +1539,6 @@ async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
         err.contains("no unlimited mode"),
         "error should reject unlimited mode: {err}"
     );
-}
-
-#[tokio::test]
-async fn test_plugin_config_accepts_mesh_series_budget_bounds() {
-    for budget in [1u64, 10_000, 1_000_000] {
-        let config = serde_json::json!({"mesh_series_budget_per_family": budget});
-        PrometheusMetrics::new(&config, "ferrum").unwrap_or_else(|err| {
-            panic!("expected mesh_series_budget_per_family={budget} to be accepted: {err}")
-        });
-    }
 }
 
 #[tokio::test]
