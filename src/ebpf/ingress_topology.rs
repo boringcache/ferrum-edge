@@ -142,7 +142,10 @@ impl IngressTopologyStatus {
     }
 
     pub fn is_ready(self) -> bool {
-        matches!(self.state, IngressTopologyState::Disabled | IngressTopologyState::Ready)
+        matches!(
+            self.state,
+            IngressTopologyState::Disabled | IngressTopologyState::Ready
+        )
     }
 }
 
@@ -202,8 +205,7 @@ impl IpCidr {
     }
 
     fn contains_ip(self, address: IpAddr) -> bool {
-        same_family(self.address, address)
-            && mask_ip(address, self.prefix_len) == self.address
+        same_family(self.address, address) && mask_ip(address, self.prefix_len) == self.address
     }
 
     fn contains_cidr(self, other: Self) -> bool {
@@ -305,23 +307,20 @@ impl IngressTopologyValidator {
                 "the Kubernetes Node set exceeds the supported bounded topology size",
             );
         }
-        let requirements = match requirements_from_nodes(
-            &listed.items,
-            &self.node_name,
-            self.require_ipv6,
-        ) {
-            Ok(requirements) => requirements,
-            Err(reason) => {
-                return unavailable(
-                    reason,
-                    self.configured_interfaces.len(),
-                    0,
-                    true,
-                    self.require_ipv6,
-                    "Kubernetes Node PodCIDR/address evidence is incomplete for this node",
-                );
-            }
-        };
+        let requirements =
+            match requirements_from_nodes(&listed.items, &self.node_name, self.require_ipv6) {
+                Ok(requirements) => requirements,
+                Err(reason) => {
+                    return unavailable(
+                        reason,
+                        self.configured_interfaces.len(),
+                        0,
+                        true,
+                        self.require_ipv6,
+                        "Kubernetes Node PodCIDR/address evidence is incomplete for this node",
+                    );
+                }
+            };
 
         let configured = self.configured_interfaces.clone();
         let proc_root = self.proc_root.clone();
@@ -482,9 +481,7 @@ pub fn validate_topology_snapshot(
         }
     }
 
-    if (requirements.require_ipv4 && !v4_covered)
-        || (requirements.require_ipv6 && !v6_covered)
-    {
+    if (requirements.require_ipv4 && !v4_covered) || (requirements.require_ipv6 && !v6_covered) {
         return unavailable(
             IngressTopologyReason::FamilyUnproved,
             configured_count,
@@ -684,8 +681,12 @@ fn requirements_from_nodes(
     if !local_found {
         return Err(IngressTopologyReason::LocalNodeMissing);
     }
-    let has_v4 = remote_pod_cidrs.iter().any(|cidr| cidr.family() == IpFamily::Ipv4);
-    let has_v6 = remote_pod_cidrs.iter().any(|cidr| cidr.family() == IpFamily::Ipv6);
+    let has_v4 = remote_pod_cidrs
+        .iter()
+        .any(|cidr| cidr.family() == IpFamily::Ipv4);
+    let has_v6 = remote_pod_cidrs
+        .iter()
+        .any(|cidr| cidr.family() == IpFamily::Ipv6);
     if !has_v4 || (require_ipv6 && !has_v6) {
         return Err(IngressTopologyReason::FamilyUnproved);
     }
@@ -780,13 +781,13 @@ fn read_routes(
 }
 
 fn read_bounded(path: &Path) -> Result<String, IngressTopologyReason> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|_| IngressTopologyReason::RouteTableUnavailable)?;
+    let metadata =
+        std::fs::metadata(path).map_err(|_| IngressTopologyReason::RouteTableUnavailable)?;
     if metadata.len() > MAX_ROUTE_FILE_BYTES {
         return Err(IngressTopologyReason::RouteTableTooLarge);
     }
-    let file = std::fs::File::open(path)
-        .map_err(|_| IngressTopologyReason::RouteTableUnavailable)?;
+    let file =
+        std::fs::File::open(path).map_err(|_| IngressTopologyReason::RouteTableUnavailable)?;
     let mut bytes = Vec::with_capacity(
         usize::try_from(metadata.len().min(MAX_ROUTE_FILE_BYTES)).unwrap_or_default(),
     );
@@ -796,8 +797,8 @@ fn read_bounded(path: &Path) -> Result<String, IngressTopologyReason> {
     if bytes.len() as u64 > MAX_ROUTE_FILE_BYTES {
         return Err(IngressTopologyReason::RouteTableTooLarge);
     }
-    let contents = String::from_utf8(bytes)
-        .map_err(|_| IngressTopologyReason::RouteTableInvalid)?;
+    let contents =
+        String::from_utf8(bytes).map_err(|_| IngressTopologyReason::RouteTableInvalid)?;
     if contents.lines().count() > MAX_ROUTE_LINES {
         return Err(IngressTopologyReason::RouteTableTooLarge);
     }
@@ -951,8 +952,8 @@ fn read_trimmed(path: &Path) -> Option<String> {
 }
 
 fn ipv4_from_proc_hex(raw: &str) -> Result<Ipv4Addr, IngressTopologyReason> {
-    let value = u32::from_str_radix(raw, 16)
-        .map_err(|_| IngressTopologyReason::RouteTableInvalid)?;
+    let value =
+        u32::from_str_radix(raw, 16).map_err(|_| IngressTopologyReason::RouteTableInvalid)?;
     Ok(Ipv4Addr::from(value.to_le_bytes()))
 }
 
@@ -971,9 +972,9 @@ fn ipv6_from_hex(raw: &str) -> Result<Ipv6Addr, IngressTopologyReason> {
 fn valid_interface_name(interface: &str) -> bool {
     !interface.is_empty()
         && interface.len() <= 15
-        && interface.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
-        })
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn mask_ip(address: IpAddr, prefix_len: u8) -> IpAddr {
@@ -998,7 +999,10 @@ fn mask_ip(address: IpAddr, prefix_len: u8) -> IpAddr {
 }
 
 fn same_family(left: IpAddr, right: IpAddr) -> bool {
-    matches!((left, right), (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)))
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
 }
 
 fn unavailable(

@@ -43,11 +43,11 @@ use crate::cni::spec::{
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
-use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::ingress_topology::{
     IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState, IngressTopologyStatus,
     IngressTopologyValidator, MAX_CONFIGURED_INTERFACE_BYTES, MAX_CONFIGURED_INTERFACES,
 };
+use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
@@ -1725,8 +1725,7 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
-    let mut ingress_topology_interval =
-        tokio::time::interval(INGRESS_TOPOLOGY_REVALIDATE_INTERVAL);
+    let mut ingress_topology_interval = tokio::time::interval(INGRESS_TOPOLOGY_REVALIDATE_INTERVAL);
     ingress_topology_interval.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
@@ -9222,8 +9221,7 @@ mod tests {
                 // classifier twice to one interface would install two filters both
                 // trying to assign the same packet.
                 assert_eq!(
-                    node_agent_ingress_redirect_ifaces_from_env()
-                        .expect("valid interface list"),
+                    node_agent_ingress_redirect_ifaces_from_env().expect("valid interface list"),
                     vec!["eth0".to_string(), "eth1".to_string()]
                 );
                 assert!(node_waypoint_ingress_redirect_configured());

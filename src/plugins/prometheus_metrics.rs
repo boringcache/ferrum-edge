@@ -3574,9 +3574,7 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_configured_count Number of explicitly configured ingress interfaces (names are never labels).\n",
             );
-            output.push_str(
-                "# TYPE ferrum_node_agent_ingress_interface_configured_count gauge\n",
-            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_configured_count gauge\n");
             render_process_counter(
                 &mut output,
                 "ferrum_node_agent_ingress_interface_configured_count",
@@ -3586,9 +3584,7 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_expected_count Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
             );
-            output.push_str(
-                "# TYPE ferrum_node_agent_ingress_interface_expected_count gauge\n",
-            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_expected_count gauge\n");
             render_process_counter(
                 &mut output,
                 "ferrum_node_agent_ingress_interface_expected_count",
@@ -3598,15 +3594,11 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
             );
-            output.push_str(
-                "# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n",
-            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n");
             output.push_str(
                 "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
             );
-            output.push_str(
-                "# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n",
-            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
             for (family, required, covered) in [
                 ("ipv4", topology.ipv4_required, topology.ipv4_covered),
                 ("ipv6", topology.ipv6_required, topology.ipv6_covered),

@@ -46,12 +46,8 @@ fn exact_single_uplink_ipv4_topology_is_ready() {
         route("10.244.2.0/24", "eth0", 0),
         route("172.18.0.0/16", "eth0", 0),
     ];
-    let outcome = validate_topology_snapshot(
-        &["eth0".to_string()],
-        &v4_requirements(),
-        &routes,
-        &links,
-    );
+    let outcome =
+        validate_topology_snapshot(&["eth0".to_string()], &v4_requirements(), &routes, &links);
 
     assert_eq!(outcome.status.state, IngressTopologyState::Ready);
     assert_eq!(outcome.status.reason, IngressTopologyReason::Valid);
@@ -70,12 +66,8 @@ fn existing_but_wrong_interface_is_unavailable() {
         route("10.244.2.0/24", "eth0", 0),
         route("172.18.0.0/16", "eth0", 0),
     ];
-    let outcome = validate_topology_snapshot(
-        &["mgmt0".to_string()],
-        &v4_requirements(),
-        &routes,
-        &links,
-    );
+    let outcome =
+        validate_topology_snapshot(&["mgmt0".to_string()], &v4_requirements(), &routes, &links);
 
     assert_eq!(outcome.status.state, IngressTopologyState::Unavailable);
     assert_eq!(outcome.status.reason, IngressTopologyReason::WrongInterface);
@@ -97,14 +89,9 @@ fn down_and_loopback_devices_are_rejected_before_route_evidence() {
         },
     )]);
     assert_eq!(
-        validate_topology_snapshot(
-            &["eth0".to_string()],
-            &v4_requirements(),
-            &routes,
-            &down,
-        )
-        .status
-        .reason,
+        validate_topology_snapshot(&["eth0".to_string()], &v4_requirements(), &routes, &down,)
+            .status
+            .reason,
         IngressTopologyReason::DeviceDown,
     );
 
@@ -116,14 +103,9 @@ fn down_and_loopback_devices_are_rejected_before_route_evidence() {
         },
     )]);
     assert_eq!(
-        validate_topology_snapshot(
-            &["lo".to_string()],
-            &v4_requirements(),
-            &routes,
-            &loopback,
-        )
-        .status
-        .reason,
+        validate_topology_snapshot(&["lo".to_string()], &v4_requirements(), &routes, &loopback,)
+            .status
+            .reason,
         IngressTopologyReason::Loopback,
     );
 }
@@ -193,14 +175,9 @@ fn dual_stack_requires_complete_family_coverage() {
         route("172.18.0.0/16", "eth0", 0),
     ];
     assert_eq!(
-        validate_topology_snapshot(
-            &["eth0".to_string()],
-            &requirements,
-            &incomplete,
-            &links,
-        )
-        .status
-        .reason,
+        validate_topology_snapshot(&["eth0".to_string()], &requirements, &incomplete, &links,)
+            .status
+            .reason,
         IngressTopologyReason::RouteMissing,
     );
 
@@ -212,12 +189,8 @@ fn dual_stack_requires_complete_family_coverage() {
         ],
     ]
     .concat();
-    let outcome = validate_topology_snapshot(
-        &["eth0".to_string()],
-        &requirements,
-        &complete,
-        &links,
-    );
+    let outcome =
+        validate_topology_snapshot(&["eth0".to_string()], &requirements, &complete, &links);
     assert_eq!(outcome.status.state, IngressTopologyState::Ready);
     assert!(outcome.status.ipv4_covered);
     assert!(outcome.status.ipv6_covered);
@@ -245,12 +218,8 @@ fn multi_uplink_requires_the_complete_exact_set() {
         route("192.0.2.0/24", "eth1", 0),
     ];
 
-    let incomplete = validate_topology_snapshot(
-        &["eth0".to_string()],
-        &requirements,
-        &routes,
-        &links,
-    );
+    let incomplete =
+        validate_topology_snapshot(&["eth0".to_string()], &requirements, &routes, &links);
     assert_eq!(
         incomplete.status.reason,
         IngressTopologyReason::IncompleteInterfaceSet,
@@ -302,14 +271,9 @@ fn rejected_subprefix_disproves_complete_route_coverage() {
     ];
 
     assert_eq!(
-        validate_topology_snapshot(
-            &["eth0".to_string()],
-            &v4_requirements(),
-            &routes,
-            &links,
-        )
-        .status
-        .reason,
+        validate_topology_snapshot(&["eth0".to_string()], &v4_requirements(), &routes, &links,)
+            .status
+            .reason,
         IngressTopologyReason::RouteAmbiguous,
     );
 }
