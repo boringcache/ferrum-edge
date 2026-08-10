@@ -1434,9 +1434,8 @@ fn same_namespace_tls_gateways_are_both_emitted_as_mesh_services() {
 }
 
 /// Across Gateway namespaces, physical compatibility is decided from each
-/// namespace's deterministic effective serving credential — not from every raw
-/// `certificateRef` that will lose same-namespace slot arbitration. Disagreeing
-/// effective slots on one socket stay fail-closed on both effective claims.
+/// namespace's complete admitted certificate set. Disagreeing sets on one
+/// socket stay fail-closed on every effective claim.
 #[test]
 fn tls_listeners_on_one_port_across_namespaces_with_different_certs_conflict() {
     let class = object(
