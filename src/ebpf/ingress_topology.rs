@@ -387,12 +387,18 @@ impl IngressTopologyValidator {
                         }
                         event = stream.next() => {
                             let Some(event) = event else {
+                                let decision = recovery.on_stream_end();
                                 publish_requirement_failure(
                                     &outcomes_tx,
                                     &self,
                                     IngressTopologyReason::KubernetesUnavailable,
                                 );
-                                break 'watch NodeWatchLoopEnd::StreamEnded;
+                                match decision {
+                                    NodeWatchCacheDecision::ForceRelist { backoff_secs } => {
+                                        break 'watch NodeWatchLoopEnd::Relist { backoff_secs };
+                                    }
+                                    _ => continue,
+                                }
                             };
                             match event {
                                 Ok(Event::Init) => {
@@ -570,7 +576,7 @@ impl IngressTopologyValidator {
                 };
 
                 match watch_end {
-                    NodeWatchLoopEnd::Shutdown | NodeWatchLoopEnd::StreamEnded => break,
+                    NodeWatchLoopEnd::Shutdown => break,
                     NodeWatchLoopEnd::Relist { backoff_secs } => {
                         let delay = crate::util::backoff::jittered_backoff(backoff_secs);
                         let sleep = tokio::time::sleep(delay);
@@ -595,7 +601,6 @@ impl IngressTopologyValidator {
 
 enum NodeWatchLoopEnd {
     Shutdown,
-    StreamEnded,
     Relist { backoff_secs: u64 },
 }
 
@@ -694,6 +699,15 @@ impl NodeWatchCacheRecovery {
     pub fn on_watch_error(&mut self) -> NodeWatchCacheDecision {
         self.invalid_reason = Some(IngressTopologyReason::KubernetesUnavailable);
         NodeWatchCacheDecision::AwaitReconnect
+    }
+
+    /// A completed watcher stream cannot reconnect itself. Withdraw any
+    /// previously valid snapshot and create a fresh LIST/watch generation
+    /// after the same bounded recovery delay used for invalid snapshots.
+    #[doc(hidden)]
+    pub fn on_stream_end(&mut self) -> NodeWatchCacheDecision {
+        self.invalid_reason = Some(IngressTopologyReason::KubernetesUnavailable);
+        self.force_relist()
     }
 
     fn force_relist(&mut self) -> NodeWatchCacheDecision {

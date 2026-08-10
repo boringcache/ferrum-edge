@@ -840,3 +840,32 @@ fn repeated_invalid_node_cache_snapshots_stay_bounded_without_spinning() {
         NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
     );
 }
+
+#[test]
+fn ended_node_watch_forces_a_paced_fresh_snapshot() {
+    let mut recovery = NodeWatchCacheRecovery::new();
+    assert_eq!(
+        recovery.on_stream_end(),
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 1 },
+    );
+    assert_eq!(
+        recovery.invalid_reason(),
+        Some(IngressTopologyReason::KubernetesUnavailable),
+    );
+    assert_eq!(
+        recovery.on_incremental(),
+        NodeWatchCacheDecision::SuppressIncremental {
+            reason: IngressTopologyReason::KubernetesUnavailable,
+        },
+    );
+    assert_eq!(
+        recovery.on_stream_end(),
+        NodeWatchCacheDecision::ForceRelist { backoff_secs: 2 },
+    );
+
+    assert_eq!(
+        recovery.on_valid_snapshot(),
+        NodeWatchCacheDecision::CommitSnapshot,
+    );
+    assert_eq!(recovery.relist_backoff_secs(), 1);
+}
