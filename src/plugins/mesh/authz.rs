@@ -973,7 +973,7 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 /// back to the router-stamped service port. They must never fall back to the
 /// outbound capture listener port (`:15001`), because that makes port-scoped
 /// ALLOWs over-deny and DENYs under-deny.
-fn mesh_authz_destination_port(
+pub(crate) fn mesh_authz_destination_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched_proxy: Option<&crate::config::types::Proxy>,
     ingress_listener_authz_port: Option<u16>,
@@ -995,6 +995,24 @@ fn mesh_authz_destination_port(
     )
     .or(frontend_listen_port)
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
+}
+
+/// Destination port for stream authorization and stream metric attribution.
+///
+/// Transparent stream listeners bind a fixed interception port while the
+/// trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
+/// destination. Prefer that connection fact, then the router-selected
+/// destination, and use the listener socket only when neither was observed.
+/// Keeping this pure resolver shared prevents a port-scoped policy and its
+/// Telemetry CEL labels from describing different destinations.
+pub(crate) fn mesh_stream_authz_destination_port(
+    connection_destination_port: Option<u16>,
+    destination_port: Option<u16>,
+    listen_port: u16,
+) -> u16 {
+    connection_destination_port
+        .or(destination_port)
+        .unwrap_or(listen_port)
 }
 
 /// Resolve Istio's `destination.ip` for an HTTP-family request.
@@ -2601,10 +2619,11 @@ impl Plugin for MeshAuthz {
         // trusted PROXY / SO_ORIGINAL_DST / capture tuple carries the actual
         // destination. Both operation `ports` and `when: destination.port` must
         // judge that original port or a port-scoped DENY can fail open.
-        let destination_port = ctx
-            .connection_destination_port
-            .or(ctx.destination_port)
-            .unwrap_or(ctx.listen_port);
+        let destination_port = mesh_stream_authz_destination_port(
+            ctx.connection_destination_port,
+            ctx.destination_port,
+            ctx.listen_port,
+        );
         let attributes = self.build_stream_condition_attributes(
             ctx,
             source_principal.as_ref(),
