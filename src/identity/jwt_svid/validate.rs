@@ -370,7 +370,13 @@ fn numeric_claim(claims: &Map<String, Value>, name: &str) -> Result<Option<i64>,
                 // NumericDate may legitimately be fractional; anything outside
                 // the i64 range (or NaN / infinity) is refused rather than
                 // saturated into a plausible-looking timestamp.
-                if value.is_finite() && (i64::MIN as f64..=i64::MAX as f64).contains(&value) {
+                // `i64::MAX as f64` rounds up to exactly 2^63. The upper bound
+                // must therefore be exclusive: including it would admit the
+                // out-of-range JSON integer 9223372036854775808 and Rust's
+                // float-to-int cast would silently saturate it to `i64::MAX`.
+                if value.is_finite()
+                    && (i64::MIN as f64..i64::MAX as f64).contains(&value)
+                {
                     Ok(Some(value.trunc() as i64))
                 } else {
                     Err(JwtSvidError::InvalidToken(

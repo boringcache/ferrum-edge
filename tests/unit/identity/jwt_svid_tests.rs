@@ -752,6 +752,19 @@ fn validate_rejects_a_non_numeric_expiry() {
 }
 
 #[test]
+fn validate_rejects_a_numeric_date_above_i64_max_without_saturating_it() {
+    let key = forge_key();
+    let token = sign_compact(
+        &key,
+        r#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#,
+        r#"{"sub":"spiffe://td.test/ns/test/sa/foo","aud":["aud"],"exp":9223372036854775808}"#,
+    );
+    let err = validate_jwt_svid(&token, "aud", &forged_bundles(&key, "k1"))
+        .expect_err("an out-of-range NumericDate must fail rather than saturate");
+    assert!(err.to_string().contains("representable range"));
+}
+
+#[test]
 fn validate_rejects_a_bad_typ_header() {
     let key = forge_key();
     let token = sign_compact(
@@ -1065,6 +1078,21 @@ async fn rotate_if_due_is_a_no_op_while_the_key_is_young() {
         signer.rotate_if_due().await.expect("no-op succeeds"),
         None,
         "a fresh key must not rotate"
+    );
+    assert_eq!(signer.generation(), before);
+}
+
+#[tokio::test]
+async fn a_u64_rotation_cadence_above_i64_max_is_not_immediately_due() {
+    let mut config = ephemeral_config();
+    config.key_lifetime_secs = u64::MAX;
+    let signer = LocalJwtAuthority::new(config).expect("authority builds");
+    let before = signer.generation();
+
+    assert_eq!(
+        signer.rotate_if_due().await.expect("no-op succeeds"),
+        None,
+        "a huge valid u64 cadence must not wrap negative and rotate a fresh key"
     );
     assert_eq!(signer.generation(), before);
 }

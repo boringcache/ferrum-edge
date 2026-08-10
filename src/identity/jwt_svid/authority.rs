@@ -707,7 +707,12 @@ impl LocalJwtAuthority {
         let age = Utc::now()
             .signed_duration_since(state.active_since)
             .num_seconds();
-        age >= self.key_lifetime_secs as i64
+        // A configured cadence is a `u64`. Casting it to `i64` would turn a
+        // value above `i64::MAX` negative and make a brand-new key appear due
+        // immediately. Convert the non-negative observed age instead: a clock
+        // step backwards is not evidence that the key has reached its cadence,
+        // and every `u64` setting remains representable for comparison.
+        u64::try_from(age).is_ok_and(|age| age >= self.key_lifetime_secs)
     }
 
     /// Key id of the active signing key. Public information (it is the `kid`
