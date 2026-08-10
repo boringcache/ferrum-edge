@@ -1910,14 +1910,104 @@ Istio's `Sidecar` resource has an `ingress[]` block letting a workload declare c
 
 ### Materialization model
 
-Each modeled ingress entry becomes one inbound loopback route:
+Each modeled ingress entry becomes one inbound forward path on the shared
+`:15006` capture listener:
 
-- **hosts** — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
+- **HTTP-family** (`http`/`http2`/`grpc`/`https`) — one host-routed loopback
+  route (same sibling machinery as the default service-port inbound routes).
+- **Stream-family** (`tcp`/`tls`/database protocols; issue #3260) — one
+  raw-TCP inbound relay in `local_inbound_tcp_routes`, keyed by the declared
+  listener port and forwarding to `defaultEndpoint`. PeerAuthentication and
+  AuthorizationPolicy still apply on the capture listener / L4 stream chain;
+  authz uses the declared listener port (not the backend port).
+
+Shared fields for both lanes:
+
+- **hosts** (HTTP only) — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
 - **backend** — the entry's `defaultEndpoint`, resolved to a loopback `host:port` (see supported forms below).
-- **listen path** — `/` (the route is selected by host, then disambiguated by port).
-- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). This reuses `select_mesh_inbound_port_route`: multiple ingress listeners on one workload are siblings disambiguated by listener port, and a request that addresses no declared listener port fails closed with `502` rather than being routed to an arbitrary backend.
+- **listen path** (HTTP only) — `/` (the route is selected by host, then disambiguated by port).
+- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** (HTTP) a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). HTTP reuses `select_mesh_inbound_port_route`; stream reuses the `mesh_tcp_inbound` orig-dst table. A request that addresses no declared listener port fails closed rather than being routed to an arbitrary backend.
+- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.)
 
-- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.) The listener port is stamped onto the request at port selection and read by authz; if it is somehow unavailable for an ingress route, authz fails closed (it never falls back to the backend port).
+### Two inbound arrival shapes (both remap to `defaultEndpoint`)
+
+A stream ingress listener is reachable two ways, and both must forward to the
+declared `defaultEndpoint` — not to the listener port:
+
+1. **Direct plaintext capture.** iptables REDIRECT steers the connection into
+   the `:15006` capture listener; `SO_ORIGINAL_DST` recovers the **declared
+   listener port**, which selects the `local_inbound_tcp_routes` entry and
+   relays to `defaultEndpoint`. Stream `mesh_authz` authorizes on the recovered
+   original-destination port (the listener port).
+2. **Identity-protected mesh-mTLS CONNECT.** A peer sidecar's raw-TCP egress
+   opens a **fresh SVID-mTLS HTTP/2 CONNECT** to `:15006` whose `:authority` is
+   the destination `pod-ip:<declared listener port>`. This never touches the
+   REDIRECT capture table, so it is resolved at the CONNECT boundary instead
+   (`build_inbound_hbone_relay_proxy` →
+   `MeshConfig::resolve_sidecar_ingress_connect_relay`): the authority is
+   remapped onto the listener's validated loopback `defaultEndpoint`
+   (`pod-ip:16379` → `127.0.0.1:6379`), and the **declared listener port** is
+   stamped onto the request so `mesh_authz` authorizes on it exactly as in the
+   HTTP ingress case. PeerAuthentication resolves on the `defaultEndpoint` app
+   port on both shapes (direct capture translates the listener port through the
+   pre-handshake alias table; the CONNECT remap arrives with that port already).
+
+The CONNECT remap is deliberately narrow and fails closed before any dial:
+
+- Only for a **byte-stream** CONNECT. A datagram-over-CONNECT (`connect-udp`)
+  is excluded — `ingress[]` stream listeners are TCP and UDP behavior is
+  unchanged.
+- The `:authority` host must belong to the unambiguously resolved local-service
+  workload set **and equal the accepted connection's concrete local IP**. The
+  second check is what distinguishes this pod from sibling replicas that share
+  the same service identity. A sibling replica's IP, a bare loopback authority,
+  or a service FQDN sharing the port number is refused; an unavailable accepted
+  local address also fails closed.
+- Exactly **one** valid, owner-stamped, **stream-family** listener must be
+  declared on that port. Ambiguity (two entries on one port), a missing owner
+  stamp, an off-box/`:0`/unmodeled-protocol endpoint, and an HTTP-family
+  listener are all refused rather than dialed.
+- A declared port that fails any of the above returns a route miss — it never
+  falls back to dialing the listener port the operator replaced.
+- After the plugin chain, the **effective** destination is re-checked against
+  the same declared mapping, so a `mesh_route_dispatch` route override or an
+  upstream selection cannot widen it (and a listener withdrawn between
+  synthesis and dial fails closed).
+- Once an `ingress` block is declared, it replaces the workload's ordinary
+  inbound CONNECT surface as well as its materialized service-port routes.
+  Unlisted ports and explicit-empty, all-unsupported, or carrier-rejected
+  listener sets are refused rather than falling through to the transparent
+  relay. With no declared `ingress` block, ordinary Ambient/Waypoint relay
+  behavior is unchanged.
+- The remap is **`Sidecar`-topology only**, matching the inbound materializer it
+  gates. `FERRUM_MESH_SIDECAR_ENFORCED` is topology-independent, so an
+  Ambient/Waypoint proxy in a mesh that also runs sidecars can receive a slice
+  whose applicable `Sidecar` declares `ingress[]`. Those topologies materialize
+  no inbound routes at all and serve every authenticated inbound through the
+  transparent relay, so the declaration marker is not back-projected there and
+  their relay behavior is unchanged.
+
+#### Live datapath coverage
+
+Two `#[ignore]`d functional tests in `tests/functional/functional_mesh_mode_test.rs`
+drive the shipped `ferrum-edge` binary over this lane (data-plane CI shard):
+
+- `functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port`
+  — a Sidecar consuming a slice with one already-resolved stream
+  `local_ingress_listeners` entry. A real SVID-mTLS bare HTTP/2 CONNECT naming
+  `127.0.0.1:<declared listener port>` is relayed to the listener's
+  `defaultEndpoint`, proven by that backend's reply tag rather than the decoy
+  bound on the declared port itself. A CONNECT naming a declared workload port
+  the `ingress[]` block omits is refused, even though a live backend is
+  listening there and the ordinary open-relay guard would have admitted it.
+- `functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener`
+  — the same datapath under `FERRUM_MESH_CONFIG_PROTOCOL=file` with
+  `FERRUM_MESH_SIDECAR_ENFORCED=true`, so the data plane runs the real
+  `Sidecar.ingress[]` resolution and SIGHUP is a deterministic in-test config
+  refresh. An `AuthorizationPolicy` DENY scoped to the **declared listener
+  port** rejects the CONNECT with 403 (authorizing on the `defaultEndpoint`
+  backend port would let it fail open), and a reload that declares a different
+  listener fails the withdrawn port closed while the new one serves.
 
 ### Precedence vs. the default inbound listeners (fail-closed)
 
@@ -1925,7 +2015,9 @@ Per Istio, when `ingress` is **declared** it **replaces** the workload's default
 
 **Omitted vs. explicit-empty `ingress` (Istio-faithful):** an **omitted** `ingress` block keeps the automatic per-service-port inbound defaults, while a **declared** `ingress` — *including an explicit empty `ingress: []`* — configures the workload's inbound listeners explicitly and replaces those defaults. So `ingress: []` suppresses the default inbound routes (the operator declared "no custom inbound listeners"), the same as a non-empty-but-all-unsupported list; it does **not** fall back to the service-port defaults. The K8s translator records `ingress` presence (mirroring `egress`'s omitted-vs-explicit-empty distinction); on the native source a non-empty list always declares, and an explicit `ingress_declared: true` carries the empty-but-declared case. Only a workload whose applicable `Sidecar` **omits** `ingress` entirely keeps the default service-port inbound behavior. This avoids any silent host+path conflict — the two never coexist for one workload. The "ingress was declared" marker is tracked separately from the resolved-listener list and rides its own ECDS carrier so it survives an empty resolved list on the xDS path.
 
-The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried backend against the same allowlists `MeshSidecarIngress::resolve` enforces — a loopback host + nonzero port for a TCP backend, or an admissible absolute socket path for a `unix://` backend. A malformed or hostile carrier pointing a listener at an off-box host, a `:0` backend, or a traversal-like socket path is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution. A carrier that sets **both** shapes (a `host:port` alongside a socket path) is refused outright, so a TCP fallback can never ride along with a Unix backend.
+The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried backend and protocol against the same allowlists `MeshSidecarIngress::resolve` enforces — a modeled HTTP/stream protocol plus loopback host + nonzero port for a TCP backend, or a modeled HTTP-family protocol plus an admissible absolute socket path for a `unix://` backend. A malformed or hostile carrier pointing a listener at an off-box host, a `:0` backend, an unmodeled protocol, or a traversal-like socket path is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution. A carrier that sets **both** backend shapes (a `host:port` alongside a socket path) is refused outright, so a TCP fallback can never ride along with a Unix backend.
+
+The carrier's `protocol` field has **no compatibility default**: an omitted `protocol` decodes to `Unknown` and is therefore inert on both lanes, exactly like an explicit `udp`/`unknown`. For Unix backends, the carried HTTP protocol must also agree with the h2c marker derived at resolution. A carrier that cannot consistently say what a listener speaks never gets one — it must not silently become a live listener on the declared port.
 
 ### Supported and deferred `defaultEndpoint` forms
 
@@ -1939,8 +2031,10 @@ The resolved listeners that ride the slice are **re-validated before dialing**: 
 | `unix:///absolute/path.sock` | Modeled **only when the path sits under a configured `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` entry** (default: none, so refused). Dispatched over a `tokio::net::UnixStream` — HTTP/1.1 or h2c per the declared `port.protocol` (see "Unix-socket backends" below). |
 | `unix://` with an inadmissible path (relative, `.`/`..` component, `//`, trailing `/`, NUL / control character, > 103 bytes, surrounding whitespace) | **Deferred** — the `deferred_fields` entry names the exact rule that was broken; the operator-supplied path is never echoed back. A path that is *syntactically* fine but outside the data plane's containment roots is refused at materialization instead (the control plane cannot see the data plane's allowlist). |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
-| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
-| Missing or **unrecognized** `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — a custom inbound listener routes only *recognized* HTTP-family protocols; a missing protocol (Istio defaults an unset port to TCP) or a mistyped string is **not** guessed as HTTP and is reported as a deferred non-HTTP listener, so it is never exposed on the HTTP request path. (The service-port default path keeps the `unknown → HTTP` convention for auto-discovered ports; this stricter rule applies only to explicitly declared `ingress[]` listeners. On the native source a mistyped `protocol` fails deserialization outright.) |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) with a supported loopback `defaultEndpoint` | **Modeled** (issue #3260) — materializes a raw-TCP inbound relay keyed by the declared listener port, forwarding to `defaultEndpoint`. Authz uses the listener port. |
+| Missing `port.protocol` (K8s) | **Modeled as TCP** — Istio defaults an unset port protocol to TCP; Ferrum stream-models it the same way (never guesses HTTP). |
+| Unrecognized `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — never guessed as HTTP or as a live TCP listener. (On the native source a mistyped `protocol` fails deserialization outright.) |
+| `Udp` `port.protocol` | **Deferred** — not a REDIRECT-captured TCP stream lane. |
 | Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it (the native model also accepts an omitted field, defaulting to empty); with no forward target there is nothing to route. |
 
 The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. The HTTP-family classification is shared by translation/resolution and the status writer (one predicate), so a modeled listener is never falsely reported as a deferred non-HTTP listener (and vice-versa). A listener `port` of `0` is a hard validation error (rejected), not a deferral.
@@ -2022,7 +2116,7 @@ A listener that is edited, replaced, or deleted takes effect on the next slice a
 
 ### `bind` and `captureMode` limitations
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too).
+- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
 - **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
 
 ### xDS / file / native parity
