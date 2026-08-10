@@ -4,8 +4,8 @@ use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
-    ClientDisconnectKey, CounterKey, DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY, HboneRelayFailureKey,
-    MeshTcpEgressConnKey, MetricsRegistry, PrometheusMetrics, global_registry,
+    ClientDisconnectKey, CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry,
+    PrometheusMetrics, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
@@ -1511,15 +1511,18 @@ async fn test_plugin_config_sets_registry_tunables() {
         "cache_invalidation_min_age_ms": 1000,
         "mesh_series_budget_per_family": 2500
     });
-    let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
+    let registry = Arc::new(MetricsRegistry::new());
+    let plugin = PrometheusMetrics::new_with_registry_for_test(
+        &config,
+        "ferrum",
+        Arc::clone(&registry),
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
 
-    // The plugin owns the single process-global registry. Assert the actual
-    // constructor wire-through, then restore the default to avoid persistent
-    // cross-test budget pollution.
-    let registry = global_registry();
+    // Exercise the same constructor wire-through as production without
+    // mutating the process-global registry shared by parallel tests.
     assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
-    registry.set_mesh_series_budget_per_family_for_test(DEFAULT_MESH_SERIES_BUDGET_PER_FAMILY);
 }
 
 #[tokio::test]

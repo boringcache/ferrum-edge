@@ -4041,6 +4041,14 @@ fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, Strin
 
 impl PrometheusMetrics {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
+        Self::new_with_registry(config, namespace, global_registry())
+    }
+
+    fn new_with_registry(
+        config: &Value,
+        namespace: &str,
+        registry: Arc<MetricsRegistry>,
+    ) -> Result<Self, String> {
         if !(config.is_object() || config.is_null()) {
             return Err("prometheus_metrics: config must be an object".to_string());
         }
@@ -4052,8 +4060,6 @@ impl PrometheusMetrics {
                     .to_string(),
             );
         }
-
-        let registry = global_registry();
 
         let render_cache_ttl_secs = optional_u64(
             config,
@@ -4081,6 +4087,19 @@ impl PrometheusMetrics {
         );
 
         Ok(Self { registry })
+    }
+
+    /// Construct against an isolated registry while exercising the production
+    /// config wire-through. External unit tests use this to avoid racing the
+    /// process-global registry when the test harness runs constructors in
+    /// parallel.
+    #[doc(hidden)]
+    pub fn new_with_registry_for_test(
+        config: &Value,
+        namespace: &str,
+        registry: Arc<MetricsRegistry>,
+    ) -> Result<Self, String> {
+        Self::new_with_registry(config, namespace, registry)
     }
 }
 
