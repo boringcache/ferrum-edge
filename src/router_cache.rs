@@ -119,9 +119,12 @@ struct HttpPortMatchContext<'a> {
     single_nontls_listen_port: Option<u16>,
     /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
     single_tls_listen_port: Option<u16>,
-    /// Listener ports rejected by the listener supervisor. Keeping this in a
-    /// lock-free snapshot makes a refused listener ineligible even when its
-    /// numeric port is also reachable through a process-global socket.
+    /// Listener ports rejected by Gateway listener *admission* (reserved /
+    /// stream / TLS-class collisions and equivalent reconcile refusals). A
+    /// lock-free snapshot keeps a refused listener ineligible even when its
+    /// numeric port would otherwise match through the process-global socket or
+    /// the single-listener Service remap. Ordinary OS bind failures are not
+    /// published here — see `GatewayListenerManager::reconcile`.
     refused_listener_ports: &'a BTreeSet<u16>,
 }
 
@@ -1432,10 +1435,17 @@ impl RouterCache {
         }
     }
 
-    /// Publish listener ports which the listener supervisor could not serve.
-    /// Cache entries are invalidated because listener admission is part of the
-    /// routing decision, not merely listener lifecycle telemetry.
-    pub(crate) fn set_refused_listener_ports(&self, ports: BTreeSet<u16>) {
+    /// Publish the current-generation set of Gateway listener ports whose
+    /// admission was refused (reserved / stream / TLS-class collisions, missing
+    /// TLS material, deferred class flips).
+    ///
+    /// The snapshot is replaced wholesale under `ArcSwap` so each request sees
+    /// either the previous or the new coherent set — never a partial update.
+    /// Lookup caches are cleared on change so a prior positive cache hit cannot
+    /// resurrect a refused listener via remap or an exact-port miss that later
+    /// matched a sibling. Passing an empty set withdraws every refusal for the
+    /// next reconcile generation.
+    pub fn set_refused_listener_ports(&self, ports: BTreeSet<u16>) {
         if self.refused_listener_ports.load().as_ref() == &ports {
             return;
         }
@@ -1961,6 +1971,13 @@ impl RouterCache {
     ) {
         self.route_snapshot
             .store(Arc::new(RouteSnapshot { table, generation }));
+    }
+
+    /// Test-only: flip the refused-port snapshot without clearing lookup caches,
+    /// so the cache-hit fail-closed re-validation path can be exercised.
+    #[cfg(test)]
+    fn set_refused_listener_ports_without_clearing_for_tests(&self, ports: BTreeSet<u16>) {
+        self.refused_listener_ports.store(Arc::new(ports));
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
@@ -6633,5 +6650,39 @@ mod tests {
             table.mesh_http_egress_by_workload_decision("10.0.0.7:18080".parse().unwrap()),
             Some(MeshHttpEgressByWorkloadDecision::CloseNotRoutable)
         ));
+    }
+
+    #[test]
+    fn cache_hit_fail_closed_revalidates_refused_listener_without_clear() {
+        let mut scoped = minimal_proxy_for_routing("scoped", "/api");
+        scoped.hosts = vec!["app.example.com".into()];
+        scoped.listen_port = Some(80);
+        let config = GatewayConfig {
+            proxies: vec![scoped],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let warm = cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+            .expect("warm exact-port entry");
+        assert_eq!(warm.proxy.id, "scoped");
+        let cached_before = cache.cache_len();
+        assert!(cached_before >= 1);
+
+        // Flip refusal without clearing so the next lookup must reject a
+        // still-resident positive cache entry on the hit path.
+        cache.set_refused_listener_ports_without_clearing_for_tests(BTreeSet::from([80]));
+        assert_eq!(
+            cache.cache_len(),
+            cached_before,
+            "test helper must leave the positive entry resident"
+        );
+        assert!(
+            cache
+                .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+                .is_none(),
+            "cache hit must fail closed against the current refused-port snapshot"
+        );
     }
 }

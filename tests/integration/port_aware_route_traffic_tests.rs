@@ -180,9 +180,13 @@ async fn reserve_free_port() -> u16 {
 }
 
 /// `Ok((status, body))`, or `Err` when the port is not accepting at all.
-async fn try_http_get(port: u16, path: &str) -> Result<(u16, String), std::io::Error> {
+async fn try_http_get_host(
+    port: u16,
+    path: &str,
+    host: &str,
+) -> Result<(u16, String), std::io::Error> {
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -201,10 +205,20 @@ async fn try_http_get(port: u16, path: &str) -> Result<(u16, String), std::io::E
     Ok((status, body))
 }
 
+async fn try_http_get(port: u16, path: &str) -> Result<(u16, String), std::io::Error> {
+    try_http_get_host(port, path, HOST).await
+}
+
 async fn http_get(port: u16, path: &str) -> (u16, String) {
     try_http_get(port, path)
         .await
         .unwrap_or_else(|e| panic!("request to port {port} failed: {e}"))
+}
+
+async fn http_get_host(port: u16, path: &str, host: &str) -> (u16, String) {
+    try_http_get_host(port, path, host)
+        .await
+        .unwrap_or_else(|e| panic!("request to port {port} host {host} failed: {e}"))
 }
 
 /// Two Gateway listener ports of the SAME protocol (both plaintext) carrying
@@ -438,6 +452,91 @@ async fn gateway_listener_port_colliding_with_admin_is_refused() {
         http_get(global_proxy_port, "/api/x").await.0,
         404,
         "a refused listener route must not escape through single-listener remapping"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+}
+
+/// An admission-refused listener must not poison an unrelated sibling listener,
+/// and moving the collided route onto a free port withdraws the fail-closed
+/// routing state for that generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
+    let (backend_refused, _br) = start_body_backend(b"listener-refused").await;
+    let (backend_ok, _bo) = start_body_backend(b"listener-ok").await;
+
+    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = admin_http.local_addr().unwrap().port();
+    let sibling_port = reserve_free_port().await;
+
+    let mut refused = port_scoped_proxy("gw-refused", backend_refused, Some(admin_port));
+    refused.hosts = vec![HOST.to_string()];
+    let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
+    sibling.hosts = vec!["ok.example.com".to_string()];
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let handles = serve(
+        test_env_config(0, 0),
+        config_with(vec![refused, sibling]),
+        serve_options(proxy_http, admin_http),
+        shutdown_tx.clone(),
+    )
+    .await
+    .expect("file::serve starts");
+
+    wait_for_listener_ports(&handles, &[sibling_port]).await;
+    assert!(
+        handles
+            .gateway_listeners
+            .bind_failures()
+            .iter()
+            .any(|failure| failure.port == admin_port),
+        "the admin collision must remain surfaced"
+    );
+    let (ok_status, ok_body) = http_get_host(sibling_port, "/api/x", "ok.example.com").await;
+    assert_eq!(ok_status, 200, "sibling listener must keep serving: {ok_body}");
+    assert_eq!(ok_body, "listener-ok");
+    assert_eq!(
+        http_get_host(sibling_port, "/api/x", HOST).await.0,
+        404,
+        "the refused route must not be reachable on the sibling listener port"
+    );
+
+    let recovered_port = reserve_free_port().await;
+    let mut recovered = port_scoped_proxy("gw-refused", backend_refused, Some(recovered_port));
+    recovered.hosts = vec![HOST.to_string()];
+    let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
+    sibling.hosts = vec!["ok.example.com".to_string()];
+    let outcome = handles
+        .proxy_state
+        .update_config(config_with(vec![recovered, sibling]));
+    assert!(
+        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+        "recovery publication must apply: {outcome:?}"
+    );
+    wait_for_listener_ports(&handles, &[sibling_port, recovered_port]).await;
+    assert!(
+        handles
+            .gateway_listeners
+            .bind_failures()
+            .iter()
+            .all(|failure| failure.port != recovered_port && failure.port != admin_port),
+        "recovery must withdraw the prior refusal: {:?}",
+        handles.gateway_listeners.bind_failures()
+    );
+    assert_eq!(
+        http_get(recovered_port, "/api/x").await,
+        (200, "listener-refused".to_string()),
+        "withdrawing the collision must restore the route on the new listen_port"
+    );
+    assert_eq!(
+        http_get_host(sibling_port, "/api/x", "ok.example.com")
+            .await
+            .1,
+        "listener-ok",
+        "sibling must remain healthy across recovery"
     );
 
     let _ = shutdown_tx.send(true);

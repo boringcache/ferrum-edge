@@ -73,9 +73,17 @@
 //! [`GatewayListenerManager::bind_failures`] and logged, then retried on a slow
 //! tick. It is deliberately never fatal: a Gateway listener port is
 //! control-plane input, and killing the process over one unbindable port would
-//! take down every healthy listener with it. Routes scoped to a listener that
-//! did not bind simply stay unreachable, which is the fail-closed outcome —
-//! they are never served somewhere else.
+//! take down every healthy listener with it.
+//!
+//! Routing fail-closed is scoped to **admission refusals** (reserved /
+//! stream / TLS-class collisions, missing TLS material, deferred class flips),
+//! which are published into [`crate::router_cache::RouterCache`] so a refused
+//! listener cannot become reachable through the process-global proxy or the
+//! single-listener Service remap. Ordinary OS bind failures (for example
+//! privileged `:80` without `CAP_NET_BIND_SERVICE`) stay telemetry-only: the
+//! Service-fronted topology still remaps that listener port through
+//! `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT` when the table has
+//! exactly one listen port of that protocol class.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -567,8 +575,17 @@ impl GatewayListenerManager {
             .map(|drain| drain.port)
             .collect();
 
+        // Admission refusals suppress remapping. Start from plan.refused
+        // (reserved / stream / TLS-class collisions) and extend only for
+        // reconcile-time decisions that likewise must not leak onto the
+        // process-global proxy. Ordinary `spawn_listener` OS errors are
+        // intentionally omitted so Service-fronted `:80`/`:443` remapping
+        // survives privileged-port bind failures.
+        let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
+
         for (port, class) in &plan.ports {
             if defer_rebind.contains(port) || retiring_ports.contains(port) {
+                refused_route_ports.insert(*port);
                 if !failures.iter().any(|failure| failure.port == *port) {
                     let error = format!(
                         "port {port} still has a retiring Gateway listener task; the replacement \
@@ -596,6 +613,7 @@ impl GatewayListenerManager {
                 );
                 warn!(port = *port, "Gateway API listener refused: {error}");
                 failures.push(GatewayListenerBindFailure { port: *port, error });
+                refused_route_ports.insert(*port);
                 continue;
             }
             match self.spawn_listener(*port, *class).await {
@@ -616,19 +634,11 @@ impl GatewayListenerManager {
             .iter()
             .filter_map(|(port, listener)| listener.quic.is_some().then_some(*port))
             .collect();
-        let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
-        refused_route_ports.extend(
-            plan.ports
-                .keys()
-                .filter(|port| !live.contains_key(port))
-                .copied(),
-        );
         drop(live);
 
-        // A bind refusal is a routing admission decision, not just telemetry.
-        // Suppress those port-scoped routes before publishing the result so a
-        // global proxy socket (including the single-listener Service remap)
-        // cannot make an unserved listener reachable.
+        // Publish the current-generation admission set (including empty) so a
+        // recovered listener withdraws prior fail-closed state atomically from
+        // the router's lock-free snapshot.
         self.state
             .router_cache
             .set_refused_listener_ports(refused_route_ports);
