@@ -44,7 +44,7 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
 use crate::ebpf::ingress_topology::{
-    IngressTopologyOutcome, IngressTopologyReason, IngressTopologyState, IngressTopologyStatus,
+    IngressTopologyMonitor, IngressTopologyOutcome, IngressTopologyStatus,
     IngressTopologyValidator, MAX_CONFIGURED_INTERFACE_BYTES, MAX_CONFIGURED_INTERFACES,
 };
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
@@ -81,8 +81,7 @@ const CNI_STATUS_KUBE_UNAVAILABLE_REASON: &str =
 const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
     "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-const INGRESS_TOPOLOGY_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
-const INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
+const INGRESS_TOPOLOGY_INITIAL_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
 // Verified handshakes need longer than the ordinary orphan grace for producer
@@ -1458,19 +1457,30 @@ async fn run_with_backend(
         Err(err) => return Err(owner.fail_with(err)),
     };
     // A tc attach proves only that the configured link accepted the program.
-    // Keep startup readiness false until Kubernetes Node evidence and the host
-    // route/link snapshot prove that the complete explicit set is supported.
-    let initial_topology = if config.capture_contract.ingress_redirect_enabled() {
+    // One shutdown-owned background monitor performs the initial bounded Node
+    // LIST, follows its watch, and re-reads host route/link state. The pod/CNI
+    // loop receives completed outcomes only and never waits on Kubernetes or
+    // procfs/sysfs I/O.
+    let mut topology_monitor = if config.capture_contract.ingress_redirect_enabled() {
+        Some(topology_validator.spawn_monitor(client.clone(), shutdown_tx.subscribe()))
+    } else {
+        None
+    };
+    let initial_topology = if let Some(monitor) = topology_monitor.as_mut() {
         match tokio::time::timeout(
-            INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT,
-            topology_validator.validate(&client),
+            INGRESS_TOPOLOGY_INITIAL_TIMEOUT,
+            monitor.outcomes.changed(),
         )
         .await
         {
-            Ok(outcome) => outcome,
-            Err(_) => topology_timeout_outcome(
-                topology_validator.configured_interfaces().len(),
-                config.capture_contract.ingress_capture_supports_ipv6,
+            Ok(Ok(())) => monitor.outcomes.borrow_and_update().clone(),
+            Ok(Err(_)) => IngressTopologyOutcome::monitor_stopped(
+                config.capture_contract.ingress_redirect_ifaces.len(),
+            ),
+            Err(_) => IngressTopologyOutcome::validation_timeout(
+                config.capture_contract.ingress_redirect_ifaces.len(),
+                false,
+                false,
             ),
         }
     } else {
@@ -1492,10 +1502,6 @@ async fn run_with_backend(
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
-    let topology_validator = config
-        .capture_contract
-        .ingress_redirect_enabled()
-        .then_some(topology_validator);
     run_with_pod_stream(
         &mut owner,
         config,
@@ -1504,32 +1510,12 @@ async fn run_with_backend(
         startup_ready,
         cni_config,
         Some(client),
-        topology_validator,
+        topology_monitor,
         topology_ready,
         pod_stream,
         std::iter::empty(),
     )
     .await
-}
-
-fn topology_timeout_outcome(
-    configured_interfaces: usize,
-    require_ipv6: bool,
-) -> IngressTopologyOutcome {
-    IngressTopologyOutcome {
-        status: IngressTopologyStatus {
-            state: IngressTopologyState::Unavailable,
-            reason: IngressTopologyReason::ValidationTimeout,
-            configured_interfaces: u16::try_from(configured_interfaces).unwrap_or(u16::MAX),
-            expected_interfaces: 0,
-            ipv4_required: true,
-            ipv4_covered: false,
-            ipv6_required: require_ipv6,
-            ipv6_covered: false,
-        },
-        diagnostic: "NodeWaypoint ingress topology validation exceeded its two-second budget"
-            .to_string(),
-    }
 }
 
 fn apply_ingress_topology_outcome(
@@ -1645,7 +1631,7 @@ async fn run_with_pod_stream<S, I>(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
-    topology_validator: Option<IngressTopologyValidator>,
+    mut topology_monitor: Option<IngressTopologyMonitor>,
     topology_ready: Arc<AtomicBool>,
     mut pod_stream: S,
     seed_pods: I,
@@ -1725,8 +1711,7 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
-    let mut ingress_topology_interval = tokio::time::interval(INGRESS_TOPOLOGY_REVALIDATE_INTERVAL);
-    ingress_topology_interval.tick().await;
+    let mut topology_monitor_open = topology_monitor.is_some();
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
@@ -1923,33 +1908,47 @@ where
                     metrics.as_ref(),
                 );
             }
-            _ = ingress_topology_interval.tick(), if topology_validator.is_some() => {
-                let Some(validator) = topology_validator.as_ref() else {
-                    continue;
-                };
-                let Some(client) = kube_client.as_ref() else {
-                    continue;
-                };
-                let outcome = match tokio::time::timeout(
-                    INGRESS_TOPOLOGY_REVALIDATE_TIMEOUT,
-                    validator.validate(client),
-                ).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => topology_timeout_outcome(
-                        validator.configured_interfaces().len(),
-                        config.capture_contract.ingress_capture_supports_ipv6,
-                    ),
-                };
-                apply_ingress_topology_outcome(
-                    metrics.as_ref(),
-                    topology_ready.as_ref(),
-                    startup_ready.as_ref(),
-                    initial_sync_complete,
-                    has_failed_pod_enrollments(&pod_states)
-                        || has_pending_capture_failures(&pod_states),
-                    &outcome,
-                    "runtime_revalidation",
-                );
+            changed = async {
+                match topology_monitor.as_mut() {
+                    Some(monitor) => monitor.outcomes.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if topology_monitor_open => {
+                match changed {
+                    Ok(()) => {
+                        let Some(monitor) = topology_monitor.as_mut() else {
+                            topology_monitor_open = false;
+                            continue;
+                        };
+                        let outcome = monitor.outcomes.borrow_and_update().clone();
+                        apply_ingress_topology_outcome(
+                            metrics.as_ref(),
+                            topology_ready.as_ref(),
+                            startup_ready.as_ref(),
+                            initial_sync_complete,
+                            has_failed_pod_enrollments(&pod_states)
+                                || has_pending_capture_failures(&pod_states),
+                            &outcome,
+                            "runtime_revalidation",
+                        );
+                    }
+                    Err(_) => {
+                        topology_monitor_open = false;
+                        let outcome = IngressTopologyOutcome::monitor_stopped(
+                            config.capture_contract.ingress_redirect_ifaces.len(),
+                        );
+                        apply_ingress_topology_outcome(
+                            metrics.as_ref(),
+                            topology_ready.as_ref(),
+                            startup_ready.as_ref(),
+                            initial_sync_complete,
+                            has_failed_pod_enrollments(&pod_states)
+                                || has_pending_capture_failures(&pod_states),
+                            &outcome,
+                            "runtime_revalidation",
+                        );
+                    }
+                }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness_with_sync_state(
@@ -1982,6 +1981,12 @@ where
         "Node agent shutting down, detaching BPF programs"
     );
     owner.shutdown_pods(&pod_states, config);
+
+    if let Some(monitor) = topology_monitor
+        && let Err(err) = monitor.task.await
+    {
+        warn!(error = %err, "Node ingress-topology monitor task panicked");
+    }
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -8107,7 +8112,6 @@ fn initialize_backend_after_load(
     if ingress_redirect_enabled {
         metrics.set_ingress_topology(IngressTopologyStatus::validating(
             config.capture_contract.ingress_redirect_ifaces.len(),
-            config.capture_contract.ingress_capture_supports_ipv6,
         ));
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
         info!(

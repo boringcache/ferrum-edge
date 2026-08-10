@@ -5,12 +5,15 @@ on:
   pull_request:
     paths:
       - ".github/workflows/node-waypoint-ebpf-live.yml"
+      - ".dockerignore"
       - ".github/actions/package-ferrum-runtime-image/**"
       - ".github/actions/setup-kubernetes-tools/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - "Dockerfile.iproute2-layer"
       - "Dockerfile.release"
+      - ".github/scripts/stage_iproute2_runtime.sh"
       - "build.rs"
       - "proto/**"
       - "ebpf/**"
@@ -58,6 +61,40 @@ env:
   ISTIO_CRD_SHA256: 952afcf4b1bf47d2bdf1f230d636f9e613c3ee9cc68ef53ab751f6d59e2ee205
 
 jobs:
+  production-dockerfile-smoke:
+    name: Production Dockerfile eBPF image smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Build production root Dockerfile
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg FEATURES=cloud-secrets,ebpf \
+            --tag ferrum-edge:production-dockerfile-smoke \
+            --file Dockerfile \
+            .
+
+      - name: Execute distroless runtime entrypoints
+        run: |
+          set -euo pipefail
+          image=ferrum-edge:production-dockerfile-smoke
+          docker run --rm --entrypoint /usr/sbin/ip "$image" -V
+          docker run --rm --entrypoint /app/ferrum-edge "$image" version
+          container="$(docker create "$image")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker export "$container" | tar -tf - > runtime-files.txt
+          for forbidden in bin/sh usr/bin/apt usr/bin/apt-get usr/sbin/iptables usr/sbin/ip6tables; do
+            if grep -Fxq "$forbidden" runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
+          done
+
   node-waypoint-ebpf-live:
     name: NodeWaypoint eBPF live datapath
     runs-on: ubuntu-24.04

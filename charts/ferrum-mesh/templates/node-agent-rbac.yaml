@@ -21,11 +21,11 @@ rules:
     verbs: ["get", "list", "watch"]
   {{- if .Values.nodeAgent.ingressRedirectIfaces }}
   # NodeWaypoint ingress-interface validation derives the complete, per-family
-  # remote PodCIDR/address route set from Nodes. It is read-only and bounded;
-  # no interface is auto-selected from this data.
+  # remote PodCIDR/InternalIP route set from one bounded long-lived Node watch.
+  # It is read-only; no interface is auto-selected from this data.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list"]
+    verbs: ["list", "watch"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

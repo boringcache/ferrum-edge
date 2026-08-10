@@ -85,9 +85,16 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | Mid-life `includeOutboundPorts` annotation changes that failed to re-apply (annotation parse error or BPF map write error). The pod retains its previous policy. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are not counted here — they are retried on the next Apply event. |
 | `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, `interface_topology_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge and any configured ingress-interface topology are proved. |
 | `ferrum_node_agent_ingress_interface_topology{state,reason}` | Gauge for the optional NodeWaypoint ingress-interface proof. `state` and `reason` are closed sets; configured interface names, route destinations, node addresses, and other host/Kubernetes values are never labels. |
-| `ferrum_node_agent_ingress_interface_{configured,expected}_count` | Bounded counts for the explicit operator set and the complete route-derived set. Names are deliberately omitted. |
-| `ferrum_node_agent_ingress_interface_family_{required,covered}{family}` | Closed `ipv4`/`ipv6` gauges showing which families the capture listener requires and whether the current topology proof covers them. |
+| `ferrum_node_agent_ingress_interface_configured_interfaces`, `ferrum_node_agent_ingress_interface_expected_interfaces` | Bounded counts for the explicit operator set and the complete route-derived set. Names are deliberately omitted. |
+| `ferrum_node_agent_ingress_interface_family_required{family}`, `ferrum_node_agent_ingress_interface_family_covered{family}` | Closed `ipv4`/`ipv6` gauges showing which families the observed remote PodCIDRs require and whether the current topology proof covers them. |
 | `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
+
+`ferrum_node_agent_ingress_interface_topology` emits only the current active
+`state`/`reason` series with value `1`; it does not emit every possible state as
+`0`/`1` like `ferrum_node_agent_capture_state`. Alert on
+`ferrum_node_agent_ingress_interface_topology{state!="ready"} == 1`, and add
+`absent(ferrum_node_agent_ingress_interface_topology)` when an absent node-agent
+scrape must also page.
 
 The NodeWaypoint proxy's authenticated `/metrics` additionally exposes
 `ferrum_mesh_bpf_accept_to_first_byte_microseconds`. It measures from the
@@ -494,13 +501,27 @@ undeclared port is left to the direct-pod guard.
 #### Interface topology proof and drift handling
 
 A successful tc attach is necessary but is not readiness evidence. Before the
-initial pod relist can advertise readiness, the node-agent lists a bounded Node
-set (maximum 256), reads each remote Node's PodCIDRs and Internal/External IPs,
-and resolves the complete required interface set from the host IPv4/IPv6 route
-tables. The configured set must equal that proved set exactly for every family
-served by the transparent capture listener. This covers a single uplink,
-dual-stack, and multiple route-selected uplinks without choosing an interface
-on the operator's behalf.
+initial pod relist can advertise readiness, the node-agent completes one paged
+Node LIST and retains a long-lived watch-backed cache with a hard maximum of 256
+Nodes. Each remote Ready Node must publish supported `spec.podCIDR`/
+`spec.podCIDRs` and a usable same-family `status.addresses[type=InternalIP]`;
+`ExternalIP` is deliberately not route-symmetry evidence. CNIs/platforms that
+omit `Node.spec.podCIDR`/`podCIDRs`, or Ready Nodes without usable InternalIP
+evidence, are unsupported by this routed-topology proof and remain fail-closed.
+A newly registered, still-unallocated Node may be ignored only when Kubernetes
+positively reports `Ready=False`, `spec.unschedulable=true`, and no PodCIDR has
+been assigned. A Node with an assigned PodCIDR may already carry pods and is
+never ignored; missing or `Unknown` status is incomplete proof.
+
+Required families come from the observed remote PodCIDRs intersected with the
+capture listener's capability. An IPv4-only cluster therefore requires only
+IPv4 even when `[::]` provides dual-stack capture, while an IPv6-only cluster is
+provable when the capture listener supports IPv6. An IPv6-only cluster with an
+IPv4-only capture listener has no applicable family and remains unavailable.
+Every required family retains complete per-CIDR and same-family InternalIP
+coverage. The configured set must equal the resulting route-selected set
+exactly. This covers a single uplink, dual-stack, and multiple route-selected
+uplinks without choosing an interface on the operator's behalf.
 
 The supported topology is symmetric routed node/CNI traffic: each remote
 PodCIDR and its Node address must resolve into the same proved ingress set. A
@@ -517,11 +538,14 @@ by this routed-topology implementation. An existing management device that has
 no proved remote PodCIDR route role is also refused as an unexpected/wrong
 interface rather than accepted because tc can attach to it.
 
-The same proof reruns every five seconds with a two-second per-pass timeout,
-bounded Node/route/interface work, and no request-path locks. Link-down, route
-replacement, family loss, or Node topology drift withdraws `/health` readiness
-on the next bounded pass and changes capture state to
-`interface_topology_unavailable`; recovery restores readiness only after both
+Node changes are derived from the bounded long-lived cache rather than a fresh
+cluster-wide LIST on each tick. Host route/link drift checks remain every five
+seconds with a two-second per-pass timeout in a shutdown-owned background task;
+the pod/CNI/retry select loop receives completed outcomes through a latest-value
+channel and never waits on Kubernetes or filesystem I/O. Link-down, route
+replacement, family loss, incomplete Node evidence, or Node topology drift
+withdraws `/health` readiness on the next bounded result and changes capture
+state to `interface_topology_unavailable`; recovery restores readiness only after both
 the topology and the initial pod relist are proved. The classifier remains
 scoped to the explicit configured set throughout, so drift cannot trigger
 implicit direct-pod fallback or broader node capture. CNI STATUS shares the

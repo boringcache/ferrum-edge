@@ -2356,7 +2356,7 @@
     "emission": "conditional"
   },
   {
-    "name": "ferrum_node_agent_ingress_interface_configured_count",
+    "name": "ferrum_node_agent_ingress_interface_configured_interfaces",
     "type": "gauge",
     "help": "Number of explicitly configured ingress interfaces (names are never labels).",
     "labels": [
@@ -2368,7 +2368,7 @@
     "emission": "conditional"
   },
   {
-    "name": "ferrum_node_agent_ingress_interface_expected_count",
+    "name": "ferrum_node_agent_ingress_interface_expected_interfaces",
     "type": "gauge",
     "help": "Number of interfaces required by the proved node/CNI route topology (names are never labels).",
     "labels": [

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Multi-stage build for Ferrum Edge
 
 # Build features for the main binary. Default = `cloud-secrets` (the historical
@@ -18,6 +19,7 @@
 # deliberately not done here because it changes the capture-image build
 # interface and must be validated against the release/CI image-build scripts.
 ARG FEATURES=cloud-secrets
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot
 
 # --- eBPF build stage (nightly, Linux only) ---
 # Compiles the no_std `ferrum-ebpf` crate to a BPF ELF using nightly +
@@ -45,29 +47,13 @@ RUN cargo +nightly build \
         -Z build-std=core \
     && test -f target/bpfel-unknown-none/release/ferrum-ebpf
 
-# Runtime tool closure for the distroless eBPF image. Copy only `ip` and the
-# shared objects resolved by its loader; do not ship a shell, package manager,
-# or the iptables fallback tools.
+# Runtime tool closure for the distroless eBPF image. Inventory the actual base
+# filesystem and stage only loader-resolved libraries it does not already own.
+FROM ${RUNTIME_BASE} AS runtime-base
 FROM debian:13-slim AS iproute2-runtime
-# Distroless uses merged-/usr symlinks for /lib and /lib64. Stage loader paths
-# beneath their real /usr destinations so the final COPY never replaces them.
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && mkdir -p /iproute2-root/usr/sbin /iproute2-root/usr/lib /iproute2-root/usr/lib64 \
-    && cp /usr/sbin/ip /iproute2-root/usr/sbin/ip \
-    && ldd /usr/sbin/ip > /tmp/iproute2-ldd \
-    && awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
-        /tmp/iproute2-ldd > /tmp/iproute2-libraries \
-    && test -s /tmp/iproute2-libraries \
-    && while IFS= read -r library; do \
-        case "$library" in \
-            /lib/*|/lib64/*) destination="/usr$library" ;; \
-            /usr/lib/*|/usr/lib64/*) destination="$library" ;; \
-            *) echo "unexpected iproute2 library path: $library" >&2; exit 1 ;; \
-        esac; \
-        mkdir -p "/iproute2-root$(dirname "$destination")"; \
-        cp -L "$library" "/iproute2-root$destination" || exit 1; \
-    done < /tmp/iproute2-libraries \
-    && rm -rf /var/lib/apt/lists/*
+COPY .github/scripts/stage_iproute2_runtime.sh /usr/local/bin/stage-iproute2-runtime
+RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
+    /bin/sh /usr/local/bin/stage-iproute2-runtime /iproute2-root /distroless-root
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
@@ -116,7 +102,7 @@ RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
 # Stage 2: Distroless Linux eBPF capture runtime. NodeWaypoint ingress redirect
 # owns an exact policy rule/route and therefore requires the `ip` binary at
 # startup and teardown, but no shell or package manager is present.
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM runtime-base
 
 COPY --from=iproute2-runtime /iproute2-root/usr/sbin/ip /usr/sbin/ip
 COPY --from=iproute2-runtime /iproute2-root/usr/lib/ /usr/lib/

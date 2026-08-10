@@ -569,7 +569,7 @@
         },
         "ingressRedirectIfaces": {
           "type": "string",
-          "description": "Comma-separated explicit host interfaces for the optional NodeWaypoint tc ingress redirect (maximum 16); empty disables it. The node agent never auto-selects or broadens this set and keeps readiness false unless the exact set completely covers the supported per-family remote Node PodCIDR/address route topology."
+          "description": "Comma-separated explicit host interfaces for the optional NodeWaypoint tc ingress redirect (maximum 16); empty disables it. The node agent never auto-selects or broadens this set and keeps readiness false unless the exact set completely covers the supported per-family remote Ready-Node PodCIDR/InternalIP route topology. Ready Nodes without both evidence types are unsupported."
         },
         "trustedKubeletProbeSourceIps": {
           "type": "string"

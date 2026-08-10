@@ -569,8 +569,8 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains(
         "ferrum_node_agent_ingress_interface_topology{state=\"disabled\",reason=\"disabled\"} 1"
     ));
-    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_count 0"));
-    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_count 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 0"));
     assert!(
         output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 0")
     );

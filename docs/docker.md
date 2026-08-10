@@ -36,7 +36,7 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
 2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
-3. **Runtime Tool Stage**: Extracts the `ip` executable and only its resolved shared-library closure from Debian 13 for the NodeWaypoint ingress policy-rule lifecycle
+3. **Runtime Tool Stage**: Extracts the `ip` executable and only its non-base resolved shared-library closure from Debian 13 for the NodeWaypoint ingress policy-rule lifecycle. The shared staging helper used by both Docker definitions excludes glibc, the dynamic loader, libgcc, and libstdc++, which remain owned by the distroless base ABI
 4. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) plus that bounded `ip` closure — no shell, package manager, or iptables fallback tools
 
 > **Current eBPF build coupling.** The runtime stage unconditionally copies the
@@ -50,7 +50,7 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 > stage first.
 
 **Image Features**:
-- **Distroless**: The source-build eBPF image adds only `ip` and its resolved shared objects to the distroless base; it contains no shell, package manager, `iptables`, or `ip6tables`
+- **Distroless**: The source-build eBPF image adds only `ip` and non-base resolved shared objects to the distroless base; it contains no shell, package manager, `iptables`, or `ip6tables`. PR CI builds the production root Dockerfile, runs `ip -V` and `ferrum-edge version` through explicit entrypoints, and inspects the exported filesystem for forbidden runtime tools
 - Non-root user execution by default (UID 65532, distroless `nonroot`; the node-agent chart overrides this for kernel capture)
 - Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)

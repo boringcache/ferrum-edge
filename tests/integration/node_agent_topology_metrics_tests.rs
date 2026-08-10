@@ -37,8 +37,8 @@ fn unavailable_topology_renders_only_closed_labels_and_bounded_counts() {
     assert!(output.contains(
         "ferrum_node_agent_ingress_interface_topology{state=\"unavailable\",reason=\"wrong_interface\"} 1"
     ));
-    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_count 2"));
-    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_count 1"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 2"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 1"));
     assert!(
         output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv6\"} 1")
     );

@@ -3572,22 +3572,22 @@ impl MetricsRegistry {
                 ));
             }
             output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_configured_count Number of explicitly configured ingress interfaces (names are never labels).\n",
+                "# HELP ferrum_node_agent_ingress_interface_configured_interfaces Number of explicitly configured ingress interfaces (names are never labels).\n",
             );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_configured_count gauge\n");
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n");
             render_process_counter(
                 &mut output,
-                "ferrum_node_agent_ingress_interface_configured_count",
+                "ferrum_node_agent_ingress_interface_configured_interfaces",
                 u64::from(topology.configured_interfaces),
                 &ns_label,
             );
             output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_expected_count Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
+                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
             );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_expected_count gauge\n");
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
             render_process_counter(
                 &mut output,
-                "ferrum_node_agent_ingress_interface_expected_count",
+                "ferrum_node_agent_ingress_interface_expected_interfaces",
                 u64::from(topology.expected_interfaces),
                 &ns_label,
             );

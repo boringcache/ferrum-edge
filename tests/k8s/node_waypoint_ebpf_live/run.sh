@@ -856,7 +856,7 @@ for node in data.get("items") or []:
     addresses = (node.get("status") or {}).get("addresses") or []
     seen = False
     for item in addresses:
-        if item.get("type") not in ("InternalIP", "ExternalIP"):
+        if item.get("type") != "InternalIP":
             continue
         address = ipaddress.ip_address(item.get("address", ""))
         if address.version == 6 and not require_v6:
@@ -865,7 +865,7 @@ for node in data.get("items") or []:
         prefix = 32 if address.version == 4 else 128
         print(f"address|{address.version}|{address}/{prefix}|{address}")
     if not seen:
-        raise SystemExit("remote Node has no usable address evidence")
+        raise SystemExit("remote Ready Node has no usable InternalIP evidence")
 ' "$local_node" "$REQUIRE_DUAL_STACK" "$remote_filter"
 }
 
@@ -1318,6 +1318,8 @@ assert_node_agent_ready_metric() {
   grep -q 'ferrum_node_agent_capture_state{state="ready"} 1' "$metrics_file"
   grep -q 'ferrum_mesh_node_topology_degraded{reason="none"} 0' "$metrics_file"
   grep -q 'ferrum_node_agent_ingress_interface_topology{state="ready",reason="valid"} 1' "$metrics_file"
+  grep -Eq '^ferrum_node_agent_ingress_interface_configured_interfaces [1-9][0-9]*$' "$metrics_file"
+  grep -Eq '^ferrum_node_agent_ingress_interface_expected_interfaces [1-9][0-9]*$' "$metrics_file"
   grep -q 'ferrum_node_agent_ingress_interface_family_required{family="ipv4"} 1' "$metrics_file"
   grep -q 'ferrum_node_agent_ingress_interface_family_covered{family="ipv4"} 1' "$metrics_file"
   mkdir -p "$RESULTS_DIR/node-agent-metrics"
