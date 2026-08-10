@@ -1581,8 +1581,7 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
-    let mut udp_registry_retraction_retry =
-        tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
+    let mut udp_registry_retraction_retry = tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
     udp_registry_retraction_retry.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
