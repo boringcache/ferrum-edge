@@ -1332,6 +1332,8 @@ fn source_sidecar_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
         egress_stream_enabled: true,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        unix_socket_allowed_roots: Vec::new(),
+        unix_socket_allowed_uids: Vec::new(),
         locality_lb_strict: false,
     }
 }

@@ -13511,6 +13511,784 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
     eprintln!("LIVE_XC_STAGE shutdown:ok");
 }
 
+// ── Sidecar ingress Unix-socket backends (issue #3261) ───────────────────────
+//
+// These tests drive the REAL translation boundary: a `Sidecar` with
+// `ingress[].defaultEndpoint: unix://…` rides the localized mesh file source,
+// the data plane builds the slice itself (`MeshSlice::from_gateway_config` — the
+// same materialization every CP path uses), materializes the tagged upstream,
+// and then serves LIVE traffic over the socket. Nothing here hand-authors the
+// reserved `mesh.unix_socket` tag, so a regression anywhere between the Sidecar
+// spec and the dial fails the test.
+//
+// The inbound listener is plaintext (no SVID material, dev posture, an explicit
+// PeerAuthentication DISABLE), so the client side is a plain TCP/HTTP client and
+// the assertions stay about the Unix backend rather than about mTLS.
+
+/// A minimal HTTP/1.1 server on a Unix-domain stream socket. Answers every
+/// request with `name` plus the request line and forwarded Host, so a test can
+/// prove WHICH socket served it and that header regeneration survived the
+/// transport swap.
+#[cfg(unix)]
+struct UnixHttp1Backend {
+    path: PathBuf,
+    hits: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl UnixHttp1Backend {
+    fn start(path: PathBuf, name: &'static str) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind unix http1 backend");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = Arc::clone(&hits);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits = Arc::clone(&hits_task);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n =
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => return,
+                        };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let request_line = request.lines().next().unwrap_or("").to_string();
+                    let host = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+                        .map(|line| line["host:".len()..].trim().to_string())
+                        .unwrap_or_default();
+                    let body = format!("{name}|{request_line}|{host}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self { path, hits, task }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Simulate the app going away without rewriting config: stop serving and
+    /// unlink the socket, so the next dial gets `ENOENT`.
+    fn make_stale(&self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixHttp1Backend {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A minimal **h2c prior-knowledge HTTP/2** gRPC-shaped server on a
+/// Unix-domain stream socket.
+///
+/// `/ferrum.Test/Echo` answers immediately with a DATA frame plus a terminal
+/// `grpc-status: 0` TRAILER and echoes the received `grpc-timeout` back in a
+/// header, so a test can prove trailers AND deadline propagation survived the
+/// socket hop. `/ferrum.Test/Slow` sleeps well past any short deadline so the
+/// gateway's deadline enforcement (and the resulting upstream cancellation) is
+/// observable.
+#[cfg(unix)]
+struct UnixH2cBackend {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl UnixH2cBackend {
+    fn start(path: PathBuf) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind unix h2c backend");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                            let received_timeout = req
+                                .headers()
+                                .get("grpc-timeout")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let te_trailers = req
+                                .headers()
+                                .get("te")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let slow = req.uri().path().ends_with("/Slow");
+                            // Drain the request body so bidirectional streaming
+                            // is genuinely exercised rather than short-circuited.
+                            let _ = req.into_body().collect().await;
+                            if slow {
+                                tokio::time::sleep(Duration::from_millis(2_000)).await;
+                            }
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                "grpc-status",
+                                hyper::header::HeaderValue::from_static("0"),
+                            );
+                            trailers.insert(
+                                "grpc-message",
+                                hyper::header::HeaderValue::from_static("ok"),
+                            );
+                            let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+                                Ok(Frame::data(Bytes::from_static(b"\x00\x00\x00\x00\x04unix"))),
+                                Ok(Frame::trailers(trailers)),
+                            ];
+                            let body = StreamBody::new(stream::iter(frames));
+                            let response = hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("x-received-grpc-timeout", received_timeout)
+                                .header("x-received-te", te_trailers)
+                                .body(body)
+                                .expect("h2c grpc response builds");
+                            Ok::<_, std::io::Error>(response)
+                        });
+                    let _ = Http2ServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { path, task }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixH2cBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// One `Sidecar` `ingress[]` entry for the mesh document below.
+#[cfg(unix)]
+struct UnixIngressEntry {
+    listener_port: u16,
+    protocol: AppProtocol,
+    default_endpoint: String,
+}
+
+/// `{ "mesh": … }` file-source document: an `echo` workload/service in `ferrum`
+/// plus a namespace-default `Sidecar` whose `ingress[]` is `entries`.
+///
+/// PeerAuthentication DISABLE keeps the inbound listener plaintext so the test
+/// client needs no SVID; the Unix backend behavior under test is independent of
+/// the inbound transport.
+#[cfg(unix)]
+fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry]) -> String {
+    use ferrum_edge::modes::mesh::config::{MeshSidecar, MeshSidecarIngress};
+
+    let server_id = SpiffeId::new(server_spiffe).expect("server SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let workload = Workload {
+        spiffe_id: server_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "echo".to_string())]),
+            namespace: Some("ferrum".to_string()),
+        },
+        service_name: "echo".to_string(),
+        service_namespace: None,
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain,
+        namespace: "ferrum".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("echo".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "echo".to_string(),
+        namespace: "ferrum".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id,
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    let sidecar = MeshSidecar {
+        name: "echo-ingress".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_selector: None,
+        egress_inherits_defaults: true,
+        egress: Vec::new(),
+        // Declared even when the list is empty: that is how the withdrawal
+        // phase proves the routes are gone rather than silently replaced by the
+        // service-port defaults.
+        ingress_declared: true,
+        ingress: entries
+            .iter()
+            .map(|entry| MeshSidecarIngress {
+                port: entry.listener_port,
+                protocol: entry.protocol,
+                name: None,
+                bind: None,
+                default_endpoint: entry.default_endpoint.clone(),
+            })
+            .collect(),
+        outbound_traffic_policy: None,
+    };
+    // `local_inbound_services` is deliberately NOT set here: it is a
+    // `serde(skip)` runtime back-projection the data plane resolves for itself
+    // from the un-narrowed local view, so a document that tried to supply it
+    // would be silently dropped rather than honored.
+    let mesh = MeshConfig {
+        workloads: vec![workload],
+        services: vec![service],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-disable".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Disable,
+            port_overrides: HashMap::new(),
+        }],
+        sidecars: vec![sidecar],
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh })).expect("mesh document serializes")
+}
+
+/// Plain HTTP/1.1 request against the plaintext sidecar inbound listener.
+/// Returns `(status, raw response)`.
+#[cfg(unix)]
+async fn plaintext_inbound_http1(
+    port: u16,
+    authority: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    // Only default to `Connection: close` when the caller did not set its own —
+    // the WebSocket case needs `Connection: Upgrade` for the flavor detector to
+    // classify the request as an upgrade at all.
+    if !extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        request.push_str("Connection: close\r\n");
+    }
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+    // A refusal on an upgrade request may leave the connection open, so read
+    // until EOF OR a short quiet period and use whatever arrived. A response
+    // that never arrives at all still fails, because the status parse below has
+    // nothing to read.
+    let mut raw = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut chunk = [0u8; 4096];
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return Err(Box::new(e)),
+            // Quiet socket: if headers already arrived we are done, otherwise
+            // keep waiting until the outer deadline.
+            Err(_) if raw.windows(4).any(|w| w == b"\r\n\r\n") => break,
+            Err(_) => continue,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("no status line in response: {text:?}"))?;
+    Ok((status, text))
+}
+
+/// A gRPC-shaped h2c prior-knowledge request against the plaintext sidecar
+/// inbound listener. Returns `(status, response headers, trailers)`.
+#[cfg(unix)]
+async fn plaintext_inbound_grpc(
+    port: u16,
+    authority: &str,
+    path: &str,
+    grpc_timeout: Option<&str>,
+) -> Result<(u16, hyper::HeaderMap, hyper::HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(stream))
+        .await?;
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut builder = hyper::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    if let Some(timeout) = grpc_timeout {
+        builder = builder.header("grpc-timeout", timeout);
+    }
+    let request = builder.body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")))?;
+    let response =
+        tokio::time::timeout(Duration::from_secs(15), sender.send_request(request)).await??;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let collected =
+        tokio::time::timeout(Duration::from_secs(15), response.into_body().collect()).await??;
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    driver.abort();
+    Ok((status, headers, trailers))
+}
+
+/// Read a gRPC status code from either the response headers (Trailers-Only) or
+/// the terminal trailers.
+#[cfg(unix)]
+fn grpc_status_code(headers: &hyper::HeaderMap, trailers: &hyper::HeaderMap) -> Option<i32> {
+    trailers
+        .get("grpc-status")
+        .or_else(|| headers.get("grpc-status"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i32>().ok())
+}
+
+/// Keystone for issue #3261: a `Sidecar` ingress `defaultEndpoint: unix://…`
+/// translated through the supported source path serves LIVE traffic over the
+/// socket on HTTP/1.1 and on h2c (including native gRPC trailers and deadline
+/// enforcement), refuses the cases Ferrum does not support, and stays
+/// fail-closed for a socket outside the configured containment roots.
+///
+/// Also covers the lifecycle the acceptance criteria call out: update (re-point
+/// to a different allowed socket on SIGHUP), withdrawal (the entry disappears),
+/// and a stale socket (the app went away without a config change).
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+
+    let temp = TempDir::new().expect("temp dir");
+    // The CONTAINMENT root. Only sockets strictly below it are admissible.
+    let socket_root = temp.path().join("sockets");
+    std::fs::create_dir_all(&socket_root).expect("create socket root");
+    // Deliberately OUTSIDE the root, standing in for `/var/run/docker.sock`.
+    let outside_root = temp.path().join("privileged");
+    std::fs::create_dir_all(&outside_root).expect("create outside root");
+
+    let http1_socket = socket_root.join("http1.sock");
+    let h2c_socket = socket_root.join("h2c.sock");
+    let outside_socket = outside_root.join("privileged.sock");
+
+    let http1_backend = UnixHttp1Backend::start(http1_socket.clone(), "unix-http1-a");
+    let _h2c_backend = UnixH2cBackend::start(h2c_socket.clone());
+    // A REAL, reachable socket that config points at but containment forbids:
+    // the refusal must be the allowlist, not an absent socket.
+    let outside_backend = UnixHttp1Backend::start(outside_socket.clone(), "must-never-be-reached");
+
+    let unix_url = |path: &std::path::Path| format!("unix://{}", path.display());
+    let phase_a = vec![
+        UnixIngressEntry {
+            listener_port: 8443,
+            protocol: AppProtocol::Http,
+            default_endpoint: unix_url(&http1_socket),
+        },
+        UnixIngressEntry {
+            listener_port: 9443,
+            protocol: AppProtocol::Grpc,
+            default_endpoint: unix_url(&h2c_socket),
+        },
+        UnixIngressEntry {
+            listener_port: 7443,
+            protocol: AppProtocol::Http,
+            default_endpoint: unix_url(&outside_socket),
+        },
+    ];
+
+    let mesh_doc_path = temp.path().join("mesh.json");
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(server_spiffe, &phase_a),
+    )
+    .expect("write mesh document");
+
+    let ports = reserve_mesh_ports().await;
+    let inbound_port = ports.inbound;
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: "127.0.0.1:1".parse().expect("dummy addr"),
+            ports,
+            node_id: "functional-mesh-unix-ingress",
+            config_protocol: "file",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                (
+                    "FERRUM_MESH_FILE_CONFIG_PATH",
+                    mesh_doc_path
+                        .to_str()
+                        .expect("mesh document path is UTF-8")
+                        .to_string(),
+                ),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                // `ingress[]` materialization is gated on enforcement, NOT dry-run.
+                ("FERRUM_MESH_SIDECAR_ENFORCED", "true".to_string()),
+                // THE containment allowlist. Without it every unix listener is
+                // refused, which is asserted separately by the unit tests.
+                (
+                    "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
+                    socket_root
+                        .to_str()
+                        .expect("socket root is UTF-8")
+                        .to_string(),
+                ),
+                // A Unix target's synthetic loopback `host:port` is never a
+                // network dial target. Public-only IP egress must therefore
+                // leave this socket path to its own containment, inode, and
+                // peer-credential admission gates instead of rejecting the
+                // carrier address before Unix dispatch.
+                ("FERRUM_BACKEND_ALLOW_IPS", "public".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+            ],
+        },
+    );
+
+    if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!("mesh inbound listener never bound\n{output}");
+    }
+
+    // ── (a) HTTP/1.1 over the socket, through real Sidecar translation ──
+    let authority_8443 = "echo.ferrum.svc.cluster.local:8443";
+    let (status, body) = match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("HTTP/1.1 request to the unix ingress listener failed: {e}\n{output}");
+        }
+    };
+    if status != 200 || !body.contains("unix-http1-a") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a translated unix:// ingress listener must serve live HTTP/1.1 traffic from its \
+             socket; status {status} body {body:?}\n{output}"
+        );
+    }
+    assert!(
+        http1_backend.hits() >= 1,
+        "the HTTP/1.1 unix socket must have served the request"
+    );
+
+    // ── (b) native gRPC over h2c: trailers and `te: trailers` survive ──
+    let authority_9443 = "echo.ferrum.svc.cluster.local:9443";
+    let (grpc_status, grpc_headers, grpc_trailers) = match plaintext_inbound_grpc(
+        inbound_port,
+        authority_9443,
+        "/ferrum.Test/Echo",
+        Some("30S"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("gRPC request to the h2c unix ingress listener failed: {e}\n{output}");
+        }
+    };
+    if grpc_status != 200 || grpc_status_code(&grpc_headers, &grpc_trailers) != Some(0) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "gRPC over an h2c unix ingress listener must return OK with terminal trailers; \
+             status {grpc_status} headers {grpc_headers:?} trailers {grpc_trailers:?}\n{output}"
+        );
+    }
+    assert!(
+        grpc_trailers.contains_key("grpc-status"),
+        "the terminal grpc-status must arrive as a TRAILER, not a header: {grpc_trailers:?}"
+    );
+    assert_eq!(
+        grpc_headers
+            .get("x-received-te")
+            .and_then(|v| v.to_str().ok()),
+        Some("trailers"),
+        "the gateway must regenerate `te: trailers` on the h2c socket hop"
+    );
+    let forwarded_deadline = grpc_headers
+        .get("x-received-grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !forwarded_deadline.is_empty(),
+        "the client's gRPC deadline must be propagated onto the socket hop"
+    );
+
+    // ── (c) deadline enforcement / upstream cancellation ──
+    // 5 MILLISECONDS against a backend that sleeps 2s: the gateway must cancel
+    // and answer DEADLINE_EXCEEDED rather than hang for the backend.
+    let (slow_status, slow_headers, slow_trailers) = match plaintext_inbound_grpc(
+        inbound_port,
+        authority_9443,
+        "/ferrum.Test/Slow",
+        Some("5m"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("deadline-bounded gRPC request failed to complete: {e}\n{output}");
+        }
+    };
+    let slow_code = grpc_status_code(&slow_headers, &slow_trailers);
+    if slow_code != Some(4) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "an exceeded gRPC deadline on the h2c unix hop must be DEADLINE_EXCEEDED (4); got \
+             status {slow_status} code {slow_code:?} headers {slow_headers:?} trailers \
+             {slow_trailers:?}\n{output}"
+        );
+    }
+
+    // ── (d) gRPC against an `http`-declared (HTTP/1.1) socket is REFUSED ──
+    // HTTP/1.1 cannot carry gRPC trailers, so this must be a clean gRPC
+    // UNAVAILABLE, never a downgraded dial.
+    let (h1_grpc_status, h1_grpc_headers, h1_grpc_trailers) =
+        match plaintext_inbound_grpc(inbound_port, authority_8443, "/ferrum.Test/Echo", None).await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("gRPC request to the http-declared unix listener failed: {e}\n{output}");
+            }
+        };
+    let h1_grpc_code = grpc_status_code(&h1_grpc_headers, &h1_grpc_trailers);
+    if h1_grpc_status != 200 || h1_grpc_code != Some(14) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "gRPC to an http-declared unix ingress listener must be refused UNAVAILABLE (14); \
+             got status {h1_grpc_status} code {h1_grpc_code:?}\n{output}"
+        );
+    }
+
+    // ── (e) WebSocket upgrade over a unix backend is explicitly refused ──
+    let (ws_status, ws_body) = match plaintext_inbound_http1(
+        inbound_port,
+        authority_8443,
+        "/ws",
+        &[
+            ("Connection", "Upgrade"),
+            ("Upgrade", "websocket"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("WebSocket upgrade attempt failed to complete: {e}\n{output}");
+        }
+    };
+    if ws_status != 502 || !ws_body.contains("does not support WebSocket") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a WebSocket upgrade to a unix-socket backend must be refused 502 with the documented \
+             message; got status {ws_status} body {ws_body:?}\n{output}"
+        );
+    }
+
+    // ── (f) containment: a real socket OUTSIDE the allowed roots never dials ──
+    let (denied_status, denied_body) =
+        match plaintext_inbound_http1(inbound_port, "echo.ferrum.svc.cluster.local:7443", "/", &[])
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("request to the out-of-root unix listener failed: {e}\n{output}");
+            }
+        };
+    if denied_status == 200 || denied_body.contains("must-never-be-reached") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a unix socket outside FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS must never be dialed; \
+             got status {denied_status} body {denied_body:?}\n{output}"
+        );
+    }
+    assert_eq!(
+        outside_backend.hits(),
+        0,
+        "the out-of-root socket must have received NO connection at all"
+    );
+
+    // ── (g) stale socket: the app vanished without a config change ──
+    http1_backend.make_stale();
+    let (stale_status, stale_body) =
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("request to the stale unix socket failed: {e}\n{output}");
+            }
+        };
+    if stale_status == 200 {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a removed unix socket must fail the request, not serve it; body \
+             {stale_body:?}\n{output}"
+        );
+    }
+
+    // ── (h) UPDATE: re-point the listener at a DIFFERENT allowed socket ──
+    let updated_socket = socket_root.join("http1-b.sock");
+    let updated_backend = UnixHttp1Backend::start(updated_socket.clone(), "unix-http1-b");
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(
+            server_spiffe,
+            &[UnixIngressEntry {
+                listener_port: 8443,
+                protocol: AppProtocol::Http,
+                default_endpoint: unix_url(&updated_socket),
+            }],
+        ),
+    )
+    .expect("rewrite mesh document for the update phase");
+    let pid = child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP")
+            .success(),
+        "SIGHUP delivery failed for pid {pid}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok((200, body)) if body.contains("unix-http1-b") => break,
+            _ if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            other => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "the reloaded listener never dialed the new socket; last result \
+                     {other:?}\n{output}"
+                );
+            }
+        }
+    }
+    assert!(
+        updated_backend.hits() >= 1,
+        "the re-pointed socket must have served the request after reload"
+    );
+
+    // ── (i) WITHDRAWAL: the ingress entry disappears entirely ──
+    // `ingress_declared` stays true with an EMPTY list, so Istio semantics say
+    // the service-port defaults must NOT come back either.
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(server_spiffe, &[]),
+    )
+    .expect("rewrite mesh document for the withdrawal phase");
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP")
+            .success(),
+        "SIGHUP delivery failed for pid {pid}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let hits_before_withdrawal = updated_backend.hits();
+    loop {
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok((status, body)) if status != 200 && !body.contains("unix-http1-b") => break,
+            _ if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            other => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "a withdrawn unix ingress listener must stop routing; last result \
+                     {other:?}\n{output}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        updated_backend.hits(),
+        hits_before_withdrawal,
+        "no request may reach the socket after its listener was withdrawn"
+    );
+
+    kill_child(&mut child);
+}
+
 // ── Live H3 → authenticated mesh-transport gRPC datapath (issue #3284) ───────
 //
 // The LIVE keystone for H3-to-gRPC mesh dispatch. Every test below drives a real
