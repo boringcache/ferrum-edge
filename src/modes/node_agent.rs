@@ -1890,10 +1890,8 @@ fn publish_udp_migration_registry_sync_if_ready(
                 .to_string(),
         );
     };
-    let expected_pod_uids: HashSet<String> = pod_states
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect();
+    let expected_pod_uids: HashSet<String> =
+        pod_states.iter().map(|entry| entry.key().clone()).collect();
     crate::proxy::udp_placement_migration::publish_registry_sync_marker_for_pods(
         registry_dir,
         generation,
@@ -5428,12 +5426,7 @@ fn handle_pod_added_inner(
                 if let Some(current_state) = pod_states.get(pod_uid) {
                     remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
-                        pod_enrollment_attempt_signature(
-                            event,
-                            pod_ip,
-                            &cgroup_path,
-                            &veth_iface,
-                        ),
+                        pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface),
                         RetryablePodEnrollment::from_event(event),
                         prior_cleanup_state.as_ref(),
                         current_state.value(),

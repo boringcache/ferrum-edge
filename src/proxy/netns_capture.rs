@@ -196,8 +196,7 @@ fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
         let process_uid = unsafe { libc::geteuid() };
         if metadata.nlink() != 1 || metadata.uid() != process_uid {
             return Err(
-                "Ambient capture registry entry is not singly linked and process-owned"
-                    .to_string(),
+                "Ambient capture registry entry is not singly linked and process-owned".to_string(),
             );
         }
     }
@@ -241,11 +240,11 @@ impl PodCaptureSource for DirectoryCaptureSource {
         for (index, entry) in entries.enumerate() {
             if index >= MAX_MIGRATION_REGISTRY_ENTRIES {
                 return Err(
-                    "Ambient capture registry exceeds its migration entry limit".to_string(),
+                    "Ambient capture registry exceeds its migration entry limit".to_string()
                 );
             }
-            let entry = entry
-                .map_err(|_| "could not enumerate Ambient capture registry for migration")?;
+            let entry =
+                entry.map_err(|_| "could not enumerate Ambient capture registry for migration")?;
             let pod_uid = entry
                 .file_name()
                 .into_string()
