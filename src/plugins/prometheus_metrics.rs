@@ -4283,7 +4283,7 @@ mod tests {
         let mut summary = mesh_summary();
         summary.metadata.insert(
             prometheus_helpers::MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
-            "s0,4:edge;r11;".to_string(),
+            "m0;s0,4:edge;r11;".to_string(),
         );
 
         registry.record(&summary);

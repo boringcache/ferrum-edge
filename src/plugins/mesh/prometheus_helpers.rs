@@ -15,7 +15,7 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::metric_tag_cel::{
     MAX_METRIC_TAG_CEL_AST_NODES, MAX_METRIC_TAG_CEL_NESTING, MetricTagCelAttr,
     MetricTagCelContext, metadata_destination_port, metadata_request_host, metadata_request_method,
-    sanitize_metric_tag_value,
+    sanitize_metric_tag_value, split_metric_tag_cel_plan,
 };
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
@@ -1496,9 +1496,12 @@ struct MetricTagCelExtras<'a> {
 fn apply_metric_override_plan(
     key: &mut MeshRequestKey,
     attribution: &MeshRequestKey,
-    mut plan: &str,
+    plan: &str,
     extras: MetricTagCelExtras<'_>,
 ) {
+    let Some((_, mut plan)) = split_metric_tag_cel_plan(plan) else {
+        return;
+    };
     while !plan.is_empty() {
         let Some(op) = plan.as_bytes().first().copied() else {
             return;
@@ -2316,7 +2319,7 @@ mod tests {
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Copy the source workload into destination workload, then set
                 // the source to a new value. The order is observable.
-                "n0,5;s0,4:edge;".to_string(),
+                "m0;n0,5;s0,4:edge;".to_string(),
             )]),
             ..TransactionSummary::default()
         };
@@ -2339,7 +2342,7 @@ mod tests {
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Remove source_principal, rename source_workload into
                 // source_app (removing source_workload).
-                "r2;n0,3;".to_string(),
+                "m0;r2;n0,3;".to_string(),
             )]),
             ..TransactionSummary::default()
         };

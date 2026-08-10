@@ -334,7 +334,7 @@ fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projecti
         ),
         (
             MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
-            "s0,4:edge;r11;".to_string(),
+            "m0;s0,4:edge;r11;".to_string(),
         ),
     ]);
 
@@ -349,7 +349,7 @@ fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projecti
         projected
             .get(MESH_REQUEST_COUNT_OVERRIDES_METADATA)
             .map(String::as_str),
-        Some("s0,4:edge;r11;")
+        Some("m0;s0,4:edge;r11;")
     );
 
     let mut summary = TransactionSummary {
@@ -372,7 +372,7 @@ fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projecti
     summary.metadata.remove(MESH_METRICS_DISABLED_METADATA);
     summary.metadata.insert(
         MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
-        "s0,4:edge;r11;".to_string(),
+        "m0;s0,4:edge;r11;".to_string(),
     );
     let registry = MetricsRegistry::new();
     registry.record(&summary);

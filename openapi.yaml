@@ -17461,8 +17461,11 @@ components:
                       precompiled plan only. Supported CEL attributes are the
                       finalized mesh metric-key peer labels plus
                       `request.method`, `request.host`, `response.code`, and
-                      `destination.port` stamped before emission when an active
-                      expression requires them. Exact CEL label values are
+                      `destination.port`. With several effective
+                      `workload_metrics` instances, inputs are stamped from the
+                      union required by the final composed per-family plans;
+                      replacing one family also replaces that family's input
+                      requirements. Exact CEL label values are
                       admitted under a finite per-family live-series budget
                       (default 10_000 distinct keys); further distinct keys are
                       dropped and counted on

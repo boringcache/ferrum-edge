@@ -754,3 +754,190 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
     assert!(!meta.contains_key("mesh.metrics.cel.request_host"));
     assert!(!meta.contains_key("mesh.metrics.cel.request_method"));
 }
+
+#[tokio::test]
+async fn multiple_effective_instances_union_surviving_family_cel_inputs() {
+    // Effective instances compose per family: the later REQUEST_DURATION plan
+    // must not clear request.host while the earlier REQUEST_COUNT plan remains
+    // active, and the earlier instance must not suppress the later method need.
+    let request_count = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set_expr", "cel": "request.host"}
+            }]
+        }
+    }))
+    .expect("request-count host CEL");
+    let request_duration = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_DURATION",
+                "name": "destination_service",
+                "operation": {"type": "set_expr", "cel": "request.method"}
+            }]
+        }
+    }))
+    .expect("request-duration method CEL");
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "POST".into(), "/pay".into());
+    ctx.request_authority = Some("checkout.default.svc".into());
+    let mut headers = HashMap::new();
+    request_count.before_proxy(&mut ctx, &mut headers).await;
+    request_duration.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.cel.request_host")
+            .map(String::as_str),
+        Some("checkout.default.svc")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.cel.request_method")
+            .map(String::as_str),
+        Some("POST")
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.record(&TransactionSummary {
+        http_method: "POST".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    });
+    let output = registry.render_uncached();
+    let request_count = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("request count");
+    let request_duration = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_request_duration_ms_count{"))
+        .expect("request duration");
+    assert!(
+        request_count.contains(r#"source_workload="checkout.default.svc""#),
+        "{request_count}"
+    );
+    assert!(
+        request_duration.contains(r#"destination_service="POST""#),
+        "{request_duration}"
+    );
+}
+
+#[tokio::test]
+async fn later_same_family_plan_replaces_cel_input_requirements() {
+    let cel = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set_expr", "cel": "request.host"}
+            }]
+        }
+    }))
+    .expect("request-count host CEL");
+    let replacement = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {"type": "set", "value": "replacement"}
+            }]
+        }
+    }))
+    .expect("request-count replacement");
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    ctx.request_authority = Some("stale.example".into());
+    let mut headers = HashMap::new();
+    cel.before_proxy(&mut ctx, &mut headers).await;
+    replacement.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        !ctx.metadata.contains_key("mesh.metrics.cel.request_host"),
+        "same-family replacement without CEL must retire the old input need"
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.record(&TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    });
+    let output = registry.render_uncached();
+    let request_count = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("request count");
+    assert!(
+        request_count.contains(r#"source_workload="replacement""#),
+        "{request_count}"
+    );
+}
+
+#[tokio::test]
+async fn multiple_stream_instances_preserve_surviving_destination_port_need() {
+    let opened = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "TCP_OPENED_CONNECTIONS",
+                "name": "destination_service",
+                "operation": {"type": "set_expr", "cel": "string(destination.port)"}
+            }]
+        }
+    }))
+    .expect("TCP opened destination-port CEL");
+    let sent = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "TCP_SENT_BYTES",
+                "name": "source_workload",
+                "operation": {"type": "set", "value": "edge"}
+            }]
+        }
+    }))
+    .expect("TCP sent static override");
+
+    let mut stream = ferrum_edge::plugins::StreamConnectionContext::new(
+        "10.0.0.2".into(),
+        "10.0.0.3".into(),
+        "proxy-1".into(),
+        Some("reviews.catalog.svc.cluster.local".into()),
+        0,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    );
+    stream.destination_port = Some(15001);
+    stream.connection_destination_port = Some(9080);
+    stream.metadata = Some(HashMap::from([(
+        "mesh.metrics.prometheus_metrics_observed".into(),
+        "1".into(),
+    )]));
+    opened.on_stream_connect(&mut stream).await;
+    sent.on_stream_connect(&mut stream).await;
+
+    let metadata = stream.metadata.as_mut().expect("stream metadata");
+    assert_eq!(
+        metadata
+            .get("mesh.metrics.cel.destination_port")
+            .map(String::as_str),
+        Some("9080")
+    );
+    let registry = MetricsRegistry::new();
+    registry.finalize_mesh_tcp_opened(
+        metadata,
+        "reviews.catalog.svc.cluster.local",
+        Some("reviews.catalog.svc.cluster.local"),
+    );
+    let output = registry.render_uncached();
+    let opened = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_tcp_connections_opened_total{"))
+        .expect("TCP opened metric");
+    assert!(
+        opened.contains(r#"destination_service="9080""#),
+        "{opened}"
+    );
+}

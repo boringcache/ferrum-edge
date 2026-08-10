@@ -200,11 +200,84 @@ pub struct MetricTagCelStampNeeds {
 }
 
 impl MetricTagCelStampNeeds {
+    const REQUEST_HOST_BIT: u8 = 1;
+    const REQUEST_METHOD_BIT: u8 = 1 << 1;
+    const DESTINATION_PORT_BIT: u8 = 1 << 2;
+
     pub fn merge(&mut self, other: Self) {
         self.request_host |= other.request_host;
         self.request_method |= other.request_method;
         self.destination_port |= other.destination_port;
     }
+
+    /// Compact, construction-time marker embedded in one metric family's
+    /// override plan. Keeping the marker per family lets several effective
+    /// `workload_metrics` instances compose without a later instance clearing
+    /// an attribute still required by an earlier surviving family plan.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self.bitmask() {
+            0 => "0",
+            1 => "1",
+            2 => "2",
+            3 => "3",
+            4 => "4",
+            5 => "5",
+            6 => "6",
+            7 => "7",
+            _ => "7",
+        }
+    }
+
+    pub(crate) fn from_marker(marker: &str) -> Option<Self> {
+        let bits = match marker {
+            "0" => 0,
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            "4" => 4,
+            "5" => 5,
+            "6" => 6,
+            "7" => 7,
+            _ => return None,
+        };
+        Some(Self {
+            request_host: bits & Self::REQUEST_HOST_BIT != 0,
+            request_method: bits & Self::REQUEST_METHOD_BIT != 0,
+            destination_port: bits & Self::DESTINATION_PORT_BIT != 0,
+        })
+    }
+
+    pub(crate) const fn all() -> Self {
+        Self {
+            request_host: true,
+            request_method: true,
+            destination_port: true,
+        }
+    }
+
+    const fn bitmask(self) -> u8 {
+        let mut bits = 0;
+        if self.request_host {
+            bits |= Self::REQUEST_HOST_BIT;
+        }
+        if self.request_method {
+            bits |= Self::REQUEST_METHOD_BIT;
+        }
+        if self.destination_port {
+            bits |= Self::DESTINATION_PORT_BIT;
+        }
+        bits
+    }
+}
+
+/// Split the self-contained compact family plan into its CEL input marker and
+/// operation body. A malformed marker invalidates the whole plan; callers that
+/// decide what to stamp may conservatively fall back to [`MetricTagCelStampNeeds::all`],
+/// while metric evaluation applies no partial operations.
+pub(crate) fn split_metric_tag_cel_plan(plan: &str) -> Option<(MetricTagCelStampNeeds, &str)> {
+    let plan = plan.strip_prefix('m')?;
+    let (marker, operations) = plan.split_once(';')?;
+    Some((MetricTagCelStampNeeds::from_marker(marker)?, operations))
 }
 
 impl MetricTagCelExpr {
