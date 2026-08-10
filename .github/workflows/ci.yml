@@ -2191,6 +2191,17 @@ jobs:
             --set image.repository=example/ferrum-edge \
             --set image.tag=udp-cleanup \
             > "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --skip-schema-validation \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.err"; then
+            echo "::error title=Ambient UDP guard is ephemeral::ambient topology must require the node-agent registry hostPath even while capture is disabled"
+            exit 1
+          fi
+          grep -F 'ambient topology requires nodeAgent.enabled=true' \
+            "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.err"
           registry_refs="$(grep -c 'name: node-waypoint-pod-registry' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml")"
           if [ "$registry_refs" -lt 4 ]; then
             echo "::error title=Ambient disabled cleanup registry missing::expected registry volume and mount in both Ambient and node-agent DaemonSets"

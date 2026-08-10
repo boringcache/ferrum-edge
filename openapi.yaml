@@ -11487,6 +11487,7 @@ components:
             - host_cleanup_failed
             - cleanup_proof_missing
             - state_persistence_failed
+            - durable_state_rejected
           description: Closed-set node-local failure reason; never includes pod UIDs or generations.
 
     NodeWaypointObservabilitySnapshot:

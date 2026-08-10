@@ -22,6 +22,9 @@ const MAX_STATE_BYTES: u64 = 4096;
 const MAX_GENERATION_BYTES: usize = 64;
 const MAX_REGISTRY_SYNC_MARKER_BYTES: u64 = 256;
 const MAX_REGISTRY_SYNC_ENTRIES: usize = 100_000;
+const MAX_TEMP_DIRECTORY_ENTRIES_SCANNED_PER_WRITE: usize = 4096;
+const MAX_TEMP_FILES_REAPED_PER_WRITE: usize = 16;
+const MIN_CRASH_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -663,11 +666,18 @@ pub fn publish_registry_sync_marker_for_pods(
         if name.starts_with('.') {
             continue;
         }
-        open_owned_regular_file(&entry.path(), u64::MAX)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| {
-                format!("could not securely sync Ambient UDP registry entry: {error}")
+        let file = open_owned_regular_file(&entry.path(), u64::MAX).map_err(|error| {
+            format!("could not securely validate Ambient UDP registry entry: {error}")
+        })?;
+        // Current node-agent entries were file+directory synced when their
+        // atomic rename completed. Only an unexpected predecessor entry can
+        // predate that contract, so pay the compatibility fsync once for the
+        // stale set instead of reopening every live pod on every mutation.
+        if !expected_pod_uids.contains(&name) {
+            file.sync_all().map_err(|error| {
+                format!("could not securely sync stale Ambient UDP registry entry: {error}")
             })?;
+        }
         registry_pod_uids.insert(name);
     }
     if !expected_pod_uids.is_subset(&registry_pod_uids) {
@@ -766,6 +776,7 @@ fn atomic_write(
     bytes: &[u8],
     description: &str,
 ) -> Result<(), String> {
+    reap_owned_temporary_files(directory, temporary_prefix);
     let mut temporary = tempfile::Builder::new()
         .prefix(&format!("{temporary_prefix}.tmp."))
         .tempfile_in(directory)
@@ -782,6 +793,70 @@ fn atomic_write(
         .map_err(|error| format!("could not publish {description}: {error}"))?;
     sync_directory(directory)
         .map_err(|error| format!("could not sync {description} directory: {error}"))
+}
+
+/// Reap only aged crash-left temporary files produced by this module. The age
+/// fence avoids racing an overlapping rollout's active atomic write. A bounded
+/// scan keeps work predictable; secure open plus an identity recheck refuses
+/// symlinks, directories, hard links, foreign owners, and a pathname whose
+/// identity changed between the two validation opens.
+fn reap_owned_temporary_files(directory: &Path, temporary_prefix: &str) {
+    let exact_prefix = format!("{temporary_prefix}.tmp.");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut reaped = 0usize;
+    for entry in entries
+        .take(MAX_TEMP_DIRECTORY_ENTRIES_SCANNED_PER_WRITE)
+        .flatten()
+    {
+        if reaped >= MAX_TEMP_FILES_REAPED_PER_WRITE {
+            break;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&exact_prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(opened) = open_owned_regular_file(&path, u64::MAX) else {
+            continue;
+        };
+        let Ok(opened_metadata) = opened.metadata() else {
+            continue;
+        };
+        let old_enough = opened_metadata
+            .modified()
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= MIN_CRASH_TEMP_AGE);
+        if !old_enough {
+            continue;
+        }
+        let Ok(current) = open_owned_regular_file(&path, u64::MAX) else {
+            continue;
+        };
+        let Ok(current_metadata) = current.metadata() else {
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened_metadata.dev() != current_metadata.dev()
+                || opened_metadata.ino() != current_metadata.ino()
+            {
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        if opened_metadata.len() != current_metadata.len() {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            reaped += 1;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -854,6 +929,7 @@ pub enum UdpMigrationFailureReason {
     HostCleanupFailed,
     CleanupProofMissing,
     StatePersistenceFailed,
+    DurableStateRejected,
 }
 
 impl UdpMigrationFailureReason {
@@ -874,6 +950,7 @@ impl UdpMigrationFailureReason {
             9 => Self::HostCleanupFailed,
             10 => Self::CleanupProofMissing,
             11 => Self::StatePersistenceFailed,
+            12 => Self::DurableStateRejected,
             _ => Self::None,
         }
     }
@@ -892,6 +969,7 @@ impl UdpMigrationFailureReason {
             Self::HostCleanupFailed => "host_cleanup_failed",
             Self::CleanupProofMissing => "cleanup_proof_missing",
             Self::StatePersistenceFailed => "state_persistence_failed",
+            Self::DurableStateRejected => "durable_state_rejected",
         }
     }
 }
@@ -900,7 +978,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
-static FAILURES_TOTAL: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static FAILURES_TOTAL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UdpMigrationStatusSnapshot {
@@ -908,10 +986,6 @@ pub struct UdpMigrationStatusSnapshot {
     pub phase: UdpMigrationStatusPhase,
     pub outstanding: u64,
     pub failure_reason: UdpMigrationFailureReason,
-}
-
-pub fn set_enabled(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn set_phase(phase: UdpMigrationStatusPhase, outstanding: usize) {
@@ -994,6 +1068,7 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         UdpMigrationFailureReason::HostCleanupFailed,
         UdpMigrationFailureReason::CleanupProofMissing,
         UdpMigrationFailureReason::StatePersistenceFailed,
+        UdpMigrationFailureReason::DurableStateRejected,
     ] {
         output.push_str(&format!(
             "ferrum_mesh_udp_placement_migration_failures_total{{reason=\"{}\"{}}} {}\n",

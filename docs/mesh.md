@@ -3446,12 +3446,27 @@ two explicit releases. The placements are `pod-netns`, `host-netns`, and
 `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`. A later transition must choose a
 new generation rather than reusing the most recently completed value.
 
+The Helm-side contract is a live-cluster guard. Run these transitions with
+`helm upgrade` under an identity allowed to read the release namespace: Helm's
+`lookup` must read the installed
+`ferrum-mesh-udp-placement-<release>` ConfigMap. `helm template` does not query
+the cluster. Without `--is-upgrade` it therefore cannot enforce predecessor
+ordering; with `--is-upgrade` its empty lookup is treated as a pre-contract
+release and blocks ordinary upgrades. GitOps/client-render pipelines must add
+an equivalent cluster-state admission gate if they need the Helm-side check.
+The per-node durable runtime guard remains authoritative, fail-closed, and
+independent of that pipeline gate.
+
 1. Render the destination switches plus
    `FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup`, a new
    `..._GENERATION`, and exact `..._FROM` / `..._TO` values. Do not use Helm
    `--wait`: cleanup pods deliberately remain unready. The chart temporarily
    uses `maxUnavailable: 100%` so that intentional unready state cannot deadlock
-   the DaemonSet rollout. When the predecessor is `pod-netns` (or the conservative
+   the DaemonSet rollout. This can restart every Ambient proxy simultaneously,
+   interrupting HBONE and raw TCP as well as UDP; finalize applies the same
+   strategy and can create a second mesh-wide restart. Schedule both releases
+   in a maintenance window sized for complete Ambient data-plane interruption.
+   When the predecessor is `pod-netns` (or the conservative
    `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
    `SYS_PTRACE`, and `NET_ADMIN`; stable/final host placement drops the setns
    privilege set.
@@ -3502,6 +3517,52 @@ upgrade from any pre-contract release requires an explicit cleanup adoption
 release even when the requested placement appears unchanged or disabled: the
 missing ConfigMap cannot prove whether that older release owned pod- or
 host-netns rules. Initial installs are unaffected.
+
+**Abort and durable-state recovery (maintenance only).** There is deliberately
+no online `cleanup -> stable` or tuple-switch transition. Once cleanup is
+persisted, resuming/finalizing that exact tuple is the only traffic-bearing
+path. If the tuple is wrong, or a node rejects a corrupt/truncated/unsupported,
+non-regular, multiply-linked, foreign-UID, or unreadable
+`.udp-placement-state-v1.json`, use this fail-closed procedure:
+
+1. Enter a maintenance window, cordon every node selected by both the Ambient
+   and node-agent DaemonSets, drain all enrolled workloads, and verify there is
+   no workload UDP, HBONE, or TCP traffic left on those nodes. Do not delete or
+   rewrite either artifact while traffic is active.
+2. Stop both DaemonSets and verify that no Ambient proxy or node-agent pod is
+   running on any affected node. This is the proof that neither the pod-netns
+   nor host-netns producer can start while ownership is repaired.
+3. Repair the Helm artifact first. Set
+   `ferrum-mesh-udp-placement-<release>` back to the known predecessor
+   (`target=<from>`, `phase=stable`, and empty `generation/from/to`) for a true
+   abort, or to the new cleanup-adoption tuple for corrupt/unknown ownership.
+   This ordering prevents the next Helm operation from authorizing a producer
+   before node-local state is repaired.
+4. On **every** node in the DaemonSet scope, repair the registry hostPath named
+   by `nodeAgent.podRegistryDir`. For a true abort, atomically replace
+   `.udp-placement-state-v1.json` with
+   `{"version":1,"active":"<from>","pending":null,"completed":null}`;
+   create the temp file in the same directory, use the mesh container's
+   effective UID and a single link, fsync the file, rename it, then fsync the
+   directory. Retract `.udp-registry-synced` while both processes are stopped.
+   For corrupt or unknown ownership, quarantine the rejected state outside the
+   registry and leave the state path absent, then run a fresh explicit cleanup
+   adoption release; absent state makes cleanup probe **both** ownership
+   domains. Never guess ownership, chown a live file, follow a symlink, or
+   repair only a subset of nodes.
+5. Verify both artifacts and their tuple on every node before resuming the
+   DaemonSets. Apply the matching Helm values only after that verification so
+   the repaired ConfigMap becomes the release contract rather than a transient
+   manual edit. Keep nodes drained until the node-agent has completed its
+   relist, the intended Ambient producer is ready, and authenticated health
+   shows the expected phase. Then uncordon nodes under the normal rollout
+   policy.
+
+A planned `securityContext` UID change must use the same stopped-and-drained
+procedure (or retain the old UID until after the migration); the reader rejects
+old-UID state by design. Re-adopting `host-netns` from absent or rejected state
+always requires cleanup/finalize—stable host startup never fabricates a
+predecessor proof.
 
 **Recovery and churn contract.** Cleanup persists `(generation, from, to)`
 before touching rules. A proxy restart resumes only that tuple; a different or

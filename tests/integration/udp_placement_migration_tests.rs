@@ -11,6 +11,18 @@ use ferrum_edge::proxy::udp_placement_migration::{
     prepare_placement, publish_registry_sync_marker_for_pods,
 };
 
+fn age_crash_temp(path: &std::path::Path) {
+    let old = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(2 * 60 * 60))
+        .expect("old timestamp");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open crash temp")
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .expect("age crash temp");
+}
+
 struct MutableSource(Mutex<Vec<PodCaptureTarget>>);
 
 impl PodCaptureSource for MutableSource {
@@ -184,13 +196,11 @@ fn crash_leftover_temporary_files_do_not_block_exact_tuple_resume() {
     let registry = tempfile::tempdir().expect("registry");
     prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
         .expect("bootstrap placement");
-    std::fs::write(
-        registry
-            .path()
-            .join(".udp-placement-state-v1.json.tmp.crashed"),
-        b"incomplete",
-    )
-    .expect("crash leftover");
+    let crashed_temp = registry
+        .path()
+        .join(".udp-placement-state-v1.json.tmp.crashed");
+    std::fs::write(&crashed_temp, b"incomplete").expect("crash leftover");
+    age_crash_temp(&crashed_temp);
     let cleanup = transition(
         UdpMigrationPhase::Cleanup,
         "crash-resume",
@@ -201,17 +211,107 @@ fn crash_leftover_temporary_files_do_not_block_exact_tuple_resume() {
     assert_eq!(context.generation(), "crash-resume");
     assert!(context.cleanup_pod_netns());
     assert!(!context.cleanup_host_netns());
+    assert!(
+        !crashed_temp.exists(),
+        "the next state publication must reap an owned exact-prefix crash temp"
+    );
+}
+
+#[test]
+fn marker_publication_reaps_only_owned_exact_prefix_temporary_files() {
+    let registry = tempfile::tempdir().expect("registry");
+    let owned = registry.path().join(".udp-registry-synced.tmp.crashed");
+    let fresh = registry.path().join(".udp-registry-synced.tmp.active");
+    let foreign_prefix = registry.path().join(".udp-registry-synced.other");
+    std::fs::write(&owned, b"partial").expect("owned temp");
+    age_crash_temp(&owned);
+    std::fs::write(&fresh, b"in progress").expect("fresh temp");
+    std::fs::write(&foreign_prefix, b"foreign").expect("foreign file");
+
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "temp-reap",
+            &HashSet::new(),
+        ),
+        Ok(true)
+    );
+    assert!(!owned.exists());
+    assert!(fresh.exists());
+    assert!(foreign_prefix.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_temp_reaper_refuses_symlinks_and_directories() {
+    use std::os::unix::fs::symlink;
+
+    let registry = tempfile::tempdir().expect("registry");
+    let foreign = registry.path().join("foreign-target");
+    let symlink_temp = registry.path().join(".udp-registry-synced.tmp.symlink");
+    let directory_temp = registry.path().join(".udp-registry-synced.tmp.directory");
+    std::fs::write(&foreign, b"foreign").expect("foreign target");
+    symlink(&foreign, &symlink_temp).expect("symlink temp");
+    std::fs::create_dir(&directory_temp).expect("directory temp");
+
+    assert_eq!(
+        publish_registry_sync_marker_for_pods(
+            registry.path(),
+            "temp-reap-safe",
+            &HashSet::new(),
+        ),
+        Ok(true)
+    );
+    assert!(symlink_temp.symlink_metadata().is_ok());
+    assert!(directory_temp.is_dir());
+    assert_eq!(std::fs::read(&foreign).expect("foreign survives"), b"foreign");
 }
 
 #[test]
 fn malformed_or_non_regular_durable_state_fails_closed() {
     let registry = tempfile::tempdir().expect("registry");
-    std::fs::create_dir(registry.path().join(".udp-placement-state-v1.json"))
-        .expect("non-regular state fixture");
+    let state = registry.path().join(".udp-placement-state-v1.json");
+    std::fs::create_dir(&state).expect("non-regular state fixture");
     let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
         .err()
         .expect("non-regular state must not be guessed");
     assert!(error.contains("securely open"));
+
+    std::fs::remove_dir(&state).expect("remove non-regular state");
+    std::fs::write(&state, b"{\"version\":1").expect("truncated state fixture");
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .err()
+        .expect("truncated state must not be guessed");
+    assert!(error.contains("malformed"));
+
+    std::fs::write(
+        &state,
+        br#"{"version":2,"active":"pod-netns","pending":null,"completed":null}"#,
+    )
+    .expect("unsupported state fixture");
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .err()
+        .expect("unsupported state must not be guessed");
+    assert!(error.contains("unsupported version"));
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_durable_state_is_rejected_without_guessing_ownership() {
+    let registry = tempfile::tempdir().expect("registry");
+    let source = registry.path().join("state-source");
+    let state = registry.path().join(".udp-placement-state-v1.json");
+    std::fs::write(
+        &source,
+        br#"{"version":1,"active":"pod-netns","pending":null,"completed":null}"#,
+    )
+    .expect("linked state source");
+    std::fs::hard_link(&source, &state).expect("hard-linked state fixture");
+
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .err()
+        .expect("multiply-linked state must not be guessed");
+    assert!(error.contains("singly linked"));
 }
 
 #[test]

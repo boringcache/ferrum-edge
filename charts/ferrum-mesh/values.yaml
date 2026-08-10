@@ -192,6 +192,9 @@ injector:
       override: {}
 
 ambient:
+  # Requires nodeAgent.enabled=true. Ambient always shares the node-local
+  # pod-registry hostPath with the node-agent so UDP placement ownership and
+  # cleanup proof remain durable even when UDP capture itself is disabled.
   enabled: false
   inboundPort: 15006
   outboundPort: 15001

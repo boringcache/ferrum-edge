@@ -12400,17 +12400,43 @@ async fn arm_mesh_runtime_startup(
             crate::proxy::udp_placement_migration::UdpPlacementRequest::from_env(target).map_err(
                 |error| anyhow::anyhow!("invalid Ambient UDP migration settings: {error}"),
             )?;
-        crate::proxy::udp_placement_migration::set_enabled(true);
-        let placement_decision = crate::proxy::udp_placement_migration::prepare_placement(
-            registry_dir,
-            &migration_request,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("Ambient UDP placement guard rejected startup: {error}")
-        })?;
+        let placement_decision = match
+            crate::proxy::udp_placement_migration::prepare_placement(
+                registry_dir,
+                &migration_request,
+            )
+        {
+            Ok(decision) => Some(decision),
+            Err(error) => {
+                use crate::proxy::udp_placement_migration::{
+                    UdpMigrationFailureReason, UdpMigrationStatusPhase, set_failure, set_phase,
+                    snapshot,
+                };
+                let phase = if migration_request.phase
+                    == crate::proxy::udp_placement_migration::UdpMigrationPhase::Finalize
+                {
+                    UdpMigrationStatusPhase::FinalizeBlocked
+                } else {
+                    UdpMigrationStatusPhase::Failed
+                };
+                set_phase(phase, 0);
+                if snapshot().failure_reason == UdpMigrationFailureReason::None {
+                    set_failure(UdpMigrationFailureReason::DurableStateRejected);
+                }
+                udp_migration_blocks_readiness = true;
+                warn!(
+                    %error,
+                    phase = phase.as_str(),
+                    "Ambient UDP placement guard rejected the producer; unrelated mesh and admin listeners will continue with readiness withheld"
+                );
+                None
+            }
+        };
         let run_stable_placement = match placement_decision {
-            crate::proxy::udp_placement_migration::UdpPlacementDecision::RunStable => true,
-            crate::proxy::udp_placement_migration::UdpPlacementDecision::RunCleanup(context) => {
+            Some(crate::proxy::udp_placement_migration::UdpPlacementDecision::RunStable) => true,
+            Some(
+                crate::proxy::udp_placement_migration::UdpPlacementDecision::RunCleanup(context),
+            ) => {
                 udp_migration_blocks_readiness = true;
                 if context.cleanup_pod_netns() {
                     crate::proxy::netns_udp_capture::preflight_capture_tools(true)
@@ -12430,6 +12456,7 @@ async fn arm_mesh_runtime_startup(
                 }));
                 false
             }
+            None => false,
         };
         // Reap host-namespace UDP state whenever THIS process is not the one that
         // owns it. Host capture's own manager recovers (and then rebuilds) its
@@ -13320,7 +13347,7 @@ async fn arm_mesh_runtime_startup(
             .await?;
         if udp_migration_blocks_readiness {
             info!(
-                "Mesh runtime listeners started, but readiness remains false during the explicit Ambient UDP cleanup phase"
+                "Mesh runtime listeners started, but readiness remains false due to Ambient UDP placement cleanup or guard rejection"
             );
         } else {
             startup_ready.store(true, std::sync::atomic::Ordering::Release);
@@ -17559,6 +17586,68 @@ fn spawn_orig_dst_bridge_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ambient_udp_cleanup_supervisor_waits_for_registry_then_completes() {
+        use crate::proxy::udp_placement_migration::{
+            UdpMigrationPhase, UdpMigrationStatusPhase, UdpPlacement, UdpPlacementDecision,
+            UdpPlacementRequest, prepare_placement, publish_registry_sync_marker_for_pods,
+            snapshot,
+        };
+
+        let registry = tempfile::tempdir().expect("registry");
+        let stable = UdpPlacementRequest {
+            phase: UdpMigrationPhase::Stable,
+            target: UdpPlacement::PodNetns,
+            generation: None,
+            from: None,
+            to: None,
+        };
+        prepare_placement(registry.path(), &stable).expect("stable placement");
+        let cleanup = UdpPlacementRequest {
+            phase: UdpMigrationPhase::Cleanup,
+            target: UdpPlacement::HostNetns,
+            generation: Some("supervisor-test".to_string()),
+            from: Some(UdpPlacement::PodNetns),
+            to: Some(UdpPlacement::HostNetns),
+        };
+        let context = match prepare_placement(registry.path(), &cleanup)
+            .expect("cleanup placement")
+        {
+            UdpPlacementDecision::RunCleanup(context) => context,
+            UdpPlacementDecision::RunStable => panic!("cleanup must not run a producer"),
+        };
+        let source = Arc::new(
+            crate::proxy::netns_capture::DirectoryCaptureSource::new(registry.path()),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_ambient_udp_placement_cleanup(
+            context,
+            source,
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(snapshot().phase, UdpMigrationStatusPhase::WaitingForRegistry);
+        assert!(
+            publish_registry_sync_marker_for_pods(
+                registry.path(),
+                "supervisor-test",
+                &std::collections::HashSet::new(),
+            )
+            .expect("registry marker")
+        );
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(snapshot().phase, UdpMigrationStatusPhase::CleanupComplete);
+
+        let _ = shutdown_tx.send(true);
+        task.await.expect("cleanup supervisor task");
+    }
     use crate::config::EnvConfig;
     use crate::config::types::PluginScope;
     use crate::dns::{DnsCache, DnsConfig};

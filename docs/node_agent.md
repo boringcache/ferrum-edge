@@ -428,6 +428,18 @@ same-generation clear/mutate/republish cycle resets accumulated completion. The
 generation is bounded operator input and neither it nor the publication identity
 is used as a metric label or log field.
 
+Marker publication failures are migration-local: the watcher stays alive,
+withholds readiness and proof, and retries. Retraction failures are stricter.
+The node-agent keeps the control loop alive but fences watcher Apply/Delete,
+CNI ADD/DEL/GC, and capture retry mutations until the stale marker is securely
+absent; watcher events are deferred and CNI calls fail retryably rather than
+being acknowledged without capture. Shutdown likewise preserves registry
+entries instead of running the ordered pod-detach mutation if proof retraction
+fails; the backend owner still performs its process-exit cleanup. Publication is bounded in the steady state:
+each pod registry entry is atomically file+directory synced when it changes,
+while marker publication validates the snapshot and performs one directory
+sync instead of fsyncing every live pod on every event.
+
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod
 enrollment returns. The node-agent still attaches the outbound-redirect programs
