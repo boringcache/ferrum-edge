@@ -101,7 +101,6 @@ jobs:
           binary-path: target/pr-build/ferrum-edge
           image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
           bpf-elf-path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
-          base-image: debian:13-slim
           install-iproute2: "true"
 
       - name: Install Kubernetes tools

@@ -30,8 +30,10 @@ inputs:
     default: ""
   install-iproute2:
     description: >-
-      Install iproute2 in a Debian-family runtime image. Required by the eBPF
-      NodeWaypoint ingress redirect's exact policy-rule lifecycle.
+      Copy the iproute2 `ip` executable and its resolved Debian 13 runtime
+      library closure into the image. Required by the eBPF NodeWaypoint ingress
+      redirect's exact policy-rule lifecycle; no shell or package manager is
+      copied into the final image.
     required: false
     default: "false"
 
@@ -83,13 +85,26 @@ runs:
         fi
 
         {
+          if [ "$install_iproute2" = "true" ]; then
+            cat <<'DOCKERFILE'
+        FROM debian:13-slim AS ferrum-iproute2
+        RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+            && mkdir -p /iproute2-root \
+            && cp --parents /usr/sbin/ip /iproute2-root \
+            && ldd /usr/sbin/ip > /tmp/iproute2-ldd \
+            && awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
+                /tmp/iproute2-ldd > /tmp/iproute2-libraries \
+            && test -s /tmp/iproute2-libraries \
+            && while IFS= read -r library; do \
+                cp -L --parents "$library" /iproute2-root || exit 1; \
+            done < /tmp/iproute2-libraries \
+            && rm -rf /var/lib/apt/lists/*
+        DOCKERFILE
+          fi
           printf 'FROM %s\n' "$base_image"
           if [ "$install_iproute2" = "true" ]; then
             cat <<'DOCKERFILE'
-        RUN apt-get update && apt-get install -y --no-install-recommends \
-            ca-certificates \
-            iproute2 \
-            && rm -rf /var/lib/apt/lists/*
+        COPY --from=ferrum-iproute2 /iproute2-root/ /
         DOCKERFILE
           fi
           cat <<'DOCKERFILE'

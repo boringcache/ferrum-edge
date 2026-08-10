@@ -498,11 +498,11 @@ jobs:
           [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md).
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
-          degrading. The published \`-ebpf\` image is based on Debian slim and
-          includes \`iproute2\` for the supported NodeWaypoint ingress policy-rule
-          lifecycle, but it deliberately omits \`iptables\`/\`ip6tables\`; the
-          explicit iptables fallback therefore **crash-loops**. To use that
-          fallback, build a custom runtime image that adds \`iptables\`/\`ip6tables\`
+          degrading. The published \`-ebpf\` image is **distroless** — it has no
+          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
+          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
+          published image **crash-loops**. To use the iptables fallback, build a
+          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
           (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
           then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
           host iptables capture:

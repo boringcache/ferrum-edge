@@ -134,9 +134,10 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   `node_waypoint` mode additionally requires `CAP_SYS_ADMIN` on all supported
 >   kernels because enrollment enters pod network namespaces with `setns()` to
 >   resolve host-side veth peers before attaching pod-veth tc classifiers. The
->   `-ebpf` runtime is based on Debian slim and includes `iproute2`, which the
->   exact NodeWaypoint ingress policy-rule lifecycle requires; the default image
->   remains distroless. The capture image still omits `iptables`/`ip6tables`.
+>   published `-ebpf` runtime remains distroless but includes the `ip` executable
+>   and its resolved runtime-library closure, which the exact NodeWaypoint
+>   ingress policy-rule lifecycle requires. It still omits a shell, package
+>   manager, and `iptables`/`ip6tables`.
 >   On a node that fails the kernel/cgroup/bpffs probe the `-ebpf` pod does **not**
 >   silently degrade to the mock backend: `run()` hands off to `handle_fallback`,
 >   whose default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` returns an error and the
@@ -837,7 +838,7 @@ If any prerequisite is missing, the node agent fails fast by default. It logs th
 
 | Value | Behaviour |
 |---|---|
-| `fail` (default) | Refuse to start, surface the kernel deficiency in the error log, and exit. This matches the published `-ebpf` image, which includes `iproute2` for the supported eBPF path but deliberately omits `iptables`/`ip6tables`. |
+| `fail` (default) | Refuse to start, surface the kernel deficiency in the error log, and exit. This matches the published distroless `-ebpf` image, which includes `ip` for the supported eBPF path but deliberately omits a shell and `iptables`/`ip6tables`. |
 | `iptables` | Apply host iptables capture rules and continue serving. This requires a custom runtime image that includes `/bin/sh`, `iptables`, and `ip6tables` when IPv6 capture is enabled. The gauge records the reason; pod-level eBPF enrollment is skipped. Existing pods that were enrolled before degradation keep working until the next reconcile; new pods rely on the iptables capture path. |
 
 Suggested remediations by reason label:

@@ -36,7 +36,8 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
 2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
-3. **Runtime Stage**: Debian 13 slim with `ca-certificates` and `iproute2`; the latter is required by the real eBPF NodeWaypoint ingress policy-rule lifecycle
+3. **Runtime Tool Stage**: Extracts the `ip` executable and only its resolved shared-library closure from Debian 13 for the NodeWaypoint ingress policy-rule lifecycle
+4. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) plus that bounded `ip` closure — no shell, package manager, or iptables fallback tools
 
 > **Current eBPF build coupling.** The runtime stage unconditionally copies the
 > eBPF ELF from the `ebpf-builder` stage, so every `docker build` runs that
@@ -49,8 +50,8 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 > stage first.
 
 **Image Features**:
-- **Capture-ready runtime**: The source-build image contains `iproute2` for the supported eBPF path but deliberately omits `iptables`/`ip6tables`; the separately built default release image remains distroless
-- Non-root user execution by default (numeric UID/GID 65532; the node-agent chart overrides this for kernel capture)
+- **Distroless**: The source-build eBPF image adds only `ip` and its resolved shared objects to the distroless base; it contains no shell, package manager, `iptables`, or `ip6tables`
+- Non-root user execution by default (UID 65532, distroless `nonroot`; the node-agent chart overrides this for kernel capture)
 - Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)
 - OpenSSL is vendored (statically linked) — no runtime `libssl` dependency
@@ -136,7 +137,7 @@ When the plaintext admin listener is disabled (`FERRUM_ADMIN_HTTP_PORT=0`), the 
 HEALTHCHECK CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
 ```
 
-> **Note**: The default prebuilt release image is distroless and has no shell or curl. The source-built eBPF image is Debian slim, but the built-in health command or orchestrator-level `httpGet` probes remain the portable choices.
+> **Note**: The distroless images have no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (for example, Kubernetes `httpGet` probes).
 
 ## Running with Docker Compose
 
@@ -491,7 +492,7 @@ docker stop --time=30 ferrum-edge
 
 **In orchestration** (Kubernetes):
 
-> **Note**: The default prebuilt release image has no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of relying on a variant-specific shell.
+> **Note**: The distroless images have no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of a shell-based sleep.
 
 ```yaml
 terminationGracePeriodSeconds: 30
@@ -591,13 +592,13 @@ The container runs as numeric UID/GID 65532 by default. Ensure volume permission
 sudo chown -R 65532:65532 /path/to/volume
 ```
 
-> **Note**: `docker exec` with shell commands is not available in the default distroless release image. Fix permissions from the host or use an init container so the procedure works with every image variant.
+> **Note**: `docker exec` with shell commands is not available in distroless images. Fix permissions from the host or use an init container.
 
 ### Health Check Failing
 
 ```bash
 # Debug health endpoint (only when the admin port is published to the host —
-# admin binds loopback by default; the default release has no in-container curl, so use
+# admin binds loopback by default; distroless has no in-container curl, so use
 # `docker compose ps` / the built-in HEALTHCHECK to check health otherwise)
 curl -v http://localhost:9000/health
 

@@ -45,7 +45,23 @@ RUN cargo +nightly build \
         -Z build-std=core \
     && test -f target/bpfel-unknown-none/release/ferrum-ebpf
 
-# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching the runtime glibc
+# Runtime tool closure for the distroless eBPF image. Copy only `ip` and the
+# shared objects resolved by its loader; do not ship a shell, package manager,
+# or the iptables fallback tools.
+FROM debian:13-slim AS iproute2-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && mkdir -p /iproute2-root \
+    && cp --parents /usr/sbin/ip /iproute2-root \
+    && ldd /usr/sbin/ip > /tmp/iproute2-ldd \
+    && awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
+        /tmp/iproute2-ldd > /tmp/iproute2-libraries \
+    && test -s /tmp/iproute2-libraries \
+    && while IFS= read -r library; do \
+        cp -L --parents "$library" /iproute2-root || exit 1; \
+    done < /tmp/iproute2-libraries \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
 ARG FEATURES
 
@@ -89,16 +105,12 @@ COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
 
-# Stage 2: Linux eBPF capture runtime. The release pipeline uses this root
-# Dockerfile only for the `-ebpf` variant; the default image remains distroless
-# via Dockerfile.release. NodeWaypoint ingress redirect owns an exact policy
-# rule/route and therefore requires the `ip` binary at startup and teardown.
-FROM debian:13-slim
+# Stage 2: Distroless Linux eBPF capture runtime. NodeWaypoint ingress redirect
+# owns an exact policy rule/route and therefore requires the `ip` binary at
+# startup and teardown, but no shell or package manager is present.
+FROM gcr.io/distroless/cc-debian13:nonroot
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    iproute2 \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=iproute2-runtime /iproute2-root/ /
 
 WORKDIR /app
 
@@ -111,7 +123,7 @@ COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/fe
 # image the file is present but unused (the mock backend attaches nothing).
 # `FERRUM_NODE_AGENT_BPF_ELF_PATH` below points the aya loader at this path
 # (the CARGO_MANIFEST_DIR-relative default in src/ebpf/loader.rs does not exist
-# in the runtime image).
+# in the distroless runtime image).
 COPY --from=ebpf-builder --chown=65532:65532 \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 
@@ -137,10 +149,7 @@ LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \
       org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
-# Run the gateway as the same numeric nonroot identity as the default
-# distroless image. The mesh/node-agent charts explicitly select UID 0 for
-# kernel capture operations and override this image default.
-USER 65532:65532
-
+# Run the gateway (already running as nonroot via the distroless tag). The
+# mesh/node-agent charts explicitly select UID 0 for kernel capture operations.
 ENTRYPOINT ["/app/ferrum-edge"]
 CMD ["run"]

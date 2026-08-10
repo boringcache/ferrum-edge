@@ -3453,7 +3453,7 @@ the cluster network.
 
 ### Mixed-kernel clusters
 
-Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published `-ebpf` image: it includes `iproute2` for the supported capture path but deliberately omits the iptables fallback tools. The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
+Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published distroless `-ebpf` image: it includes `ip` and its runtime libraries for the supported capture path but deliberately omits a shell and the iptables fallback tools. The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
 
 1. Alert on node-agent readiness/startup failures, `ferrum_node_agent_capture_state{state!="ready"} == 1`, and `ferrum_mesh_node_topology_degraded == 1` to track the degraded set.
 2. Label degraded nodes (e.g., `ferrum.io/capture-mode=iptables`) and configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers on those nodes.
