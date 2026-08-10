@@ -15072,9 +15072,7 @@ mod tests {
             let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
             let startup_ready = Arc::new(AtomicBool::new(false));
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-            let events = futures_util::stream::pending::<
-                Result<Event<Pod>, kube_watcher::Error>,
-            >();
+            let events = futures_util::stream::pending::<Result<Event<Pod>, kube_watcher::Error>>();
             let run = run_with_pod_stream(
                 &mut owner,
                 &config,

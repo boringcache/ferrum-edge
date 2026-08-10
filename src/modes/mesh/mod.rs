@@ -12454,11 +12454,10 @@ async fn arm_mesh_runtime_startup(
                         "Ambient UDP cleanup tooling preflight failed; no producer or cleanup will run, readiness remains false, and admin diagnostics stay available"
                     );
                 } else {
-                    let source = Arc::new(
-                        crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                    let source =
+                        Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                             env_config.mesh_node_waypoint_pod_registry_dir.clone(),
-                        ),
-                    );
+                        ));
                     let cleanup_shutdown = shutdown_tx.subscribe();
                     info!(
                         from = context.from().as_str(),

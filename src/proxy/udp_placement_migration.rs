@@ -604,9 +604,7 @@ fn validate_durable_state(state: &DurablePlacementState) -> Result<(), String> {
         validate_generation(&transition.generation)
             .map_err(|_| "Ambient UDP migration state has an invalid generation".to_string())?;
         if transition.from == transition.to {
-            return Err(
-                "Ambient UDP migration state has an invalid no-op transition".to_string(),
-            );
+            return Err("Ambient UDP migration state has an invalid no-op transition".to_string());
         }
         Ok(())
     };
