@@ -735,6 +735,44 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ambient": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "ambient"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodeAgent": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "nodeAgent"
+        ]
+      }
+    }
+  ],
   "definitions": {
     "secretSource": {
       "type": "object",
