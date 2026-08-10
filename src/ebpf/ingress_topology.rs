@@ -386,6 +386,20 @@ impl IngressTopologyValidator {
                         };
                         match event {
                             Ok(Event::Init) => {
+                                // A relist is not a continuation of the last
+                                // authoritative snapshot. Withdraw any ready
+                                // outcome until InitDone publishes a complete,
+                                // bounded replacement.
+                                if requirements.take().is_some() {
+                                    publish_requirement_failure(
+                                        &outcomes_tx,
+                                        &self,
+                                        IngressTopologyReason::KubernetesUnavailable,
+                                    );
+                                }
+                                cache_failure = Some(
+                                    IngressTopologyReason::KubernetesUnavailable,
+                                );
                                 initializing = Some(BoundedNodeSet::default());
                             }
                             Ok(Event::InitApply(node)) => {
@@ -461,9 +475,19 @@ impl IngressTopologyValidator {
                                 }
                             }
                             Err(_) => {
-                                // kube-runtime reconnects and relists. Retain the
-                                // last complete cache while it does so; a partial
-                                // replacement is never published before InitDone.
+                                // kube-runtime reconnects and relists, but stale
+                                // Kubernetes evidence must never keep readiness
+                                // true while that recovery is in progress.
+                                requirements = None;
+                                initializing = None;
+                                cache_failure = Some(
+                                    IngressTopologyReason::KubernetesUnavailable,
+                                );
+                                publish_requirement_failure(
+                                    &outcomes_tx,
+                                    &self,
+                                    IngressTopologyReason::KubernetesUnavailable,
+                                );
                             }
                         }
                     }
