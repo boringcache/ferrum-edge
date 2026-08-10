@@ -1135,6 +1135,39 @@ fn test_upstream_source_locality_rejected_by_admin_api() {
 }
 
 #[test]
+fn test_upstream_mesh_target_tags_rejected_in_operator_config() {
+    let mut upstream = make_upstream("test");
+    upstream.targets[0].tags = HashMap::from([
+        ("environment".to_string(), "production".to_string()),
+        (
+            "mesh.unix_socket".to_string(),
+            "/run/containerd/containerd.sock".to_string(),
+        ),
+        ("mesh.future_transport".to_string(), "enabled".to_string()),
+    ]);
+
+    let errors = upstream
+        .validate_operator_provided_fields()
+        .expect_err("operator-provided targets must not forge reserved mesh tags");
+    for key in ["mesh.unix_socket", "mesh.future_transport"] {
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("targets[0].tags")
+                    && error.contains(key)
+                    && error.contains("reserved mesh.* namespace")
+            }),
+            "expected a reserved-tag rejection for {key}, got: {errors:?}"
+        );
+    }
+    assert_eq!(errors.len(), 2, "ordinary target tags must remain allowed");
+
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "mesh materialization must continue accepting its trusted transport tags"
+    );
+}
+
+#[test]
 fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.locality_lb_strict = true;
