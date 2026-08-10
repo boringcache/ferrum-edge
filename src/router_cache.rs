@@ -3062,10 +3062,10 @@ fn find_regex_match_indexed(
         return None;
     }
 
-    // RegexSet preserves config order, but listener scope has to be ranked
-    // before that order: an earlier port-agnostic regex is the fallback on
-    // other frontends and must not shadow an exact-port sibling on its own
-    // listener. Among entries with the same port rank, first match still wins.
+    // Different patterns retain config-order precedence. Listener scope is
+    // ranked only among identical-pattern siblings so that a scoped override
+    // can beat its port-agnostic fallback without letting a later, broader
+    // pattern shadow an earlier security-sensitive route.
     let mut best: Option<(&RegexRouteEntry, u8)> = None;
     if let Some(regex_set) = &routes.regex_set {
         let matches = regex_set.matches(path);
@@ -3074,6 +3074,9 @@ fn find_regex_match_indexed(
             let Some(priority) = entry.candidate.match_priority(port_ctx) else {
                 continue;
             };
+            if best.is_some_and(|(current, _)| current.pattern.as_str() != entry.pattern.as_str()) {
+                continue;
+            }
             if best.is_none_or(|(_, current)| priority < current) {
                 best = Some((entry, priority));
                 if priority == 0 {
@@ -3087,6 +3090,9 @@ fn find_regex_match_indexed(
                 continue;
             };
             if !entry.pattern.is_match(path) {
+                continue;
+            }
+            if best.is_some_and(|(current, _)| current.pattern.as_str() != entry.pattern.as_str()) {
                 continue;
             }
             if best.is_none_or(|(_, current)| priority < current) {
@@ -5631,6 +5637,8 @@ mod tests {
                         port: 8080,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 5000,
+                        endpoint_unix_path: None,
+                        endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
                     },
@@ -5638,6 +5646,8 @@ mod tests {
                         port: 8443,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 6000,
+                        endpoint_unix_path: None,
+                        endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
                     },
@@ -5705,6 +5715,8 @@ mod tests {
                     port: 8443,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 8080,
+                    endpoint_unix_path: None,
+                    endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
                 }],
@@ -5776,8 +5788,9 @@ mod tests {
     }
 
     /// Codex round-4 P2: a Sidecar that DECLARES two HTTP-family ingress[]
-    /// listeners but where only ONE resolved (the other had an omitted / `unix://`
-    /// / off-box `defaultEndpoint`) must NOT collapse to the single-listener
+    /// listeners but where only ONE resolved (the other had an omitted /
+    /// inadmissible `unix://` / off-box `defaultEndpoint`) must NOT collapse to
+    /// the single-listener
     /// no-signal pass-through. `MeshConfig.declared_ingress_http_ports` (2) carries
     /// the DECLARED count past the resolved set (1), so `mesh_ingress_listener_groups`
     /// reports `declared_http_ports == 2`, keeping the group AMBIGUOUS: an
@@ -5800,6 +5813,8 @@ mod tests {
                     port: 8080,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 5000,
+                    endpoint_unix_path: None,
+                    endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
                 }],

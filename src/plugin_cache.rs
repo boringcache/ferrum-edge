@@ -43,9 +43,10 @@ use crate::plugins::{
 };
 
 // ---------------------------------------------------------------------------
-// PriorityOverridePlugin — wraps any plugin with a user-specified priority
+// PluginInstanceWrapper — per-instance priority override + execution trigger
 // ---------------------------------------------------------------------------
 
+use crate::plugins::trigger::{PluginTriggerGate, TriggerPhase};
 use crate::plugins::{
     PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
@@ -53,11 +54,96 @@ use crate::plugins::{
 };
 use async_trait::async_trait;
 
-/// Thin wrapper that overrides a plugin's built-in priority with a
-/// user-configured value from `PluginConfig.priority_override`.
-struct PriorityOverridePlugin {
+/// Thin wrapper carrying the two generic per-instance `PluginConfig` controls
+/// that are not part of a plugin's own configuration: `priority_override` and
+/// the declarative execution `trigger`.
+///
+/// # Why one wrapper
+///
+/// This is the single central eligibility point for triggers, so built-in and
+/// custom plugins get identical semantics without reimplementing matching.
+/// Every capability declaration, protocol filter, scope merge, and priority
+/// decision still comes from the inner plugin, so the published chain shape is
+/// byte-for-byte what it would be without a trigger.
+///
+/// # What a false trigger suppresses
+///
+/// Every request/response/stream hook of THAT instance, plus its per-request
+/// buffering, release, and policy-enforcement claims — so a skipped instance
+/// performs no external call, takes no lease, retains no state, and never forces
+/// a body buffer of its own. `on_stream_disconnect` is included: the connect
+/// decision travels on the summary in an opaque crate-constructed carrier, so a
+/// false connect trigger suppresses the disconnect hook too.
+///
+/// The response-body RELEASE predicates (`should_release_response_body_*`) are
+/// gated to `true` rather than `false`, because `true` — not `false` — is the
+/// no-contribution answer in the proxy's `all(...)` fold: a skipped instance may
+/// neither need the body retained nor pin the response to the buffered path.
+///
+/// Static chain-shape declarations (`supported_protocols`,
+/// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
+/// gated: they describe the published generation, not one request, and gating
+/// them would make the plugin cache's composition admission depend on request
+/// data.
+///
+/// # Every hook must be forwarded
+///
+/// This wrapper stands in for the inner plugin at every call site, so a trait
+/// method it does not override silently resolves to the TRAIT DEFAULT for the
+/// wrapped instance — a capability regression that appears only when an operator
+/// sets `priority_override` or a trigger. Adding a `Plugin` hook means adding it
+/// here; `tests/unit/plugins/plugin_trigger_gate_tests.rs` pins the ones whose
+/// default is a silent no-op.
+///
+/// `is_deferred_cors_wrapper` is the one deliberate exception: this wrapper is
+/// not that marker, and claiming it would stop `install_cors_finalizer` from
+/// installing the deferral around a wrapped `cors` instance. The finalizer runs
+/// after this wrapping, so a gated `cors` instance ends up INSIDE
+/// `DeferredCorsPlugin` and its trigger still governs both hooks that wrapper
+/// forwards.
+///
+/// # Phase boundary
+///
+/// `WS frame`, `UDP datagram`, WS-disconnect, the initial response-header
+/// policy, and the `log` phase have no request context at the point they run, so
+/// they cannot be gated coherently. Plugin-cache admission REFUSES a trigger on
+/// an instance that declares the first four rather than silently half-applying
+/// one; the `log` phase is the documented ungated boundary and is forwarded
+/// unconditionally. See `trigger_composition_error`.
+struct PluginInstanceWrapper {
     inner: Arc<dyn Plugin>,
     priority: u16,
+    /// `None` for a priority-only wrapper — the historical behavior.
+    trigger: Option<PluginTriggerGate>,
+}
+
+impl PluginInstanceWrapper {
+    /// Decide (and memoize) whether the instance runs for this request.
+    #[inline]
+    fn runs(&self, ctx: &mut RequestContext, phase: TriggerPhase) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_request(ctx, phase),
+            None => true,
+        }
+    }
+
+    /// Read an already-memoized decision; fails closed to "runs".
+    #[inline]
+    fn runs_cached(&self, ctx: &RequestContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.request_decision_or_run(ctx),
+            None => true,
+        }
+    }
+
+    /// Decide (and memoize) whether the instance runs for a stream connection.
+    #[inline]
+    fn runs_stream(&self, ctx: &mut StreamConnectionContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_stream(ctx),
+            None => true,
+        }
+    }
 }
 
 /// Pure capability view used by candidate admission. Runtime construction of
@@ -669,6 +755,135 @@ pub(crate) fn validate_plugin_security_composition(
     Ok(())
 }
 
+/// Refuse a per-instance execution trigger whose phase surface the gate cannot
+/// cover coherently, or whose input the plugin's own phase is what establishes.
+///
+/// This is deliberately validation-time, fail-closed rejection rather than a
+/// partially-applied trigger: the failure mode of a half-gated instance is
+/// exactly the asymmetric-skip / stale-state class the decide-once memo exists
+/// to prevent.
+///
+/// The refused surfaces are:
+///
+/// * **WebSocket frame, WS-disconnect, and UDP datagram hooks.** They run with
+///   no `RequestContext` / `StreamConnectionContext` in hand (`on_ws_frame`
+///   takes only a proxy id, connection id, direction, and message), so there is
+///   nothing authoritative left to evaluate. Gating the upgrade but not the
+///   frames would let a "skipped" WAF stop inspecting the handshake while still
+///   inspecting — or stop inspecting — the messages. Tracked for a typed
+///   frame-phase predicate surface in a follow-up.
+/// * **The initial response-header policy.** `apply_initial_response_header_policy`
+///   is a synchronous, contextless re-assertion of a plugin-owned header set
+///   (`security_headers`), invoked from paths that hold no `RequestContext` at
+///   all — the gateway's own error/short-circuit header assembly among them — and
+///   its declared names are folded into a per-generation list the H3
+///   cross-protocol bridge carries. There is nothing to evaluate at those call
+///   sites and nothing per-request in the folded list, so gating the hook that
+///   does have a context while the others keep applying would half-apply the
+///   trigger: the same instance would own the header on one response and not on
+///   the next. Refused instead.
+/// * **Fixed request/response body ceilings.** These limits are folded into the
+///   per-proxy/protocol request view and enforced by the core collectors before
+///   a per-instance hook can evaluate a trigger. Accepting a trigger would make
+///   a skipped instance keep enforcing its limit.
+/// * **Contextless response-trailer declarations.** Named/prefixed/unbounded
+///   trailer ownership is likewise folded per generation and consumed on paths
+///   that do not call back into the instance with a request context. The
+///   request-conditional unbounded variant is safe because its predicate is
+///   evaluated through the wrapped plugin for each request.
+/// * **An identity-reading trigger on an authentication plugin.** `authenticate`
+///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
+///   such a trigger could only ever read another mechanism's committed identity,
+///   which makes the effective auth chain order-dependent.
+/// * **An identity-reading trigger on a STREAM-ONLY plugin.** The stream
+///   lifecycle has exactly one gated hook, `on_stream_connect`, and stream
+///   authentication runs inside that same priority-ordered chain, so every gated
+///   stream phase is at or before the stream authentication boundary. An
+///   identity-reading trigger therefore never gates a stream connection
+///   (`PluginTriggerGate::admits_stream` returns "run" without memoizing, the
+///   same rule as `TriggerPhase::PreAuth`), and `spiffe_id` has no authoritative
+///   stream fact at all. On a plugin that also serves HTTP that is a documented
+///   per-protocol limitation and the trigger still governs its HTTP requests. On
+///   a plugin whose protocols are stream-only it could gate nothing whatsoever,
+///   so it is refused rather than accepted as an inert predicate.
+fn trigger_composition_error(
+    plugin: &dyn Plugin,
+    gate: &PluginTriggerGate,
+) -> Option<&'static str> {
+    if plugin.requires_ws_frame_hooks() || plugin.observes_ws_frame_decisions() {
+        return Some(
+            "the plugin runs WebSocket frame hooks, which execute without a request context and therefore cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_websocket_framing() {
+        return Some(
+            "the plugin requires WebSocket framing, whose per-frame phase cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_ws_disconnect_hooks() {
+        return Some(
+            "the plugin runs WebSocket disconnect hooks, which execute without a request context and therefore cannot be gated by a trigger",
+        );
+    }
+    if plugin.requires_udp_datagram_hooks() {
+        return Some(
+            "the plugin runs UDP datagram hooks, which execute without a connection context and therefore cannot be gated by a trigger",
+        );
+    }
+    if plugin.is_initial_response_header_policy() {
+        return Some(
+            "the plugin owns the initial response-header policy, which is re-asserted without a request context and whose declared header names are published per generation, so a trigger could only be half-applied",
+        );
+    }
+    if plugin.enforced_request_body_limit().is_some() {
+        return Some(
+            "the plugin publishes a fixed per-proxy request-body ceiling that the proxy core enforces before a per-request trigger can be evaluated",
+        );
+    }
+    if plugin.enforced_response_body_limit().is_some() {
+        return Some(
+            "the plugin publishes a fixed per-proxy response-body ceiling that the proxy core enforces outside the per-request plugin hook chain",
+        );
+    }
+    if matches!(
+        plugin.response_trailer_policy(),
+        crate::plugins::ResponseTrailerPolicy::Names(_)
+            | crate::plugins::ResponseTrailerPolicy::NamesAndPrefixes { .. }
+            | crate::plugins::ResponseTrailerPolicy::Unbounded
+    ) {
+        return Some(
+            "the plugin publishes contextless response-trailer ownership into the per-generation policy; use a plugin whose trailer policy is absent or request-conditional",
+        );
+    }
+    if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
+        return Some(
+            "an authentication plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`, which its own phase establishes",
+        );
+    }
+    if gate.reads_authenticated_identity() && is_stream_only_plugin(plugin) {
+        return Some(
+            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: a stream connection's only gated phase is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
+        );
+    }
+    None
+}
+
+/// Protocols whose plugin lifecycle is the stream connect/disconnect pair rather
+/// than the HTTP request pipeline. `Udp` covers DTLS, which has no separate
+/// [`ProxyProtocol`] variant.
+const STREAM_PROXY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp, ProxyProtocol::Udp];
+
+/// Whether every protocol this plugin serves is a stream protocol, so it can
+/// never reach the HTTP request pipeline where an identity predicate is
+/// authoritative.
+fn is_stream_only_plugin(plugin: &dyn Plugin) -> bool {
+    let protocols = plugin.supported_protocols();
+    !protocols.is_empty()
+        && protocols
+            .iter()
+            .all(|protocol| STREAM_PROXY_PROTOCOLS.contains(protocol))
+}
+
 /// A correlation header names one trust-domain value. Allowing two instances
 /// that can execute for the same protocol to own the same normalized header
 /// would make their instance-scoped metadata and stream-generated IDs
@@ -733,7 +948,7 @@ pub(crate) fn validate_correlation_id_composition(
 }
 
 #[async_trait]
-impl Plugin for PriorityOverridePlugin {
+impl Plugin for PluginInstanceWrapper {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -756,6 +971,18 @@ impl Plugin for PriorityOverridePlugin {
     fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
         self.inner.has_proxy_lifecycle_state_for_test(proxy_id)
     }
+    fn has_proxy_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.inner
+            .has_proxy_lifecycle_state_for_generation_for_test(proxy_id, generation)
+    }
+    fn write_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.inner
+            .write_proxy_lifecycle_state_for_test(proxy_id, generation);
+    }
     fn mesh_bpf_metrics_exporter(
         &self,
     ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
@@ -768,12 +995,22 @@ impl Plugin for PriorityOverridePlugin {
         self.priority
     }
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.prepare_grpc_deadline(ctx)
     }
     fn requires_grpc_deadline_preflight(&self) -> bool {
         self.inner.requires_grpc_deadline_preflight()
     }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        // Every dispatcher runs this hook for every plugin on the chain, so
+        // this is where a trigger decision is normally taken and memoized —
+        // before any later `&RequestContext`-only capability predicate is
+        // consulted.
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.on_request_received(ctx).await
     }
     async fn authenticate(
@@ -781,8 +1018,16 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         consumer_index: &crate::consumer_index::ConsumerIndex,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PreAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.authenticate(ctx, consumer_index).await
     }
+    /// Deliberately UNGATED, both of them. Credential-redaction discovery is
+    /// fail-safe work: a skipped instance still knows which query parameters and
+    /// headers of THIS request carry its credentials, and suppressing that would
+    /// let a trigger leak a token into a log line. Gating here could only ever
+    /// add disclosure, which is the one thing a trigger must never do.
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         self.inner.mark_query_credentials_for_redaction(ctx);
     }
@@ -790,6 +1035,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.request_headers_to_redact()
     }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.authorize(ctx).await
     }
     fn is_authorize_plugin(&self) -> bool {
@@ -832,6 +1080,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner.enforce_final_backend_header_policy(ctx, headers)
     }
     async fn dispatch_finalized_request_egress(
@@ -841,6 +1092,11 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
         backend_header_overlay: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        // Irreversible outbound egress. A skipped instance must contact
+        // nothing, so this gate precedes the inner call.
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .dispatch_finalized_request_egress(ctx, headers, body, backend_header_overlay)
             .await
@@ -865,6 +1121,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &mut std::collections::HashMap<String, String>,
         body: &mut Vec<u8>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
             .await
@@ -878,6 +1137,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .validate_client_request_body_contract(ctx, headers, body)
             .await
@@ -890,6 +1152,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         consumer_index: &crate::consumer_index::ConsumerIndex,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .should_buffer_request_body_before_authenticate(ctx, consumer_index)
     }
@@ -922,6 +1188,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.before_proxy(ctx, headers).await
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
@@ -939,6 +1208,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         backend_path: &str,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn apply_websocket_handshake_response_headers(
@@ -947,6 +1219,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner.apply_websocket_handshake_response_headers(
             ctx,
             response_status,
@@ -964,9 +1239,16 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         admission: &crate::plugins::BackendAdmissionContext<'_>,
     ) -> crate::plugins::BackendAdmissionDecision {
+        if !self.runs_cached(ctx) {
+            return crate::plugins::BackendAdmissionDecision::Continue;
+        }
         self.inner.try_backend_admission(ctx, admission)
     }
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.should_buffer_request_body(ctx)
     }
     async fn after_proxy(
@@ -975,14 +1257,24 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .after_proxy(ctx, response_status, response_headers)
             .await
     }
     fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner.observe_origin_http_response_status(ctx, status);
     }
     fn enforces_origin_response_header_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.enforces_origin_response_header_policy(ctx)
     }
     fn enforce_origin_response_header_policy(
@@ -991,10 +1283,17 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner
             .enforce_origin_response_header_policy(ctx, response_status, response_headers);
     }
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.owns_deadline_response_header(ctx, name)
     }
     fn is_initial_response_header_policy(&self) -> bool {
@@ -1014,6 +1313,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.response_trailer_policy()
     }
     fn request_applies_unbounded_response_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .request_applies_unbounded_response_trailer_policy(ctx)
     }
@@ -1022,6 +1325,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_content_type: Option<&str>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_modify_response_content_type(ctx, response_content_type)
     }
@@ -1030,6 +1337,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_add_response_cache_control_no_transform(ctx, response_headers)
     }
@@ -1038,6 +1349,10 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &RequestContext,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .may_add_response_strong_etag(ctx, response_headers)
     }
@@ -1046,6 +1361,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .simulate_after_proxy_response_headers(ctx, response_headers);
     }
@@ -1069,23 +1387,46 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.warn_on_rejection_response_replacement()
     }
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.requires_buffered_grpc_web_trailer_policy(ctx)
     }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.should_buffer_response_body(ctx)
     }
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.may_release_response_body_under_retries(ctx)
     }
+    // The five release predicates below answer "may the response body be
+    // released to the streaming path despite this instance?". The proxy folds
+    // them with `all(...)` and only ever asks an instance whose
+    // `should_buffer_response_body` said `true` — which a skipped instance never
+    // does. `true` is therefore the NO-CONTRIBUTION answer here, and the
+    // symmetric counterpart of the `false` those buffering predicates return: a
+    // skipped instance runs no response hook, so it can neither need the body
+    // retained nor pin the response to the buffered path.
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner.should_release_response_body_under_retries(
             ctx,
             response_status,
@@ -1098,6 +1439,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_before_content_type_rewrite(
                 ctx,
@@ -1111,6 +1455,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_later_no_transform(
                 ctx,
@@ -1124,6 +1471,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         final_response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_simulated_final_headers(
                 ctx,
@@ -1137,12 +1487,31 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return true;
+        }
         self.inner
             .should_release_response_body_for_later_strong_etag(
                 ctx,
                 response_status,
                 response_headers,
             )
+    }
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        // Opting a zero-byte synthetic response into the buffered body pipeline
+        // is work this instance requests for itself. A skipped instance requests
+        // none. Must also FORWARD (rather than fall back to the trait default)
+        // so a priority-overridden `openapi_validator` keeps enforcing an empty
+        // representation its contract distinguishes.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
+        self.inner
+            .should_process_empty_synthetic_response_body(ctx, response_status)
     }
     fn should_buffer_response_body_for_content_type(
         &self,
@@ -1151,6 +1520,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         // Must forward, not fall back to the trait default (which ignores
         // content-type): a priority-overridden inspect-mode policy needs the
         // buffer->stream downgrade for SSE, else it buffers an unbounded stream.
@@ -1161,6 +1533,24 @@ impl Plugin for PriorityOverridePlugin {
             response_headers,
         )
     }
+    /// Must forward: this is the header-only half of the response phase
+    /// (`response_caching`'s RFC 9111 invalidation and cacheability marking),
+    /// and the trait default is a no-op. Omitting it silently dropped that work
+    /// for any instance an operator gave a `priority_override` — the exact
+    /// side effect `on_final_response_headers` exists to keep on the streaming
+    /// path (GHSA-pwcm-6rh8-f2gh).
+    fn on_final_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
+        self.inner
+            .on_final_response_headers(ctx, response_status, response_headers);
+    }
     async fn on_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -1168,6 +1558,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &mut std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_response_body(ctx, response_status, response_headers, body)
             .await
@@ -1180,6 +1573,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .normalize_response_body_with_context(
                 ctx,
@@ -1207,6 +1603,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .transform_request_body_with_context(ctx, body, content_type, request_headers)
             .await
@@ -1224,6 +1623,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_final_request_body_with_context(ctx, headers, body)
             .await
@@ -1235,11 +1637,22 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
     ) -> bool {
         // Security phase declarations must survive a priority-only wrapper.
+        // They must NOT survive a false trigger: the claiming hook will not run,
+        // so claiming here would reserve a decode budget nobody consumes.
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .enforces_final_request_body_policy(ctx, headers, body)
     }
     fn needs_final_request_body_context(&self) -> bool {
-        self.inner.needs_final_request_body_context()
+        // Context-free transform/final hooks cannot evaluate this wrapper's
+        // trigger. Force the production dispatcher onto the context-aware
+        // compatibility methods whenever a trigger exists; those methods gate
+        // first and then delegate to an inner context-free implementation when
+        // necessary. Priority-only wrappers preserve the inner capability.
+        self.trigger.is_some() || self.inner.needs_final_request_body_context()
     }
     fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         self.inner
@@ -1262,6 +1675,9 @@ impl Plugin for PriorityOverridePlugin {
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return None;
+        }
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
@@ -1274,6 +1690,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.response_body_production()
     }
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.requires_replay_response_body_transform(ctx)
     }
     /// Must forward: this wrapper still runs the inner plugin's response-body
@@ -1284,12 +1704,28 @@ impl Plugin for PriorityOverridePlugin {
     /// edit, and a `Dynamic` contribution would stop poisoning the fold — both
     /// exactly the replays `ResponsePolicyProvenance` exists to retire.
     fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
-        self.inner.response_presentation_policy()
+        match (
+            self.trigger.as_ref(),
+            self.inner.response_presentation_policy(),
+        ) {
+            // A trigger makes a static transform request-dependent. Finalized
+            // response-cache and dedup replays skip presentation transforms,
+            // while their keys do not bind every pristine trigger input (for
+            // example frontend SNI/protocol or a header removed before cache
+            // lookup). Mark the whole proxy policy unprovable so both replay
+            // consumers fail closed instead of crossing a trigger decision.
+            (Some(_), Some(_)) => Some(ResponsePresentationPolicy::Dynamic),
+            (_, policy) => policy,
+        }
     }
     fn applies_response_transport_encoding(&self) -> bool {
         self.inner.applies_response_transport_encoding()
     }
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.enforces_final_client_visible_response_body(ctx)
     }
     async fn finalize_client_visible_response_body(
@@ -1299,11 +1735,18 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .finalize_client_visible_response_body(ctx, response_status, response_headers, body)
             .await
     }
     fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner
             .enforces_final_client_visible_response_headers(ctx)
     }
@@ -1313,6 +1756,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .finalize_client_visible_response_headers(ctx, response_status, response_headers)
             .await
@@ -1323,6 +1769,10 @@ impl Plugin for PriorityOverridePlugin {
         response_content_type: Option<&str>,
         response_body: &[u8],
     ) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         // Must forward: falling back to the trait default (`false`) would make a
         // priority-overridden body policy invisible to the shared representation
         // gate, reopening the encoded/partial bypass for exactly the proxies that
@@ -1331,6 +1781,10 @@ impl Plugin for PriorityOverridePlugin {
             .enforces_response_body_policy(ctx, response_content_type, response_body)
     }
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.may_enforce_response_body_policy(ctx)
     }
     fn on_response_body_transformed(
@@ -1338,6 +1792,9 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         response_headers: &mut std::collections::HashMap<String, String>,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_body_transformed(ctx, response_headers);
     }
@@ -1348,6 +1805,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return PluginResult::Continue;
+        }
         self.inner
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await
@@ -1362,6 +1822,9 @@ impl Plugin for PriorityOverridePlugin {
         response_headers: &std::collections::HashMap<String, String>,
         body: &[u8],
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_committed(ctx, response_status, response_headers, body)
             .await;
@@ -1372,6 +1835,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
+        if !self.runs(ctx, TriggerPhase::PostAuth) {
+            return;
+        }
         self.inner
             .on_response_stream_terminated(ctx, response_status, outcome)
             .await;
@@ -1379,8 +1845,22 @@ impl Plugin for PriorityOverridePlugin {
     async fn log(&self, summary: &TransactionSummary) {
         self.inner.log(summary).await;
     }
+    /// Must forward: the trait default degrades to `log()`, so a wrapped mesh
+    /// observability sink would silently lose its precomputed RED key purely
+    /// because the instance carries a `priority_override` or a trigger. The
+    /// `log` phase is the documented ungated boundary, so no gate here.
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        self.inner.log_with_mesh_key(summary, mesh_key).await;
+    }
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
+    }
+    fn authentication_applies(&self, ctx: &RequestContext) -> bool {
+        self.runs_cached(ctx) && self.inner.authentication_applies(ctx)
     }
     fn authentication_challenge(&self) -> Option<&'static str> {
         self.inner.authentication_challenge()
@@ -1401,9 +1881,21 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.tracked_keys_count()
     }
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        if !self.runs_stream(ctx) {
+            return PluginResult::Continue;
+        }
         self.inner.on_stream_connect(ctx).await
     }
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        // Symmetry with `on_stream_connect`. The connection's decision travels
+        // on the summary in an opaque crate-constructed carrier, never through
+        // the summary's plugin-writable `metadata` map, so a skipped instance
+        // cannot be re-admitted here by another plugin's metadata write.
+        if let Some(gate) = &self.trigger
+            && !gate.stream_disconnect_decision_or_run(summary)
+        {
+            return;
+        }
         self.inner.on_stream_disconnect(summary).await;
     }
     fn requires_ws_frame_hooks(&self) -> bool {
@@ -1475,10 +1967,17 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         content_type: Option<&str>,
     ) {
+        if !self.runs_cached(ctx) {
+            return;
+        }
         self.inner
             .on_response_stream_selected(ctx, response_status, content_type);
     }
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance enforces nothing and needs nothing buffered.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
         self.inner.forces_reqwest_dispatch(ctx)
     }
     fn response_stream_inspector(
@@ -1487,6 +1986,9 @@ impl Plugin for PriorityOverridePlugin {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.runs_cached(ctx) {
+            return None;
+        }
         self.inner
             .response_stream_inspector(ctx, response_status, content_type)
     }
@@ -1757,10 +2259,42 @@ fn try_create_plugin(
 
     match created {
         Ok(Some(plugin)) => {
-            let plugin: Arc<dyn Plugin> = if let Some(priority) = pc.priority_override {
-                Arc::new(PriorityOverridePlugin {
+            let trigger = match pc.trigger.as_ref() {
+                Some(trigger) => {
+                    let gate = PluginTriggerGate::compile(trigger, &pc.id).map_err(|error| {
+                        let msg = format!(
+                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) execution trigger is invalid: {}",
+                            pc.plugin_name,
+                            pc.id,
+                            pc.scope,
+                            pc.proxy_id.as_deref().unwrap_or("<none>"),
+                            error
+                        );
+                        error!("Config rejected: {}", msg);
+                        msg
+                    })?;
+                    if let Some(reason) = trigger_composition_error(plugin.as_ref(), &gate) {
+                        let msg = format!(
+                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) cannot carry an execution trigger: {}",
+                            pc.plugin_name,
+                            pc.id,
+                            pc.scope,
+                            pc.proxy_id.as_deref().unwrap_or("<none>"),
+                            reason
+                        );
+                        error!("Config rejected: {}", msg);
+                        return Err(msg);
+                    }
+                    Some(gate)
+                }
+                None => None,
+            };
+            let plugin: Arc<dyn Plugin> = if pc.priority_override.is_some() || trigger.is_some() {
+                let priority = pc.priority_override.unwrap_or_else(|| plugin.priority());
+                Arc::new(PluginInstanceWrapper {
                     inner: plugin,
                     priority,
+                    trigger,
                 })
             } else {
                 plugin
@@ -3474,15 +4008,50 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
+        let has_trigger = plugin_config.trigger.is_some();
         if !plugin_config.enabled
-            || !is_security_composition_candidate_plugin(
-                plugin_config.plugin_name.as_str(),
-                &custom_plugin_names,
-            )
+            || (!has_trigger
+                && !is_security_composition_candidate_plugin(
+                    plugin_config.plugin_name.as_str(),
+                    &custom_plugin_names,
+                ))
         {
             continue;
         }
-        let created = if plugin_config.plugin_name == "serverless_function" {
+        // A trigger's composition safety depends on the concrete plugin's
+        // contextless hooks and generation-folded capabilities. Construct every
+        // triggered instance through the production factory even when ordinary
+        // cross-plugin admission can use a cheap capability stand-in; otherwise
+        // an admin write can accept a row that runtime publication rejects and
+        // wedge every subsequent reload behind it.
+        let created = if has_trigger && plugin_config.plugin_name == "geo_restriction" {
+            // GeoRestriction's constructor opens a node-local MMDB. Its plugin
+            // capabilities are trigger-neutral (all protocols, no contextless
+            // hooks, limits, trailer policy, or auth role), so candidate
+            // admission can validate the exact trigger and policy shape without
+            // turning CP/admin validation into a data-plane file dependency.
+            plugin_config.trigger.as_ref().map_or(Ok(None), |trigger| {
+                trigger
+                    .validate()
+                    .and_then(|()| {
+                        crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                            &plugin_config.config,
+                        )
+                    })
+                    .map(|()| None)
+            })
+        } else if has_trigger {
+            try_create_plugin(
+                plugin_config,
+                config,
+                http_client,
+                &country_mmdb_load_session,
+                &current_adaptive_states,
+                &mut staged_adaptive_states,
+                &current_tcp_throttle_states,
+                &mut staged_tcp_throttle_states,
+            )
+        } else if plugin_config.plugin_name == "serverless_function" {
             crate::plugins::serverless_function::security_composition_capabilities(
                 &plugin_config.config,
             )
@@ -3612,11 +4181,12 @@ fn remove_shadowed_global_plugin(
 }
 
 /// Cross-plugin composition candidate validation. The security composition
-/// candidate walker constructs every composition-relevant plugin once — using a
-/// pure capability view for environment-bound `serverless_function` and for
-/// expensive final request-body policy plugins — and runs both the
-/// security-sensitive ordering/body-view invariants and the correlation-header
-/// invariants. This remains the single admission entrypoint for both concerns.
+/// candidate walker constructs every composition-relevant plugin once, plus
+/// every instance carrying a trigger — using a pure capability view only for
+/// untriggered environment-bound `serverless_function` and expensive final
+/// request-body policy plugins — and runs both the security-sensitive
+/// ordering/body-view invariants and the correlation-header invariants. This
+/// remains the single admission entrypoint for both concerns.
 pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
@@ -3633,6 +4203,10 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
         && left.proxy_id == right.proxy_id
         && left.enabled == right.enabled
         && left.priority_override == right.priority_override
+        // A proxy-group instance is shared across its associated proxies, so a
+        // changed execution trigger is a different policy and must not be
+        // treated as the same shared instance.
+        && left.trigger == right.trigger
 }
 
 // ---------------------------------------------------------------------------
@@ -3787,10 +4361,11 @@ pub struct PluginPhaseData {
     ///
     /// `None` when any enrolled instance reported
     /// `ResponsePresentationPolicy::Dynamic` — its client-visible rewrite comes
-    /// from live runtime state that no construction-time digest describes, so
-    /// this proxy has no provable presentation policy and every replay consumer
-    /// must fail closed. Folding the remaining static members would produce a
-    /// digest that matches while an undescribed transform silently changes.
+    /// from live or per-request state the construction-time digest and replay
+    /// partition do not prove, so this proxy has no provable presentation policy
+    /// and every replay consumer must fail closed. Folding the remaining static
+    /// members would produce a digest that matches while an undescribed
+    /// transform silently changes.
     pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 

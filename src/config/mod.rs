@@ -11,6 +11,7 @@
 //!   config-change watchers (MongoDB replica-set change streams)
 //! - `config_migration` — Config format version migrations (chain-of-responsibility)
 //! - `migrations` — SQL schema migrations for database mode
+//! - `plugin_trigger` — Declarative per-plugin-instance execution triggers
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
 // The fault-injection seam is driven by external tests through the lib target's
@@ -33,6 +34,7 @@ pub(crate) mod incremental_apply;
 pub mod migrations;
 pub mod mongo_index_plan;
 pub mod mongo_store;
+pub mod plugin_trigger;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
 pub mod public_env_inventory;

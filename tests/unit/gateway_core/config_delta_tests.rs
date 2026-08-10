@@ -133,6 +133,7 @@ fn make_plugin_config(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
         priority_override: None,
+        trigger: None,
         api_spec_id: None,
         created_at: updated_at,
         updated_at,
