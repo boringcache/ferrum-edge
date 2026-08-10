@@ -1611,6 +1611,7 @@ fn apply_ingress_topology_outcome(
 /// Narrow external-test seam for the production topology outcome transition.
 /// It exposes only the two readiness bits; BPF-map and metrics effects remain
 /// observable through the existing mock backend and metrics snapshots.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) fn apply_ingress_topology_outcome_for_test(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
@@ -1687,6 +1688,7 @@ where
 /// Inject completed topology outcomes into the production pod/CNI select loop.
 /// Kubernetes and host I/O stay outside this seam; it exists solely so external
 /// tests can exercise the real outcome arm and readiness/quarantine wiring.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
     backend: &mut crate::ebpf::MockEbpfBackend,
@@ -2157,6 +2159,7 @@ fn cni_topology_readiness_rejection(
     }
 }
 
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) fn cni_topology_readiness_rejection_for_test(
     verb: RpcVerb,
     initial_sync_complete: bool,
