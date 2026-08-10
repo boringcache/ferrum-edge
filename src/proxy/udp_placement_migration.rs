@@ -258,7 +258,7 @@ impl UdpCleanupProofProgress {
     }
 
     pub fn completion_proof(&self) -> Option<&UdpRegistrySyncProof> {
-        if self.host_complete && self.pod_complete {
+        if self.host_complete() && self.pod_complete() {
             self.proof.as_ref()
         } else {
             None
