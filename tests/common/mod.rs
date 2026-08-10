@@ -91,5 +91,6 @@ pub use hmac_helpers::{
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
 pub use trusted_projected_gateway::{
-    TrustedProjectedGateway, TrustedProjectedGatewayOptions, trusted_projected_config_from_yaml,
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, run_trusted_projected_gateway_test,
+    trusted_projected_config_from_yaml,
 };

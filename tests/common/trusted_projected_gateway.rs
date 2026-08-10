@@ -16,6 +16,7 @@
 //! YAML/admin inputs remain fail-closed via `validate_operator_provided_fields`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -34,6 +35,36 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::scaffolding::ports::reserve_colocated_tcp_udp;
+
+/// Run an in-process trusted-projection regression on the same 8 MiB stack
+/// budget configured for production Tokio workers in `src/main.rs`.
+///
+/// `#[tokio::test]` otherwise runs its current-thread runtime on Rust's 2 MiB
+/// test thread. That is too small for Ferrum's deliberately broad, but bounded,
+/// proxy request future on the mesh retry path. The future is constructed
+/// inside this thread so none of its state is first placed on the caller's
+/// smaller stack.
+pub fn run_trusted_projected_gateway_test<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let thread = std::thread::Builder::new()
+        .name("trusted-projected-gateway-test".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build trusted projected gateway test runtime");
+            runtime.block_on(test());
+        })
+        .expect("spawn trusted projected gateway test thread");
+
+    if let Err(panic) = thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
 
 /// Parse fixture YAML into a trusted projected config.
 ///

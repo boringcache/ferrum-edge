@@ -67,6 +67,7 @@ use ferrum_edge::xds::XdsAdsServer;
 
 use crate::common::{
     TrustedProjectedGateway, TrustedProjectedGatewayOptions, ensure_gateway_built,
+    run_trusted_projected_gateway_test,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
@@ -4493,7 +4494,7 @@ fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
     );
 
     let live = mesh_test_fn_body(
-        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers",
+        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner",
     );
     let arm = live
         .find("arm_application_phase")
@@ -4856,8 +4857,15 @@ async fn grpc_mesh_retry_request(
 /// another backend stream is admitted because this generic intake cannot prove
 /// them safe to replay.
 #[ignore]
-#[tokio::test]
-async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers() {
+#[test]
+fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers() {
+    run_trusted_projected_gateway_test(
+        functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner,
+    );
+}
+
+async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner()
+ {
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-client";
     let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-backend";
     let identities = TempDir::new().expect("mesh retry identity tempdir");
