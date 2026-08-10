@@ -915,33 +915,36 @@ impl WorkloadMetrics {
 /// published.
 ///
 /// Composition mirrors request/stream stamping: instances run in chain order, a
-/// later plan replaces the same metric family, and untouched family plans
-/// survive. The bound is the sum of the surviving stamped plan strings — the
-/// same 16,384-byte ceiling documented for per-instance construction — never
-/// the sum of every intermediate instance. Diagnostics name the proxy only and
-/// never echo plan bytes, expressions, request data, or secrets.
+/// later unconditional plan replaces the same metric family, and untouched
+/// family plans survive. For a triggered instance, either the replacement or
+/// the earlier plan can survive for a particular request, so admission retains
+/// the larger possible family plan. The bound is the sum of these worst-case
+/// surviving stamped plan lengths — the same 16,384-byte ceiling documented for
+/// per-instance construction — never the sum of every intermediate instance.
+/// Diagnostics name the proxy only and never echo plan bytes, expressions,
+/// request data, or secrets.
 pub(crate) fn validate_effective_metric_tag_override_plan_budget(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
 ) -> Result<(), String> {
-    let mut effective: [Option<&str>; MeshMetricFamily::ALL.len()] =
-        [None; MeshMetricFamily::ALL.len()];
-    let mut saw_workload_metrics = false;
+    let mut effective_plan_lengths = [0usize; MeshMetricFamily::ALL.len()];
     for plugin in plugins {
         if plugin.name() != "workload_metrics" {
             continue;
         }
-        saw_workload_metrics = true;
+        let conditional = plugin.metric_tag_override_plans_are_conditional();
         for (family, plan) in plugin.metric_tag_override_plans() {
-            effective[family.index()] = Some(plan.as_str());
+            let effective = &mut effective_plan_lengths[family.index()];
+            if conditional {
+                *effective = (*effective).max(plan.len());
+            } else {
+                *effective = plan.len();
+            }
         }
     }
-    if !saw_workload_metrics {
-        return Ok(());
-    }
     let mut total = 0usize;
-    for plan in effective.into_iter().flatten() {
-        total = total.checked_add(plan.len()).ok_or_else(|| {
+    for plan_len in effective_plan_lengths {
+        total = total.checked_add(plan_len).ok_or_else(|| {
             format!(
                 "proxy_id={proxy_id}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
             )

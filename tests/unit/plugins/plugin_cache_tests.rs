@@ -1776,7 +1776,7 @@ fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
 }
 
 fn workload_metrics_family_set_overrides(metric: &str, count: usize) -> serde_json::Value {
-    // Each max-length set encodes to 263 plan bytes (`s0,256:` + 256 + `;`).
+    // Each max-length set encodes to 264 plan bytes (`s0,256:` + 256 + `;`).
     // 62 entries plus the `m0;` family header stay under the 16384-byte
     // single-instance ceiling; two different-family instances at that size
     // exceed the composed effective-chain budget.
@@ -1860,6 +1860,58 @@ fn test_workload_metrics_effective_plan_budget_measures_same_family_as_replaceme
             .filter(|plugin| plugin.name() == "workload_metrics")
             .count(),
         2
+    );
+}
+
+#[test]
+fn test_workload_metrics_effective_plan_budget_retains_earlier_plan_when_trigger_can_skip() {
+    let mut earlier = make_plugin_config_with_json(
+        "wm-earlier",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    earlier.priority_override = Some(9359);
+
+    let mut conditional_replacement = make_plugin_config_with_json(
+        "wm-conditional",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_COUNT", 1),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    conditional_replacement.priority_override = Some(9360);
+    conditional_replacement.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"method": ["POST"]}}
+        }))
+        .expect("valid method trigger"),
+    );
+
+    let mut other_family = make_plugin_config_with_json(
+        "wm-duration",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_DURATION", 1),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    other_family.priority_override = Some(9361);
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["wm-earlier", "wm-conditional", "wm-duration"],
+        )],
+        vec![earlier, conditional_replacement, other_family],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("a skipped replacement can leave the larger earlier plan effective");
+    assert!(
+        error.contains("exceed 16384 encoded bytes across surviving families"),
+        "unexpected error: {error}"
     );
 }
 

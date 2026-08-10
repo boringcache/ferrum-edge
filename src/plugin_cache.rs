@@ -999,6 +999,9 @@ impl Plugin for PluginInstanceWrapper {
     )] {
         self.inner.metric_tag_override_plans()
     }
+    fn metric_tag_override_plans_are_conditional(&self) -> bool {
+        self.trigger.is_some() || self.inner.metric_tag_override_plans_are_conditional()
+    }
     fn priority(&self) -> u16 {
         self.priority
     }
