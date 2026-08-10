@@ -735,8 +735,7 @@ impl GatewayApiListenerParentKind {
     ///
     /// Distinct from [`Self::as_str`]: mesh consumers key services by
     /// `(namespace, name)` and must never alias a Gateway-derived service with a
-    /// ListenerSet-derived one (or with a core Service that happens to share a
-    /// human-readable label).
+    /// ListenerSet-derived one.
     pub fn mesh_service_kind_prefix(self) -> &'static str {
         match self {
             Self::Gateway => "gateway",
