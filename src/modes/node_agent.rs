@@ -44,12 +44,17 @@ use crate::cni::spec::{
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
+use crate::ebpf::ingress_topology::{
+    IngressTopologyMonitor, IngressTopologyOutcome, IngressTopologyStatus,
+    IngressTopologyValidator, MAX_CONFIGURED_INTERFACE_BYTES, MAX_CONFIGURED_INTERFACES,
+};
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
     NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
@@ -77,6 +82,8 @@ const CNI_STATUS_KUBE_UNAVAILABLE_REASON: &str =
 const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
     "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const INGRESS_TOPOLOGY_INITIAL_TIMEOUT: Duration = Duration::from_secs(2);
+const INGRESS_TOPOLOGY_DATAPATH_RETRY: Duration = Duration::from_secs(5);
 const UDP_REGISTRY_RETRACTION_RETRY: Duration = Duration::from_secs(1);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
@@ -354,7 +361,7 @@ impl NodeAgentConfig {
         // node-global iptables REDIRECT for enrolled workloads and needs an
         // explicit attach point, and silently guessing the uplink would be a
         // node-wide datapath change made on the node-agent's own initiative.
-        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env();
+        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env()?;
         capture_contract.node_waypoint_ingress_redirect_mark =
             if capture_contract.ingress_redirect_ifaces.is_empty() {
                 0
@@ -481,18 +488,43 @@ impl NodeAgentConfig {
 /// entirely. Entries are deduplicated because attaching the same classifier
 /// twice to one interface would install two filters that both try to
 /// `bpf_sk_assign` the same packet.
-fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
+fn node_agent_ingress_redirect_ifaces_from_env() -> Result<Vec<String>, String> {
     let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if raw.len() > MAX_CONFIGURED_INTERFACE_BYTES {
+        return Err(format!(
+            "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES exceeds the supported {}-byte bound",
+            MAX_CONFIGURED_INTERFACE_BYTES
+        ));
+    }
     let mut ifaces: Vec<String> = Vec::new();
     for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if name.len() > 15
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES contains an invalid interface name; \
+                 names must be 1..=15 bytes and use only ASCII letters, digits, '_', '-', '.', \
+                 or ':'"
+                    .to_string(),
+            );
+        }
         let name = name.to_string();
         if !ifaces.contains(&name) {
+            if ifaces.len() == MAX_CONFIGURED_INTERFACES {
+                return Err(format!(
+                    "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES exceeds the supported limit of {} \
+                     explicitly configured interfaces",
+                    MAX_CONFIGURED_INTERFACES
+                ));
+            }
             ifaces.push(name);
         }
     }
-    ifaces
+    Ok(ifaces)
 }
 
 /// Whether this node is configured for the NodeWaypoint inbound tc ingress
@@ -510,7 +542,13 @@ fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
 ///
 /// Evaluated once per listener plan / startup, never on a request path.
 pub fn node_waypoint_ingress_redirect_configured() -> bool {
-    !node_agent_ingress_redirect_ifaces_from_env().is_empty()
+    node_agent_ingress_redirect_ifaces_from_env()
+        .map(|interfaces| !interfaces.is_empty())
+        // Invalid non-empty input must not suppress the proxy listener while
+        // the node-agent rejects the same configuration. Returning true keeps
+        // the two-process contract fail-closed rather than silently disabling
+        // one half.
+        .unwrap_or(true)
 }
 
 /// Declared inbound TCP application ports for a pod, derived from its
@@ -1177,8 +1215,9 @@ async fn start_node_agent_admin_listeners(
         admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready),
-        // node_agent mode has no post-start listener supervision that flips
-        // readiness; readiness is governed by `startup_ready` alone.
+        // Node-agent readiness is governed by this shared flag. The pod relist
+        // raises it only while the ingress-interface topology proof is valid;
+        // the bounded drift monitor may lower it after startup.
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
@@ -1399,6 +1438,15 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
+    let topology_validator = IngressTopologyValidator::new(
+        config.capture_contract.ingress_redirect_ifaces.clone(),
+        config.node_name.clone(),
+        config.capture_contract.ingress_capture_supports_ipv6,
+    );
+    let topology_ready = Arc::new(AtomicBool::new(
+        !config.capture_contract.ingress_redirect_enabled(),
+    ));
+
     // `initialize_backend` is transactional: any post-`load_programs` failure
     // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
     // function owns cleanup exactly once through `InitializedBackendOwner`
@@ -1407,18 +1455,67 @@ async fn run_with_backend(
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
     let mut owner =
         InitializedBackendOwner::new(backend, config.capture_contract.ingress_redirect_enabled());
-
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
         Err(err) => return Err(owner.fail_with(err)),
     };
+    let udp_migration_generation =
+        crate::proxy::udp_placement_migration::migration_generation_from_env()
+            .map_err(anyhow::Error::msg)?;
+    if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
+        anyhow::bail!(
+            "Ambient UDP migration generation requires the node-waypoint pod registry directory"
+        );
+    }
+    if cni_config.enabled && ownership_store_path_for_socket(&cni_config.socket_path).is_none() {
+        anyhow::bail!("CNI listener requires an absolute socket path with a parent directory");
+    }
+    // A tc attach proves only that the configured link accepted the program.
+    // One shutdown-owned background monitor performs the initial bounded Node
+    // LIST, follows its watch, and re-reads host route/link state. The pod/CNI
+    // loop receives completed outcomes only and never waits on Kubernetes or
+    // procfs/sysfs I/O.
+    let mut topology_monitor = if config.capture_contract.ingress_redirect_enabled() {
+        Some(topology_validator.spawn_monitor(client.clone(), shutdown_tx.subscribe()))
+    } else {
+        None
+    };
+    let initial_topology = if let Some(monitor) = topology_monitor.as_mut() {
+        match tokio::time::timeout(INGRESS_TOPOLOGY_INITIAL_TIMEOUT, monitor.outcomes.changed())
+            .await
+        {
+            Ok(Ok(())) => monitor.outcomes.borrow_and_update().clone(),
+            Ok(Err(_)) => IngressTopologyOutcome::monitor_stopped(
+                config.capture_contract.ingress_redirect_ifaces.len(),
+            ),
+            Err(_) => IngressTopologyOutcome::validation_timeout(
+                config.capture_contract.ingress_redirect_ifaces.len(),
+                false,
+                false,
+            ),
+        }
+    } else {
+        IngressTopologyOutcome {
+            status: IngressTopologyStatus::disabled(),
+            diagnostic: "inbound ingress redirect is disabled".to_string(),
+        }
+    };
+    let topology_publication_ok = apply_ingress_topology_outcome(
+        owner.backend_mut(),
+        config,
+        metrics.as_ref(),
+        topology_ready.as_ref(),
+        startup_ready.as_ref(),
+        false,
+        false,
+        udp_migration_generation.is_none(),
+        &initial_topology,
+        "startup",
+    );
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
-    let udp_migration_generation =
-        crate::proxy::udp_placement_migration::migration_generation_from_env()
-            .map_err(anyhow::Error::msg)?;
     run_with_pod_stream(
         &mut owner,
         config,
@@ -1427,11 +1524,165 @@ async fn run_with_backend(
         startup_ready,
         cni_config,
         Some(client),
+        topology_monitor,
+        topology_ready,
+        topology_publication_ok,
         udp_migration_generation,
         pod_stream,
         std::iter::empty(),
     )
     .await
+}
+
+fn set_node_agent_startup_readiness(
+    startup_ready: &AtomicBool,
+    initial_pod_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> bool {
+    let ready = initial_pod_sync_complete && topology_ready && udp_migration_ready;
+    startup_ready.store(ready, Ordering::Release);
+    ready
+}
+
+#[allow(dead_code)] // External unit tests cover the combined readiness boundary.
+pub(crate) fn set_node_agent_startup_readiness_for_test(
+    initial_pod_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> bool {
+    let startup_ready = AtomicBool::new(false);
+    set_node_agent_startup_readiness(
+        &startup_ready,
+        initial_pod_sync_complete,
+        topology_ready,
+        udp_migration_ready,
+    )
+}
+
+// This publication boundary deliberately receives each independent readiness
+// input explicitly so callers cannot hide capture or startup state in defaults.
+#[allow(clippy::too_many_arguments)]
+fn apply_ingress_topology_outcome(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    topology_ready: &AtomicBool,
+    startup_ready: &AtomicBool,
+    initial_sync_complete: bool,
+    capture_failures_pending: bool,
+    udp_migration_ready: bool,
+    outcome: &IngressTopologyOutcome,
+    phase: &'static str,
+) -> bool {
+    let previous_snapshot = metrics.snapshot();
+    let previous = previous_snapshot.ingress_topology;
+    let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
+    let requested_ready = !ingress_redirect_enabled || outcome.status.is_ready();
+    let datapath_update_ok = !ingress_redirect_enabled
+        || backend
+            .update_capture_config(
+                &config
+                    .capture_contract
+                    .bpf_capture_config_for_topology(requested_ready),
+            )
+            .is_ok();
+    let (status, diagnostic) = if datapath_update_ok {
+        (outcome.status, outcome.diagnostic.as_str())
+    } else {
+        (
+            IngressTopologyStatus {
+                state: crate::ebpf::ingress_topology::IngressTopologyState::Unavailable,
+                reason: crate::ebpf::ingress_topology::IngressTopologyReason::DatapathUpdateFailed,
+                ..outcome.status
+            },
+            "the ingress redirect quarantine state could not be published to the BPF capture map",
+        )
+    };
+    metrics.set_ingress_topology(status);
+    let ready = requested_ready && datapath_update_ok;
+    topology_ready.store(ready, Ordering::Release);
+    set_node_agent_startup_readiness(
+        startup_ready,
+        initial_sync_complete,
+        ready,
+        udp_migration_ready,
+    );
+    if ready {
+        if previous_snapshot.capture_state
+            == NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
+        {
+            metrics.set_capture_state(if capture_failures_pending {
+                NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+            } else {
+                NODE_AGENT_CAPTURE_STATE_READY
+            });
+        }
+        if previous.state != status.state || previous.reason != status.reason {
+            info!(
+                phase,
+                state = status.state.label(),
+                reason = status.reason.label(),
+                configured_interfaces = status.configured_interfaces,
+                expected_interfaces = status.expected_interfaces,
+                ipv4_covered = status.ipv4_covered,
+                ipv6_required = status.ipv6_required,
+                ipv6_covered = status.ipv6_covered,
+                "NodeWaypoint ingress interface topology is proved"
+            );
+        }
+    } else {
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
+        if previous.state != status.state || previous.reason != status.reason {
+            warn!(
+                phase,
+                state = status.state.label(),
+                reason = status.reason.label(),
+                configured_interfaces = status.configured_interfaces,
+                expected_interfaces = status.expected_interfaces,
+                ipv4_required = status.ipv4_required,
+                ipv6_required = status.ipv6_required,
+                diagnostic,
+                "NodeWaypoint ingress interface topology is unproved; readiness withdrawn. \
+                 Correct the explicit interface set or restore the node routes/link state; \
+                 Ferrum will not guess or broaden capture."
+            );
+        }
+    }
+    datapath_update_ok
+}
+
+/// Narrow external-test seam for the production topology outcome transition.
+/// It exposes only the two readiness bits; BPF-map and metrics effects remain
+/// observable through the existing mock backend and metrics snapshots.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+pub(crate) fn apply_ingress_topology_outcome_for_test(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    topology_ready: bool,
+    startup_ready: bool,
+    initial_sync_complete: bool,
+    outcome: &IngressTopologyOutcome,
+) -> (bool, bool) {
+    let topology_ready = AtomicBool::new(topology_ready);
+    let startup_ready = AtomicBool::new(startup_ready);
+    let _ = apply_ingress_topology_outcome(
+        backend,
+        config,
+        metrics,
+        &topology_ready,
+        &startup_ready,
+        initial_sync_complete,
+        false,
+        true,
+        outcome,
+        "test",
+    );
+    (
+        topology_ready.load(Ordering::Acquire),
+        startup_ready.load(Ordering::Acquire),
+    )
 }
 
 /// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
@@ -1461,6 +1712,7 @@ where
         enabled: false,
         socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
     };
+    let topology_ready = Arc::new(AtomicBool::new(true));
     run_with_pod_stream(
         &mut owner,
         config,
@@ -1470,8 +1722,72 @@ where
         cni_config,
         None,
         None,
+        topology_ready,
+        true,
+        None,
         pod_stream,
         seed_pods,
+    )
+    .await
+}
+
+/// Inject completed topology outcomes into the production pod/CNI select loop.
+/// Kubernetes and host I/O stay outside this seam; it exists solely so external
+/// tests can exercise the real outcome arm and readiness/quarantine wiring.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    pod_stream: S,
+    initial_topology: IngressTopologyOutcome,
+    mut topology_stream: T,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    T: Stream<Item = IngressTopologyOutcome> + Unpin + Send + 'static,
+{
+    let (outcomes_tx, outcomes) = tokio::sync::watch::channel(initial_topology.clone());
+    let task = tokio::spawn(async move {
+        while let Some(outcome) = topology_stream.next().await {
+            outcomes_tx.send_replace(outcome);
+        }
+    });
+    let monitor = IngressTopologyMonitor { outcomes, task };
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let topology_ready = Arc::new(AtomicBool::new(false));
+    let topology_publication_ok = apply_ingress_topology_outcome(
+        backend,
+        config,
+        metrics.as_ref(),
+        topology_ready.as_ref(),
+        startup_ready.as_ref(),
+        false,
+        false,
+        true,
+        &initial_topology,
+        "test_startup",
+    );
+    let mut owner = InitializedBackendOwner::borrowed(backend, false);
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        CniListenerConfig {
+            enabled: false,
+            socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+        },
+        None,
+        Some(monitor),
+        topology_ready,
+        topology_publication_ok,
+        None,
+        pod_stream,
+        std::iter::empty(),
     )
     .await
 }
@@ -1485,6 +1801,9 @@ async fn run_with_pod_stream<S, I>(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
+    mut topology_monitor: Option<IngressTopologyMonitor>,
+    topology_ready: Arc<AtomicBool>,
+    mut topology_publication_ok: bool,
     udp_migration_generation: Option<String>,
     mut pod_stream: S,
     seed_pods: I,
@@ -1494,8 +1813,10 @@ where
     I: IntoIterator<Item = PodAttachmentState>,
 {
     // Caller must have already initialized the backend (`run_with_backend` or
-    // `run_with_pod_stream_for_test`) so production keeps init → kube-client
-    // ordering for cleanup-ownership compatibility with PR #3142.
+    // `run_with_pod_stream_for_test`). Production preserves the established
+    // init → Kubernetes-client cleanup ownership, then takes the initial
+    // topology snapshot before entering this loop. This loop owns only
+    // periodic revalidation and pod reconciliation.
     if cni_config.enabled && kube_client.is_none() {
         anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
     }
@@ -1581,6 +1902,12 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    let mut topology_monitor_open = topology_monitor.is_some();
+    let mut last_topology_outcome = topology_monitor
+        .as_ref()
+        .map(|monitor| monitor.outcomes.borrow().clone());
+    let mut topology_datapath_retry = tokio::time::interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
+    topology_datapath_retry.tick().await;
     let mut udp_registry_retraction_retry = tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
     udp_registry_retraction_retry.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
@@ -1642,20 +1969,25 @@ where
                             &pod,
                         );
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
-                            startup_ready.store(
+                            set_node_agent_startup_readiness(
+                                startup_ready.as_ref(),
+                                initial_pod_sync_complete,
+                                topology_ready.load(Ordering::Acquire),
                                 udp_registry_sync_published,
-                                Ordering::Release,
                             );
                         }
                     }
@@ -1688,20 +2020,25 @@ where
                             handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
-                            startup_ready.store(
+                            set_node_agent_startup_readiness(
+                                startup_ready.as_ref(),
+                                initial_pod_sync_complete,
+                                topology_ready.load(Ordering::Acquire),
                                 udp_registry_sync_published,
-                                Ordering::Release,
                             );
                         }
                     }
@@ -1769,11 +2106,23 @@ where
                                 );
                             }
                         }
-                        let ready =
+                        let topology_is_ready = topology_ready.load(Ordering::Acquire);
+                        let udp_migration_ready =
                             udp_migration_generation.is_none() || udp_registry_sync_published;
-                        startup_ready.store(ready, Ordering::Release);
+                        let ready = set_node_agent_startup_readiness(
+                            startup_ready.as_ref(),
+                            initial_pod_sync_complete,
+                            topology_is_ready,
+                            udp_migration_ready,
+                        );
                         if ready {
-                            info!("Node agent initial pod sync complete; /health now reports ready");
+                            info!(
+                                "Node agent initial pod sync, ingress topology proof, and UDP migration proof complete; /health now reports ready"
+                            );
+                        } else if !topology_is_ready {
+                            warn!(
+                                "Node agent initial pod sync complete, but the NodeWaypoint ingress interface topology is unproved; /health remains not ready"
+                            );
                         } else {
                             warn!(
                                 "Node agent initial pod sync complete, but readiness remains withheld until the migration registry proof is published"
@@ -1804,27 +2153,22 @@ where
                             });
                             continue;
                         };
-                        if matches!(work.request.verb, RpcVerb::Gc | RpcVerb::Status)
-                            && !startup_ready.load(Ordering::Acquire)
-                        {
+                        if let Some(reason) = cni_capture_readiness_rejection(
+                            work.request.verb,
+                            initial_pod_sync_complete,
+                            topology_ready.load(Ordering::Acquire),
+                            udp_migration_generation.is_none() || udp_registry_sync_published,
+                        ) {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
                             // pod_states is not authoritative enough to prove
                             // those keys unowned, so GC must retry later.
-                            // STATUS is fail-closed on the same gate: the
-                            // node-agent is not yet ready to authoritatively
-                            // service ADD against a complete local view.
-                            let reason = match work.request.verb {
-                                RpcVerb::Status => {
-                                    "node-agent initial pod sync is incomplete; not ready for ADD"
-                                        .to_string()
-                                }
-                                _ => {
-                                    "node-agent initial pod sync is incomplete; retry GC"
-                                        .to_string()
-                                }
-                            };
-                            let _ = work.respond.send(CniRpcResponse::Error { reason });
+                            // ADD/CHECK/STATUS share the combined topology and
+                            // UDP migration readiness gate so neither feature
+                            // can falsely satisfy the other's proof boundary.
+                            let _ = work.respond.send(CniRpcResponse::Error {
+                                reason: reason.to_string(),
+                            });
                             continue;
                         }
                         let cni_mutates_capture = matches!(
@@ -1871,20 +2215,25 @@ where
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
                         if refresh_udp_registry_sync {
+                            let Some(generation) = udp_migration_generation.as_deref() else {
+                                startup_ready.store(false, Ordering::Release);
+                                warn!(
+                                    "Ambient UDP migration generation disappeared during CNI registry refresh; readiness remains fenced"
+                                );
+                                continue;
+                            };
                             publish_udp_migration_registry_sync_with_recovery(
-                                udp_migration_generation.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Ambient UDP migration generation disappeared during registry refresh"
-                                    )
-                                })?,
+                                generation,
                                 &pod_states,
                                 config,
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
-                            startup_ready.store(
+                            set_node_agent_startup_readiness(
+                                startup_ready.as_ref(),
+                                initial_pod_sync_complete,
+                                topology_ready.load(Ordering::Acquire),
                                 udp_registry_sync_published,
-                                Ordering::Release,
                             );
                         }
                     }
@@ -1923,9 +2272,11 @@ where
                                 &mut udp_registry_sync_published,
                                 &mut udp_registry_sync_retraction_pending,
                             );
-                            startup_ready.store(
+                            set_node_agent_startup_readiness(
+                                startup_ready.as_ref(),
+                                initial_pod_sync_complete,
+                                topology_ready.load(Ordering::Acquire),
                                 udp_registry_sync_published,
-                                Ordering::Release,
                             );
                         }
                     }
@@ -2013,13 +2364,85 @@ where
                         &mut udp_registry_sync_retraction_pending,
                     );
                     if udp_registry_sync_published {
-                        startup_ready.store(true, Ordering::Release);
+                        set_node_agent_startup_readiness(
+                            startup_ready.as_ref(),
+                            initial_pod_sync_complete,
+                            topology_ready.load(Ordering::Acquire),
+                            true,
+                        );
                         info!(
                             "Ambient UDP registry synchronization marker published after relist recovery converged"
                         );
                     } else if refresh_udp_registry_sync {
                         startup_ready.store(false, Ordering::Release);
                     }
+                }
+            }
+            changed = async {
+                match topology_monitor.as_mut() {
+                    Some(monitor) => monitor.outcomes.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if topology_monitor_open => {
+                match changed {
+                    Ok(()) => {
+                        let Some(monitor) = topology_monitor.as_mut() else {
+                            topology_monitor_open = false;
+                            continue;
+                        };
+                        let outcome = monitor.outcomes.borrow_and_update().clone();
+                        topology_publication_ok = apply_ingress_topology_outcome(
+                            owner.backend_mut(),
+                            config,
+                            metrics.as_ref(),
+                            topology_ready.as_ref(),
+                            startup_ready.as_ref(),
+                            initial_pod_sync_complete,
+                            has_failed_pod_enrollments(&pod_states)
+                                || has_pending_capture_failures(&pod_states),
+                            udp_migration_generation.is_none() || udp_registry_sync_published,
+                            &outcome,
+                            "runtime_revalidation",
+                        );
+                        last_topology_outcome = Some(outcome);
+                    }
+                    Err(_) => {
+                        topology_monitor_open = false;
+                        let outcome = IngressTopologyOutcome::monitor_stopped(
+                            config.capture_contract.ingress_redirect_ifaces.len(),
+                        );
+                        topology_publication_ok = apply_ingress_topology_outcome(
+                            owner.backend_mut(),
+                            config,
+                            metrics.as_ref(),
+                            topology_ready.as_ref(),
+                            startup_ready.as_ref(),
+                            initial_pod_sync_complete,
+                            has_failed_pod_enrollments(&pod_states)
+                                || has_pending_capture_failures(&pod_states),
+                            udp_migration_generation.is_none() || udp_registry_sync_published,
+                            &outcome,
+                            "runtime_revalidation",
+                        );
+                        last_topology_outcome = Some(outcome);
+                    }
+                }
+            }
+            _ = topology_datapath_retry.tick(), if !topology_publication_ok => {
+                if let Some(outcome) = last_topology_outcome.as_ref() {
+                    topology_publication_ok = apply_ingress_topology_outcome(
+                        owner.backend_mut(),
+                        config,
+                        metrics.as_ref(),
+                        topology_ready.as_ref(),
+                        startup_ready.as_ref(),
+                        initial_pod_sync_complete,
+                        has_failed_pod_enrollments(&pod_states)
+                            || has_pending_capture_failures(&pod_states),
+                        udp_migration_generation.is_none() || udp_registry_sync_published,
+                        outcome,
+                        "datapath_publication_retry",
+                    );
                 }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
@@ -2082,6 +2505,12 @@ where
         owner.preserve_fail_closed_state("UDP registry proof retraction failure");
     }
 
+    if let Some(monitor) = topology_monitor
+        && let Err(err) = monitor.task.await
+    {
+        warn!(error = %err, "Node ingress-topology monitor task panicked");
+    }
+
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
     {
@@ -2094,6 +2523,61 @@ where
             Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
         }
     }
+}
+
+fn cni_capture_readiness_rejection(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> Option<&'static str> {
+    match verb {
+        RpcVerb::Gc if !initial_sync_complete => {
+            Some("node-agent initial pod sync is incomplete; retry GC")
+        }
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !initial_sync_complete => {
+            Some("node-agent initial pod sync is incomplete; capture is not ready")
+        }
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !topology_ready => {
+            Some("NodeWaypoint ingress interface topology is unproved; enrollment is quarantined")
+        }
+        RpcVerb::Add | RpcVerb::Check | RpcVerb::Status if !udp_migration_ready => {
+            Some("Ambient UDP migration registry proof is unavailable; enrollment is fenced")
+        }
+        _ => None,
+    }
+}
+
+fn cni_topology_readiness_rejection(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    topology_ready: bool,
+) -> Option<&'static str> {
+    cni_capture_readiness_rejection(verb, initial_sync_complete, topology_ready, true)
+}
+
+#[allow(dead_code)] // External unit tests cover the combined proof gate.
+pub(crate) fn cni_capture_readiness_rejection_for_test(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    topology_ready: bool,
+    udp_migration_ready: bool,
+) -> Option<&'static str> {
+    cni_capture_readiness_rejection(
+        verb,
+        initial_sync_complete,
+        topology_ready,
+        udp_migration_ready,
+    )
+}
+
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+pub(crate) fn cni_topology_readiness_rejection_for_test(
+    verb: RpcVerb,
+    initial_sync_complete: bool,
+    startup_ready: bool,
+) -> Option<&'static str> {
+    cni_topology_readiness_rejection(verb, initial_sync_complete, startup_ready)
 }
 
 fn watcher_init_stale_uids(
@@ -2280,7 +2764,12 @@ fn clear_partial_capture_state_if_recovered(
         && !has_pending_capture_failures(pod_states)
         && metrics.snapshot().capture_state == NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
     {
-        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+        let topology = metrics.snapshot().ingress_topology;
+        metrics.set_capture_state(if topology.is_ready() {
+            NODE_AGENT_CAPTURE_STATE_READY
+        } else {
+            NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
+        });
     }
 }
 
@@ -8166,7 +8655,11 @@ fn initialize_backend_after_load(
     routing_installed: &std::cell::Cell<bool>,
 ) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
-    if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
+    if let Err(e) = backend.update_capture_config(
+        &config
+            .capture_contract
+            .bpf_capture_config_for_topology(false),
+    ) {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));
@@ -8384,8 +8877,18 @@ fn initialize_backend_after_load(
         anyhow::bail!("node-agent eBPF startup validation failed: {e}");
     }
 
-    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
-    info!("BPF programs loaded and maps initialized");
+    if ingress_redirect_enabled {
+        metrics.set_ingress_topology(IngressTopologyStatus::validating(
+            config.capture_contract.ingress_redirect_ifaces.len(),
+        ));
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE);
+        info!(
+            "BPF programs loaded and maps initialized; NodeWaypoint ingress topology proof pending"
+        );
+    } else {
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+        info!("BPF programs loaded and maps initialized");
+    }
     Ok(())
 }
 
@@ -9488,7 +9991,11 @@ mod tests {
     fn ingress_redirect_ifaces_parse_dedupes_and_defaults_to_disabled() {
         // Unset is the default and must disable the redirect entirely.
         with_env_vars(&[], || {
-            assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            assert!(
+                node_agent_ingress_redirect_ifaces_from_env()
+                    .expect("unset interface list")
+                    .is_empty()
+            );
             assert!(!node_waypoint_ingress_redirect_configured());
         });
 
@@ -9502,7 +10009,7 @@ mod tests {
                 // classifier twice to one interface would install two filters both
                 // trying to assign the same packet.
                 assert_eq!(
-                    node_agent_ingress_redirect_ifaces_from_env(),
+                    node_agent_ingress_redirect_ifaces_from_env().expect("valid interface list"),
                     vec!["eth0".to_string(), "eth1".to_string()]
                 );
                 assert!(node_waypoint_ingress_redirect_configured());
@@ -9514,7 +10021,11 @@ mod tests {
         with_env_vars(
             &[("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", " , ")],
             || {
-                assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+                assert!(
+                    node_agent_ingress_redirect_ifaces_from_env()
+                        .expect("whitespace-only interface list")
+                        .is_empty()
+                );
             },
         );
     }
@@ -15013,6 +15524,9 @@ mod tests {
                 socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
             },
             None,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            true,
             Some("generation-1".to_string()),
             events,
             std::iter::empty(),
@@ -15064,6 +15578,9 @@ mod tests {
                 socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
             },
             None,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            true,
             Some("generation-1".to_string()),
             events,
             std::iter::empty(),
@@ -15124,6 +15641,9 @@ mod tests {
                     socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
                 },
                 None,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                true,
                 Some("generation-1".to_string()),
                 events,
                 std::iter::empty(),
