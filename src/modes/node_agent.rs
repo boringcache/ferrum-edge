@@ -1801,6 +1801,17 @@ where
                 // past the backoff window, and retry stale detach/map cleanup
                 // that would otherwise keep capture partially attached. Cheap
                 // no-ops when none are pending.
+                let retry_mutates_udp_registry = has_failed_pod_enrollments(&pod_states)
+                    || has_pending_capture_failures(&pod_states);
+                retract_udp_migration_registry_sync_for_mutation(
+                    udp_migration_generation.as_deref(),
+                    retry_mutates_udp_registry
+                        && startup_ready.load(Ordering::Acquire)
+                        && init_seen.is_none(),
+                    config,
+                    &mut udp_registry_sync_published,
+                )
+                .map_err(anyhow::Error::msg)?;
                 retry_backed_off_pod_enrollments(
                     owner.backend_mut(),
                     &pod_states,
