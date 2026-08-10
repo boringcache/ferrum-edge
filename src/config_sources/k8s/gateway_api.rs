@@ -4659,10 +4659,13 @@ fn mesh_services_from_gateway(
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
             let name = listener_name;
             services.push(MeshService {
-                // Keep generated listener identities disjoint from ListenerSet
-                // identities, even when a Gateway name starts with
-                // `listenerset-`.
-                name: format!("gateway-{}-{name}", object.metadata.name),
+                // Kind-scoped, length-prefixed identity — see
+                // `gateway_api_listener_mesh_service_name`.
+                name: super::gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::Gateway,
+                    &object.metadata.name,
+                    name,
+                ),
                 namespace: object.metadata.namespace.clone(),
                 ports: vec![ServicePort {
                     port,
@@ -8237,12 +8240,12 @@ mod tests {
         assert!(
             mesh.services
                 .iter()
-                .any(|service| service.name == "gateway-sample-https-valid")
+                .any(|service| service.name == "gateway-6-sample-https-valid")
         );
         assert!(
             mesh.services
                 .iter()
-                .all(|service| service.name != "gateway-sample-https-invalid")
+                .all(|service| service.name != "gateway-6-sample-https-invalid")
         );
     }
 
@@ -8303,14 +8306,14 @@ mod tests {
             result.config.mesh.as_ref().is_some_and(|mesh| mesh
                 .services
                 .iter()
-                .any(|service| service.name == "gateway-edge-a-https-a")),
+                .any(|service| service.name == "gateway-6-edge-a-https-a")),
             "the planned winning TLS listener should stay materialized"
         );
         assert!(
             result.config.mesh.as_ref().is_none_or(|mesh| mesh
                 .services
                 .iter()
-                .all(|service| service.name != "gateway-edge-b-https-b")),
+                .all(|service| service.name != "gateway-6-edge-b-https-b")),
             "the accepted non-winning TLS listener must not advertise a listener under the namespace winner's certificate"
         );
         assert!(

@@ -470,8 +470,8 @@ pub struct GatewayApiListenerSetStatus {
     pub programmed_reason: String,
     pub programmed_message: String,
     /// Listener names for which translation emitted the ListenerSet-owned mesh
-    /// service. This typed forward evidence avoids reconstructing ownership
-    /// from collision-prone synthetic service names in the status writer.
+    /// service. Typed forward evidence keeps Programmed correlated to exact
+    /// listeners even when operators inspect synthetic service names.
     pub programmed_listeners: Vec<String>,
     /// Listener name → conflict reason (`HostnameConflict` / `ProtocolConflict`).
     pub listener_conflicts: Vec<(String, String)>,
@@ -730,6 +730,46 @@ impl GatewayApiListenerParentKind {
             Self::ListenerSet => "ListenerSet",
         }
     }
+
+    /// Kind-scoped prefix for synthetic listener `MeshService` names.
+    ///
+    /// Distinct from [`Self::as_str`]: mesh consumers key services by
+    /// `(namespace, name)` and must never alias a Gateway-derived service with a
+    /// ListenerSet-derived one (or with a core Service that happens to share a
+    /// human-readable label).
+    pub fn mesh_service_kind_prefix(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::ListenerSet => "listenerset",
+        }
+    }
+}
+
+/// Synthetic `MeshService.name` for one Gateway- or ListenerSet-derived listener.
+///
+/// Format: `{kind}-{parent_byte_len}-{parent_name}-{listener_name}` where `kind`
+/// is `gateway` or `listenerset` and `parent_byte_len` is the UTF-8 byte length
+/// of `parent_name` in decimal with no leading zeros (except `0` for empty).
+///
+/// Downstream mesh consumers key services by `(namespace, name)`. A plain
+/// hyphen join of parent and listener is ambiguous: Gateway `a-b` + listener
+/// `c` and Gateway `a` + listener `b-c` both yield `gateway-a-b-c`, so one
+/// entry can overwrite the other while exact listener provenance still marks
+/// both Programmed. Length-prefixing the parent makes `(parent, listener)`
+/// injective within each kind without truncating and without assuming a
+/// DNS-label ceiling — `MeshService.name` validation only requires a non-empty
+/// string. Kind prefixes keep the two resource kinds disjoint even when their
+/// resource names collide.
+pub fn gateway_api_listener_mesh_service_name(
+    kind: GatewayApiListenerParentKind,
+    parent_name: &str,
+    listener_name: &str,
+) -> String {
+    format!(
+        "{}-{}-{parent_name}-{listener_name}",
+        kind.mesh_service_kind_prefix(),
+        parent_name.len()
+    )
 }
 
 /// Stable identity of one Gateway API listener.

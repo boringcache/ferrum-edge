@@ -7,7 +7,8 @@
 
 use base64::Engine as _;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, K8sMetadata, K8sObject,
+    K8sTranslationOptions, gateway_api_listener_mesh_service_name, translate_k8s_objects,
     translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
@@ -420,7 +421,7 @@ fn listenerset_attaches_and_materializes_http_route() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "listenerset-extra-extra-http")
+                .any(|service| service.name == "listenerset-5-extra-extra-http")
         }),
         "accepted ListenerSet listener must materialize a mesh service"
     );
@@ -1036,7 +1037,7 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "gateway-shared-same")
+                .any(|service| service.name == "gateway-6-shared-same")
         }),
         "the winning Gateway listener should emit its kind-scoped synthetic name"
     );
@@ -1044,7 +1045,7 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .all(|service| service.name != "listenerset-shared-same")
+                .all(|service| service.name != "listenerset-6-shared-same")
         }),
         "the non-winning ListenerSet must not emit its kind-scoped service"
     );
@@ -1097,20 +1098,35 @@ fn kind_scoped_service_identities_disambiguate_gateway_with_listenerset_prefix()
         .as_ref()
         .expect("collision regression should materialize mesh listener services");
     assert!(
-        mesh.services
-            .iter()
-            .any(|service| service.name == "gateway-listenerset-shared-same"),
-        "the Gateway must emit gateway-{{name}}-{{listener}} even when its name starts with listenerset-"
+        mesh.services.iter().any(|service| {
+            service.name
+                == gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::Gateway,
+                    "listenerset-shared",
+                    "same",
+                )
+        }),
+        "the Gateway must emit the kind-scoped length-prefixed identity even when its name starts with listenerset-"
     );
     assert!(
-        mesh.services
-            .iter()
-            .any(|service| service.name == "listenerset-shared-same"),
-        "the ListenerSet should still emit its own listenerset-{{name}}-{{listener}} identity"
+        mesh.services.iter().any(|service| {
+            service.name
+                == gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::ListenerSet,
+                    "shared",
+                    "same",
+                )
+        }),
+        "the ListenerSet should still emit its own kind-scoped length-prefixed identity"
     );
     assert!(
         mesh.services.iter().all(|service| {
-            service.name != "listenerset-shared-same"
+            service.name
+                != gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::ListenerSet,
+                    "shared",
+                    "same",
+                )
                 || service.ports.iter().any(|port| port.port == 8080)
         }),
         "the ListenerSet-prefixed colliding name must remain ListenerSet-owned, not a Gateway identity"
@@ -1157,13 +1173,13 @@ fn core_service_with_gateway_synthetic_name_cannot_spoof_programmed_status() {
             }]
         }),
     );
-    let objects = vec![gateway_class(), gateway, service("gateway-edge-public")];
+    let objects = vec![gateway_class(), gateway, service("gateway-4-edge-public")];
     let opts = options().with_pod_discovery_enabled(true);
     let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
-            .any(|service| service.name == "gateway-edge-public")
+            .any(|service| service.name == "gateway-4-edge-public")
     }));
 
     let updates = plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
@@ -1220,7 +1236,7 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
         !mesh
             .services
             .iter()
-            .any(|service| service.name == "listenerset-tls-set-https")
+            .any(|service| service.name == "listenerset-7-tls-set-https")
     }));
 
     let mut grant = object(
@@ -1248,7 +1264,7 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "listenerset-tls-set-https")
+                .any(|service| service.name == "listenerset-7-tls-set-https")
         }),
         "a ListenerSet-scoped ReferenceGrant must authorize the valid cross-namespace TLS Secret"
     );
@@ -1321,9 +1337,9 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
     );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services.iter().any(|service| {
-            service.namespace == "gateway-ns" && service.name == "gateway-edge-https"
+            service.namespace == "gateway-ns" && service.name == "gateway-4-edge-https"
         }) && !mesh.services.iter().any(|service| {
-            service.namespace == "extension-ns" && service.name == "listenerset-extra-https-extra"
+            service.namespace == "extension-ns" && service.name == "listenerset-5-extra-https-extra"
         })
     }));
 
@@ -1422,7 +1438,7 @@ fn listenerset_resolved_refs_same_namespace_tls_secret_outcomes() {
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
-            .any(|service| service.name == "listenerset-tls-set-https")
+            .any(|service| service.name == "listenerset-7-tls-set-https")
     }));
 
     let missing = vec![
@@ -1455,7 +1471,7 @@ fn listenerset_resolved_refs_same_namespace_tls_secret_outcomes() {
         !mesh
             .services
             .iter()
-            .any(|service| service.name == "listenerset-tls-set-https")
+            .any(|service| service.name == "listenerset-7-tls-set-https")
     }));
 }
 
@@ -1660,7 +1676,7 @@ fn listenerset_catch_all_and_wildcard_coexist_with_exact_hostname() {
         ["fallback", "exact", "wild"].iter().all(|listener| {
             mesh.services
                 .iter()
-                .any(|service| service.name == format!("listenerset-mixed-{listener}"))
+                .any(|service| service.name == format!("listenerset-5-mixed-{listener}"))
         })
     }));
 }
@@ -1706,11 +1722,11 @@ fn listenerset_identical_hostnames_still_conflict() {
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
-            .any(|service| service.name == "listenerset-dup-first")
+            .any(|service| service.name == "listenerset-3-dup-first")
             && !mesh
                 .services
                 .iter()
-                .any(|service| service.name == "listenerset-dup-second")
+                .any(|service| service.name == "listenerset-3-dup-second")
     }));
 }
 
@@ -1740,7 +1756,7 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
         !mesh
             .services
             .iter()
-            .any(|service| service.name.starts_with("listenerset-missing-"))
+            .any(|service| service.name.starts_with("listenerset-7-missing-"))
     }));
     assert!(
         translation
@@ -1811,7 +1827,7 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
         !mesh
             .services
             .iter()
-            .any(|service| service.name.starts_with("listenerset-too-many-"))
+            .any(|service| service.name.starts_with("listenerset-8-too-many-"))
     }));
 
     let malformed = vec![
@@ -1864,11 +1880,11 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
-            .any(|service| service.name == "listenerset-malformed-ok")
+            .any(|service| service.name == "listenerset-9-malformed-ok")
             && !mesh.services.iter().any(|service| {
-                service.name == "listenerset-malformed-bad-proto"
-                    || service.name == "listenerset-malformed-bad-tls"
-                    || service.name == "listenerset-malformed-bad-host"
+                service.name == "listenerset-9-malformed-bad-proto"
+                    || service.name == "listenerset-9-malformed-bad-tls"
+                    || service.name == "listenerset-9-malformed-bad-host"
             })
     }));
     let updates = plan_gateway_api_status_updates(&malformed, options(), &[]);
@@ -1883,4 +1899,271 @@ fn listenerset_invalid_shapes_fail_closed_with_field_diagnostics() {
     }
     let ok = listenerset_listener_condition(&updates, "malformed", "ok", "Accepted");
     assert_eq!(ok["status"], "True");
+}
+
+/// Hyphen-joined parent/listener pairs are ambiguous: Gateway `a-b` + listener
+/// `c` and Gateway `a` + listener `b-c` both used to emit `gateway-a-b-c`. Mesh
+/// consumers key services by `(namespace, name)`, so one entry overwrote the
+/// other while exact listener provenance still marked both Programmed.
+///
+/// Prove both services survive the downstream `(namespace, name)` collection
+/// path and that each exact parent/listener provenance maps to the right object.
+#[test]
+fn gateway_adversarial_hyphen_pairs_remain_distinct_after_service_keying() {
+    let objects = vec![
+        gateway_class(),
+        object(
+            "Gateway",
+            "a-b",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "c",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "ab-c.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "Same"}}
+                }]
+            }),
+        ),
+        object(
+            "Gateway",
+            "a",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "b-c",
+                    "port": 81,
+                    "protocol": "HTTP",
+                    "hostname": "a-bc.example.com",
+                    "allowedRoutes": {"namespaces": {"from": "Same"}}
+                }]
+            }),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let mesh = translation
+        .config
+        .mesh
+        .as_ref()
+        .expect("adversarial Gateways must materialize mesh listener services");
+
+    let expected_ab_c = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::Gateway,
+        "a-b",
+        "c",
+    );
+    let expected_a_bc = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::Gateway,
+        "a",
+        "b-c",
+    );
+    assert_ne!(
+        expected_ab_c, expected_a_bc,
+        "helper must keep the adversarial Gateway pair injective"
+    );
+    assert_eq!(expected_ab_c, "gateway-3-a-b-c");
+    assert_eq!(expected_a_bc, "gateway-1-a-b-c");
+
+    // Downstream consumers (overlay ownership, remote merge, xDS fold) key by
+    // `(namespace, name)`. Replaying that collection must retain BOTH services.
+    let mut by_key: HashMap<(String, String), &ferrum_edge::modes::mesh::config::MeshService> =
+        HashMap::new();
+    for service in &mesh.services {
+        let previous = by_key.insert((service.namespace.clone(), service.name.clone()), service);
+        assert!(
+            previous.is_none(),
+            "duplicate (namespace, name) MeshService key would silently overwrite: {}/{}",
+            service.namespace,
+            service.name
+        );
+    }
+    let service_ab_c = by_key
+        .get(&("default".to_string(), expected_ab_c.clone()))
+        .expect("Gateway a-b / listener c must survive (namespace, name) keying");
+    let service_a_bc = by_key
+        .get(&("default".to_string(), expected_a_bc.clone()))
+        .expect("Gateway a / listener b-c must survive (namespace, name) keying");
+    assert_eq!(service_ab_c.ports[0].port, 80);
+    assert_eq!(service_ab_c.ports[0].name.as_deref(), Some("c"));
+    assert_eq!(service_a_bc.ports[0].port, 81);
+    assert_eq!(service_a_bc.ports[0].name.as_deref(), Some("b-c"));
+
+    for (gateway, listener) in [("a-b", "c"), ("a", "b-c")] {
+        assert!(
+            translation
+                .materialized_gateway_listeners
+                .contains(&GatewayApiListenerKey {
+                    namespace: "default".to_string(),
+                    parent_kind: GatewayApiListenerParentKind::Gateway,
+                    gateway: gateway.to_string(),
+                    listener: listener.to_string(),
+                }),
+            "exact provenance must retain {gateway}/{listener}"
+        );
+    }
+
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    for (gateway, listener) in [("a-b", "c"), ("a", "b-c")] {
+        let gateway_update = updates
+            .iter()
+            .find(|update| update.kind == "Gateway" && update.name == gateway)
+            .unwrap_or_else(|| panic!("Gateway {gateway} status"));
+        let programmed = gateway_update.status["conditions"]
+            .as_array()
+            .expect("Gateway conditions")
+            .iter()
+            .find(|condition| condition["type"] == "Programmed")
+            .expect("Gateway Programmed");
+        assert_eq!(
+            programmed["status"], "True",
+            "Gateway {gateway} Programmed must track its own materialized listener"
+        );
+        let listener_status = gateway_update.status["listeners"]
+            .as_array()
+            .expect("Gateway listeners")
+            .iter()
+            .find(|entry| entry["name"] == listener)
+            .unwrap_or_else(|| panic!("listener {listener} status"));
+        let listener_programmed = listener_status["conditions"]
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|condition| condition["type"] == "Programmed")
+            .expect("listener Programmed");
+        assert_eq!(
+            listener_programmed["status"], "True",
+            "listener {gateway}/{listener} Programmed must stay exact"
+        );
+    }
+}
+
+/// Same hyphen-join ambiguity for ListenerSet-derived services:
+/// `listenerset-a-b-c` used to alias ListenerSet `a-b`/listener `c` with
+/// ListenerSet `a`/listener `b-c`. Prove both survive `(namespace, name)` keying
+/// with exact Programmed provenance parity.
+#[test]
+fn listenerset_adversarial_hyphen_pairs_remain_distinct_after_service_keying() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", Some("Same")),
+        listenerset(
+            "a-b",
+            "edge",
+            json!([{
+                "name": "c",
+                "port": 8080,
+                "protocol": "HTTP",
+                "hostname": "ab-c.set.example.com",
+                "allowedRoutes": {"namespaces": {"from": "Same"}}
+            }]),
+        ),
+        listenerset(
+            "a",
+            "edge",
+            json!([{
+                "name": "b-c",
+                "port": 8081,
+                "protocol": "HTTP",
+                "hostname": "a-bc.set.example.com",
+                "allowedRoutes": {"namespaces": {"from": "Same"}}
+            }]),
+        ),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+    let mesh = translation
+        .config
+        .mesh
+        .as_ref()
+        .expect("adversarial ListenerSets must materialize mesh listener services");
+
+    let expected_ab_c = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::ListenerSet,
+        "a-b",
+        "c",
+    );
+    let expected_a_bc = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::ListenerSet,
+        "a",
+        "b-c",
+    );
+    assert_ne!(expected_ab_c, expected_a_bc);
+    assert_eq!(expected_ab_c, "listenerset-3-a-b-c");
+    assert_eq!(expected_a_bc, "listenerset-1-a-b-c");
+
+    let mut by_key: HashMap<(String, String), &ferrum_edge::modes::mesh::config::MeshService> =
+        HashMap::new();
+    for service in &mesh.services {
+        if !service.name.starts_with("listenerset-") {
+            continue;
+        }
+        let previous = by_key.insert((service.namespace.clone(), service.name.clone()), service);
+        assert!(
+            previous.is_none(),
+            "duplicate ListenerSet MeshService key would silently overwrite: {}/{}",
+            service.namespace,
+            service.name
+        );
+    }
+    let service_ab_c = by_key
+        .get(&("default".to_string(), expected_ab_c.clone()))
+        .expect("ListenerSet a-b / listener c must survive keying");
+    let service_a_bc = by_key
+        .get(&("default".to_string(), expected_a_bc.clone()))
+        .expect("ListenerSet a / listener b-c must survive keying");
+    assert_eq!(service_ab_c.ports[0].port, 8080);
+    assert_eq!(service_ab_c.ports[0].name.as_deref(), Some("c"));
+    assert_eq!(service_a_bc.ports[0].port, 8081);
+    assert_eq!(service_a_bc.ports[0].name.as_deref(), Some("b-c"));
+
+    for status in &translation.listenerset_statuses {
+        if status.resource.name == "a-b" {
+            assert!(
+                status.programmed && status.programmed_listeners == ["c"],
+                "ListenerSet a-b must program only its own listener: {status:?}"
+            );
+        }
+        if status.resource.name == "a" {
+            assert!(
+                status.programmed && status.programmed_listeners == ["b-c"],
+                "ListenerSet a must program only its own listener: {status:?}"
+            );
+        }
+    }
+
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    for (set_name, listener) in [("a-b", "c"), ("a", "b-c")] {
+        let set_update = updates
+            .iter()
+            .find(|update| update.kind == "ListenerSet" && update.name == set_name)
+            .unwrap_or_else(|| panic!("ListenerSet {set_name} status"));
+        let programmed = set_update.status["conditions"]
+            .as_array()
+            .expect("ListenerSet conditions")
+            .iter()
+            .find(|condition| condition["type"] == "Programmed")
+            .expect("ListenerSet Programmed");
+        assert_eq!(
+            programmed["status"], "True",
+            "ListenerSet {set_name} Programmed must track its own materialization"
+        );
+        let listener_status = set_update.status["listeners"]
+            .as_array()
+            .expect("ListenerSet listeners")
+            .iter()
+            .find(|entry| entry["name"] == listener)
+            .unwrap_or_else(|| panic!("listener {listener} status"));
+        let listener_programmed = listener_status["conditions"]
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|condition| condition["type"] == "Programmed")
+            .expect("listener Programmed");
+        assert_eq!(
+            listener_programmed["status"], "True",
+            "listener {set_name}/{listener} Programmed must stay exact"
+        );
+    }
 }
