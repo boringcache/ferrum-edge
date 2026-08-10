@@ -152,7 +152,8 @@ pub(crate) const MESH_GRPC_RESPONSE_MESSAGES_OVERRIDES_METADATA: &str =
 
 /// Istio Telemetry metric families Ferrum emits with mesh identity labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum MeshMetricFamily {
+#[doc(hidden)]
+pub enum MeshMetricFamily {
     RequestCount,
     RequestDuration,
     RequestSize,
