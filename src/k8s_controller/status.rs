@@ -12,19 +12,17 @@ use crate::config_sources::k8s::backend_tls_policy::{
     MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
 };
 use crate::config_sources::k8s::{
-    FrontendTlsHostnameClaim, GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
-    GatewayApiListenerKey, GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent,
-    GatewayApiRouteAttachment, GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject,
-    K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
-    frontend_tls_hostname_conflict_losers,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
+    GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslation, K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status,
     gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
     gateway_api_status_conflict_context, merge_backend_lb_policy_status,
-    namespace_selector_matches, normalize_gateway_hostname,
-    parse_gateway_listener_allowed_route_namespaces, parse_k8s_timestamp,
+    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
     parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
-    sort_frontend_tls_hostname_claims, translate_k8s_objects_collecting_skips,
-    validate_gateway_listener_allowed_routes, validate_listenerset_listener_entry,
+    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
+    validate_listenerset_listener_entry,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -436,10 +434,6 @@ struct GatewayApiStatusIndexes<'a> {
     reference_grant_permissions: ReferenceGrantPermissionIndex<'a>,
     has_any_service: bool,
     conflicts_by_loser: HashMap<K8sResourceKey, Vec<&'a GatewayApiRouteConflict>>,
-    /// Listeners that lost a Gateway TLS SNI hostname collision, mapped to the
-    /// listener that won it. Computed with the translator's own predicate so
-    /// status and serving state cannot disagree (#3267 / #3268).
-    frontend_tls_hostname_losers: BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Backend Services `(namespace, name)` that a managed Gateway actually
     /// carries traffic to.
     ///
@@ -628,7 +622,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             effective_backend_services.extend(route_backend_service_targets(object));
         }
 
-        let mut indexes = Self {
+        Self {
             gateways_by_ns_name,
             managed_gateways,
             listenersets_by_ns_name,
@@ -642,88 +636,9 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             reference_grant_permissions,
             has_any_service,
             conflicts_by_loser,
-            frontend_tls_hostname_losers: BTreeMap::new(),
             effective_backend_services,
-        };
-        indexes.frontend_tls_hostname_losers = frontend_tls_hostname_losers(&indexes);
-        indexes
-    }
-}
-
-/// Resolve Gateway TLS SNI hostname collisions across every managed Gateway.
-///
-/// Delegates the decision itself to the translator's shared predicate; this
-/// only builds the claims from the status writer's indexes. Certificate
-/// identity is the `(secret_namespace, secret_name)` of each authorized, valid
-/// reference — enough for the equality comparison the predicate performs, and
-/// consistent with the translator's source URIs within one snapshot.
-fn frontend_tls_hostname_losers(
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey> {
-    let mut claims = Vec::new();
-    for ((namespace, name), gateway) in &indexes.gateways_by_ns_name {
-        if !indexes.managed_gateways.contains(&(*namespace, *name)) {
-            continue;
-        }
-        let creation_timestamp = gateway
-            .metadata
-            .creation_timestamp
-            .as_deref()
-            .and_then(parse_k8s_timestamp);
-        for listener in gateway
-            .spec
-            .get("listeners")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|listener| {
-                listener_is_terminating_tls(listener)
-                    && listener_protocol_mode_is_supported(listener)
-                    && validate_gateway_listener_allowed_routes(listener).is_ok()
-            })
-        {
-            let identities = listener_tls_certificate_ref_identities(gateway, listener, indexes);
-            // Only a listener whose references ALL resolve can claim a
-            // hostname. One that does not is already reported through
-            // `ResolvedRefs`, and the translator never gave it a claim either —
-            // reporting it as `Conflicted` too would be a second, misleading
-            // reason for the same withdrawal.
-            let declared_refs = listener
-                .get("tls")
-                .and_then(|tls| tls.get("certificateRefs"))
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            if identities.is_empty() || identities.len() != declared_refs {
-                continue;
-            }
-            claims.push(FrontendTlsHostnameClaim {
-                key: GatewayApiListenerKey {
-                    namespace: (*namespace).to_string(),
-                    parent_kind: GatewayApiListenerParentKind::Gateway,
-                    gateway: (*name).to_string(),
-                    listener: listener
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("listener")
-                        .to_string(),
-                },
-                serving_namespace: (*namespace).to_string(),
-                hostname: listener
-                    .get("hostname")
-                    .and_then(Value::as_str)
-                    .map(normalize_gateway_hostname),
-                creation_timestamp,
-                certificate_identity: identities
-                    .into_iter()
-                    .map(|(secret_namespace, secret_name)| {
-                        format!("{secret_namespace}/{secret_name}")
-                    })
-                    .collect(),
-            });
         }
     }
-    sort_frontend_tls_hostname_claims(&mut claims);
-    frontend_tls_hostname_conflict_losers(&claims)
 }
 
 /// Backend Service `(namespace, name)` targets named by an HTTP-family route.
@@ -1971,14 +1886,14 @@ fn gateway_listener_statuses(
             // its Accepted/ResolvedRefs status — its own references are valid —
             // but serves no route traffic, exactly as the translator withdrew
             // it. Reported as `Conflicted`, the Gateway API condition for it.
-            let hostname_conflict_winner = indexes
-                .frontend_tls_hostname_losers
-                .get(&GatewayApiListenerKey {
+            let hostname_conflict_winner = translation.and_then(|translation| {
+                translation.frontend_tls_hostname_conflicts.get(&GatewayApiListenerKey {
                     namespace: gateway.metadata.namespace.clone(),
                     parent_kind: GatewayApiListenerParentKind::Gateway,
                     gateway: gateway.metadata.name.clone(),
                     listener: listener_name.to_string(),
-                });
+                })
+            });
             let hostname_conflict_message = hostname_conflict_winner.map(|winner| {
                 format!(
                     "Listener hostname is already served with a different certificate by Gateway {}/{} listener {}",

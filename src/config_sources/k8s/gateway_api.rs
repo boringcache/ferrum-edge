@@ -1993,6 +1993,7 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
         .collect();
     sort_frontend_tls_hostname_claims(&mut claims);
     let losers = frontend_tls_hostname_conflict_losers(&claims);
+    acc.gateway_api_frontend_tls_hostname_conflicts = losers.clone();
     for (loser, winner) in &losers {
         acc.warnings.push(format!(
             "Gateway API {} {}/{} listener {} field spec.listeners[].hostname '{}' is already served with a different certificate by {} {}/{} listener {}; reporting the conflict and leaving route traffic on this listener unmaterialized",

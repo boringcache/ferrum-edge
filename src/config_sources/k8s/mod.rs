@@ -410,6 +410,14 @@ pub struct K8sTranslation {
     /// `Accepted=True` / `NoConflicts`.
     pub listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Gateway/ListenerSet listeners withdrawn because another admitted
+    /// listener owns the same explicit SNI hostname with a different complete
+    /// certificate set. Unlike physical port conflicts, a Gateway loser keeps
+    /// `Accepted=True`; status consumes this exact post-admission map so a
+    /// listener removed earlier by physical arbitration cannot remain a stale
+    /// hostname winner.
+    pub frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Route claims this translation refused because two different Gateway API
     /// listeners materialize one physical `(namespace, hosts, listen path,
     /// listen port)` route slot. Runtime materialization is withdrawn on both
@@ -929,6 +937,9 @@ pub(crate) struct K8sAccumulator {
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Post-admission explicit-SNI collision losers and their winners.
+    pub(crate) gateway_api_frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
     /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
     /// key membership; the bool is ownership only — interoperable waypoint
@@ -996,6 +1007,7 @@ impl K8sAccumulator {
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
@@ -1526,6 +1538,7 @@ impl K8sAccumulator {
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
             listenerset_statuses: self.listenerset_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,
+            frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
         }
     }

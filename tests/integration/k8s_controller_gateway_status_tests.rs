@@ -1037,6 +1037,85 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     }
 }
 
+#[test]
+fn physically_refused_hostname_winner_does_not_conflict_the_surviving_listener() {
+    let mut older = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-old",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "plain",
+                    "port": 8443,
+                    "protocol": "HTTP"
+                },
+                {
+                    "name": "secure",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-old"}]}
+                }
+            ]
+        }),
+    );
+    older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut survivor = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge-new",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "secure",
+                "port": 9443,
+                "protocol": "HTTPS",
+                "hostname": "shop.example.com",
+                "tls": {"mode": "Terminate", "certificateRefs": [{"name": "cert-new"}]}
+            }]
+        }),
+    );
+    survivor.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![
+        class,
+        survivor,
+        older,
+        tls_secret_object("cert-old"),
+        tls_secret_object("cert-new"),
+    ];
+
+    let old_update = gateway_update(&objects, "edge-old");
+    assert_listener_refused(&old_update, "plain", "ProtocolConflict");
+    assert_listener_refused(&old_update, "secure", "ProtocolConflict");
+
+    let surviving_update = gateway_update(&objects, "edge-new");
+    let surviving_listener = listener_status(&surviving_update, "secure");
+    let conflicted = listener_condition(surviving_listener, "Conflicted");
+    assert_eq!(conflicted["status"].as_str(), Some("False"));
+    assert_eq!(conflicted["reason"].as_str(), Some("NoConflicts"));
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert!(
+        translation
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .any(|source| source.gateway == "edge-new")
+    );
+    assert!(translation.frontend_tls_hostname_conflicts.is_empty());
+}
+
 /// Physically refused same-port listeners must not be advertised as
 /// MeshServices. A healthy sibling on a different port must still be exposed.
 #[test]
