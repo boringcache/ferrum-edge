@@ -643,9 +643,7 @@ fn hostname_coverages_overlap(left: &str, right: &str) -> bool {
         (None, None) => false,
         (Some(suffix), None) => hostname_matches_suffix(right, suffix),
         (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
-        (Some(left), Some(right)) => {
-            suffix_is_within(left, right) || suffix_is_within(right, left)
-        }
+        (Some(left), Some(right)) => suffix_is_within(left, right) || suffix_is_within(right, left),
     }
 }
 
