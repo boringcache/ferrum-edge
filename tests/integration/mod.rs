@@ -55,6 +55,7 @@ mod gateway_api_backend_tls_policy_tests;
 mod gateway_api_listenerset_tests;
 mod gateway_api_udproute_datapath_tests;
 mod gateway_hbone_pool_tests;
+mod gateway_multi_cert_sni_tests;
 mod gateway_svid_identity_tests;
 mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
