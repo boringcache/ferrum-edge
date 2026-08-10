@@ -10181,14 +10181,10 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(
-            &old_config,
-            &self.env_config.namespace,
-        );
-        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(
-            &new_config,
-            &self.env_config.namespace,
-        );
+        let old_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&old_config, &self.env_config.namespace);
+        let new_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&new_config, &self.env_config.namespace);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -54326,10 +54322,14 @@ mod tests {
             updated_at: timestamp,
         }];
 
-        assert!(!config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"));
+        assert!(!config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
 
         config.plugin_configs[0].plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
-        assert!(config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"));
+        assert!(config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
 
         config.plugin_configs[0].namespace = "tenant-b".to_string();
         assert!(
