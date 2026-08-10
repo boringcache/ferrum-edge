@@ -12080,10 +12080,8 @@ async fn run_ambient_udp_placement_cleanup(
     let mut host_recovery = context.cleanup_host_netns().then(|| {
         crate::proxy::host_udp_capture::HostUdpStaleGenerationRecovery::new(Some(ready_dir))
     });
-    let mut proof_window = UdpCleanupProofWindow::new(
-        context.cleanup_pod_netns(),
-        context.cleanup_host_netns(),
-    );
+    let mut proof_window =
+        UdpCleanupProofWindow::new(context.cleanup_pod_netns(), context.cleanup_host_netns());
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;

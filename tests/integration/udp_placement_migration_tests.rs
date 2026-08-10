@@ -8,8 +8,7 @@ use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpClea
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpCleanupProofWindow, UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement,
     UdpPlacementDecision, UdpPlacementRequest, UdpRegistrySyncProof, clear_registry_sync_marker,
-    prepare_placement,
-    publish_registry_sync_marker_for_pods,
+    prepare_placement, publish_registry_sync_marker_for_pods,
 };
 
 struct MutableSource(Mutex<Vec<PodCaptureTarget>>);
@@ -111,9 +110,7 @@ fn publish_registry_proof(
         .expect("current registry publication proof")
 }
 
-fn complete_cleanup(
-    context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext,
-) {
+fn complete_cleanup(context: &ferrum_edge::proxy::udp_placement_migration::UdpMigrationContext) {
     let proof = publish_registry_proof(context);
     context
         .mark_cleanup_complete(&proof)
