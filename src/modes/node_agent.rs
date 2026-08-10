@@ -1590,6 +1590,14 @@ where
             event = pod_stream.next() => {
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
+                        let refresh_udp_registry_sync =
+                            retract_udp_migration_registry_sync_for_mutation(
+                                udp_migration_generation.as_deref(),
+                                startup_ready.load(Ordering::Acquire) && init_seen.is_none(),
+                                config,
+                                &mut udp_registry_sync_published,
+                            )
+                            .map_err(anyhow::Error::msg)?;
                         handle_kube_pod_applied(
                             owner.backend_mut(),
                             &pod_states,
@@ -1597,10 +1605,44 @@ where
                             metrics.as_ref(),
                             &pod,
                         );
+                        if refresh_udp_registry_sync {
+                            udp_registry_sync_published =
+                                publish_udp_migration_registry_sync_if_ready(
+                                    udp_migration_generation.as_deref().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Ambient UDP migration generation disappeared during registry refresh"
+                                        )
+                                    })?,
+                                    &pod_states,
+                                    config,
+                                )
+                                .map_err(anyhow::Error::msg)?;
+                        }
                     }
                     Some(Ok(Event::Delete(pod))) => {
+                        let refresh_udp_registry_sync =
+                            retract_udp_migration_registry_sync_for_mutation(
+                                udp_migration_generation.as_deref(),
+                                startup_ready.load(Ordering::Acquire) && init_seen.is_none(),
+                                config,
+                                &mut udp_registry_sync_published,
+                            )
+                            .map_err(anyhow::Error::msg)?;
                         if let Some(uid) = pod_uid(&pod) {
                             handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                        }
+                        if refresh_udp_registry_sync {
+                            udp_registry_sync_published =
+                                publish_udp_migration_registry_sync_if_ready(
+                                    udp_migration_generation.as_deref().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Ambient UDP migration generation disappeared during registry refresh"
+                                        )
+                                    })?,
+                                    &pod_states,
+                                    config,
+                                )
+                                .map_err(anyhow::Error::msg)?;
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -1708,6 +1750,20 @@ where
                             let _ = work.respond.send(CniRpcResponse::Error { reason });
                             continue;
                         }
+                        let cni_mutates_capture = matches!(
+                            work.request.verb,
+                            RpcVerb::Add | RpcVerb::Del | RpcVerb::Gc
+                        );
+                        let refresh_udp_registry_sync =
+                            retract_udp_migration_registry_sync_for_mutation(
+                                udp_migration_generation.as_deref(),
+                                cni_mutates_capture
+                                    && startup_ready.load(Ordering::Acquire)
+                                    && init_seen.is_none(),
+                                config,
+                                &mut udp_registry_sync_published,
+                            )
+                            .map_err(anyhow::Error::msg)?;
                         let enrolled_uid = process_cni_work_item(
                             owner.backend_mut(),
                             &pod_states,
@@ -1717,6 +1773,19 @@ where
                             work,
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
+                        if refresh_udp_registry_sync {
+                            udp_registry_sync_published =
+                                publish_udp_migration_registry_sync_if_ready(
+                                    udp_migration_generation.as_deref().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Ambient UDP migration generation disappeared during registry refresh"
+                                        )
+                                    })?,
+                                    &pod_states,
+                                    config,
+                                )
+                                .map_err(anyhow::Error::msg)?;
+                        }
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
@@ -1897,6 +1966,31 @@ fn publish_udp_migration_registry_sync_if_ready(
         generation,
         &expected_pod_uids,
     )
+}
+
+/// Retract a previously published migration snapshot before any post-relist
+/// mutation can attach, detach, or rewrite pod capture ownership. The caller
+/// republishes only after the mutation and all retry/failure state converge.
+/// During the initial relist the marker is already retracted by `Event::Init`,
+/// so individual `InitApply` events deliberately do not churn it.
+fn retract_udp_migration_registry_sync_for_mutation(
+    generation: Option<&str>,
+    initial_sync_complete: bool,
+    config: &NodeAgentConfig,
+    published: &mut bool,
+) -> Result<bool, String> {
+    if generation.is_none() || !initial_sync_complete {
+        return Ok(false);
+    }
+    let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+        return Err(
+            "Ambient UDP migration generation requires the node-waypoint pod registry directory"
+                .to_string(),
+        );
+    };
+    crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)?;
+    *published = false;
+    Ok(true)
 }
 
 fn clear_partial_capture_state_if_recovered(
@@ -14442,6 +14536,56 @@ mod tests {
             "/sys/fs/cgroup/kubepods/poduid1\nspiffe_id=spiffe://cluster.local/ns/default/sa/api\nipv4=10.1.2.3\nipv6=fd00::123\n",
             "registry entry carries the workload identity and family-specific source pod IPs"
         );
+    }
+
+    #[test]
+    fn udp_migration_marker_retracts_before_post_relist_mutation() {
+        let registry = tempfile::tempdir().unwrap();
+        crate::proxy::udp_placement_migration::publish_registry_sync_marker(
+            registry.path(),
+            "generation-1",
+        )
+        .unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let mut published = true;
+
+        assert!(
+            retract_udp_migration_registry_sync_for_mutation(
+                Some("generation-1"),
+                true,
+                &config,
+                &mut published,
+            )
+            .unwrap()
+        );
+        assert!(!published);
+        assert!(!registry.path().join(".udp-registry-synced").exists());
+
+        crate::proxy::udp_placement_migration::publish_registry_sync_marker(
+            registry.path(),
+            "generation-1",
+        )
+        .unwrap();
+        assert!(
+            !retract_udp_migration_registry_sync_for_mutation(
+                Some("generation-1"),
+                false,
+                &config,
+                &mut published,
+            )
+            .unwrap()
+        );
+        assert!(registry.path().join(".udp-registry-synced").is_file());
     }
 
     #[test]

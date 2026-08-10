@@ -419,8 +419,11 @@ Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
 workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
 During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
 atomically republishes the requested generation only after `InitDone`; the proxy
-will not prove predecessor cleanup from an incomplete registry view. The
-generation is bounded operator input and is never used as a metric label.
+will not prove predecessor cleanup from an incomplete registry view. After the
+relist, every pod/CNI capture mutation retracts the marker before changing
+ownership and republishes only after registry persistence and retry state
+converge. The generation is bounded operator input and is never used as a metric
+label.
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

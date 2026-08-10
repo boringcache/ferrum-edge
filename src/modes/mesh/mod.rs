@@ -12127,6 +12127,19 @@ async fn run_ambient_udp_placement_cleanup(
                 }
             }
 
+            // The node agent retracts this marker before every post-relist pod
+            // or CNI mutation. Recheck after the cleanup work as well as before
+            // it so a concurrent attachment cannot race between the initial
+            // proof check and durable completion publication.
+            if !context.registry_is_synchronized() {
+                last_complete_fingerprint = None;
+                host_complete_passes = 0;
+                set_phase(UdpMigrationStatusPhase::WaitingForRegistry, 0);
+                set_failure(UdpMigrationFailureReason::RegistryNotSynchronized);
+                ticker.tick().await;
+                continue;
+            }
+
             let outstanding = host_outstanding.saturating_add(pod_outstanding);
             let phase =
                 if failure_reason == Some(UdpMigrationFailureReason::GateAcknowledgementMissing) {
