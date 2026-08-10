@@ -2242,6 +2242,36 @@ jobs:
             exit 1
           fi
           grep -F 'pre-contract Ambient UDP upgrade requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.err"
+          # Helm and the runtime intentionally share one exact lowercase phase
+          # contract. The chart must not normalize a spelling that the process
+          # will reject only after rollout.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=CLEANUP \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-case \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.err"; then
+            echo "::error title=UDP migration phase normalized by Helm::chart and runtime admission must reject the same non-lowercase spelling"
+            exit 1
+          fi
+          grep -F 'FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-case \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=Pod-Netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=Host-Netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.err"; then
+            echo "::error title=UDP migration tuple normalized by Helm::chart and runtime admission must reject the same non-lowercase placement spelling"
+            exit 1
+          fi
+          grep -F 'Ambient UDP migration FROM must be pod-netns, host-netns, or disabled' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.err"
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
             --set ambient.enabled=true --set nodeAgent.enabled=true \
             --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \

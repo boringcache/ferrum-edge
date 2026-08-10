@@ -12,10 +12,10 @@
 {{- end -}}
 {{- $target := "disabled" -}}
 {{- if $enabled -}}{{- $target = ternary "host-netns" "pod-netns" $host -}}{{- end -}}
-{{- $phase := lower (trim (toString (default "stable" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE")))) -}}
+{{- $phase := default "stable" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE") | toString | trim -}}
 {{- $generation := trim (toString (default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION"))) -}}
-{{- $from := lower (trim (toString (default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM")))) -}}
-{{- $to := lower (trim (toString (default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")))) -}}
+{{- $from := default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM") | toString | trim -}}
+{{- $to := default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO") | toString | trim -}}
 {{- if not (has $phase (list "stable" "cleanup" "finalize")) -}}
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize" -}}
 {{- end -}}
