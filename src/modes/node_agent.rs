@@ -77,6 +77,7 @@ const CNI_STATUS_KUBE_UNAVAILABLE_REASON: &str =
 const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
     "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const UDP_REGISTRY_RETRACTION_RETRY: Duration = Duration::from_secs(1);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
 // Verified handshakes need longer than the ordinary orphan grace for producer
@@ -1580,6 +1581,9 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    let mut udp_registry_retraction_retry =
+        tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
+    udp_registry_retraction_retry.tick().await;
     let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
@@ -1891,6 +1895,43 @@ where
                         // spinning on an immediately-ready closed receiver.
                         cni_work_open = false;
                         debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                    }
+                }
+            }
+            _ = udp_registry_retraction_retry.tick(), if udp_registry_sync_retraction_pending => {
+                match retract_udp_migration_registry_sync_for_mutation(
+                    udp_migration_generation.as_deref(),
+                    false,
+                    config,
+                    &mut udp_registry_sync_published,
+                    &mut udp_registry_sync_retraction_pending,
+                    UdpRegistryMutationLane::RetryTick,
+                ) {
+                    Ok(_) => {
+                        // A deferred watcher mutation must run before a fresh
+                        // proof is published. With no queued mutation, restore
+                        // the proof immediately once the authoritative initial
+                        // snapshot already completed.
+                        if pending_pod_event.is_none()
+                            && initial_pod_sync_complete
+                            && init_seen.is_none()
+                            && let Some(generation) = udp_migration_generation.as_deref()
+                        {
+                            publish_udp_migration_registry_sync_with_recovery(
+                                generation,
+                                &pod_states,
+                                config,
+                                &mut udp_registry_sync_published,
+                                &mut udp_registry_sync_retraction_pending,
+                            );
+                            startup_ready.store(
+                                udp_registry_sync_published,
+                                Ordering::Release,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        startup_ready.store(false, Ordering::Release);
                     }
                 }
             }
