@@ -1,12 +1,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use ferrum_edge::proxy::netns_capture::{
-    PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget,
-};
-use ferrum_edge::proxy::netns_udp_capture::{
-    NetnsUdpCleanupBackend, NetnsUdpCleanupManager,
-};
+use ferrum_edge::proxy::netns_capture::{PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget};
+use ferrum_edge::proxy::netns_udp_capture::{NetnsUdpCleanupBackend, NetnsUdpCleanupManager};
 use ferrum_edge::proxy::udp_placement_migration::{
     UdpMigrationFailureReason, UdpMigrationPhase, UdpPlacement, UdpPlacementDecision,
     UdpPlacementRequest, clear_registry_sync_marker, prepare_placement,
@@ -222,7 +218,9 @@ fn host_to_pod_cleanup_and_finalize_are_symmetric() {
         UdpPlacement::HostNetns,
     );
     let context = cleanup_context(registry.path(), &bootstrap_cleanup);
-    context.mark_cleanup_complete().expect("host bootstrap proof");
+    context
+        .mark_cleanup_complete()
+        .expect("host bootstrap proof");
     prepare_placement(
         registry.path(),
         &transition(
@@ -258,9 +256,21 @@ fn host_to_pod_cleanup_and_finalize_are_symmetric() {
 #[test]
 fn enabled_disabled_transitions_also_require_cleanup_and_finalize() {
     for (from, to, generation) in [
-        (UdpPlacement::PodNetns, UdpPlacement::Disabled, "disable-pod"),
-        (UdpPlacement::Disabled, UdpPlacement::HostNetns, "enable-host"),
-        (UdpPlacement::HostNetns, UdpPlacement::Disabled, "disable-host"),
+        (
+            UdpPlacement::PodNetns,
+            UdpPlacement::Disabled,
+            "disable-pod",
+        ),
+        (
+            UdpPlacement::Disabled,
+            UdpPlacement::HostNetns,
+            "enable-host",
+        ),
+        (
+            UdpPlacement::HostNetns,
+            UdpPlacement::Disabled,
+            "disable-host",
+        ),
         (UdpPlacement::Disabled, UdpPlacement::PodNetns, "enable-pod"),
     ] {
         let registry = tempfile::tempdir().expect("registry");
@@ -359,11 +369,9 @@ fn registry_relist_ack_is_bound_to_generation_and_retracted_on_restart() {
         ),
     );
     assert!(!context.registry_is_synchronized());
-    publish_registry_sync_marker(registry.path(), "generation-b")
-        .expect("stale marker");
+    publish_registry_sync_marker(registry.path(), "generation-b").expect("stale marker");
     assert!(!context.registry_is_synchronized());
-    publish_registry_sync_marker(registry.path(), "generation-a")
-        .expect("matching marker");
+    publish_registry_sync_marker(registry.path(), "generation-a").expect("matching marker");
     assert!(context.registry_is_synchronized());
     clear_registry_sync_marker(registry.path()).expect("restart retraction");
     assert!(!context.registry_is_synchronized());
@@ -379,11 +387,8 @@ async fn partial_pod_cleanup_retries_and_pod_churn_invalidates_completion_snapsh
         fail_once: Mutex::new(HashSet::from([2])),
         cleaned: Mutex::new(Vec::new()),
     };
-    let mut manager = NetnsUdpCleanupManager::new(
-        source.clone(),
-        backend,
-        std::time::Duration::from_secs(2),
-    );
+    let mut manager =
+        NetnsUdpCleanupManager::new(source.clone(), backend, std::time::Duration::from_secs(2));
 
     let partial = manager.migration_cleanup_once().await;
     assert_eq!(partial.outstanding, 1);
@@ -422,12 +427,9 @@ async fn stale_gate_ack_cannot_authorize_migration_cleanup() {
     std::fs::create_dir_all(&ack_dir).expect("ack dir");
     std::fs::write(ready_dir.join("pod-a"), b"").expect("ready marker");
     std::fs::write(ack_dir.join("pod-a"), b"stale").expect("stale ack");
-    let mut manager = NetnsUdpCleanupManager::new(
-        source,
-        backend,
-        std::time::Duration::from_secs(2),
-    )
-    .with_ready_dir(Some(ready_dir));
+    let mut manager =
+        NetnsUdpCleanupManager::new(source, backend, std::time::Duration::from_secs(2))
+            .with_ready_dir(Some(ready_dir));
 
     let blocked = manager.migration_cleanup_once().await;
     assert_eq!(blocked.outstanding, 1);

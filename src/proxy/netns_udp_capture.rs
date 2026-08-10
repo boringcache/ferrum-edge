@@ -1254,8 +1254,7 @@ pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
 pub struct NetnsUdpCleanupProgress {
     pub outstanding: usize,
     pub registry_fingerprint: u64,
-    pub failure_reason:
-        Option<super::udp_placement_migration::UdpMigrationFailureReason>,
+    pub failure_reason: Option<super::udp_placement_migration::UdpMigrationFailureReason>,
 }
 
 impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
@@ -1321,9 +1320,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             .saturating_sub(self.cleaned_netns.len())
             .saturating_add(self.unresolved_reasons.len());
         let failure_reason = if !self.unresolved_reasons.is_empty() {
-            Some(
-                super::udp_placement_migration::UdpMigrationFailureReason::PodNetnsUnresolved,
-            )
+            Some(super::udp_placement_migration::UdpMigrationFailureReason::PodNetnsUnresolved)
         } else if !self.pending_ack_netns.is_empty() {
             Some(
                 super::udp_placement_migration::UdpMigrationFailureReason::GateAcknowledgementMissing,

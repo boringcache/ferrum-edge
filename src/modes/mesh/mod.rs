@@ -12064,8 +12064,7 @@ async fn run_ambient_udp_placement_cleanup(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use crate::proxy::udp_placement_migration::{
-        UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure, set_failure,
-        set_phase,
+        UdpMigrationFailureReason, UdpMigrationStatusPhase, clear_failure, set_failure, set_phase,
     };
 
     let ready_dir = context.registry_dir().join(".udp-ready");
@@ -12121,8 +12120,7 @@ async fn run_ambient_udp_placement_cleanup(
                     failure_reason = Some(reason);
                     last_complete_fingerprint = None;
                 } else if progress.outstanding == 0 {
-                    pod_complete = last_complete_fingerprint
-                        == Some(progress.registry_fingerprint);
+                    pod_complete = last_complete_fingerprint == Some(progress.registry_fingerprint);
                     last_complete_fingerprint = Some(progress.registry_fingerprint);
                 } else {
                     last_complete_fingerprint = None;
@@ -12130,15 +12128,14 @@ async fn run_ambient_udp_placement_cleanup(
             }
 
             let outstanding = host_outstanding.saturating_add(pod_outstanding);
-            let phase = if failure_reason
-                == Some(UdpMigrationFailureReason::GateAcknowledgementMissing)
-            {
-                UdpMigrationStatusPhase::WaitingForGateAck
-            } else if !pod_complete {
-                UdpMigrationStatusPhase::CleaningPodNetns
-            } else {
-                UdpMigrationStatusPhase::CleaningHostNetns
-            };
+            let phase =
+                if failure_reason == Some(UdpMigrationFailureReason::GateAcknowledgementMissing) {
+                    UdpMigrationStatusPhase::WaitingForGateAck
+                } else if !pod_complete {
+                    UdpMigrationStatusPhase::CleaningPodNetns
+                } else {
+                    UdpMigrationStatusPhase::CleaningHostNetns
+                };
             set_phase(phase, outstanding);
             if let Some(reason) = failure_reason {
                 set_failure(reason);
@@ -12379,8 +12376,7 @@ async fn arm_mesh_runtime_startup(
         let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
             anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
         })?;
-        let registry_dir =
-            std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir);
+        let registry_dir = std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir);
         let target = crate::proxy::udp_placement_migration::UdpPlacement::from_capture_settings(
             settings.udp_capture_enabled,
             settings.udp_host_netns_enabled,
@@ -12405,11 +12401,9 @@ async fn arm_mesh_runtime_startup(
                     crate::proxy::netns_udp_capture::preflight_capture_tools(true)
                         .map_err(anyhow::Error::msg)?;
                 }
-                let source = Arc::new(
-                    crate::proxy::netns_capture::DirectoryCaptureSource::new(
-                        env_config.mesh_node_waypoint_pod_registry_dir.clone(),
-                    ),
-                );
+                let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                    env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+                ));
                 let cleanup_shutdown = shutdown_tx.subscribe();
                 info!(
                     from = context.from().as_str(),

@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,10 +86,9 @@ pub struct UdpPlacementRequest {
 
 impl UdpPlacementRequest {
     pub fn from_env(target: UdpPlacement) -> Result<Self, String> {
-        let phase_raw = crate::config::resolve_ferrum_var(
-            "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE",
-        )
-        .unwrap_or_else(|| "stable".to_string());
+        let phase_raw =
+            crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE")
+                .unwrap_or_else(|| "stable".to_string());
         let phase = match phase_raw.trim() {
             "stable" => UdpMigrationPhase::Stable,
             "cleanup" => UdpMigrationPhase::Cleanup,
@@ -101,23 +100,16 @@ impl UdpPlacementRequest {
                 );
             }
         };
-        let generation = crate::config::resolve_ferrum_var(
-            "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION",
-        )
-        .filter(|value| !value.trim().is_empty());
-        let from = crate::config::resolve_ferrum_var(
-            "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM",
-        )
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM")
-        })
-        .transpose()?;
+        let generation =
+            crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
+                .filter(|value| !value.trim().is_empty());
+        let from = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM"))
+            .transpose()?;
         let to = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")
             .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")
-            })
+            .map(|value| UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"))
             .transpose()?;
 
         if phase == UdpMigrationPhase::Stable {
@@ -143,8 +135,7 @@ impl UdpPlacementRequest {
             };
             let Some(to) = to else {
                 return Err(
-                    "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO is required during migration"
-                        .to_string(),
+                    "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO is required during migration".to_string(),
                 );
             };
             if from == to {
@@ -263,12 +254,18 @@ impl UdpMigrationContext {
 
     pub const fn cleanup_pod_netns(&self) -> bool {
         self.cleanup_both
-            || matches!(self.transition.from, UdpPlacement::PodNetns | UdpPlacement::Disabled)
+            || matches!(
+                self.transition.from,
+                UdpPlacement::PodNetns | UdpPlacement::Disabled
+            )
     }
 
     pub const fn cleanup_host_netns(&self) -> bool {
         self.cleanup_both
-            || matches!(self.transition.from, UdpPlacement::HostNetns | UdpPlacement::Disabled)
+            || matches!(
+                self.transition.from,
+                UdpPlacement::HostNetns | UdpPlacement::Disabled
+            )
     }
 
     pub fn registry_is_synchronized(&self) -> bool {
@@ -335,9 +332,9 @@ pub fn prepare_placement(
             Ok(UdpPlacementDecision::RunStable)
         }
         UdpMigrationPhase::Cleanup => {
-            let transition = request.transition().ok_or_else(|| {
-                "Ambient UDP cleanup transition is incomplete".to_string()
-            })?;
+            let transition = request
+                .transition()
+                .ok_or_else(|| "Ambient UDP cleanup transition is incomplete".to_string())?;
             let state_was_absent = state.is_none();
             let mut state = state.unwrap_or_else(|| DurablePlacementState::new(transition.from));
             let cleanup_both = if let Some(pending) = &state.pending {
@@ -377,9 +374,9 @@ pub fn prepare_placement(
             }))
         }
         UdpMigrationPhase::Finalize => {
-            let transition = request.transition().ok_or_else(|| {
-                "Ambient UDP finalize transition is incomplete".to_string()
-            })?;
+            let transition = request
+                .transition()
+                .ok_or_else(|| "Ambient UDP finalize transition is incomplete".to_string())?;
             let mut state = state.ok_or_else(|| {
                 "Ambient UDP finalize has no durable migration state on this node".to_string()
             })?;
@@ -468,10 +465,8 @@ fn write_state(registry_dir: &Path, state: &DurablePlacementState) -> Result<(),
 }
 
 pub fn migration_generation_from_env() -> Result<Option<String>, String> {
-    let value = crate::config::resolve_ferrum_var(
-        "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION",
-    )
-    .filter(|value| !value.trim().is_empty());
+    let value = crate::config::resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION")
+        .filter(|value| !value.trim().is_empty());
     if let Some(value) = value.as_deref() {
         validate_generation(value)?;
     }
@@ -491,10 +486,7 @@ pub fn clear_registry_sync_marker(registry_dir: &Path) -> Result<(), String> {
     }
 }
 
-pub fn publish_registry_sync_marker(
-    registry_dir: &Path,
-    generation: &str,
-) -> Result<(), String> {
+pub fn publish_registry_sync_marker(registry_dir: &Path, generation: &str) -> Result<(), String> {
     validate_generation(generation)?;
     std::fs::create_dir_all(registry_dir)
         .map_err(|error| format!("could not create Ambient UDP registry directory: {error}"))?;
@@ -504,8 +496,8 @@ pub fn publish_registry_sync_marker(
         if index >= MAX_REGISTRY_SYNC_ENTRIES {
             return Err("Ambient UDP registry exceeds its synchronization entry limit".to_string());
         }
-        let entry = entry
-            .map_err(|error| format!("could not read Ambient UDP registry entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("could not read Ambient UDP registry entry: {error}"))?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
             continue;

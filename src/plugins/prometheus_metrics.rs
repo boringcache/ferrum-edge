@@ -2061,10 +2061,7 @@ impl MetricsRegistry {
             .map(|label| label.clone())
             .unwrap_or_default();
         let gateway_ns_label = gateway_namespace_label(&ns_label);
-        crate::proxy::udp_placement_migration::render_prometheus(
-            output,
-            &gateway_ns_label,
-        );
+        crate::proxy::udp_placement_migration::render_prometheus(output, &gateway_ns_label);
     }
 
     /// Render metrics without caching. Used internally and for testing.
