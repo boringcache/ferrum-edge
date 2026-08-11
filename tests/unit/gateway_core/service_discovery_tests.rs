@@ -4401,14 +4401,19 @@ fn discovery_body_limits_envconfig_parse_does_not_pin_process_install() {
     );
 }
 
-#[test]
-fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() {
+#[tokio::test]
+async fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() {
     use ferrum_edge::config::env_config::{
         DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
         DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
         DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, DiscoveryBodyLimits,
     };
     use ferrum_edge::service_discovery::http_body::install_discovery_body_limits;
+
+    // Installing limits updates the same process-wide budget ceiling used by
+    // collector tests. Hold their lifetime lock so this deterministic install
+    // cannot race a test-owned override or a live budget permit.
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
 
     let defaults = DiscoveryBodyLimits {
         max_response_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
@@ -4561,6 +4566,12 @@ async fn discovery_collector_accepts_agreeing_repeated_content_length() {
 
 #[tokio::test]
 async fn discovery_collector_does_not_preallocate_uncharged_content_length() {
+    let collector_src = include_str!("../../../src/service_discovery/http_body.rs");
+    assert!(
+        !collector_src.contains("Vec::with_capacity") && !collector_src.contains("buf.reserve"),
+        "the collector must not preallocate from untrusted Content-Length"
+    );
+
     // A large-but-under-ceiling Content-Length must not allocate that capacity
     // outside the shared budget. Stall after headers so only the declaration is
     // visible; budget usage must stay zero until retained bytes are charged.
