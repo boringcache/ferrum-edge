@@ -488,12 +488,9 @@ fn transparent_reply(
         } else {
             socket2::Domain::IPV6
         };
-        let socket = socket2::Socket::new(
-            domain,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|error| format!("reply socket: {error}"))?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                .map_err(|error| format!("reply socket: {error}"))?;
         socket
             .set_reuse_address(true)
             .map_err(|error| format!("SO_REUSEADDR: {error}"))?;
@@ -646,16 +643,8 @@ impl LiveTopology {
         let pod_if_c = format!("pc{suffix}");
 
         attach_veth_pair(
-            host_pid,
-            pod_a_pid,
-            &if_a,
-            &pod_if_a,
-            HOST_A_V4,
-            POD_A_V4,
-            HOST_A_V6,
-            POD_A_V6,
-            REMOTE_V4,
-            REMOTE_V6,
+            host_pid, pod_a_pid, &if_a, &pod_if_a, HOST_A_V4, POD_A_V4, HOST_A_V6, POD_A_V6,
+            REMOTE_V4, REMOTE_V6,
         )?;
 
         // Give node-originated traffic a real output route. Pod egress reaches
@@ -669,28 +658,12 @@ impl LiveTopology {
             ),
         )?;
         attach_veth_pair(
-            host_pid,
-            pod_b_pid,
-            &if_b,
-            &pod_if_b,
-            HOST_B_V4,
-            POD_B_V4,
-            HOST_B_V6,
-            POD_B_V6,
-            REMOTE_V4,
-            REMOTE_V6,
+            host_pid, pod_b_pid, &if_b, &pod_if_b, HOST_B_V4, POD_B_V4, HOST_B_V6, POD_B_V6,
+            REMOTE_V4, REMOTE_V6,
         )?;
         attach_veth_pair(
-            host_pid,
-            pod_c_pid,
-            &if_c,
-            &pod_if_c,
-            HOST_C_V4,
-            POD_C_V4,
-            HOST_C_V6,
-            POD_C_V6,
-            REMOTE_V4,
-            REMOTE_V6,
+            host_pid, pod_c_pid, &if_c, &pod_if_c, HOST_C_V4, POD_C_V4, HOST_C_V6, POD_C_V6,
+            REMOTE_V4, REMOTE_V6,
         )?;
 
         let host_sysfs = PathBuf::from(format!("/proc/{host_pid}/root/sys/class/net"));
@@ -886,13 +859,14 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     let pod_b_reply = SocketAddr::new(IpAddr::V6(POD_B_V6), 43002);
     let waiter = spawn_reply_waiter(topo.pod_b_pid, pod_b_reply);
     std::thread::sleep(Duration::from_millis(100));
-    transparent_reply(host_pid, captured_v6_dst, pod_b_reply, b"reply-b6")
-        .unwrap_or_else(|error| {
+    transparent_reply(host_pid, captured_v6_dst, pod_b_reply, b"reply-b6").unwrap_or_else(
+        |error| {
             panic!(
                 "IPv6 transparent reply failed: {error}\n{}",
                 bounded_host_diag(host_pid)
             );
-        });
+        },
+    );
     let got = waiter
         .join()
         .expect("IPv6 reply waiter thread")
@@ -929,13 +903,12 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     let pod_a_reply = SocketAddr::new(IpAddr::V4(POD_A_V4), 43001);
     let waiter = spawn_reply_waiter(topo.pod_a_pid, pod_a_reply);
     std::thread::sleep(Duration::from_millis(100));
-    transparent_reply(host_pid, captured_dst, pod_a_reply, b"reply-a")
-        .unwrap_or_else(|error| {
-            panic!(
-                "transparent reply failed: {error}\n{}",
-                bounded_host_diag(host_pid)
-            );
-        });
+    transparent_reply(host_pid, captured_dst, pod_a_reply, b"reply-a").unwrap_or_else(|error| {
+        panic!(
+            "transparent reply failed: {error}\n{}",
+            bounded_host_diag(host_pid)
+        );
+    });
     let got = waiter
         .join()
         .expect("reply waiter thread")
@@ -1054,10 +1027,7 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .map_err(|error| format!("inbound bind: {error}"))?;
         socket
-            .send_to(
-                b"inbound-to-pod",
-                SocketAddr::new(IpAddr::V4(POD_A_V4), 9),
-            )
+            .send_to(b"inbound-to-pod", SocketAddr::new(IpAddr::V4(POD_A_V4), 9))
             .map_err(|error| format!("inbound send: {error}"))?;
         Ok(())
     })

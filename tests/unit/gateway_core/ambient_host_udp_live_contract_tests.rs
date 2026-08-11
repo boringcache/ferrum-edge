@@ -111,9 +111,8 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
 fn ambient_host_udp_live_gate_is_owned_by_the_required_ci_verifier() {
     let required_ci = read(".github/scripts/verify_required_ci.py");
     assert!(
-        required_ci.contains(
-            "\".github/workflows/ambient-host-udp-live.yml\": \"Ambient Host UDP Live\""
-        ),
+        required_ci
+            .contains("\".github/workflows/ambient-host-udp-live.yml\": \"Ambient Host UDP Live\""),
         "the required-CI verifier must require an unconditional merge-group \
          owner for `Ambient Host UDP Live`"
     );
@@ -141,8 +140,7 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
     );
     assert!(
         runner.contains("mktemp \"${TMPDIR:-/tmp}/ferrum-host-udp-lib.XXXXXX\"")
-            && runner
-                .contains("mktemp \"${TMPDIR:-/tmp}/ferrum-host-udp-functional.XXXXXX\""),
+            && runner.contains("mktemp \"${TMPDIR:-/tmp}/ferrum-host-udp-functional.XXXXXX\""),
         "unredacted test output must never be placed in the uploaded artifact tree"
     );
     assert!(
