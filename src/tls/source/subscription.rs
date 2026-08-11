@@ -15,7 +15,7 @@ use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -378,6 +378,11 @@ pub struct MaterialSetReloadConfig {
     /// explicit test limit). Avoids re-resolving a mutable env/conf value on
     /// each poll.
     pub max_material_bytes: usize,
+    /// Optional oneshot fired after the initial fingerprint baseline is
+    /// established (and before the loop begins accepting force/tick polls).
+    /// Tests use this as a deterministic readiness barrier; production callers
+    /// leave it `None`.
+    pub ready_tx: Option<oneshot::Sender<()>>,
 }
 
 /// Configuration for [`spawn_async_material_set_reload_task`].
@@ -644,6 +649,7 @@ async fn run_material_set_reload_loop(
         revision_tx,
         rebuild,
         max_material_bytes,
+        ready_tx,
     } = config;
 
     if sources.is_empty() {
@@ -651,6 +657,9 @@ async fn run_material_set_reload_loop(
             surface,
             "TLS material reload watcher has no sources; exiting"
         );
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(());
+        }
         force_reload_registry().remove(surface);
         return;
     }
@@ -676,6 +685,13 @@ async fn run_material_set_reload_loop(
         }
     };
     let mut last_load_failed = last_fingerprint.is_none();
+
+    // Deterministic readiness: force/tick handling starts only after the
+    // initial fingerprint baseline is established, so callers cannot race the
+    // baseline onto a rewritten candidate.
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
+    }
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1379,7 +1395,8 @@ mod tests {
                 interval: Duration::from_millis(50),
                 revision_tx,
                 rebuild,
-            max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: None,
             },
             Some(shutdown_rx),
         );
@@ -1436,7 +1453,8 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 revision_tx,
                 rebuild,
-            max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: None,
             },
             Some(shutdown_rx),
         );
@@ -1486,7 +1504,7 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 revision_tx,
                 rebuild,
-            max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
             },
             Some(shutdown_rx),
         );

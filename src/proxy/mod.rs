@@ -7059,6 +7059,7 @@ impl ProxyState {
                     revision_tx,
                     max_material_bytes: self.env_config.tls_max_material_size_bytes,
                     rebuild: Box::new(move || state.reload_frontend_dtls_material()),
+                    ready_tx: None,
                 },
                 shutdown_rx,
             ),

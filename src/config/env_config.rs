@@ -134,7 +134,9 @@ pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 /// Absent selects the documented default. Values above the hard maximum clamp
 /// down. `0` and other values below the minimum are rejected with a stable,
 /// setting-named, secret-free error. A malformed value is an error (never a
-/// silent fallback to unlimited or to the default).
+/// silent fallback to unlimited or to the default). EnvConfig install accepts
+/// an identical repeated ceiling and fails closed on a mismatching repeated
+/// value so the process cannot retain a field that disagrees with loaders.
 pub fn tls_max_material_size_bytes_from_env() -> Result<usize, String> {
     if let Some(max_bytes) = crate::tls::source::installed_tls_max_material_size_bytes() {
         return Ok(max_bytes);
@@ -3679,13 +3681,18 @@ impl EnvConfig {
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
 
-        // Same pure parser as free-helper / loader paths. Snapshot the validated
-        // limit so later loaders cannot independently re-resolve a mutable env
-        // value and diverge from this EnvConfig generation.
+        // Same pure parser as free-helper / loader paths. Install the validated
+        // limit as the authoritative process snapshot. Identical reinstall is
+        // accepted; a mismatching repeated value fails closed so this field
+        // cannot diverge from what production loaders enforce.
         let tls_max_material_size_bytes = parse_tls_max_material_size_bytes(
             resolve_var(conf, TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
         )?;
-        crate::tls::source::install_tls_max_material_size_bytes(tls_max_material_size_bytes);
+        crate::tls::source::install_tls_max_material_size_bytes(tls_max_material_size_bytes)
+            .map_err(|error| match error {
+                crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
+                other => other.to_string(),
+            })?;
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it

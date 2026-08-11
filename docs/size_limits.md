@@ -114,10 +114,10 @@ Enforcement rules:
 
 - **Before or during allocation.** Provider strings and Kubernetes `ByteString` values are length-checked before `into_bytes()` / clone. Inline PEM is checked before copying. Managed and ACME material are validated at persistence/admission and again at the common loader boundary so corrupted existing state cannot bypass the ceiling.
 - **Files.** Metadata size is only an optimization. Reads always use a bounded reader through `limit + 1`, so growth after metadata inspection, non-regular files, and TOCTOU races cannot force an unbounded buffer. There is no unbounded fallback read.
-- **Finite only.** `0` is rejected (not unlimited). Values above `4194304` clamp down. A malformed value fails closed.
+- **Finite only.** `0` is rejected (not unlimited). Values above `4194304` clamp down. A malformed value fails closed. Explicit helper/store ceilings go through the same validation before any read, conversion, clone, or store, so `usize::MAX` cannot make the bounded reader practically unbounded.
 - **Diagnostics.** Oversized input returns a stable, source-redacted `MaterialError::Oversized` classification. Public diagnostics never include filesystem paths, provider IDs, secret names/values, PEM fragments, or credentials.
 - **Live rotation.** An oversized watched source records a bounded `load_error`, retains the last-known-good TLS generation, and continues the existing watcher retry policy.
-- **One runtime policy.** `EnvConfig` validates and snapshots the ceiling for the process/config generation; loaders and free helpers consume that snapshot (or the same pure parser) so they cannot diverge.
+- **One runtime policy.** `EnvConfig` validates and installs the ceiling for the process/config generation. Identical reinstall is accepted; a mismatching repeated install fails closed so the configured field cannot diverge from what production loaders enforce. Loaders and free helpers consume that snapshot (or the same pure parser).
 
 See also [configuration.md](configuration.md) and [frontend_tls.md](frontend_tls.md).
 

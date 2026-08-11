@@ -166,6 +166,7 @@ pub fn start_dp_grpc_tls_reload_task(
                 )?;
                 Ok(())
             }),
+            ready_tx: None,
         },
         shutdown_rx,
     );

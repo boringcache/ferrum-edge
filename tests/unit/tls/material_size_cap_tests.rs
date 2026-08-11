@@ -1,7 +1,7 @@
 //! Issue #3736: bound every TLS material source before whole-value buffering.
 //!
 //! Covers exact limit / limit+1, bounded file streaming, every material kind,
-//! each source class (file, inline, provider/k8s loader boundaries, managed,
+//! each source class (file, inline, provider/k8s admission helpers, managed,
 //! ACME), redacted oversized diagnostics, startup refusal, and live-reload
 //! last-known-good retention with observable `load_error`.
 
@@ -23,10 +23,12 @@ use ferrum_edge::tls::source::subscription::{
     spawn_material_set_reload_task,
 };
 use ferrum_edge::tls::source::{
-    CertSource, MaterialError, MaterialKind, enforce_material_byte_limit_with,
-    load_material_blocking_with, read_bounded_material_bytes,
+    CertSource, MaterialError, MaterialKind, SourceScheme, admit_k8s_secret_bytes_before_clone,
+    admit_provider_secret_string_before_into_bytes, enforce_material_byte_limit_with,
+    install_tls_max_material_size_bytes, load_material_blocking_with, read_bounded_material_bytes,
+    validate_explicit_tls_max_material_size_bytes,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 const LIMIT: usize = 64;
 
@@ -97,8 +99,8 @@ fn file_uri_source_honours_the_same_ceiling() {
     let path = dir.path().join("via-uri.bin");
     std::fs::write(&path, vec![b'z'; LIMIT + 1]).expect("write");
     let source = CertSource::parse(format!("file://{}", path.display()), MaterialKind::Cert);
-    let error = load_material_blocking_with(&source, MaterialKind::Cert, LIMIT)
-        .expect_err("oversize");
+    let error =
+        load_material_blocking_with(&source, MaterialKind::Cert, LIMIT).expect_err("oversize");
     assert_oversized(error, MaterialKind::Cert);
 }
 
@@ -151,8 +153,12 @@ fn bounded_reader_seam_rejects_after_metadata_precheck_would_have_passed() {
     .expect_err("limit+1 reader must refuse");
     assert_oversized(error, MaterialKind::CaBundle);
 
-    let ok = read_bounded_material_bytes(Cursor::new(vec![b'g'; LIMIT]), MaterialKind::CaBundle, LIMIT)
-        .expect("exact limit reader must accept");
+    let ok = read_bounded_material_bytes(
+        Cursor::new(vec![b'g'; LIMIT]),
+        MaterialKind::CaBundle,
+        LIMIT,
+    )
+    .expect("exact limit reader must accept");
     assert_eq!(ok.len(), LIMIT);
 }
 
@@ -206,39 +212,154 @@ fn shared_length_gate_covers_every_material_kind() {
 }
 
 #[test]
-fn provider_and_kubernetes_loaders_enforce_before_into_bytes_or_clone() {
-    let source = include_str!("../../../src/tls/source/mod.rs");
+fn explicit_limit_validation_rejects_zero_and_caps_hostile_high_values() {
+    let zero = validate_explicit_tls_max_material_size_bytes(0).expect_err("0 must fail closed");
+    match zero {
+        MaterialError::InvalidSource { details, .. } => {
+            assert!(details.contains("not unlimited"), "{details}");
+        }
+        other => panic!("expected InvalidSource for 0, got {other}"),
+    }
 
-    let provider = source
-        .split("fn load_secret_material_with(")
-        .nth(1)
-        .expect("provider loader exists")
-        .split("fn load_k8s_secret_material_with(")
-        .next()
-        .expect("provider loader ends");
-    let provider_gate = provider
-        .find("enforce_material_byte_limit_with(resolved.value.len()")
-        .expect("provider length gate before conversion");
-    let provider_into_bytes = provider
-        .find("resolved.value.into_bytes()")
-        .expect("provider into_bytes");
-    assert!(
-        provider_gate < provider_into_bytes,
-        "provider bound must precede into_bytes"
+    assert_eq!(
+        validate_explicit_tls_max_material_size_bytes(usize::MAX).expect("cap high values"),
+        HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES
     );
 
-    let k8s = source
-        .split("fn load_k8s_secret_material_with(")
-        .nth(1)
-        .expect("k8s loader exists")
-        .split("fn load_managed_material_with(")
-        .next()
-        .expect("k8s loader ends");
-    let k8s_gate = k8s
-        .find("enforce_material_byte_limit_with(value.0.len()")
-        .expect("k8s length gate before clone");
-    let k8s_clone = k8s.find("value.0.clone()").expect("k8s clone");
-    assert!(k8s_gate < k8s_clone, "k8s bound must precede clone");
+    for seam in [
+        enforce_material_byte_limit_with(1, MaterialKind::Cert, 0),
+        read_bounded_material_bytes(Cursor::new(vec![b'x']), MaterialKind::Key, 0).map(|_| ()),
+        load_material_blocking_with(
+            &CertSource::parse("/tmp/ferrum-tls-material-cap-zero-check".into(), MaterialKind::Cert),
+            MaterialKind::Cert,
+            0,
+        )
+        .map(|_| ()),
+    ] {
+        seam.expect_err("explicit seam must reject 0 before any read/convert/clone");
+    }
+
+    let capped = enforce_material_byte_limit_with(
+        HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES + 1,
+        MaterialKind::Jwks,
+        usize::MAX,
+    )
+    .expect_err("usize::MAX must enforce the finite hard maximum");
+    match capped {
+        MaterialError::Oversized { max_bytes, .. } => {
+            assert_eq!(max_bytes, HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES);
+        }
+        other => panic!("expected Oversized under capped hard max, got {other}"),
+    }
+
+    let managed_zero = ManagedTlsStore::open_with_material_limit(
+        tempfile::tempdir().expect("tempdir").path(),
+        0,
+    )
+    .expect_err("managed open must reject 0");
+    assert!(matches!(managed_zero, ManagedTlsError::InvalidConfiguration(_)));
+
+    let managed_high = ManagedTlsStore::open_with_material_limit(
+        tempfile::tempdir().expect("tempdir").path(),
+        usize::MAX,
+    )
+    .expect("managed open caps high values");
+    let high_load = managed_high
+        .material_with_limit("jwks/missing#jwks", MaterialKind::Jwks, usize::MAX)
+        .expect_err("validated high limit still fails closed on missing id");
+    assert!(matches!(high_load, ManagedTlsError::NotFound(_)));
+
+    let acme_zero = AcmeCertificateStore::open_with_material_limit(
+        tempfile::tempdir().expect("tempdir").path(),
+        0,
+    )
+    .expect_err("acme open must reject 0");
+    assert!(matches!(acme_zero, AcmeError::InvalidConfiguration(_)));
+
+    let acme_high = AcmeCertificateStore::open_with_material_limit(
+        tempfile::tempdir().expect("tempdir").path(),
+        usize::MAX,
+    )
+    .expect("acme open caps high values");
+    let acme_missing = acme_high
+        .material_with_limit("certificates/missing#cert", MaterialKind::Cert, usize::MAX)
+        .expect_err("validated high ACME limit still fails closed on missing id");
+    assert!(matches!(acme_missing, AcmeError::NotFound(_)));
+}
+
+#[test]
+fn provider_and_kubernetes_admission_helpers_enforce_before_into_bytes_or_clone() {
+    // Executable boundary coverage (not source-text parsing): the production
+    // provider and Kubernetes loaders call these helpers before into_bytes /
+    // clone. All compiled cloud schemes share load_secret_material_with.
+    for kind in [
+        MaterialKind::Cert,
+        MaterialKind::Key,
+        MaterialKind::CaBundle,
+        MaterialKind::Crl,
+        MaterialKind::Ocsp,
+        MaterialKind::Jwks,
+    ] {
+        admit_provider_secret_string_before_into_bytes(LIMIT, kind, LIMIT)
+            .expect("provider exact limit");
+        let provider_over =
+            admit_provider_secret_string_before_into_bytes(LIMIT + 1, kind, LIMIT)
+                .expect_err("provider limit+1");
+        assert_oversized(provider_over, kind);
+
+        admit_k8s_secret_bytes_before_clone(LIMIT, kind, LIMIT).expect("k8s exact limit");
+        let k8s_over =
+            admit_k8s_secret_bytes_before_clone(LIMIT + 1, kind, LIMIT).expect_err("k8s limit+1");
+        assert_oversized(k8s_over, kind);
+    }
+
+    for scheme in [
+        SourceScheme::Vault,
+        SourceScheme::Aws,
+        SourceScheme::Azure,
+        SourceScheme::Gcp,
+    ] {
+        assert!(
+            scheme.is_secret_provider(),
+            "{scheme:?} must share the compiled provider admission boundary"
+        );
+    }
+    assert!(!SourceScheme::K8sSecret.is_secret_provider());
+    assert!(!SourceScheme::File.is_secret_provider());
+}
+
+#[test]
+fn install_accepts_identical_reinstall_and_rejects_mismatch() {
+    // Prefer the documented default so this is coherent with EnvConfig installs
+    // that other suites may have already performed in-process.
+    install_tls_max_material_size_bytes(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES)
+        .expect("identical install of the default must succeed");
+    install_tls_max_material_size_bytes(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES)
+        .expect("repeated identical install must succeed");
+
+    let mismatch = install_tls_max_material_size_bytes(1024)
+        .expect_err("mismatching repeated install must fail closed");
+    match mismatch {
+        MaterialError::InvalidSource { details, .. } => {
+            assert!(
+                details.contains("already installed with a different value"),
+                "{details}"
+            );
+            assert!(
+                !details.contains("1024") && !details.contains("4194304"),
+                "mismatch diagnostic must not echo numeric ceilings: {details}"
+            );
+        }
+        other => panic!("expected InvalidSource mismatch, got {other}"),
+    }
+
+    let zero = install_tls_max_material_size_bytes(0).expect_err("install must not clamp 0");
+    match zero {
+        MaterialError::InvalidSource { details, .. } => {
+            assert!(details.contains("not unlimited"), "{details}");
+        }
+        other => panic!("expected InvalidSource for install(0), got {other}"),
+    }
 }
 
 #[test]
@@ -258,15 +379,10 @@ fn managed_store_refuses_oversized_admission_and_load_for_every_kind() {
         ),
         ManagedTlsRecord::new_ca_bundle("ca-over".into(), "ca-over".into(), None, over.clone()),
         ManagedTlsRecord::new_crl("crl-over".into(), "crl-over".into(), None, over.clone()),
-        ManagedTlsRecord::new_ocsp_response(
-            "ocsp-over".into(),
-            "ocsp-over".into(),
-            None,
-            {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(vec![0u8; LIMIT + 1])
-            },
-        ),
+        ManagedTlsRecord::new_ocsp_response("ocsp-over".into(), "ocsp-over".into(), None, {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; LIMIT + 1])
+        }),
         ManagedTlsRecord::new_jwks("jwks-over".into(), "jwks-over".into(), None, over),
     ];
 
@@ -285,15 +401,17 @@ fn managed_store_refuses_oversized_admission_and_load_for_every_kind() {
         );
     }
 
-    // Persist within-limit material under a high ceiling, then prove the
-    // common-load boundary still rejects under a lower explicit limit.
-    let wide = ManagedTlsStore::open_with_material_limit(dir.path(), LIMIT).expect("reopen");
+    // Persist under a wider valid ceiling, then reopen through a smaller ceiling
+    // and prove rejection at the borrowed common-load boundary (no whole-record
+    // clone of the oversized relative material for the test itself).
+    let wide = ManagedTlsStore::open_with_material_limit(dir.path(), LIMIT).expect("wide open");
     let ok =
         ManagedTlsRecord::new_jwks("jwks-ok".into(), "jwks-ok".into(), None, "j".repeat(LIMIT));
     wide.upsert(ok, false).expect("within-limit upsert");
-    let error = wide
+    let narrow = ManagedTlsStore::open_with_material_limit(dir.path(), 8).expect("narrow open");
+    let error = narrow
         .material_with_limit("jwks/jwks-ok#jwks", MaterialKind::Jwks, 8)
-        .expect_err("pre-existing oversize relative to new ceiling must fail");
+        .expect_err("pre-existing oversize relative to narrower ceiling must fail");
     assert!(matches!(error, ManagedTlsError::MaterialTooLarge));
 }
 
@@ -355,7 +473,9 @@ fn acme_store_refuses_oversized_admission_and_load() {
     store
         .upsert_certificate(ok, false)
         .expect("within-limit ACME upsert");
-    let error = store
+
+    let narrow = AcmeCertificateStore::open_with_material_limit(dir.path(), 8).expect("narrow");
+    let error = narrow
         .material_with_limit("certificates/acme-ok#cert", MaterialKind::Cert, 8)
         .expect_err("existing ACME material past the new ceiling must fail at load");
     assert!(matches!(error, AcmeError::MaterialTooLarge));
@@ -427,6 +547,7 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
 
     let (revision_tx, mut revision_rx) = watch::channel(0u64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = spawn_material_set_reload_task(
         MaterialSetReloadConfig {
             surface,
@@ -439,11 +560,19 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
             revision_tx,
             max_material_bytes: LIMIT,
             rebuild,
+            ready_tx: Some(ready_tx),
         },
         Some(shutdown_rx),
     );
 
-    // Force an initial successful rotation off changed-but-valid bytes.
+    // Wait for the initial fingerprint baseline before rewriting/forcing so the
+    // loop cannot first observe the rewritten candidate as its baseline.
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("watcher readiness")
+        .expect("ready signal");
+
+    // Changed valid candidate advances once.
     std::fs::write(&path, {
         let mut bytes = vec![b'v'; LIMIT];
         bytes[0] = b'w';
@@ -457,8 +586,8 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
         .expect("watcher alive");
     let revision_after_good = *revision_rx.borrow();
     let rebuilds_after_good = rebuilds.load(Ordering::SeqCst);
-    assert!(revision_after_good >= 1);
-    assert!(rebuilds_after_good >= 1);
+    assert_eq!(revision_after_good, 1);
+    assert_eq!(rebuilds_after_good, 1);
 
     let events_before = global_event_log()
         .list(&TlsEventFilter {
@@ -469,7 +598,7 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
         .len();
 
     // Oversized candidate must not rebuild or advance revision, and must
-    // record a bounded load_error event.
+    // record a bounded load_error event while retaining last-known-good.
     std::fs::write(&path, vec![b'x'; LIMIT + 1]).expect("write oversized");
     assert!(request_material_set_reload(surface));
 
@@ -493,7 +622,9 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
             saw_load_error = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Event log is updated by the watcher task; poll without sleeping the
+        // readiness contract (already established above).
+        tokio::task::yield_now().await;
     }
     assert!(
         saw_load_error,
@@ -508,6 +639,25 @@ async fn live_reload_retains_last_known_good_on_oversized_rotation() {
         rebuilds.load(Ordering::SeqCst),
         rebuilds_after_good,
         "oversized load must not invoke rebuild"
+    );
+
+    // Retry remains possible: a later valid candidate advances again.
+    std::fs::write(&path, {
+        let mut bytes = vec![b'v'; LIMIT];
+        bytes[0] = b'y';
+        bytes
+    })
+    .expect("rewrite recoverable good bytes");
+    assert!(request_material_set_reload(surface));
+    tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
+        .await
+        .expect("retry rotation")
+        .expect("watcher alive after retry");
+    assert_eq!(*revision_rx.borrow(), revision_after_good + 1);
+    assert_eq!(
+        rebuilds.load(Ordering::SeqCst),
+        rebuilds_after_good + 1,
+        "valid retry must rebuild once more"
     );
 
     shutdown_tx.send_replace(true);

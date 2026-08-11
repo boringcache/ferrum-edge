@@ -229,11 +229,13 @@ impl ManagedTlsStore {
     ///
     /// Production callers should prefer [`Self::open`], which snapshots the
     /// validated runtime policy. Tests inject a small finite limit here instead
-    /// of mutating process-global policy state.
+    /// of mutating process-global policy state. Rejects `0` and caps values
+    /// above the hard maximum before any store I/O.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
     ) -> Result<Self, ManagedTlsError> {
+        let max_material_bytes = validate_managed_material_limit(max_material_bytes)?;
         let dir = dir.into();
         if dir.as_os_str().is_empty() {
             return Err(ManagedTlsError::InvalidPath(
@@ -243,7 +245,7 @@ impl ManagedTlsStore {
         std::fs::create_dir_all(&dir).map_err(|error| ManagedTlsError::Write(error.to_string()))?;
         Ok(Self {
             file: SharedStoreFile::open(dir.join(STORE_FILE_NAME))?,
-            max_material_bytes: max_material_bytes.max(1),
+            max_material_bytes,
         })
     }
 
@@ -333,14 +335,23 @@ impl ManagedTlsStore {
     ///
     /// Used by the common TLS source loader so a caller-held snapshot cannot
     /// diverge from store admission, and by tests that inject a finite limit.
+    /// Snapshots the authoritative document, borrows the selected record,
+    /// validates the requested material, and clones only the selected bounded
+    /// output after the check.
     pub fn material_with_limit(
         &self,
         identifier: &str,
         fallback_kind: MaterialKind,
         max_bytes: usize,
     ) -> Result<ManagedMaterial, ManagedTlsError> {
+        let max_bytes = validate_managed_material_limit(max_bytes)?;
         let reference = ManagedSourceReference::parse(identifier, fallback_kind)?;
-        let record = self.get(&reference.id)?;
+        validate_managed_id(&reference.id)?;
+        let document = self.file.snapshot()?;
+        let record = document
+            .records
+            .get(&reference.id)
+            .ok_or_else(|| ManagedTlsError::NotFound(reference.id.clone()))?;
         reference.material_from(record, max_bytes)
     }
 }
@@ -609,7 +620,7 @@ impl ManagedSourceReference {
 
     fn material_from(
         &self,
-        record: ManagedTlsRecord,
+        record: &ManagedTlsRecord,
         max_bytes: usize,
     ) -> Result<ManagedMaterial, ManagedTlsError> {
         let expected_kind = match self.part {
@@ -623,7 +634,7 @@ impl ManagedSourceReference {
         };
         if record.kind != expected_kind {
             return Err(ManagedTlsError::WrongKind {
-                id: record.id,
+                id: record.id.clone(),
                 actual: record.kind.as_str(),
                 expected: expected_kind.as_str(),
             });
@@ -676,6 +687,8 @@ impl ManagedSourceReference {
                         kind: self.part.source_suffix(),
                     }
                 })?;
+                // Encoded length is an upper bound; also check decoded size.
+                ensure_managed_bytes_within_limit(encoded.len(), max_bytes)?;
                 let bytes =
                     decode_base64(encoded).map_err(|_| ManagedTlsError::MissingMaterial {
                         id: record.id.clone(),
@@ -792,7 +805,10 @@ fn combine_cert_and_chain(cert_pem: &str, chain_pem: Option<&str>) -> String {
     combined
 }
 
-fn combined_cert_chain_len(cert_pem: &str, chain_pem: Option<&str>) -> Result<usize, ManagedTlsError> {
+fn combined_cert_chain_len(
+    cert_pem: &str,
+    chain_pem: Option<&str>,
+) -> Result<usize, ManagedTlsError> {
     let Some(chain_pem) = chain_pem else {
         return Ok(cert_pem.len());
     };
@@ -823,6 +839,17 @@ fn managed_material_max_bytes() -> Result<usize, ManagedTlsError> {
         }
         other => ManagedTlsError::InvalidConfiguration(other.to_string()),
     })
+}
+
+fn validate_managed_material_limit(max_bytes: usize) -> Result<usize, ManagedTlsError> {
+    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(
+        |error| match error {
+            crate::tls::source::MaterialError::InvalidSource { details, .. } => {
+                ManagedTlsError::InvalidConfiguration(details)
+            }
+            other => ManagedTlsError::InvalidConfiguration(other.to_string()),
+        },
+    )
 }
 
 fn ensure_managed_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), ManagedTlsError> {

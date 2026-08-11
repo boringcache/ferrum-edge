@@ -664,13 +664,16 @@ impl AcmeCertificateStore {
     }
 
     /// Open an ACME certificate store with an explicit material byte ceiling.
+    ///
+    /// Rejects `0` and caps values above the hard maximum before any store I/O.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
     ) -> Result<Self, AcmeError> {
+        let max_material_bytes = validate_acme_material_limit(max_material_bytes)?;
         Ok(Self {
             file: SharedStoreFile::open(acme_store_path(dir, STORE_FILE_NAME)?)?,
-            max_material_bytes: max_material_bytes.max(1),
+            max_material_bytes,
         })
     }
 
@@ -745,14 +748,24 @@ impl AcmeCertificateStore {
     }
 
     /// Load ACME material while applying an explicit byte ceiling.
+    ///
+    /// Snapshots the authoritative document, borrows the selected record,
+    /// validates the requested material (including checked combined cert+chain
+    /// length), and clones only the selected bounded output after the check.
     pub fn material_with_limit(
         &self,
         identifier: &str,
         fallback_kind: MaterialKind,
         max_bytes: usize,
     ) -> Result<AcmeMaterial, AcmeError> {
+        let max_bytes = validate_acme_material_limit(max_bytes)?;
         let reference = AcmeSourceReference::parse(identifier, fallback_kind)?;
-        let record = self.get_certificate(&reference.id)?;
+        validate_acme_id(&reference.id)?;
+        let document = self.file.snapshot()?;
+        let record = document
+            .certificates
+            .get(&reference.id)
+            .ok_or_else(|| AcmeError::NotFound(reference.id.clone()))?;
         reference.material_from(record, max_bytes)
     }
 }
@@ -1278,17 +1291,15 @@ impl AcmeSourceReference {
 
     fn material_from(
         &self,
-        record: AcmeCertificateRecord,
+        record: &AcmeCertificateRecord,
         max_bytes: usize,
     ) -> Result<AcmeMaterial, AcmeError> {
         let bytes = match self.part {
-            AcmeMaterialPart::Cert => {
-                combine_acme_public_material_checked(
-                    &record.cert_pem,
-                    record.chain_pem.as_deref(),
-                    max_bytes,
-                )?
-            }
+            AcmeMaterialPart::Cert => combine_acme_public_material_checked(
+                &record.cert_pem,
+                record.chain_pem.as_deref(),
+                max_bytes,
+            )?,
             AcmeMaterialPart::Key => {
                 ensure_acme_bytes_within_limit(record.key_pem.len(), max_bytes)?;
                 record.key_pem.as_bytes().to_vec()
@@ -1367,7 +1378,10 @@ fn combined_public_material(cert_pem: &str, chain_pem: Option<&str>) -> String {
     combined
 }
 
-fn combined_public_material_len(cert_pem: &str, chain_pem: Option<&str>) -> Result<usize, AcmeError> {
+fn combined_public_material_len(
+    cert_pem: &str,
+    chain_pem: Option<&str>,
+) -> Result<usize, AcmeError> {
     let Some(chain_pem) = chain_pem else {
         return Ok(cert_pem.len());
     };
@@ -1400,6 +1414,17 @@ fn acme_material_max_bytes() -> Result<usize, AcmeError> {
         }
         other => AcmeError::InvalidConfiguration(other.to_string()),
     })
+}
+
+fn validate_acme_material_limit(max_bytes: usize) -> Result<usize, AcmeError> {
+    crate::tls::source::validate_explicit_tls_max_material_size_bytes(max_bytes).map_err(
+        |error| match error {
+            crate::tls::source::MaterialError::InvalidSource { details, .. } => {
+                AcmeError::InvalidConfiguration(details)
+            }
+            other => AcmeError::InvalidConfiguration(other.to_string()),
+        },
+    )
 }
 
 fn ensure_acme_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), AcmeError> {

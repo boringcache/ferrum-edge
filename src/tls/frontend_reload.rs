@@ -125,6 +125,7 @@ pub fn spawn_frontend_tls_reload_task(
             revision_tx,
             rebuild: publish_rebuild,
             max_material_bytes,
+            ready_tx: None,
         },
         shutdown_rx,
     )
