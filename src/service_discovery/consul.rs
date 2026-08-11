@@ -278,7 +278,9 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             //   (no wrap/coercion into a routable weight).
             let weight = match service.get("Weights").and_then(|w| w.get("Passing")) {
                 None => self.default_weight,
-                Some(passing) => match passing.as_u64().and_then(super::admit_registry_target_weight)
+                Some(passing) => match passing
+                    .as_u64()
+                    .and_then(super::admit_registry_target_weight)
                 {
                     Some(weight) => weight,
                     None => {

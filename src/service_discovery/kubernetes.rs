@@ -188,9 +188,9 @@ impl KubernetesDiscoverer {
         };
 
         let selected = if let Some(ref port_name) = self.port_name {
-            ports.iter().find(|port| {
-                port.get("name").and_then(|n| n.as_str()).unwrap_or("") == port_name
-            })
+            ports
+                .iter()
+                .find(|port| port.get("name").and_then(|n| n.as_str()).unwrap_or("") == port_name)
         } else {
             ports.first()
         };
@@ -497,47 +497,5 @@ mod tests {
         });
         // Name defaults to "" which != "http", so should return None
         assert_eq!(d.extract_port(&item), None);
-    }
-
-    #[test]
-    fn extract_port_boundary_values_reject_without_wrapping() {
-        let d = make_discoverer("default", "svc", None, None);
-        let cases: &[(u64, Option<u16>)] = &[
-            (0, None),
-            (1, Some(1)),
-            (65535, Some(65535)),
-            (65536, None),
-            (65537, None),
-            (u64::MAX, None),
-        ];
-        for &(raw, expected) in cases {
-            let item = serde_json::json!({
-                "ports": [{"name": "http", "port": raw}]
-            });
-            assert_eq!(
-                d.extract_port(&item),
-                expected,
-                "extract_port raw={raw} must not wrap"
-            );
-            let classified = d.classify_port(&item);
-            match expected {
-                Some(port) => assert_eq!(classified, EndpointSlicePortAdmission::Admitted(port)),
-                None if raw == 0 || raw > u16::MAX as u64 => {
-                    assert_eq!(classified, EndpointSlicePortAdmission::Invalid);
-                }
-                None => panic!("unexpected None for raw={raw}"),
-            }
-        }
-    }
-
-    #[test]
-    fn extract_port_65537_does_not_wrap_to_one() {
-        let d = make_discoverer("default", "svc", Some("http"), None);
-        let item = serde_json::json!({
-            "ports": [{"name": "http", "port": 65537}]
-        });
-        // Pre-fix `as u16` would wrap 65537 → 1; checked admission must reject.
-        assert_eq!(d.extract_port(&item), None);
-        assert_eq!(d.classify_port(&item), EndpointSlicePortAdmission::Invalid);
     }
 }

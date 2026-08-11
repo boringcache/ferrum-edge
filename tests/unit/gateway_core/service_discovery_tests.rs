@@ -1423,7 +1423,11 @@ async fn test_consul_discover_weight_boundary_table() {
 
         let targets = discoverer.discover().await.unwrap();
         if *expect_admit {
-            assert_eq!(targets.len(), 1, "case {idx}: weight {weight_value} must admit");
+            assert_eq!(
+                targets.len(),
+                1,
+                "case {idx}: weight {weight_value} must admit"
+            );
             assert_eq!(targets[0].weight, expected_weight.unwrap());
         } else {
             assert!(
@@ -1655,8 +1659,16 @@ async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
     assert_eq!(targets[0].port, 8080);
     assert_eq!(targets[1].host, "10.244.0.4");
     assert_eq!(targets[1].port, 65535);
-    assert!(!targets.iter().any(|t| t.host == "10.244.0.1" && t.port == 1));
-    assert!(!targets.iter().any(|t| t.host == "10.244.0.1" || t.host == "10.244.0.3"));
+    assert!(
+        !targets
+            .iter()
+            .any(|t| t.host == "10.244.0.1" && t.port == 1)
+    );
+    assert!(
+        !targets
+            .iter()
+            .any(|t| t.host == "10.244.0.1" || t.host == "10.244.0.3")
+    );
 }
 
 // ── Kubernetes response parsing edge cases ────────────────────────────
