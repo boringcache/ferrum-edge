@@ -4191,10 +4191,10 @@ fn discovery_body_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Serializes the full lifetime of discovery-body async tests that touch the
-/// process-wide override and/or shared budget. Holds the lock until drop so
-/// parallel unit tests cannot replace limits or observe `BUDGET_USED` while
-/// another test-owned permit is live. Never zeroes global usage itself.
+/// Serializes discovery-body tests that compare process counters or publish the
+/// production install seam. Custom limits and their budget counters are scoped
+/// to the calling test thread, so unrelated parallel discovery tests keep the
+/// installed/default production limits.
 struct DiscoveryBodyLimitsGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     clear_override: bool,
@@ -4449,6 +4449,47 @@ async fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() 
     assert!(
         zero.contains("0 is not unlimited") || zero.contains("must be >= 1"),
         "{zero}"
+    );
+}
+
+#[tokio::test]
+async fn discovery_body_test_override_does_not_leak_to_parallel_threads() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+    };
+
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    assert_eq!(
+        ferrum_edge::service_discovery::http_body::effective_discovery_body_limits()
+            .max_response_bytes,
+        64
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        256
+    );
+
+    let (parallel_limits, parallel_budget) = std::thread::spawn(|| {
+        (
+            ferrum_edge::service_discovery::http_body::effective_discovery_body_limits(),
+            ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        )
+    })
+    .join()
+    .expect("parallel discovery test thread");
+    assert_eq!(
+        parallel_limits.max_response_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        parallel_limits.max_error_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(
+        parallel_budget,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
     );
 }
 

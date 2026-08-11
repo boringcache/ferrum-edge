@@ -137,18 +137,29 @@ impl AsRef<[u8]> for ChargedDiscoveryBodyOwner {
 /// Cancellation-safe shared-budget lease for one in-flight discovery body.
 struct DiscoveryBodyBudgetPermit {
     charged: usize,
+    test_budget: Option<std::sync::Arc<TestDiscoveryBodyBudget>>,
 }
 
 impl DiscoveryBodyBudgetPermit {
     fn empty() -> Self {
-        Self { charged: 0 }
+        Self {
+            charged: 0,
+            test_budget: active_test_budget(),
+        }
     }
 
     fn try_grow(&mut self, additional: usize) -> Result<(), DiscoveryBodyError> {
         if additional == 0 {
             return Ok(());
         }
-        try_charge_budget(additional)?;
+        match &self.test_budget {
+            Some(budget) => try_charge_counter(
+                &budget.used,
+                budget.limits.body_budget_bytes,
+                additional,
+            )?,
+            None => try_charge_budget(additional)?,
+        }
         self.charged = self.charged.saturating_add(additional);
         Ok(())
     }
@@ -156,16 +167,37 @@ impl DiscoveryBodyBudgetPermit {
 
 impl Drop for DiscoveryBodyBudgetPermit {
     fn drop(&mut self) {
-        release_budget(self.charged);
+        match &self.test_budget {
+            Some(budget) => release_budget_counter(&budget.used, self.charged),
+            None => release_budget(self.charged),
+        }
         self.charged = 0;
     }
 }
 
 static INSTALLED_LIMITS: OnceLock<DiscoveryBodyLimits> = OnceLock::new();
-static TEST_OVERRIDE_LIMITS: std::sync::Mutex<Option<DiscoveryBodyLimits>> =
-    std::sync::Mutex::new(None);
 static BUDGET_USED: AtomicUsize = AtomicUsize::new(0);
 static BUDGET_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES);
+
+/// Test-only limits and budget counter owned by one test thread.
+///
+/// The permit keeps this allocation alive if an async body is later dropped on
+/// another thread, while unrelated parallel tests never inherit its ceilings or
+/// contribute bytes to its budget.
+struct TestDiscoveryBodyBudget {
+    limits: DiscoveryBodyLimits,
+    used: AtomicUsize,
+}
+
+std::thread_local! {
+    static TEST_OVERRIDE_LIMITS: std::cell::RefCell<
+        Option<std::sync::Arc<TestDiscoveryBodyBudget>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn active_test_budget() -> Option<std::sync::Arc<TestDiscoveryBodyBudget>> {
+    TEST_OVERRIDE_LIMITS.with(|slot| slot.borrow().clone())
+}
 
 /// Install process discovery body ceilings (EnvConfig / production path).
 ///
@@ -197,13 +229,13 @@ pub fn install_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), 
     }
 }
 
-/// Test-only override that replaces effective ceilings without touching the
-/// production OnceLock. Restored by [`clear_discovery_body_limits_override_for_test`].
+/// Test-only override that replaces effective ceilings and the budget counter
+/// for the calling test thread without touching production process state.
+/// Restored by [`clear_discovery_body_limits_override_for_test`].
 ///
-/// Callers must hold the external discovery-body test lifetime lock for the
-/// entire override + collection window. This function never zeroes
-/// [`BUDGET_USED`]: resetting usage while another test-owned permit is live
-/// would undercount. Stale charges are released by permit `Drop`.
+/// Callers must clear the override on the same thread after every owned permit
+/// has dropped. A permit retains the override-owned counter itself, so a drop on
+/// another thread still releases the correct budget.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> Result<(), String> {
     crate::config::env_config::parse_discovery_body_limits(
@@ -211,35 +243,33 @@ pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> R
         Some(&limits.max_error_bytes.to_string()),
         Some(&limits.body_budget_bytes.to_string()),
     )?;
-    let mut guard = TEST_OVERRIDE_LIMITS
-        .lock()
-        .map_err(|_| "service discovery body limit test override lock poisoned".to_string())?;
-    *guard = Some(limits);
-    BUDGET_MAX.store(limits.body_budget_bytes, Ordering::Release);
-    Ok(())
+    TEST_OVERRIDE_LIMITS.with(|slot| {
+        let mut slot = slot.try_borrow_mut().map_err(|_| {
+            "service discovery body limit test override is already borrowed".to_string()
+        })?;
+        *slot = Some(std::sync::Arc::new(TestDiscoveryBodyBudget {
+            limits,
+            used: AtomicUsize::new(0),
+        }));
+        Ok(())
+    })
 }
 
-/// Clear a test override and restore the budget max from the installed (or
-/// default) ceilings.
-///
-/// Does not reset [`BUDGET_USED`]. Call only after every test-owned permit in
-/// the serialized window has dropped (or will drop via RAII before the next
-/// test acquires the lifetime lock).
+/// Clear the calling thread's test override without changing production state.
+/// Existing permits retain and release their own override-owned counter.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn clear_discovery_body_limits_override_for_test() {
-    if let Ok(mut guard) = TEST_OVERRIDE_LIMITS.lock() {
-        *guard = None;
-    }
-    let limits = installed_or_default_limits();
-    BUDGET_MAX.store(limits.body_budget_bytes, Ordering::Release);
+    TEST_OVERRIDE_LIMITS.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = None;
+        }
+    });
 }
 
 /// Effective ceilings: test override → installed EnvConfig snapshot → defaults.
 pub fn effective_discovery_body_limits() -> DiscoveryBodyLimits {
-    if let Ok(guard) = TEST_OVERRIDE_LIMITS.lock()
-        && let Some(limits) = *guard
-    {
-        return limits;
+    if let Some(budget) = active_test_budget() {
+        return budget.limits;
     }
     installed_or_default_limits()
 }
@@ -253,7 +283,15 @@ fn installed_or_default_limits() -> DiscoveryBodyLimits {
 
 fn try_charge_budget(additional: usize) -> Result<(), DiscoveryBodyError> {
     let max = BUDGET_MAX.load(Ordering::Acquire);
-    match BUDGET_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+    try_charge_counter(&BUDGET_USED, max, additional)
+}
+
+fn try_charge_counter(
+    used_counter: &AtomicUsize,
+    max: usize,
+    additional: usize,
+) -> Result<(), DiscoveryBodyError> {
+    match used_counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
         used.checked_add(additional).filter(|next| *next <= max)
     }) {
         Ok(_) => Ok(()),
@@ -262,10 +300,14 @@ fn try_charge_budget(additional: usize) -> Result<(), DiscoveryBodyError> {
 }
 
 fn release_budget(bytes: usize) {
+    release_budget_counter(&BUDGET_USED, bytes);
+}
+
+fn release_budget_counter(used_counter: &AtomicUsize, bytes: usize) {
     if bytes == 0 {
         return;
     }
-    let _ = BUDGET_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+    let _ = used_counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
         Some(used.saturating_sub(bytes))
     });
 }
@@ -273,12 +315,18 @@ fn release_budget(bytes: usize) {
 /// Observation seam for tests: bytes currently charged against the shared budget.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn discovery_body_budget_used_for_test() -> usize {
+    if let Some(budget) = active_test_budget() {
+        return budget.used.load(Ordering::Acquire);
+    }
     BUDGET_USED.load(Ordering::Acquire)
 }
 
 /// Observation seam for tests: configured shared budget ceiling.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn discovery_body_budget_max_for_test() -> usize {
+    if let Some(budget) = active_test_budget() {
+        return budget.limits.body_budget_bytes;
+    }
     BUDGET_MAX.load(Ordering::Acquire)
 }
 
