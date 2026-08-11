@@ -440,8 +440,14 @@ async fn run_trust_acceptance(client: &Client, gateway: &TestGateway, backend: &
         ),
     ];
     for (label, candidate) in invalid_candidates {
-        let (status, body) =
-            trust_put(client, gateway, PRIMARY_NAMESPACE, PRIMARY_NAMESPACE, candidate).await;
+        let (status, body) = trust_put(
+            client,
+            gateway,
+            PRIMARY_NAMESPACE,
+            PRIMARY_NAMESPACE,
+            candidate,
+        )
+        .await;
         assert_eq!(
             status, 400,
             "[{backend}] {label} must be refused at admission: {body}"
