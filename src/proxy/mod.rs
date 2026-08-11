@@ -8728,10 +8728,10 @@ impl ProxyState {
                         // sticky `HBONE dispatch required` 502. Preserve a prior
                         // definitive verdict; otherwise leave Unknown so
                         // can_attempt_hbone_backend stays fail-open.
-                        if let Some(previous) = target.previous_hbone {
-                            if !matches!(previous, ProtocolSupport::Unknown) {
-                                record.hbone = previous;
-                            }
+                        if let Some(previous) = target.previous_hbone
+                            && !matches!(previous, ProtocolSupport::Unknown)
+                        {
+                            record.hbone = previous;
                         }
                         append_probe_error(
                             record,
