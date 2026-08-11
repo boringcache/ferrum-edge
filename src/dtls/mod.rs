@@ -1239,9 +1239,29 @@ impl DtlsServer {
                                         .await;
                                 }
                             }
-                            // `WouldBlock` (or any error) means the socket is
-                            // drained for this readiness edge.
-                            _ => break,
+                            Ok(_) => break,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionRefused
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                trace!(
+                                    "DTLS server transient recvmmsg error (ignored): {}",
+                                    e
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "DTLS server recvmmsg error: {}",
+                                    e
+                                ));
+                            }
                         }
                     }
                 }

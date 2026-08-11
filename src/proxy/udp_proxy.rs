@@ -144,8 +144,7 @@ struct UdpSession {
     /// generation and must still resolve to an attribution-identical binding,
     /// so pod churn / interface reuse / registry removal ends the session
     /// instead of letting it keep relaying under stale evidence.
-    node_waypoint_source:
-        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>>,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
@@ -217,6 +216,27 @@ struct UdpSession {
     /// Dedicated cancellation wake for an in-flight datagram hook. Unlike
     /// `stop_notify`, this is not shared with the backend reply task.
     hook_ingress_stop_notify: Arc<tokio::sync::Notify>,
+}
+
+/// Source evidence pinned by an admitted NodeWaypoint UDP/DTLS session.
+/// Keeping the resolver beside the binding lets both client datagrams and
+/// backend replies revalidate against the current registry AND live slice.
+#[derive(Clone)]
+struct NodeWaypointUdpSessionSource {
+    scoping: crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    binding: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>,
+    ingress_ifindex: Option<u32>,
+}
+
+impl NodeWaypointUdpSessionSource {
+    fn revalidate(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal> {
+        self.scoping
+            .revalidate(&self.binding, ingress_ifindex, source)
+    }
 }
 
 impl UdpSession {
@@ -571,6 +591,28 @@ fn spawn_session_hook_ingress_worker(
                 .load(std::sync::atomic::Ordering::Acquire)
                 || session.expired.load(std::sync::atomic::Ordering::Acquire)
             {
+                break;
+            }
+
+            // A datagram may spend an arbitrary interval in an async plugin.
+            // Revalidate again after that await so a registry/slice change in
+            // the meantime cannot produce a late backend side effect under the
+            // old workload identity.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(
+                    &session.stop_reply_task,
+                    session.stop_notify.as_ref(),
+                );
+                session.close_hook_ingress();
                 break;
             }
 
@@ -2496,21 +2538,28 @@ async fn process_datagram(
     // veth, a pod restarted under a new UID at the same address, or a registry
     // removal all fail here and terminate the session rather than letting it
     // keep relaying under evidence that is no longer vouched for.
-    if let (Some(scoping), Some(pinned)) =
-        (node_waypoint_udp_source, session.node_waypoint_source.as_ref())
-        && let Err(refusal) = scoping.index.revalidate(
-            pinned,
+    if let Some(source) = session.node_waypoint_source.as_ref()
+        && let Err(refusal) = source.revalidate(
             local_addr.map(|local| local.ifindex),
             client_addr.ip(),
         )
     {
-        scoping
+        source
+            .scoping
             .index
             .warn_refusal(proxy_id, &udp_session_client_ip(client_addr), refusal);
         session
             .expired
             .store(true, std::sync::atomic::Ordering::Release);
-        sessions.remove(&client_addr);
+        // Wake the owning reply task and let that task perform the
+        // identity-aware map removal, active-session decrement, overload-guard
+        // release, and disconnect emission. Removing here would make its later
+        // `remove_if` miss and leak all three lifecycle accounts.
+        signal_udp_reply_task_stop(
+            &session.stop_reply_task,
+            session.stop_notify.as_ref(),
+        );
+        session.close_hook_ingress();
         *last_client = None;
         return Err(anyhow::anyhow!(
             "NodeWaypoint UDP source attribution no longer valid for this session ({}); \
@@ -2760,6 +2809,15 @@ async fn process_new_session_datagram(
         local_addr.map(|local| local.ifindex),
     )
     .await?;
+    let node_waypoint_session_source = node_waypoint_source_binding.and_then(|binding| {
+        node_waypoint_udp_source
+            .cloned()
+            .map(|scoping| NodeWaypointUdpSessionSource {
+                scoping,
+                binding,
+                ingress_ifindex: local_addr.map(|local| local.ifindex),
+            })
+    });
 
     // Bind the flow's datagram hooks to the decisions the admission chain just
     // memoized. Evaluated once here; every datagram of this session — starting
@@ -2818,7 +2876,7 @@ async fn process_new_session_datagram(
         preselected_backend_target,
         admitted_datagram_plugins,
         stream_ctx,
-        node_waypoint_source_binding,
+        node_waypoint_session_source,
     )
     .await?;
     reservation.disarm();
@@ -3312,6 +3370,7 @@ async fn start_dtls_frontend_listener(
                     // exists — never a mesh-wide fallback. `None` for every other
                     // topology and non-mesh DTLS proxy, whose behaviour is
                     // unchanged. See docs/mesh.md.
+                    let mut handler_node_waypoint_session_source = None;
                     if let Some(scoping) = handler_node_waypoint_source.as_ref() {
                         match scoping
                             .resolve(client_conn.ingress_ifindex, client_addr.ip())
@@ -3322,6 +3381,12 @@ async fn start_dtls_frontend_listener(
                                     "peer_spiffe_id".to_string(),
                                     resolved.binding.principal.as_str().to_string(),
                                 );
+                                handler_node_waypoint_session_source =
+                                    Some(NodeWaypointUdpSessionSource {
+                                        scoping: scoping.clone(),
+                                        binding: resolved.binding,
+                                        ingress_ifindex: client_conn.ingress_ifindex,
+                                    });
                             }
                             Err(refusal) => {
                                 scoping.index.warn_refusal(
@@ -3414,6 +3479,7 @@ async fn start_dtls_frontend_listener(
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
+                        handler_node_waypoint_session_source,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -3579,6 +3645,7 @@ async fn handle_dtls_client(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -3613,6 +3680,7 @@ async fn handle_dtls_client(
         listen_port,
         crls,
         backend_dtls_config_cache,
+        node_waypoint_source,
     )
     .await;
     DtlsHandlerResult {
@@ -3755,6 +3823,7 @@ async fn handle_dtls_client_inner(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
@@ -3928,6 +3997,8 @@ async fn handle_dtls_client_inner(
     // feed the same session map drained into the disconnect summary.
     let dgram_metadata_fwd = Arc::clone(&datagram_metadata);
     let dgram_metadata_rev = Arc::clone(&datagram_metadata);
+    let node_waypoint_source_fwd = node_waypoint_source.clone();
+    let node_waypoint_source_rev = node_waypoint_source;
     let shared_activity_ms = Arc::new(AtomicU64::new(coarse_epoch_millis()));
 
     // Client → Backend
@@ -3941,6 +4012,20 @@ async fn handle_dtls_client_inner(
                 Ok(d) => d,
                 Err(_) => break,
             };
+            if let Some(source) = node_waypoint_source_fwd.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &proxy_id_fwd,
+                    dgram_client_ip.as_ref(),
+                    refusal,
+                );
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution no longer valid ({})",
+                    refusal.as_str()
+                ));
+            }
             let len = data.len();
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -4005,6 +4090,7 @@ async fn handle_dtls_client_inner(
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_fwd.as_ref(), coarse_epoch_millis(), true, true);
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     // Backend → Client — reuse pre-computed plugin list and context strings
@@ -4034,6 +4120,20 @@ async fn handle_dtls_client_inner(
             } else {
                 break;
             };
+            if let Some(source) = node_waypoint_source_rev.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &proxy_id_rev,
+                    dgram_client_ip_rev.as_ref(),
+                    refusal,
+                );
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution no longer valid ({})",
+                    refusal.as_str()
+                ));
+            }
             let len = data.len();
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -4091,14 +4191,21 @@ async fn handle_dtls_client_inner(
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_rev.as_ref(), coarse_epoch_millis(), true, true);
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     let mut client_to_backend = client_to_backend;
     let mut backend_to_client = backend_to_client;
     let mut idle_watchdog = Box::pin(dtls_shared_idle_watchdog(shared_activity_ms, idle_timeout));
     let outcome = tokio::select! {
-        _ = &mut client_to_backend => Ok(()),
-        _ = &mut backend_to_client => Ok(()),
+        result = &mut client_to_backend => match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(anyhow::anyhow!("DTLS client forwarding task failed: {error}")),
+        },
+        result = &mut backend_to_client => match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(anyhow::anyhow!("DTLS backend forwarding task failed: {error}")),
+        },
         result = &mut idle_watchdog => result,
     };
     client_to_backend.abort();
@@ -4227,9 +4334,7 @@ async fn create_session(
     preselected_backend_target: Option<(String, u16)>,
     admitted_datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     mut stream_ctx: StreamConnectionContext,
-    node_waypoint_source: Option<
-        Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>,
-    >,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -4381,6 +4486,23 @@ async fn create_session(
         cb.record_success(cb_is_half_open_probe);
     }
 
+    // Admission preceded DNS and backend setup. Re-check immediately before
+    // publishing the session so a registry/slice change during those awaits
+    // cannot forward the retained first datagram under stale evidence.
+    if let Some(source) = node_waypoint_source.as_ref()
+        && let Err(refusal) =
+            source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source
+            .scoping
+            .index
+            .warn_refusal(proxy_id, client_ip.as_ref(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed during session setup ({})",
+            refusal.as_str()
+        ));
+    }
+
     let now = coarse_epoch_millis();
     let connected_wall_at = chrono::Utc::now();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
@@ -4520,7 +4642,7 @@ async fn create_session(
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
-        loop {
+        'reply: loop {
             // Listener/global shutdown may already be set; borrow() also
             // advances each watch "seen" version so the cancel future's
             // changed() waits for a subsequent change.
@@ -4623,6 +4745,32 @@ async fn create_session(
             } else {
                 break;
             };
+
+            // A backend reply can outlive the client datagram that created the
+            // session. Revalidate before EVERY reply so pod deletion, identity
+            // rotation, or interface/address reuse cannot deliver stale-session
+            // data to a new workload that inherited the peer tuple.
+            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                && let Err(refusal) =
+                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &reply_proxy_id,
+                    &udp_session_client_ip(client_addr),
+                    refusal,
+                );
+                reply_session.expired.store(true, Ordering::Release);
+                disconnect_error = Some((
+                    format!(
+                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                        refusal.as_str()
+                    ),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
 
             // Amplification factor check: drop backend responses that exceed
             // the configured ratio relative to the last client request size.
@@ -4751,6 +4899,27 @@ async fn create_session(
                 for _ in 0..batch_limit {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
+                            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                && let Err(refusal) =
+                                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                            {
+                                source.scoping.index.warn_refusal(
+                                    &reply_proxy_id,
+                                    &udp_session_client_ip(client_addr),
+                                    refusal,
+                                );
+                                reply_session.expired.store(true, Ordering::Release);
+                                disconnect_error = Some((
+                                    format!(
+                                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                                        refusal.as_str()
+                                    ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
                             // Amplification check on batched response datagram
                             if let Some(factor) = reply_amplification_factor {
                                 let req_size =

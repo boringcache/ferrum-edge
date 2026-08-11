@@ -321,6 +321,45 @@ fn a_pod_that_left_the_live_slice_resolves_no_scope() {
     );
 }
 
+/// A registry generation and a slice generation are independent publications.
+/// If the slice re-attests the same pod UID under a new SPIFFE identity before
+/// the registry catches up, the stale registry principal must not be paired
+/// with the new workload's scope.
+#[test]
+fn a_stale_registry_principal_cannot_borrow_a_re_attested_pods_scope() {
+    let fixture = Fixture::new();
+    fixture.manager.reconcile_once();
+    let pinned = fixture
+        .scoping()
+        .resolve(Some(IFINDEX_A), ip(IP_A))
+        .expect("initial registry and slice generations agree")
+        .binding;
+
+    fixture
+        .resolver
+        .install_policy_scopes_from_workloads(&[workload(
+            SPIFFE_B,
+            "team-a",
+            labels(&[("app", "api")]),
+            POD_A,
+        )]);
+
+    let scoping = fixture.scoping();
+    assert_eq!(
+        scoping
+            .resolve(Some(IFINDEX_A), ip(IP_A))
+            .err()
+            .expect("a stale principal must fail admission"),
+        NodeWaypointUdpSourceRefusal::PodNotInSlice
+    );
+    assert_eq!(
+        scoping
+            .revalidate(&pinned, Some(IFINDEX_A), ip(IP_A))
+            .expect_err("a live session must fail when the slice re-attests its pod"),
+        NodeWaypointUdpSourceRefusal::PodNotInSlice
+    );
+}
+
 /// Reload/update, not just first construction: a workload whose labels change
 /// in a new slice generation must be scoped by the NEW labels for sessions
 /// admitted after the change.

@@ -815,6 +815,27 @@ impl NodeWaypointIdentityResolver {
             .map(Arc::clone)
     }
 
+    /// Resolve a pod's scope only when the same live slice generation still
+    /// binds that pod UID to `expected_spiffe_id`.
+    ///
+    /// UDP/DTLS source attribution begins with the node-agent registry rather
+    /// than an eBPF SPIFFE hash.  Joining on pod UID alone would let a stale
+    /// registry principal survive a slice update that re-attested the same pod
+    /// under a different identity.  This one `ArcSwap` load proves both the
+    /// identity and its scope coherently, matching `resolve_record`'s TCP
+    /// fail-closed boundary without touching the identity cache.
+    pub fn policy_scope_for_pod_identity(
+        &self,
+        pod_uid: &[u8; 16],
+        expected_spiffe_id: &SpiffeId,
+    ) -> Option<Arc<PolicyScopeCache>> {
+        let slice = self.slice.load();
+        if slice.spiffe_for_pod_uid(pod_uid) != Some(expected_spiffe_id) {
+            return None;
+        }
+        slice.scope_for(pod_uid)
+    }
+
     /// Install a node-waypoint slice generation derived from a slice's workload
     /// set.
     ///

@@ -459,10 +459,35 @@ impl NodeWaypointUdpSourceScoping {
         source: IpAddr,
     ) -> Result<ResolvedUdpSource, NodeWaypointUdpSourceRefusal> {
         let binding = self.index.authorize(ingress_ifindex, source)?;
-        let Some(scope) = self.resolver.policy_scope_for_pod(&binding.pod_uid) else {
+        let Some(scope) = self
+            .resolver
+            .policy_scope_for_pod_identity(&binding.pod_uid, &binding.principal)
+        else {
             return Err(self.index.record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
         };
         Ok(ResolvedUdpSource { binding, scope })
+    }
+
+    /// Re-authorize a live session against both current attribution evidence
+    /// and the current slice's coherent pod-identity/scope generation.
+    pub fn revalidate(
+        &self,
+        pinned: &NodeWaypointUdpSourceBinding,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), NodeWaypointUdpSourceRefusal> {
+        self.index
+            .revalidate(pinned, ingress_ifindex, source)?;
+        if self
+            .resolver
+            .policy_scope_for_pod_identity(&pinned.pod_uid, &pinned.principal)
+            .is_none()
+        {
+            return Err(self
+                .index
+                .record(NodeWaypointUdpSourceRefusal::PodNotInSlice));
+        }
+        Ok(())
     }
 }
 
@@ -607,8 +632,8 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
                 _ = ticker.tick() => {
                     self.reconcile_once();
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
