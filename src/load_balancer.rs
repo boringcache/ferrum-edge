@@ -1679,7 +1679,7 @@ impl LoadBalancerCache {
             namespace,
             upstream_id,
             ctx_key,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -1734,7 +1734,7 @@ impl LoadBalancerCache {
             upstream_id,
             ctx_key,
             port,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -1785,7 +1785,7 @@ impl LoadBalancerCache {
             upstream_id,
             ctx_key,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -1844,7 +1844,7 @@ impl LoadBalancerCache {
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -5638,7 +5638,7 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_many(ctx_key, std::slice::from_ref(exclude), health)
+        self.select_excluding_many(ctx_key, std::slice::from_ref(&exclude), health)
     }
 
     /// Retry-only: exclude every sticky identity in `excludes` before selecting.
@@ -5666,7 +5666,7 @@ impl LoadBalancer {
     ) -> Option<Arc<UpstreamTarget>> {
         self.select_excluding_with(
             ctx_key,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5724,7 +5724,7 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        self.select_excluding_for_port_many(ctx_key, port, std::slice::from_ref(exclude), health)
+        self.select_excluding_for_port_many(ctx_key, port, std::slice::from_ref(&exclude), health)
     }
 
     /// Retry-only multi-identity exclusion on a live per-port override lane.
@@ -5754,7 +5754,7 @@ impl LoadBalancer {
         self.select_excluding_for_port_with(
             ctx_key,
             port,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5827,7 +5827,7 @@ impl LoadBalancer {
         self.select_excluding_from_subset_many(
             ctx_key,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -5859,7 +5859,7 @@ impl LoadBalancer {
         self.select_excluding_from_subset_with(
             ctx_key,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
@@ -5942,7 +5942,7 @@ impl LoadBalancer {
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
         )
     }
@@ -5978,7 +5978,7 @@ impl LoadBalancer {
             ctx_key,
             port,
             subset_name,
-            std::slice::from_ref(exclude),
+            std::slice::from_ref(&exclude),
             health,
             RetryExcludeContract::EffectiveEndpointLane,
         )
