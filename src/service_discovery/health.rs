@@ -1,0 +1,613 @@
+//! Service-discovery task lifecycle and staleness health (issues #3717/#3721).
+//!
+//! Holds one bounded entry per *running* discovery task, keyed by the same
+//! `namespace|upstream_id` ownership key the manager uses. Cardinality is
+//! therefore exactly the number of configured service-discovery upstreams:
+//! entries are created when a task starts and removed when its generation is
+//! superseded or stopped, so a flapping registry cannot grow this map.
+//!
+//! Two consumers read it:
+//!
+//! * authenticated `/health` and `/status` — aggregate **plus** per-upstream
+//!   detail (upstream identity is operator-configured, so it never reaches the
+//!   unauthenticated tier);
+//! * `/metrics` — fixed-cardinality process aggregates only. Upstream ids are
+//!   never Prometheus labels.
+//!
+//! Every diagnostic here is a count, an age, or a closed-set reason token.
+//! Registry URLs, Consul tokens, Kubernetes bearer tokens, response bodies, and
+//! provider error strings never enter this module.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use serde::Serialize;
+use tokio::time::Instant;
+
+use crate::config::env_config::DiscoveryStalenessPolicy;
+use crate::config::types::SdStalePolicy;
+
+/// Consecutive unexpected exits (panic / early return) after which a task is
+/// reported as crash-looping. The supervisor keeps retrying at the capped
+/// backoff — the state exists so repeated crashes surface as a degraded signal
+/// instead of an invisible hot loop.
+pub const DISCOVERY_CRASH_LOOP_THRESHOLD: u64 = 3;
+
+/// Multiple of the poll interval below which a configured staleness window is
+/// floored. A window shorter than a couple of healthy poll cycles would report
+/// permanent staleness on a slow-polling provider.
+pub const DISCOVERY_MIN_STALE_POLL_INTERVALS: u64 = 3;
+
+/// Lifecycle state of one supervised discovery task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryTaskState {
+    /// Spawned; no poll outcome observed yet.
+    Starting,
+    /// Poller running normally.
+    Running,
+    /// Poller exited unexpectedly and the supervisor is waiting out its backoff.
+    Restarting,
+    /// Repeated unexpected exits without an intervening successful snapshot.
+    CrashLooping,
+    /// Cleanly canceled or shut down; retained only until the manager removes it.
+    Stopped,
+}
+
+impl DiscoveryTaskState {
+    /// Fixed-cardinality label for logs, status output, and metrics buckets.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Restarting => "restarting",
+            Self::CrashLooping => "crash_looping",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// Closed-set failure reasons. Never derived from provider payloads or URLs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryFailureReason {
+    /// `ServiceDiscoverer::discover()` returned an error.
+    DiscoverFailed,
+    /// The snapshot parsed but was refused by shared/atomic admission.
+    SnapshotRejected,
+    /// Admitted targets could not be published into the load balancer.
+    PublishFailed,
+    /// The poller task exited unexpectedly (panic or early return).
+    TaskExited,
+}
+
+impl DiscoveryFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoverFailed => "discover_failed",
+            Self::SnapshotRejected => "snapshot_rejected",
+            Self::PublishFailed => "publish_failed",
+            Self::TaskExited => "task_exited",
+        }
+    }
+}
+
+/// Resolved staleness bound for one task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiscoveryStaleness {
+    /// `None` means unbounded last-known retention (explicit unsafe opt-in).
+    pub max_stale: Option<Duration>,
+    pub policy: SdStalePolicy,
+}
+
+impl DiscoveryStaleness {
+    /// Unbounded retention — legacy behavior, only reachable via opt-in.
+    pub const fn unbounded(policy: SdStalePolicy) -> Self {
+        Self {
+            max_stale: None,
+            policy,
+        }
+    }
+
+    /// Seconds for status output; `0` reports unbounded.
+    pub fn max_stale_seconds(self) -> u64 {
+        self.max_stale.map(|d| d.as_secs()).unwrap_or(0)
+    }
+}
+
+#[derive(Debug)]
+struct TaskHealth {
+    generation: u64,
+    state: DiscoveryTaskState,
+    provider: &'static str,
+    staleness: DiscoveryStaleness,
+    /// Monotonic task start; the staleness anchor until the first success.
+    started_at: Instant,
+    /// Last successfully admitted **and** published (or confirmed) snapshot.
+    last_success_at: Option<Instant>,
+    consecutive_failures: u64,
+    consecutive_crashes: u64,
+    restarts: u64,
+    last_error: Option<DiscoveryFailureReason>,
+    /// Whether the expiry action for the current stale episode has already run.
+    /// Suppresses the staleness timer so an expired task cannot hot-loop, and
+    /// is cleared by the next successfully published snapshot.
+    expiry_applied: bool,
+    /// Whether discovered targets are currently withdrawn by the expiry policy.
+    /// Always `false` under [`SdStalePolicy::Retain`].
+    withdrawn: bool,
+}
+
+impl TaskHealth {
+    /// Age of the staleness anchor: the last published snapshot, or task start
+    /// when none has ever been admitted.
+    fn anchor_age(&self, now: Instant) -> Duration {
+        let anchor = self.last_success_at.unwrap_or(self.started_at);
+        now.saturating_duration_since(anchor)
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        self.staleness
+            .max_stale
+            .is_some_and(|max| self.anchor_age(now) >= max)
+    }
+}
+
+/// Per-upstream lifecycle detail for authenticated `/health` and `/status`.
+///
+/// `upstream` is the operator-configured `namespace|id` ownership key. It is
+/// deliberately absent from `/metrics` and from the unauthenticated health tier.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DiscoveryTaskStatus {
+    pub upstream: String,
+    pub provider: &'static str,
+    pub state: &'static str,
+    pub stale: bool,
+    pub withdrawn: bool,
+    pub policy: &'static str,
+    /// Effective staleness bound; `0` reports unbounded retention.
+    pub max_stale_seconds: u64,
+    /// Age of the last successfully admitted and published snapshot. `null`
+    /// when the task has never published one.
+    pub last_success_age_seconds: Option<u64>,
+    /// Age of the current staleness anchor (task start when never successful).
+    pub anchor_age_seconds: u64,
+    pub consecutive_failures: u64,
+    pub consecutive_crashes: u64,
+    pub restarts: u64,
+    pub last_error: Option<&'static str>,
+}
+
+/// Fixed-cardinality process aggregate of discovery task health.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DiscoveryHealthAggregate {
+    pub tasks: u64,
+    pub running: u64,
+    pub restarting: u64,
+    pub crash_looping: u64,
+    pub stale: u64,
+    pub withdrawn: u64,
+    /// Stale tasks whose expiry policy is `fail_readiness`.
+    pub readiness_failing: u64,
+    /// Tasks that have never published an admitted snapshot.
+    pub never_succeeded: u64,
+    /// Maximum staleness-anchor age across tasks, in seconds.
+    pub max_anchor_age_seconds: u64,
+}
+
+impl DiscoveryHealthAggregate {
+    /// Readiness only fails under the explicit `fail_readiness` policy.
+    ///
+    /// A crash-looping or stale task under `retain`/`withdraw` degrades coarse
+    /// health but must not pull a whole gateway out of rotation for one
+    /// upstream's registry outage — the `withdraw` policy has already removed
+    /// the unsafe routes.
+    pub fn ready(&self) -> bool {
+        self.readiness_failing == 0
+    }
+
+    /// Any lifecycle or staleness condition an operator should see.
+    pub fn degraded(&self) -> bool {
+        self.restarting > 0
+            || self.crash_looping > 0
+            || self.stale > 0
+            || self.withdrawn > 0
+            || self.readiness_failing > 0
+    }
+}
+
+/// Full authenticated projection: aggregate plus per-upstream detail.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DiscoveryHealthSnapshot {
+    #[serde(flatten)]
+    pub aggregate: DiscoveryHealthAggregate,
+    pub upstreams: Vec<DiscoveryTaskStatus>,
+}
+
+static INSTALLED_STALENESS_POLICY: OnceLock<DiscoveryStalenessPolicy> = OnceLock::new();
+static STALENESS_POLICY_OVERRIDE: std::sync::RwLock<Option<DiscoveryStalenessPolicy>> =
+    std::sync::RwLock::new(None);
+
+/// Install the process-wide discovery staleness policy from the accepted
+/// `EnvConfig` snapshot, before any mode can start a poller.
+///
+/// Identical reinstall is accepted; a conflicting value fails closed so the
+/// runtime policy cannot diverge from the parsed configuration.
+pub fn install_discovery_staleness_policy(policy: DiscoveryStalenessPolicy) -> Result<(), String> {
+    crate::config::env_config::parse_discovery_staleness_policy(
+        Some(&policy.max_stale_seconds.to_string()),
+        Some(policy.policy.as_str()),
+        Some(if policy.allow_unbounded {
+            "true"
+        } else {
+            "false"
+        }),
+    )?;
+    match INSTALLED_STALENESS_POLICY.set(policy) {
+        Ok(()) => Ok(()),
+        Err(_) => match INSTALLED_STALENESS_POLICY.get() {
+            Some(existing) if *existing == policy => Ok(()),
+            Some(_) => Err(
+                "service discovery staleness policy is already installed with a different \
+                 value for this process"
+                    .to_string(),
+            ),
+            None => Err(
+                "service discovery staleness policy install raced and left no installed value"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+/// Effective process staleness policy: test override → installed snapshot →
+/// bounded defaults.
+pub fn effective_discovery_staleness_policy() -> DiscoveryStalenessPolicy {
+    if let Ok(guard) = STALENESS_POLICY_OVERRIDE.read()
+        && let Some(policy) = *guard
+    {
+        return policy;
+    }
+    INSTALLED_STALENESS_POLICY
+        .get()
+        .copied()
+        .unwrap_or_else(DiscoveryStalenessPolicy::defaults)
+}
+
+/// Test-only override of the process staleness policy. `None` clears it.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn override_discovery_staleness_policy_for_test(policy: Option<DiscoveryStalenessPolicy>) {
+    if let Ok(mut guard) = STALENESS_POLICY_OVERRIDE.write() {
+        *guard = policy;
+    }
+}
+
+/// Resolve the effective staleness bound for one upstream, applying the
+/// per-upstream override when present and the unsafe unbounded opt-in gate.
+///
+/// A per-upstream `max_stale_seconds: 0` without
+/// `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true` is refused in favor of
+/// the bounded process default: an unbounded window must never be reachable by
+/// editing one upstream's row.
+pub fn resolve_upstream_staleness(
+    upstream_id: &str,
+    configured: Option<u64>,
+    policy_override: Option<SdStalePolicy>,
+    poll_interval_seconds: u64,
+) -> DiscoveryStaleness {
+    let process = effective_discovery_staleness_policy();
+    let policy = policy_override.unwrap_or(process.policy);
+    let seconds = match configured {
+        Some(0) if !process.allow_unbounded => {
+            tracing::warn!(
+                upstream = %upstream_id,
+                fallback_max_stale_seconds = process.max_stale_seconds,
+                "Service discovery: upstream requested unbounded last-known retention \
+                 (max_stale_seconds=0) without FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true; \
+                 applying the bounded process default"
+            );
+            process.max_stale_seconds
+        }
+        Some(configured) => configured,
+        None => process.max_stale_seconds,
+    };
+    resolve_staleness(seconds, policy, poll_interval_seconds)
+}
+
+static REGISTRY: OnceLock<DashMap<String, TaskHealth>> = OnceLock::new();
+
+fn registry() -> &'static DashMap<String, TaskHealth> {
+    REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Mutate the entry for `key` only when it still owns `generation`.
+///
+/// This is the fence that keeps a superseded supervisor from publishing health
+/// (or restarting) after a reconcile replaced it.
+fn with_current<R>(key: &str, generation: u64, f: impl FnOnce(&mut TaskHealth) -> R) -> Option<R> {
+    let mut entry = registry().get_mut(key)?;
+    if entry.generation != generation {
+        return None;
+    }
+    Some(f(entry.value_mut()))
+}
+
+/// Register (or replace) the health entry for a newly started task generation.
+pub(crate) fn register_task(
+    key: &str,
+    generation: u64,
+    provider: &'static str,
+    staleness: DiscoveryStaleness,
+) {
+    registry().insert(
+        key.to_string(),
+        TaskHealth {
+            generation,
+            state: DiscoveryTaskState::Starting,
+            provider,
+            staleness,
+            started_at: Instant::now(),
+            last_success_at: None,
+            consecutive_failures: 0,
+            consecutive_crashes: 0,
+            restarts: 0,
+            last_error: None,
+            expiry_applied: false,
+            withdrawn: false,
+        },
+    );
+}
+
+/// Remove the entry for `key` when `generation` still owns it.
+///
+/// A stale generation's removal is ignored so a slow supervisor teardown cannot
+/// delete the health of the task that replaced it.
+pub(crate) fn remove_task(key: &str, generation: u64) {
+    registry().remove_if(key, |_, entry| entry.generation == generation);
+}
+
+/// Whether `generation` is still the owner of `key`.
+pub(crate) fn generation_is_current(key: &str, generation: u64) -> bool {
+    registry()
+        .get(key)
+        .is_some_and(|entry| entry.generation == generation)
+}
+
+/// Record a successfully admitted and published (or confirmed) snapshot.
+pub(crate) fn record_success(key: &str, generation: u64) {
+    with_current(key, generation, |entry| {
+        entry.state = DiscoveryTaskState::Running;
+        entry.last_success_at = Some(Instant::now());
+        entry.consecutive_failures = 0;
+        entry.consecutive_crashes = 0;
+        entry.last_error = None;
+        if entry.expiry_applied {
+            entry.expiry_applied = false;
+            entry.withdrawn = false;
+            crate::plugins::prometheus_metrics::global_registry()
+                .record_service_discovery_stale_recovery();
+        }
+    });
+}
+
+/// Record a poll that produced no new published snapshot.
+pub(crate) fn record_failure(key: &str, generation: u64, reason: DiscoveryFailureReason) {
+    with_current(key, generation, |entry| {
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_error = Some(reason);
+        if entry.state == DiscoveryTaskState::Starting {
+            entry.state = DiscoveryTaskState::Running;
+        }
+    });
+}
+
+/// Claim the expiry action for the current stale episode.
+///
+/// Idempotent: returns `true` only for the transition into the expired state,
+/// so the discovery loop applies exactly one expiry action per episode — under
+/// every policy, including `retain`, which performs no withdrawal — and cannot
+/// hot-loop on an already-expired staleness deadline.
+pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
+    with_current(key, generation, |entry| {
+        if entry.expiry_applied {
+            return false;
+        }
+        entry.expiry_applied = true;
+        entry.withdrawn = withdrew;
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Record an unexpected poller exit and return the supervisor's next backoff.
+///
+/// `None` means the generation was superseded and the supervisor must exit
+/// without restarting.
+pub(crate) fn record_unexpected_exit(key: &str, generation: u64) -> Option<Duration> {
+    let crashes = with_current(key, generation, |entry| {
+        entry.restarts = entry.restarts.saturating_add(1);
+        entry.consecutive_crashes = entry.consecutive_crashes.saturating_add(1);
+        entry.last_error = Some(DiscoveryFailureReason::TaskExited);
+        entry.state = if entry.consecutive_crashes >= DISCOVERY_CRASH_LOOP_THRESHOLD {
+            DiscoveryTaskState::CrashLooping
+        } else {
+            DiscoveryTaskState::Restarting
+        };
+        entry.consecutive_crashes
+    })?;
+    Some(restart_backoff(crashes))
+}
+
+/// Mark a task as cleanly stopped (cancel or shutdown), never a crash.
+pub(crate) fn record_clean_exit(key: &str, generation: u64) {
+    with_current(key, generation, |entry| {
+        entry.state = DiscoveryTaskState::Stopped;
+    });
+}
+
+/// Bounded exponential restart backoff with ±25% jitter.
+///
+/// Doubles from [`crate::util::backoff::BACKOFF_INITIAL_SECS`] and caps at
+/// [`crate::util::backoff::BACKOFF_MAX_SECS`], so a poller that panics on every
+/// iteration settles at one attempt per capped interval instead of hot-looping.
+pub fn restart_backoff(consecutive_crashes: u64) -> Duration {
+    let mut secs = crate::util::backoff::BACKOFF_INITIAL_SECS;
+    for _ in 1..consecutive_crashes.min(16) {
+        secs = crate::util::backoff::next_backoff_secs(secs, true);
+    }
+    crate::util::backoff::jittered_backoff(secs)
+}
+
+/// Effective staleness bound for one task.
+///
+/// Floors the configured window at [`DISCOVERY_MIN_STALE_POLL_INTERVALS`] poll
+/// intervals so a slow-polling provider cannot be reported permanently stale,
+/// and honors an explicit unbounded opt-in.
+pub fn resolve_staleness(
+    configured_max_stale_seconds: u64,
+    policy: SdStalePolicy,
+    poll_interval_seconds: u64,
+) -> DiscoveryStaleness {
+    if configured_max_stale_seconds == 0 {
+        return DiscoveryStaleness::unbounded(policy);
+    }
+    let floor = poll_interval_seconds.saturating_mul(DISCOVERY_MIN_STALE_POLL_INTERVALS);
+    DiscoveryStaleness {
+        max_stale: Some(Duration::from_secs(configured_max_stale_seconds.max(floor))),
+        policy,
+    }
+}
+
+/// Instant at which `key`'s generation next crosses its staleness bound.
+///
+/// The discovery loop arms a timer on this so withdrawal happens on expiry
+/// rather than at the next poll tick, which may be far later.
+pub(crate) fn next_stale_deadline(key: &str, generation: u64) -> Option<Instant> {
+    let entry = registry().get(key)?;
+    if entry.generation != generation || entry.expiry_applied {
+        return None;
+    }
+    let max = entry.staleness.max_stale?;
+    Some(entry.last_success_at.unwrap_or(entry.started_at) + max)
+}
+
+fn project(key: &str, entry: &TaskHealth, now: Instant) -> DiscoveryTaskStatus {
+    DiscoveryTaskStatus {
+        upstream: key.to_string(),
+        provider: entry.provider,
+        state: entry.state.as_str(),
+        stale: entry.is_stale(now),
+        withdrawn: entry.withdrawn,
+        policy: entry.staleness.policy.as_str(),
+        max_stale_seconds: entry.staleness.max_stale_seconds(),
+        last_success_age_seconds: entry
+            .last_success_at
+            .map(|at| now.saturating_duration_since(at).as_secs()),
+        anchor_age_seconds: entry.anchor_age(now).as_secs(),
+        consecutive_failures: entry.consecutive_failures,
+        consecutive_crashes: entry.consecutive_crashes,
+        restarts: entry.restarts,
+        last_error: entry.last_error.map(DiscoveryFailureReason::as_str),
+    }
+}
+
+/// Fixed-cardinality aggregate for `/metrics` and coarse health.
+///
+/// Staleness is recomputed against `Instant::now()` on every call, so an
+/// expired window is visible even before the owning task's timer fires.
+pub fn aggregate() -> DiscoveryHealthAggregate {
+    let now = Instant::now();
+    let mut aggregate = DiscoveryHealthAggregate::default();
+    for entry in registry().iter() {
+        let entry = entry.value();
+        aggregate.tasks += 1;
+        match entry.state {
+            DiscoveryTaskState::Running | DiscoveryTaskState::Starting => aggregate.running += 1,
+            DiscoveryTaskState::Restarting => aggregate.restarting += 1,
+            DiscoveryTaskState::CrashLooping => aggregate.crash_looping += 1,
+            DiscoveryTaskState::Stopped => {}
+        }
+        if entry.last_success_at.is_none() {
+            aggregate.never_succeeded += 1;
+        }
+        if entry.withdrawn {
+            aggregate.withdrawn += 1;
+        }
+        if entry.is_stale(now) {
+            aggregate.stale += 1;
+            if entry.staleness.policy.fails_readiness() {
+                aggregate.readiness_failing += 1;
+            }
+        }
+        aggregate.max_anchor_age_seconds = aggregate
+            .max_anchor_age_seconds
+            .max(entry.anchor_age(now).as_secs());
+    }
+    aggregate
+}
+
+/// Authenticated projection: aggregate plus per-upstream detail, sorted by
+/// upstream key so the body is stable across scrapes.
+pub fn snapshot() -> DiscoveryHealthSnapshot {
+    let now = Instant::now();
+    let mut upstreams: Vec<DiscoveryTaskStatus> = registry()
+        .iter()
+        .map(|entry| project(entry.key(), entry.value(), now))
+        .collect();
+    upstreams.sort_by(|a, b| a.upstream.cmp(&b.upstream));
+    DiscoveryHealthSnapshot {
+        aggregate: aggregate(),
+        upstreams,
+    }
+}
+
+/// Whether any discovery task is currently configured. Used to keep the health
+/// body free of an empty discovery object on gateways without discovery.
+pub fn has_tasks() -> bool {
+    !registry().is_empty()
+}
+
+/// Drop all registry entries. Test-only: the registry is process-global, so
+/// external suites that start managers must isolate themselves.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn reset_for_test() {
+    registry().clear();
+}
+
+/// Register a task generation directly, as a reconcile-driven replacement
+/// would. Test-only seam for proving that a superseded supervisor exits instead
+/// of restarting or publishing.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn register_task_for_test(
+    key: &str,
+    generation: u64,
+    provider: &'static str,
+    staleness: DiscoveryStaleness,
+) {
+    register_task(key, generation, provider, staleness);
+}
+
+/// Generation currently owning `key`, if any. Test-only observation seam: a
+/// kept task keeps its generation across reconcile, a replaced one does not.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn generation_for_test(key: &str) -> Option<u64> {
+    registry().get(key).map(|entry| entry.generation)
+}
+
+/// Force `key`'s staleness anchor to `age` seconds ago without waiting.
+///
+/// Test-only. Returns `false` when the key is absent, so a test cannot silently
+/// assert against an entry that was never registered.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn age_anchor_for_test(key: &str, age_seconds: u64) -> bool {
+    let Some(mut entry) = registry().get_mut(key) else {
+        return false;
+    };
+    let Some(shifted) = Instant::now().checked_sub(Duration::from_secs(age_seconds)) else {
+        return false;
+    };
+    entry.started_at = shifted;
+    if entry.last_success_at.is_some() {
+        entry.last_success_at = Some(shifted);
+    }
+    true
+}

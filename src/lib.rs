@@ -1020,6 +1020,10 @@ pub mod _test_support {
             shutdown_rx,
             dns_cache,
             health_checker,
+            // No supervised task generation behind this seam: external tests
+            // drive the pipeline directly, so there is no lifecycle entry to
+            // fence or to advance the staleness anchor on.
+            None,
         )
         .await
         {

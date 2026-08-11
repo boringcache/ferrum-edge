@@ -3417,6 +3417,8 @@ fn retry_proxy_allows_mesh_service_discovery_upstream() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let mut proxy = make_proxy("p1", "/api");
     proxy.upstream_id = Some("mesh-sd-upstream".into());
@@ -3450,6 +3452,8 @@ fn retry_proxy_allows_sidecar_topology_mesh_service_discovery_upstream() {
             topology: ferrum_edge::config::types::MeshSdTopology::Sidecar,
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let mut proxy = make_proxy("p1", "/api");
     proxy.upstream_id = Some("mesh-sd-upstream".into());
@@ -3671,6 +3675,8 @@ fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retr
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let mut proxy = make_proxy("p1", "/api");
     proxy.upstream_id = Some("mesh-sd-upstream".into());

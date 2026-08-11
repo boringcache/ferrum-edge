@@ -38,6 +38,8 @@ fn make_upstream(id: &str) -> Upstream {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
         subsets: None,
         port_overrides: HashMap::new(),

@@ -85,6 +85,7 @@ mod router_cache_tests;
 mod runtime_metrics_tests;
 mod secondary_request_headers_tests;
 mod send_mmsg_batch_tests;
+mod service_discovery_lifecycle_tests;
 mod service_discovery_tests;
 mod sni_tests;
 mod socket_opts_tests;

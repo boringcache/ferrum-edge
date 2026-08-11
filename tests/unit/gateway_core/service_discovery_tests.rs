@@ -275,6 +275,8 @@ fn test_sd_config_roundtrip_json() {
         consul: None,
         mesh: None,
         default_weight: 3,
+        max_stale_seconds: None,
+        stale_policy: None,
     };
 
     let json = serde_json::to_string(&config).unwrap();
@@ -2526,6 +2528,8 @@ async fn test_manager_start_with_mismatched_provider_skips() {
             consul: None, // mismatch: provider says consul but no config
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
 
@@ -2561,6 +2565,8 @@ async fn test_manager_start_with_dns_sd_mismatch_skips() {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
 
@@ -2590,6 +2596,8 @@ async fn test_manager_start_with_kubernetes_mismatch_skips() {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
 
@@ -2625,6 +2633,8 @@ async fn test_manager_start_with_mesh_missing_epoch_skips() {
                 topology: Default::default(),
             }),
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
 
@@ -2665,6 +2675,8 @@ async fn test_manager_mesh_discovery_populates_load_balancer() {
                 topology: Default::default(),
             }),
             default_weight: 4,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
     config.mesh = Some(Box::new(MeshConfig {
@@ -4587,6 +4599,8 @@ async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_qu
             }),
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
     )]);
     let cache = Arc::new(LoadBalancerCache::new(&config));

@@ -243,6 +243,125 @@ pub const DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// Hard maximum concurrent discovery-body budget (256 MiB).
 pub const HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Settings key for the provider-neutral discovery staleness bound.
+pub const SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS";
+/// Settings key for the discovery staleness expiry policy.
+pub const SERVICE_DISCOVERY_STALE_POLICY_KEY: &str = "FERRUM_SERVICE_DISCOVERY_STALE_POLICY";
+/// Settings key for the unsafe unbounded-retention opt-in.
+pub const SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE";
+
+/// Default maximum age of the last successfully admitted and published
+/// discovery snapshot before the expiry policy applies (5 minutes).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
+/// Hard maximum discovery staleness bound (24 hours). Larger values clamp down;
+/// unbounded retention is `0` plus the explicit unsafe opt-in.
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 86_400;
+/// Minimum discovery staleness bound. A window shorter than one poll interval
+/// would expire between healthy polls, so short values clamp up here and are
+/// additionally floored at three poll intervals per task at runtime.
+pub const MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS: u64 = 5;
+
+/// Validated provider-neutral discovery staleness policy (issue #3717).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryStalenessPolicy {
+    /// Process default maximum staleness in seconds. `0` means unbounded and is
+    /// only reachable with `allow_unbounded`.
+    pub max_stale_seconds: u64,
+    /// Action taken when a task's last admitted snapshot expires.
+    pub policy: crate::config::types::SdStalePolicy,
+    /// Whether unbounded (`0`) retention is admitted — process default and
+    /// per-upstream overrides alike.
+    pub allow_unbounded: bool,
+}
+
+impl DiscoveryStalenessPolicy {
+    pub const fn defaults() -> Self {
+        Self {
+            max_stale_seconds: DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+            policy: crate::config::types::SdStalePolicy::Withdraw,
+            allow_unbounded: false,
+        }
+    }
+}
+
+impl Default for DiscoveryStalenessPolicy {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Pure parse/validation for the three discovery staleness env keys.
+///
+/// - `None` selects each key's documented default.
+/// - A malformed number, an unknown policy token, or a malformed boolean fails
+///   closed rather than silently reverting to unbounded retention.
+/// - `0` (unbounded last-known retention) is admitted only when the unsafe
+///   opt-in is explicitly `true`.
+/// - Values above the hard maximum clamp down; values below the floor clamp up.
+pub fn parse_discovery_staleness_policy(
+    max_stale: Option<&str>,
+    policy: Option<&str>,
+    allow_unbounded: Option<&str>,
+) -> Result<DiscoveryStalenessPolicy, String> {
+    let allow_unbounded = match allow_unbounded.map(str::trim) {
+        None | Some("") => false,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => {
+                return Err(format!(
+                    "{SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY} must be true or false"
+                ));
+            }
+        },
+    };
+
+    let max_stale_seconds = match max_stale.map(str::trim) {
+        None | Some("") => DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+        Some(raw) => {
+            let value = raw.parse::<u64>().map_err(|_| {
+                format!(
+                    "{SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY} must be a whole number of seconds; \
+                     the configured value is not"
+                )
+            })?;
+            if value == 0 {
+                if !allow_unbounded {
+                    return Err(format!(
+                        "{SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY}=0 keeps discovered targets \
+                         routable forever after the registry stops answering. Set a bounded \
+                         window, or opt in explicitly with \
+                         {SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY}=true"
+                    ));
+                }
+                0
+            } else {
+                value
+                    .max(MIN_SERVICE_DISCOVERY_MAX_STALE_SECONDS)
+                    .min(HARD_MAX_SERVICE_DISCOVERY_MAX_STALE_SECONDS)
+            }
+        }
+    };
+
+    let policy = match policy.map(str::trim) {
+        None | Some("") => crate::config::types::SdStalePolicy::default(),
+        Some(raw) => crate::config::types::SdStalePolicy::parse_token(raw).ok_or_else(|| {
+            format!(
+                "{SERVICE_DISCOVERY_STALE_POLICY_KEY} must be one of retain, withdraw, \
+                 fail_readiness"
+            )
+        })?,
+    };
+
+    Ok(DiscoveryStalenessPolicy {
+        max_stale_seconds,
+        policy,
+        allow_unbounded,
+    })
+}
+
 /// Validated discovery body ceilings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryBodyLimits {
@@ -2694,6 +2813,17 @@ pub struct EnvConfig {
     /// Kubernetes/Consul pollers. Default 32 MiB, hard maximum 256 MiB; must be
     /// at least the per-response success ceiling; `0` is rejected.
     pub service_discovery_body_budget_bytes: usize,
+    /// Provider-neutral maximum age of the last successfully admitted and
+    /// published discovery snapshot before the expiry policy applies, in
+    /// seconds. `0` is unbounded last-known retention and requires
+    /// `service_discovery_allow_unbounded_stale`. (default: 300)
+    pub service_discovery_max_stale_seconds: u64,
+    /// Action applied when a discovery task's snapshot exceeds the staleness
+    /// bound. (default: `withdraw`)
+    pub service_discovery_stale_policy: crate::config::types::SdStalePolicy,
+    /// Unsafe opt-in that admits unbounded (`0`) discovery staleness, both as
+    /// the process default and as a per-upstream override. (default: false)
+    pub service_discovery_allow_unbounded_stale: bool,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
@@ -3452,6 +3582,9 @@ impl Default for EnvConfig {
                 DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
             service_discovery_max_error_body_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
             service_discovery_body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+            service_discovery_max_stale_seconds: DEFAULT_SERVICE_DISCOVERY_MAX_STALE_SECONDS,
+            service_discovery_stale_policy: crate::config::types::SdStalePolicy::Withdraw,
+            service_discovery_allow_unbounded_stale: false,
             tls_cert_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
@@ -4028,6 +4161,18 @@ impl EnvConfig {
         let service_discovery_max_response_body_bytes = discovery_body_limits.max_response_bytes;
         let service_discovery_max_error_body_bytes = discovery_body_limits.max_error_bytes;
         let service_discovery_body_budget_bytes = discovery_body_limits.body_budget_bytes;
+
+        // Provider-neutral bounded staleness policy (issue #3717). Parsing is
+        // pure here as well; the runtime snapshot is installed once from `main`
+        // before any poller can start.
+        let discovery_staleness = parse_discovery_staleness_policy(
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_STALE_SECONDS_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_STALE_POLICY_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE_KEY).as_deref(),
+        )?;
+        let service_discovery_max_stale_seconds = discovery_staleness.max_stale_seconds;
+        let service_discovery_stale_policy = discovery_staleness.policy;
+        let service_discovery_allow_unbounded_stale = discovery_staleness.allow_unbounded;
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it
@@ -4762,6 +4907,9 @@ impl EnvConfig {
             service_discovery_max_response_body_bytes,
             service_discovery_max_error_body_bytes,
             service_discovery_body_budget_bytes,
+            service_discovery_max_stale_seconds,
+            service_discovery_stale_policy,
+            service_discovery_allow_unbounded_stale,
             tls_cert_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,

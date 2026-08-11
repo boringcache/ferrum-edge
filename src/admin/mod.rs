@@ -2034,9 +2034,19 @@ async fn handle_admin_request_inner(
         let jwks_now = tokio::time::Instant::now();
         let jwks_ready = jwks_trust.ready(jwks_now);
         let jwks_degraded = jwks_trust.degraded(jwks_now);
-        let ready = startup_ready && !serving_degraded && jwks_ready;
+        // Service-discovery task lifecycle and bounded staleness (issues #3717 /
+        // #3721). Readiness fails only for a stale task under the explicit
+        // `fail_readiness` policy; a crash-looping, restarting, or withdrawn
+        // task degrades coarse health without pulling the whole gateway out of
+        // rotation for one upstream's registry outage.
+        let discovery_health = crate::service_discovery::health::aggregate();
+        let discovery_ready = discovery_health.ready();
+        let ready = startup_ready && !serving_degraded && jwks_ready && discovery_ready;
         health_status["ready"] = json!(ready);
         if jwks_degraded && jwks_ready {
+            health_status["status"] = json!("degraded");
+        }
+        if discovery_health.degraded() && discovery_ready {
             health_status["status"] = json!("degraded");
         }
 
@@ -2211,6 +2221,15 @@ async fn handle_admin_request_inner(
                     .unwrap_or_default();
             // Fixed-cardinality active-remote JWKS trust health only — never
             // URLs, kids, tokens, claims, or key material (issue #3739).
+            // Per-upstream discovery lifecycle detail (issues #3717 / #3721).
+            // Upstream identity is operator-configured, so it stays inside the
+            // authenticated tier; every other field is a count, an age, or a
+            // closed-set token — never a registry URL, token, or payload.
+            if crate::service_discovery::health::has_tasks() {
+                health_status["service_discovery"] =
+                    serde_json::to_value(crate::service_discovery::health::snapshot())
+                        .unwrap_or_default();
+            }
             health_status["jwks_trust"] = json!({
                 "fresh": jwks_trust.fresh,
                 "grace": jwks_trust.grace,
@@ -2232,7 +2251,7 @@ async fn handle_admin_request_inner(
             // degradation as "starting". Use the sticky flag instead.
             // Expired active JWKS trust is also an operator-visible outage of a
             // previously-ready dependency, so it shares `unavailable`.
-            health_status["status"] = json!(if serving_degraded || !jwks_ready {
+            health_status["status"] = json!(if serving_degraded || !jwks_ready || !discovery_ready {
                 "unavailable"
             } else {
                 "starting"

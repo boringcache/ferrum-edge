@@ -1362,6 +1362,8 @@ fn test_upstream_service_discovery_dns_sd_validated() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("dns_sd config is required")));
@@ -1377,6 +1379,8 @@ fn test_upstream_service_discovery_mesh_validated() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("mesh config is required")));
@@ -1399,6 +1403,8 @@ fn test_mesh_sd_namespace_must_match_upstream_namespace() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -1426,6 +1432,8 @@ fn test_mesh_sd_namespace_matching_upstream_passes() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -1446,6 +1454,8 @@ fn test_mesh_sd_namespace_omitted_passes() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2182,6 +2192,8 @@ fn test_k8s_port_name_too_long() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2206,6 +2218,8 @@ fn test_k8s_label_selector_too_long() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2232,6 +2246,8 @@ fn test_consul_datacenter_too_long() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2258,6 +2274,8 @@ fn test_consul_tag_too_long() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2284,6 +2302,8 @@ fn test_consul_token_control_chars() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2310,6 +2330,8 @@ fn test_consul_valid_optional_fields() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2330,6 +2352,8 @@ fn test_k8s_valid_optional_fields() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2350,6 +2374,8 @@ fn test_mesh_service_name_required() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2374,6 +2400,8 @@ fn test_mesh_port_zero_rejected() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("mesh.port")));
@@ -2396,6 +2424,8 @@ fn test_mesh_valid_optional_fields() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
