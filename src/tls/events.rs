@@ -6,7 +6,6 @@
 //! restarts.
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -17,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::tls::shared_store::{
-    TlsPersistentStoreKind, TlsStoreIoDirection, read_bounded_document_bytes,
-    record_store_record_count, validate_explicit_store_max_document_bytes,
+    TlsPersistentStoreKind, TlsStoreIoDirection, open_authoritative_document_file,
+    read_bounded_document_bytes, record_store_record_count,
+    validate_explicit_store_max_document_bytes,
 };
 use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterialSource};
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
@@ -145,8 +145,8 @@ impl TlsEventLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let max_document_bytes = crate::config::env_config::tls_store_max_document_bytes_from_env()
-            .map_err(|details| details)?;
+        let max_document_bytes =
+            crate::config::env_config::tls_store_max_document_bytes_from_env()?;
         let mut events = match load_event_log_events(&path, max_document_bytes) {
             Ok(events) => events,
             Err(error) => return Err(error),
@@ -232,22 +232,29 @@ impl TlsEventLog {
     }
 
     pub fn record(&self, mut event: TlsSourceEvent) {
+        // Allocate the id before building the candidate. Gaps after a refused
+        // persist are acceptable; the deque must stay untouched until durable
+        // publication succeeds.
         event.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let Ok(mut events) = self.events.lock() else {
             return;
         };
-        events.push_back(event);
-        while events.len() > self.capacity {
-            events.pop_front();
+        let mut candidate = events.clone();
+        candidate.push_back(event);
+        while candidate.len() > self.capacity {
+            candidate.pop_front();
         }
-        if let Err(error) = self.persist_locked(&events) {
+        if let Err(error) = self.persist_locked(&candidate) {
             warn!(
                 error = %error,
                 "Failed to persist TLS source rotation event"
             );
-        } else {
-            record_store_record_count(TlsPersistentStoreKind::Events, events.len() as u64);
+            // Leave the prior in-memory deque exactly unchanged so a refused
+            // oversized/I/O candidate cannot evict durable history from cache.
+            return;
         }
+        *events = candidate;
+        record_store_record_count(TlsPersistentStoreKind::Events, events.len() as u64);
     }
 
     pub fn list(&self, filter: &TlsEventFilter) -> Vec<TlsSourceEvent> {
@@ -310,20 +317,16 @@ fn load_event_log_events(
     path: &Path,
     max_document_bytes: usize,
 ) -> Result<VecDeque<TlsSourceEvent>, String> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(VecDeque::new());
-        }
+    let mut file = match open_authoritative_document_file(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(VecDeque::new()),
         Err(error) => return Err(error.to_string()),
     };
     if let Ok(metadata) = file.metadata()
         && metadata.len() > max_document_bytes as u64
     {
-        crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
-            TlsPersistentStoreKind::Events,
-            TlsStoreIoDirection::Read,
-        );
+        crate::plugins::prometheus_metrics::global_registry()
+            .record_tls_store_oversized(TlsPersistentStoreKind::Events, TlsStoreIoDirection::Read);
         return Err(format!(
             "TLS event log document exceeds the configured byte ceiling (max {max_document_bytes} bytes)"
         ));
@@ -343,9 +346,8 @@ fn load_event_log_events(
     };
     crate::plugins::prometheus_metrics::global_registry()
         .set_tls_store_document_bytes(TlsPersistentStoreKind::Events, bytes.len() as u64);
-    let parsed = serde_json::from_slice::<TlsEventLogFile>(&bytes).map_err(|_error| {
-        "TLS event log is malformed".to_string()
-    })?;
+    let parsed = serde_json::from_slice::<TlsEventLogFile>(&bytes)
+        .map_err(|_error| "TLS event log is malformed".to_string())?;
     Ok(parsed.events.into_iter().collect())
 }
 

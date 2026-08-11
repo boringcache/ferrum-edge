@@ -47,7 +47,6 @@ use crate::config::types::validate_resource_id;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
     VersionedStoreFile, record_store_admission_rejected, record_store_pruned,
-    record_store_record_count,
 };
 use crate::tls::source::MaterialKind;
 
@@ -614,6 +613,10 @@ impl VersionedStoreFile for AcmeCertificateStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.certificates.len() as u64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -632,6 +635,10 @@ impl VersionedStoreFile for AcmeOrderStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.orders.len() as u64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -649,6 +656,10 @@ impl VersionedStoreFile for AcmeAccountStoreFile {
 
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
+    }
+
+    fn logical_record_count(&self) -> u64 {
+        self.accounts.len() as u64
     }
 }
 
@@ -701,19 +712,16 @@ impl AcmeCertificateStore {
         let max_material_bytes = validate_acme_material_limit(max_material_bytes)?;
         let max_certificates = validate_acme_certificate_limit(max_certificates)?;
         let path = acme_store_path(dir, STORE_FILE_NAME)?;
-        let file = open_shared_acme_store(path, TlsPersistentStoreKind::AcmeCertificates, max_document_bytes)?;
-        let store = Self {
+        let file = open_shared_acme_store(
+            path,
+            TlsPersistentStoreKind::AcmeCertificates,
+            max_document_bytes,
+        )?;
+        Ok(Self {
             file,
             max_material_bytes,
             max_certificates,
-        };
-        if let Ok(document) = store.file.snapshot() {
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeCertificates,
-                document.certificates.len() as u64,
-            );
-        }
-        Ok(store)
+        })
     }
 
     /// Configured logical certificate admission ceiling.
@@ -778,24 +786,21 @@ impl AcmeCertificateStore {
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
-            Ok((record, document.certificates.len() as u64))
+            Ok(record)
         })?;
-        record_store_record_count(TlsPersistentStoreKind::AcmeCertificates, outcome.1);
-        Ok(outcome.0)
+        Ok(outcome)
     }
 
     pub fn delete_certificate(&self, id: &str) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(id)?;
         let id = id.to_string();
-        let outcome = self.file.mutate(move |document| {
+        self.file.mutate(move |document| {
             let removed = document.certificates.remove(&id);
             match removed {
-                Some(record) => Ok((record, document.certificates.len() as u64)),
+                Some(record) => Ok(record),
                 None => Err(AcmeError::NotFound(id)),
             }
-        })?;
-        record_store_record_count(TlsPersistentStoreKind::AcmeCertificates, outcome.1);
-        Ok(outcome.0)
+        })
     }
 
     pub fn material(
@@ -860,8 +865,9 @@ fn open_shared_acme_store<T: VersionedStoreFile>(
 
 impl AcmeOrderStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
-        let terminal_history = crate::config::env_config::tls_acme_terminal_order_history_from_env()
-            .map_err(AcmeError::InvalidConfiguration)?;
+        let terminal_history =
+            crate::config::env_config::tls_acme_terminal_order_history_from_env()
+                .map_err(AcmeError::InvalidConfiguration)?;
         Self::open_with_limits(dir, terminal_history, None)
     }
 
@@ -873,18 +879,12 @@ impl AcmeOrderStore {
     ) -> Result<Self, AcmeError> {
         let terminal_history = validate_acme_terminal_history(terminal_history)?;
         let path = acme_store_path(dir, ORDER_STORE_FILE_NAME)?;
-        let file = open_shared_acme_store(path, TlsPersistentStoreKind::AcmeOrders, max_document_bytes)?;
-        let store = Self {
+        let file =
+            open_shared_acme_store(path, TlsPersistentStoreKind::AcmeOrders, max_document_bytes)?;
+        Ok(Self {
             file,
             terminal_history,
-        };
-        if let Ok(document) = store.file.snapshot() {
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeOrders,
-                document.orders.len() as u64,
-            );
-        }
-        Ok(store)
+        })
     }
 
     /// Configured retained terminal order history per certificate.
@@ -962,25 +962,22 @@ impl AcmeOrderStore {
             }
             document.orders.insert(record.id.clone(), record.clone());
             let pruned = prune_terminal_order_history(document, terminal_history);
-            Ok((record, pruned, document.orders.len() as u64))
+            Ok((record, pruned))
         })?;
         record_store_pruned(outcome.1 as u64);
-        record_store_record_count(TlsPersistentStoreKind::AcmeOrders, outcome.2);
         Ok(outcome.0)
     }
 
     pub fn delete_order(&self, id: &str) -> Result<AcmeOrderRecord, AcmeError> {
         validate_acme_id(id)?;
         let id = id.to_string();
-        let outcome = self.file.mutate(move |document| {
+        self.file.mutate(move |document| {
             let removed = document.orders.remove(&id);
             match removed {
-                Some(record) => Ok((record, document.orders.len() as u64)),
+                Some(record) => Ok(record),
                 None => Err(AcmeError::OrderNotFound(id)),
             }
-        })?;
-        record_store_record_count(TlsPersistentStoreKind::AcmeOrders, outcome.1);
-        Ok(outcome.0)
+        })
     }
 
     /// Key authorization for a pending HTTP-01 token.
@@ -1085,15 +1082,12 @@ impl AcmeAccountStore {
     ) -> Result<Self, AcmeError> {
         let max_accounts = validate_acme_account_limit(max_accounts)?;
         let path = acme_store_path(dir, ACCOUNT_STORE_FILE_NAME)?;
-        let file = open_shared_acme_store(path, TlsPersistentStoreKind::AcmeAccounts, max_document_bytes)?;
-        let store = Self { file, max_accounts };
-        if let Ok(document) = store.file.snapshot() {
-            record_store_record_count(
-                TlsPersistentStoreKind::AcmeAccounts,
-                document.accounts.len() as u64,
-            );
-        }
-        Ok(store)
+        let file = open_shared_acme_store(
+            path,
+            TlsPersistentStoreKind::AcmeAccounts,
+            max_document_bytes,
+        )?;
+        Ok(Self { file, max_accounts })
     }
 
     /// Configured logical account admission ceiling.
@@ -1160,10 +1154,9 @@ impl AcmeAccountStore {
                 last_used_at: Some(now),
             };
             document.accounts.insert(key, record.clone());
-            Ok((record, document.accounts.len() as u64))
+            Ok(record)
         })?;
-        record_store_record_count(TlsPersistentStoreKind::AcmeAccounts, outcome.1);
-        Ok(outcome.0)
+        Ok(outcome)
     }
 }
 
@@ -1619,23 +1612,19 @@ fn order_is_active_or_recoverable(order: &AcmeOrderRecord) -> bool {
 /// Retain all active/recoverable orders plus at most `max_terminal` newest
 /// terminal orders per certificate (or orphan bucket). Returns how many were
 /// removed. Runs under the exclusive mutation lock of the order store.
-fn prune_terminal_order_history(
-    document: &mut AcmeOrderStoreFile,
-    max_terminal: usize,
-) -> usize {
+fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal: usize) -> usize {
     use std::collections::HashMap;
 
-    let mut terminal_by_group: HashMap<String, Vec<(String, DateTime<Utc>)>> = HashMap::new();
+    // Group by `Option<String>` so a corrupt/external `certificate_id` equal to
+    // any sentinel can never collide with the orphan (`None`) bucket.
+    let mut terminal_by_group: HashMap<Option<String>, Vec<(String, DateTime<Utc>)>> =
+        HashMap::new();
     for (id, order) in &document.orders {
         if order_is_active_or_recoverable(order) {
             continue;
         }
-        let group = order
-            .certificate_id
-            .clone()
-            .unwrap_or_else(|| "__orphan__".to_string());
         terminal_by_group
-            .entry(group)
+            .entry(order.certificate_id.clone())
             .or_default()
             .push((id.clone(), order.updated_at));
     }

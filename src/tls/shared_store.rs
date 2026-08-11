@@ -216,6 +216,10 @@ pub trait VersionedStoreFile:
 {
     fn store_version(&self) -> u64;
     fn set_store_version(&mut self, version: u64);
+    /// Logical record cardinality published on successful authoritative reads
+    /// and successful durable publishes. Must not advance on a rejected
+    /// candidate.
+    fn logical_record_count(&self) -> u64;
 }
 
 /// Whether the filesystem exposes an exact *replacement identity* for the store
@@ -363,7 +367,10 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     /// A missing document is an empty store; an unreadable, unparseable, or
     /// oversized one is an error, so a corrupt shared volume is never silently
     /// replaced by an empty local map.
-    pub fn open(path: PathBuf, store_kind: TlsPersistentStoreKind) -> Result<Self, SharedStoreError> {
+    pub fn open(
+        path: PathBuf,
+        store_kind: TlsPersistentStoreKind,
+    ) -> Result<Self, SharedStoreError> {
         Self::open_with_identity_mode(path, StoreIdentityMode::platform_default(), store_kind)
     }
 
@@ -542,15 +549,15 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     /// destination path only ever names a complete, atomically renamed
     /// document.
     fn read_authoritative(&self) -> Result<Arc<T>, SharedStoreError> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        let mut file = match open_authoritative_document_file(&self.path)? {
+            Some(file) => file,
+            None => {
                 let value = Arc::new(T::default());
                 self.publish_cached(value.clone(), None, None)?;
                 record_store_document_bytes(self.store_kind, 0);
+                record_store_record_count(self.store_kind, value.logical_record_count());
                 return Ok(value);
             }
-            Err(error) => return Err(SharedStoreError::read(&self.path, error)),
         };
         // Stamp from the open handle so it describes exactly the bytes read,
         // not whatever the path may point at by the time the read finishes.
@@ -568,15 +575,15 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         let stamp = stamp
             .as_ref()
             .map(|metadata| FileStamp::from_metadata(metadata, self.identity_mode));
-        let bytes = match read_bounded_document_bytes(&mut file, &self.path, self.max_document_bytes)
-        {
-            Ok(bytes) => bytes,
-            Err(error @ SharedStoreError::Oversized { .. }) => {
-                record_store_oversized(self.store_kind, TlsStoreIoDirection::Read);
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+        let bytes =
+            match read_bounded_document_bytes(&mut file, &self.path, self.max_document_bytes) {
+                Ok(bytes) => bytes,
+                Err(error @ SharedStoreError::Oversized { .. }) => {
+                    record_store_oversized(self.store_kind, TlsStoreIoDirection::Read);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
         // A document that does not parse is an error. A partially written one
         // cannot be observed (rename is atomic), so this is real corruption and
         // must never degrade to an empty local map.
@@ -584,6 +591,7 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
             .map_err(|error| SharedStoreError::parse(&self.path, error))?;
         let value = Arc::new(parsed);
         record_store_document_bytes(self.store_kind, bytes.len() as u64);
+        record_store_record_count(self.store_kind, value.logical_record_count());
         self.publish_cached(value.clone(), stamp, Some(file))?;
         Ok(value)
     }
@@ -598,7 +606,8 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
                 TlsStoreAdmissionReason::DocumentBytes,
             );
             // Fail before rename so the previous authoritative document and the
-            // in-process cache remain intact.
+            // in-process cache remain intact. Rejected candidates must not move
+            // the record-count gauge ahead of durable state.
             return Err(SharedStoreError::oversized(
                 &self.path,
                 self.max_document_bytes,
@@ -610,12 +619,15 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         // Pin the freshly published inode the same way a read does. If it
         // cannot be reopened the cache simply records no stamp, which makes
         // every later read re-read — degraded, never stale.
-        let pinned = File::open(&self.path).ok();
+        let pinned = open_authoritative_document_file(&self.path)
+            .ok()
+            .and_then(|opened| opened);
         let stamp = pinned
             .as_ref()
             .and_then(|file| file.metadata().ok())
             .map(|metadata| FileStamp::from_metadata(&metadata, self.identity_mode));
         record_store_document_bytes(self.store_kind, payload.len() as u64);
+        record_store_record_count(self.store_kind, value.logical_record_count());
         self.publish_cached(Arc::new(value.clone()), stamp, pinned)
     }
 
@@ -706,6 +718,45 @@ pub fn validate_explicit_store_max_document_bytes(
         });
     }
     Ok(max_bytes.min(crate::config::env_config::HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES))
+}
+
+/// Open a durable TLS document for an authoritative bounded read.
+///
+/// Returns `Ok(None)` when the path is absent. On Unix the open uses
+/// `O_NONBLOCK` so a FIFO/special path cannot hang before the post-open
+/// regular-file check and bounded `limit+1` reader run. The regular-file
+/// verdict comes from the opened descriptor's own metadata (not a racy path
+/// precheck). Errors are content-free aside from the operator-configured path.
+pub fn open_authoritative_document_file(path: &Path) -> Result<Option<File>, SharedStoreError> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SharedStoreError::read(path, error)),
+        }
+    };
+    #[cfg(not(unix))]
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SharedStoreError::read(path, error)),
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| SharedStoreError::read(path, error))?;
+    if !metadata.is_file() {
+        // Stable, content-free refusal: never echo whatever a special file
+        // might produce if a blocking open had succeeded.
+        return Err(SharedStoreError::read(path, "path is not a regular file"));
+    }
+    Ok(Some(file))
 }
 
 /// Read at most `max_bytes + 1` from `reader`, rejecting without retaining an

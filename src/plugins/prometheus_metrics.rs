@@ -821,16 +821,17 @@ pub struct MetricsRegistry {
     pub tls_cert_rotation_counter: DashMap<TlsCertRotationKey, TimestampedCounter>,
     /// Current serialized byte length of each persistent TLS store document.
     /// Fixed cardinality: one gauge per [`crate::tls::shared_store::TlsPersistentStoreKind`].
-    tls_store_document_bytes: [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL
-        .len()],
+    tls_store_document_bytes:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
     /// Current logical record count for each persistent TLS store.
-    tls_store_record_count: [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    tls_store_record_count:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
     /// Oversized read/write refusals by store kind and I/O direction.
-    tls_store_oversized_total: [[AtomicU64; 2];
-        crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    tls_store_oversized_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
     /// Logical admission refusals by store kind and fixed reason.
-    tls_store_admission_rejected_total: [[AtomicU64; 2];
-        crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    tls_store_admission_rejected_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
     /// Terminal ACME order history entries pruned under the exclusive mutation lock.
     tls_store_pruned_total: AtomicU64,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
@@ -1742,6 +1743,15 @@ impl MetricsRegistry {
     ) {
         self.tls_store_record_count[kind.index()].store(count, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Fixed-cardinality test/operator seam for the current logical record
+    /// count gauge of one persistent TLS store.
+    pub fn current_tls_store_record_count(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+    ) -> u64 {
+        self.tls_store_record_count[kind.index()].load(Ordering::Relaxed)
     }
 
     pub fn record_tls_store_oversized(

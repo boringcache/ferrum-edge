@@ -33,6 +33,10 @@ impl VersionedStoreFile for ProbeDocument {
     fn set_store_version(&mut self, version: u64) {
         self.version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        u64::from(!self.value.is_empty())
+    }
 }
 
 fn document_bytes(value: &str) -> Vec<u8> {

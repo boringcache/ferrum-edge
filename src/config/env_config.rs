@@ -204,9 +204,10 @@ fn parse_bounded_usize_setting(
 ) -> Result<usize, String> {
     let value = match raw {
         None => return Ok(default),
-        Some(value) => value.trim().parse::<usize>().map_err(|_| {
-            format!("{key} must be a whole number; the configured value is not")
-        })?,
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("{key} must be a whole number; the configured value is not"))?,
     };
     if value < min {
         return Err(match zero_means {

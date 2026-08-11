@@ -74,7 +74,6 @@ use uuid::Uuid;
 
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, VersionedStoreFile,
-    record_store_record_count,
 };
 
 const LEASE_STORE_FILE_NAME: &str = "tls-leases.json";
@@ -151,6 +150,10 @@ impl VersionedStoreFile for TlsLeaseStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.leases.len() as u64
+    }
 }
 
 /// Shared lease table for one managed-TLS store directory.
@@ -191,10 +194,10 @@ impl TlsLeaseStore {
                 dir.display()
             ))
         })?;
-        let file = SharedStoreFile::open(dir.join(LEASE_STORE_FILE_NAME), TlsPersistentStoreKind::Leases)?;
-        if let Ok(document) = file.snapshot() {
-            record_store_record_count(TlsPersistentStoreKind::Leases, document.leases.len() as u64);
-        }
+        let file: SharedStoreFile<TlsLeaseStoreFile> = SharedStoreFile::open(
+            dir.join(LEASE_STORE_FILE_NAME),
+            TlsPersistentStoreKind::Leases,
+        )?;
         Ok(Self { holder, file })
     }
 
@@ -258,7 +261,6 @@ impl TlsLeaseStore {
         let Some(fence) = fence else {
             return Ok(None);
         };
-        self.publish_lease_record_count();
         Ok(Some(TlsLeaseGuard {
             store: Arc::clone(self),
             name: name.to_string(),
@@ -306,9 +308,6 @@ impl TlsLeaseStore {
             existing.expires_at = now + lease_delta(ttl);
             Ok((true, true))
         })?;
-        if renewed {
-            self.publish_lease_record_count();
-        }
         Ok(renewed)
     }
 
@@ -379,19 +378,7 @@ impl TlsLeaseStore {
             existing.expires_at = Utc::now();
             Ok((true, true))
         })?;
-        if released {
-            self.publish_lease_record_count();
-        }
         Ok(released)
-    }
-
-    fn publish_lease_record_count(&self) {
-        if let Ok(document) = self.file.snapshot() {
-            record_store_record_count(
-                TlsPersistentStoreKind::Leases,
-                document.leases.len() as u64,
-            );
-        }
     }
 }
 

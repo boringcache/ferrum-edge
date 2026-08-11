@@ -27,7 +27,7 @@ use x509_parser::prelude::*;
 use crate::config::types::validate_resource_id;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
-    VersionedStoreFile, record_store_admission_rejected, record_store_record_count,
+    VersionedStoreFile, record_store_admission_rejected,
 };
 use crate::tls::source::MaterialKind;
 
@@ -225,6 +225,10 @@ impl VersionedStoreFile for ManagedTlsStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.records.len() as u64
+    }
 }
 
 #[derive(Debug)]
@@ -290,12 +294,6 @@ impl ManagedTlsStore {
             max_material_bytes,
             max_records,
         };
-        if let Ok(document) = store.file.snapshot() {
-            record_store_record_count(
-                TlsPersistentStoreKind::Managed,
-                document.records.len() as u64,
-            );
-        }
         Ok(store)
     }
 
@@ -374,26 +372,21 @@ impl ManagedTlsStore {
                 record.updated_at = now;
             }
             document.records.insert(record.id.clone(), record.clone());
-            // Publish the gauge only after durable publication succeeds so a
-            // refused oversized candidate cannot leave counts ahead of state.
-            Ok((record, document.records.len() as u64))
+            Ok(record)
         })?;
-        record_store_record_count(TlsPersistentStoreKind::Managed, outcome.1);
-        Ok(outcome.0)
+        Ok(outcome)
     }
 
     pub fn delete(&self, id: &str) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(id)?;
         let id = id.to_string();
-        let outcome = self.file.mutate(move |document| {
+        self.file.mutate(move |document| {
             let removed = document.records.remove(&id);
             match removed {
-                Some(record) => Ok((record, document.records.len() as u64)),
+                Some(record) => Ok(record),
                 None => Err(ManagedTlsError::NotFound(id)),
             }
-        })?;
-        record_store_record_count(TlsPersistentStoreKind::Managed, outcome.1);
-        Ok(outcome.0)
+        })
     }
 
     #[allow(dead_code)] // External unit tests; production uses material_with_limit.

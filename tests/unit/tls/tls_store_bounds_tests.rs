@@ -4,7 +4,8 @@
 //! on oversized candidate writes, managed create vs overwrite/delete at the
 //! logical record limit, ACME active/recoverable retention with bounded terminal
 //! history across thousands of renewal cycles, bounded event-log load/compaction,
-//! secret-safe oversized diagnostics, multi-process atomic visibility, and
+//! secret-safe oversized diagnostics, true OS-process atomic visibility, FIFO
+//! open fail-closed without hang, replica record-count gauge refresh, and
 //! config/docs/metric inventory parity.
 
 use std::io::Cursor;
@@ -24,10 +25,12 @@ use ferrum_edge::config::env_config::{
 };
 use ferrum_edge::config::public_env_inventory::PUBLIC_FERRUM_ENV_SETTINGS;
 use ferrum_edge::tls::acme::{
-    AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStatus, AcmeCertificateStore, AcmeError,
-    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
+    AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStatus, AcmeCertificateStore,
+    AcmeError, AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
 };
-use ferrum_edge::tls::events::{TlsEventFilter, TlsEventLog, TlsSourceEvent, TlsSourceEventMaterial};
+use ferrum_edge::tls::events::{
+    TlsEventFilter, TlsEventLog, TlsSourceEvent, TlsSourceEventMaterial,
+};
 use ferrum_edge::tls::managed::{ManagedTlsError, ManagedTlsRecord, ManagedTlsStore};
 use ferrum_edge::tls::shared_store::{
     SharedStoreError, SharedStoreFile, StoreIdentityMode, TlsPersistentStoreKind,
@@ -57,6 +60,10 @@ impl VersionedStoreFile for ProbeDocument {
     fn set_store_version(&mut self, version: u64) {
         self.version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        u64::from(!self.value.is_empty())
+    }
 }
 
 fn open_probe(
@@ -67,6 +74,20 @@ fn open_probe(
         path,
         StoreIdentityMode::platform_default(),
         TlsPersistentStoreKind::Managed,
+        max_document_bytes,
+    )
+    .expect("open probe store")
+}
+
+fn open_probe_kind(
+    path: std::path::PathBuf,
+    max_document_bytes: usize,
+    kind: TlsPersistentStoreKind,
+) -> SharedStoreFile<ProbeDocument> {
+    SharedStoreFile::open_with_limits(
+        path,
+        StoreIdentityMode::platform_default(),
+        kind,
         max_document_bytes,
     )
     .expect("open probe store")
@@ -111,8 +132,7 @@ fn sample_certificate(id: &str) -> AcmeCertificateRecord {
         account_id: Some("acct".to_string()),
         order_url: Some(format!("https://acme.example.test/order/{id}")),
         status: AcmeCertificateStatus::Issued,
-        cert_pem: "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n"
-            .to_string(),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n".to_string(),
         key_pem: "-----BEGIN PRIVATE KEY-----\nYQ==\n-----END PRIVATE KEY-----\n".to_string(),
         chain_pem: None,
         issued_at: Some(now),
@@ -305,10 +325,7 @@ fn shared_store_rejects_oversized_on_disk_without_replacing_cache() {
 
     // Replace the on-disk document with an oversized payload without going
     // through the store writer, simulating corruption / hostile rewrite.
-    let oversized = format!(
-        r#"{{"version":9,"value":"{}"}}"#,
-        "Z".repeat(DOC_LIMIT + 1)
-    );
+    let oversized = format!(r#"{{"version":9,"value":"{}"}}"#, "Z".repeat(DOC_LIMIT + 1));
     assert!(oversized.len() > DOC_LIMIT);
     std::fs::write(&path, oversized.as_bytes()).expect("write oversized");
 
@@ -554,8 +571,8 @@ fn event_log_bounds_load_and_compacts_atomically() {
         log.record(event_with("cert-d"));
     }
 
-    let reloaded = TlsEventLog::open_with_document_limit(2, Some(path.clone()), 64 * 1024)
-        .expect("reload");
+    let reloaded =
+        TlsEventLog::open_with_document_limit(2, Some(path.clone()), 64 * 1024).expect("reload");
     let events = reloaded.list(&TlsEventFilter::default());
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].sources[0].cert_id, "cert-c");
@@ -570,31 +587,178 @@ fn event_log_bounds_load_and_compacts_atomically() {
 }
 
 #[test]
+fn event_log_oversized_candidate_leaves_prior_live_and_durable_state_intact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tls-events.json");
+    let log =
+        TlsEventLog::open_with_document_limit(4, Some(path.clone()), 4 * 1024).expect("open");
+    log.record(event_with("seed-a"));
+    log.record(event_with("seed-b"));
+    let before = log.list(&TlsEventFilter::default());
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].sources[0].cert_id, "seed-a");
+    assert_eq!(before[1].sources[0].cert_id, "seed-b");
+    let before_ids: Vec<u64> = before.iter().map(|event| event.id).collect();
+
+    // One event whose serialized form alone exceeds the document ceiling.
+    let mut oversized = event_with("too-large");
+    oversized.error = Some("E".repeat(8 * 1024));
+    log.record(oversized);
+
+    let live = log.list(&TlsEventFilter::default());
+    assert_eq!(live.len(), 2);
+    assert_eq!(
+        live.iter().map(|event| event.id).collect::<Vec<_>>(),
+        before_ids
+    );
+    assert_eq!(live[0].sources[0].cert_id, "seed-a");
+    assert_eq!(live[1].sources[0].cert_id, "seed-b");
+
+    let reopened = TlsEventLog::open_with_document_limit(4, Some(path), 4 * 1024)
+        .expect("reopen prior document");
+    let reloaded = reopened.list(&TlsEventFilter::default());
+    assert_eq!(reloaded.len(), 2);
+    assert_eq!(
+        reloaded.iter().map(|event| event.id).collect::<Vec<_>>(),
+        before_ids
+    );
+    assert_eq!(reloaded[0].sources[0].cert_id, "seed-a");
+    assert_eq!(reloaded[1].sources[0].cert_id, "seed-b");
+}
+
+#[test]
+fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
+    use ferrum_edge::plugins::prometheus_metrics::global_registry;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("probe-store.json");
+    // Use the leases kind so this gauge assertion is less likely to race with
+    // concurrent managed/ACME store tests that share process-global metrics.
+    let kind = TlsPersistentStoreKind::Leases;
+    let writer = open_probe_kind(path.clone(), DOC_LIMIT, kind);
+    let reader = open_probe_kind(path, DOC_LIMIT, kind);
+    assert_eq!(global_registry().current_tls_store_record_count(kind), 0);
+
+    writer
+        .mutate(|document| {
+            document.value = "replica-visible".to_string();
+            Ok::<_, SharedStoreError>(())
+        })
+        .expect("writer publish");
+    assert_eq!(global_registry().current_tls_store_record_count(kind), 1);
+
+    // A second handle observing the other handle's generation must refresh the
+    // logical record count, not only document bytes.
+    let seen = reader.snapshot().expect("reader observes writer");
+    assert_eq!(seen.value, "replica-visible");
+    assert_eq!(global_registry().current_tls_store_record_count(kind), 1);
+
+    let refused = writer
+        .mutate(|document| {
+            document.value = "X".repeat(DOC_LIMIT + 64);
+            Ok::<_, SharedStoreError>(())
+        })
+        .expect_err("oversized candidate");
+    assert!(matches!(
+        refused,
+        SharedStoreError::Oversized {
+            direction: TlsStoreIoDirection::Write,
+            ..
+        }
+    ));
+    assert_eq!(
+        global_registry().current_tls_store_record_count(kind),
+        1,
+        "rejected candidate must not advance the gauge"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_store_and_event_log_reject_fifo_promptly_without_hanging() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_fifo = dir.path().join("store.fifo");
+    let events_fifo = dir.path().join("events.fifo");
+    for path in [&store_fifo, &events_fifo] {
+        let path_c = CString::new(path.as_os_str().as_bytes()).expect("c path");
+        // SAFETY: `path_c` is a live NUL-terminated path; mode is ordinary perms.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        if !watchdog_done.load(AtomicOrdering::SeqCst) {
+            panic!("FIFO open hung past the watchdog budget");
+        }
+    });
+
+    let store_error = SharedStoreFile::<ProbeDocument>::open_with_limits(
+        store_fifo,
+        StoreIdentityMode::platform_default(),
+        TlsPersistentStoreKind::Managed,
+        DOC_LIMIT,
+    )
+    .expect_err("shared store FIFO must refuse");
+    let store_rendered = store_error.to_string();
+    assert!(
+        store_rendered.contains("not a regular file") || store_rendered.contains("failed to read"),
+        "{store_rendered}"
+    );
+    assert!(!store_rendered.contains("BEGIN "));
+
+    let event_error = TlsEventLog::open_with_document_limit(2, Some(events_fifo), DOC_LIMIT)
+        .expect_err("event log FIFO must refuse");
+    assert!(
+        event_error.contains("not a regular file") || event_error.contains("failed to read"),
+        "{event_error}"
+    );
+    assert!(!event_error.contains("BEGIN "));
+
+    done.store(true, AtomicOrdering::SeqCst);
+    watchdog.join().expect("watchdog joins");
+}
+
+#[test]
 fn multi_process_mutation_is_atomic_and_visible() {
+    const CHILD_DIR_ENV: &str = "FERRUM_TEST_TLS_STORE_BOUNDS_CHILD_DIR";
+    const TEST_NAME: &str =
+        "unit::tls::tls_store_bounds_tests::multi_process_mutation_is_atomic_and_visible";
+
+    if let Ok(dir) = std::env::var(CHILD_DIR_ENV) {
+        let store =
+            ManagedTlsStore::open_with_limits(&dir, 64 * 1024, 64, None).expect("child open");
+        for index in 0..20 {
+            let id = format!("rec-{index}");
+            store
+                .upsert(sample_managed(&id), true)
+                .unwrap_or_else(|error| panic!("upsert {id}: {error}"));
+            thread::sleep(Duration::from_millis(1));
+        }
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-    let store_a = Arc::new(
-        ManagedTlsStore::open_with_limits(&path, 64 * 1024, 64, None).expect("open a"),
-    );
-    let store_b = Arc::new(
-        ManagedTlsStore::open_with_limits(&path, 64 * 1024, 64, None).expect("open b"),
-    );
+    let store_b =
+        ManagedTlsStore::open_with_limits(&path, 64 * 1024, 64, None).expect("parent open");
 
-    let writer = {
-        let store_a = Arc::clone(&store_a);
-        thread::spawn(move || {
-            for index in 0..20 {
-                let id = format!("rec-{index}");
-                store_a
-                    .upsert(sample_managed(&id), true)
-                    .unwrap_or_else(|error| panic!("upsert {id}: {error}"));
-                thread::sleep(Duration::from_millis(1));
-            }
-        })
-    };
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut child = std::process::Command::new(exe)
+        .env(CHILD_DIR_ENV, &path)
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn OS-process writer child");
 
     let mut saw_partial_json = false;
-    for _ in 0..40 {
+    for _ in 0..200 {
         match store_b.get("rec-5") {
             Ok(record) => {
                 assert_eq!(record.id, "rec-5");
@@ -608,8 +772,16 @@ fn multi_process_mutation_is_atomic_and_visible() {
             }
             Err(error) => panic!("unexpected reader error: {error}"),
         }
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(Duration::from_millis(5));
     }
-    writer.join().expect("writer joins");
-    store_b.get("rec-19").expect("final record visible");
+
+    let output = child.wait_with_output().expect("wait for writer child");
+    assert!(
+        output.status.success(),
+        "child writer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    store_b
+        .get("rec-19")
+        .expect("final record visible across OS processes");
 }
