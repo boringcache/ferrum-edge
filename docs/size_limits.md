@@ -22,6 +22,9 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_TLS_ACME_MAX_CERTIFICATES` | `usize` | `1024` | Logical create ceiling for ACME certificates. |
 | `FERRUM_TLS_ACME_MAX_ACCOUNTS` | `usize` | `256` | Logical create ceiling for ACME accounts. |
 | `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | `usize` | `16` | Per-certificate terminal ACME order history retention; active/recoverable orders are never pruned. |
+| `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4MB) | Per-response Kubernetes/Consul discovery success-body ceiling. Hard maximum 16 MiB; `0` is rejected (not unlimited). See [Service Discovery Response Body Ceilings](#service-discovery-response-body-ceilings). |
+| `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4KB) | Independent discovery error-body ceiling. Hard maximum 64 KiB; must be `<=` the success ceiling; `0` is rejected. |
+| `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32MB) | Concurrent discovery-body budget across pollers. Hard maximum 256 MiB; must be `>=` the success ceiling; `0` is rejected. |
 
 ## Enforcement Layers
 
@@ -148,6 +151,28 @@ Enforcement rules:
 - **Recovery.** Quarantine or replace an oversized/corrupt document with a known-good backup from the shared volume. Do not truncate live material in place and do not empty a store that still holds active certificates or recoverable ACME finalization packages. Diagnostics never echo PEM, keys, domains, or account credentials.
 
 See also [frontend_tls.md](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas).
+
+## Service Discovery Response Body Ceilings
+
+Kubernetes EndpointSlice and Consul health discovery responses are control-plane snapshots buffered before JSON parse. Proxy request/response size limits do **not** cover these registry polls. Ferrum enforces:
+
+| Variable | Type | Default | Hard maximum | Description |
+|----------|------|---------|--------------|-------------|
+| `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4 MiB) | `16777216` (16 MiB) | Per-response success-body ceiling for Kubernetes and Consul. |
+| `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4 KiB) | `65536` (64 KiB) | Independent error-body ceiling; must be `<=` the success ceiling. |
+| `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32 MiB) | `268435456` (256 MiB) | Concurrent retained-body budget across all discovery pollers; must be `>=` the success ceiling. |
+
+Enforcement rules:
+
+- **Content-Length fast path.** Every present `Content-Length` field line (and every comma-folded member) must parse and agree. An exact agreed length above the role ceiling is refused before any chunk is retained. Ambiguous or disagreeing framing fails closed (never treated as unknown length).
+- **Streaming.** Chunked / missing-length bodies are counted chunk-by-chunk and abort before retaining `limit + 1` bytes. Collectors never call unbounded `Response::{text,json,bytes}` first.
+- **Shared budget.** Each retained byte range charges a cancellation-safe permit **before** append; permits release on every error and drop path. Small bodies charge only their actual size. The collector does **not** pre-allocate from an untrusted `Content-Length` outside this budget.
+- **Error bodies.** Non-success responses are drained under the tighter error ceiling and discarded. Fixed provider/status diagnostics are emitted; body bytes, URLs, tokens, and headers are never logged.
+- **Finite only.** `0` is rejected (not unlimited). Values above each hard maximum clamp down. A malformed value fails closed.
+- **Parse vs publish.** `EnvConfig` parsing validates these ceilings without installing process-global state. Production startup publishes the accepted snapshot once before any discovery poller runs (identical reinstall accepted; mismatch fails closed).
+- **Fail closed.** Oversized, budget-exhausted, and malformed Kubernetes envelopes retain the last admitted `LoadBalancerCache` targets and any pending Consul `X-Consul-Index` cursor.
+
+See also [configuration.md](configuration.md#service-discovery).
 
 ## Error Responses
 

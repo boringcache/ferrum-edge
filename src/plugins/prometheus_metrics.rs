@@ -737,6 +737,14 @@ pub struct MetricsRegistry {
     service_discovery_cursor_rollback: AtomicU64,
     /// Blocking-query cursor advances after an admitted higher-index snapshot.
     service_discovery_cursor_advance: AtomicU64,
+    /// Discovery HTTP responses rejected for oversized / ambiguous body bounds.
+    service_discovery_response_oversized: AtomicU64,
+    /// Discovery HTTP responses rejected because the concurrent body budget
+    /// could not admit the next byte range.
+    service_discovery_body_budget_rejected: AtomicU64,
+    /// Kubernetes EndpointSliceList envelopes rejected as malformed (missing /
+    /// null / non-array `items`, invalid JSON, incompatible top-level shape).
+    service_discovery_malformed_envelope: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -926,6 +934,9 @@ impl MetricsRegistry {
             service_discovery_shared_admission_rejected: AtomicU64::new(0),
             service_discovery_cursor_rollback: AtomicU64::new(0),
             service_discovery_cursor_advance: AtomicU64::new(0),
+            service_discovery_response_oversized: AtomicU64::new(0),
+            service_discovery_body_budget_rejected: AtomicU64::new(0),
+            service_discovery_malformed_envelope: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -1437,7 +1448,25 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    // Test-crate observation seams for issue #3719 counters.
+    pub fn record_service_discovery_response_oversized(&self) {
+        self.service_discovery_response_oversized
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_body_budget_rejected(&self) {
+        self.service_discovery_body_budget_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_malformed_envelope(&self) {
+        self.service_discovery_malformed_envelope
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
     #[allow(dead_code)]
     pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
         self.service_discovery_provider_normalization_rejected
@@ -1459,6 +1488,24 @@ impl MetricsRegistry {
     #[allow(dead_code)]
     pub fn service_discovery_cursor_advance_total(&self) -> u64 {
         self.service_discovery_cursor_advance
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_response_oversized_total(&self) -> u64 {
+        self.service_discovery_response_oversized
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_body_budget_rejected_total(&self) -> u64 {
+        self.service_discovery_body_budget_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_malformed_envelope_total(&self) -> u64 {
+        self.service_discovery_malformed_envelope
             .load(Ordering::Relaxed)
     }
 
@@ -3082,8 +3129,14 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
-        // Service-discovery admission / cursor events (aggregate, label-safe).
+        // Service-discovery admission / cursor / body-bound events (aggregate, label-safe).
         for (name, help, value) in [
+            (
+                "ferrum_service_discovery_body_budget_rejected_total",
+                "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+                self.service_discovery_body_budget_rejected
+                    .load(Ordering::Relaxed),
+            ),
             (
                 "ferrum_service_discovery_cursor_advance_total",
                 "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
@@ -3097,9 +3150,21 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed),
             ),
             (
+                "ferrum_service_discovery_malformed_envelope_total",
+                "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+                self.service_discovery_malformed_envelope
+                    .load(Ordering::Relaxed),
+            ),
+            (
                 "ferrum_service_discovery_provider_normalization_rejected_total",
                 "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
                 self.service_discovery_provider_normalization_rejected
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_response_oversized_total",
+                "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
+                self.service_discovery_response_oversized
                     .load(Ordering::Relaxed),
             ),
             (
