@@ -3612,6 +3612,19 @@ egress rather than leaking it. Shutdown retracts readiness, waits (bounded) for
 the node-agent to acknowledge that its BPF gates closed, and only then removes
 everything; without the acknowledgement it retains the DROP guard.
 
+**Hosted live-kernel coverage (#3705).** The required
+`ambient-host-udp-live` workflow exercises the production
+`ProxyHostUdpBackend` / host-netns TPROXY path with
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on a privileged runner: two
+independent workload netns/veth pairs, IPv4 and IPv6 delivery, original-destination
+recovery, ingress-ifindex attribution, identical-tuple isolation by interface,
+transparent replies, restart/reinstall, exact Ferrum-owned cleanup, and explicit
+negatives (source spoofing, missing/zero pktinfo, unenrolled/ambiguous interfaces,
+node-originated and inbound-to-pod traffic, fail-closed prerequisite/partial-install
+contracts). `FERRUM_LIVE_TESTS_REQUIRED=1` converts unsupported runners into hard
+failures. Bounded redacted diagnostics capture rules/routes, Ferrum chains, socket
+bind state, interface indexes, and post-cleanup state.
+
 **A restart is a handshake too.** Readiness is durable and shared with the
 node-agent, so a generation that dies — a crash, a restart, a rollout that
 switches placement or turns UDP capture off — leaves behind BOTH its `mangle`

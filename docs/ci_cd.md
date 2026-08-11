@@ -41,6 +41,7 @@ adding, removing, or materially changing a workflow.
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
+| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Path-filtered PRs, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`). |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -533,6 +534,23 @@ observational while NodeWaypoint remains Experimental; they are not part of the
 release-blocking sidecar GA contract. The workflow uploads Kubernetes
 diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 `bpftool` evidence with 14-day retention.
+
+#### 5b. Ambient Host-Network UDP Live-Kernel Workflow
+
+**Runs**: `ubuntu-24.04`
+
+`ambient-host-udp-live` runs on PRs that touch host-UDP capture, mesh UDP
+serving, capture plan generators, Ambient mesh serving, Helm mesh charts, the
+live fixture, or related docs. It builds the lib and functional test binaries
+(without running them as the invoking user), preflights `unshare` /
+`iptables` / `ip6tables` / TPROXY primitives, then runs
+`tests/k8s/ambient_host_udp_live/run.sh` as root with
+`FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
+`ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
+destination recovery, ingress-ifindex attribution, transparent replies,
+restart/cleanup ownership, and explicit negative cases. Skips under required
+mode are hard failures. Bounded redacted diagnostics are uploaded with 14-day
+retention.
 
 #### 6. Performance Regression Job
 

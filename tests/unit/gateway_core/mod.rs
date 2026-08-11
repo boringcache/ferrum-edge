@@ -1,4 +1,5 @@
 mod adaptive_buffer_tests;
+mod ambient_host_udp_live_contract_tests;
 mod allowed_methods_logging_tests;
 mod backend_capability_commit_tests;
 mod backend_capability_probe_merge_tests;

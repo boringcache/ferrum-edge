@@ -1,0 +1,149 @@
+name: Ambient Host UDP Live Kernel
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/ambient-host-udp-live.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/scripts/pr_ci_plan.py"
+      - ".github/scripts/live_suite_path_filter.py"
+      - ".github/actions/setup-rust-ci/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "proto/**"
+      - "src/capture/**"
+      - "src/modes/mesh/**"
+      - "src/proxy/host_udp_capture.rs"
+      - "src/proxy/host_udp_capture_live_tests.rs"
+      - "src/proxy/mesh_udp_capture.rs"
+      - "src/proxy/netns_capture.rs"
+      - "src/proxy/netns_udp_capture.rs"
+      - "src/proxy/udp_batch.rs"
+      - "src/proxy/udp_placement_migration.rs"
+      - "src/proxy/mod.rs"
+      - "src/socket_opts.rs"
+      - "src/ebpf/veth.rs"
+      - "charts/ferrum-mesh/**"
+      - "tests/k8s/ambient_host_udp_live/**"
+      - "tests/functional/functional_mesh_mode_test.rs"
+      - "tests/unit/gateway_core/mesh_host_udp_capture_plan_tests.rs"
+      - "tests/unit/gateway_core/ambient_host_udp_live_contract_tests.rs"
+      - "tests/integration/mesh_k8s_pod_discovery/host_udp_capture_tests.rs"
+      - "docs/mesh.md"
+      - "docs/tcp_udp_proxy.md"
+      - "docs/configuration.md"
+      - "docs/node_agent.md"
+      - "docs/ci_cd.md"
+  merge_group:
+    paths:
+      - ".github/workflows/ambient-host-udp-live.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/scripts/pr_ci_plan.py"
+      - ".github/scripts/live_suite_path_filter.py"
+      - ".github/actions/setup-rust-ci/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "proto/**"
+      - "src/capture/**"
+      - "src/modes/mesh/**"
+      - "src/proxy/host_udp_capture.rs"
+      - "src/proxy/host_udp_capture_live_tests.rs"
+      - "src/proxy/mesh_udp_capture.rs"
+      - "src/proxy/netns_capture.rs"
+      - "src/proxy/netns_udp_capture.rs"
+      - "src/proxy/udp_batch.rs"
+      - "src/proxy/udp_placement_migration.rs"
+      - "src/proxy/mod.rs"
+      - "src/socket_opts.rs"
+      - "src/ebpf/veth.rs"
+      - "charts/ferrum-mesh/**"
+      - "tests/k8s/ambient_host_udp_live/**"
+      - "tests/functional/functional_mesh_mode_test.rs"
+      - "tests/unit/gateway_core/mesh_host_udp_capture_plan_tests.rs"
+      - "tests/unit/gateway_core/ambient_host_udp_live_contract_tests.rs"
+      - "tests/integration/mesh_k8s_pod_discovery/host_udp_capture_tests.rs"
+      - "docs/mesh.md"
+      - "docs/tcp_udp_proxy.md"
+      - "docs/configuration.md"
+      - "docs/node_agent.md"
+      - "docs/ci_cd.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ambient-host-udp-live-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ambient-host-udp-live:
+    name: Ambient host-network UDP live-kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-ambient-host-udp-live"
+
+      - name: Build live test binaries
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --lib --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          echo "lib_test_bin=${bins[0]}" >> "$GITHUB_OUTPUT"
+
+          cargo build --bin ferrum-edge
+          mapfile -t functional_bins < <(
+            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+          )
+          if [ "${#functional_bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one functional test binary, found %s:\n' "${#functional_bins[@]}" >&2
+            printf '%s\n' "${functional_bins[@]}" >&2
+            exit 1
+          fi
+          echo "functional_test_bin=${functional_bins[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight privileged host-UDP primitives
+        run: |
+          set -euo pipefail
+          sudo -n true
+          for bin in unshare nsenter setpriv timeout ip iptables ip6tables iptables-save; do
+            command -v "$bin" >/dev/null 2>&1 || {
+              echo "::error::$bin is required for ambient host-UDP live tests"
+              exit 1
+            }
+          done
+          sudo unshare --net sh -c 'ip link set lo up 2>/dev/null || true; iptables -t mangle -L >/dev/null; ip6tables -t mangle -L >/dev/null'
+
+      - name: Run ambient host-UDP live gate as root
+        env:
+          FERRUM_LIVE_TESTS_REQUIRED: "1"
+          FERRUM_HOST_UDP_LIB_TEST_BIN: ${{ steps.build_test_bin.outputs.lib_test_bin }}
+          FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN: ${{ steps.build_test_bin.outputs.functional_test_bin }}
+          FERRUM_HOST_UDP_LIVE_RESULTS: ${{ github.workspace }}/target/ambient-host-udp-live
+        run: sudo -E tests/k8s/ambient_host_udp_live/run.sh
+
+      - name: Upload bounded diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ambient-host-udp-live-results
+          path: target/ambient-host-udp-live
+          if-no-files-found: warn
+          retention-days: 14

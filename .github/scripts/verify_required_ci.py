@@ -1113,9 +1113,12 @@ def main() -> int:
     node_waypoint_yml = Path(
         ".github/workflows/node-waypoint-ebpf-live.yml"
     ).read_text(encoding="utf-8")
+    ambient_host_udp_yml = Path(
+        ".github/workflows/ambient-host-udp-live.yml"
+    ).read_text(encoding="utf-8")
     required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | extract_documentation_paths(
         node_waypoint_yml
-    )
+    ) | extract_documentation_paths(ambient_host_udp_yml)
     configured_live_doc_patterns = {
         pattern
         for patterns in SUITE_PATTERNS.values()

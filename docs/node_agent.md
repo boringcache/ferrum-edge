@@ -435,6 +435,8 @@ device as a distinct peer rather than a self-linked bridge/uplink. A broader
 route through a shared bridge is refused because it is not per-pod interface
 ownership evidence. It requires a CNI that gives each pod its own host-side
 interface.
+The production host-netns TPROXY datapath is live-gated by the required
+`ambient-host-udp-live` workflow ([#3705](https://github.com/ferrum-edge/ferrum-edge/issues/3705)).
 Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
 workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
 During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
