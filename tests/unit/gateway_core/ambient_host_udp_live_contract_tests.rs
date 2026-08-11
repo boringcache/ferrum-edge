@@ -245,9 +245,7 @@ fn host_udp_shutdown_ack_wait_fits_inside_mesh_background_drain() {
     let mesh = read("src/modes/mesh/mod.rs");
 
     assert!(
-        host_udp.contains(
-            "const GATE_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(1);"
-        ),
+        host_udp.contains("const GATE_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(1);"),
         "host-UDP shutdown ack wait must stay at the 1s pod-netns ceiling so \
          teardown still runs under the mesh background drain"
     );
