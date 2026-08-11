@@ -14,7 +14,8 @@
 //! - [`admission`] — the transport admission boundary: total / per-peer-UID
 //!   connection ceilings taken before an accepted socket reaches tonic,
 //!   permit-owning connection wrappers, initial/idle connection deadlines, the
-//!   service-wide RPC ceiling, and the bounded shutdown force-close.
+//!   service-wide RPC ceiling, the bounded shutdown force-close, and the fatal
+//!   accept signal that routes an unusable listener into that same bounded path.
 
 pub mod admission;
 pub mod client;
@@ -27,8 +28,8 @@ pub mod server;
 #[allow(unused_imports)]
 pub use admission::{
     AcceptDecision, AcceptFailure, AcceptRetryPolicy, ActivitySnapshot, AdmittedStream,
-    ConnectionActivity, ConnectionAdmission, ConnectionPermit, ConnectionWatchdog, RpcPermit,
-    WorkloadApiAdmissionConfig, close_reason, reject_reason,
+    ConnectionActivity, ConnectionAdmission, ConnectionPermit, ConnectionWatchdog,
+    FatalAcceptSignal, RpcPermit, WorkloadApiAdmissionConfig, close_reason, reject_reason,
 };
 #[cfg(unix)]
 #[allow(unused_imports)]

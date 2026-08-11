@@ -30,10 +30,14 @@
 //!   stream — the shape that hangs a purely graceful drain forever;
 //! - normal X.509-SVID rotation, JWT-SVID mint/validate, bundle streaming, peer
 //!   attestation, and socket-inode cleanup all still work under tight limits;
+//! - a **fatal accept** reaches the bounded drain even while an established
+//!   long-lived rotation stream is open, so termination cannot stay pending
+//!   indefinitely;
 //! - the exported metric families stay fixed-cardinality, and the RPC families
-//!   state in their help text that they are the stream observation — one
-//!   admitted RPC is exactly one HTTP/2 stream — so nothing here claims a
-//!   separate stream family that does not exist.
+//!   state the *one-way* stream relationship in their help text — every
+//!   admitted RPC is one HTTP/2 stream, but not every live stream is an
+//!   admitted RPC — so nothing here claims an observation this layer does not
+//!   make.
 //!
 //! Everything runs on the ordinary hosted Linux CI runner: Unix sockets in a
 //! per-test temp directory, no root, no network. Nothing here sleeps for a fixed
@@ -456,6 +460,18 @@ const H2_END_HEADERS: u8 = 0x4;
 /// `REFUSED_STREAM`, the error code RFC 9113 §5.1.2 defines for a stream opened
 /// past the advertised concurrency limit.
 const H2_REFUSED_STREAM: u32 = 0x7;
+/// `ENHANCE_YOUR_CALM` — the only other code RFC 9113 §5.1.2 sanctions for
+/// excess-stream enforcement, and then only at connection level.
+const H2_ENHANCE_YOUR_CALM: u32 = 0xb;
+
+/// What the server answered a stream opened past the advertised ceiling with.
+#[derive(Debug)]
+enum ExcessStreamRefusal {
+    /// `RST_STREAM` on the excess stream itself, carrying its error code.
+    ResetStream(u32),
+    /// A connection-level `GOAWAY`: its error code and last-stream-id.
+    GoAway { error_code: u32, last_stream_id: u32 },
+}
 
 struct H2Frame {
     frame_type: u8,
@@ -614,7 +630,7 @@ async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level()
             match frame.frame_type {
                 H2_RST_STREAM if frame.stream_id == 3 => {
                     assert_eq!(frame.payload.len(), 4, "RST_STREAM carries a 4-byte code");
-                    return Some(u32::from_be_bytes([
+                    return ExcessStreamRefusal::ResetStream(u32::from_be_bytes([
                         frame.payload[0],
                         frame.payload[1],
                         frame.payload[2],
@@ -622,8 +638,30 @@ async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level()
                     ]));
                 }
                 // A connection-level refusal is a bounded rejection too; RFC
-                // 9113 §5.1.2 permits either.
-                H2_GOAWAY => return None,
+                // 9113 §5.1.2 permits either. Its payload is parsed rather
+                // than accepted on sight — see the assertions below.
+                H2_GOAWAY => {
+                    assert!(
+                        frame.payload.len() >= 8,
+                        "GOAWAY carries a 4-byte last-stream-id and a 4-byte error code"
+                    );
+                    return ExcessStreamRefusal::GoAway {
+                        // The reserved high bit of the last-stream-id is
+                        // masked off, per RFC 9113 §6.8.
+                        last_stream_id: u32::from_be_bytes([
+                            frame.payload[0],
+                            frame.payload[1],
+                            frame.payload[2],
+                            frame.payload[3],
+                        ]) & 0x7fff_ffff,
+                        error_code: u32::from_be_bytes([
+                            frame.payload[4],
+                            frame.payload[5],
+                            frame.payload[6],
+                            frame.payload[7],
+                        ]),
+                    };
+                }
                 // Anything the server says about stream 1 (or a window update)
                 // is not what is being asserted here.
                 _ => continue,
@@ -635,12 +673,36 @@ async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level()
         "a stream opened past the advertised ceiling must be refused promptly; parking it is the \
          unbounded allocation the ceiling exists to prevent",
     );
-    if let Some(code) = refusal {
-        assert_eq!(
+
+    // The refusal has to be an RFC-appropriate *excess-stream* refusal, not
+    // merely "the connection ended somehow". A `PROTOCOL_ERROR` GOAWAY is what a
+    // malformed HPACK block or a bad request sequence produces, so accepting any
+    // GOAWAY would let this test pass without the concurrency ceiling ever being
+    // enforced.
+    match refusal {
+        ExcessStreamRefusal::ResetStream(code) => assert_eq!(
             code, H2_REFUSED_STREAM,
-            "the excess stream must be refused with REFUSED_STREAM, which tells a conforming \
-             client the request may be retried on a new stream"
-        );
+            "the excess stream must be reset with REFUSED_STREAM, which tells a conforming client \
+             the request may be retried on a new stream"
+        ),
+        ExcessStreamRefusal::GoAway { error_code, last_stream_id } => {
+            // Both halves are required: the code proves it was an excess-stream
+            // refusal, the last-stream-id proves it was *this* stream that was
+            // refused rather than one already served.
+            assert!(
+                error_code == H2_REFUSED_STREAM || error_code == H2_ENHANCE_YOUR_CALM,
+                "a connection-level refusal of the excess stream must carry REFUSED_STREAM (0x7) \
+                 or ENHANCE_YOUR_CALM (0xb); {error_code:#x} — PROTOCOL_ERROR is 0x1 — is a \
+                 generic malformed-request failure and does not prove the concurrency ceiling was \
+                 enforced"
+            );
+            assert!(
+                last_stream_id < 3,
+                "the GOAWAY must declare stream 3 unprocessed (last-stream-id {last_stream_id} \
+                 must be below 3); a GOAWAY that already processed it is not a refusal of the \
+                 excess stream"
+            );
+        }
     }
 
     drop(stream);
@@ -986,26 +1048,39 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
         "the rejection counter must be exported once a connection has been shed"
     );
 
-    // The issue asks for stream observability. The RPC families *are* that
-    // observation — one admitted RPC is exactly one HTTP/2 stream — and the help
-    // text has to say so, or an operator reading `/metrics` cannot tell that no
-    // separate stream family is missing.
+    // The issue asks for stream observability, and the honest answer is a
+    // *one-way* relationship: every admitted RPC is one HTTP/2 stream, but not
+    // every live stream is an admitted RPC. The help text has to state the
+    // limitation rather than the converse, or an operator reading `/metrics`
+    // will take `active_rpcs` for the live stream count and a shed RPC for a
+    // protocol-level stream refusal — neither of which is true.
     for (family, expected) in [
         (
             "# HELP ferrum_mesh_workload_api_active_rpcs",
-            "one HTTP/2 stream",
+            "service-dispatched RPC streams only",
         ),
         (
             "# HELP ferrum_mesh_workload_api_rpcs_rejected_total",
-            "HTTP/2 stream",
+            "not a protocol-level stream refusal",
         ),
     ] {
         if let Some(line) = rendered.lines().find(|line| line.starts_with(family)) {
             assert!(
                 line.contains(expected),
-                "{family} must state its relationship to HTTP/2 streams: {line}"
+                "{family} must state the one-way relationship to HTTP/2 streams: {line}"
             );
         }
+    }
+    // And the converse claim must not creep back in.
+    for line in rendered
+        .lines()
+        .filter(|line| line.starts_with("# HELP ferrum_mesh_workload_api_"))
+    {
+        assert!(
+            !line.contains("live admitted-stream count") && !line.contains("refused HTTP/2 stream"),
+            "no Workload API help text may claim that every live HTTP/2 stream is an admitted \
+             RPC, or that a shed RPC is a protocol-level stream refusal: {line}"
+        );
     }
 
     harness.shutdown_within(Duration::from_secs(30)).await;
@@ -1084,4 +1159,84 @@ fn metric_reason(line: &str, family: &str) -> Option<String> {
     let rest = line.strip_prefix(family)?.strip_prefix("{reason=\"")?;
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+#[tokio::test]
+async fn a_fatal_accept_terminates_the_listener_within_its_bounded_drain() {
+    // The failure this pins is a *lifecycle* one, and it is invisible to the
+    // accept-retry policy the unit suite exercises. A fatal accept used to end
+    // the incoming stream and nothing else — but under
+    // `serve_with_incoming_shutdown`, tonic reads any end of input as a
+    // *graceful* shutdown and then waits for every established connection. A
+    // Workload API rotation stream is designed to stay open indefinitely, so the
+    // serve future never completed, the exit guard never published termination,
+    // the socket was never cleaned up, and mesh mode went on serving traffic
+    // with no identity surface behind it.
+    //
+    // The seam is the fatal-accept channel itself — the exact channel the accept
+    // loop publishes on — because a real fatal `accept(2)` cannot be provoked
+    // from a test. Nothing here sleeps or polls for the outcome: the trigger is
+    // a channel publication and the wait is on the termination watch channel.
+    const GRACE: Duration = Duration::from_secs(1);
+    let harness = Harness::start(
+        "fatalacc",
+        WorkloadApiAdmissionConfig {
+            shutdown_grace: GRACE,
+            ..limits()
+        },
+    )
+    .await;
+
+    // An established, deliberately long-lived rotation stream: exactly the shape
+    // a purely graceful drain waits on forever.
+    let mut client = connect(&harness.path).await;
+    let mut rotation = client
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .expect("the long-lived rotation stream is admitted")
+        .into_inner();
+    tokio::time::timeout(Duration::from_secs(10), rotation.next())
+        .await
+        .expect("the rotation stream responds promptly")
+        .expect("the rotation stream yields its first response")
+        .expect("the first rotation response is not an error");
+
+    let mut terminated = harness.listener.termination_signal();
+    assert!(
+        !*terminated.borrow(),
+        "the listener must still be serving before the fatal accept, or this test proves nothing"
+    );
+
+    harness.listener.fatal_accept_signal().raise();
+
+    // The configured graceful budget, plus the fixed post-force-close settle,
+    // plus generous runner margin. The point is that the wait terminates at all
+    // — an unbounded drain would sit here until the timeout.
+    let budget = GRACE + Duration::from_secs(5) + Duration::from_secs(25);
+    tokio::time::timeout(budget, async {
+        while !*terminated.borrow() {
+            if terminated.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect(
+        "a fatal accept must reach the bounded drain and publish termination; waiting out an \
+         established rotation stream is the unbounded hang this path exists to prevent",
+    );
+    assert!(
+        *terminated.borrow(),
+        "termination must be published as `true`, not merely inferred from a closed channel"
+    );
+
+    // The exit guard runs the identity-checked socket cleanup *before* it
+    // publishes termination, so by here the artifact must be gone.
+    assert!(
+        !harness.path.exists(),
+        "the fatal-accept drain must still unlink the socket Ferrum created"
+    );
+
+    drop(rotation);
+    drop(client);
 }

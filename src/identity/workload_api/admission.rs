@@ -98,15 +98,20 @@
 //! per-rejection detail stays in `debug!` logs, which are off by default and so
 //! cannot themselves be flooded into a disk-exhaustion primitive.
 //!
-//! The RPC gauge and shed counter **are** the stream-level observation: every
-//! admitted Workload API RPC occupies exactly one HTTP/2 stream for its whole
-//! lifetime, so `active_rpcs` is the live admitted-stream count and
-//! `rpcs_rejected_total` is the over-ceiling stream refusal count. That
-//! relationship is stated in the metric help text rather than being left for a
-//! reader to infer, and there is deliberately no *second* stream family: a
-//! stream refused by HTTP/2's own advertised `SETTINGS_MAX_CONCURRENT_STREAMS`
-//! is refused inside h2 before any Ferrum code runs, so counting it here would
-//! claim an observation this layer does not make.
+//! The RPC gauge and shed counter are the closest thing here to a stream-level
+//! observation, and the relationship is **one-way**: every admitted Workload API
+//! RPC occupies exactly one HTTP/2 stream for its whole lifetime, but not every
+//! live HTTP/2 stream is an admitted Workload API RPC. A stream refused by
+//! HTTP/2's own advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is refused inside
+//! h2 before any Ferrum code runs, and an unknown or malformed route is rejected
+//! before service dispatch; neither is counted. So `active_rpcs` is the count of
+//! **service-dispatched** Workload API RPC streams, not the live stream count,
+//! and `rpcs_rejected_total` counts RPCs shed *after* their stream was already
+//! opened and accepted by h2 — a `RESOURCE_EXHAUSTED` gRPC result on a live
+//! stream, not a protocol-level stream refusal. The help text says exactly that
+//! rather than the stronger converse, and there is deliberately no *second*
+//! stream family: transport-level excess streams are not observable from this
+//! layer, so a counter claiming them would claim coverage that does not exist.
 
 use std::collections::HashMap;
 use std::io;
@@ -1217,46 +1222,114 @@ impl tonic::transport::server::Connected for AdmittedUnixStream {
     }
 }
 
+/// The channel a **fatal** accept failure is published on, as a handle.
+///
+/// A fatal accept is not just "stop yielding connections". Ending the incoming
+/// stream is, to tonic, indistinguishable from a *graceful* end of input: with a
+/// shutdown future attached, `serve_with_incoming_shutdown` broadcasts graceful
+/// shutdown and then waits for every established connection to finish on its
+/// own. A Workload API rotation stream is designed to stay open indefinitely, so
+/// that wait has no bound — the serve future would never complete, the exit
+/// guard would never publish termination, and mesh mode would never learn its
+/// identity surface is gone.
+///
+/// So the fatal condition is published *explicitly* instead. The outer serve
+/// task selects on this signal and runs the same bounded drain a requested
+/// shutdown runs: the configured graceful budget, then a force close of whatever
+/// is left, then a bounded settle, then socket cleanup and termination. The
+/// accept loop watches it too, so admission stops at the same instant however
+/// the signal was raised.
+///
+/// Cloneable and shared rather than a bare `watch::Sender`, because several
+/// holders — the accept loop, the serve task, and the listener handle — must all
+/// keep the channel open: a closed channel is not a fatal accept, and treating
+/// it as one would terminate a healthy listener the moment one holder went away.
+#[derive(Debug, Clone)]
+pub struct FatalAcceptSignal {
+    tx: Arc<watch::Sender<bool>>,
+}
+
+impl FatalAcceptSignal {
+    /// A fresh, unraised signal together with its first observer.
+    pub fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx: Arc::new(tx) }, rx)
+    }
+
+    /// Publish the fatal accept condition.
+    ///
+    /// `send_replace` rather than `send`: publication must not depend on a
+    /// receiver currently existing, or a fatal accept raced against a dropped
+    /// observer would be silently lost.
+    pub fn raise(&self) {
+        self.tx.send_replace(true);
+    }
+
+    /// Whether the fatal condition has been published.
+    pub fn is_raised(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// A new observer of this signal.
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.tx.subscribe()
+    }
+}
+
 /// The accept loop, as a stream of admitted connections.
 ///
 /// Yields only admitted connections — a refused or failed accept never becomes
 /// a stream item, so the transport below it cannot observe an error it would
-/// react to by tearing down the listener.
+/// react to by tearing down the listener. Yielding `Err` would not help either:
+/// tonic logs an incoming-item error and keeps serving, so an error item is not
+/// a termination path at all.
 ///
 /// Ends immediately when `stop` flips, so shutdown stops admission at once
 /// rather than admitting one more connection per accept the runtime happens to
-/// have already completed — and ends on a **fatal** listener error, so a socket
-/// that can never accept again terminates the serve task and fires the
-/// termination signal mesh mode watches, instead of retrying a permanent failure
-/// forever inside one non-yielding future.
+/// have already completed. On a **fatal** listener error it raises `fatal`
+/// *before* ending, so a socket that can never accept again enters the bounded
+/// drain in [`super::listener`] — graceful budget, force close, settle — rather
+/// than leaving the serve future waiting on connections that never end. The loop
+/// also watches `fatal`, so admission stops at once however the signal was
+/// raised.
 #[cfg(unix)]
 pub fn admission_stream(
     listener: tokio::net::UnixListener,
     admission: ConnectionAdmission,
     stop: watch::Receiver<bool>,
+    fatal: FatalAcceptSignal,
 ) -> impl Stream<Item = Result<AdmittedUnixStream, io::Error>> + Send {
     struct AcceptState {
         listener: tokio::net::UnixListener,
         admission: ConnectionAdmission,
         stop: watch::Receiver<bool>,
+        fatal_rx: watch::Receiver<bool>,
+        fatal: FatalAcceptSignal,
         retry: AcceptRetryPolicy,
     }
 
+    let fatal_rx = fatal.subscribe();
     futures_util::stream::unfold(
         AcceptState {
             listener,
             admission,
             stop,
+            fatal_rx,
+            fatal,
             retry: AcceptRetryPolicy::new(),
         },
         |mut state| async move {
             loop {
-                if *state.stop.borrow() {
+                if *state.stop.borrow() || *state.fatal_rx.borrow() {
                     return None;
                 }
                 let accepted = tokio::select! {
                     biased;
                     _ = wait_until_set(&mut state.stop) => return None,
+                    // `state.fatal` keeps the channel open for as long as this
+                    // loop exists, so this arm only ever resolves on a real
+                    // publication, never on a dropped sender.
+                    _ = wait_until_set(&mut state.fatal_rx) => return None,
                     accepted = state.listener.accept() => accepted,
                 };
                 match accepted {
@@ -1286,10 +1359,16 @@ pub fn admission_stream(
                             AcceptDecision::Terminate => {
                                 error!(
                                     error = %error,
-                                    "SPIFFE Workload API accept failed fatally; ending the \
-                                     listener so the serve task terminates and mesh mode observes \
-                                     the loss of the surface"
+                                    "SPIFFE Workload API accept failed fatally; raising the fatal \
+                                     accept signal so the listener enters its bounded drain and \
+                                     mesh mode observes the loss of the surface"
                                 );
+                                // Raised *before* the stream ends. Ending it
+                                // alone is only a graceful end of input to
+                                // tonic, which then waits out every established
+                                // connection — and a Workload API rotation
+                                // stream never ends on its own.
+                                state.fatal.raise();
                                 return None;
                             }
                             AcceptDecision::Retry { backoff, log } => {
@@ -1331,7 +1410,8 @@ pub enum AcceptFailure {
     Resource,
     /// The listener itself is unusable — a closed or invalid descriptor, a
     /// socket that is not a socket. Retrying is a spin that can never succeed,
-    /// so admission ends and the serve task's termination guard fires.
+    /// so admission ends and [`FatalAcceptSignal`] is raised, which is what
+    /// actually drives the bounded drain and the serve task's termination guard.
     Fatal,
 }
 
@@ -1370,7 +1450,9 @@ pub fn classify_accept_error(error: &io::Error) -> AcceptFailure {
 pub enum AcceptDecision {
     /// Try again after `backoff`, logging this occurrence only when `log`.
     Retry { backoff: Duration, log: bool },
-    /// Stop accepting. The incoming stream ends and the serve task exits.
+    /// Stop accepting. The accept loop raises [`FatalAcceptSignal`] and then
+    /// ends the incoming stream; the signal — not the end of the stream — is
+    /// what puts the serve task into its bounded drain.
     Terminate,
 }
 

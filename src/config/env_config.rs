@@ -1553,9 +1553,13 @@ pub struct EnvConfig {
     pub mesh_workload_api_unix_identity_rules: Vec<String>,
     /// Simultaneously accepted Workload API connections across all peers
     /// (issue #3758). Enforced before the accepted socket reaches tonic, so a
-    /// refused connection allocates no HTTP/2 or RPC state. Hard ceiling
-    /// [`crate::identity::workload_api::admission::MAX_CONNECTIONS_CEILING`];
-    /// `0` is refused rather than meaning "unbounded".
+    /// refused connection allocates no HTTP/2 or RPC state. Minimum
+    /// [`crate::identity::workload_api::admission::MIN_MAX_CONNECTIONS`] (**2**),
+    /// hard ceiling
+    /// [`crate::identity::workload_api::admission::MAX_CONNECTIONS_CEILING`].
+    /// Both `0` and `1` are refused: `0` is not an "unbounded" spelling, and `1`
+    /// cannot satisfy the strictly-below per-UID quota rule, so a globally fair
+    /// transport needs room for at least two connections.
     pub mesh_workload_api_max_connections: usize,
     /// Simultaneously accepted Workload API connections per kernel-attested
     /// peer UID. Keeps one compromised member of the socket group from

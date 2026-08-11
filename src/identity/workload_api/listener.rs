@@ -167,6 +167,18 @@
 //! it carries the socket cleanup with it. Mesh mode observes the signal and
 //! initiates the shared shutdown path; a requested shutdown races nothing,
 //! because the observer checks the shared shutdown flag first and stays quiet.
+//!
+//! A **fatal accept** — a listener whose descriptor can never accept again —
+//! reaches that guard through an explicit channel
+//! ([`super::admission::FatalAcceptSignal`]) rather than through the end of the
+//! incoming stream. Ending the stream is not enough: tonic treats end-of-input
+//! under `serve_with_incoming_shutdown` as a *graceful* shutdown and then waits
+//! for every established connection, and a Workload API rotation stream is
+//! designed to stay open indefinitely — so the serve future would never
+//! complete and termination would never be published. The outer serve task
+//! therefore selects on the fatal signal and runs the same bounded drain a
+//! requested shutdown runs: graceful budget, force close, bounded settle,
+//! identity-checked socket cleanup, termination.
 
 use std::fmt;
 use std::io;
@@ -177,7 +189,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::admission::WorkloadApiAdmissionConfig;
+use super::admission::{FatalAcceptSignal, WorkloadApiAdmissionConfig};
 #[cfg(unix)]
 use super::admission::{ConnectionAdmission, FORCE_CLOSE_SETTLE, admission_stream, wait_until_set};
 use super::server::WorkloadApiService;
@@ -566,6 +578,7 @@ pub struct WorkloadApiListener {
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     terminated_rx: watch::Receiver<bool>,
+    fatal_accept: FatalAcceptSignal,
     join: JoinHandle<()>,
 }
 
@@ -596,6 +609,23 @@ impl WorkloadApiListener {
     /// [`Self::shutdown`] is called.
     pub fn termination_signal(&self) -> watch::Receiver<bool> {
         self.terminated_rx.clone()
+    }
+
+    /// The listener's **fatal accept** signal — the exact channel the accept
+    /// loop publishes on when `accept(2)` fails unrecoverably.
+    ///
+    /// Exposed because the property that matters here is a *lifecycle* one and
+    /// is otherwise unobservable: a real fatal `accept(2)` cannot be provoked
+    /// from a test, and the failure mode being guarded against — a fatal accept
+    /// that ends the incoming stream, leaves tonic waiting on an established
+    /// long-lived rotation stream, and therefore never publishes
+    /// [`Self::termination_signal`] — is invisible to any assertion made on the
+    /// retry policy alone. Raising this signal drives the identical path the
+    /// accept loop drives: admission stops, the configured graceful budget runs,
+    /// whatever is left is force-closed, the serve task settles boundedly, the
+    /// socket is cleaned up identity-checked, and termination is published.
+    pub fn fatal_accept_signal(&self) -> FatalAcceptSignal {
+        self.fatal_accept.clone()
     }
 
     /// Signal the serve future to stop, wait for it, and unlink the socket we
@@ -723,7 +753,17 @@ pub async fn serve_workload_api_with_admission(
     // the shutdown deadline.
     let (force_close_tx, force_close_rx) = watch::channel(false);
     let connection_admission = ConnectionAdmission::new(limits.clone(), force_close_rx);
-    let incoming = admission_stream(listener, connection_admission, shutdown_tx.subscribe());
+    // The fatal-accept channel is separate from the shutdown channel on purpose:
+    // a requested shutdown and a listener that can never accept again take the
+    // same bounded drain, but they are different events and the second one has
+    // to be distinguishable in the log an operator reads afterwards.
+    let (fatal_accept, mut fatal_accept_observer) = FatalAcceptSignal::new();
+    let incoming = admission_stream(
+        listener,
+        connection_admission,
+        shutdown_tx.subscribe(),
+        fatal_accept.clone(),
+    );
     let server = service.into_server();
     let guard = ServeExitGuard {
         socket_path: path.clone(),
@@ -732,10 +772,16 @@ pub async fn serve_workload_api_with_admission(
         _socket_lifecycle_lock: startup_lock,
     };
     let serve_limits = limits.clone();
+    let task_fatal_accept = fatal_accept.clone();
     let join = tokio::spawn(async move {
         // Bound first so it drops LAST — after the serve future, and on a panic
         // unwind as well as on a clean return.
         let exit_guard = guard;
+        // Held for the task's whole life so the fatal-accept channel stays open
+        // even after tonic has dropped the incoming stream. A *closed* channel
+        // is not a fatal accept, and letting the observer resolve on one would
+        // divert an ordinary shutdown into the fatal branch.
+        let _fatal_accept_retainer = task_fatal_accept;
         let serve = tonic::transport::Server::builder()
             .max_concurrent_streams(Some(serve_limits.max_concurrent_streams))
             // Paired with `load_shed`: a request beyond the per-connection
@@ -752,13 +798,33 @@ pub async fn serve_workload_api_with_admission(
 
         // Two steps rather than one `select!` arm: the borrow of `serve` taken
         // by the race has to end before the drain can take ownership of it.
-        let raced = tokio::select! {
-            result = &mut serve => Some(result),
-            _ = wait_until_set(&mut drain_observer) => None,
+        let stop = tokio::select! {
+            result = &mut serve => ServeStop::Completed(result),
+            _ = wait_until_set(&mut drain_observer) => ServeStop::Requested,
+            _ = wait_until_set(&mut fatal_accept_observer) => ServeStop::FatalAccept,
         };
-        let result = match raced {
-            Some(result) => result,
-            None => drain_with_deadline(serve, force_close_tx, serve_limits.shutdown_grace).await,
+        let result = match stop {
+            ServeStop::Completed(result) => result,
+            // Both stop reasons take the *same* bounded path. A fatal accept
+            // must not be left to tonic's graceful end-of-input handling: with a
+            // shutdown future attached, tonic waits for every established
+            // connection, and a Workload API rotation stream is designed never
+            // to end on its own — so the serve future would never complete, the
+            // exit guard would never publish termination, and mesh mode would go
+            // on serving traffic with no identity surface behind it.
+            ServeStop::Requested => {
+                drain_with_deadline(serve, force_close_tx, serve_limits.shutdown_grace).await
+            }
+            ServeStop::FatalAccept => {
+                tracing::error!(
+                    socket = %exit_guard.socket_path.display(),
+                    grace_secs = serve_limits.shutdown_grace.as_secs(),
+                    "SPIFFE Workload API accept failed fatally; draining the listener within its \
+                     configured grace and then force-closing, so mesh mode observes the loss of \
+                     the surface within a bound"
+                );
+                drain_with_deadline(serve, force_close_tx, serve_limits.shutdown_grace).await
+            }
         };
         if let Err(error) = result {
             warn!(
@@ -786,8 +852,25 @@ pub async fn serve_workload_api_with_admission(
         socket_path: path,
         shutdown_tx,
         terminated_rx,
+        fatal_accept,
         join,
     })
+}
+
+/// Why the serve future stopped being raced.
+///
+/// Named rather than an `Option`, because the two non-completion reasons take
+/// the same bounded drain but are different operational events: one is the
+/// operator asking for shutdown, the other is a listener that can never accept
+/// again. Collapsing them would make the second one unreadable in a log.
+#[cfg(unix)]
+enum ServeStop {
+    /// The serve future finished on its own.
+    Completed(Result<(), tonic::transport::Error>),
+    /// Shutdown was requested through [`WorkloadApiListener::shutdown`].
+    Requested,
+    /// The accept loop published [`FatalAcceptSignal`].
+    FatalAccept,
 }
 
 /// Graceful drain, then a force close, then a bounded settle.

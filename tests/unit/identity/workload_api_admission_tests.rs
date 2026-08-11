@@ -888,8 +888,12 @@ fn accept_failures_are_classified_by_what_they_mean_for_the_listener() {
 fn the_accept_retry_policy_backs_off_within_a_bound_and_terminates_on_a_fatal_error() {
     let mut policy = AcceptRetryPolicy::new();
 
-    // A fatal failure ends admission, so the serve task exits and the
-    // termination guard mesh mode watches actually fires.
+    // A fatal failure ends admission. This is the *decision* only: what turns it
+    // into a bounded termination is the accept loop raising the fatal signal and
+    // the serve task draining on it, which is a lifecycle this pure state
+    // machine cannot observe and does not claim — it is pinned live in
+    // `tests/integration/workload_api_admission_tests.rs`
+    // (`a_fatal_accept_terminates_the_listener_...`).
     assert_eq!(
         policy.on_error(AcceptFailure::Fatal),
         AcceptDecision::Terminate

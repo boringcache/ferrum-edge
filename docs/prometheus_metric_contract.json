@@ -2417,7 +2417,7 @@
   {
     "name": "ferrum_mesh_workload_api_active_rpcs",
     "type": "gauge",
-    "help": "SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling; each admitted RPC occupies exactly one HTTP/2 stream, so this is also the live admitted-stream count.",
+    "help": "SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling; counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.",
     "labels": [
       "gateway_namespace"
     ],
@@ -2455,7 +2455,7 @@
   {
     "name": "ferrum_mesh_workload_api_rpcs_rejected_total",
     "type": "counter",
-    "help": "SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned; each shed RPC is one refused HTTP/2 stream.",
+    "help": "SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.",
     "labels": [
       "gateway_namespace"
     ],
