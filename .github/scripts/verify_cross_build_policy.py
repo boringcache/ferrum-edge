@@ -23450,8 +23450,12 @@ pre_build = []
             three_family_release.replace(
                 "\n"
                 + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["name"]
                 + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
                 + "    runs-on: ubuntu-latest\n"
+                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME][
+                    "permissions"
+                ]
                 + adopted_tools_manifest_steps,
                 "",
                 1,
