@@ -4,8 +4,11 @@
 Reads Criterion estimates.json trees and E2E JSON blobs produced by the
 mesh-performance-baselines workflow. Never fabricates measurements: missing
 inputs become explicit null/incomplete entries. Publication gates fail closed
-on undersampling, missing DNS rows, malformed metrics, nonzero errors, or
-excessive CPU steal.
+on undersampling, missing DNS rows, malformed metrics, nonzero errors,
+unexpected target identities, unsupported suite filters, or excessive CPU steal.
+Repetition evidence counts distinct expected run_N.txt executions with exactly
+one valid gateway/direct identity each — duplicate or partial blobs in a single
+file do not satisfy the repetition gate.
 """
 
 from __future__ import annotations
@@ -49,6 +52,10 @@ MIN_E2E_REPETITIONS = 3
 # Documented publication threshold: same 5.0% CPU-steal ceiling used across
 # Ferrum hosted perf workflows. Collections above this are not publication-ready.
 MAX_CPU_STEAL_PERCENT = 5.0
+SUPPORTED_SUITES = frozenset({"all", "mesh", "hbone", "dns"})
+DNS_GATEWAY_TARGET_MARKER = ":15053"
+DNS_DIRECT_TARGET_MARKER = ":17053"
+HBONE_GATEWAY_TARGET_MARKER = ":18000"
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +114,23 @@ def required_repetitions(configured: int | None) -> int:
     if configured is None:
         return MIN_E2E_REPETITIONS
     return max(MIN_E2E_REPETITIONS, int(configured))
+
+
+def normalize_suites(suites: str | None) -> str | None:
+    """Return a supported suite filter, or None when the value is unsupported."""
+    value = (suites or "").strip().lower()
+    if value not in SUPPORTED_SUITES:
+        return None
+    return value
+
+
+def suites_supported(suites: str | None) -> bool:
+    return normalize_suites(suites) is not None
+
+
+def expected_run_paths(root: Path, required_reps: int) -> list[Path]:
+    """Distinct expected execution artifacts: run_1.txt .. run_N.txt."""
+    return [root / f"run_{idx}.txt" for idx in range(1, required_reps + 1)]
 
 
 def load_json(path: Path) -> Any | None:
@@ -306,12 +330,31 @@ def summarize_mesh(criterion_root: Path) -> dict[str, Any]:
     }
 
 
+def hbone_blob_looks_relevant(blob: dict[str, Any]) -> bool:
+    return "rps" in blob or "target" in blob or "label" in blob
+
+
 def classify_hbone_blob(blob: dict[str, Any]) -> str | None:
+    """Map a relevant HBONE blob to gateway/direct via known identity.
+
+    Gateway identity requires the fixed harness port (:18000). Direct baseline
+    uses an ephemeral backend port, so it is identified by the direct label.
+    Ambiguous or unexpected targets fail closed (return None).
+    """
     target = str(blob.get("target", ""))
     label = str(blob.get("label", "")).lower()
-    if ":18000" in target or "gateway" in label or "hbone" in label:
+    if HBONE_GATEWAY_TARGET_MARKER in target:
         return "gateway"
-    if "direct" in label or ("127.0.0.1:" in target and ":18000" not in target):
+    if "direct" in label and HBONE_GATEWAY_TARGET_MARKER not in target:
+        return "direct"
+    return None
+
+
+def classify_dns_target(target: str) -> str | None:
+    """Map DNS report targets to gateway/direct; unknown targets fail closed."""
+    if DNS_GATEWAY_TARGET_MARKER in target:
+        return "gateway"
+    if DNS_DIRECT_TARGET_MARKER in target:
         return "direct"
     return None
 
@@ -406,35 +449,60 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
     for scenario in HBONE_SCENARIOS:
         key = scenario["key"]
         scenario_dir = hbone_root / key
-        run_stats: dict[str, list[dict[str, Any]]] = {"gateway": [], "direct": []}
+        gateway_samples: list[dict[str, Any]] = []
+        direct_samples: list[dict[str, Any]] = []
         rejected = 0
-        if scenario_dir.is_dir():
-            for run_path in sorted(scenario_dir.glob("run_*.txt")):
-                text = run_path.read_text(encoding="utf-8", errors="replace")
-                for blob in extract_json_blobs(text):
-                    if not isinstance(blob, dict):
-                        rejected += 1
-                        continue
-                    sample = parse_hbone_sample(blob, str(run_path))
-                    if sample is None:
-                        if "rps" in blob or "target" in blob or "label" in blob:
-                            rejected += 1
-                        continue
-                    kind = sample.pop("kind")
-                    run_stats[kind].append(sample)
+        shape_failures = 0
+        for run_path in expected_run_paths(scenario_dir, required_reps):
+            if not run_path.is_file():
+                shape_failures += 1
+                continue
+            text = run_path.read_text(encoding="utf-8", errors="replace")
+            gateway_for_run: list[dict[str, Any]] = []
+            direct_for_run: list[dict[str, Any]] = []
+            run_rejected = 0
+            for blob in extract_json_blobs(text):
+                if not isinstance(blob, dict):
+                    continue
+                if not hbone_blob_looks_relevant(blob):
+                    continue
+                sample = parse_hbone_sample(blob, str(run_path))
+                if sample is None:
+                    run_rejected += 1
+                    continue
+                kind = sample.pop("kind")
+                if kind == "gateway":
+                    gateway_for_run.append(sample)
+                else:
+                    direct_for_run.append(sample)
+            # Exactly one gateway + one direct identity per expected execution.
+            if (
+                run_rejected
+                or len(gateway_for_run) != 1
+                or len(direct_for_run) != 1
+            ):
+                rejected += run_rejected
+                if len(gateway_for_run) != 1:
+                    rejected += max(len(gateway_for_run), 1) if gateway_for_run else 1
+                if len(direct_for_run) != 1:
+                    rejected += max(len(direct_for_run), 1) if direct_for_run else 1
+                shape_failures += 1
+                continue
+            gateway_samples.append(gateway_for_run[0])
+            direct_samples.append(direct_for_run[0])
 
         gateway = aggregate_throughput_samples(
-            run_stats["gateway"],
+            gateway_samples,
             rate_key="rps",
             latency_keys=("p50_us", "p95_us", "p99_us"),
         )
         direct = aggregate_throughput_samples(
-            run_stats["direct"],
+            direct_samples,
             rate_key="rps",
             latency_keys=("p50_us", "p95_us", "p99_us"),
         )
-        gateway_reps = gateway["repetitions"] if gateway else 0
-        direct_reps = direct["repetitions"] if direct else 0
+        gateway_reps = len(gateway_samples)
+        direct_reps = len(direct_samples)
         gateway_evidence = repetition_evidence(gateway_reps, required_reps)
         direct_evidence = repetition_evidence(direct_reps, required_reps)
         overhead = None
@@ -450,9 +518,17 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
             overhead = (
                 (direct["rps_mean"] - gateway["rps_mean"]) / direct["rps_mean"]
             ) * 100.0
-        complete = gateway_evidence["ok"] and direct_evidence["ok"]
+        complete = (
+            gateway_evidence["ok"]
+            and direct_evidence["ok"]
+            and shape_failures == 0
+            and rejected == 0
+            and gateway_reps == required_reps
+            and direct_reps == required_reps
+        )
         errors_ok = bool(
-            gateway
+            complete
+            and gateway
             and direct
             and gateway["total_errors_sum"] == 0
             and direct["total_errors_sum"] == 0
@@ -465,6 +541,7 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
             "complete": complete,
             "errors_ok": errors_ok,
             "rejected_blobs": rejected,
+            "shape_failures": shape_failures,
             "repetition_evidence": {
                 "required": required_reps,
                 "gateway": gateway_evidence,
@@ -474,43 +551,110 @@ def summarize_hbone(hbone_root: Path, required_reps: int) -> dict[str, Any]:
     return out
 
 
-def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
-    gateway_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    direct_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+def _parse_dns_blob_rows(
+    blob: dict[str, Any],
+    source: str,
+    expected_keys: set[tuple[str, str]],
+) -> tuple[dict[tuple[str, str], dict[str, Any]] | None, int]:
+    """Parse one DNS identity blob; None means malformed/conflicting shape."""
+    reports = blob.get("reports")
+    if not isinstance(reports, list):
+        return None, 1
+    parsed: dict[tuple[str, str], dict[str, Any]] = {}
     rejected = 0
+    for report in reports:
+        if not isinstance(report, dict):
+            rejected += 1
+            continue
+        sample = parse_dns_report(report, source)
+        if sample is None:
+            rejected += 1
+            continue
+        key = (sample["name_class"], sample["transport"])
+        if key in parsed:
+            rejected += 1
+            continue
+        parsed[key] = {
+            "qps": sample["qps"],
+            "p50_us": sample["p50_us"],
+            "p90_us": sample["p90_us"],
+            "p99_us": sample["p99_us"],
+            "total_errors": sample["total_errors"],
+            "source": sample["source"],
+        }
+    if rejected or set(parsed.keys()) != expected_keys:
+        return None, rejected + (0 if set(parsed.keys()) == expected_keys else 1)
+    return parsed, 0
 
-    if dns_root.is_dir():
-        for run_path in sorted(dns_root.glob("run_*.txt")):
-            text = run_path.read_text(encoding="utf-8", errors="replace")
-            for blob in extract_json_blobs(text):
-                if not isinstance(blob, dict) or "reports" not in blob:
-                    continue
-                reports = blob.get("reports")
-                if not isinstance(reports, list):
-                    rejected += 1
-                    continue
-                target = str(blob.get("target", ""))
-                is_direct = ":17053" in target
-                bucket = direct_rows if is_direct else gateway_rows
-                for report in reports:
-                    if not isinstance(report, dict):
-                        rejected += 1
-                        continue
-                    sample = parse_dns_report(report, str(run_path))
-                    if sample is None:
-                        rejected += 1
-                        continue
-                    key = (sample["name_class"], sample["transport"])
-                    bucket.setdefault(key, []).append(
-                        {
-                            "qps": sample["qps"],
-                            "p50_us": sample["p50_us"],
-                            "p90_us": sample["p90_us"],
-                            "p99_us": sample["p99_us"],
-                            "total_errors": sample["total_errors"],
-                            "source": sample["source"],
-                        }
-                    )
+
+def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
+    gateway_rows: dict[tuple[str, str], list[dict[str, Any]]] = {
+        key: [] for key in DNS_GATEWAY_ROWS
+    }
+    direct_rows: dict[tuple[str, str], list[dict[str, Any]]] = {
+        key: [] for key in DNS_DIRECT_ROWS
+    }
+    rejected = 0
+    shape_failures = 0
+    gateway_keys = set(DNS_GATEWAY_ROWS)
+    direct_keys = set(DNS_DIRECT_ROWS)
+
+    for run_path in expected_run_paths(dns_root, required_reps):
+        if not run_path.is_file():
+            shape_failures += 1
+            continue
+        text = run_path.read_text(encoding="utf-8", errors="replace")
+        gateway_for_run: dict[tuple[str, str], dict[str, Any]] | None = None
+        direct_for_run: dict[tuple[str, str], dict[str, Any]] | None = None
+        run_rejected = 0
+        gateway_blobs = 0
+        direct_blobs = 0
+        for blob in extract_json_blobs(text):
+            if not isinstance(blob, dict) or "reports" not in blob:
+                continue
+            target = str(blob.get("target", ""))
+            kind = classify_dns_target(target)
+            if kind is None:
+                # Unexpected/malformed target identity fails closed.
+                run_rejected += 1
+                continue
+            expected = gateway_keys if kind == "gateway" else direct_keys
+            parsed, blob_rejected = _parse_dns_blob_rows(blob, str(run_path), expected)
+            run_rejected += blob_rejected
+            if parsed is None:
+                continue
+            if kind == "gateway":
+                gateway_blobs += 1
+                if gateway_blobs == 1:
+                    gateway_for_run = parsed
+                else:
+                    run_rejected += 1
+            else:
+                direct_blobs += 1
+                if direct_blobs == 1:
+                    direct_for_run = parsed
+                else:
+                    run_rejected += 1
+
+        if (
+            run_rejected
+            or gateway_blobs != 1
+            or direct_blobs != 1
+            or gateway_for_run is None
+            or direct_for_run is None
+        ):
+            rejected += run_rejected
+            if gateway_blobs != 1:
+                rejected += 1
+            if direct_blobs != 1:
+                rejected += 1
+            shape_failures += 1
+            continue
+
+        for key, sample in gateway_for_run.items():
+            gateway_rows[key].append(sample)
+        for key, sample in direct_for_run.items():
+            direct_rows[key].append(sample)
 
     def aggregate(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
         return aggregate_throughput_samples(
@@ -527,7 +671,7 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         agg = aggregate(samples)
         gateway_summary[row_key] = agg
         gateway_evidence[row_key] = repetition_evidence(
-            agg["repetitions"] if agg else 0,
+            len(samples),
             required_reps,
         )
 
@@ -539,7 +683,7 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         agg = aggregate(samples)
         direct_summary[row_key] = agg
         direct_evidence[row_key] = repetition_evidence(
-            agg["repetitions"] if agg else 0,
+            len(samples),
             required_reps,
         )
 
@@ -564,8 +708,11 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         else:
             overhead[transport] = None
 
-    row_complete = all(v["ok"] for v in gateway_evidence.values()) and all(
-        v["ok"] for v in direct_evidence.values()
+    row_complete = (
+        shape_failures == 0
+        and rejected == 0
+        and all(v["ok"] for v in gateway_evidence.values())
+        and all(v["ok"] for v in direct_evidence.values())
     )
     errors_ok = all(
         (row or {}).get("total_errors_sum", 1) == 0
@@ -580,6 +727,7 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         "complete": row_complete,
         "errors_ok": errors_ok,
         "rejected_blobs": rejected,
+        "shape_failures": shape_failures,
         "repetition_evidence": {
             "required": required_reps,
             "gateway": gateway_evidence,
@@ -651,17 +799,23 @@ def selected_suite_gates(
     acceptance: dict[str, Any],
     suites: str,
 ) -> dict[str, bool]:
-    suites = (suites or "all").strip().lower()
-    required: dict[str, bool] = {"runner_health_ok": bool(acceptance.get("runner_health_ok"))}
-    if suites in ("all", "mesh"):
+    normalized = normalize_suites(suites)
+    required: dict[str, bool] = {
+        "suites_supported": normalized is not None,
+        "runner_health_ok": bool(acceptance.get("runner_health_ok")),
+    }
+    if normalized is None:
+        # Unsupported suite values must not silently reduce to runner-health-only.
+        return required
+    if normalized in ("all", "mesh"):
         required["mesh_complete"] = bool(acceptance.get("mesh_complete"))
-    if suites in ("all", "hbone"):
+    if normalized in ("all", "hbone"):
         required["hbone_complete"] = bool(acceptance.get("hbone_complete"))
         required["hbone_errors_ok"] = bool(acceptance.get("hbone_errors_ok"))
-    if suites in ("all", "dns"):
+    if normalized in ("all", "dns"):
         required["dns_complete"] = bool(acceptance.get("dns_complete"))
         required["dns_errors_ok"] = bool(acceptance.get("dns_errors_ok"))
-    if suites == "all":
+    if normalized == "all":
         required["ready_to_publish_baselines"] = bool(
             acceptance.get("ready_to_publish_baselines")
         )
@@ -1034,7 +1188,99 @@ def self_test() -> int:
         assert evidence["direct"]["actual"] == 1
         assert evidence["gateway"]["ok"] is False
 
-        # --- missing DNS rows ---
+        # --- duplicate relevant blobs in one run file must not satisfy reps ---
+        dup = root / "dup_blobs" / "hbone" / "1kib_c50_30s"
+        dup.mkdir(parents=True)
+        gateway = {
+            "label": "gateway-hbone",
+            "target": "127.0.0.1:18000",
+            "rps": 80.0,
+            "p50_us": 100,
+            "p95_us": 200,
+            "p99_us": 300,
+            "total_errors": 0,
+        }
+        direct = {
+            "label": "direct",
+            "target": "127.0.0.1:19000",
+            "rps": 100.0,
+            "p50_us": 80,
+            "p95_us": 160,
+            "p99_us": 240,
+            "total_errors": 0,
+        }
+        # Three duplicate gateway+direct pairs in a single execution artifact.
+        (dup / "run_1.txt").write_text(
+            "\n".join(json.dumps(x) for x in (gateway, direct, gateway, direct, gateway, direct))
+            + "\n",
+            encoding="utf-8",
+        )
+        _write_hbone_run(dup / "run_2.txt", gateway_rps=81.0, direct_rps=101.0)
+        _write_hbone_run(dup / "run_3.txt", gateway_rps=82.0, direct_rps=102.0)
+        hbone_dup = summarize_hbone(dup.parent, required_repetitions(3))
+        assert hbone_dup["1kib_c50_30s"]["complete"] is False
+        assert hbone_dup["1kib_c50_30s"]["errors_ok"] is False
+        assert hbone_dup["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 2
+        assert hbone_dup["1kib_c50_30s"]["shape_failures"] >= 1
+
+        # --- malformed relevant blobs alongside valid samples fail closed ---
+        malformed = root / "malformed_mixed" / "hbone" / "1kib_c50_30s"
+        malformed.mkdir(parents=True)
+        bad_mixed = {
+            "label": "gateway-hbone",
+            "target": "127.0.0.1:18000",
+            "rps": "not-a-number",
+            "p50_us": 1,
+            "p95_us": 2,
+            "p99_us": 3,
+            "total_errors": 0,
+        }
+        for run in range(1, 4):
+            _write_hbone_run(
+                malformed / f"run_{run}.txt",
+                gateway_rps=80.0 + run,
+                direct_rps=100.0 + run,
+            )
+            # Append a malformed relevant blob to an otherwise valid run.
+            with (malformed / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(bad_mixed) + "\n")
+        hbone_malformed = summarize_hbone(malformed.parent, required_repetitions(3))
+        assert hbone_malformed["1kib_c50_30s"]["complete"] is False
+        assert hbone_malformed["1kib_c50_30s"]["errors_ok"] is False
+        assert hbone_malformed["1kib_c50_30s"]["rejected_blobs"] >= 1
+        assert hbone_malformed["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 0
+
+        # --- missing counterpart (gateway without direct) fails the run ---
+        missing_direct = root / "missing_counterpart" / "hbone" / "1kib_c50_30s"
+        missing_direct.mkdir(parents=True)
+        for run in range(1, 4):
+            (missing_direct / f"run_{run}.txt").write_text(
+                json.dumps(gateway) + "\n",
+                encoding="utf-8",
+            )
+        hbone_missing = summarize_hbone(missing_direct.parent, required_repetitions(3))
+        assert hbone_missing["1kib_c50_30s"]["complete"] is False
+        assert hbone_missing["1kib_c50_30s"]["repetition_evidence"]["direct"]["actual"] == 0
+        assert hbone_missing["1kib_c50_30s"]["repetition_evidence"]["gateway"]["actual"] == 0
+        assert classify_hbone_blob(
+            {"label": "mystery", "target": "127.0.0.1:9999", "rps": 1.0}
+        ) is None
+        assert classify_hbone_blob(
+            {
+                "label": "Gateway → HBONE → Backend",
+                "target": "http://127.0.0.1:18000/echo",
+                "rps": 1.0,
+            }
+        ) == "gateway"
+        assert classify_hbone_blob(
+            {
+                "label": "Direct baseline",
+                "target": "http://127.0.0.1:54321/echo",
+                "rps": 1.0,
+            }
+        ) == "direct"
+
+        # --- missing DNS rows / incomplete per-run shape ---
         dns_missing = root / "dns_missing"
         dns_missing.mkdir()
         partial = {
@@ -1055,9 +1301,32 @@ def self_test() -> int:
             (dns_missing / f"run_{i}.txt").write_text(json.dumps(partial) + "\n", encoding="utf-8")
         dns_partial = summarize_dns(dns_missing, required_repetitions(3))
         assert dns_partial["complete"] is False
-        assert dns_partial["repetition_evidence"]["gateway"]["mesh-internal/udp"]["ok"] is True
+        assert dns_partial["errors_ok"] is False
+        # Incomplete run shape must not credit any row toward repetition evidence.
+        assert dns_partial["repetition_evidence"]["gateway"]["mesh-internal/udp"]["ok"] is False
         assert dns_partial["repetition_evidence"]["gateway"]["mesh-wildcard/udp"]["ok"] is False
         assert dns_partial["repetition_evidence"]["direct_stub"]["upstream-forward/udp"]["ok"] is False
+        assert dns_partial["shape_failures"] == 3
+
+        # --- unexpected DNS target identity fails closed (not gateway) ---
+        dns_unexpected = root / "dns_unexpected"
+        dns_unexpected.mkdir()
+        for run in range(1, 4):
+            _write_full_dns_run(dns_unexpected / f"run_{run}.txt")
+            unexpected = _dns_blob(
+                target="127.0.0.1:9999",
+                rows=[(cls, transport, 50.0) for cls, transport in DNS_GATEWAY_ROWS],
+            )
+            with (dns_unexpected / f"run_{run}.txt").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(unexpected) + "\n")
+        dns_bad_target = summarize_dns(dns_unexpected, required_repetitions(3))
+        assert dns_bad_target["complete"] is False
+        assert dns_bad_target["errors_ok"] is False
+        assert dns_bad_target["rejected_blobs"] >= 1
+        assert dns_bad_target["repetition_evidence"]["gateway"]["mesh-internal/udp"]["actual"] == 0
+        assert classify_dns_target("127.0.0.1:9999") is None
+        assert classify_dns_target("127.0.0.1:15053") == "gateway"
+        assert classify_dns_target("127.0.0.1:17053") == "direct"
 
         # --- bad metrics rejected (NaN / non-positive / invalid latency) ---
         bad = root / "bad_metrics" / "hbone" / "1kib_c50_30s"
@@ -1207,6 +1476,12 @@ def self_test() -> int:
         assert summary_steal["acceptance_gate"]["runner_health_ok"] is False
         assert summary_steal["ready_to_publish_baselines"] is False
 
+        # Restore healthy steal evidence for subsequent suite-selection checks.
+        (valid / "runner_health.json").write_text(
+            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-24.04"}) + "\n",
+            encoding="utf-8",
+        )
+
         # partial-suite acceptance only requires selected gates
         partial_gates = selected_suite_gates(
             {
@@ -1220,6 +1495,7 @@ def self_test() -> int:
             },
             "hbone",
         )
+        assert partial_gates["suites_supported"] is True
         assert partial_gates["hbone_complete"] is True
         assert "mesh_complete" not in partial_gates
         assert selected_suite_accepted(
@@ -1247,9 +1523,53 @@ def self_test() -> int:
             "hbone",
         )
 
+        # unsupported suite selection fails closed (does not reduce to health-only)
+        assert normalize_suites("nope") is None
+        assert suites_supported("all")
+        assert not suites_supported("mesh,hbone")
+        invalid_gates = selected_suite_gates(
+            {
+                "mesh_complete": True,
+                "hbone_complete": True,
+                "hbone_errors_ok": True,
+                "dns_complete": True,
+                "dns_errors_ok": True,
+                "runner_health_ok": True,
+                "ready_to_publish_baselines": True,
+            },
+            "not-a-suite",
+        )
+        assert invalid_gates == {
+            "suites_supported": False,
+            "runner_health_ok": True,
+        }
+        assert not selected_suite_accepted(
+            {
+                "mesh_complete": True,
+                "hbone_complete": True,
+                "hbone_errors_ok": True,
+                "dns_complete": True,
+                "dns_errors_ok": True,
+                "runner_health_ok": True,
+                "ready_to_publish_baselines": True,
+            },
+            "not-a-suite",
+        )
+        summary_invalid = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="bogus",
+        )
+        assert summary_invalid["acceptance_gate"]["suites_supported"] is False
+        assert summary_invalid["selected_suite_accepted"] is False
+        assert summary_invalid["ready_to_publish_baselines"] is False
+        assert "mesh_complete" not in summary_invalid["selected_suite_gates"]
+
         # write + check-acceptance path
         out_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
         assert check_acceptance(out_path, "all") == 0
+        assert check_acceptance(out_path, "bogus") == 1
 
     print("summarize_mesh_baseline_results self-test passed")
     return 0
@@ -1266,8 +1586,10 @@ def build_summary(
     hbone = summarize_hbone(results_root / "hbone", required_reps)
     dns = summarize_dns(results_root / "dns", required_reps)
     runner_health = load_runner_health(results_root)
+    suites_ok = suites_supported(suites)
 
     acceptance = {
+        "suites_supported": suites_ok,
         "mesh_complete": mesh_complete(mesh),
         "hbone_complete": all(v.get("complete") for v in hbone.values()) if hbone else False,
         "hbone_errors_ok": all(v.get("errors_ok") for v in hbone.values()) if hbone else False,
@@ -1280,6 +1602,7 @@ def build_summary(
     }
     ready = all(
         [
+            suites_ok,
             acceptance["mesh_complete"],
             acceptance["hbone_complete"],
             acceptance["hbone_errors_ok"],
@@ -1300,7 +1623,7 @@ def build_summary(
         "runner_health": runner_health,
         "acceptance_gate": acceptance,
         "selected_suite_gates": selected,
-        "selected_suite_accepted": all(selected.values()),
+        "selected_suite_accepted": selected_suite_accepted(acceptance, suites),
         "ready_to_publish_baselines": ready,
     }
 
@@ -1313,6 +1636,12 @@ def check_acceptance(summary_path: Path, suites: str) -> int:
     acceptance = summary.get("acceptance_gate")
     if not isinstance(acceptance, dict):
         print("::error::summary.acceptance_gate missing")
+        return 1
+    if not suites_supported(suites):
+        print(
+            "::error::unsupported suites value "
+            f"{suites!r} (expected one of: {', '.join(sorted(SUPPORTED_SUITES))})"
+        )
         return 1
     # Prefer gates recomputed for the suites argument so callers can override.
     gates = selected_suite_gates(acceptance, suites)

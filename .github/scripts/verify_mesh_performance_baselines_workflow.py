@@ -67,6 +67,16 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("runner_health.json" in text, "machine-readable runner_health.json required", failures)
     require("runner_health_probes.jsonl" in text, "per-E2E runner health probes required", failures)
     require("--check-acceptance" in text, "selected-suite acceptance step required", failures)
+    require(
+        "unsupported suites value" in text,
+        "workflow must reject unsupported suites at the boundary",
+        failures,
+    )
+    require(
+        "all|mesh|hbone|dns" in text or 'supported = {"all", "mesh", "hbone", "dns"}' in text,
+        "workflow suite allowlist must be all|mesh|hbone|dns",
+        failures,
+    )
     require("authz_match" in text and "ip_restriction" in text, "mesh benches incomplete", failures)
     require("slice_apply" in text and "xds_translation" in text, "mesh benches incomplete", failures)
     require("1kib_c50_30s" in text and "16kib_c50_30s" in text, "HBONE scenarios incomplete", failures)
@@ -130,6 +140,16 @@ def check_scripts(failures: list[str]) -> None:
     require("DNS_GATEWAY_ROWS" in summary, "summarizer must enumerate required DNS gateway rows", failures)
     require("--check-acceptance" in summary, "summarizer must support acceptance check", failures)
     require("undersampling" in summary or "one gateway" in summary, "summarizer self-test must cover undersampling", failures)
+    require("SUPPORTED_SUITES" in summary, "summarizer must define SUPPORTED_SUITES", failures)
+    require("suites_supported" in summary, "summarizer must gate on suites_supported", failures)
+    require("expected_run_paths" in summary, "summarizer must count distinct expected run files", failures)
+    require("classify_dns_target" in summary, "summarizer must classify DNS targets fail-closed", failures)
+    require("duplicate relevant blobs" in summary, "summarizer self-test must cover duplicate blobs", failures)
+    require("malformed relevant blobs alongside" in summary, "summarizer self-test must cover malformed mixed runs", failures)
+    require("missing counterpart" in summary, "summarizer self-test must cover missing counterpart data", failures)
+    require("unexpected DNS target" in summary, "summarizer self-test must cover unexpected DNS targets", failures)
+    require("unsupported suite selection" in summary, "summarizer self-test must cover invalid suites", failures)
+    require("shape_failures" in summary, "summarizer must track per-run shape failures", failures)
 
 def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")
@@ -188,6 +208,14 @@ jobs:
       - run: collect_mesh_baseline_provenance.py
       - run: summarize_mesh_baseline_results.py
       - run: runner_health.json runner_health_probes.jsonl
+      - run: |
+          case "${SUITES}" in
+            all|mesh|hbone|dns) ;;
+            *)
+              echo "::error::unsupported suites value"
+              exit 1
+              ;;
+          esac
       - name: Enforce selected-suite acceptance gates
         if: always()
         run: --check-acceptance

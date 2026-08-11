@@ -10,8 +10,9 @@
 #
 # Runner is pinned to GitHub-hosted ubuntu-24.04 (no arbitrary / self-hosted
 # label input). Publication fails closed when selected-suite gates are false,
-# including undersampled E2E rows, missing DNS rows, nonzero errors, or CPU
-# steal above 5.0%. Artifacts still upload via if: always().
+# including undersampled E2E rows, missing DNS rows, malformed/duplicate
+# relevant blobs, unexpected DNS target identities, unsupported suite filters,
+# nonzero errors, or CPU steal above 5.0%. Artifacts still upload via if: always().
 
 name: Mesh Performance Baselines
 
@@ -104,11 +105,21 @@ jobs:
           SUITES: ${{ env.BENCH_SUITES }}
         run: |
           set -euo pipefail
+          case "${SUITES}" in
+            all|mesh|hbone|dns) ;;
+            *)
+              echo "::error::unsupported suites value '${SUITES}' (expected all|mesh|hbone|dns)"
+              exit 1
+              ;;
+          esac
           mkdir -p mesh-baseline-results/{mesh,hbone,dns,drafts,logs}
           : > mesh-baseline-results/logs/runner_health_probes.jsonl
           python3 - <<'PY'
           import json, os
           suites = os.environ["SUITES"]
+          supported = {"all", "mesh", "hbone", "dns"}
+          if suites not in supported:
+              raise SystemExit(f"unsupported suites value: {suites!r}")
           iterations = max(3, int(os.environ["BENCH_ITERATIONS"]))
           commands = []
           if suites in ("all", "mesh"):
