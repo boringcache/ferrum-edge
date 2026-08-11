@@ -40,9 +40,9 @@
 //! Nothing in this module logs, formats, or returns trust material. Errors name
 //! the offending field and index only.
 
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -693,8 +693,10 @@ pub fn record_trust_generation_published(
         // outcome, so it must not keep advertising the removed database
         // revision. Retain only prior states that still have a current record;
         // do not insert newly ambiguous records that never published.
-        let current_namespaces: HashSet<&str> =
-            records.iter().map(|record| record.namespace.as_str()).collect();
+        let current_namespaces: HashSet<&str> = records
+            .iter()
+            .map(|record| record.namespace.as_str())
+            .collect();
         let mut retained = PUBLISHED_NAMESPACE_STATES.load().as_ref().clone();
         retained.retain(|namespace, _| current_namespaces.contains(namespace.as_str()));
         PUBLISHED_NAMESPACE_STATES.store(Arc::new(retained));

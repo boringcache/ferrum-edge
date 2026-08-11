@@ -6368,9 +6368,7 @@ async fn handle_gateway_trust_status(
     let generation = published
         .as_ref()
         .map(|state| state.generation.clone())
-        .unwrap_or_else(|| {
-            crate::config::gateway_trust::published_namespace_generation(namespace)
-        });
+        .unwrap_or_else(|| crate::config::gateway_trust::published_namespace_generation(namespace));
     Ok(json_response(
         StatusCode::OK,
         &json!({

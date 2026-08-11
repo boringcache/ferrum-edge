@@ -492,7 +492,10 @@ fn observability_counters_are_bounded_and_material_free() {
     let published = published_namespace_state("production")
         .expect("the exact namespace publication must be observable");
     assert_eq!(published.bundle.revision, valid_record().revision);
-    assert_eq!(published.generation, published_namespace_generation("production"));
+    assert_eq!(
+        published.generation,
+        published_namespace_generation("production")
+    );
 
     // A rejected candidate must NOT look like a publication: the previous valid
     // generation is still the one serving.
