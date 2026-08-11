@@ -531,7 +531,10 @@ async fn a_resource_filtered_backup_does_not_export_or_import_trust() {
     assert_eq!(partial["counts"]["gateway_trust_bundles"], 0);
 
     let (status, imported) = post_json(&base, "/batch", "ferrum", partial).await;
-    assert_eq!(status, 201, "the partial artifact must remain batch-compatible: {imported}");
+    assert_eq!(
+        status, 201,
+        "the partial artifact must remain batch-compatible: {imported}"
+    );
 
     let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
     assert_eq!(status, 200);

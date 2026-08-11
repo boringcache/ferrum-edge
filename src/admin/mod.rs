@@ -7395,13 +7395,12 @@ fn serialize_backup_payload(
     // trust there would let `?resources=proxies` rotate a namespace's roots.
     // Absence is the documented no-op on restore/import, so omission preserves
     // trust rather than revoking it.
-    let gateway_trust_bundles: Option<&[GatewayTrustBundleRecord]> = if source == "database"
-        && resource_filter.is_none()
-    {
-        Some(config.gateway_trust_bundles.as_slice())
-    } else {
-        None
-    };
+    let gateway_trust_bundles: Option<&[GatewayTrustBundleRecord]> =
+        if source == "database" && resource_filter.is_none() {
+            Some(config.gateway_trust_bundles.as_slice())
+        } else {
+            None
+        };
 
     let backup = BackupPayload {
         version: &config.version,
