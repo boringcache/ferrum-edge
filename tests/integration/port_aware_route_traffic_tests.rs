@@ -337,8 +337,7 @@ async fn two_same_protocol_gateway_listeners_bind_and_route_independently() {
     let (backend_80, _b80) = start_body_backend(b"listener-a").await;
     let (backend_8080, _b8080) = start_body_backend(b"listener-b").await;
 
-    let startup =
-        start_two_same_protocol_gateway_listeners(backend_80, backend_8080).await;
+    let startup = start_two_same_protocol_gateway_listeners(backend_80, backend_8080).await;
     let TwoSameProtocolListenersStartup {
         handles,
         shutdown_tx,
