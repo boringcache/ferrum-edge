@@ -21,6 +21,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::time::Instant;
@@ -321,9 +322,15 @@ pub fn resolve_upstream_staleness(
 }
 
 static REGISTRY: OnceLock<DashMap<String, TaskHealth>> = OnceLock::new();
+static COARSE_AGGREGATE: OnceLock<ArcSwap<DiscoveryHealthAggregate>> = OnceLock::new();
+static COARSE_AGGREGATE_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn registry() -> &'static DashMap<String, TaskHealth> {
     REGISTRY.get_or_init(DashMap::new)
+}
+
+fn coarse_aggregate_cache() -> &'static ArcSwap<DiscoveryHealthAggregate> {
+    COARSE_AGGREGATE.get_or_init(|| ArcSwap::from_pointee(DiscoveryHealthAggregate::default()))
 }
 
 /// Mutate the entry for `key` only when it still owns `generation`.
@@ -364,6 +371,7 @@ pub(crate) fn register_task(
             expiry_retry_attempts: 0,
         },
     );
+    refresh_coarse_aggregate();
 }
 
 /// Remove the entry for `key` when `generation` still owns it.
@@ -371,7 +379,12 @@ pub(crate) fn register_task(
 /// A stale generation's removal is ignored so a slow supervisor teardown cannot
 /// delete the health of the task that replaced it.
 pub(crate) fn remove_task(key: &str, generation: u64) {
-    registry().remove_if(key, |_, entry| entry.generation == generation);
+    if registry()
+        .remove_if(key, |_, entry| entry.generation == generation)
+        .is_some()
+    {
+        refresh_coarse_aggregate();
+    }
 }
 
 /// Whether `generation` is still the owner of `key`.
@@ -383,7 +396,15 @@ pub(crate) fn generation_is_current(key: &str, generation: u64) -> bool {
 
 /// Record a successfully admitted and published (or confirmed) snapshot.
 pub(crate) fn record_success(key: &str, generation: u64) {
-    with_current(key, generation, |entry| {
+    let affects_coarse = with_current(key, generation, |entry| {
+        let affects_coarse = entry.expiry_applied
+            || entry.expiry_retry_at.is_some()
+            || matches!(
+                entry.state,
+                DiscoveryTaskState::Restarting
+                    | DiscoveryTaskState::CrashLooping
+                    | DiscoveryTaskState::Stopped
+            );
         entry.state = DiscoveryTaskState::Running;
         entry.last_success_at = Some(Instant::now());
         entry.consecutive_failures = 0;
@@ -397,7 +418,11 @@ pub(crate) fn record_success(key: &str, generation: u64) {
             crate::plugins::prometheus_metrics::global_registry()
                 .record_service_discovery_stale_recovery();
         }
+        affects_coarse
     });
+    if affects_coarse == Some(true) {
+        refresh_coarse_aggregate();
+    }
 }
 
 /// Record a poll that produced no new published snapshot.
@@ -418,7 +443,7 @@ pub(crate) fn record_failure(key: &str, generation: u64, reason: DiscoveryFailur
 /// every policy, including `retain`, which performs no withdrawal — and cannot
 /// hot-loop on an already-expired staleness deadline.
 pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
-    with_current(key, generation, |entry| {
+    let claimed = with_current(key, generation, |entry| {
         if entry.expiry_applied {
             return false;
         }
@@ -428,7 +453,11 @@ pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
         entry.expiry_retry_attempts = 0;
         true
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    if claimed {
+        refresh_coarse_aggregate();
+    }
+    claimed
 }
 
 /// Defer a failed staleness withdrawal with bounded exponential backoff.
@@ -437,14 +466,18 @@ pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
 /// dynamic targets are still installed. The retry deadline prevents an elapsed
 /// staleness timer from spinning.
 pub(crate) fn defer_expiry_retry(key: &str, generation: u64) -> Option<Duration> {
-    with_current(key, generation, |entry| {
+    let backoff = with_current(key, generation, |entry| {
         entry.expiry_retry_attempts = entry.expiry_retry_attempts.saturating_add(1);
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_error = Some(DiscoveryFailureReason::PublishFailed);
         let backoff = restart_backoff(entry.expiry_retry_attempts);
         entry.expiry_retry_at = Some(Instant::now() + backoff);
         backoff
-    })
+    });
+    if backoff.is_some() {
+        refresh_coarse_aggregate();
+    }
+    backoff
 }
 
 /// Record an unexpected poller exit and return the supervisor's next backoff.
@@ -463,14 +496,18 @@ pub(crate) fn record_unexpected_exit(key: &str, generation: u64) -> Option<Durat
         };
         entry.consecutive_crashes
     })?;
+    refresh_coarse_aggregate();
     Some(restart_backoff(crashes))
 }
 
 /// Mark a task as cleanly stopped (cancel or shutdown), never a crash.
 pub(crate) fn record_clean_exit(key: &str, generation: u64) {
-    with_current(key, generation, |entry| {
+    let updated = with_current(key, generation, |entry| {
         entry.state = DiscoveryTaskState::Stopped;
     });
+    if updated.is_some() {
+        refresh_coarse_aggregate();
+    }
 }
 
 /// Bounded exponential restart backoff with ±25% jitter.
@@ -542,12 +579,7 @@ fn project(key: &str, entry: &TaskHealth, now: Instant) -> DiscoveryTaskStatus {
     }
 }
 
-/// Fixed-cardinality aggregate for `/metrics` and coarse health.
-///
-/// Staleness is recomputed against `Instant::now()` on every call, so an
-/// expired window is visible even before the owning task's timer fires.
-pub fn aggregate() -> DiscoveryHealthAggregate {
-    let now = Instant::now();
+fn compute_aggregate(now: Instant) -> DiscoveryHealthAggregate {
     let mut aggregate = DiscoveryHealthAggregate::default();
     for entry in registry().iter() {
         let entry = entry.value();
@@ -579,6 +611,33 @@ pub fn aggregate() -> DiscoveryHealthAggregate {
     aggregate
 }
 
+/// Recompute the coarse projection after a background lifecycle transition.
+/// This may walk configured tasks on the control-plane/background path; the
+/// unauthenticated health path remains an O(1) ArcSwap load.
+fn refresh_coarse_aggregate() {
+    // Serialize recomputes so an older transition cannot publish its snapshot
+    // after a newer one. The lock is never touched by aggregate readers.
+    let _guard = COARSE_AGGREGATE_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    coarse_aggregate_cache().store(std::sync::Arc::new(compute_aggregate(Instant::now())));
+}
+
+/// Precomputed fixed-cardinality aggregate for unauthenticated coarse health.
+///
+/// Background lifecycle transitions precompute this snapshot, keeping the
+/// unauthenticated `/health` and `/status` paths lock-free and O(1). Age-only
+/// fields are not consumed on that tier; authenticated projections and metrics
+/// use [`aggregate`] to compute their current values.
+pub fn coarse_aggregate() -> DiscoveryHealthAggregate {
+    **coarse_aggregate_cache().load()
+}
+
+/// Current fixed-cardinality aggregate for authenticated detail and `/metrics`.
+pub fn aggregate() -> DiscoveryHealthAggregate {
+    compute_aggregate(Instant::now())
+}
+
 /// Authenticated projection: aggregate plus per-upstream detail, sorted by
 /// upstream key so the body is stable across scrapes.
 pub fn snapshot() -> DiscoveryHealthSnapshot {
@@ -589,7 +648,7 @@ pub fn snapshot() -> DiscoveryHealthSnapshot {
         .collect();
     upstreams.sort_by(|a, b| a.upstream.cmp(&b.upstream));
     DiscoveryHealthSnapshot {
-        aggregate: aggregate(),
+        aggregate: compute_aggregate(now),
         upstreams,
     }
 }
@@ -605,6 +664,7 @@ pub fn has_tasks() -> bool {
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn reset_for_test() {
     registry().clear();
+    refresh_coarse_aggregate();
 }
 
 /// Register a task generation directly, as a reconcile-driven replacement
@@ -650,5 +710,7 @@ pub fn age_anchor_for_test(key: &str, age_seconds: u64) -> bool {
     if entry.last_success_at.is_some() {
         entry.last_success_at = Some(shifted);
     }
+    drop(entry);
+    refresh_coarse_aggregate();
     true
 }

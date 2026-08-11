@@ -2039,7 +2039,7 @@ async fn handle_admin_request_inner(
         // while a default fail-closed withdrawal is still retrying publication.
         // A crash-looping, restarting, or successfully withdrawn task only
         // degrades coarse health.
-        let discovery_health = crate::service_discovery::health::aggregate();
+        let discovery_health = crate::service_discovery::health::coarse_aggregate();
         let discovery_ready = discovery_health.ready();
         let ready = startup_ready && !serving_degraded && jwks_ready && discovery_ready;
         health_status["ready"] = json!(ready);

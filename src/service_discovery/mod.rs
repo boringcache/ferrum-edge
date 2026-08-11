@@ -1580,10 +1580,44 @@ async fn run_discovery_loop(
             }
         }
 
-        // Discover targets. Provider cursors (e.g. Consul X-Consul-Index) stay
-        // pending until shared admission and publication succeed for this exact
-        // snapshot — dropping the commit handle retains the prior cursor.
-        match discoverer.discover().await {
+        // Keep cancellation, shutdown, and the staleness deadline live while a
+        // provider call is in flight. A hung registry request must not postpone
+        // fail-closed withdrawal beyond the configured bound.
+        let discover_result = {
+            let discover_future = discoverer.discover();
+            tokio::pin!(discover_future);
+            loop {
+                let stale_deadline = health::next_stale_deadline(&ctx.key, ctx.generation);
+                tokio::select! {
+                    result = &mut discover_future => break result,
+                    _ = async {
+                        match stale_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        apply_staleness_expiry(&ctx, &mut state);
+                    }
+                    _ = wait_for_cancel(cancel_rx.clone()) => {
+                        return DiscoveryLoopExit::Canceled;
+                    }
+                    _ = async {
+                        if let Some(ref rx) = shutdown_rx {
+                            wait_for_shutdown(rx.clone()).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        return DiscoveryLoopExit::Shutdown;
+                    }
+                }
+            }
+        };
+
+        // Provider cursors (e.g. Consul X-Consul-Index) stay pending until
+        // shared admission and publication succeed for this exact snapshot —
+        // dropping the commit handle retains the prior cursor.
+        match discover_result {
             Ok(snapshot) => {
                 match apply_discovered_snapshot(
                     &ctx.upstream_namespace,

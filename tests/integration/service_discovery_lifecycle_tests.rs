@@ -143,6 +143,7 @@ struct ScriptedDiscoverer {
     calls: Arc<AtomicU64>,
     targets: std::sync::Mutex<Vec<UpstreamTarget>>,
     fail: Arc<AtomicBool>,
+    hang: Arc<AtomicBool>,
     panic_until_call: u64,
 }
 
@@ -152,6 +153,7 @@ impl ScriptedDiscoverer {
             calls: Arc::new(AtomicU64::new(0)),
             targets: std::sync::Mutex::new(targets),
             fail: Arc::new(AtomicBool::new(false)),
+            hang: Arc::new(AtomicBool::new(false)),
             panic_until_call: 0,
         }
     }
@@ -173,6 +175,9 @@ impl ServiceDiscoverer for ScriptedDiscoverer {
         }
         if self.fail.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("scripted discovery failure"));
+        }
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
         }
         let targets = self.targets.lock().expect("targets lock").clone();
         Ok(DiscoverySnapshot::from_targets(targets))
@@ -623,6 +628,70 @@ async fn expiry_recovers_and_republishes_without_a_config_reload() {
 }
 
 #[tokio::test]
+async fn expiry_withdrawal_is_not_blocked_by_a_hung_discovery_call() {
+    let _guard = isolated().await;
+
+    let config = config_with(vec![upstream_with_sd("hung-registry", Vec::new(), None)]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "discovered.local",
+        8080,
+    )]));
+    let calls = Arc::clone(&discoverer.calls);
+    let hang = Arc::clone(&discoverer.hang);
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "hung-registry",
+        "scripted",
+        discoverer,
+        lb_cache,
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        Vec::new(),
+        LoadBalancerAlgorithm::RoundRobin,
+        1,
+        3,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    assert!(
+        wait_for(|| {
+            health::snapshot()
+                .upstreams
+                .iter()
+                .any(|upstream| {
+                    upstream.upstream == task.key
+                        && upstream.last_success_age_seconds.is_some()
+                })
+        })
+        .await,
+        "initial discovered snapshot must publish"
+    );
+    hang.store(true, Ordering::SeqCst);
+    assert!(
+        wait_for(|| calls.load(Ordering::SeqCst) >= 2).await,
+        "second discovery call must enter the scripted hang"
+    );
+
+    assert!(
+        wait_for(|| {
+            health::snapshot()
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.upstream == task.key && upstream.withdrawn)
+        })
+        .await,
+        "staleness withdrawal must fire while discovery remains pending"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
+}
+
+#[tokio::test]
 async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
     let _guard = isolated().await;
 
@@ -651,8 +720,8 @@ async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
         DnsCache::new(Default::default()),
         Vec::new(),
         LoadBalancerAlgorithm::RoundRobin,
-        60,
-        180,
+        1,
+        3,
         SdStalePolicy::Withdraw,
         1,
     );
