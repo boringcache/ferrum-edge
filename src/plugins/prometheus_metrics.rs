@@ -3410,7 +3410,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_tasks_readiness_failing",
-                "Stale service-discovery tasks configured with the fail_readiness expiry policy.",
+                "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
                 discovery_health.readiness_failing as i64,
             ),
             (

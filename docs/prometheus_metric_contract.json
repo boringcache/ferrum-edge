@@ -3281,7 +3281,7 @@
   {
     "name": "ferrum_service_discovery_tasks_readiness_failing",
     "type": "gauge",
-    "help": "Stale service-discovery tasks configured with the fail_readiness expiry policy.",
+    "help": "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
     "labels": [
       "namespace"
     ],

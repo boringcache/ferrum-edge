@@ -2035,10 +2035,10 @@ async fn handle_admin_request_inner(
         let jwks_ready = jwks_trust.ready(jwks_now);
         let jwks_degraded = jwks_trust.degraded(jwks_now);
         // Service-discovery task lifecycle and bounded staleness (issues #3717 /
-        // #3721). Readiness fails only for a stale task under the explicit
-        // `fail_readiness` policy; a crash-looping, restarting, or withdrawn
-        // task degrades coarse health without pulling the whole gateway out of
-        // rotation for one upstream's registry outage.
+        // #3721). Readiness fails for an explicit `fail_readiness` policy and
+        // while a default fail-closed withdrawal is still retrying publication.
+        // A crash-looping, restarting, or successfully withdrawn task only
+        // degrades coarse health.
         let discovery_health = crate::service_discovery::health::aggregate();
         let discovery_ready = discovery_health.ready();
         let ready = startup_ready && !serving_degraded && jwks_ready && discovery_ready;
