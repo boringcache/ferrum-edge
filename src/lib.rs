@@ -1018,7 +1018,7 @@ pub mod _test_support {
             DiscoveryBodyRole::Error
         };
         match collect_discovery_response_body(response, role).await {
-            Ok(body) => Ok(body.len()),
+            Ok(body) => Ok(body.as_slice().len()),
             Err(DiscoveryBodyError::Oversized) => Err("response_oversized"),
             Err(DiscoveryBodyError::BudgetExhausted) => Err("body_budget_rejected"),
             Err(DiscoveryBodyError::ReadFailed) => Err("body_read_failed"),
