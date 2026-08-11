@@ -441,6 +441,11 @@ impl GatewayListenerAdmission {
     pub(crate) fn allows(&self, port: u16) -> bool {
         !self.pending && !self.refused_ports.contains(&port)
     }
+
+    #[inline]
+    fn explicitly_refuses(&self, port: u16) -> bool {
+        self.refused_ports.contains(&port)
+    }
 }
 
 pub(crate) struct RouteSnapshot {
@@ -1724,6 +1729,13 @@ impl RouterCache {
         frontend_port: Option<u16>,
         frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
+        // A withdrawn or class-flipping listener may still have an accepted
+        // connection draining after its route disappeared. Never reinterpret
+        // that listener as the process-global socket and apply the
+        // single-listener Service remap to a surviving sibling.
+        if frontend_port.is_some_and(|port| listener_admission.explicitly_refuses(port)) {
+            return None;
+        }
         let normalized = normalize_encoded_slashes(path);
         let path: &str = &normalized;
         let port_ctx = HttpPortMatchContext {

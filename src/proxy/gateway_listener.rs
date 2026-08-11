@@ -534,6 +534,7 @@ impl GatewayListenerManager {
                 (plan.ports.get(port) != Some(&listener.class)).then_some(*port)
             })
             .collect();
+        let stale_route_ports: BTreeSet<u16> = stale.iter().copied().collect();
         // Ports whose retiring generation has not finished closing its accept
         // sockets. Rebinding them in this pass could co-serve two classes, so
         // they are left unbound and retried.
@@ -615,12 +616,17 @@ impl GatewayListenerManager {
             .collect();
 
         // Admission refusals suppress remapping. Start from plan.refused
-        // (reserved / stream / TLS-class collisions) and extend only for
-        // reconcile-time decisions that likewise must not leak onto the
-        // process-global proxy. Ordinary `spawn_listener` OS errors are
+        // (reserved / stream / TLS-class collisions) and every port whose old
+        // accept loop is still draining, including a listener withdrawn from
+        // the current plan. A request already accepted by that old listener
+        // must not be remapped to the sole surviving listener. Extend this set
+        // for other reconcile-time decisions that likewise must not leak onto
+        // the process-global proxy. Ordinary `spawn_listener` OS errors are
         // intentionally omitted so Service-fronted `:80`/`:443` remapping
         // survives privileged-port bind failures.
         let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
+        refused_route_ports.extend(stale_route_ports);
+        refused_route_ports.extend(retiring_ports.iter().copied());
 
         for (port, class) in &plan.ports {
             if defer_rebind.contains(port) || retiring_ports.contains(port) {
