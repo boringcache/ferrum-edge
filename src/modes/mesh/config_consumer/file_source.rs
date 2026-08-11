@@ -449,11 +449,7 @@ impl MeshLocalSourceRecovery {
     /// superseded (file-slice) pending state is left exactly as found, so a
     /// late install can neither resurrect a canceled recovery nor overwrite a
     /// newer candidate's identity.
-    pub fn bind_installed_slice_if_policy_recovery(
-        &self,
-        expected_epoch: u64,
-        slice: &MeshSlice,
-    ) {
+    pub fn bind_installed_slice_if_policy_recovery(&self, expected_epoch: u64, slice: &MeshSlice) {
         let identity = slice_content_identity(slice);
         let mut state = match self.state.lock() {
             Ok(state) => state,

@@ -286,9 +286,8 @@ fn stock_policy_reload_rejection_raises_and_recovery_clears_only_after_proxy() {
 
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
     let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
-    let (tx, _rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
-        baseline.clone(),
-    )));
+    let (tx, _rx) =
+        tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline.clone())));
     let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
     let rejected = apply_stock_policy_reload_candidate(

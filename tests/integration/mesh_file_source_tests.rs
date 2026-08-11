@@ -668,9 +668,8 @@ mesh:
 "#;
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
     let baseline = load_stock_policy_baseline(&path).expect("policy baseline");
-    let (tx, _rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
-        baseline.clone(),
-    )));
+    let (tx, _rx) =
+        tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline.clone())));
     let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
     let rejected = apply_stock_policy_reload_candidate(
@@ -747,20 +746,19 @@ fn stock_policy_recovery_epoch_fences_stale_slice_binding() {
 
 #[test]
 fn stock_policy_reload_without_consumer_fails_closed() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
     use ferrum_edge::modes::mesh::config_consumer::file_source::{
         MeshLocalReloadApply, MeshLocalSourceRecovery,
     };
     use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
         StockPolicySnapshot, apply_stock_policy_reload_candidate,
     };
-    use ferrum_edge::modes::mesh::config::MeshConfig;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     let baseline = MeshConfig::default();
-    let (tx, rx) = tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(
-        baseline.clone(),
-    )));
+    let (tx, rx) =
+        tokio::sync::watch::channel(StockPolicySnapshot::initial(Arc::new(baseline.clone())));
     drop(rx);
     let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
 
