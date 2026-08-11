@@ -2918,8 +2918,10 @@ impl ConsulPipelineHarness {
                 None,
             );
         }
-        let mut dns_config = ferrum_edge::dns::DnsConfig::default();
-        dns_config.backend_allow_ips = backend_allow_ips;
+        let dns_config = ferrum_edge::dns::DnsConfig {
+            backend_allow_ips,
+            ..Default::default()
+        };
         let dns_cache = ferrum_edge::dns::DnsCache::new(dns_config);
         // Keep the cancel sender alive so `borrow()` stays meaningful for the
         // production cancel checks inside the apply pipeline.
@@ -2987,7 +2989,7 @@ async fn consul_higher_index_http_500_does_not_advance_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -3048,7 +3050,7 @@ async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -3105,7 +3107,7 @@ async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("8.8.8.8", 8080))
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -3117,7 +3119,7 @@ async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
         .and(query_param("index", "10"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
                 .insert_header("X-Consul-Index", "99"),
         )
         .mount(&mock_server)
@@ -3167,7 +3169,7 @@ async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_publis
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("8.8.8.8", 8080))
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
                 .insert_header("X-Consul-Index", "50"),
         )
         .up_to_n_times(1)
@@ -3179,7 +3181,7 @@ async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_publis
         .and(query_param("index", "50"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.9", 8080))
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
                 .insert_header("X-Consul-Index", "50"),
         )
         .up_to_n_times(1)
@@ -3191,7 +3193,7 @@ async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_publis
         .and(query_param("index", "50"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("backend.example.com", 8080))
+                .set_body_json(consul_health_instance("backend.example.com", 8080))
                 .insert_header("X-Consul-Index", "50"),
         )
         .mount(&mock_server)
@@ -3236,7 +3238,7 @@ async fn consul_successful_higher_index_publishes_then_commits() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "42"),
         )
         .mount(&mock_server)
@@ -3279,7 +3281,7 @@ async fn consul_successful_lower_index_rollback_publishes_then_commits() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "100"),
         )
         .up_to_n_times(1)
@@ -3291,7 +3293,7 @@ async fn consul_successful_lower_index_rollback_publishes_then_commits() {
         .and(query_param("index", "100"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.2", 8080))
+                .set_body_json(consul_health_instance("10.0.0.2", 8080))
                 .insert_header("X-Consul-Index", "7"),
         )
         .mount(&mock_server)
@@ -3328,7 +3330,7 @@ async fn consul_publication_failure_does_not_commit_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "42"),
         )
         .mount(&mock_server)
@@ -3422,7 +3424,7 @@ async fn consul_unchanged_snapshot_commits_cursor_only_after_prior_install() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "20"),
         )
         .up_to_n_times(1)
@@ -3436,7 +3438,7 @@ async fn consul_unchanged_snapshot_commits_cursor_only_after_prior_install() {
         .and(query_param("index", "20"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "21"),
         )
         .mount(&mock_server)
@@ -3478,7 +3480,7 @@ async fn consul_all_provider_entries_rejected_retains_targets_and_cursor() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.1", 8080))
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
                 .insert_header("X-Consul-Index", "10"),
         )
         .up_to_n_times(1)
@@ -3490,7 +3492,7 @@ async fn consul_all_provider_entries_rejected_retains_targets_and_cursor() {
         .and(query_param("index", "10"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_invalid_entries())
+                .set_body_json(consul_invalid_entries())
                 .insert_header("X-Consul-Index", "99"),
         )
         .mount(&mock_server)
@@ -3535,7 +3537,7 @@ async fn consul_mixed_provider_entries_publish_valid_subset_and_commit() {
         .and(path("/v1/health/service/api"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_mixed_entries())
+                .set_body_json(consul_mixed_entries())
                 .insert_header("X-Consul-Index", "33"),
         )
         .mount(&mock_server)
@@ -3667,7 +3669,7 @@ async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_qu
         .and(query_param("index", "12"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&consul_health_instance("10.0.0.7", 8080))
+                .set_body_json(consul_health_instance("10.0.0.7", 8080))
                 .insert_header("X-Consul-Index", "13"),
         )
         .mount(&mock_server)
