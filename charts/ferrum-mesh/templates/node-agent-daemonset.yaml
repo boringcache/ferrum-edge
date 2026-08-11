@@ -98,8 +98,20 @@
 {{- $nodeAgentStartupProbe := $nodeAgentProbes.startup | default dict -}}
 {{- $nodeAgentLivenessProbe := $nodeAgentProbes.liveness | default dict -}}
 {{- $nodeAgentReadinessProbe := $nodeAgentProbes.readiness | default dict -}}
-{{- $nodeAgentDefaultLiveProbe := and (or ($nodeAgentStartupProbe.enabled | default true) ($nodeAgentLivenessProbe.enabled | default true)) (not ($nodeAgentLivenessProbe.override | default dict)) -}}
-{{- $nodeAgentDefaultReadyProbe := and ($nodeAgentReadinessProbe.enabled | default true) (not ($nodeAgentReadinessProbe.override | default dict)) -}}
+{{- $nodeAgentStartupEnabled := true -}}
+{{- if hasKey $nodeAgentStartupProbe "enabled" -}}
+{{- $nodeAgentStartupEnabled = $nodeAgentStartupProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentLivenessEnabled := true -}}
+{{- if hasKey $nodeAgentLivenessProbe "enabled" -}}
+{{- $nodeAgentLivenessEnabled = $nodeAgentLivenessProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentReadinessEnabled := true -}}
+{{- if hasKey $nodeAgentReadinessProbe "enabled" -}}
+{{- $nodeAgentReadinessEnabled = $nodeAgentReadinessProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentDefaultLiveProbe := and (or $nodeAgentStartupEnabled $nodeAgentLivenessEnabled) (not ($nodeAgentLivenessProbe.override | default dict)) -}}
+{{- $nodeAgentDefaultReadyProbe := and $nodeAgentReadinessEnabled (not ($nodeAgentReadinessProbe.override | default dict)) -}}
 {{- if and $nodeAgentProbeUsesTls $nodeAgentAdminClientCaKey (or $nodeAgentDefaultLiveProbe $nodeAgentDefaultReadyProbe) -}}
 {{- fail "nodeAgent.admin.port=0 with admin mTLS (tls.clientCaKey) makes HTTPS require a client certificate, but computed exec probes cannot present one; override/disable probes or keep a plaintext loopback admin.port" -}}
 {{- end -}}

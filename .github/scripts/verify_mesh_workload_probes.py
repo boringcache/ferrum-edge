@@ -360,7 +360,10 @@ def validate_node_agent_https_mtls_probe_policy(
             "Node-agent HTTPS-only mTLS with disabled probes missing",
             "disabling all computed probes must permit HTTPS-only mTLS",
         )
-    if "readinessProbe:" in disabled or "livenessProbe:" in disabled:
+    if any(
+        probe in disabled
+        for probe in ("startupProbe:", "livenessProbe:", "readinessProbe:")
+    ):
         fail(
             "Node-agent HTTPS-only mTLS disabled probes still rendered",
             "disabled probes must omit computed handlers",
