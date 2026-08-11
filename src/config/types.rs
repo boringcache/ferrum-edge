@@ -483,6 +483,18 @@ pub struct SubsetTrafficPolicy {
     /// sibling subsets cannot consume one another's allowance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (ms), mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.idleTimeout`. Overlaid onto
+    /// the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_idle_timeout_seconds` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap, mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.http2MaxRequests`. Overlaid
+    /// onto the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_http2_max_concurrent_streams` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_max_concurrent_streams: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
     /// already resolved from the Istio outlier shape. The ejection *thresholds*
     /// (consecutive errors, interval, base-ejection time, min-health) are
@@ -873,6 +885,12 @@ impl ResolvedPortOverride {
         if let Some(pending) = subset.http1_max_pending_requests {
             self.http1_max_pending_requests = Some(pending);
         }
+        if let Some(idle_ms) = subset.http_idle_timeout_ms {
+            self.http_idle_timeout_ms = Some(idle_ms);
+        }
+        if let Some(max_streams) = subset.h2_max_concurrent_streams {
+            self.h2_max_concurrent_streams = Some(max_streams);
+        }
     }
 }
 
@@ -928,7 +946,9 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
     if let Some(subset_policy) = subset_policy
         && (subset_policy.h2_upgrade_policy.is_some()
             || subset_policy.max_retries.is_some()
-            || subset_policy.http1_max_pending_requests.is_some())
+            || subset_policy.http1_max_pending_requests.is_some()
+            || subset_policy.http_idle_timeout_ms.is_some()
+            || subset_policy.h2_max_concurrent_streams.is_some())
     {
         inherited
             .get_or_insert_with(ResolvedPortOverride::default)
@@ -989,6 +1009,10 @@ pub struct ResolvedSubsetTrafficPolicy {
     pub max_retries: Option<u32>,
     /// Subset-scoped concurrent in-flight HTTP/1.1 cap.
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (milliseconds).
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap.
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
@@ -1000,6 +1024,8 @@ impl ResolvedSubsetTrafficPolicy {
         h2_upgrade_policy: Option<H2UpgradePolicy>,
         max_retries: Option<u32>,
         http1_max_pending_requests: Option<u32>,
+        http_idle_timeout_ms: Option<u64>,
+        h2_max_concurrent_streams: Option<u32>,
     ) -> Option<Self> {
         let resolved = Self {
             tls,
@@ -1007,6 +1033,8 @@ impl ResolvedSubsetTrafficPolicy {
             h2_upgrade_policy,
             max_retries,
             http1_max_pending_requests,
+            http_idle_timeout_ms,
+            h2_max_concurrent_streams,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -1017,6 +1045,8 @@ impl ResolvedSubsetTrafficPolicy {
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
+            && self.http_idle_timeout_ms.is_none()
+            && self.h2_max_concurrent_streams.is_none()
     }
 }
 
@@ -1719,10 +1749,11 @@ pub struct Upstream {
     /// Inherited (non-`portLevelSettings`) DestinationRule
     /// `connectionPool.http` overlay.
     ///
-    /// This carries the top-level block for service-discovery upstreams and the
-    /// three subset-inheritable fields (`h2UpgradePolicy`, `maxRetries`, and
-    /// `http1MaxPendingRequests`) for every upstream. During proxy projection a
-    /// selected subset overlays those three fields onto this base. Dispatch
+    /// This carries the top-level `connectionPool.http` block for every
+    /// upstream (including the five subset-inheritable fields:
+    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, and `http2MaxRequests`). During proxy projection a
+    /// selected subset overlays those fields onto this base. Dispatch
     /// merges an explicit per-port entry first, then this inherited fallback,
     /// giving exact `port-level > subset-level > top-level` field precedence.
     /// Not serialized — derived from the matching DestinationRule.
@@ -2370,8 +2401,10 @@ pub struct Proxy {
     /// `GatewayConfig::resolve_dispatch_port_overrides()`.
     ///
     /// Service-discovery upstreams use this because target ports resolve at
-    /// runtime. All upstreams also use it for the subset-inheritable fields,
-    /// after the selected subset has overlaid the top-level values. The
+    /// runtime. All upstreams also use it for the subset-inheritable HTTP
+    /// fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, `http2MaxRequests`), after the selected subset has
+    /// overlaid the top-level values. The
     /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
     /// fall back to this overlay when the LB-selected target port has no
@@ -8803,6 +8836,14 @@ impl Upstream {
                     (
                         "http1_max_pending_requests",
                         policy.http1_max_pending_requests.is_some(),
+                    ),
+                    (
+                        "http_idle_timeout_ms",
+                        policy.http_idle_timeout_ms.is_some(),
+                    ),
+                    (
+                        "h2_max_concurrent_streams",
+                        policy.h2_max_concurrent_streams.is_some(),
                     ),
                 ] {
                     if configured {

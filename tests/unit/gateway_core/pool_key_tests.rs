@@ -1876,3 +1876,56 @@ fn http3_pool_key_partitions_by_upstream_subset() {
         "v2 subset and no-subset must not share H3 pool: {key_v2} vs {key_none}"
     );
 }
+
+/// Same backend host:port with divergent subset `idleTimeout` /
+/// `http2MaxRequests` must not first-materialize each other. Reqwest isolates
+/// via `upstream_subset` plus the idle `rcfg` segment; direct-H2 / gRPC isolate
+/// via `upstream_subset` (builder-only stream caps are not themselves keyed —
+/// subset identity is the isolation contract).
+#[tokio::test]
+async fn same_endpoint_subset_idle_and_h2_caps_partition_pool_keys() {
+    let pool = pool_with_defaults();
+
+    let mut v1 = minimal_proxy();
+    v1.upstream_subset = Some("v1".to_string());
+    v1.pool_idle_timeout_seconds = Some(45);
+    v1.pool_http2_max_concurrent_streams = Some(10);
+
+    let mut v2 = minimal_proxy();
+    v2.upstream_subset = Some("v2".to_string());
+    v2.pool_idle_timeout_seconds = Some(12);
+    v2.pool_http2_max_concurrent_streams = Some(40);
+
+    let mut unmatched = minimal_proxy();
+    unmatched.upstream_subset = None;
+    unmatched.pool_idle_timeout_seconds = Some(60);
+    unmatched.pool_http2_max_concurrent_streams = Some(200);
+
+    let reqwest_v1 = pool.pool_key_for_warmup(&v1);
+    let reqwest_v2 = pool.pool_key_for_warmup(&v2);
+    let reqwest_none = pool.pool_key_for_warmup(&unmatched);
+    assert_ne!(reqwest_v1, reqwest_v2);
+    assert_ne!(reqwest_v1, reqwest_none);
+    assert!(
+        reqwest_v1.contains("|rcfg=") && reqwest_v1.contains(";i45"),
+        "v1 idleTimeout must participate in reqwest rcfg: {reqwest_v1}"
+    );
+    assert!(
+        reqwest_v2.contains(";i12"),
+        "v2 idleTimeout must participate in reqwest rcfg: {reqwest_v2}"
+    );
+
+    let h2_v1 = Http2ConnectionPool::pool_key_for_warmup(&v1);
+    let h2_v2 = Http2ConnectionPool::pool_key_for_warmup(&v2);
+    assert_ne!(
+        h2_v1, h2_v2,
+        "same-endpoint subsets must not share direct-H2 connections: {h2_v1} vs {h2_v2}"
+    );
+
+    let grpc_v1 = GrpcConnectionPool::pool_key_for_warmup(&v1);
+    let grpc_v2 = GrpcConnectionPool::pool_key_for_warmup(&v2);
+    assert_ne!(
+        grpc_v1, grpc_v2,
+        "same-endpoint subsets must not share native-gRPC connections: {grpc_v1} vs {grpc_v2}"
+    );
+}
