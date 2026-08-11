@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use crate::config::EnvConfig;
 use crate::config::config_migration::ConfigMigrator;
-use crate::config::migrations::MigrationRunner;
+use crate::config::migrations::{MigrationRunner, bounded_migration_diagnostic_field};
 use crate::config::types::CURRENT_CONFIG_VERSION;
 
 fn sql_migration_pool_options(db_type: &str) -> sqlx::any::AnyPoolOptions {
@@ -116,7 +116,11 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         } else {
             println!("Pending migrations that would be applied:");
             for m in &status.pending {
-                println!("  V{}: {}", m.version, m.name);
+                println!(
+                    "  V{}: {}",
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name)
+                );
             }
         }
 
@@ -127,7 +131,12 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
             } else {
                 println!("\nPending custom plugin migrations that would be applied:");
                 for m in &plugin_status.pending {
-                    println!("  [{}] V{}: {}", m.plugin_name, m.version, m.name);
+                    println!(
+                        "  [{}] V{}: {}",
+                        bounded_migration_diagnostic_field(&m.plugin_name),
+                        m.version,
+                        bounded_migration_diagnostic_field(&m.name)
+                    );
                 }
             }
         }
@@ -140,7 +149,12 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         } else {
             println!("Applied {} migration(s):", applied.len());
             for m in &applied {
-                println!("  V{}: {} ({}ms)", m.version, m.name, m.execution_time_ms);
+                println!(
+                    "  V{}: {} ({}ms)",
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name),
+                    m.execution_time_ms
+                );
             }
         }
 
@@ -156,7 +170,10 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
                 for m in &plugin_applied {
                     println!(
                         "  [{}] V{}: {} ({}ms)",
-                        m.plugin_name, m.version, m.name, m.execution_time_ms
+                        bounded_migration_diagnostic_field(&m.plugin_name),
+                        m.version,
+                        bounded_migration_diagnostic_field(&m.name),
+                        m.execution_time_ms
                     );
                 }
             }
@@ -279,7 +296,10 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         for m in &status.applied {
             println!(
                 "  V{}: {} (applied: {}, checksum: {})",
-                m.version, m.name, m.applied_at, m.checksum
+                m.version,
+                bounded_migration_diagnostic_field(&m.name),
+                bounded_migration_diagnostic_field(&m.applied_at),
+                bounded_migration_diagnostic_field(&m.checksum)
             );
         }
     }
@@ -291,7 +311,11 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     } else {
         println!("Pending migrations:");
         for m in &status.pending {
-            println!("  V{}: {}", m.version, m.name);
+            println!(
+                "  V{}: {}",
+                m.version,
+                bounded_migration_diagnostic_field(&m.name)
+            );
         }
     }
 
@@ -306,7 +330,11 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
             for m in &plugin_status.applied {
                 println!(
                     "  [{}] V{}: {} (applied: {}, checksum: {})",
-                    m.plugin_name, m.version, m.name, m.applied_at, m.checksum
+                    bounded_migration_diagnostic_field(&m.plugin_name),
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name),
+                    bounded_migration_diagnostic_field(&m.applied_at),
+                    bounded_migration_diagnostic_field(&m.checksum)
                 );
             }
         }
@@ -318,7 +346,12 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         } else {
             println!("Pending plugin migrations:");
             for m in &plugin_status.pending {
-                println!("  [{}] V{}: {}", m.plugin_name, m.version, m.name);
+                println!(
+                    "  [{}] V{}: {}",
+                    bounded_migration_diagnostic_field(&m.plugin_name),
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name)
+                );
             }
         }
     }

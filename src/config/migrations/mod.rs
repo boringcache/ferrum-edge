@@ -17,7 +17,7 @@ use chrono::Utc;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyConnection, AnyPool, Connection, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -386,6 +386,7 @@ pub enum MigrationHistoryNamespace {
 pub enum MigrationHistoryIntegrityKind {
     DuplicateDeclaredNamespace,
     NonPositiveDeclaredVersion,
+    DeclaredVersionOutOfRange,
     DuplicateDeclaredVersion,
     UnorderedDeclaredVersions,
     DuplicateAppliedNamespace,
@@ -397,10 +398,12 @@ pub enum MigrationHistoryIntegrityKind {
 }
 
 impl MigrationHistoryIntegrityKind {
-    fn as_str(self) -> &'static str {
+    /// Stable fixed-cardinality label for metrics, audit records, and APIs.
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::DuplicateDeclaredNamespace => "duplicate_declared_namespace",
             Self::NonPositiveDeclaredVersion => "non_positive_declared_version",
+            Self::DeclaredVersionOutOfRange => "declared_version_out_of_range",
             Self::DuplicateDeclaredVersion => "duplicate_declared_version",
             Self::UnorderedDeclaredVersions => "unordered_declared_versions",
             Self::DuplicateAppliedNamespace => "duplicate_applied_namespace",
@@ -419,6 +422,10 @@ pub enum MigrationHistoryIntegrityReason {
     DuplicateDeclaredNamespace,
     NonPositiveDeclaredVersion {
         version: i64,
+    },
+    DeclaredVersionOutOfRange {
+        version: i64,
+        max_supported_version: i64,
     },
     DuplicateDeclaredVersion {
         version: i64,
@@ -454,6 +461,9 @@ impl MigrationHistoryIntegrityReason {
             }
             Self::NonPositiveDeclaredVersion { .. } => {
                 MigrationHistoryIntegrityKind::NonPositiveDeclaredVersion
+            }
+            Self::DeclaredVersionOutOfRange { .. } => {
+                MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange
             }
             Self::DuplicateDeclaredVersion { .. } => {
                 MigrationHistoryIntegrityKind::DuplicateDeclaredVersion
@@ -505,6 +515,11 @@ const INTEGRITY_DIAGNOSTIC_FIELD_MAX_ESCAPED_CHARS: usize = 128;
 
 struct BoundedIntegrityDiagnosticField<'a>(&'a str);
 
+/// Render hostile migration-ledger text as one bounded, escaped field.
+pub(crate) fn bounded_migration_diagnostic_field(value: &str) -> impl fmt::Display + '_ {
+    BoundedIntegrityDiagnosticField(value)
+}
+
 impl fmt::Display for BoundedIntegrityDiagnosticField<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut rendered = 0;
@@ -549,6 +564,13 @@ impl fmt::Display for MigrationHistoryIntegrityError {
             | MigrationHistoryIntegrityReason::UnknownAppliedVersion { version } => {
                 write!(f, " version={version}")
             }
+            MigrationHistoryIntegrityReason::DeclaredVersionOutOfRange {
+                version,
+                max_supported_version,
+            } => write!(
+                f,
+                " version={version} max_supported_version={max_supported_version}"
+            ),
             MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
                 previous_version,
                 version,
@@ -650,6 +672,16 @@ pub fn validate_migration_history_integrity(
                     &declaration.namespace,
                     MigrationHistoryIntegrityReason::NonPositiveDeclaredVersion {
                         version: migration.version,
+                    },
+                ));
+            }
+            if migration.version > i64::from(i32::MAX) {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::DeclaredVersionOutOfRange {
+                        version: migration.version,
+                        max_supported_version: i64::from(i32::MAX),
                     },
                 ));
             }
@@ -920,19 +952,22 @@ impl MigrationRunner {
 
     fn plugin_applied_histories(applied: &[PluginMigrationRecord]) -> Vec<AppliedMigrationHistory> {
         let mut histories: Vec<AppliedMigrationHistory> = Vec::new();
+        let mut history_indexes: HashMap<&str, usize> = HashMap::new();
         for record in applied {
-            let namespace = MigrationHistoryNamespace::CustomPlugin(record.plugin_name.clone());
-            if let Some(history) = histories
-                .iter_mut()
-                .find(|history| history.namespace == namespace)
-            {
-                history.migrations.push(AppliedMigrationHistoryEntry {
-                    version: record.version,
-                    checksum: record.checksum.clone(),
-                });
+            if let Some(&history_index) = history_indexes.get(record.plugin_name.as_str()) {
+                histories[history_index]
+                    .migrations
+                    .push(AppliedMigrationHistoryEntry {
+                        version: record.version,
+                        checksum: record.checksum.clone(),
+                    });
             } else {
+                let history_index = histories.len();
+                history_indexes.insert(record.plugin_name.as_str(), history_index);
                 histories.push(AppliedMigrationHistory {
-                    namespace,
+                    namespace: MigrationHistoryNamespace::CustomPlugin(
+                        record.plugin_name.clone(),
+                    ),
                     migrations: vec![AppliedMigrationHistoryEntry {
                         version: record.version,
                         checksum: record.checksum.clone(),

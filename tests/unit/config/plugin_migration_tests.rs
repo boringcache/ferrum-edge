@@ -777,7 +777,36 @@ async fn later_applied_plugin_version_cannot_hide_a_missing_prefix_entry() {
 }
 
 #[tokio::test]
-async fn duplicate_plugin_declarations_fail_before_creating_core_or_history_tables() {
+async fn invalid_plugin_declarations_fail_before_creating_core_or_history_tables() {
+    let out_of_range_pool = test_pool().await;
+    let out_of_range_runner =
+        MigrationRunner::new(out_of_range_pool.clone(), "sqlite".to_string());
+    let out_of_range = vec![(
+        "out_of_range_plugin",
+        vec![CustomPluginMigration {
+            version: i64::from(i32::MAX) + 1,
+            name: "out_of_range",
+            checksum: "out-of-range",
+            sql: "CREATE TABLE out_of_range_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let out_of_range_error = out_of_range_runner
+        .run_all_pending(&out_of_range)
+        .await
+        .expect_err("out-of-range plugin versions must fail before integer truncation");
+    assert_eq!(
+        out_of_range_error
+            .downcast_ref::<MigrationHistoryIntegrityError>()
+            .expect("out-of-range version error must remain typed")
+            .kind(),
+        MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange
+    );
+    assert!(!table_exists(&out_of_range_pool, "_ferrum_migrations").await);
+    assert!(!table_exists(&out_of_range_pool, "_ferrum_plugin_migrations").await);
+    assert!(!table_exists(&out_of_range_pool, "out_of_range_data").await);
+
     let duplicate_version_pool = test_pool().await;
     let duplicate_version_runner =
         MigrationRunner::new(duplicate_version_pool.clone(), "sqlite".to_string());

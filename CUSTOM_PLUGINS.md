@@ -1291,7 +1291,8 @@ Custom plugins that need their own database tables can declare migrations that r
 
 Ferrum validates the complete core and plugin migration histories under that
 lock before applying either core or plugin work. Declared plugin names and
-positive version IDs must be unique and versions must be ordered. Applied rows
+version IDs must be in the inclusive `1..=2147483647` tracking-column range,
+must be unique, and must be ordered. Applied rows
 must be an exact checksum-matching prefix of those declarations; unknown IDs,
 missing earlier rows, duplicates, checksum drift, and orphan history for a
 plugin absent from the compiled binary are blocking integrity errors for
@@ -1341,7 +1342,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | `i64` | Migration version number, scoped per plugin. Must be positive and monotonically increasing. |
+| `version` | `i64` | Migration version number, scoped per plugin. Must be in `1..=2147483647`, unique, and monotonically increasing. |
 | `name` | `&'static str` | Human-readable name (e.g., `"create_audit_log"`). |
 | `checksum` | `&'static str` | Unique checksum for tamper detection. Convention: `v{N}_{name}_{short_hash}`. |
 | `sql` | `&'static str` | Default SQL for all databases. Must be SQLite/PostgreSQL/MySQL compatible when no overrides are set. |

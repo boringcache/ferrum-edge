@@ -153,7 +153,8 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 Each migration has a checksum. V001 uses a `sha256:<hex>` digest derived from
 the V001 wrapper and dialect schema source, so changing the baseline changes the
 stored value and makes later source tampering visible. Before any write, Ferrum
-first requires unique namespaces, unique positive version IDs, and increasing
+first requires unique namespaces, unique version IDs in the inclusive
+`1..=2147483647` tracking-column range, and increasing
 declaration order. It then requires every applied namespace to be an exact
 checksum-matching prefix of the binary's declarations. An unknown applied ID,
 a missing earlier row before a later applied version, a duplicate/ambiguous

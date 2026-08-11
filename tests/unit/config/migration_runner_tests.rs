@@ -624,6 +624,13 @@ fn shared_history_integrity_rejects_unknown_missing_and_ambiguous_sequences() {
         (
             declared_history(
                 MigrationHistoryNamespace::Core,
+                &[(i64::from(i32::MAX) + 1, "out-of-range")],
+            ),
+            MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange,
+        ),
+        (
+            declared_history(
+                MigrationHistoryNamespace::Core,
                 &[(2, "second"), (1, "first")],
             ),
             MigrationHistoryIntegrityKind::UnorderedDeclaredVersions,
@@ -633,6 +640,10 @@ fn shared_history_integrity_rejects_unknown_missing_and_ambiguous_sequences() {
             .expect_err("invalid declaration ordering must fail closed");
         assert_eq!(error.kind(), expected_kind);
     }
+    assert_eq!(
+        MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange.as_str(),
+        "declared_version_out_of_range"
+    );
 
     let duplicate_applied = applied_history(
         MigrationHistoryNamespace::Core,
