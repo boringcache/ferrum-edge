@@ -217,6 +217,15 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_destination_active_requests` | gauge | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Active upstream requests currently holding a DestinationRule http2MaxRequests permit. |
 | `ferrum_destination_active_requests_admitted_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests admitted through the DestinationRule http2MaxRequests breaker. |
 | `ferrum_destination_active_requests_rejected_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests shed because their destination was at its http2MaxRequests ceiling. |
+| `ferrum_dp_config_cp_connected` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0). |
+| `ferrum_dp_config_max_stale_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled). |
+| `ferrum_dp_config_new_traffic_blocked` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0). |
+| `ferrum_dp_config_snapshot_age_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock. |
+| `ferrum_dp_config_snapshot_apply_failures_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots that were admitted and then failed to apply since process start. |
+| `ferrum_dp_config_snapshots_applied_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots/deltas validated and successfully applied since process start. |
+| `ferrum_dp_config_snapshots_rejected_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP payloads refused before apply since process start. |
+| `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
+| `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
 | `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
