@@ -851,6 +851,119 @@ fn test_env_config_mesh_mode_gateway_svid_takes_precedence_over_ca_backend() {
 }
 
 #[test]
+fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
+    // Mesh startup deliberately suppresses automatic CA-backed issuance when
+    // any explicit file SVID path is present. Validation must reject that
+    // combination before accepting a Workload API surface with no issuer.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            let error = EnvConfig::from_env().expect_err(
+                "file SVID override must not leave an enabled Workload API without an issuer",
+            );
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED"));
+            assert!(error.contains("FERRUM_GATEWAY_SVID"));
+            assert!(error.contains("overrides automatic CA-backed issuance"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+            (
+                "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES",
+                "uid:not-a-number=spiffe://cluster.local/ns/default/sa/app",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject an attestor rule startup cannot parse");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES"));
+            assert!(error.contains("not a numeric uid"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_requires_available_attestor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            remove_var("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject a Workload API with no usable attestor");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED=true"));
+            assert!(error.contains("requires at least one attestor"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_mode_production_mode_accepts_numeric_one() {
     // FERRUM_MESH_PRODUCTION_MODE=1 must be honored (same truthy spelling as
     // EnvConfig bools), so the opt-out cannot re-open the no-identity posture.
@@ -992,6 +1105,192 @@ fn test_env_config_mesh_production_refuses_remote_discovery_tls_no_verify() {
             assert!(err.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"));
         },
     );
+}
+
+/// Shared mesh + production posture used by the TLS no-verify production
+/// guardrail tests. `EnvConfig::from_env()` is the same validation path both
+/// `ferrum-edge validate` and runtime startup exercise before listeners or
+/// background pollers start.
+fn mesh_production_tls_guard_base_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("FERRUM_MODE", "mesh"),
+        ("FERRUM_DP_CP_GRPC_URLS", "https://cp:50051"),
+        (
+            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+            "secret-padding-for-32-char-min!!",
+        ),
+        ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+        ("FERRUM_MESH_CA_BACKEND", "spire"),
+        (
+            "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+            "spiffe://cluster.local/ns/default/sa/reviews",
+        ),
+    ]
+}
+
+#[test]
+fn test_env_config_mesh_production_refuses_tls_no_verify() {
+    let mut vars = mesh_production_tls_guard_base_env();
+    vars.push(("FERRUM_TLS_NO_VERIFY", "true"));
+    with_env_vars(&vars, || {
+        remove_var("FERRUM_ADMIN_TLS_NO_VERIFY");
+        let err = EnvConfig::from_env().expect_err("production must refuse TLS no-verify");
+        assert!(
+            err.contains("FERRUM_MESH_PRODUCTION_MODE=true"),
+            "got: {err}"
+        );
+        assert!(err.contains("FERRUM_TLS_NO_VERIFY"), "got: {err}");
+        assert!(
+            !err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"),
+            "only the engaged bypass must be named: {err}"
+        );
+    });
+}
+
+#[test]
+fn test_env_config_mesh_production_refuses_admin_tls_no_verify() {
+    let mut vars = mesh_production_tls_guard_base_env();
+    vars.push(("FERRUM_ADMIN_TLS_NO_VERIFY", "true"));
+    with_env_vars(&vars, || {
+        remove_var("FERRUM_TLS_NO_VERIFY");
+        let err = EnvConfig::from_env().expect_err("production must refuse admin TLS no-verify");
+        assert!(
+            err.contains("FERRUM_MESH_PRODUCTION_MODE=true"),
+            "got: {err}"
+        );
+        assert!(err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"), "got: {err}");
+        assert!(
+            !err.contains("FERRUM_TLS_NO_VERIFY"),
+            "only the engaged bypass must be named: {err}"
+        );
+    });
+}
+
+#[test]
+fn test_env_config_mesh_production_refuses_both_tls_no_verify_flags() {
+    let mut vars = mesh_production_tls_guard_base_env();
+    vars.push(("FERRUM_TLS_NO_VERIFY", "true"));
+    vars.push(("FERRUM_ADMIN_TLS_NO_VERIFY", "true"));
+    with_env_vars(&vars, || {
+        let err = EnvConfig::from_env().expect_err("production must refuse both bypasses");
+        assert!(
+            err.contains("FERRUM_MESH_PRODUCTION_MODE=true"),
+            "got: {err}"
+        );
+        assert!(err.contains("FERRUM_TLS_NO_VERIFY"), "got: {err}");
+        assert!(err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"), "got: {err}");
+        let tls_pos = err.find("FERRUM_TLS_NO_VERIFY").expect("tls flag named");
+        let admin_pos = err
+            .find("FERRUM_ADMIN_TLS_NO_VERIFY")
+            .expect("admin flag named");
+        assert!(
+            tls_pos < admin_pos,
+            "offender order must be deterministic (TLS then ADMIN): {err}"
+        );
+    });
+}
+
+#[test]
+fn test_env_config_mesh_production_allows_verified_tls_with_custom_ca() {
+    let ca_path = std::fs::canonicalize("tests/certs/server.crt")
+        .expect("fixture CA")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    with_env_vars(&mesh_production_tls_guard_base_env(), || {
+        remove_var("FERRUM_TLS_NO_VERIFY");
+        remove_var("FERRUM_ADMIN_TLS_NO_VERIFY");
+        // SAFETY: ENV_LOCK is held by with_env_vars.
+        unsafe {
+            std::env::set_var("FERRUM_TLS_CA_BUNDLE_PATH", &ca_path);
+        }
+        let result = EnvConfig::from_env();
+        unsafe {
+            std::env::remove_var("FERRUM_TLS_CA_BUNDLE_PATH");
+        }
+        let config =
+            result.expect("production mesh with verified TLS and a custom CA must validate");
+        assert!(!config.tls_no_verify);
+        assert!(!config.admin_tls_no_verify);
+        assert_eq!(config.tls_ca_bundle_path.as_deref(), Some(ca_path.as_str()));
+    });
+}
+
+#[test]
+fn test_env_config_mesh_non_production_allows_tls_no_verify_opt_in() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "https://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "false"),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+            ("FERRUM_TLS_NO_VERIFY", "true"),
+            ("FERRUM_ADMIN_TLS_NO_VERIFY", "true"),
+            ("FERRUM_MESH_ALLOW_NO_CA", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env()
+                .expect("non-production mesh must preserve the development no-verify opt-in");
+            assert!(config.tls_no_verify);
+            assert!(config.admin_tls_no_verify);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_production_tls_no_verify_guard_is_topology_independent() {
+    // The EnvConfig guard is mode-scoped, not topology-scoped: every mesh
+    // topology must fail closed before topology-specific startup can run.
+    for topology in [
+        "sidecar",
+        "ambient",
+        "service_waypoint",
+        "node_waypoint",
+        "east_west_gateway",
+        "egress_gateway",
+    ] {
+        let mut vars = mesh_production_tls_guard_base_env();
+        vars.push(("FERRUM_MESH_TOPOLOGY", topology));
+        vars.push(("FERRUM_TLS_NO_VERIFY", "true"));
+        with_env_vars(&vars, || {
+            remove_var("FERRUM_ADMIN_TLS_NO_VERIFY");
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_TLS_NO_VERIFY"),
+                "topology {topology} must still refuse TLS no-verify: {err}"
+            );
+            assert!(
+                err.contains("FERRUM_MESH_PRODUCTION_MODE=true"),
+                "topology {topology}: {err}"
+            );
+        });
+    }
+}
+
+#[test]
+fn test_env_config_mesh_production_tls_no_verify_validation_path_parity() {
+    // `from_env` is the shared parse+validate entrypoint for both the
+    // `validate` CLI and runtime startup. Re-running it under the same
+    // production+bypass posture must yield the same fail-closed verdict and
+    // name the same offender — proving the guard is not a one-shot side path.
+    let mut vars = mesh_production_tls_guard_base_env();
+    vars.push(("FERRUM_ADMIN_TLS_NO_VERIFY", "true"));
+    with_env_vars(&vars, || {
+        remove_var("FERRUM_TLS_NO_VERIFY");
+        let first = EnvConfig::from_env().expect_err("first validate");
+        let second = EnvConfig::from_env().expect_err("second validate");
+        assert_eq!(first, second);
+        assert!(first.contains("FERRUM_ADMIN_TLS_NO_VERIFY"));
+        assert!(first.contains("FERRUM_MESH_PRODUCTION_MODE=true"));
+    });
 }
 
 #[test]
@@ -2872,6 +3171,57 @@ fn test_env_config_websocket_idle_timeout_seconds_custom() {
             assert_eq!(config.websocket_idle_timeout_seconds, 45);
         },
     );
+}
+
+#[test]
+fn test_env_config_websocket_max_lifetime_is_finite_and_configurable() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS");
+            assert_eq!(
+                EnvConfig::from_env()
+                    .unwrap()
+                    .websocket_max_lifetime_seconds,
+                3_600
+            );
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", "900"),
+        ],
+        || {
+            assert_eq!(
+                EnvConfig::from_env()
+                    .unwrap()
+                    .websocket_max_lifetime_seconds,
+                900
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_websocket_max_lifetime_rejects_unbounded_values() {
+    for value in ["0", "86401"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(error.contains("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS"));
+            },
+        );
+    }
 }
 
 // ============================================================================
