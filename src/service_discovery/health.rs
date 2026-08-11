@@ -135,6 +135,11 @@ struct TaskHealth {
     /// Whether discovered targets are currently withdrawn by the expiry policy.
     /// Always `false` under [`SdStalePolicy::Retain`].
     withdrawn: bool,
+    /// Next bounded retry after a failed withdrawal publication. Leaving an
+    /// expired deadline armed directly would hot-loop, while marking the
+    /// expiry applied would retain stale dynamic targets forever.
+    expiry_retry_at: Option<Instant>,
+    expiry_retry_attempts: u64,
 }
 
 impl TaskHealth {
@@ -186,7 +191,8 @@ pub struct DiscoveryHealthAggregate {
     pub crash_looping: u64,
     pub stale: u64,
     pub withdrawn: u64,
-    /// Stale tasks whose expiry policy is `fail_readiness`.
+    /// Stale tasks whose policy requires failed readiness, including a
+    /// `withdraw` task whose withdrawal has not yet published successfully.
     pub readiness_failing: u64,
     /// Tasks that have never published an admitted snapshot.
     pub never_succeeded: u64,
@@ -195,12 +201,13 @@ pub struct DiscoveryHealthAggregate {
 }
 
 impl DiscoveryHealthAggregate {
-    /// Readiness only fails under the explicit `fail_readiness` policy.
+    /// Readiness fails under the explicit `fail_readiness` policy and while a
+    /// fail-closed withdrawal has not yet published successfully.
     ///
-    /// A crash-looping or stale task under `retain`/`withdraw` degrades coarse
-    /// health but must not pull a whole gateway out of rotation for one
-    /// upstream's registry outage — the `withdraw` policy has already removed
-    /// the unsafe routes.
+    /// A crash-looping or stale task under `retain` degrades coarse health but
+    /// stays ready. A successfully applied `withdraw` also stays ready because
+    /// the unsafe routes are gone; publication failure is not allowed to make
+    /// that assumption.
     pub fn ready(&self) -> bool {
         self.readiness_failing == 0
     }
@@ -353,6 +360,8 @@ pub(crate) fn register_task(
             last_error: None,
             expiry_applied: false,
             withdrawn: false,
+            expiry_retry_at: None,
+            expiry_retry_attempts: 0,
         },
     );
 }
@@ -380,6 +389,8 @@ pub(crate) fn record_success(key: &str, generation: u64) {
         entry.consecutive_failures = 0;
         entry.consecutive_crashes = 0;
         entry.last_error = None;
+        entry.expiry_retry_at = None;
+        entry.expiry_retry_attempts = 0;
         if entry.expiry_applied {
             entry.expiry_applied = false;
             entry.withdrawn = false;
@@ -413,9 +424,27 @@ pub(crate) fn claim_expiry(key: &str, generation: u64, withdrew: bool) -> bool {
         }
         entry.expiry_applied = true;
         entry.withdrawn = withdrew;
+        entry.expiry_retry_at = None;
+        entry.expiry_retry_attempts = 0;
         true
     })
     .unwrap_or(false)
+}
+
+/// Defer a failed staleness withdrawal with bounded exponential backoff.
+///
+/// The expiry remains unapplied so readiness continues to fail closed while
+/// dynamic targets are still installed. The retry deadline prevents an elapsed
+/// staleness timer from spinning.
+pub(crate) fn defer_expiry_retry(key: &str, generation: u64) -> Option<Duration> {
+    with_current(key, generation, |entry| {
+        entry.expiry_retry_attempts = entry.expiry_retry_attempts.saturating_add(1);
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_error = Some(DiscoveryFailureReason::PublishFailed);
+        let backoff = restart_backoff(entry.expiry_retry_attempts);
+        entry.expiry_retry_at = Some(Instant::now() + backoff);
+        backoff
+    })
 }
 
 /// Record an unexpected poller exit and return the supervisor's next backoff.
@@ -486,6 +515,9 @@ pub(crate) fn next_stale_deadline(key: &str, generation: u64) -> Option<Instant>
     if entry.generation != generation || entry.expiry_applied {
         return None;
     }
+    if let Some(retry_at) = entry.expiry_retry_at {
+        return Some(retry_at);
+    }
     let max = entry.staleness.max_stale?;
     Some(entry.last_success_at.unwrap_or(entry.started_at) + max)
 }
@@ -534,7 +566,9 @@ pub fn aggregate() -> DiscoveryHealthAggregate {
         }
         if entry.is_stale(now) {
             aggregate.stale += 1;
-            if entry.staleness.policy.fails_readiness() {
+            if entry.staleness.policy.fails_readiness()
+                || (entry.staleness.policy.withdraws() && !entry.withdrawn)
+            {
                 aggregate.readiness_failing += 1;
             }
         }
@@ -591,6 +625,13 @@ pub fn register_task_for_test(
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn generation_for_test(key: &str) -> Option<u64> {
     registry().get(key).map(|entry| entry.generation)
+}
+
+/// Number of bounded withdrawal-publication retries for `key`.
+/// Test-only observation seam for the fail-closed retry contract.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn expiry_retry_attempts_for_test(key: &str) -> Option<u64> {
+    registry().get(key).map(|entry| entry.expiry_retry_attempts)
 }
 
 /// Force `key`'s staleness anchor to `age` seconds ago without waiting.

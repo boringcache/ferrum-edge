@@ -623,6 +623,79 @@ async fn expiry_recovers_and_republishes_without_a_config_reload() {
 }
 
 #[tokio::test]
+async fn failed_expiry_publication_retries_and_fails_readiness_closed() {
+    let _guard = isolated().await;
+
+    let config = config_with(vec![upstream_with_sd("withdraw-retry", Vec::new(), None)]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let base_store = epoch_store(&config);
+    let exhausted_store = Arc::new(
+        ferrum_edge::_test_support::request_epoch_store_with_lb_generation_for_test(
+            &base_store,
+            u64::MAX - 1,
+        ),
+    );
+    let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
+        "stale-discovered.local",
+        8080,
+    )]));
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "withdraw-retry",
+        "scripted",
+        discoverer,
+        lb_cache,
+        Some(exhausted_store),
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        Vec::new(),
+        LoadBalancerAlgorithm::RoundRobin,
+        60,
+        180,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    assert!(
+        wait_for(|| {
+            health::snapshot()
+                .upstreams
+                .iter()
+                .any(|upstream| {
+                    upstream.upstream == task.key
+                        && upstream.last_success_age_seconds.is_some()
+                })
+        })
+        .await,
+        "initial discovered snapshot must publish before LB generation exhaustion"
+    );
+    assert!(health::age_anchor_for_test(&task.key, 600));
+    assert!(
+        wait_for(|| health::expiry_retry_attempts_for_test(&task.key).is_some_and(|n| n >= 2))
+            .await,
+        "a failed withdrawal publication must be retried with bounded delay"
+    );
+
+    let snapshot = health::snapshot();
+    let status = snapshot
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.upstream == task.key)
+        .expect("task health remains registered");
+    assert!(status.stale);
+    assert!(!status.withdrawn);
+    assert_eq!(status.last_error, Some("publish_failed"));
+    assert!(
+        !snapshot.aggregate.ready(),
+        "withdraw policy must fail readiness while stale targets remain installed"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
+}
+
+#[tokio::test]
 async fn fail_readiness_policy_degrades_readiness_until_recovery() {
     let _guard = isolated().await;
 

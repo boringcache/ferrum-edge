@@ -11730,9 +11730,11 @@ components:
             and `ready: false`). Expired JWKS trust clears after a later
             validated non-empty refresh. CP, DP, and mesh modes report the
             sticky listener/poll form. A service-discovery upstream configured
-            with the `fail_readiness` staleness policy whose snapshot expired
-            also reports `unavailable`; it clears as soon as a fresh snapshot is
-            admitted and published, without a config reload.
+            with the `fail_readiness` staleness policy whose snapshot expired,
+            or a `withdraw` upstream whose withdrawal publication is still
+            retrying, also reports `unavailable`; it clears as soon as a fresh
+            snapshot is admitted or the withdrawal publishes, without a config
+            reload.
         ready:
           type: boolean
           description: |
@@ -11740,7 +11742,9 @@ components:
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
             store is past its maximum-stale deadline AND no service-discovery
-            upstream using the `fail_readiness` staleness policy is expired. While `false`, the
+            upstream using the `fail_readiness` staleness policy is expired AND
+            no expired `withdraw` upstream still has stale targets installed
+            because its withdrawal publication is retrying. While `false`, the
             endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
             post-startup serving-listener failure sets `ready: false` durably
             (sticky) even though internal startup completed. In CP mode an
@@ -12004,7 +12008,8 @@ components:
         Kubernetes token, or response payload. Unauthenticated probes never
         receive this object; they see only the coarse `status`/`ready` effects
         (stale/withdrawn/restarting → `degraded`; an expired `fail_readiness`
-        upstream → `unavailable` + not-ready).
+        upstream or a failed withdrawal publication → `unavailable` +
+        not-ready).
       required:
         - tasks
         - running
@@ -12046,7 +12051,10 @@ components:
         readiness_failing:
           type: integer
           format: uint64
-          description: Stale tasks configured with the `fail_readiness` expiry policy.
+          description: >
+            Stale tasks configured with the `fail_readiness` expiry policy,
+            plus `withdraw` tasks whose fail-closed withdrawal publication is
+            still retrying.
         never_succeeded:
           type: integer
           format: uint64

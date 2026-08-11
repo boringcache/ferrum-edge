@@ -1693,16 +1693,16 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
             }
         }
         Err(error) => {
-            // Claim the episode anyway: an unclaimed elapsed deadline would
-            // re-fire immediately and spin. The failure is recorded so the
-            // condition stays visible.
-            health::claim_expiry(&ctx.key, ctx.generation, false);
-            registry.record_service_discovery_stale_expiry();
+            // Keep the expiry unapplied and retry with bounded backoff. Marking
+            // it applied here would retain stale dynamic targets indefinitely;
+            // leaving the elapsed deadline unchanged would hot-loop.
+            let retry_after = health::defer_expiry_retry(&ctx.key, ctx.generation);
             warn!(
                 upstream = %ctx.upstream_id,
                 provider = ctx.provider_name,
                 error = %error,
-                "Service discovery: staleness withdrawal could not be published; discovered targets remain installed"
+                retry_after_seconds = retry_after.map(|duration| duration.as_secs()),
+                "Service discovery: staleness withdrawal could not be published; discovered targets remain installed and withdrawal will be retried"
             );
         }
     }
