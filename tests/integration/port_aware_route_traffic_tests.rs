@@ -498,7 +498,10 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
         "the admin collision must remain surfaced"
     );
     let (ok_status, ok_body) = http_get_host(sibling_port, "/api/x", "ok.example.com").await;
-    assert_eq!(ok_status, 200, "sibling listener must keep serving: {ok_body}");
+    assert_eq!(
+        ok_status, 200,
+        "sibling listener must keep serving: {ok_body}"
+    );
     assert_eq!(ok_body, "listener-ok");
     assert_eq!(
         http_get_host(sibling_port, "/api/x", HOST).await.0,
@@ -654,7 +657,10 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
         1,
         Some(admin_port),
     )]));
-    assert!(outcome.applied(), "refused generation must publish: {outcome:?}");
+    assert!(
+        outcome.applied(),
+        "refused generation must publish: {outcome:?}"
+    );
     assert!(
         state
             .find_proxy_on_frontend_for_test(
@@ -690,7 +696,10 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
         1,
         Some(busy_port),
     )]));
-    assert!(outcome.applied(), "allowed generation must publish: {outcome:?}");
+    assert!(
+        outcome.applied(),
+        "allowed generation must publish: {outcome:?}"
+    );
     assert!(
         state
             .find_proxy_on_frontend_for_test(
@@ -710,12 +719,7 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
         "the held socket must force an ordinary OS bind failure"
     );
     let remapped = state
-        .find_proxy_on_frontend_for_test(
-            Some(HOST),
-            "/api/window",
-            Some(global_proxy_port),
-            false,
-        )
+        .find_proxy_on_frontend_for_test(Some(HOST), "/api/window", Some(global_proxy_port), false)
         .expect("matching-generation acknowledgement enables Service remap");
     assert_eq!(remapped.proxy.id, "ordinary-bind-failure");
 

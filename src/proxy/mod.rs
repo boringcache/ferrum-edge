@@ -41,6 +41,10 @@ pub mod client_ip;
 pub mod deferred_log;
 pub mod gateway_listener;
 pub mod grpc_proxy;
+/// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
+/// Hyper's client handshake proves only the client half, so both h2c transports
+/// — the pooled gRPC path and the Unix-socket path — establish through here.
+pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
@@ -97,7 +101,9 @@ pub mod stream_listener;
 pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
+pub mod udp_placement_migration;
 pub mod udp_proxy;
+pub mod unix_backend;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -941,14 +947,16 @@ fn inject_gateway_workload_metrics_if_svid(
         .plugin_configs
         .iter()
         .position(|plugin| {
-            plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            plugin.namespace == namespace
+                && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                 && plugin.enabled
                 && plugin.scope == PluginScope::Global
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
         })
         .or_else(|| {
             config.plugin_configs.iter().position(|plugin| {
-                plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                plugin.namespace == namespace
+                    && plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                     && plugin.scope == PluginScope::Global
                     && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
             })
@@ -968,12 +976,25 @@ fn inject_gateway_workload_metrics_if_svid(
     if let Some(existing) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
     }) {
+        // The managed ID is validation-safe and can therefore collide with an
+        // operator-owned plugin. Never change the type (and potentially the
+        // security role) of such a plugin merely because its ID collides.
+        if existing.plugin_name != WORKLOAD_METRICS_PLUGIN_NAME {
+            warn!(
+                namespace,
+                plugin_id = GATEWAY_WORKLOAD_METRICS_PLUGIN_ID,
+                plugin_name = %existing.plugin_name,
+                "Gateway workload metrics injection skipped due to an operator plugin ID collision"
+            );
+            return;
+        }
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
         existing.scope = PluginScope::Global;
         existing.proxy_id = None;
         existing.enabled = true;
         existing.priority_override = None;
+        existing.trigger = None;
         existing.api_spec_id = None;
         existing.config = serde_json::json!({
             "workload_spiffe_id": spiffe_id,
@@ -1000,14 +1021,21 @@ fn inject_gateway_workload_metrics_if_svid(
     });
 }
 
-fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespace: &str) -> bool {
     config.proxies.is_empty()
         && config.consumers.is_empty()
         && config.upstreams.is_empty()
-        && config
-            .plugin_configs
-            .iter()
-            .all(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        && config.plugin_configs.iter().all(|plugin| {
+            plugin.namespace == namespace
+                && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.scope == PluginScope::Global
+                && plugin.proxy_id.is_none()
+                && plugin.enabled
+                && plugin.priority_override.is_none()
+                && plugin.trigger.is_none()
+                && plugin.api_spec_id.is_none()
+        })
 }
 
 fn gateway_hbone_mtls_observed(
@@ -2039,9 +2067,9 @@ fn websocket_idle_disabled_proxy_ids(
 /// Emit the resource-hoarding warning for a set of proxies with a disabled
 /// WebSocket idle bound. An upgraded WebSocket holds a dedicated backend
 /// connection plus a `websocket_max_connections` slot for its entire lifetime;
-/// with the idle timeout disabled, a silent (non-heartbeating) client can hoard
-/// that slot indefinitely. Activity from either direction — including Ping/Pong
-/// — refreshes the timer, so the disabled state is the only exposure.
+/// with the idle timeout disabled, a silent (non-heartbeating) client can retain
+/// that slot until the finite absolute session deadline. Activity from either
+/// direction — including Ping/Pong — refreshes only the idle timer.
 fn emit_websocket_idle_disabled_warning(
     disabled_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
@@ -2057,10 +2085,10 @@ fn emit_websocket_idle_disabled_warning(
         ws_idle_disabled_proxy_sample = %sample,
         global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
         "WebSocket idle timeout is disabled (0) for one or more HTTP-family proxies. \
-         Idle upgraded WebSocket sessions will hold a backend connection and a \
-         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot indefinitely (resource-hoarding risk). \
-         Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
-         websocket_idle_timeout_seconds to a non-zero value to bound idle lifetime."
+         Idle upgraded WebSocket sessions can hold a backend connection and a \
+         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot until the finite absolute session \
+         lifetime. Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
+         websocket_idle_timeout_seconds to a non-zero value for an earlier idle bound."
     );
 }
 
@@ -2431,46 +2459,107 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     }
 }
 
-/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
-/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
-/// terminator where no inbound route is materialized. Returns `None` (caller
-/// 404s) when the authority is missing/portless or is not a safe local relay
-/// target per [`inbound_hbone_relay_destination_allowed`].
+/// A synthesized inbound CONNECT relay proxy plus the authoritative CONNECT
+/// destination port to authorize on. For a Sidecar `ingress[]` remap this is
+/// the declared listener port; for ordinary and external-UDP relays it is the
+/// original authority port, which may differ from the selected dial port.
+pub(crate) struct InboundConnectRelay {
+    pub(crate) proxy: Arc<Proxy>,
+    pub(crate) ingress_listener_authz_port: Option<u16>,
+}
+
+/// Build the inbound CONNECT relay proxy for an authenticated mesh peer.
 ///
-/// `is_udp_connect` selects the SECOND, narrower admission source used only by
-/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
-/// naming an external destination the EgressGateway's `ServiceEntry`-derived
-/// allowlist admits relays to that external host over a local `UdpSocket`, with
-/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
-/// relay never consults it, so a bare CONNECT stays bounded to loopback /
-/// slice-known workload targets exactly as before.
+/// Two shapes share this boundary, in strict order:
+///
+/// 1. **Sidecar `ingress[]` stream remap (issue #3260).** The identity-protected
+///    Sidecar inbound path is a fresh mesh-mTLS H2 CONNECT to `:15006`, so it
+///    never reaches the REDIRECT-captured `local_inbound_tcp_routes` table that
+///    serves direct plaintext. When the authority names the concrete local IP
+///    of THIS accepted connection on a
+///    DECLARED stream-family ingress listener port, relay to that listener's
+///    validated loopback `defaultEndpoint` — `pod-ip:16379` → `127.0.0.1:6379`
+///    — and report the DECLARED listener port so `mesh_authz` authorizes on it.
+///    A declared ingress block that does not resolve to exactly one valid,
+///    owner-stamped, stream-family mapping for that exact local IP returns
+///    `None` (caller 404s) instead of falling through to dial an unlisted or
+///    invalid port the operator replaced.
+/// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
+///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
+///    original destination the peer asked for. Unchanged, and unreachable for a
+///    declared ingress listener port so this can never widen it.
+///
+/// Returns `None` (caller 404s) when the authority is missing/portless or is not
+/// a safe local relay target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` is true for a datagram-over-CONNECT
+/// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
+/// opens a `UdpSocket` straight at the resolved port, and #3260 must not widen
+/// UDP behavior. UDP additionally consults the EgressGateway's external
+/// ServiceEntry allowlist (#3263) after the ordinary local-target guard.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
     is_udp_connect: bool,
-) -> Option<Arc<Proxy>> {
+    accepted_local_ip: Option<std::net::IpAddr>,
+) -> Option<InboundConnectRelay> {
+    use crate::modes::mesh::config::SidecarIngressConnectRelay;
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
     let port = authority.port_u16()?;
     if host.is_empty() || port == 0 {
         return None;
     }
-    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return Some(Arc::new(
-            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-        ));
+    let ingress_remap = match mesh {
+        Some(mesh) if !is_udp_connect => {
+            mesh.resolve_sidecar_ingress_connect_relay(host, port, accepted_local_ip)
+        }
+        _ => SidecarIngressConnectRelay::NotDeclared,
+    };
+    match ingress_remap {
+        SidecarIngressConnectRelay::NotDeclared => {}
+        SidecarIngressConnectRelay::Deny => {
+            debug!(
+                listener_port = port,
+                "Refusing authenticated inbound CONNECT after a Sidecar ingress block was \
+                 declared: the authority does not resolve to one valid, owner-stamped, \
+                 stream-family loopback endpoint for this accepted local address"
+            );
+            return None;
+        }
+        SidecarIngressConnectRelay::Relay {
+            listener_port,
+            endpoint_host,
+            endpoint_port,
+        } => {
+            let endpoint = endpoint_host.as_str();
+            let relay = crate::modes::mesh::mesh_ingress_relay_proxy(endpoint, endpoint_port);
+            return Some(InboundConnectRelay {
+                proxy: Arc::new(relay),
+                ingress_listener_authz_port: Some(listener_port),
+            });
+        }
     }
-    if is_udp_connect
-        && let Some((dial_host, dial_port)) =
-            mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
-    {
-        // The relay dials the SELECTED ENDPOINT, not the authority: a STATIC
-        // ServiceEntry host must never be DNS-resolved here.
-        return Some(Arc::new(
-            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(&dial_host, dial_port),
-        ));
+
+    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        if is_udp_connect
+            && let Some((dial_host, dial_port)) =
+                mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
+        {
+            return Some(InboundConnectRelay {
+                proxy: Arc::new(crate::modes::mesh::mesh_inbound_hbone_relay_proxy(
+                    &dial_host, dial_port,
+                )),
+                ingress_listener_authz_port: Some(port),
+            });
+        }
+        return None;
     }
-    None
+    let relay = crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port);
+    Some(InboundConnectRelay {
+        proxy: Arc::new(relay),
+        ingress_listener_authz_port: Some(port),
+    })
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -6071,6 +6160,18 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Concrete local address of the accepted TCP connection. Unlike the
+    /// listener's wildcard bind address, this identifies the pod IP the peer
+    /// actually reached and binds a Sidecar ingress CONNECT to this replica.
+    ///
+    /// Populated only on the INBOUND mesh listener
+    /// (`mesh_direction == Some(Inbound)`, the only direction its consumer
+    /// `build_inbound_hbone_relay_proxy` runs on), and only after the accept
+    /// loop's overload / connection-permit fast-reject arms — the `getsockname`
+    /// must not be charged to every non-mesh or captured-egress accept, or to a
+    /// flood of connections the gateway is about to RST. `None` everywhere
+    /// else; its one consumer fails closed without it.
+    accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     /// Direction stamped at listener-spawn time for mesh listeners.
@@ -6099,6 +6200,7 @@ struct RequestConnectionMetadata {
     /// connection instead of re-parsing the DER on every multiplexed request.
     peer_spiffe_extraction_cache:
         Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
+    websocket_shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -6956,7 +7058,9 @@ impl ProxyState {
                     sources: watched_sources,
                     interval,
                     revision_tx,
+                    max_material_bytes: self.env_config.tls_max_material_size_bytes,
                     rebuild: Box::new(move || state.reload_frontend_dtls_material()),
+                    ready_tx: None,
                 },
                 shutdown_rx,
             ),
@@ -6995,6 +7099,7 @@ impl ProxyState {
                         self.env_config.secret_refresh_interval_seconds.max(1),
                     ),
                     revision_tx,
+                    max_material_bytes: self.env_config.tls_max_material_size_bytes,
                     rebuild: Box::new(move || rebuild_state.reload_backend_tls_material()),
                 },
                 shutdown_rx,
@@ -7390,8 +7495,7 @@ impl ProxyState {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
-            gateway_listener_admission:
-                crate::router_cache::GatewayListenerAdmission::pending(),
+            gateway_listener_admission: crate::router_cache::GatewayListenerAdmission::pending(),
             config_generation: 1,
             route_generation: 1,
             lb_generation: 1,
@@ -7838,6 +7942,7 @@ impl ProxyState {
     /// Production route lookup exposed narrowly for external generation-race
     /// regression tests. Both HTTP and HTTP/3 use the same epoch-bound helper.
     #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn find_proxy_on_frontend_for_test(
         &self,
         host: Option<&str>,
@@ -7846,13 +7951,8 @@ impl ProxyState {
         frontend_is_tls: bool,
     ) -> Option<crate::router_cache::RouteMatch> {
         let epoch = self.request_epoch.load();
-        self.router_cache.find_proxy_in_epoch(
-            &epoch,
-            host,
-            path,
-            frontend_port,
-            frontend_is_tls,
-        )
+        self.router_cache
+            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls)
     }
 
     /// The Alt-Svc value to advertise for the frontend port a request arrived
@@ -10207,8 +10307,10 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
-        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
+        let old_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&old_config, &self.env_config.namespace);
+        let new_is_empty =
+            config_empty_ignoring_gateway_managed_plugins(&new_config, &self.env_config.namespace);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -11336,6 +11438,7 @@ async fn handle_connection(
     state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    accepted_local_addr: Option<SocketAddr>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
@@ -11386,11 +11489,13 @@ async fn handle_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
@@ -11399,6 +11504,7 @@ async fn handle_connection(
             mesh_inbound_pre_handshake_app_port,
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -11666,6 +11772,44 @@ async fn handle_websocket_request_authenticated(
     // how the caller classified or constructed the request context.
     ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
+    let ws_session_deadline =
+        effective_websocket_session_deadline(&ctx, state.env_config.websocket_max_lifetime_seconds);
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            current_cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
 
     // Absolute route retry ceiling retained before any DestinationRule target
     // projection. WebSocket retries authorize each attempt/candidate against
@@ -12484,6 +12628,37 @@ async fn handle_websocket_request_authenticated(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -12665,6 +12840,10 @@ async fn handle_websocket_request_authenticated(
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
+    let ws_shutdown_rx = ctx
+        .websocket_shutdown_rx
+        .clone()
+        .or_else(|| state.health_check_shutdown_rx.clone());
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -12734,7 +12913,33 @@ async fn handle_websocket_request_authenticated(
         // when no cap is configured for the destination port. Dropping it on
         // any session-end path releases the slot exactly once — no leak.
         let _backend_conn_guard = backend_conn_guard;
-        match on_upgrade.await {
+        let upgrade_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                ws_session_deadline,
+                ws_shutdown_rx.clone(),
+                &state.overload,
+            ) => {
+                // No relay ever started, and the stop is a policy decision
+                // rather than a transport failure, so the disconnect carries
+                // only `termination_reason`. Tagging a synthetic
+                // `ReadWriteTimeout` here would count a drain or an elapsed
+                // absolute lifetime as a failed session in metrics and alerts.
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    &proxy_id,
+                    &session_meta,
+                    0,
+                    0,
+                    None,
+                    reason,
+                )
+                .await;
+                return;
+            }
+            result = on_upgrade => result,
+        };
+        match upgrade_result {
             Ok(upgraded) => {
                 // H1/H2 frontends adapt hyper's `Upgraded` (which is
                 // `AsyncRead + AsyncWrite` in hyper-1 land) into the
@@ -12773,6 +12978,9 @@ async fn handle_websocket_request_authenticated(
                             // RFC 9220 §5 compliance.
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -12796,6 +13004,9 @@ async fn handle_websocket_request_authenticated(
                             ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -14318,6 +14529,112 @@ pub struct WsSessionMeta {
     pub session_start_mono: Instant,
 }
 
+pub(crate) const WS_TERMINATION_METADATA_KEY: &str = "websocket.termination_reason";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsTerminationReason {
+    CredentialExpired,
+    MaxLifetime,
+    IdleTimeout,
+    Drain,
+    NormalPeerClose,
+    RelayError,
+}
+
+impl WsTerminationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialExpired => "credential_expired",
+            Self::MaxLifetime => "max_lifetime",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Drain => "drain",
+            Self::NormalPeerClose => "normal_peer_close",
+            Self::RelayError => "relay_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WsSessionDeadline {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) reason: WsTerminationReason,
+}
+
+pub(crate) fn effective_websocket_session_deadline(
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+) -> WsSessionDeadline {
+    let now = tokio::time::Instant::now();
+    let maximum = ctx
+        .grpc_deadline_received_at
+        .checked_add(Duration::from_secs(max_lifetime_seconds))
+        .unwrap_or(now);
+    match ctx.credential_deadline_at {
+        Some(credential) if credential <= maximum => WsSessionDeadline {
+            at: credential,
+            reason: WsTerminationReason::CredentialExpired,
+        },
+        _ => WsSessionDeadline {
+            at: maximum,
+            reason: WsTerminationReason::MaxLifetime,
+        },
+    }
+}
+
+fn ws_deadline_close_frame(reason: WsTerminationReason) -> CloseFrame {
+    let (code, text) = match reason {
+        WsTerminationReason::CredentialExpired => (CloseCode::Policy, "credential expired"),
+        WsTerminationReason::MaxLifetime => (CloseCode::Policy, "maximum lifetime reached"),
+        WsTerminationReason::Drain => (CloseCode::Away, "gateway draining"),
+        _ => (CloseCode::Away, "session ended"),
+    };
+    CloseFrame {
+        code,
+        reason: text.into(),
+    }
+}
+
+pub(crate) async fn wait_for_websocket_session_stop(
+    deadline: WsSessionDeadline,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    overload: &crate::overload::OverloadState,
+) -> WsTerminationReason {
+    if deadline.at <= tokio::time::Instant::now() {
+        return deadline.reason;
+    }
+    if overload.draining.load(Ordering::Acquire)
+        || shutdown.as_ref().is_some_and(|receiver| *receiver.borrow())
+    {
+        return WsTerminationReason::Drain;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.at) => deadline.reason,
+        changed = async {
+            match shutdown.as_mut() {
+                Some(receiver) => receiver.changed().await.ok(),
+                None => std::future::pending().await,
+            }
+        } => {
+            let _ = changed;
+            WsTerminationReason::Drain
+        }
+        _ = overload.wait_for_drain_start() => WsTerminationReason::Drain,
+    }
+}
+
+fn ws_disconnect_metadata(
+    session_meta: &WsSessionMeta,
+    termination_reason: WsTerminationReason,
+) -> HashMap<String, String> {
+    let mut metadata = session_meta.metadata.clone();
+    metadata.insert(
+        WS_TERMINATION_METADATA_KEY.to_string(),
+        termination_reason.as_str().to_string(),
+    );
+    metadata
+}
+
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
 /// `copy_bidirectional` is used instead of frame-level parsing.
 ///
@@ -14344,11 +14661,46 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         Option<tcp_proxy::StreamIoSide>,
     )>,
 ) {
+    let termination_reason = if failure.is_some() {
+        WsTerminationReason::RelayError
+    } else {
+        WsTerminationReason::NormalPeerClose
+    };
+    fire_ws_tunnel_disconnect_hooks_with_reason(
+        ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        failure,
+        termination_reason,
+    )
+    .await;
+}
+
+/// [`fire_ws_tunnel_disconnect_hooks`] with an explicit termination
+/// classification. The public wrapper derives the reason from `failure`; the
+/// absolute-deadline and drain stops pass their own reason with no failure,
+/// because a gateway-initiated policy close is not a relay fault.
+async fn fire_ws_tunnel_disconnect_hooks_with_reason(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: &WsSessionMeta,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+    termination_reason: WsTerminationReason,
+) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -14370,7 +14722,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata.clone(),
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -14383,9 +14735,12 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// comes from `session_start_mono` (`Instant`); wall `session_start` is only
 /// used for `timestamp_connected` rendering. Takes `session_meta` by value
 /// because the framed relay consumes it at teardown.
-#[doc(hidden)]
+///
+/// `termination_reason` is the bounded classification published under
+/// [`WS_TERMINATION_METADATA_KEY`]; it always overwrites any same-named key the
+/// request accumulated, so plugin- or peer-influenced metadata cannot forge it.
 #[allow(clippy::too_many_arguments)]
-pub async fn fire_ws_framed_disconnect_hooks(
+pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
     session_meta: WsSessionMeta,
@@ -14398,12 +14753,14 @@ pub async fn fire_ws_framed_disconnect_hooks(
         retry::ErrorClass,
         Option<tcp_proxy::StreamIoSide>,
     )>,
+    termination_reason: WsTerminationReason,
 ) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(&session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace,
         proxy_id: proxy_id.to_string(),
@@ -14425,7 +14782,7 @@ pub async fn fire_ws_framed_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username,
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata,
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -15182,6 +15539,9 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
     fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -15234,26 +15594,49 @@ where
         let pre_relay_failure = {
             use tokio::io::AsyncWriteExt;
             let mut offset = 0usize;
-            let write_result = tokio::time::timeout(residual_write_timeout, async {
-                while offset < backend_read_buffer.len() {
-                    match client_io.write(&backend_read_buffer[offset..]).await {
-                        Ok(0) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "client accepted zero bytes while forwarding WebSocket backend residual bytes",
-                            ));
-                        }
-                        Ok(n) => {
-                            offset = offset.saturating_add(n);
-                        }
-                        Err(err) => {
-                            return Err(err);
+            let write_result = tokio::select! {
+                biased;
+                reason = wait_for_websocket_session_stop(
+                    session_deadline,
+                    shutdown_rx.clone(),
+                    &overload,
+                ) => {
+                    // The residual forward was cut short by policy, not by a
+                    // transport fault, so no failure is attributed; the bytes
+                    // actually handed to the client are still reported.
+                    recovered_backend_bytes_written = offset as u64;
+                    fire_ws_tunnel_disconnect_hooks_with_reason(
+                        &ws_disconnect_plugins,
+                        proxy_id,
+                        &session_meta,
+                        0,
+                        recovered_backend_bytes_written,
+                        None,
+                        reason,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                result = tokio::time::timeout(residual_write_timeout, async {
+                    while offset < backend_read_buffer.len() {
+                        match client_io.write(&backend_read_buffer[offset..]).await {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                                ));
+                            }
+                            Ok(n) => {
+                                offset = offset.saturating_add(n);
+                            }
+                            Err(err) => {
+                                return Err(err);
+                            }
                         }
                     }
-                }
-                Ok(())
-            })
-            .await;
+                    Ok(())
+                }) => result,
+            };
             recovered_backend_bytes_written = offset as u64;
             match write_result {
                 Ok(Ok(())) => None,
@@ -15310,16 +15693,49 @@ where
         } else {
             None
         };
-        let copy_result = tcp_proxy::bidirectional_copy_for_relay(
-            client_io,
-            backend,
-            websocket_idle_timeout,
-            tunnel_half_close_cap,
-            None,
-            None,
-            buf_size,
-        )
-        .await;
+        let copy_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                session_deadline,
+                shutdown_rx.clone(),
+                &overload,
+            ) => {
+                debug!(
+                    proxy_id = %proxy_id,
+                    connection_id,
+                    termination_reason = reason.as_str(),
+                    "WebSocket tunnel stopped by absolute session policy"
+                );
+                // Cancelling the raw copy forfeits its byte totals:
+                // `bidirectional_copy_for_relay` owns stack-local counters and
+                // only reports them when it returns, so a policy-stopped tunnel
+                // session reports just the pre-relay residual bytes. Frame-
+                // parsed sessions keep exact counts through shared atomics; use
+                // frame mode when byte fidelity across forced closes matters.
+                // No failure is attributed — this is a gateway policy close, not
+                // a relay fault, and `termination_reason` carries the cause.
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    0,
+                    recovered_backend_bytes_written,
+                    None,
+                    reason,
+                )
+                .await;
+                return Ok(());
+            }
+            result = tcp_proxy::bidirectional_copy_for_relay(
+                client_io,
+                backend,
+                websocket_idle_timeout,
+                tunnel_half_close_cap,
+                None,
+                None,
+                buf_size,
+            ) => result,
+        };
         adaptive_buffer.record_connection(
             &session_meta.namespace,
             proxy_id,
@@ -15348,7 +15764,21 @@ where
         // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
         // the tunnel-mode session teardown. Frame counts are 0 because tunnel
         // mode does raw TCP bidirectional copy — no frames are parsed.
-        fire_ws_tunnel_disconnect_hooks(
+        let termination_reason = if copy_result.first_failure.is_some() {
+            if websocket_idle_timeout.is_some()
+                && copy_result
+                    .first_failure
+                    .as_ref()
+                    .is_some_and(|(_, class, _, _)| *class == retry::ErrorClass::ReadWriteTimeout)
+            {
+                WsTerminationReason::IdleTimeout
+            } else {
+                WsTerminationReason::RelayError
+            }
+        } else {
+            WsTerminationReason::NormalPeerClose
+        };
+        fire_ws_tunnel_disconnect_hooks_with_reason(
             &ws_disconnect_plugins,
             proxy_id,
             &session_meta,
@@ -15357,6 +15787,7 @@ where
                 .bytes_backend_to_client
                 .saturating_add(recovered_backend_bytes_written),
             tunnel_failure,
+            termination_reason,
         )
         .await;
         return Ok(());
@@ -15469,7 +15900,11 @@ where
     let cancel_btc = cancel.clone();
     let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
     let policy_close_ctb = Arc::clone(&policy_close);
-    let policy_close_btc = policy_close;
+    let policy_close_btc = Arc::clone(&policy_close);
+    let policy_close_stop = policy_close;
+    let termination_reason = Arc::new(std::sync::OnceLock::new());
+    let termination_reason_ctb = Arc::clone(&termination_reason);
+    let termination_reason_btc = Arc::clone(&termination_reason);
 
     // Forward messages from client to backend
     let client_to_backend = async move {
@@ -15499,6 +15934,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_ctb
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_ctb,
                                 connection_id,
@@ -15836,6 +16273,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_btc
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_btc,
                                 connection_id,
@@ -16126,41 +16565,124 @@ where
     // upgraded sockets and `_ws_connection_permit` forever and eventually
     // starve new WebSocket sessions. Race the two halves for first-completion
     // (the exit branch each one runs calls `cancel()` on the opposite token)
-    // then wait on the remaining half with a bounded drain grace. If the
-    // grace expires the remaining future is dropped — in-flight plugin calls
-    // are cancelled and all captured sockets are released.
+    // then wait on the remaining half with a bounded drain grace while still
+    // racing the absolute session stop. If either bound fires, cancellation
+    // is published and the remaining future gets one bounded close-delivery
+    // grace before it is dropped, releasing all captured sockets.
     let mut c2b = Box::pin(client_to_backend);
     let mut b2c = Box::pin(backend_to_client);
-    let client_done = tokio::select! {
-        _ = &mut c2b => true,
-        _ = &mut b2c => false,
+    let mut stop = Box::pin(wait_for_websocket_session_stop(
+        session_deadline,
+        shutdown_rx,
+        &overload,
+    ));
+    let first_completion = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            // Deliberately NOT a `first_failure`: an absolute-deadline or drain
+            // stop is a gateway-initiated policy close that delivers a real
+            // Close frame in both directions. Recording it as a relay
+            // `ReadWriteTimeout` would publish `result="error"` on
+            // `ferrum_websocket_sessions_total` and resolve to
+            // `DisconnectCause::IdleTimeout` for `proxy_alerts`, so every
+            // session that simply reached `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`
+            // would look like a stalled relay. `termination_reason` already
+            // carries the real cause. A genuine hang is still recorded below,
+            // when the remaining half misses `WS_DRAIN_GRACE`.
+            let _ = termination_reason.set(reason);
+            let _ = publish_ws_policy_close(
+                &policy_close_stop,
+                &cancel,
+                Some(ws_deadline_close_frame(reason)),
+            );
+            2u8
+        }
+        _ = &mut c2b => 0u8,
+        _ = &mut b2c => 1u8,
     };
     // On grace-timeout the remaining half's future is dropped (in-flight
     // plugin calls cancelled, sockets released). Record that as a failure so
     // `on_ws_disconnect` surfaces `cause=timeout` instead of looking like a
     // clean close. The direction tags which half was still running when the
     // grace expired.
-    if client_done {
-        if tokio::time::timeout(WS_DRAIN_GRACE, b2c).await.is_err() {
+    if first_completion == 0 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
+                let _ = termination_reason.set(reason);
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c) => result.is_err(),
+        };
+        if remaining_timed_out {
             let _ = first_failure.set((
                 crate::plugins::Direction::BackendToClient,
                 retry::ErrorClass::ReadWriteTimeout,
                 None,
             ));
         }
-    } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
+    } else if first_completion == 1 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
+                let _ = termination_reason.set(reason);
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b) => result.is_err(),
+        };
+        if remaining_timed_out {
+            let _ = first_failure.set((
+                crate::plugins::Direction::ClientToBackend,
+                retry::ErrorClass::ReadWriteTimeout,
+                None,
+            ));
+        }
+    } else if tokio::time::timeout(WS_DRAIN_GRACE, async {
+        tokio::join!(c2b, b2c);
+    })
+    .await
+    .is_err()
+    {
         let _ = first_failure.set((
-            crate::plugins::Direction::ClientToBackend,
+            crate::plugins::Direction::Unknown,
             retry::ErrorClass::ReadWriteTimeout,
             None,
         ));
     }
 
+    let termination_reason = termination_reason.get().copied().unwrap_or_else(|| {
+        if first_failure.get().is_some() {
+            WsTerminationReason::RelayError
+        } else {
+            WsTerminationReason::NormalPeerClose
+        }
+    });
+
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
     // have wound down. When no plugin opted in the list is empty and we skip
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
-    fire_ws_framed_disconnect_hooks(
+    fire_ws_framed_disconnect_hooks_with_reason(
         &ws_disconnect_plugins,
         proxy_id,
         session_meta,
@@ -16169,6 +16691,7 @@ where
         bytes_c2b.load(Ordering::Relaxed),
         bytes_b2c.load(Ordering::Relaxed),
         first_failure.get().cloned(),
+        termination_reason,
     )
     .await;
 
@@ -16799,6 +17322,13 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&Upstr
     // keyed by the workload app/container port behind defaultEndpoint. Route
     // overrides and upstream selection can replace that initial proxy port, so
     // the concrete target port is authoritative once one has been selected.
+    //
+    // This keeps the two inbound lanes in lock-step. Direct plaintext capture
+    // translates the captured listener port through
+    // `MeshInboundTlsPolicy.app_port_by_orig_dst_port` before selecting a
+    // posture; an authenticated CONNECT that a declared ingress listener
+    // remapped (issue #3260) arrives here with `backend_port` ALREADY equal to
+    // that same `defaultEndpoint` port, so both lanes resolve one posture.
     upstream_target
         .map(|target| target.port)
         .unwrap_or(proxy.backend_port)
@@ -16901,6 +17431,8 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
 
 struct TlsConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// See [`RequestConnectionMetadata::accepted_local_addr`].
+    accepted_local_addr: Option<SocketAddr>,
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
@@ -17214,6 +17746,7 @@ async fn run_accept_loop(
     // mesh mode. Outside it, skip the wildcard-bind `getsockname()` fallback
     // entirely so a non-mesh gateway's accept loop is byte-for-byte unchanged.
     let resolve_connection_destination_ip = frontend_bound_ip.is_none()
+        && mesh_direction.is_some()
         && state.env_config.mode == crate::config::env_config::OperatingMode::Mesh;
     // Count consecutive accept() failures to back off a busy-loop. Under fd
     // exhaustion (EMFILE/ENFILE) accept() fails WITHOUT consuming the pending
@@ -17344,6 +17877,33 @@ async fn run_accept_loop(
                         } else {
                             None
                         };
+                        // Concrete local address of the accepted connection —
+                        // the pod IP the peer actually reached, even when the
+                        // listener is bound to a wildcard address. Read only
+                        // AFTER the overload/permit fast-reject arms so a
+                        // connection flood still costs zero extra syscalls.
+                        //
+                        // Gated to the INBOUND mesh listener, the only direction
+                        // its consumer runs on: `build_inbound_hbone_relay_proxy`
+                        // is synthesized solely when `mesh_direction == Inbound`.
+                        // Computing it on the outbound capture listener would add
+                        // a `getsockname()` to every captured egress connection —
+                        // whose `orig_dst` is already present, so the value would
+                        // never be read. `connection_destination_ip` below keeps
+                        // its own LAZY wildcard fallback for that direction.
+                        let accepted_local_addr = if mesh_direction
+                            == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                        {
+                            frontend_bound_addr
+                                .filter(|addr| !addr.ip().is_unspecified())
+                                .or_else(|| {
+                                    resolve_connection_destination_ip
+                                        .then(|| stream.local_addr().ok())
+                                        .flatten()
+                                })
+                        } else {
+                            None
+                        };
                         // Istio `destination.ip` input for this connection. A
                         // captured original destination wins when present (it
                         // is the address the client actually dialled, whereas
@@ -17356,6 +17916,7 @@ async fn run_accept_loop(
                         // cost, and never anything a client sends.
                         let connection_destination_ip = orig_dst
                             .map(|addr| addr.ip())
+                            .or_else(|| accepted_local_addr.map(|addr| addr.ip()))
                             .or(frontend_bound_ip)
                             .or_else(|| {
                                 resolve_connection_destination_ip
@@ -17588,6 +18149,7 @@ async fn run_accept_loop(
                             let result = if let Some(tls_config) = tls_config {
                                 let tls_connection_metadata = TlsConnectionMetadata {
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
                                     mesh_direction,
@@ -17611,6 +18173,7 @@ async fn run_accept_loop(
                                     state,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
@@ -17754,6 +18317,7 @@ async fn handle_tls_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -17763,6 +18327,7 @@ async fn handle_tls_connection(
         let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
@@ -17771,6 +18336,7 @@ async fn handle_tls_connection(
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -24258,6 +24824,9 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let accepted_local_ip = connection_metadata
+        .accepted_local_addr
+        .map(|addr| addr.ip());
 
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
@@ -24314,6 +24883,7 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
+    ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -25040,7 +25610,15 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
-            // A UDP CONNECT additionally consults the EgressGateway's
+            //
+            // The SAME boundary also remaps an authenticated byte-stream CONNECT
+            // that names a DECLARED Sidecar `ingress[]` stream listener onto that
+            // listener's `defaultEndpoint` (issue #3260) — the identity-protected
+            // counterpart of the direct plaintext capture path's
+            // `local_inbound_tcp_routes` lookup, which a fresh mesh-mTLS CONNECT
+            // to `:15006` never reaches. The remap is withheld from the `udp`
+            // flavor (`ingress[]` stream listeners are TCP; UDP behavior is
+            // unchanged). A UDP CONNECT additionally consults the EgressGateway's
             // ServiceEntry-derived external-destination allowlist (issue #3263),
             // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
@@ -25050,31 +25628,24 @@ async fn handle_proxy_request_inner(
                     req.uri().authority(),
                     epoch.config.mesh.as_deref(),
                     is_udp_hbone_connect,
+                    accepted_local_ip,
                 )
             } else {
                 None
             };
             match hbone_relay {
-                Some(relay_proxy) => {
-                    // Preserve the CONNECT authority port for mesh
-                    // authorization on every synthesized HBONE relay. UDP
-                    // EgressGateway may dial a ServiceEntry targetPort that
-                    // differs from this authority port; TCP relays dial the
-                    // authority port directly. Either way AuthorizationPolicy
-                    // `destination.port` must see the authority port, and the
-                    // synthesized proxy's backend_port remains the socket dial
-                    // port. Stamp unconditionally (not only for UDP) so a
-                    // missing stamp can fail closed in `mesh_inbound_app_port`
-                    // without breaking TCP HBONE, which previously relied on
-                    // falling through to backend_port.
-                    ctx.mesh_inbound_listener_authz_port = req
-                        .uri()
-                        .authority()
-                        .and_then(|authority| authority.port_u16());
+                Some(relay) => {
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
-                    (relay_proxy, 0)
+                    // Sidecar ingress remaps authorize on the DECLARED listener
+                    // port, never the `defaultEndpoint` the relay dials (F6 §6.2
+                    // security, mirroring the materialized ingress HTTP routes).
+                    // Stamped before the plugin chain runs. Ordinary relays use
+                    // the authority port; external UDP keeps that port even when
+                    // its selected dial target uses a distinct targetPort.
+                    ctx.mesh_inbound_listener_authz_port = relay.ingress_listener_authz_port;
+                    (relay.proxy, 0)
                 }
                 None => {
                     // Outbound-capture route misses under effective
@@ -27451,6 +28022,52 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
+    // Fail-closed WebSocket gate for Unix-socket backends (a Sidecar `ingress[]`
+    // `defaultEndpoint: unix://…`, carried on the selected target's reserved
+    // `mesh.unix_socket` tag).
+    //
+    // **WebSocket over a Unix ingress socket is explicitly NOT supported.** The
+    // WebSocket dial machinery below is written against TCP/TLS and the mesh
+    // H2/HBONE CONNECT tunnels; it has no Unix transport, and the target's
+    // `host:port` is a placeholder nothing listens on (on a sidecar it is the
+    // gateway's OWN inbound listener port, so a fallback dial would loop the
+    // proxy back into itself). Refusing is therefore strictly better than
+    // falling through, and mirrors the `hbone_required` / `mesh_mtls_required`
+    // contract: a mesh-tagged target that cannot dispatch over its own
+    // transport is refused, never downgraded.
+    //
+    // gRPC is NOT gated here (issue #3261): an `http2`/`grpc`-declared listener
+    // dispatches natively over h2c through the generic path's Unix branch, and
+    // an `http`-declared (HTTP/1.1) one is refused with a clean gRPC
+    // UNAVAILABLE by the direct-dispatch mesh-transport screen further down
+    // (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), which produces a
+    // protocol-correct trailers response instead of this 502.
+    if request_protocol == ProxyProtocol::WebSocket
+        && upstream_target
+            .as_deref()
+            .is_some_and(unix_backend::target_is_unix_backend)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            "unix-socket backend target cannot serve a WebSocket upgrade; refusing rather \
+             than dialing the placeholder loopback address"
+        );
+        // This refusal precedes any backend dispatch, so release a HALF_OPEN
+        // probe slot `check_circuit_breaker` may have claimed — otherwise
+        // repeated refusals leak `half_open_in_flight` slots and wedge the
+        // breaker (same reason the HBONE / mesh-mTLS refusals do it).
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        record_request(&state, 502);
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"unix-socket backend does not support WebSocket dispatch"}"#,
+        ));
+    }
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -27650,6 +28267,18 @@ async fn handle_proxy_request_inner(
                 | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => {
                     Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
                 }
+                // An h2c Unix backend normally falls through to the generic
+                // path's Unix branch (issue #3261); refuse defensively here —
+                // this loop's direct `GrpcConnectionPool` dial has no Unix
+                // transport and would dial the placeholder loopback address.
+                grpc_proxy::GrpcMeshDispatch::UnixSocketH2c => {
+                    Some("gRPC to a unix-socket backend cannot be dialed directly")
+                }
+                grpc_proxy::GrpcMeshDispatch::RefuseUnixSocketHttp1 => Some(
+                    "gRPC over an http-declared unix-socket ingress listener is not supported \
+                     (HTTP/1.1 cannot carry gRPC trailers); declare the listener protocol as \
+                     GRPC or HTTP2",
+                ),
             };
             if let Some(message) = refusal {
                 warn!(
@@ -30938,7 +31567,8 @@ async fn handle_proxy_request_inner(
         };
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
@@ -30998,7 +31628,8 @@ async fn handle_proxy_request_inner(
         let block_reason = "sidecar SVID-mTLS backend transport is not available";
         warn!(
             proxy_id = %proxy.id,
-            upstream_target = ?upstream_target,
+            upstream_host = %effective_host,
+            upstream_port = effective_port,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
@@ -31431,6 +32062,52 @@ async fn handle_proxy_request_inner(
                     Some(&original_request_path),
                 )
                 .await);
+            }
+
+            // This retry planner has no Unix-stream attempt implementation.
+            // Screen every rotated (and same-target) candidate before mesh
+            // transport selection, circuit-breaker admission, plugins, or a
+            // network dial. This also rejects a corrupted target carrying both
+            // Unix and HBONE/mTLS markers instead of letting tag ordering pick
+            // a different security boundary than the materializer declared.
+            if current_target
+                .as_deref()
+                .is_some_and(unix_backend::target_is_unix_backend)
+            {
+                let reason = "Unix socket retry dispatch is unavailable";
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                    target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                    "Unix-socket retry target cannot be dispatched by the network retry planner; failing closed"
+                );
+                result = if is_grpc_request {
+                    mesh_grpc_unavailable_response(
+                        None,
+                        reason,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    )
+                } else {
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::buffered(
+                            br#"{"error":"Bad Gateway","message":"Unix socket retry dispatch unavailable"}"#
+                                .to_vec(),
+                        ),
+                        headers: HashMap::from([(
+                            "gateway-error-reason".to_string(),
+                            reason.to_string(),
+                        )]),
+                        connection_error: false,
+                        backend_resolved_ip: None,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    }
+                };
+                final_upstream_target = current_target.clone();
+                sticky_dispatch_refused = true;
+                backend_admission_started_at = Instant::now();
+                skip_final_cb_record = true;
+                break;
             }
 
             // Resolve the exact selected target's transport for this attempt.
@@ -33716,15 +34393,16 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    // Per-port override for the LB-selected target's policy port and the service-discovery
-    // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
+    // Per-port override for the LB-selected target's policy port and the
+    // inherited top-level/selected-subset `connectionPool.http` overlay
+    // (`Proxy.dispatch_port_override_fallback`)
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
-    // field wins when set, otherwise the top-level overlay's value is inherited —
+    // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
     // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
-    // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
-    // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
-    // in `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
+    // matches the cold-path tiering exactly (inherited fallback, then a partial
+    // per-port overlay; see `apply_connection_pool_http_to_port_override` in
+    // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
     // cloning the whole per-port value here would allocate on EVERY request for
     // an SD destination that combines an explicit port entry with a fallback.
     let per_port = proxy
@@ -34249,6 +34927,16 @@ pub(crate) async fn proxy_to_backend_retry(
     // `proxy.backend_connect_timeout_ms`.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
+
+    // A `mesh.unix_socket` target is a Unix-stream backend, and this retry path
+    // is reqwest-only (no Unix transport). Refuse rather than dial the target's
+    // placeholder loopback `host:port`, which nothing listens on — the same
+    // fail-closed contract the HBONE / mesh-mTLS transports enforce. Unreachable
+    // for the materialized Sidecar ingress proxies (they configure no retry
+    // policy), so this is a defensive gate, not a live limitation.
+    if upstream_target.is_some_and(unix_backend::target_is_unix_backend) {
+        return unix_backend_dispatch_unavailable_response(proxy, "retry");
+    }
 
     // A retry attempt must be admitted under the same effective ceiling as the
     // first attempt: the route policy is request-scoped, so a replay cannot
@@ -35037,6 +35725,10 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // Mesh transport only: this helper is reached exclusively for
+            // `mesh.hbone`/`mesh.mtls` targets. A `mesh.unix_socket` target is
+            // refused before any retry dispatch.
+            None,
         )
         .await
     };
@@ -35791,13 +36483,24 @@ async fn proxy_to_backend(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // A Unix backend's `host:port` is only a schema-compatible carrier. It is
+    // never resolved or dialed: the reserved target tag below is re-admitted
+    // against the data plane's socket-root policy and the resulting path is
+    // connected with `UnixStream`. Keep the synthetic loopback authority out
+    // of IP-egress policy too. Otherwise `FERRUM_BACKEND_ALLOW_IPS=public`
+    // rejects an entirely local Unix socket before its real containment and
+    // inode/peer-credential gates can run.
+    let unix_target = upstream_target.filter(|t| unix_backend::target_is_unix_backend(t));
+
     // Enforce the backend egress policy for a literal-IP backend before dialing
     // (reqwest/pools skip the DnsCacheResolver for IP literals).
-    if let Some(reason) = denied_literal_backend_or_dns_override(
-        effective_host,
-        proxy,
-        &state.env_config.backend_allow_ips,
-    ) {
+    if unix_target.is_none()
+        && let Some(reason) = denied_literal_backend_or_dns_override(
+            effective_host,
+            proxy,
+            &state.env_config.backend_allow_ips,
+        )
+    {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,
@@ -35816,8 +36519,9 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let resolved_ip = if dispatch_hbone
-        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
+    let resolved_ip = if unix_target.is_some()
+        || (dispatch_hbone
+            && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target))
     {
         None
     } else {
@@ -35857,6 +36561,207 @@ async fn proxy_to_backend(
             }
         }
     };
+
+    // Sidecar `ingress[]` Unix-socket backend: the selected target carries the
+    // reserved `mesh.unix_socket` tag, so this request is dialed over a
+    // `tokio::net::UnixStream` and NEVER over the target's placeholder
+    // loopback `host:port`. Same admission ordering as the HBONE / mesh-mTLS
+    // branches below, and the same fail-closed contract — a tagged target that
+    // cannot dispatch here is refused, never downgraded to TCP.
+    //
+    // TWO wire protocols, chosen by the carried `mesh.unix_socket_h2c` tag and
+    // never guessed (issue #3261):
+    //
+    //   * **HTTP/1.1** (`http`-declared listener) → `proxy_to_backend_unix`.
+    //   * **h2c prior-knowledge HTTP/2** (`http2` / `https` / `grpc`-declared)
+    //     → the SAME dispatch body the sidecar mesh-mTLS transport uses, with
+    //     the pooled TLS sender swapped for a 1:1 h2c `UnixStream` sender. That
+    //     reuse is what makes gRPC over the socket real rather than nominal:
+    //     request/response streaming, the receipt-anchored gRPC deadline,
+    //     cancellation, `te: trailers` regeneration, and terminal-trailer
+    //     forwarding are the identical code path on both transports.
+    if let Some(unix_target) = unix_target {
+        let unix_h2c = unix_backend::target_unix_backend_is_h2c(unix_target);
+        let socket_path = match unix_backend::resolve_unix_socket_target(
+            unix_target,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+        ) {
+            Some(Ok(path)) => path,
+            // The tag is present but its path failed re-admission at dial time.
+            // Refuse: the carrier may have crossed a CP/DP or file boundary
+            // since translation admitted it, and the containment allowlist is a
+            // DATA-PLANE policy this process is the first to be able to apply.
+            Some(Err(rejection)) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    rejection = rejection.reason(),
+                    "Refusing unix-socket backend dispatch: tagged path failed admission"
+                );
+                return backend_dispatch_response(
+                    unix_backend_error_response(
+                        proxy,
+                        &unix_backend::UnixBackendError::InadmissiblePath(rejection),
+                        resolved_ip.clone(),
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // Unreachable: `target_is_unix_backend` already proved the tag.
+            None => {
+                return backend_dispatch_response(
+                    unix_backend_dispatch_unavailable_response(proxy, "missing_tag"),
+                    None,
+                    None,
+                );
+            }
+        };
+        // Flavor-aware declared-Content-Length check BEFORE admission, so a
+        // capacity rejection cannot mask the size violation as a 503 (same
+        // ordering rationale as the HBONE / mesh-mTLS branches). A gRPC-flavored
+        // request on the h2c socket is bounded by the gRPC receive limit, not
+        // the HTTP one, and gets the direct pool's Trailers-Only
+        // RESOURCE_EXHAUSTED shape — running the generic HTTP check first would
+        // reject an in-budget gRPC body with the wrong status AND the wrong
+        // framing whenever the HTTP limit is the smaller of the two.
+        let unix_grpc_flavored = unix_h2c
+            && headers
+                .get("content-type")
+                .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+        if unix_grpc_flavored {
+            // Route ceilings are protocol-agnostic client policy, so an active
+            // one narrows the selected gRPC receive limit too
+            // (`GHSA-xrfj-852f-645j`).
+            let grpc_limit = effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            );
+            if grpc_limit > 0
+                && request_may_have_body(method, headers)
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
+                    crate::util::body_limit::declared_content_length(headers)
+                && len > grpc_limit as u64
+            {
+                return backend_dispatch_response(
+                    grpc_proxy::grpc_request_body_too_large_backend_response(
+                        &proxy.id,
+                        resolved_ip.clone(),
+                        usize::try_from(len).ok(),
+                        grpc_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        } else if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
+            return reject;
+        }
+        let unix_request_body_limit = if unix_grpc_flavored {
+            effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
+            )
+        } else {
+            effective_max_request_body_size_bytes
+        };
+        let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
+            client_request_body,
+            method,
+            headers,
+            unix_request_body_limit,
+            proxy.backend_read_timeout_ms,
+            request_ctx.grpc_deadline_at(),
+            plugins,
+            ctx.as_deref_mut(),
+            stream_request_body,
+            request_body_prepared,
+            retain_request_body,
+            ctx_bytes_sent_observed,
+            resolved_ip.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return backend_dispatch_response(response, None, None),
+        };
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
+        *backend_admission_started_at = Instant::now();
+        let (backend_resp, body_bytes, request_body_exceeded) = if unix_h2c {
+            proxy_to_backend_mesh_mtls(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                upstream_target,
+                plugins,
+                request_ctx,
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+                Some(socket_path),
+            )
+            .await
+        } else {
+            proxy_to_backend_unix(
+                state,
+                proxy,
+                socket_path,
+                backend_url,
+                method,
+                headers,
+                unix_request_body,
+                plugins,
+                Some(request_ctx),
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                effective_max_request_body_size_bytes,
+                effective_max_response_body_size_bytes,
+            )
+            .await
+        };
+        return BackendDispatchResult::Response {
+            response: Box::new(backend_resp),
+            retained_body: unix_retained_body.or(body_bytes),
+            backend_admission_permits,
+            request_body_exceeded,
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+        };
+    }
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -36048,6 +36953,8 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            // SVID-mTLS transport, not a unix socket.
+            None,
         )
         .await;
         return BackendDispatchResult::Response {
@@ -40055,6 +40962,658 @@ async fn proxy_to_backend_hbone(
     }
 }
 
+/// Refusal response for a `mesh.unix_socket` target on a dispatch path that has
+/// no Unix transport (the reqwest-backed retry path, or a corrupted tag).
+///
+/// Fail-closed by construction: the alternative would be dialing the target's
+/// placeholder loopback `host:port`, which nothing listens on and which — on a
+/// sidecar — is the gateway's own inbound listener port. `DispatchPolicyRejected`
+/// keeps it health-neutral and non-retryable: replaying it would resolve the
+/// same way.
+fn unix_backend_dispatch_unavailable_response(
+    proxy: &Proxy,
+    stage: &'static str,
+) -> retry::BackendResponse {
+    let error_class = retry::ErrorClass::DispatchPolicyRejected;
+    warn!(
+        proxy_id = %proxy.id,
+        stage,
+        "Refusing unix-socket backend dispatch on a path with no unix transport; \
+         failing closed rather than dialing the placeholder loopback address"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend dispatch unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: None,
+        error_class: Some(error_class),
+    }
+}
+
+/// Backend response for a failed Unix dial (path rejected, connect error,
+/// connect timeout, or an unsupported platform).
+///
+/// The operator-supplied socket path is deliberately NOT echoed into the client
+/// body — it is a filesystem location on the workload host — while the log line
+/// carries the concrete reason for diagnosis.
+fn unix_backend_error_response(
+    proxy: &Proxy,
+    err: &unix_backend::UnixBackendError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = err.error_class();
+    warn!(
+        proxy_id = %proxy.id,
+        error = %err,
+        "Unix-socket backend dispatch failed"
+    );
+    let status_code = if matches!(
+        error_class,
+        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout
+    ) {
+        504
+    } else {
+        502
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+/// HTTP-family dispatch to a co-located Unix-domain STREAM socket
+/// (Istio `Sidecar` `ingress[].defaultEndpoint: unix:///path`).
+///
+/// Mirrors [`proxy_to_backend_hbone`]'s contract — an HTTP/1.1 client handshake
+/// over an arbitrary byte stream, the same header regeneration, size-limit and
+/// timeout handling, and the same streaming-vs-buffered response decision — but
+/// the stream is a fresh `UnixStream` instead of a pooled HBONE tunnel.
+///
+/// **Not pooled.** Each request dials its own socket and drops the connection
+/// when the response completes. The destination is a co-located app on the same
+/// host, so the dial is a local `connect(2)` with no DNS, TCP handshake, or TLS;
+/// pooling is a documented follow-up rather than a correctness requirement.
+///
+/// **HTTP/1.1 only.** This function serves an `http`-declared listener. An
+/// `http2` / `https` / `grpc`-declared listener carries the
+/// `mesh.unix_socket_h2c` tag and is dispatched by `proxy_to_backend_mesh_mtls`
+/// over an h2c `UnixStream` instead, which is what gives gRPC its trailers,
+/// deadlines, and bidirectional streaming. A gRPC-flavored request that reaches
+/// an `http`-declared socket is refused with a clean gRPC UNAVAILABLE before it
+/// gets here (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), never downgraded.
+///
+/// The third return element is the client-upload overflow flag, returned — like
+/// the HBONE path — only alongside a streaming response so the caller can
+/// reclassify a post-header upload overflow as neutral `RequestBodyTooLarge`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
+async fn proxy_to_backend_unix(
+    state: &ProxyState,
+    proxy: &Proxy,
+    socket_path: &str,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    let dial = unix_backend::dial_unix_backend(
+        socket_path,
+        proxy.backend_connect_timeout_ms,
+        &state.env_config.mesh_unix_socket_allowed_roots,
+        &state.env_config.mesh_unix_socket_allowed_uids,
+    );
+    let stream = match dial.await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return (
+                unix_backend_error_response(proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(err) => {
+            return (
+                unix_hyper_error_response(proxy, err, resolved_ip, false),
+                None,
+                None,
+            );
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("unix_backend: connection closed: {}", e);
+        }
+    });
+
+    // Only `path_and_query` is read out of the computed backend URL — a Unix
+    // socket has no network authority, so the request target is origin-form and
+    // the Host header (below) carries the authority the app sees.
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid unix backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    let backend_authority = uri.authority().map(|a| a.as_str()).unwrap_or("localhost");
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    let origin_form_uri = hyper::Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .unwrap_or_else(|_| hyper::Uri::from_static("/"));
+
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if effective_request_body_size_limit > 0 {
+        effective_request_body_size_limit
+    } else {
+        usize::MAX
+    };
+    let request_body_replayable = matches!(
+        &client_request_body,
+        MeshClientRequestBody::Replayable { .. }
+    );
+    let (mut parts, body) = match client_request_body {
+        MeshClientRequestBody::Streaming(request) => {
+            let (parts, body) = request.into_parts();
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            );
+            let body = match ctx {
+                Some(c)
+                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
+                        &c.metadata,
+                    ) =>
+                {
+                    body.with_grpc_message_counter(Arc::clone(
+                        &c.grpc_request_messages_observed,
+                    ))
+                }
+                _ => body,
+            };
+            (parts, http_body_util::Either::Left(body))
+        }
+        MeshClientRequestBody::Replayable {
+            body,
+            headers,
+            trailers,
+        } => {
+            let (mut parts, ()) = Request::new(()).into_parts();
+            parts.headers = headers;
+            (
+                parts,
+                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+            )
+        }
+    };
+    parts.uri = origin_form_uri;
+    parts.version = hyper::Version::HTTP_11;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "unix", method);
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    headers_mod::merge_proxy_headers_preserving_repeated(&mut parts.headers, headers);
+    headers_mod::strip_backend_request_headers(&mut parts.headers);
+    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    if !proxy.preserve_host_header {
+        parts.headers.remove(hyper::header::HOST);
+    }
+    if !proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST) {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "backend_host",
+            "host",
+            backend_authority,
+        );
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "unix",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if request_is_secure { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
+    }
+    if let Some(ref via) = state.via_header_http11 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "configured_via",
+            "via",
+            via,
+        );
+    }
+    if state.add_forwarded_header {
+        let proto_str = if request_is_secure { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "unix",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "Unix backend read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        unix_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    None,
+                    None,
+                );
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    if effective_max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > effective_max_response_body_size_bytes
+    {
+        return (
+            unix_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                effective_max_response_body_size_bytes,
+            ),
+            None,
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        response_decision_ctx,
+        status,
+        &resp_headers,
+    );
+
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            Some(body_size_exceeded),
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            effective_max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    unix_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        effective_max_response_body_size_bytes,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "unix"),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (
+                    unix_hyper_error_response(proxy, err, resolved_ip, false),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "Unix backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                    None,
+                );
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+            None,
+        )
+    }
+}
+
+/// Non-Unix build stub. Sidecar mesh deployments are Linux-only, so this is
+/// unreachable in practice; it exists so the Windows build keeps the same
+/// fail-closed refusal instead of losing the transport gate at compile time.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(unix))]
+async fn proxy_to_backend_unix(
+    _state: &ProxyState,
+    proxy: &Proxy,
+    _socket_path: &str,
+    _backend_url: &str,
+    _method: &str,
+    _headers: &HashMap<String, String>,
+    _client_request_body: MeshClientRequestBody,
+    _plugins: &[Arc<dyn crate::plugins::Plugin>],
+    _ctx: Option<&RequestContext>,
+    _response_decision_ctx: Option<&RequestContext>,
+    _stream_response: bool,
+    _client_ip: &str,
+    _xff_append_ip: &str,
+    _request_is_secure: bool,
+    resolved_ip: Option<String>,
+    _ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    _effective_request_body_size_limit: usize,
+    _effective_max_response_body_size_bytes: usize,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    (
+        unix_backend_error_response(
+            proxy,
+            &unix_backend::UnixBackendError::PlatformUnsupported,
+            resolved_ip,
+        ),
+        None,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn unix_hyper_error_response(
+    proxy: &Proxy,
+    err: hyper::Error,
+    resolved_ip: Option<String>,
+    request_body_replayable: bool,
+) -> retry::BackendResponse {
+    error!(proxy_id = %proxy.id, error = %err, "Unix backend HTTP request failed");
+    // Same pre-wire/post-wire split the HBONE arm uses: a canceled dispatch with
+    // an immutable body proves the request never reached the app.
+    let error_class = if request_body_replayable && err.is_canceled() {
+        retry::ErrorClass::ConnectionPoolError
+    } else {
+        retry::ErrorClass::ProtocolError
+    };
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"Unix backend unavailable"}"#,
+        )),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+#[cfg(unix)]
+fn unix_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        max_request_body_size_bytes = max_size,
+        "Unix backend streaming request body exceeded configured size limit"
+    );
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+#[cfg(unix)]
+fn unix_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "Unix backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
 /// Sidecar egress dispatch: send the request as HTTP/2 over a pooled SVID-mTLS
 /// session to the destination sidecar's inbound listener (`mesh.mtls` targets).
 ///
@@ -40098,6 +41657,18 @@ async fn proxy_to_backend_mesh_mtls(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // `Some(path)` reuses this entire dispatch body for a Sidecar `ingress[]`
+    // **h2c Unix-socket** backend (issue #3261): the pooled SVID-mTLS sender is
+    // replaced by a 1:1 `UnixStream` h2c sender and the request `:scheme`
+    // becomes `http`, while everything else — gRPC flavor detection, the
+    // receipt-anchored deadline, `te: trailers`, the never-buffer-native-gRPC
+    // rule, streaming trailer forwarding, and the body ceilings — is the SAME
+    // code. Sharing it is deliberate: two copies of the gRPC-over-h2 contract
+    // would drift. On this path the target carries NO mesh transport tag, so the
+    // mesh-mTLS dial plan (pinned peer, trust domain, SNI) does not apply; the
+    // socket's containment allowlist, file type, owner uid, and mode are its
+    // identity boundary instead.
+    unix_socket_path: Option<&str>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -40149,12 +41720,29 @@ async fn proxy_to_backend_mesh_mtls(
     //     the destination service FQDN (`mesh.eastwest_sni`). A missing SNI or
     //     trust domain FAILS CLOSED (502) — never a fallback to the gateway
     //     address as SNI or any-federated verification.
+    //
+    // The h2c Unix transport has no TLS session at all, so it takes the vacant
+    // plan rather than resolving one: `MeshMtlsDialPlan::resolve` REQUIRES a
+    // pinned `mesh.spiffe_id`, which a Unix ingress target correctly never
+    // carries, and would fail the dispatch closed. Its security boundary is the
+    // socket-path containment gate already applied by the caller and re-applied
+    // at the dial.
+    let unix_dial_plan = mesh_mtls_pool::MeshMtlsDialPlan {
+        cross_cluster: false,
+        expected_peer: None,
+        expected_trust_domain: None,
+        sni_override: None,
+    };
     let mesh_mtls_pool::MeshMtlsDialPlan {
         cross_cluster,
         expected_peer,
         expected_trust_domain,
         sni_override,
-    } = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+    } = match if unix_socket_path.is_some() {
+        Ok(unix_dial_plan)
+    } else {
+        mesh_mtls_pool::MeshMtlsDialPlan::resolve(target)
+    } {
         Ok(plan) => plan,
         Err(mesh_mtls_pool::MeshMtlsDialError::PinnedPeer(err)) => {
             error!(
@@ -40233,7 +41821,8 @@ async fn proxy_to_backend_mesh_mtls(
             .map(|td| td.as_str())
             .unwrap_or(""),
         sni_override = sni_override.unwrap_or(""),
-        "Proxying request via sidecar SVID-mTLS HTTP/2"
+        unix_socket_backend = unix_socket_path.is_some(),
+        "Proxying request via sidecar HTTP/2 (SVID-mTLS, or h2c over a unix socket)"
     );
 
     // gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips the
@@ -40369,34 +41958,80 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
-    let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-    let get_sender = state.mesh_mtls_pool.get_sender(
-        proxy,
-        &target.host,
-        target.port,
-        target.dispatch_policy_port(),
-        mtls_port,
-        expected_peer.as_ref(),
-        expected_trust_domain.as_ref(),
-        sni_override,
-    );
-    let sender_result = if let Some(deadline) = client_grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, get_sender).await {
-            Ok(result) => result,
-            Err(_) => {
+    // Unix h2c: a fresh 1:1 socket per request, admitted at the TOCTOU boundary
+    // (containment, symlink-resolved containment, socket file type, owner uid,
+    // mode) and bounded by the proxy's connect timeout. Not pooled — the
+    // destination is a co-located app reached by a local `connect(2)` with no
+    // DNS, TCP handshake, or TLS; pooling is a documented performance follow-up,
+    // not a correctness requirement.
+    let sender_result = if let Some(socket_path) = unix_socket_path {
+        let dial = unix_backend::dial_unix_h2c_sender(
+            socket_path,
+            proxy.backend_connect_timeout_ms,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+            &state.env_config.mesh_unix_socket_allowed_uids,
+        );
+        // The client's end-to-end RPC deadline caps the dial exactly as it caps
+        // the pooled sender acquisition below: a wedged local app must not
+        // outlive the deadline the caller already committed to.
+        let dialed = if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, dial).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            dial.await
+        };
+        match dialed {
+            Ok(sender) => Ok(sender),
+            Err(err) => {
                 return (
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
+                    unix_backend_error_response(proxy, &err, resolved_ip),
                     None,
                     None,
                 );
             }
         }
     } else {
-        get_sender.await
+        let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+        let get_sender = state.mesh_mtls_pool.get_sender(
+            proxy,
+            &target.host,
+            target.port,
+            target.dispatch_policy_port(),
+            mtls_port,
+            expected_peer.as_ref(),
+            expected_trust_domain.as_ref(),
+            sni_override,
+        );
+        if let Some(deadline) = client_grpc_deadline_at {
+            match tokio::time::timeout_at(deadline, get_sender).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            get_sender.await
+        }
     };
     let mut sender = match sender_result {
         Ok(sender) => sender,
@@ -40431,8 +42066,18 @@ async fn proxy_to_backend_mesh_mtls(
     };
     // Bound readiness by the connect budget: a pooled-but-saturated connection
     // (stream-cap reached) must not stall the request indefinitely.
-    let connect_deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms));
+    let readiness_connect_timeout_ms = if unix_socket_path.is_some() {
+        unix_backend::effective_connect_timeout_ms(proxy.backend_connect_timeout_ms)
+    } else {
+        proxy.backend_connect_timeout_ms
+    };
+    let readiness_started_at = tokio::time::Instant::now();
+    let connect_deadline = readiness_started_at
+        .checked_add(Duration::from_millis(readiness_connect_timeout_ms))
+        // The Unix transport promises a bounded establishment path. An
+        // unrepresentable clock duration therefore expires immediately instead
+        // of falling through to the legacy mesh-pool "no deadline" behavior.
+        .or_else(|| unix_socket_path.is_some().then_some(readiness_started_at));
     let ready_deadline = match (client_grpc_deadline_at, connect_deadline) {
         (Some(client), Some(connect)) => Some(client.min(connect)),
         (Some(client), None) => Some(client),
@@ -40472,7 +42117,7 @@ async fn proxy_to_backend_mesh_mtls(
             warn!(
                 proxy_id = %proxy.id,
                 "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
-                proxy.backend_connect_timeout_ms
+                readiness_connect_timeout_ms
             );
             if is_grpc_flavored {
                 if client_grpc_deadline_at
@@ -40575,15 +42220,26 @@ async fn proxy_to_backend_mesh_mtls(
     // service-port rewrite, and the dial-authority fallback all live in the
     // shared resolver so the gRPC mesh transport cannot drift from this path
     // (see `mesh_mtls_dispatch_authority`). The original client Host still
-    // rides `x-forwarded-host` below.
+    // rides `x-forwarded-host` below. A Unix-socket dispatch reuses this hop
+    // and carries no mesh authority tag, so it lands on the preserved client
+    // Host or the target's placeholder dial authority — exactly as before.
     let authority_resolved = mesh_mtls_dispatch_authority(
         target,
         proxy.preserve_host_header,
         headers.get("host").map(String::as_str),
     );
     let authority = authority_resolved.as_ref();
+    // `:scheme` must describe the actual hop: `https` for the SVID-mTLS session,
+    // `http` for a plaintext h2c Unix socket. An `https` scheme on the socket
+    // would make the co-located app build absolute URLs / redirects claiming a
+    // TLS hop that does not exist.
+    let request_scheme = if unix_socket_path.is_some() {
+        "http"
+    } else {
+        "https"
+    };
     let tunneled_uri = match hyper::Uri::builder()
-        .scheme("https")
+        .scheme(request_scheme)
         .authority(authority)
         .path_and_query(path_and_query)
         .build()
@@ -50607,9 +52263,16 @@ mod tests {
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
+        // Anchor on the arm's own binding rather than the bare call name: the
+        // function DEFINITION appears far earlier in this file, so a `rfind` on
+        // the name alone would still succeed if the call were deleted.
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(")
-            .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
+            .rfind("let hbone_relay = if is_hbone_connect_any")
+            .expect("inbound CONNECT relay synthesis must remain in the route-miss arm");
+        assert!(
+            src[relay_pos..not_found_pos].contains("build_inbound_hbone_relay_proxy("),
+            "the route-miss arm must still synthesize the inbound CONNECT relay"
+        );
         assert!(
             relay_pos < gate_pos,
             "inbound HBONE relay synthesis must stay ahead of the REGISTRY_ONLY route-miss gate"
@@ -52501,11 +54164,16 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false, None)
             .expect("bracketed IPv6 authority should build relay");
 
-        assert_eq!(relay.backend_host, "fd00:10:244:1::4");
-        assert_eq!(relay.backend_port, 8080);
+        assert_eq!(relay.proxy.backend_host, "fd00:10:244:1::4");
+        assert_eq!(relay.proxy.backend_port, 8080);
+        assert_eq!(
+            relay.ingress_listener_authz_port,
+            Some(8080),
+            "an ordinary transparent relay authorizes on the CONNECT authority port"
+        );
     }
 
     #[test]
@@ -52602,13 +54270,14 @@ mod tests {
         // backend — the unmodified happy path that the post-override guard must
         // still accept.
         let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true, None)
             .expect("STATIC authority must synthesize a dial-endpoint relay");
-        assert_eq!(relay.backend_host, "198.51.100.9");
-        assert_eq!(relay.backend_port, 53);
+        assert_eq!(relay.proxy.backend_host, "198.51.100.9");
+        assert_eq!(relay.proxy.backend_port, 53);
+        assert_eq!(relay.ingress_listener_authz_port, Some(53));
         assert!(mesh_egress_udp_destination_allowed(
-            &relay.backend_host,
-            relay.backend_port,
+            &relay.proxy.backend_host,
+            relay.proxy.backend_port,
             Some(&mesh)
         ));
     }
@@ -52814,7 +54483,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),
@@ -53134,6 +54803,146 @@ mod tests {
                 .get("workload_spiffe_id")
                 .and_then(serde_json::Value::as_str),
             Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn gateway_workload_metrics_does_not_replace_colliding_operator_plugin() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: Some(100),
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert_eq!(config.plugin_configs.len(), 1);
+        let plugin = &config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "key_auth");
+        assert_eq!(plugin.scope, PluginScope::Global);
+        assert!(plugin.enabled);
+        assert_eq!(plugin.priority_override, Some(100));
+        assert_eq!(plugin.config, json!({ "key_names": ["api-key"] }));
+    }
+
+    #[test]
+    fn gateway_workload_metrics_operator_selection_is_namespace_scoped() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: "tenant-b-metrics".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "tenant-b".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://tenant-b.example/ns/tenant-b/sa/gateway"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({
+                    "workload_spiffe_id": "spiffe://old.example/ns/ferrum/sa/old"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        let tenant_b = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "tenant-b-metrics")
+            .expect("tenant-b operator plugin should remain");
+        assert_eq!(
+            tenant_b
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://tenant-b.example/ns/tenant-b/sa/gateway")
+        );
+        let ferrum = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "ferrum" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("ferrum managed plugin should remain");
+        assert_eq!(
+            ferrum
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn colliding_operator_plugin_is_not_ignored_as_empty_config() {
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: "key_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({ "key_names": ["api-key"] }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }];
+
+        assert!(!config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
+        assert!(config_empty_ignoring_gateway_managed_plugins(
+            &config, "ferrum"
+        ));
+
+        config.plugin_configs[0].namespace = "tenant-b".to_string();
+        assert!(
+            !config_empty_ignoring_gateway_managed_plugins(&config, "ferrum"),
+            "a managed-looking plugin from another tenant remains real config"
         );
     }
 

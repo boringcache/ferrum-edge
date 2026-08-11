@@ -888,6 +888,123 @@ pub mod _test_support {
         crate::service_discovery::service_discovery_task_key(namespace, upstream_id)
     }
 
+    /// Committed Consul blocking-query index (`0` = non-blocking).
+    ///
+    /// Observation seam for issue #3719 tests; production callers use the
+    /// discoverer's URL builder which reads the same atomic slot.
+    pub fn consul_blocking_query_index_for_test(
+        discoverer: &crate::service_discovery::consul::ConsulDiscoverer,
+    ) -> u64 {
+        discoverer.blocking_query_index()
+    }
+
+    /// Bounded `X-Consul-Index` parser used by Consul discovery (issue #3719).
+    ///
+    /// External unit tests cover the private parser through this seam so the
+    /// production module does not need an inline test module for these cases.
+    pub fn parse_consul_index_header_for_test(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        crate::service_discovery::consul::parse_consul_index_header(headers)
+    }
+
+    /// Mutable discovery-loop state used by the production apply pipeline.
+    #[derive(Debug, Default)]
+    pub struct DiscoveryLoopStateForTest {
+        inner: crate::service_discovery::DiscoveryLoopState,
+    }
+
+    impl DiscoveryLoopStateForTest {
+        pub fn new() -> Self {
+            Self {
+                inner: crate::service_discovery::DiscoveryLoopState::new(),
+            }
+        }
+
+        pub fn snapshot_installed(&self) -> bool {
+            self.inner.snapshot_installed()
+        }
+
+        pub fn last_discovered(&self) -> &[crate::config::types::UpstreamTarget] {
+            self.inner.last_discovered()
+        }
+    }
+
+    /// Whether the production apply pipeline should keep polling (`true`) or
+    /// stop the task (`false`) after handling one snapshot.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DiscoveryApplyControlForTest {
+        Continue,
+        Stop,
+    }
+
+    /// Drive the exact production admission → publication → cursor-commit
+    /// pipeline for one discovered snapshot (issue #3719).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_service_discovery_snapshot_for_test(
+        upstream_namespace: &str,
+        upstream_id: &str,
+        provider_name: &str,
+        snapshot: crate::service_discovery::DiscoverySnapshot,
+        state: &mut DiscoveryLoopStateForTest,
+        lb_cache: &crate::load_balancer::LoadBalancerCache,
+        request_epoch: &Option<std::sync::Arc<crate::request_epoch::RequestEpochStore>>,
+        static_targets: &[crate::config::types::UpstreamTarget],
+        algorithm: crate::config::types::LoadBalancerAlgorithm,
+        hash_on: &Option<String>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+        dns_cache: &crate::dns::DnsCache,
+        health_checker: &crate::health_check::HealthChecker,
+    ) -> DiscoveryApplyControlForTest {
+        match crate::service_discovery::apply_discovered_snapshot(
+            upstream_namespace,
+            upstream_id,
+            provider_name,
+            snapshot,
+            &mut state.inner,
+            lb_cache,
+            request_epoch,
+            static_targets,
+            algorithm,
+            hash_on,
+            cancel_rx,
+            shutdown_rx,
+            dns_cache,
+            health_checker,
+        )
+        .await
+        {
+            crate::service_discovery::DiscoveryApplyControl::Continue => {
+                DiscoveryApplyControlForTest::Continue
+            }
+            crate::service_discovery::DiscoveryApplyControl::Stop => {
+                DiscoveryApplyControlForTest::Stop
+            }
+        }
+    }
+
+    /// Rebuild a request-epoch store at a specific LB generation so publication
+    /// overflow (and therefore publication failure) can be exercised.
+    pub fn request_epoch_store_with_lb_generation_for_test(
+        store: &crate::request_epoch::RequestEpochStore,
+        lb_generation: u64,
+    ) -> crate::request_epoch::RequestEpochStore {
+        let current = store.load();
+        crate::request_epoch::RequestEpochStore::new(crate::request_epoch::RequestEpoch {
+            config: std::sync::Arc::clone(&current.config),
+            proxy_index_by_key: std::sync::Arc::clone(&current.proxy_index_by_key),
+            route_table: std::sync::Arc::clone(&current.route_table),
+            plugin_cache: std::sync::Arc::clone(&current.plugin_cache),
+            consumer_index: std::sync::Arc::clone(&current.consumer_index),
+            load_balancer: std::sync::Arc::clone(&current.load_balancer),
+            gateway_listener_admission: std::sync::Arc::clone(
+                &current.gateway_listener_admission,
+            ),
+            config_generation: current.config_generation,
+            route_generation: current.route_generation,
+            lb_generation,
+        })
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,
@@ -6406,7 +6523,12 @@ pub mod _test_support {
             Option<StreamIoSide>,
         )>,
     ) {
-        crate::proxy::fire_ws_framed_disconnect_hooks(
+        let termination_reason = if failure.is_some() {
+            crate::proxy::WsTerminationReason::RelayError
+        } else {
+            crate::proxy::WsTerminationReason::NormalPeerClose
+        };
+        crate::proxy::fire_ws_framed_disconnect_hooks_with_reason(
             ws_disconnect_plugins,
             proxy_id,
             session_meta,
@@ -6415,8 +6537,87 @@ pub mod _test_support {
             bytes_client_to_backend,
             bytes_backend_to_client,
             failure,
+            termination_reason,
         )
         .await
+    }
+
+    /// Return the shared WebSocket deadline plan used by H1 Upgrade, H2
+    /// Extended CONNECT, and H3 Extended CONNECT. Offsets are monotonic and
+    /// contain no credential material.
+    pub fn websocket_deadline_plan(
+        max_lifetime: std::time::Duration,
+        credential_lifetime: Option<std::time::Duration>,
+    ) -> (std::time::Duration, &'static str) {
+        let now = tokio::time::Instant::now();
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.grpc_deadline_received_at = now;
+        ctx.credential_deadline_at = credential_lifetime.and_then(|ttl| now.checked_add(ttl));
+        let plan = crate::proxy::effective_websocket_session_deadline(&ctx, max_lifetime.as_secs());
+        (plan.at.saturating_duration_since(now), plan.reason.as_str())
+    }
+
+    /// Await the same absolute-deadline/drain arbiter used by every WebSocket
+    /// relay. The inputs are fixed test controls and carry no credential data.
+    pub async fn websocket_stop_reason_for_test(
+        deadline_after: std::time::Duration,
+        credential_deadline: bool,
+        shutdown: bool,
+        draining: bool,
+    ) -> &'static str {
+        use std::sync::atomic::Ordering;
+
+        let overload = crate::overload::OverloadState::new();
+        overload.draining.store(draining, Ordering::Release);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(shutdown);
+        let reason = if credential_deadline {
+            crate::proxy::WsTerminationReason::CredentialExpired
+        } else {
+            crate::proxy::WsTerminationReason::MaxLifetime
+        };
+        let deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now()
+                .checked_add(deadline_after)
+                .unwrap_or_else(tokio::time::Instant::now),
+            reason,
+        };
+        crate::proxy::wait_for_websocket_session_stop(deadline, Some(shutdown_rx), &overload)
+            .await
+            .as_str()
+    }
+
+    /// Await the WebSocket stop arbiter against caller-owned overload state so
+    /// external tests can start the waiter before invoking `begin_drain`.
+    pub async fn websocket_stop_reason_with_overload_for_test(
+        deadline_after: std::time::Duration,
+        overload: std::sync::Arc<crate::overload::OverloadState>,
+    ) -> &'static str {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now()
+                .checked_add(deadline_after)
+                .unwrap_or_else(tokio::time::Instant::now),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        let reason = crate::proxy::wait_for_websocket_session_stop(
+            deadline,
+            Some(shutdown_rx),
+            overload.as_ref(),
+        )
+        .await;
+        drop(shutdown_tx);
+        reason.as_str()
+    }
+
+    pub fn request_credential_deadline_remaining(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<std::time::Duration> {
+        ctx.credential_deadline_at
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.
@@ -8259,6 +8460,37 @@ pub mod _test_support {
         kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Pod>,
         kube::runtime::watcher::Error,
     >;
+    pub type NodeAgentIngressTopologyOutcomeForTest =
+        crate::ebpf::ingress_topology::IngressTopologyOutcome;
+    pub type NodeAgentNodeWatcherEventForTest = Result<
+        kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Node>,
+        kube::runtime::watcher::Error,
+    >;
+
+    pub fn spawn_node_agent_ingress_topology_monitor_for_test<S>(
+        validator: crate::ebpf::ingress_topology::IngressTopologyValidator,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        stream: S,
+    ) -> (
+        tokio::sync::watch::Receiver<NodeAgentIngressTopologyOutcomeForTest>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        S: futures_util::Stream<Item = NodeAgentNodeWatcherEventForTest> + Send + 'static,
+    {
+        let monitor = validator.spawn_monitor_with_event_stream_for_test(stream, shutdown_rx);
+        (monitor.outcomes, monitor.task)
+    }
+
+    pub fn apply_bounded_node_topology_sequence_for_test(
+        snapshot: Vec<k8s_openapi::api::core::v1::Node>,
+        incremental: Option<k8s_openapi::api::core::v1::Node>,
+    ) -> Result<(usize, usize), crate::ebpf::ingress_topology::IngressTopologyReason> {
+        crate::ebpf::ingress_topology::apply_bounded_node_topology_sequence_for_test(
+            snapshot,
+            incremental,
+        )
+    }
 
     pub async fn run_with_pod_stream_for_test<S, I>(
         backend: &mut crate::ebpf::MockEbpfBackend,
@@ -8281,6 +8513,92 @@ pub mod _test_support {
             seed_pods,
         )
         .await
+    }
+
+    pub fn apply_node_agent_ingress_topology_outcome_for_test(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: &crate::ebpf::NodeAgentMetrics,
+        topology_ready: bool,
+        startup_ready: bool,
+        initial_sync_complete: bool,
+        outcome: &crate::ebpf::ingress_topology::IngressTopologyOutcome,
+    ) -> (bool, bool) {
+        crate::modes::node_agent::apply_ingress_topology_outcome_for_test(
+            backend,
+            config,
+            metrics,
+            topology_ready,
+            startup_ready,
+            initial_sync_complete,
+            outcome,
+        )
+    }
+
+    pub fn set_node_agent_startup_readiness_for_test(
+        initial_pod_sync_complete: bool,
+        topology_ready: bool,
+        udp_migration_ready: bool,
+    ) -> bool {
+        crate::modes::node_agent::set_node_agent_startup_readiness_for_test(
+            initial_pod_sync_complete,
+            topology_ready,
+            udp_migration_ready,
+        )
+    }
+
+    pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: Arc<crate::ebpf::NodeAgentMetrics>,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        pod_stream: S,
+        initial_topology: NodeAgentIngressTopologyOutcomeForTest,
+        topology_stream: T,
+    ) -> Result<(), anyhow::Error>
+    where
+        S: futures_util::Stream<Item = NodeAgentPodWatcherEventForTest> + Unpin,
+        T: futures_util::Stream<Item = NodeAgentIngressTopologyOutcomeForTest>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        crate::modes::node_agent::run_with_topology_outcome_stream_for_test(
+            backend,
+            config,
+            metrics,
+            shutdown_tx,
+            pod_stream,
+            initial_topology,
+            topology_stream,
+        )
+        .await
+    }
+
+    pub fn node_agent_cni_topology_readiness_rejection_for_test(
+        verb: crate::cni::rpc::RpcVerb,
+        initial_sync_complete: bool,
+        startup_ready: bool,
+    ) -> Option<&'static str> {
+        crate::modes::node_agent::cni_topology_readiness_rejection_for_test(
+            verb,
+            initial_sync_complete,
+            startup_ready,
+        )
+    }
+
+    pub fn node_agent_cni_capture_readiness_rejection_for_test(
+        verb: crate::cni::rpc::RpcVerb,
+        initial_sync_complete: bool,
+        topology_ready: bool,
+        udp_migration_ready: bool,
+    ) -> Option<&'static str> {
+        crate::modes::node_agent::cni_capture_readiness_rejection_for_test(
+            verb,
+            initial_sync_complete,
+            topology_ready,
+            udp_migration_ready,
+        )
     }
 
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────

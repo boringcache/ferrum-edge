@@ -1893,12 +1893,7 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     assert_eq!(before.proxy.id, "refused");
     assert_eq!(
         cache
-            .find_proxy_on_frontend(
-                Some("exact.example.com"),
-                "/exact",
-                Some(80),
-                false,
-            )
+            .find_proxy_on_frontend(Some("exact.example.com"), "/exact", Some(80), false)
             .expect("exact path before refusal")
             .proxy
             .id,
@@ -1906,12 +1901,7 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     );
     assert_eq!(
         cache
-            .find_proxy_on_frontend(
-                Some("regex.example.com"),
-                "/items/42",
-                Some(80),
-                false,
-            )
+            .find_proxy_on_frontend(Some("regex.example.com"), "/items/42", Some(80), false)
             .expect("regex path before refusal")
             .proxy
             .id,
@@ -1934,23 +1924,13 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     );
     assert!(
         cache
-            .find_proxy_on_frontend(
-                Some("exact.example.com"),
-                "/exact",
-                Some(80),
-                false,
-            )
+            .find_proxy_on_frontend(Some("exact.example.com"), "/exact", Some(80), false)
             .is_none(),
         "refused listener must reject exact-path cache hits"
     );
     assert!(
         cache
-            .find_proxy_on_frontend(
-                Some("regex.example.com"),
-                "/items/42",
-                Some(80),
-                false,
-            )
+            .find_proxy_on_frontend(Some("regex.example.com"), "/items/42", Some(80), false)
             .is_none(),
         "refused listener must reject regex cache hits"
     );
@@ -2026,4 +2006,22 @@ fn refused_listener_invalidates_positive_cache_hits() {
             .is_none(),
         "cache hit must fail closed once the listener is refused"
     );
+}
+
+#[test]
+fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
+    let mut protected = test_proxy("protected-admin", "~^/admin/.*$");
+    protected.hosts = vec!["app.example.com".into()];
+
+    let mut scoped_fallback = test_proxy("scoped-fallback", "~^/.*$");
+    scoped_fallback.hosts = vec!["app.example.com".into()];
+    scoped_fallback.listen_port = Some(9001);
+
+    let config = test_config(vec![protected, scoped_fallback]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/admin/secret", Some(9001), false)
+        .expect("the earlier protected regex must match");
+    assert_eq!(matched.proxy.id, "protected-admin");
 }

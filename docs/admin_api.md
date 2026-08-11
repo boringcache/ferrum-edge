@@ -92,11 +92,20 @@ In mesh mode, authenticated health detail includes
 `mesh.node_waypoint_observability` (ADR counters for HBONE handshake phases,
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
-`node_waypoint` topology). The authenticated `/overload`
+`node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
+outstanding count, and closed-set failure reason for the node-local Ambient UDP
+placement guard; no generation or pod UID is exposed). The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
 coarse unauthenticated responses.
+
+Ambient UDP placement rejection, unreadable/corrupt durable state, early
+finalize, and cleanup-tooling preflight failure disable only the UDP producer
+and keep mesh admin/control listeners running. Readiness remains false, so
+authenticated `/health` and `/metrics` expose the process-static bounded phase
+and reason needed for node-local repair while HBONE/TCP control remains
+diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
 
@@ -193,6 +202,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 
+Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
+
 ACME HTTP-01, TLS-ALPN-01, and DNS-01 order issue flows are available under:
 
 `GET /admin/tls/acme/accounts`, `GET/POST /admin/tls/acme/orders`, `GET/DELETE /admin/tls/acme/orders/{id}`, `POST /admin/tls/acme/orders/{id}/finalize`, `POST /admin/tls/acme/renew/{cert_id}`
@@ -279,6 +290,8 @@ Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are a
 Record IDs are **globally unique** across those typed collections (one shared store map keyed by ID, not namespaced by kind). Create with `allow_overwrite=true` and every typed `PUT` require the existing record kind to match the route kind; a cross-kind collision returns `409 Conflict` with a stable error of the form `managed TLS record '{id}' already exists with kind {existing}, cannot overwrite with kind {requested}`. Typed `GET`/`DELETE` still reject a kind mismatch with `400 Bad Request`. Same-kind replacement is allowed even when the record is referenced: admission validates the new material before persistence, and TLS source watchers atomically activate or retain the previous runtime config.
 
 Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
+
+Managed TLS create and update operations return `413 Payload Too Large` when an admitted material value or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
 Create, update, and delete operations ask active TLS source watchers to re-pull immediately. Surfaces without a live watcher still pick up managed records when their owning config/runtime is rebuilt.
 

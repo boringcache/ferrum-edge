@@ -7,20 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::backend_tls_policy::{
     MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
 };
 use crate::config_sources::k8s::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
-    GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment, GatewayApiRouteConflict,
-    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
-    K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
-    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
+    GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslation, K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
     gateway_api_status_conflict_context, merge_backend_lb_policy_status,
     namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
     parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
     translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
+    validate_listenerset_listener_entry,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -415,6 +416,9 @@ impl<'a> ReferenceGrantPermissionIndex<'a> {
 struct GatewayApiStatusIndexes<'a> {
     gateways_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     managed_gateways: HashSet<(&'a str, &'a str)>,
+    listenersets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    /// ListenerSets whose parentRef selects a Ferrum-managed Gateway.
+    listenersets_on_managed_gateways: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     services_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     service_imports_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
@@ -423,6 +427,8 @@ struct GatewayApiStatusIndexes<'a> {
     /// Built once so attachedRoutes and listener evaluation never rescan the
     /// full snapshot per listener (#2397).
     routes_by_gateway: HashMap<(&'a str, &'a str), Vec<&'a K8sObject>>,
+    /// Routes that parentRef a ListenerSet, keyed by `(ns, name)`.
+    routes_by_listenerset: HashMap<(&'a str, &'a str), Vec<&'a K8sObject>>,
     /// Precomputed ReferenceGrant from×to permissions (not raw grant vectors).
     reference_grant_permissions: ReferenceGrantPermissionIndex<'a>,
     has_any_service: bool,
@@ -446,11 +452,13 @@ impl<'a> GatewayApiStatusIndexes<'a> {
     ) -> Self {
         let mut gateway_classes_by_name = HashMap::new();
         let mut gateways_by_ns_name = HashMap::new();
+        let mut listenersets_by_ns_name = HashMap::new();
         let mut secrets_by_ns_name = HashMap::new();
         let mut services_by_ns_name = HashMap::new();
         let mut service_imports_by_ns_name = HashMap::new();
         let mut namespaces_by_name = HashMap::new();
         let mut routes_by_gateway: HashMap<(&str, &str), Vec<&K8sObject>> = HashMap::new();
+        let mut routes_by_listenerset: HashMap<(&str, &str), Vec<&K8sObject>> = HashMap::new();
         let mut reference_grant_permissions = ReferenceGrantPermissionIndex::default();
         let mut has_any_service = false;
 
@@ -461,6 +469,15 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 }
                 "Gateway" => {
                     gateways_by_ns_name.insert(
+                        (
+                            object.metadata.namespace.as_str(),
+                            object.metadata.name.as_str(),
+                        ),
+                        object,
+                    );
+                }
+                "ListenerSet" => {
+                    listenersets_by_ns_name.insert(
                         (
                             object.metadata.namespace.as_str(),
                             object.metadata.name.as_str(),
@@ -507,19 +524,27 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                     reference_grant_permissions.ingest(object);
                 }
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
-                    let mut seen_parents = HashSet::new();
+                    let mut seen_gateway_parents = HashSet::new();
+                    let mut seen_listenerset_parents = HashSet::new();
                     for parent_ref in route_parent_refs_borrowed(object) {
-                        let Some((namespace, name)) = parent_ref_gateway_target(object, parent_ref)
-                        else {
-                            continue;
-                        };
-                        if !seen_parents.insert((namespace, name)) {
-                            continue;
+                        if let Some((namespace, name)) =
+                            parent_ref_gateway_target(object, parent_ref)
+                            && seen_gateway_parents.insert((namespace, name))
+                        {
+                            routes_by_gateway
+                                .entry((namespace, name))
+                                .or_default()
+                                .push(object);
                         }
-                        routes_by_gateway
-                            .entry((namespace, name))
-                            .or_default()
-                            .push(object);
+                        if let Some((namespace, name)) =
+                            parent_ref_listenerset_target(object, parent_ref)
+                            && seen_listenerset_parents.insert((namespace, name))
+                        {
+                            routes_by_listenerset
+                                .entry((namespace, name))
+                                .or_default()
+                                .push(object);
+                        }
                     }
                 }
                 _ => {}
@@ -530,6 +555,33 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         for ((namespace, name), gateway) in &gateways_by_ns_name {
             if gateway_is_managed_by_ferrum_indexed(gateway, &gateway_classes_by_name) {
                 managed_gateways.insert((*namespace, *name));
+            }
+        }
+
+        let mut listenersets_on_managed_gateways = HashSet::new();
+        for ((namespace, name), listenerset) in &listenersets_by_ns_name {
+            if let Some(parent_ref) = listenerset.spec.get("parentRef") {
+                let group = parent_ref
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .unwrap_or("gateway.networking.k8s.io");
+                let kind = parent_ref
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Gateway");
+                let Some(parent_name) = parent_ref.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+                    continue;
+                }
+                let parent_namespace = parent_ref
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or(namespace);
+                if managed_gateways.contains(&(parent_namespace, parent_name)) {
+                    listenersets_on_managed_gateways.insert((*namespace, *name));
+                }
             }
         }
 
@@ -553,8 +605,11 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             }
             let route_key = K8sResourceKey::from_object(object);
             let attached = route_parent_refs_borrowed(object).iter().any(|parent_ref| {
-                parent_ref_gateway_target(object, parent_ref)
+                let targets_managed = parent_ref_gateway_target(object, parent_ref)
                     .is_some_and(|target| managed_gateways.contains(&target))
+                    || parent_ref_listenerset_target(object, parent_ref)
+                        .is_some_and(|target| listenersets_on_managed_gateways.contains(&target));
+                targets_managed
                     && materialized_route_parents.contains(&GatewayApiMaterializedRouteParent {
                         route: route_key.clone(),
                         parent_ref: route_parent_ref_key(object, parent_ref),
@@ -569,11 +624,14 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         Self {
             gateways_by_ns_name,
             managed_gateways,
+            listenersets_by_ns_name,
+            listenersets_on_managed_gateways,
             secrets_by_ns_name,
             services_by_ns_name,
             service_imports_by_ns_name,
             namespaces_by_name,
             routes_by_gateway,
+            routes_by_listenerset,
             reference_grant_permissions,
             has_any_service,
             conflicts_by_loser,
@@ -830,6 +888,12 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
                 .contains(&K8sResourceKey::from_object(object));
             backend_lb_policy_status(object, conflicted)
         }
+        "ListenerSet" => listenerset_status(
+            object,
+            ctx.indexes,
+            ctx.translation_result,
+            ctx.status_context,
+        ),
         _ => Value::Object(Default::default()),
     }
 }
@@ -1065,12 +1129,6 @@ impl ListenerReferenceStatus {
         reason: "InvalidCertificateRef",
         message: "Ferrum could not resolve this listener certificateRef",
     };
-
-    const UNSUPPORTED_CERTIFICATE_REFS: Self = Self {
-        resolved: false,
-        reason: "UnsupportedValue",
-        message: "Ferrum currently supports one Gateway TLS certificateRef per data plane",
-    };
 }
 
 fn gateway_reference_status(
@@ -1089,7 +1147,7 @@ fn gateway_reference_status(
 }
 
 fn listener_reference_status(
-    gateway: &K8sObject,
+    parent: &K8sObject,
     listener: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> ListenerReferenceStatus {
@@ -1103,6 +1161,12 @@ fn listener_reference_status(
     }
     let Some(certificate_refs) = certificate_refs else {
         return ListenerReferenceStatus::RESOLVED;
+    };
+
+    // ReferenceGrants are never inherited across Gateway ↔ ListenerSet.
+    let from_kind = match parent.kind.as_str() {
+        "ListenerSet" => "ListenerSet",
+        _ => "Gateway",
     };
 
     for certificate_ref in certificate_refs {
@@ -1123,11 +1187,12 @@ fn listener_reference_status(
         let namespace = certificate_ref
             .get("namespace")
             .and_then(Value::as_str)
-            .unwrap_or(&gateway.metadata.namespace);
-        if namespace != gateway.metadata.namespace
+            .unwrap_or(&parent.metadata.namespace);
+        if namespace != parent.metadata.namespace
             && !reference_grant_allows_secret_indexed(
                 indexes,
-                &gateway.metadata.namespace,
+                &parent.metadata.namespace,
+                from_kind,
                 namespace,
                 name,
             )
@@ -1140,12 +1205,6 @@ fn listener_reference_status(
         if !secret_object_is_valid_tls_certificate(secret) {
             return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
         }
-    }
-
-    if listener_is_terminating_tls(listener)
-        && gateway_has_multiple_distinct_tls_certificate_refs(gateway, indexes)
-    {
-        return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
     }
 
     ListenerReferenceStatus::RESOLVED
@@ -1166,81 +1225,10 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
         .eq_ignore_ascii_case("Terminate")
 }
 
-fn gateway_has_multiple_distinct_tls_certificate_refs(
-    gateway: &K8sObject,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> bool {
-    let Some(listeners) = gateway.spec.get("listeners").and_then(Value::as_array) else {
-        return false;
-    };
-    let mut selected: Option<(String, String)> = None;
-    for identity in listeners
-        .iter()
-        .filter(|listener| listener_is_terminating_tls(listener))
-        .flat_map(|listener| listener_tls_certificate_ref_identities(gateway, listener, indexes))
-    {
-        if selected
-            .as_ref()
-            .is_some_and(|existing| existing != &identity)
-        {
-            return true;
-        }
-        selected.get_or_insert(identity);
-    }
-    false
-}
-
-fn listener_tls_certificate_ref_identities(
-    gateway: &K8sObject,
-    listener: &Value,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> Vec<(String, String)> {
-    listener
-        .get("tls")
-        .and_then(|tls| tls.get("certificateRefs"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|certificate_ref| {
-            let group = certificate_ref
-                .get("group")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let kind = certificate_ref
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Secret");
-            if !group.is_empty() || kind != "Secret" {
-                return None;
-            }
-            let name = certificate_ref.get("name").and_then(Value::as_str)?;
-            let namespace = certificate_ref
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or(&gateway.metadata.namespace);
-            if namespace != gateway.metadata.namespace
-                && !reference_grant_allows_secret_indexed(
-                    indexes,
-                    &gateway.metadata.namespace,
-                    namespace,
-                    name,
-                )
-            {
-                return None;
-            }
-            let secret = indexes
-                .secrets_by_ns_name
-                .get(&(namespace, name))
-                .copied()?;
-            secret_object_is_valid_tls_certificate(secret)
-                .then(|| (namespace.to_string(), name.to_string()))
-        })
-        .collect()
-}
-
 fn reference_grant_allows_secret_indexed(
     indexes: &GatewayApiStatusIndexes<'_>,
     from_namespace: &str,
+    from_kind: &str,
     to_namespace: &str,
     secret_name: &str,
 ) -> bool {
@@ -1249,7 +1237,7 @@ fn reference_grant_allows_secret_indexed(
         .allows(&ReferenceGrantAllowQuery {
             from_namespace,
             from_group: "gateway.networking.k8s.io",
-            from_kind: "Gateway",
+            from_kind,
             to_namespace,
             to_group: "",
             to_kind: "Secret",
@@ -1266,7 +1254,7 @@ fn gateway_status(
     let references = gateway_reference_status(object, indexes);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
         Ok(translation) => {
-            let materialized = gateway_programmed(object, &translation.config);
+            let materialized = gateway_programmed(object, translation);
             (
                 true,
                 materialized,
@@ -1370,7 +1358,433 @@ fn gateway_status(
             status_context.data_plane_ready,
         )),
     );
+    let attached_listener_sets = result
+        .ok()
+        .map(|translation| {
+            translation
+                .listenerset_statuses
+                .iter()
+                .filter(|status| {
+                    status.attached
+                        && status.parent_gateway.as_ref().is_some_and(|(ns, name)| {
+                            ns == &object.metadata.namespace && name == &object.metadata.name
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    ensure_status_object(&mut status).insert(
+        "attachedListenerSets".to_string(),
+        Value::from(attached_listener_sets as u64),
+    );
     status
+}
+
+fn listenerset_status(
+    object: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+    result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
+    status_context: &GatewayApiStatusContext,
+) -> Value {
+    let outcome = result.ok().and_then(|translation| {
+        translation
+            .listenerset_statuses
+            .iter()
+            .find(|status| status.resource.matches_object(object))
+    });
+
+    let (
+        accepted,
+        accepted_reason,
+        accepted_message,
+        programmed_base,
+        programmed_reason,
+        programmed_message,
+    ) = match outcome {
+        Some(status) => (
+            status.accepted,
+            status.accepted_reason.as_str(),
+            status.accepted_message.as_str(),
+            status.programmed,
+            status.programmed_reason.as_str(),
+            status.programmed_message.as_str(),
+        ),
+        None => (
+            false,
+            "Pending",
+            "[ferrum-edge] Ferrum has not evaluated this ListenerSet yet",
+            false,
+            "Pending",
+            "[ferrum-edge] Ferrum has not evaluated this ListenerSet yet",
+        ),
+    };
+
+    let programmed = accepted && programmed_base && status_context.data_plane_ready;
+    let (programmed_reason, programmed_message) = if programmed {
+        ("Programmed", "Ferrum programmed this ListenerSet")
+    } else if accepted && programmed_base {
+        (
+            "DataPlaneNotReady",
+            "Ferrum accepted this ListenerSet, but the serving Ferrum data plane is not ready",
+        )
+    } else if accepted {
+        (programmed_reason, programmed_message)
+    } else {
+        (accepted_reason, accepted_message)
+    };
+
+    let conditions = vec![
+        condition(
+            object,
+            &object.status,
+            "Accepted",
+            accepted,
+            accepted_reason,
+            accepted_message,
+        ),
+        condition(
+            object,
+            &object.status,
+            "Programmed",
+            programmed,
+            programmed_reason,
+            programmed_message,
+        ),
+    ];
+
+    let mut status = object.status.clone();
+    merge_status_conditions(&mut status, &["Accepted", "Programmed"], conditions);
+    ensure_status_object(&mut status).insert(
+        "listeners".to_string(),
+        Value::Array(listenerset_listener_statuses(
+            object,
+            indexes,
+            accepted,
+            status_context.data_plane_ready,
+            result.ok(),
+        )),
+    );
+    status
+}
+
+fn listenerset_status_candidate_is_eligible(
+    object: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+) -> bool {
+    let key = (
+        object.metadata.namespace.as_str(),
+        object.metadata.name.as_str(),
+    );
+    indexes.listenersets_on_managed_gateways.contains(&key)
+        || has_ferrum_condition_status(&object.status)
+}
+
+fn has_ferrum_condition_status(status: &Value) -> bool {
+    status
+        .get("conditions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|condition| {
+            // ListenerSet conditions carry no controllerName, and reasons such
+            // as Accepted/Pending are shared across implementations. Only the
+            // explicit message marker written by Ferrum proves ownership for a
+            // stale-status cleanup after the parent stops being managed.
+            condition
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.starts_with("[ferrum-edge] "))
+        })
+}
+
+fn listenerset_listener_statuses(
+    listenerset: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+    listenerset_accepted: bool,
+    data_plane_ready: bool,
+    translation: Option<&crate::config_sources::k8s::K8sTranslation>,
+) -> Vec<Value> {
+    listenerset
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        // Bound hostile oversized arrays even if translation already rejected them.
+        .take(64)
+        .map(|listener| {
+            let references = listener_reference_status(listenerset, listener, indexes);
+            let listener_name = listener
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| gateway_api_section_name_is_valid(name))
+                .unwrap_or("");
+            let existing_listener_conditions = if listener_name.is_empty() {
+                None
+            } else {
+                existing_listener_status(listenerset, listener_name).and_then(existing_conditions)
+            };
+            let protocol = listener
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let route_kinds = listener_route_kind_status(protocol, listener);
+            let listener_validation_error = validate_listenerset_listener_entry(listener).err();
+            let conflict_reason = translation.and_then(|translation| {
+                translation
+                    .listenerset_statuses
+                    .iter()
+                    .find(|status| status.resource.matches_object(listenerset))
+                    .and_then(|status| {
+                        status
+                            .listener_conflicts
+                            .iter()
+                            .find(|(name, _)| name == listener_name)
+                            .map(|(_, reason)| reason.as_str())
+                    })
+            });
+            let conflicted = conflict_reason.is_some();
+            // Keep Accepted / Programmed / Conflicted / ResolvedRefs separate:
+            // conflicts do not rewrite reference resolution, and unresolved refs
+            // do not by themselves flip Accepted.
+            let spec_accepted = listenerset_accepted
+                && route_kinds.protocol_supported
+                && listener_validation_error.is_none();
+            let accepted = spec_accepted && !conflicted;
+            let resolved_refs =
+                spec_accepted && references.resolved && route_kinds.route_kinds_valid;
+            let materialized = translation.is_some_and(|translation| {
+                translation
+                    .listenerset_statuses
+                    .iter()
+                    .find(|status| status.resource.matches_object(listenerset))
+                    .is_some_and(|status| {
+                        status
+                            .programmed_listeners
+                            .iter()
+                            .any(|name| name == listener_name)
+                    })
+            });
+            let programmed = resolved_refs && materialized && data_plane_ready && !conflicted;
+            let unresolved_reason = if !route_kinds.route_kinds_valid {
+                "InvalidRouteKinds"
+            } else {
+                listenerset_resolved_refs_reason(references.reason)
+            };
+            let unresolved_message = if !route_kinds.route_kinds_valid {
+                "Listener allowedRoutes.kinds contains route kinds Ferrum does not support for this listener protocol"
+            } else {
+                references.message
+            };
+            let accepted_reason = if conflicted {
+                // ListenerEntry Accepted/Programmed use PortUnavailable when
+                // a higher-precedence listener owns the port. Preserve the
+                // specific HostnameConflict/ProtocolConflict reason only on
+                // the orthogonal Conflicted condition.
+                "PortUnavailable"
+            } else if !listenerset_accepted {
+                "Invalid"
+            } else if !route_kinds.protocol_supported {
+                "UnsupportedProtocol"
+            } else if listener_validation_error.is_some() {
+                "Invalid"
+            } else {
+                "Accepted"
+            };
+            let accepted_message = if conflicted {
+                "Listener conflicts with a higher-precedence Gateway or ListenerSet listener"
+            } else if !listenerset_accepted {
+                "Ferrum did not accept this ListenerSet"
+            } else if !route_kinds.protocol_supported {
+                "Ferrum does not support this listener protocol"
+            } else if let Some(error) = listener_validation_error.as_ref() {
+                // Display uses static field+message only (no hostile input).
+                listenerset_validation_status_message(error)
+            } else {
+                "Ferrum accepted this listener"
+            };
+            let conditions = vec![
+                condition_at(
+                    listenerset,
+                    existing_listener_conditions,
+                    "Accepted",
+                    accepted,
+                    accepted_reason,
+                    accepted_message,
+                ),
+                condition_at(
+                    listenerset,
+                    existing_listener_conditions,
+                    "ResolvedRefs",
+                    resolved_refs,
+                    if resolved_refs {
+                        "ResolvedRefs"
+                    } else if spec_accepted {
+                        unresolved_reason
+                    } else if listener_validation_error.is_some() {
+                        "Invalid"
+                    } else if !route_kinds.protocol_supported {
+                        "UnsupportedProtocol"
+                    } else {
+                        "Invalid"
+                    },
+                    if resolved_refs {
+                        "All listener references accepted by Ferrum"
+                    } else if spec_accepted {
+                        unresolved_message
+                    } else if let Some(error) = listener_validation_error.as_ref() {
+                        listenerset_validation_status_message(error)
+                    } else {
+                        "Ferrum could not resolve this listener"
+                    },
+                ),
+                condition_at(
+                    listenerset,
+                    existing_listener_conditions,
+                    "Programmed",
+                    programmed,
+                    if programmed {
+                        "Programmed"
+                    } else if conflicted {
+                        "PortUnavailable"
+                    } else if accepted && !resolved_refs {
+                        unresolved_reason
+                    } else if accepted && !materialized {
+                        "Pending"
+                    } else if accepted {
+                        "DataPlaneNotReady"
+                    } else {
+                        accepted_reason
+                    },
+                    if programmed {
+                        "Ferrum programmed this listener"
+                    } else if conflicted {
+                        "Listener conflicts with a higher-precedence Gateway or ListenerSet listener"
+                    } else if accepted && !resolved_refs {
+                        unresolved_message
+                    } else if accepted && !materialized {
+                        "Ferrum accepted this listener but found no materialized listener"
+                    } else if accepted {
+                        "Ferrum accepted this listener, but the serving Ferrum data plane is not ready"
+                    } else {
+                        accepted_message
+                    },
+                ),
+                condition_at(
+                    listenerset,
+                    existing_listener_conditions,
+                    "Conflicted",
+                    conflicted,
+                    if conflicted {
+                        conflict_reason.unwrap_or("HostnameConflict")
+                    } else {
+                        "NoConflicts"
+                    },
+                    if conflicted {
+                        "Listener conflicts with a higher-precedence Gateway or ListenerSet listener"
+                    } else {
+                        "No Gateway API listener conflicts detected by Ferrum"
+                    },
+                ),
+            ];
+            let status_name = if listener_name.is_empty() {
+                "invalid"
+            } else {
+                listener_name
+            };
+            json!({
+                "name": status_name,
+                "attachedRoutes": if listener_name.is_empty() {
+                    0
+                } else {
+                    attached_route_count_for_listenerset(indexes, listenerset, listener)
+                },
+                "supportedKinds": route_kinds.supported_kinds,
+                "conditions": conditions,
+            })
+        })
+        .collect()
+}
+
+fn listenerset_resolved_refs_reason(reason: &str) -> &'static str {
+    match reason {
+        "ResolvedRefs" => "ResolvedRefs",
+        "InvalidCertificateRef" => "InvalidCertificateRef",
+        "InvalidRouteKinds" => "InvalidRouteKinds",
+        "RefNotPermitted" => "RefNotPermitted",
+        // Map Gateway-only UnsupportedValue multi-cert outcomes onto the pinned
+        // ListenerEntry ResolvedRefs vocabulary.
+        _ => "InvalidCertificateRef",
+    }
+}
+
+fn listenerset_validation_status_message(
+    error: &crate::config_sources::k8s::GatewayApiListenerValidationError,
+) -> &'static str {
+    // GatewayApiListenerValidationError Display allocates; keep status messages
+    // on a small static set keyed by field path.
+    match error.field() {
+        "spec.listeners[].name" => "ListenerSet listener name is invalid",
+        "spec.listeners[].port" => "ListenerSet listener port is invalid",
+        "spec.listeners[].protocol" => "ListenerSet listener protocol is invalid",
+        "spec.listeners[].hostname" => "ListenerSet listener hostname is invalid",
+        "spec.listeners[].tls" | "spec.listeners[].tls.mode" => {
+            "ListenerSet listener TLS configuration is invalid"
+        }
+        _ => "ListenerSet listener configuration is invalid",
+    }
+}
+
+fn attached_route_count_for_listenerset(
+    indexes: &GatewayApiStatusIndexes<'_>,
+    listenerset: &K8sObject,
+    listener: &Value,
+) -> usize {
+    let key = (
+        listenerset.metadata.namespace.as_str(),
+        listenerset.metadata.name.as_str(),
+    );
+    indexes
+        .routes_by_listenerset
+        .get(&key)
+        .into_iter()
+        .flatten()
+        .filter(|route| {
+            route_parent_refs_borrowed(route).iter().any(|parent_ref| {
+                parent_ref_targets_listenerset(route, parent_ref, listenerset)
+                    && parent_ref_matches_listener(parent_ref, listener)
+                    && route_allowed_by_listener(indexes, route, listenerset, listener)
+                    && route_kind_allowed_by_listener(route, listener)
+                    && route_intersects_listener_hostname(route, listener)
+            })
+        })
+        .count()
+}
+
+fn parent_ref_targets_listenerset(
+    route: &K8sObject,
+    parent_ref: &Value,
+    listenerset: &K8sObject,
+) -> bool {
+    let group = parent_ref
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway.networking.k8s.io");
+    let kind = parent_ref
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("Gateway");
+    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    if group != "gateway.networking.k8s.io" || kind != "ListenerSet" {
+        return false;
+    }
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    namespace == listenerset.metadata.namespace && name == listenerset.metadata.name
 }
 
 fn gateway_status_address(address: &str) -> Value {
@@ -1392,7 +1806,6 @@ fn gateway_listener_statuses(
     gateway_accepted: bool,
     data_plane_ready: bool,
 ) -> Vec<Value> {
-    let config = translation.map(|translation| &translation.config);
     gateway
         .spec
         .get("listeners")
@@ -1414,16 +1827,35 @@ fn gateway_listener_statuses(
             let route_kinds = listener_route_kind_status(protocol, listener);
             let listener_validation_error =
                 validate_gateway_listener_allowed_routes(listener).err();
+            // A listener that lost a Gateway TLS SNI hostname collision keeps
+            // its Accepted/ResolvedRefs status — its own references are valid —
+            // but serves no route traffic, exactly as the translator withdrew
+            // it. Reported as `Conflicted`, the Gateway API condition for it.
+            let hostname_conflict_winner = translation.and_then(|translation| {
+                translation.frontend_tls_hostname_conflicts.get(&GatewayApiListenerKey {
+                    namespace: gateway.metadata.namespace.clone(),
+                    parent_kind: GatewayApiListenerParentKind::Gateway,
+                    gateway: gateway.metadata.name.clone(),
+                    listener: listener_name.to_string(),
+                })
+            });
+            let hostname_conflict_message = hostname_conflict_winner.map(|winner| {
+                format!(
+                    "Listener hostname is already served with a different certificate by Gateway {}/{} listener {}",
+                    winner.namespace, winner.gateway, winner.listener
+                )
+            });
             // A listener the translator refused for a physical same-port shape
             // conflict is unservable no matter how valid its own spec is: it
             // reports `Conflicted=True`, `Accepted=False`/`PortUnavailable`,
             // and `Programmed=False`. `ResolvedRefs` still describes the
             // listener's own references, which the conflict does not touch.
-            let conflict = translation.and_then(|translation| {
+            let physical_conflict = translation.and_then(|translation| {
                 translation
                     .listener_conflicts
                     .get(&crate::config_sources::k8s::GatewayApiListenerKey {
                         namespace: gateway.metadata.namespace.clone(),
+                        parent_kind: GatewayApiListenerParentKind::Gateway,
                         gateway: gateway.metadata.name.clone(),
                         listener: listener_name.to_string(),
                     })
@@ -1431,12 +1863,17 @@ fn gateway_listener_statuses(
             let spec_accepted = gateway_accepted
                 && route_kinds.protocol_supported
                 && listener_validation_error.is_none();
-            let accepted = spec_accepted && conflict.is_none();
+            let accepted = spec_accepted && physical_conflict.is_none();
             let resolved_refs =
                 spec_accepted && references.resolved && route_kinds.route_kinds_valid;
-            let materialized = config
-                .is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
-            let programmed = resolved_refs && materialized && data_plane_ready && conflict.is_none();
+            let materialized = translation.is_some_and(|translation| {
+                gateway_listener_programmed(gateway, listener, translation)
+            });
+            let programmed = resolved_refs
+                && materialized
+                && data_plane_ready
+                && physical_conflict.is_none()
+                && hostname_conflict_winner.is_none();
             let unresolved_reason = if listener_validation_error.is_some() {
                 "Invalid"
             } else if !route_kinds.route_kinds_valid {
@@ -1458,7 +1895,7 @@ fn gateway_listener_statuses(
                 "UnsupportedProtocol"
             } else if listener_validation_error.is_some() {
                 "Invalid"
-            } else if conflict.is_some() {
+            } else if physical_conflict.is_some() {
                 // The listener spec is valid; the PORT cannot be allocated for
                 // it because a sibling listener claims it with an
                 // incompatible frontend shape.
@@ -1472,7 +1909,7 @@ fn gateway_listener_statuses(
                 "Ferrum supports protocol TLS only with spec.listeners[].tls.mode=Passthrough"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
-            } else if let Some(conflict) = conflict {
+            } else if let Some(conflict) = physical_conflict {
                 conflict.message.as_str()
             } else {
                 validation_message
@@ -1517,12 +1954,14 @@ fn gateway_listener_statuses(
                     programmed,
                     if programmed {
                         "Programmed"
-                    } else if conflict.is_some() {
+                    } else if physical_conflict.is_some() {
                         "Invalid"
                     } else if accepted && !resolved_refs {
                         unresolved_reason
                     } else if listener_validation_error.is_some() {
                         "Invalid"
+                    } else if hostname_conflict_winner.is_some() {
+                        "HostnameConflict"
                     } else if accepted && !materialized {
                         "NoListeners"
                     } else if accepted {
@@ -1532,12 +1971,14 @@ fn gateway_listener_statuses(
                     },
                     if programmed {
                         "Ferrum programmed this listener"
-                    } else if let Some(conflict) = conflict {
+                    } else if let Some(conflict) = physical_conflict {
                         conflict.message.as_str()
                     } else if (accepted && !resolved_refs)
                         || listener_validation_error.is_some()
                     {
                         unresolved_message
+                    } else if let Some(message) = hostname_conflict_message.as_deref() {
+                        message
                     } else if accepted && !materialized {
                         "Ferrum accepted this listener but found no materialized listener"
                     } else if accepted {
@@ -1550,10 +1991,20 @@ fn gateway_listener_statuses(
                     gateway,
                     existing_listener_conditions,
                     "Conflicted",
-                    conflict.is_some(),
-                    conflict.map_or("NoConflicts", |conflict| conflict.reason),
-                    conflict.map_or(
-                        "No Gateway API listener conflicts detected by Ferrum",
+                    physical_conflict.is_some() || hostname_conflict_winner.is_some(),
+                    if let Some(conflict) = physical_conflict {
+                        conflict.reason
+                    } else if hostname_conflict_winner.is_some() {
+                        "HostnameConflict"
+                    } else {
+                        "NoConflicts"
+                    },
+                    physical_conflict.map_or_else(
+                        || {
+                            hostname_conflict_message.as_deref().unwrap_or(
+                                "No Gateway API listener conflicts detected by Ferrum",
+                            )
+                        },
                         |conflict| conflict.message.as_str(),
                     ),
                 ),
@@ -2101,7 +2552,7 @@ fn route_status(
         let accepted_message = if conflict_rejects_acceptance {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
-            "Ferrum rejected this route attachment because it is not permitted by the target Gateway listener"
+            "Ferrum rejected this route attachment because it is not permitted by the target parent listener"
         } else if no_matching_parent {
             "Ferrum rejected this route attachment because no matching parent listener was found"
         } else if no_matching_listener_hostname {
@@ -2141,7 +2592,7 @@ fn route_status(
         } else if parent_programming_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
         } else if not_allowed_by_listener {
-            "Ferrum did not program this route because it is not permitted by the target Gateway listener"
+            "Ferrum did not program this route because it is not permitted by the target parent listener"
         } else if no_matching_listener_hostname {
             "Ferrum did not program this route because no matching listener hostname was found"
         } else if accepted_for_parent && !parent_materialized {
@@ -2276,7 +2727,7 @@ fn gateway_status_apply_patch_for_update(
     let mut status_patch = serde_json::Map::new();
 
     match update.kind.as_str() {
-        "GatewayClass" | "Gateway" => {
+        "GatewayClass" | "Gateway" | "ListenerSet" => {
             let desired_conditions = preserve_live_condition_transition_times(
                 desired_owned_conditions(&update.status, owned_condition_types(&update.kind)),
                 live_status.and_then(existing_conditions),
@@ -2293,6 +2744,13 @@ fn gateway_status_apply_patch_for_update(
                 {
                     status_patch.insert("listeners".to_string(), listeners);
                 }
+                if let Some(attached) = update.status.get("attachedListenerSets").cloned() {
+                    status_patch.insert("attachedListenerSets".to_string(), attached);
+                }
+            } else if update.kind == "ListenerSet"
+                && let Some(listeners) = update.status.get("listeners").cloned()
+            {
+                status_patch.insert("listeners".to_string(), listeners);
             }
         }
         "BackendLBPolicy" | "XBackendTrafficPolicy" => {
@@ -2526,6 +2984,7 @@ fn owned_condition_types(kind: &str) -> &'static [&'static str] {
     match kind {
         "GatewayClass" => &["Accepted", "SupportedVersion"],
         "Gateway" => &["Accepted", "ResolvedRefs", "Programmed", "Conflicted"],
+        "ListenerSet" => &["Accepted", "Programmed"],
         _ => &[],
     }
 }
@@ -2803,6 +3262,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
             is_in_scope || has_ferrum_status_entry(&object.status, "ancestors")
         }
         "BackendLBPolicy" | "XBackendTrafficPolicy" => true,
+        "ListenerSet" => listenerset_status_candidate_is_eligible(object, indexes),
         _ => false,
     }
 }
@@ -2861,15 +3321,43 @@ fn parent_ref_gateway_target<'a>(
     Some((namespace, name))
 }
 
+fn parent_ref_listenerset_target<'a>(
+    route: &'a K8sObject,
+    parent_ref: &'a Value,
+) -> Option<(&'a str, &'a str)> {
+    let group = parent_ref
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway.networking.k8s.io");
+    let kind = parent_ref
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("Gateway");
+    let name = parent_ref.get("name").and_then(Value::as_str)?;
+    if group != "gateway.networking.k8s.io" || kind != "ListenerSet" {
+        return None;
+    }
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    Some((namespace, name))
+}
+
 fn parent_ref_targets_managed_gateway_indexed(
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let Some((namespace, name)) = parent_ref_gateway_target(route, parent_ref) else {
-        return false;
-    };
-    indexes.managed_gateways.contains(&(namespace, name))
+    if let Some((namespace, name)) = parent_ref_gateway_target(route, parent_ref) {
+        return indexes.managed_gateways.contains(&(namespace, name));
+    }
+    if let Some((namespace, name)) = parent_ref_listenerset_target(route, parent_ref) {
+        return indexes
+            .listenersets_on_managed_gateways
+            .contains(&(namespace, name));
+    }
+    false
 }
 
 fn parent_ref_targets_gateway(route: &K8sObject, parent_ref: &Value, gateway: &K8sObject) -> bool {
@@ -2884,20 +3372,10 @@ fn route_parent_ref_has_matching_listener(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return true;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return true;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return true;
-    }
-    gateway
+    parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -2906,7 +3384,7 @@ fn route_parent_ref_has_matching_listener(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(indexes, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, parent, listener)
                 && route_intersects_listener_hostname(route, listener)
         })
 }
@@ -2916,22 +3394,12 @@ fn route_parent_ref_not_allowed_by_listener(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return false;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return false;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return false;
-    }
 
     let mut saw_matching_listener = false;
-    for listener in gateway
+    for listener in parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -2943,7 +3411,7 @@ fn route_parent_ref_not_allowed_by_listener(
         }
         saw_matching_listener = true;
         if route_kind_allowed_by_listener(route, listener)
-            && route_allowed_by_listener(indexes, route, gateway, listener)
+            && route_allowed_by_listener(indexes, route, parent, listener)
         {
             return false;
         }
@@ -2956,20 +3424,10 @@ fn route_parent_ref_has_matching_parent(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return false;
     };
-    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
-        return false;
-    };
-    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
-        return false;
-    }
-    gateway
+    parent
         .spec
         .get("listeners")
         .and_then(Value::as_array)
@@ -2978,8 +3436,26 @@ fn route_parent_ref_has_matching_parent(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(indexes, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, parent, listener)
         })
+}
+
+/// Resolve the direct parent named by a Route parentRef without conflating a
+/// ListenerSet with a same-named Gateway. ListenerSet routes have their own
+/// listener namespace/section/port policy and must be evaluated against that
+/// object for status just as they are during translation.
+fn route_parent_object<'a>(
+    route: &K8sObject,
+    parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'a>,
+) -> Option<&'a K8sObject> {
+    if let Some(target) = parent_ref_gateway_target(route, parent_ref) {
+        return indexes.gateways_by_ns_name.get(&target).copied();
+    }
+    if let Some(target) = parent_ref_listenerset_target(route, parent_ref) {
+        return indexes.listenersets_by_ns_name.get(&target).copied();
+    }
+    None
 }
 
 fn parent_ref_matches_listener(parent_ref: &Value, listener: &Value) -> bool {
@@ -3024,26 +3500,7 @@ fn endpoint_slice_has_ready_endpoint(object: &K8sObject) -> bool {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .any(endpoint_ready)
-}
-
-fn endpoint_ready(endpoint: &Value) -> bool {
-    let Some(conditions) = endpoint.get("conditions") else {
-        return true;
-    };
-    if conditions
-        .get("terminating")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let ready = conditions.get("ready").and_then(Value::as_bool);
-    let serving = conditions
-        .get("serving")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| ready.unwrap_or(true));
-    ready.unwrap_or(true) && serving
+        .any(crate::util::endpointslice::endpoint_slice_endpoint_is_ready)
 }
 
 fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {
@@ -3078,35 +3535,32 @@ fn route_parent_ref_key_for_namespace(route_namespace: &str, parent_ref: &Value)
     format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
 }
 
-fn gateway_programmed(object: &K8sObject, config: &GatewayConfig) -> bool {
+fn gateway_programmed(object: &K8sObject, translation: &K8sTranslation) -> bool {
     let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
         return false;
     };
     listeners
         .iter()
-        .any(|listener| gateway_listener_programmed(object, listener, config))
+        .any(|listener| gateway_listener_programmed(object, listener, translation))
 }
 
 fn gateway_listener_programmed(
     object: &K8sObject,
     listener: &Value,
-    config: &GatewayConfig,
+    translation: &K8sTranslation,
 ) -> bool {
-    // Mesh services derived from this Gateway are named `{gateway.name}-{listener.name}`
-    // (see `mesh_services_from_gateway` in `gateway_api.rs`). Use exact match against
-    // the listener name to avoid a false positive when another Gateway's name is a
-    // prefix of this one (e.g. `edge` matching `edge-internal-http`).
-    let Some(mesh) = config.mesh.as_ref() else {
-        return false;
-    };
     let listener_name = listener
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("listener");
-    let expected = format!("{}-{}", object.metadata.name, listener_name);
-    mesh.services
-        .iter()
-        .any(|service| service.namespace == object.metadata.namespace && service.name == expected)
+    translation.materialized_gateway_listeners.contains(
+        &crate::config_sources::k8s::GatewayApiListenerKey {
+            namespace: object.metadata.namespace.clone(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: object.metadata.name.clone(),
+            listener: listener_name.to_string(),
+        },
+    )
 }
 
 fn route_unresolved_backend_ref_reason(
@@ -3230,7 +3684,8 @@ fn error_is_parent_ref_not_allowed(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("parentRef.namespace")
-                && message.contains("not permitted by the target Gateway listener")
+                && (message.contains("not permitted by the target Gateway listener")
+                    || message.contains("not permitted by the target ListenerSet listener"))
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -3240,7 +3695,8 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("parentRef")
-                && message.contains("does not match any known Gateway listener")
+                && (message.contains("does not match any known Gateway listener")
+                    || message.contains("does not match any known ListenerSet listener"))
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -3268,6 +3724,7 @@ fn is_status_kind(kind: &str) -> bool {
         kind,
         "GatewayClass"
             | "Gateway"
+            | "ListenerSet"
             | "HTTPRoute"
             | "GRPCRoute"
             | "TCPRoute"
@@ -3294,6 +3751,7 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("BackendTLSPolicy", "v1" | "v1alpha3") => "backendtlspolicies",
         ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
         ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
+        ("ListenerSet", "v1") => "listenersets",
         _ => return None,
     };
 
@@ -4286,7 +4744,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_status_reports_multiple_certificate_refs_unsupported() {
+    fn gateway_listener_status_accepts_multiple_distinct_certificate_refs() {
         let gateway_class = ferrum_gateway_class();
         let gateway = object(
             "Gateway",
@@ -4298,12 +4756,14 @@ mod tests {
                         "name": "https-a",
                         "port": 443,
                         "protocol": "HTTPS",
+                        "hostname": "a.example.com",
                         "tls": {"certificateRefs": [{"name": "certificate-a"}]}
                     },
                     {
                         "name": "https-b",
                         "port": 8443,
                         "protocol": "HTTPS",
+                        "hostname": "b.example.com",
                         "tls": {"certificateRefs": [{"name": "certificate-b"}]}
                     }
                 ]
@@ -4314,25 +4774,150 @@ mod tests {
 
         let updates = plan_status_updates(&[gateway_class, gateway, secret_a, secret_b], options());
 
+        // Issue #3267: distinct certificateRefs on one Gateway are served by
+        // SNI, not refused as an unsupported value.
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let conditions = gateway_update.status["conditions"].as_array().unwrap();
-        assert_condition(conditions, "ResolvedRefs", "False");
-        assert_eq!(
-            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("UnsupportedValue")
-        );
+        assert_condition(conditions, "ResolvedRefs", "True");
         let listeners = gateway_update.status["listeners"].as_array().unwrap();
-        let listener = listener_status_by_name(listeners, "https-a");
-        let listener_conditions = listener["conditions"].as_array().unwrap();
-        assert_condition(listener_conditions, "ResolvedRefs", "False");
+        for listener_name in ["https-a", "https-b"] {
+            let listener = listener_status_by_name(listeners, listener_name);
+            let listener_conditions = listener["conditions"].as_array().unwrap();
+            assert_condition(listener_conditions, "ResolvedRefs", "True");
+            assert_condition(listener_conditions, "Conflicted", "False");
+        }
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_a_tls_hostname_collision_as_conflicted() {
+        let gateway_class = ferrum_gateway_class();
+        let mut older = object(
+            "Gateway",
+            "edge-old",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-a"}]}
+                }]
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut younger = object(
+            "Gateway",
+            "edge-new",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        younger.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, younger, older, secret_a, secret_b],
+            options(),
+        );
+
+        let winner = update_for(&updates, "Gateway", "edge-old");
+        let winner_listener =
+            listener_status_by_name(winner.status["listeners"].as_array().unwrap(), "https");
+        let winner_conditions = winner_listener["conditions"].as_array().unwrap();
+        assert_condition(winner_conditions, "Conflicted", "False");
+
+        let loser = update_for(&updates, "Gateway", "edge-new");
+        let loser_listener =
+            listener_status_by_name(loser.status["listeners"].as_array().unwrap(), "https");
+        let loser_conditions = loser_listener["conditions"].as_array().unwrap();
+        // Its own references are fine; what it lost is the contested hostname.
+        assert_condition(loser_conditions, "ResolvedRefs", "True");
+        assert_condition(loser_conditions, "Conflicted", "True");
         assert_eq!(
-            find_condition(listener_conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("UnsupportedValue")
+            find_condition(loser_conditions, "Conflicted")["reason"].as_str(),
+            Some("HostnameConflict")
+        );
+        assert_condition(loser_conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(loser_conditions, "Programmed")["reason"].as_str(),
+            Some("HostnameConflict")
         );
     }
 
     #[test]
-    fn same_namespace_gateway_tls_slot_programs_only_winner() {
+    fn unsupported_tls_terminate_listener_cannot_claim_an_https_hostname() {
+        let gateway_class = ferrum_gateway_class();
+        let mut unsupported = object(
+            "Gateway",
+            "edge-unsupported",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 443,
+                    "protocol": "TLS",
+                    "hostname": "shop.example.com",
+                    "tls": {
+                        "mode": "Terminate",
+                        "certificateRefs": [{"name": "certificate-a"}]
+                    }
+                }]
+            }),
+        );
+        unsupported.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut valid = object(
+            "Gateway",
+            "edge-valid",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        valid.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, unsupported, valid, secret_a, secret_b],
+            options(),
+        );
+
+        let unsupported = update_for(&updates, "Gateway", "edge-unsupported");
+        let unsupported_listener = listener_status_by_name(
+            unsupported.status["listeners"].as_array().unwrap(),
+            "tls-terminate",
+        );
+        assert_condition(
+            unsupported_listener["conditions"].as_array().unwrap(),
+            "Accepted",
+            "False",
+        );
+
+        let valid = update_for(&updates, "Gateway", "edge-valid");
+        let valid_listener =
+            listener_status_by_name(valid.status["listeners"].as_array().unwrap(), "https");
+        let conditions = valid_listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn same_namespace_gateway_tls_listeners_are_both_programmed() {
         let gateway_class = ferrum_gateway_class();
         let gateway_a = object(
             "Gateway",
@@ -4372,15 +4957,7 @@ mod tests {
             let gateway_update = update_for(&updates, "Gateway", gateway_name);
             let conditions = gateway_update.status["conditions"].as_array().unwrap();
             assert_condition(conditions, "ResolvedRefs", "True");
-            assert_condition(
-                conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
+            assert_condition(conditions, "Programmed", "True");
 
             let listeners = gateway_update.status["listeners"].as_array().unwrap();
             let listener = listener_status_by_name(
@@ -4393,21 +4970,7 @@ mod tests {
             );
             let listener_conditions = listener["conditions"].as_array().unwrap();
             assert_condition(listener_conditions, "ResolvedRefs", "True");
-            assert_condition(
-                listener_conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
-            if gateway_name == "edge-b" {
-                assert_eq!(
-                    find_condition(listener_conditions, "Programmed")["reason"].as_str(),
-                    Some("NoListeners")
-                );
-            }
+            assert_condition(listener_conditions, "Programmed", "True");
         }
     }
 
@@ -5787,7 +6350,7 @@ mod tests {
     }
 
     #[test]
-    fn status_apply_patch_for_gateway_contains_only_ferrum_owned_fields() {
+    fn status_apply_patch_contains_only_ferrum_owned_fields() {
         let update = GatewayApiStatusUpdate {
             api_version: "gateway.networking.k8s.io/v1".to_string(),
             kind: "Gateway".to_string(),
@@ -5849,6 +6412,53 @@ mod tests {
         assert!(conditions.iter().all(|condition| {
             condition.get("type").and_then(Value::as_str) != Some("example.com/CustomReady")
         }));
+
+        let listenerset_update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "ListenerSet".to_string(),
+            namespace: "default".to_string(),
+            name: "extra".to_string(),
+            status: json!({
+                "conditions": [
+                    {
+                        "type": "Accepted",
+                        "status": "True",
+                        "observedGeneration": 7,
+                        "reason": "Accepted",
+                        "message": "[ferrum-edge] accepted",
+                        "lastTransitionTime": "2026-02-01T00:00:00Z"
+                    },
+                    {
+                        "type": "example.com/CustomReady",
+                        "status": "True"
+                    }
+                ],
+                "listeners": [{"name": "http", "conditions": []}],
+                "example.com/foreignField": "must not be claimed"
+            }),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
+        };
+        let listenerset_patch = gateway_status_apply_patch_for_update(&listenerset_update, None);
+        assert_eq!(
+            listenerset_patch["status"]["conditions"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            listenerset_patch["status"]["conditions"][0]["type"].as_str(),
+            Some("Accepted")
+        );
+        assert_eq!(
+            listenerset_patch["status"]["listeners"][0]["name"].as_str(),
+            Some("http")
+        );
+        assert!(
+            listenerset_patch["status"]
+                .get("example.com/foreignField")
+                .is_none()
+        );
     }
 
     #[test]

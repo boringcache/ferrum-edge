@@ -9,13 +9,14 @@ pub(crate) mod backend_tls_policy;
 mod core;
 mod gateway_api;
 mod istio;
+pub(crate) mod listenerset;
 mod mesh_config;
 
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status, merge_backend_lb_policy_status,
-    namespace_selector_matches, parse_reference_grant_permissions,
+    backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
+    merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
@@ -28,11 +29,12 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
-// Shared with the Istio status writer the same way: the Sidecar `ingress[]`
-// HTTP-family classification used by resolution and by deferred-field reporting
-// is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
-// modeled by resolution yet reported as a deferred non-HTTP listener.
-pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+// Shared with the Istio status writer the same way: Sidecar `ingress[]`
+// classification used by resolution and deferred-field reporting is one
+// predicate, so modeled HTTP and stream listeners cannot be reported deferred.
+pub(crate) use istio::{
+    sidecar_ingress_protocol_is_http_family, sidecar_ingress_protocol_is_modeled,
+};
 // Shared with the Istio status writer the same way (issue #3262): the Sidecar
 // `outboundTrafficPolicy` classification that decides the ENFORCED workload-scoped
 // policy is the same one that produces the reported `deferred_fields` reason, so a
@@ -219,6 +221,15 @@ pub fn validate_gateway_listener_allowed_routes(
     gateway_api::allowed_route_namespaces(listener).map(|_| ())
 }
 
+/// Validate one unstructured ListenerSet listener against the pinned v1.5.1
+/// ListenerEntry required/bounded shape (name/port/protocol/hostname/TLS plus
+/// allowedRoutes). Translation and status share this predicate.
+pub fn validate_listenerset_listener_entry(
+    listener: &Value,
+) -> Result<(), GatewayApiListenerValidationError> {
+    gateway_api::validate_listenerset_listener_entry(listener)
+}
+
 impl K8sTranslationOptions {
     pub fn new(namespace: String, trust_domain: TrustDomain) -> Self {
         let source_namespaces = HashSet::from([namespace.clone()]);
@@ -373,10 +384,19 @@ pub struct K8sTranslation {
     /// route attached to one programmed parent and one fail-closed parent does
     /// not report both parents as Programmed.
     pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    /// Gateway listeners that actually produced a synthetic `MeshService` in
+    /// this translation. Status consumes this provenance set instead of
+    /// inferring ownership from a collision-prone service name.
+    pub materialized_gateway_listeners: HashSet<GatewayApiListenerKey>,
     /// Per-`BackendTLSPolicy` translation outcome, projected for the Gateway
     /// API status writer. Computed during translation (the only place the
     /// ConfigMap/Secret CA index exists) so status planning never retranslates.
     pub backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+    /// Per-`ListenerSet` attachment/materialization outcome for status.
+    /// Computed with listener policy collection so Gateway
+    /// `status.attachedListenerSets` and ListenerSet conditions stay aligned
+    /// with the listeners that actually received traffic.
+    pub listenerset_statuses: Vec<GatewayApiListenerSetStatus>,
     /// Gateway listeners this translation refused because two listeners claim
     /// one numeric port with physically incompatible frontend shapes, keyed by
     /// listener identity with the operator-facing reason.
@@ -386,6 +406,14 @@ pub struct K8sTranslation {
     /// `Accepted=True` / `NoConflicts`.
     pub listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Gateway/ListenerSet listeners withdrawn because another admitted
+    /// listener owns the same explicit SNI hostname with a different complete
+    /// certificate set. Unlike physical port conflicts, a Gateway loser keeps
+    /// `Accepted=True`; status consumes this exact post-admission map so a
+    /// listener removed earlier by physical arbitration cannot remain a stale
+    /// hostname winner.
+    pub frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Route claims this translation refused because two different Gateway API
     /// listeners materialize one physical `(namespace, hosts, listen path,
     /// listen port)` route slot. Runtime materialization is withdrawn on both
@@ -406,10 +434,12 @@ pub struct K8sTranslation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayApiListenerConflict {
     /// Gateway API `ListenerConditionReason` for `Conflicted=True` —
-    /// `ProtocolConflict` when the port is claimed both plaintext and an
-    /// effective TLS-serving namespace slot, `HostnameConflict` when effective
-    /// per-namespace TLS serving slots on one socket resolve to different
-    /// credentials.
+    /// `ProtocolConflict` when the port is claimed by incompatible physical
+    /// shapes (HTTP-family vs raw TCP/TLS stream on one TCP transport, or
+    /// plaintext vs an effective TLS-serving HTTP-family slot),
+    /// `HostnameConflict` when effective per-namespace TLS serving slots on
+    /// one socket resolve to different credentials or a same-protocol
+    /// hostname loses ListenerSet/Gateway precedence.
     pub reason: &'static str,
     pub message: String,
 }
@@ -431,6 +461,31 @@ pub struct GatewayApiBackendTlsPolicyStatus {
     pub resolved_refs: bool,
     pub resolved_refs_reason: String,
     pub resolved_refs_message: String,
+}
+
+/// Translation/attachment outcome for one Gateway API `ListenerSet`.
+///
+/// A ListenerSet counts toward Gateway `status.attachedListenerSets` only when
+/// `attached` is true (valid parentRef, selected by `allowedListeners`, and
+/// `Accepted=True`). Status conditions must never claim Accepted/Programmed for
+/// listeners Ferrum did not materialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiListenerSetStatus {
+    pub resource: K8sResourceKey,
+    pub parent_gateway: Option<(String, String)>,
+    pub attached: bool,
+    pub accepted: bool,
+    pub accepted_reason: String,
+    pub accepted_message: String,
+    pub programmed: bool,
+    pub programmed_reason: String,
+    pub programmed_message: String,
+    /// Listener names for which translation emitted the ListenerSet-owned mesh
+    /// service. Typed forward evidence keeps Programmed correlated to exact
+    /// listeners even when operators inspect synthetic service names.
+    pub programmed_listeners: Vec<String>,
+    /// Listener name → conflict reason (`HostnameConflict` / `ProtocolConflict`).
+    pub listener_conflicts: Vec<(String, String)>,
 }
 
 /// Ceiling on the per-Service port metadata retained for BackendTLSPolicy.
@@ -667,6 +722,66 @@ impl K8sServiceKey {
     }
 }
 
+/// Parent resource kind that owns a Gateway API listener entry.
+///
+/// Gateway listeners are authored on `Gateway.spec.listeners`. ListenerSet
+/// listeners attach through `ListenerSet.spec.parentRef` and are keyed by the
+/// ListenerSet identity so routes can parentRef the ListenerSet directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum GatewayApiListenerParentKind {
+    #[default]
+    Gateway,
+    ListenerSet,
+}
+
+impl GatewayApiListenerParentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "Gateway",
+            Self::ListenerSet => "ListenerSet",
+        }
+    }
+
+    /// Kind-scoped prefix for synthetic listener `MeshService` names.
+    ///
+    /// Distinct from [`Self::as_str`]: mesh consumers key services by
+    /// `(namespace, name)` and must never alias a Gateway-derived service with a
+    /// ListenerSet-derived one.
+    pub fn mesh_service_kind_prefix(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::ListenerSet => "listenerset",
+        }
+    }
+}
+
+/// Synthetic `MeshService.name` for one Gateway- or ListenerSet-derived listener.
+///
+/// Format: `{kind}-{parent_byte_len}-{parent_name}-{listener_name}` where `kind`
+/// is `gateway` or `listenerset` and `parent_byte_len` is the UTF-8 byte length
+/// of `parent_name` in decimal with no leading zeros (except `0` for empty).
+///
+/// Downstream mesh consumers key services by `(namespace, name)`. A plain
+/// hyphen join of parent and listener is ambiguous: Gateway `a-b` + listener
+/// `c` and Gateway `a` + listener `b-c` both yield `gateway-a-b-c`, so one
+/// entry can overwrite the other while exact listener provenance still marks
+/// both Programmed. Length-prefixing the parent makes `(parent, listener)`
+/// injective within each kind without truncating and without assuming a
+/// DNS-label ceiling — `MeshService.name` validation only requires a non-empty
+/// string. Kind prefixes keep the two resource kinds disjoint even when their
+/// resource names collide.
+pub fn gateway_api_listener_mesh_service_name(
+    kind: GatewayApiListenerParentKind,
+    parent_name: &str,
+    listener_name: &str,
+) -> String {
+    format!(
+        "{}-{}-{parent_name}-{listener_name}",
+        kind.mesh_service_kind_prefix(),
+        parent_name.len()
+    )
+}
+
 /// Stable identity of one Gateway API listener.
 ///
 /// This is the arbitration/materialization domain for HTTP-family routes: a
@@ -674,17 +789,27 @@ impl K8sServiceKey {
 /// several listeners of one Gateway (and listeners of different Gateways) to
 /// share a port while being distinguished by `hostname` and protocol. Keying
 /// anything listener-specific by port alone lets a sibling listener suppress or
-/// TLS-taint an unrelated claim.
+/// TLS-taint an unrelated claim. The parent kind is part of the identity so a
+/// Gateway and ListenerSet with the same namespace/name cannot collide.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GatewayApiListenerKey {
     pub namespace: String,
+    pub parent_kind: GatewayApiListenerParentKind,
+    /// Parent resource name (`Gateway` or `ListenerSet`).
     pub gateway: String,
     pub listener: String,
 }
 
 impl std::fmt::Display for GatewayApiListenerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}#{}", self.namespace, self.gateway, self.listener)
+        write!(
+            f,
+            "{}/{}/{}#{}",
+            self.parent_kind.as_str(),
+            self.namespace,
+            self.gateway,
+            self.listener
+        )
     }
 }
 
@@ -737,24 +862,28 @@ pub(crate) enum GatewayApiNamespaceSelectorOperator {
 pub(crate) struct GatewayApiListenerPolicy {
     pub namespaces: GatewayApiAllowedRoutesNamespaces,
     pub validation_error: Option<GatewayApiListenerValidationError>,
+    /// The listener's bounded shape is valid and its protocol/mode is supported,
+    /// independently of whether certificate references currently resolve.
+    pub spec_accepted: bool,
     pub hostname: Option<String>,
     pub port: Option<u64>,
+    /// Upper-cased `spec.listeners[].protocol` (`HTTP`, `HTTPS`, `TLS`, …).
+    pub protocol: String,
     pub route_kinds: HashSet<String>,
     pub materializable: bool,
     pub routes_materializable: bool,
     pub requires_frontend_tls: bool,
-    /// Upper-cased `spec.listeners[].protocol` (`HTTP`, `HTTPS`, `TLS`, …).
-    /// Only the HTTP family participates in HTTP-route materialization and in
-    /// same-port frontend-shape admission.
-    pub protocol: String,
-    /// Resolved `(cert_path, key_path)` this listener would terminate with.
-    /// `None` for plaintext listeners and for TLS listeners whose
-    /// `certificateRefs` did not resolve to exactly one usable credential.
-    ///
-    /// Same-port physical conflicts compare the *effective* per-namespace
-    /// serving credential from the shared TLS-slot plan, not every raw
-    /// value collected here — a non-winning same-namespace sibling must not
-    /// manufacture a cross-namespace `HostnameConflict`.
+    /// Set when this listener lost ListenerSet precedence or was refused for a
+    /// physical port/protocol/hostname conflict (`HostnameConflict` /
+    /// `ProtocolConflict`). Conflicted listeners must not materialize traffic.
+    pub conflict_reason: Option<&'static str>,
+    /// For `ListenerSet` listeners: the managed Gateway `(namespace, name)`
+    /// this entry attaches to after `allowedListeners` + parentRef checks.
+    pub parent_gateway: Option<(String, String)>,
+    /// First resolved `(cert_path, key_path)` for compatibility metadata.
+    /// The authoritative listener-owned set lives in
+    /// `gateway_api_frontend_tls_listeners`; this projection never limits a
+    /// multi-certificate listener or selects the runtime SNI candidates.
     pub frontend_tls_source: Option<(String, String)>,
 }
 
@@ -834,12 +963,20 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Terminating-TLS listeners whose `certificateRefs` all resolved, awaiting
+    /// snapshot-wide finalization in `finish()`. Collision winners, the default
+    /// certificate, and the snapshot cap are decided over the whole set so the
+    /// result never depends on informer/list order (#3267 / #3268).
+    pub(crate) gateway_api_frontend_tls_listeners: Vec<gateway_api::PendingFrontendTlsListener>,
     /// Listeners refused by physical same-port shape arbitration, with the
     /// operator-facing reason. Projected onto `Gateway.status.listeners[]` as
     /// `Conflicted=True` / `Programmed=False` so status can never claim a
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Post-admission explicit-SNI collision losers and their winners.
+    pub(crate) gateway_api_frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
     /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
     /// key membership; the bool is ownership only — interoperable waypoint
@@ -853,10 +990,14 @@ pub(crate) struct K8sAccumulator {
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
     gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
+    gateway_api_materialized_gateway_listeners: HashSet<GatewayApiListenerKey>,
     /// Gateway API `BackendTLSPolicy` index keyed by target Service identity.
     backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
     /// Per-policy status projections recorded as policies are collected.
     backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+    /// Per-ListenerSet attachment verdicts recorded while collecting ListenerSet
+    /// listener policies (and after conflict resolution).
+    listenerset_statuses: Vec<GatewayApiListenerSetStatus>,
     /// Effective session persistence from `BackendLBPolicy` /
     /// `XBackendTrafficPolicy`, keyed by `(namespace, service_name)`.
     /// Oldest creationTimestamp (then full resource identity) wins when
@@ -902,13 +1043,17 @@ impl K8sAccumulator {
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
+            gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
+            gateway_api_materialized_gateway_listeners: HashSet::new(),
             backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
             backend_tls_policy_statuses: Vec::new(),
+            listenerset_statuses: Vec::new(),
             gateway_api_backend_session_policies: HashMap::new(),
             gateway_api_backend_session_policy_targets: HashMap::new(),
         }
@@ -1374,6 +1519,9 @@ impl K8sAccumulator {
             !gateway_api::dispatch_rule_internal_metadata_present(&self.config.plugin_configs),
             "internal Gateway API dispatch precedence metadata must be stripped before translation output"
         );
+        // ListenerSet Programmed evidence is recorded at the same point its
+        // kind-scoped mesh service is emitted. Normalize only after all
+        // translation-time ownership evidence is final.
         self.mesh.normalize();
         // Sort single-winner / additive mesh resources by (namespace, name) for
         // deterministic slice order. `peer_authentications` is sorted alongside
@@ -1426,8 +1574,11 @@ impl K8sAccumulator {
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
             materialized_route_parents: self.gateway_api_materialized_route_parents,
+            materialized_gateway_listeners: self.gateway_api_materialized_gateway_listeners,
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
+            listenerset_statuses: self.listenerset_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,
+            frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
         }
     }
@@ -1509,10 +1660,15 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
             let _ = gateway_api::collect_gateway_listener_policy(acc, object);
         }
     }
+    let included: Vec<&K8sObject> = objects.iter().collect();
+    let _ = listenerset::collect_listenersets_from_snapshot(acc, &included);
     // Keep status-context listener admission identical to the translation
-    // pass (shared namespace TLS-slot plan + same-port physical refusal), or a
+    // pass (ListenerSet precedence + same-port physical refusal), or a
     // route's status would arbitrate against a listener the data plane refused.
     gateway_api::refuse_incompatible_same_port_listeners(acc);
+    // Certificate ownership is decided only after every listener admission
+    // gate above has become authoritative.
+    gateway_api::finalize_frontend_tls_certificates(acc);
 }
 
 /// Build the Gateway API status-context accumulator once per reconcile/plan.
@@ -1642,12 +1798,18 @@ where
             }
         }
     }
-
-    // Every listener policy is now known, so the shared namespace TLS-slot plan
-    // and same-port physical compatibility can be decided before any route
-    // arbitrates or materializes against a listener that could never have been
-    // bound or that cannot occupy its namespace serving credential.
+    // ListenerSets attach after Gateway listener policies exist so conflict
+    // resolution can prefer parent Gateway listeners.
+    listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects)?;
+    // Every listener policy is now known, so same-port physical compatibility
+    // can be decided before any route arbitrates or materializes against a
+    // listener that could never have been bound.
     gateway_api::refuse_incompatible_same_port_listeners(&mut acc);
+    // Resolve frontend TLS over the WHOLE admitted listener snapshot before
+    // any route is translated. Hostname collisions and the resident-source
+    // cap withdraw listener traffic atomically and cannot depend on object
+    // iteration order.
+    gateway_api::finalize_frontend_tls_certificates(&mut acc);
 
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));

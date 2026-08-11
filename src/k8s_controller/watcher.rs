@@ -217,6 +217,16 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "backendtlspolicies",
         namespaced: true,
     },
+    // ListenerSet (Gateway API v1.5+): optional additional listeners attached to
+    // a managed Gateway that opts in via spec.allowedListeners. Discovery skips
+    // cleanly when the CRD is absent.
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1",
+        kind: "ListenerSet",
+        plural: "listenersets",
+        namespaced: true,
+    },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1alpha3",
@@ -1735,6 +1745,13 @@ mod tests {
             resource.kind == "XBackendTrafficPolicy"
                 && resource.group == "gateway.networking.x-k8s.io"
                 && resource.version == "v1alpha1"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "ListenerSet"
+                && resource.group == "gateway.networking.k8s.io"
+                && resource.version == "v1"
+                && resource.plural == "listenersets"
                 && resource.namespaced
         }));
         assert!(GATEWAY_API_CRDS.iter().any(|resource| {
