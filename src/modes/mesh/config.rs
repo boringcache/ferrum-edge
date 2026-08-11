@@ -244,6 +244,17 @@ pub struct MeshService {
     /// materialization, the captured connection fails as before).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cluster_ips: Vec<String>,
+    /// Kubernetes Service `metadata.uid` when translated from a cluster
+    /// object. Isolates H1 pending-admission lanes across delete/recreate of
+    /// the same `(namespace, name)` (issue #3778). Absent for native/file
+    /// sources and for payloads that omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Kubernetes Service `metadata.generation` when available. A generation
+    /// bump opens a fresh admission lane while old guards drain the prior
+    /// counter; absent when the translator/source did not stamp one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -3088,11 +3099,13 @@ pub struct MeshConnectionPoolHttp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
     /// Mapped from `http1MaxPendingRequests`. Honestly reinterpreted as the
-    /// maximum concurrent in-flight requests for a backend destination on the
-    /// HTTP/1.1 dispatch path. Projects onto the inherited/per-port dispatch
-    /// policy and is enforced per `(host, policy port, selected subset)`: when
-    /// full a new H1 request is shed with a 503 ("upstream overflow" in Envoy
-    /// terms).
+    /// maximum concurrent in-flight requests for a logical backend destination
+    /// on the HTTP/1.1 dispatch path. Projects onto the inherited/per-port
+    /// dispatch policy and is enforced per
+    /// `(namespace, upstream/Service identity, policy port, selected subset)`
+    /// (issue #3778): when full a new H1 request is shed with a 503 ("upstream
+    /// overflow" in Envoy terms). The selected endpoint host is not part of
+    /// the key.
     /// HTTP/1.1-scoped: it does NOT gate
     /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
     /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
@@ -5258,8 +5271,9 @@ fn validate_mesh_config_internal(
             );
         }
         // `http1MaxPendingRequests` is honestly reinterpreted by the limiter as
-        // a per-`(host, policy port, selected subset)` concurrent in-flight H1
-        // gate, where `Some(0)` would shed every request.
+        // a per-logical-destination `(namespace, upstream/Service identity,
+        // policy port, selected subset)` concurrent in-flight H1 gate, where
+        // `Some(0)` would shed every request.
         // Native/file/xDS slices bypass K8s translation, so apply the same
         // field-specific validation here. (`maxRetries: 0` is valid and
         // disables an existing retry policy for the destination.)

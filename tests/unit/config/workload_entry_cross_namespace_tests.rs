@@ -612,6 +612,8 @@ fn mesh_validation_rejects_spoofed_cross_namespace_service_namespace() {
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
+        generation: None,
     };
 
     let errors = validate_mesh_config(&[workload], &[service], &[], &[], &[], &[], None);
@@ -657,6 +659,8 @@ fn mesh_validation_accepts_authorized_cross_namespace_service_namespace() {
         workloads: vec![WorkloadRef { spiffe_id: spiffe }],
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
+        generation: None,
     };
 
     let errors = validate_mesh_config(&[workload], &[service], &[], &[], &[], &[], None);

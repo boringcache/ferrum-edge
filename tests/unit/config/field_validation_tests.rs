@@ -81,6 +81,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -133,6 +134,8 @@ fn make_upstream(id: &str) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     }
 }
 
@@ -2631,7 +2634,7 @@ fn test_validate_backend_ip_policy_public_denies_private_proxy() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "10.0.0.1".to_string(),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2653,7 +2656,7 @@ fn test_validate_backend_ip_policy_public_allows_public_proxy() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "8.8.8.8".to_string(),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2674,7 +2677,7 @@ fn test_validate_backend_ip_policy_public_denies_private_dns_override() {
         proxies: vec![Proxy {
             backend_host: "example.com".to_string(),
             dns_override: Some("169.254.169.254".to_string()),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2697,7 +2700,7 @@ fn test_validate_backend_ip_policy_public_allows_public_dns_override() {
         proxies: vec![Proxy {
             backend_host: "example.com".to_string(),
             dns_override: Some("8.8.8.8".to_string()),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2717,7 +2720,7 @@ fn test_validate_backend_ip_policy_private_denies_public_proxy() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "8.8.8.8".to_string(),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2734,7 +2737,7 @@ fn test_validate_backend_ip_policy_both_allows_everything() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "169.254.169.254".to_string(),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2756,7 +2759,7 @@ fn test_validate_backend_ip_policy_default_blocks_metadata_backend_host() {
     let metadata_cfg = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "169.254.169.254".to_string(),
-            ..make_proxy("meta", "/api")
+            ..make_proxy("meta", "/api"),
         }],
         ..Default::default()
     };
@@ -2773,11 +2776,11 @@ fn test_validate_backend_ip_policy_default_blocks_metadata_backend_host() {
         proxies: vec![
             Proxy {
                 backend_host: "127.0.0.1".to_string(),
-                ..make_proxy("loop", "/lo")
+                ..make_proxy("loop", "/lo"),
             },
             Proxy {
                 backend_host: "10.0.0.5".to_string(),
-                ..make_proxy("rfc1918", "/internal")
+                ..make_proxy("rfc1918", "/internal"),
             },
         ],
         ..Default::default()
@@ -2798,7 +2801,7 @@ fn test_proxy_validate_backend_egress_ips_helper() {
 
     let metadata = Proxy {
         backend_host: "169.254.169.254".to_string(),
-        ..make_proxy("m", "/a")
+        ..make_proxy("m", "/a"),
     };
     let errs = metadata
         .validate_backend_egress_ips(&default_policy)
@@ -2810,7 +2813,7 @@ fn test_proxy_validate_backend_egress_ips_helper() {
     let rebind = Proxy {
         backend_host: "example.com".to_string(),
         dns_override: Some("fd00:ec2::254".to_string()),
-        ..make_proxy("r", "/b")
+        ..make_proxy("r", "/b"),
     };
     assert!(
         rebind
@@ -2823,7 +2826,7 @@ fn test_proxy_validate_backend_egress_ips_helper() {
     // Loopback / RFC1918 backends still validate.
     let ok = Proxy {
         backend_host: "127.0.0.1".to_string(),
-        ..make_proxy("ok", "/c")
+        ..make_proxy("ok", "/c"),
     };
     assert!(ok.validate_backend_egress_ips(&default_policy).is_ok());
 }
@@ -2835,7 +2838,7 @@ fn test_validate_backend_ip_policy_hostname_skipped() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "internal.evil.com".to_string(),
-            ..proxy
+            ..proxy,
         }],
         ..Default::default()
     };
@@ -2886,6 +2889,8 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     };
     let config = GatewayConfig {
         upstreams: vec![upstream],

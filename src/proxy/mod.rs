@@ -6122,14 +6122,17 @@ pub struct ProxyState {
     pub reqwest_conn_admission: Arc<crate::backend_conn_limit::ReqwestConnectionAdmission>,
     /// Per-destination in-flight-request limiter enforcing DestinationRule
     /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
-    /// backend-dispatch path. Bounds how many requests can be simultaneously
-    /// in flight for a `(host, policy port, selected subset)`; an over-cap
-    /// request is shed with a 503 ("upstream overflow") before backend dispatch
-    /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
-    /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
-    /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
-    /// concurrency is governed by `h2_max_concurrent_streams`. See
-    /// `docs/mesh.md` and `src/backend_pending_limit.rs`.
+    /// backend-dispatch path (and H3→plain bridge). Bounds how many requests
+    /// can be simultaneously in flight for a logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)`;
+    /// an over-cap request is shed with a 503 ("upstream overflow") before
+    /// backend dispatch via an RAII
+    /// [`crate::backend_pending_limit::BackendPendingGuard`] held only until
+    /// dispatch returns. HTTP/1.1-scoped: the multiplexed transports (direct
+    /// H2, gRPC, native H3, HBONE, mesh-mTLS) do NOT consume it — their
+    /// concurrency is governed by `h2_max_concurrent_streams` (distinct from
+    /// #3775's future active-request breaker). See `docs/mesh.md` and
+    /// `src/backend_pending_limit.rs`.
     pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
 }
 
@@ -34774,7 +34777,8 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// This is the ONE derivation every frontend must use for the
 /// `http1MaxPendingRequests` gate — both the per-port cap lookup
 /// ([`resolve_backend_http1_max_pending_requests`]) and the
-/// `BackendPendingLimiter::try_acquire_for_subset` lane key. Keying the lane by
+/// [`BackendPendingLimiter::try_acquire`] lane key (via
+/// [`pending_limit_scope_for_proxy`] + policy port). Keying the lane by
 /// the DIAL port instead would split one destination's admission across two
 /// lanes when the H1/H2 and HTTP/3 frontends both serve a `targetPort`-remapped
 /// upstream (combined in-flight would reach `2N` for a cap of `N`), and would
@@ -34787,6 +34791,32 @@ pub(crate) fn dispatch_policy_port_for_target(
     upstream_target
         .map(UpstreamTarget::dispatch_policy_port)
         .unwrap_or(proxy.backend_port)
+}
+
+/// Resolve the precomputed logical H1 pending-admission scope for a proxy
+/// (issue #3778). Config publication interns it onto
+/// `Proxy.pending_limit_scope`. Incomplete test fixtures that skipped
+/// `resolve_pending_limit_scopes` get an on-demand build (still keyed by
+/// namespace / upstream_id / subset — never by selected host).
+pub(crate) fn pending_limit_scope_for_proxy(
+    proxy: &Proxy,
+) -> std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase> {
+    if let Some(scope) = proxy.pending_limit_scope.clone() {
+        return scope;
+    }
+    let logical_id = proxy
+        .upstream_id
+        .as_deref()
+        .unwrap_or(proxy.id.as_str());
+    std::sync::Arc::new(
+        crate::backend_pending_limit::BackendPendingScopeBase::new(
+            proxy.namespace.as_str(),
+            logical_id,
+            None,
+            None,
+            proxy.upstream_subset.as_deref(),
+        ),
+    )
 }
 
 /// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`
@@ -35310,8 +35340,7 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
-    // same per-`(host, policy port, selected subset)` in-flight gate as the
-    // initial attempt
+    // same per-logical-destination in-flight gate as the initial attempt
     // (`proxy_to_backend`). The initial attempt's slot was already released
     // before the retry loop ran (it drops the moment that attempt's `send()`
     // returns), so a retry no longer overlaps it — without acquiring here, a
@@ -35328,10 +35357,10 @@ pub(crate) async fn proxy_to_backend_retry(
     let retry_policy_port = dispatch_policy_port_for_target(proxy, upstream_target);
     let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_policy_port)
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let retry_pending_slot = match state.backend_pending_limit.try_acquire_for_subset(
-        effective_host,
+    let retry_pending_scope = pending_limit_scope_for_proxy(proxy);
+    let retry_pending_slot = match state.backend_pending_limit.try_acquire(
+        retry_pending_scope.as_ref(),
         retry_policy_port,
-        proxy.upstream_subset.as_deref(),
         retry_pending_cap,
     ) {
         Ok(slot) => slot,
@@ -35340,6 +35369,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = retry_dial_port,
+                pending_scope_digest = retry_pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
                 "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
@@ -38017,7 +38047,7 @@ async fn proxy_to_backend(
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
-    // number of concurrent in-flight HTTP/1.1 requests to this backend
+    // number of concurrent in-flight HTTP/1.1 requests to this logical backend
     // destination on the reqwest/HTTP-1.1 dispatch path (in-flight
     // reinterpretation — see the detailed note below and `docs/mesh.md`). The
     // slot is acquired here, AFTER local 413 / plugin rejections and
@@ -38048,16 +38078,20 @@ async fn proxy_to_backend(
     // connection-wait + upload + backend-TTFB. We therefore CANNOT implement
     // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
     // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
-    // reframed as a **max concurrent in-flight HTTP/1.1 requests per
-    // `(host, DestinationRule policy port, selected subset)`** cap (measured
-    // dispatch → response-headers), shedding excess with a 503 ("upstream
-    // overflow"). Under that framing a streamed
-    // upload IS legitimately in-flight, so there is NO body-shape exclusion —
-    // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
-    // too, which is the most common H1 traffic. The connection-failure retry
-    // path (`proxy_to_backend_retry`) re-enters this same gate per attempt (see
-    // its own acquire); the initial slot is already released before the retry
-    // loop runs, so an attempt and its retry never double-count.
+    // reframed as a **max concurrent in-flight HTTP/1.1 requests per logical
+    // destination `(namespace, upstream/Service identity, DestinationRule
+    // policy port, selected subset)`** cap (measured dispatch →
+    // response-headers), shedding excess with a 503 ("upstream overflow"). The
+    // selected endpoint host is intentionally absent from the key (issue #3778)
+    // so endpoint fan-out / DNS rotation cannot multiply the cap, and
+    // independent Services sharing pods remain isolated. Under that framing a
+    // streamed upload IS legitimately in-flight, so there is NO body-shape
+    // exclusion — bodyless GET/HEAD/OPTIONS (where `stream_request_body` is
+    // true) are capped too, which is the most common H1 traffic. The
+    // connection-failure retry path (`proxy_to_backend_retry`) re-enters this
+    // same gate per attempt (see its own acquire); the initial slot is already
+    // released before the retry loop runs, so an attempt and its retry never
+    // double-count.
     let pending_dial_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
@@ -38066,10 +38100,10 @@ async fn proxy_to_backend(
         // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
         // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
-    let pending_slot = match state.backend_pending_limit.try_acquire_for_subset(
-        effective_host,
+    let pending_scope = pending_limit_scope_for_proxy(proxy);
+    let pending_slot = match state.backend_pending_limit.try_acquire(
+        pending_scope.as_ref(),
         pending_policy_port,
-        proxy.upstream_subset.as_deref(),
         pending_cap,
     ) {
         Ok(slot) => slot,
@@ -38078,6 +38112,7 @@ async fn proxy_to_backend(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
                 backend_port = pending_dial_port,
+                pending_scope_digest = pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
                 "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
@@ -45907,6 +45942,8 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
+            generation: None,
         };
         let wl = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -46047,6 +46084,8 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
+            uid: None,
+            generation: None,
         };
         let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         // Same-namespace as the owning Service; see the TCP by-workload case.
@@ -50215,6 +50254,8 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.10".to_string()],
+                uid: None,
+                generation: None,
             }],
             ..MeshConfig::default()
         };
@@ -50285,6 +50326,8 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.20".to_string()],
+                uid: None,
+                generation: None,
             }],
             ..MeshConfig::default()
         };
@@ -50367,6 +50410,8 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
+            generation: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -50893,6 +50938,8 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             cluster_ips: vec![cluster_ip.to_string()],
+            uid: None,
+            generation: None,
         };
         let mesh = MeshConfig {
             services: vec![
@@ -56726,6 +56773,8 @@ mod tests {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         };
         upstream.port_overrides.insert(
             8080,
@@ -56784,6 +56833,8 @@ mod tests {
                 api_spec_id: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                k8s_service_uid: None,
+                k8s_service_generation: None,
             }],
             ..GatewayConfig::default()
         };
@@ -57402,6 +57453,8 @@ mod tests {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         };
         // The fallback projects even when the per-port map is empty (the SD case).
         assert!(upstream.port_overrides.is_empty());
@@ -57479,6 +57532,8 @@ mod tests {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         };
         upstream.normalize_fields();
 

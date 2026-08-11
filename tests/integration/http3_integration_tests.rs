@@ -120,6 +120,7 @@ fn create_http3_test_proxy() -> Proxy {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -883,6 +884,7 @@ async fn test_http3_streaming_decision_logic() {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
 
     // --- Case 2: Proxy with retry configured → should buffer ---
@@ -898,7 +900,7 @@ async fn test_http3_streaming_decision_logic() {
             retryable_methods: vec!["GET".to_string()],
             backoff: ferrum_edge::config::types::BackoffStrategy::Fixed { delay_ms: 100 },
         }),
-        ..proxy_stream.clone()
+        ..proxy_stream.clone(),
     };
 
     // --- Case 3: Proxy with ai_token_metrics plugin → should buffer responses ---
@@ -911,7 +913,7 @@ async fn test_http3_streaming_decision_logic() {
         plugins: vec![PluginAssociation {
             plugin_config_id: "ai-token-metrics-cfg".to_string(),
         }],
-        ..proxy_stream.clone()
+        ..proxy_stream.clone(),
     };
 
     let gc = GatewayConfig {
@@ -1503,6 +1505,8 @@ fn create_sticky_cookie_upstream() -> ferrum_edge::config::types::Upstream {
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     }
 }
 

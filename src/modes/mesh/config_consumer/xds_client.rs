@@ -1372,6 +1372,8 @@ fn reverse_translate(
                 // spec, so VIPs are unknown; the Ferrum Services carrier
                 // (preferred branch above) round-trips them via serde.
                 cluster_ips: Vec::new(),
+                uid: None,
+                generation: None,
             })
             .collect()
     };
@@ -4371,6 +4373,8 @@ mod tests {
                 ],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
+                generation: None,
             }],
             ..MeshSlice::default()
         };
@@ -5136,6 +5140,8 @@ mod tests {
                 spiffe_id: workload.spiffe_id.clone(),
             }],
             protocol_overrides: HashMap::new(),
+            uid: None,
+            generation: None,
         };
         MeshSlice {
             node_id: "node-a".to_string(),

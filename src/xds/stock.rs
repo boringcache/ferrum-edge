@@ -2084,6 +2084,8 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             workloads: workload_refs,
             protocol_overrides: HashMap::new(),
             cluster_ips,
+            uid: None,
+            generation: None,
         });
     }
 

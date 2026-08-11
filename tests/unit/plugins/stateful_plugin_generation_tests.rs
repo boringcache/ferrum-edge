@@ -155,7 +155,8 @@ fn stream_ctx(proxy_id: &str, ip: &str) -> StreamConnectionContext {
         ip.to_string(),
         ip.to_string(),
         proxy_id.to_string(),
-        Some(format!("TCP Proxy {proxy_id}")),
+        Some(format!("TCP Proxy {proxy_id
+}")),
         15432,
         BackendScheme::Tcp,
         Arc::new(ferrum_edge::ConsumerIndex::new(&[])),

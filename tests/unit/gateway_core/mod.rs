@@ -3,6 +3,7 @@ mod allowed_methods_logging_tests;
 mod backend_capability_commit_tests;
 mod backend_capability_probe_merge_tests;
 mod backend_dispatch_tests;
+mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;
 mod cached_synthetic_bytes_share_tests;
 mod cidr_tests;

@@ -282,6 +282,8 @@ fn service(name: &str, namespace: &str) -> MeshService {
         }],
         workloads: Vec::new(),
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
+        generation: None,
     }
 }
 
@@ -310,7 +312,9 @@ fn service_with_protocol_overrides(overrides: Vec<(u16, AppProtocol)>) -> MeshSe
     ports.sort_by_key(|port| port.port);
     service.ports = ports;
     service.protocol_overrides = overrides.into_iter().collect();
-    service
+    service,
+    uid: None,
+    generation: None,
 }
 
 #[test]

@@ -175,6 +175,8 @@ pub fn service_for(name: &str, namespace: &str, workloads: &[&Workload]) -> Mesh
             })
             .collect(),
         protocol_overrides: HashMap::new(),
+        uid: None,
+        generation: None,
     }
 }
 
@@ -394,6 +396,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
         allowed_ws_origins: vec![],
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -435,6 +438,8 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     }
 }
 

@@ -711,8 +711,9 @@ pub struct UpstreamPortOverride {
     /// cannot get an in-flight slot is shed with a 503 ("upstream overflow")
     /// before backend dispatch, rather than queued unboundedly. Projected onto
     /// the per-target effective proxy's `pool_http1_max_pending_requests`. The
-    /// cap is keyed per resolved `(host, policy port, selected subset name)`
-    /// lane, without logical upstream/Service identity.
+    /// cap is keyed per logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)` —
+    /// not per selected endpoint host (issue #3778).
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
     /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
@@ -1767,6 +1768,17 @@ pub struct Upstream {
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
+    /// Kubernetes Service `metadata.uid` stamped from the owning
+    /// [`crate::modes::mesh::config::MeshService`] when materializing mesh
+    /// egress upstreams. Participates in the H1 pending-admission scope so a
+    /// delete/recreate of the same Service name cannot inherit a stale lane
+    /// (issue #3778). Absent for non-mesh / native upstreams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s_service_uid: Option<String>,
+    /// Kubernetes Service `metadata.generation` when available. A generation
+    /// bump opens a fresh pending-admission lane while old guards drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s_service_generation: Option<i64>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2490,7 +2502,8 @@ pub struct Proxy {
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
     /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
-    /// that cannot get a slot for its `(host, policy port, selected subset)`
+    /// that cannot get a slot for its logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)`
     /// lane is shed with a 503 ("upstream overflow") before backend dispatch.
     /// Does NOT gate direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
     ///
@@ -2504,6 +2517,14 @@ pub struct Proxy {
     /// dropped on reload. The DB loaders therefore always start it at `None`.
     #[serde(skip)]
     pub pool_http1_max_pending_requests: Option<u32>,
+    /// Precomputed logical H1 pending-admission scope identity (issue #3778).
+    /// Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so the reqwest/H1 (and
+    /// H3→plain bridge) hot path never reconstructs namespace / upstream /
+    /// subset strings. The DestinationRule policy port is appended at acquire
+    /// time. `#[serde(skip)]` — derived only.
+    #[serde(skip)]
+    pub pending_limit_scope: Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
@@ -3808,6 +3829,10 @@ impl GatewayConfig {
         // the non-mesh common case (all `Upstream.port_overrides` empty →
         // every proxy gets `None`).
         self.resolve_dispatch_port_overrides();
+        // Intern logical H1 pending-admission scope identities (issue #3778)
+        // so reqwest/H1 + H3→plain acquire never reconstructs namespace /
+        // upstream / subset strings on the hot path.
+        self.resolve_pending_limit_scopes();
     }
 
     /// Resolve each proxy's `dispatch_kind` from `backend_scheme`, applying
@@ -3946,6 +3971,49 @@ impl GatewayConfig {
                     )
                 })
             });
+        }
+    }
+
+    /// Intern each proxy's logical H1 pending-admission scope (issue #3778).
+    ///
+    /// Built from `(namespace, upstream/Service identity including K8s UID /
+    /// generation when stamped, selected subset)`. The DestinationRule policy
+    /// port is appended at acquire time. Must run after upstreams/proxies are
+    /// settled (including mesh materialization that stamps
+    /// `Upstream.k8s_service_uid`). Invoked from `normalize_fields` beside
+    /// `resolve_dispatch_port_overrides`.
+    pub fn resolve_pending_limit_scopes(&mut self) {
+        let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
+            .upstreams
+            .iter()
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+            .collect();
+
+        for proxy in &mut self.proxies {
+            let (logical_id, uid, generation) = if let Some(ref upstream_id) = proxy.upstream_id {
+                match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
+                    Some(upstream) => (
+                        upstream.id.as_str(),
+                        upstream.k8s_service_uid.as_deref(),
+                        upstream.k8s_service_generation,
+                    ),
+                    None => (upstream_id.as_str(), None, None),
+                }
+            } else {
+                // Direct-backend proxy: the proxy itself is the logical
+                // destination. Distinct proxies do not share a lane unless
+                // they intentionally share an upstream_id.
+                (proxy.id.as_str(), None, None)
+            };
+            proxy.pending_limit_scope = Some(std::sync::Arc::new(
+                crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    proxy.namespace.as_str(),
+                    logical_id,
+                    uid,
+                    generation,
+                    proxy.upstream_subset.as_deref(),
+                ),
+            ));
         }
     }
 

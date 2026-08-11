@@ -418,6 +418,8 @@ fn service_in_namespace(
             })
             .collect(),
         protocol_overrides: HashMap::new(),
+        uid: None,
+        generation: None,
     }
 }
 

@@ -185,8 +185,8 @@ fn seeded_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    }
-}
+        pending_limit_scope: None,
+    },
 
 // ============================================================================
 // Test 1: Failover URLs at startup

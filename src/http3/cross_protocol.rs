@@ -1424,9 +1424,12 @@ where
     // never the dial port — same identity `proxy_to_backend` /
     // `proxy_to_backend_retry` derive via `dispatch_policy_port_for_target`. A
     // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3 bridge
-    // its own `host|8080|subset` lane while H1/H2 counts in `host|80|subset`,
+    // its own policy-port-keyed lane while H1/H2 counts on a different port,
     // so a cap of N admits 2N combined, and an explicit
     // `portLevelSettings[{port: 80}]` cap would be invisible here.
+    //
+    // The lane itself is the precomputed logical destination scope (issue
+    // #3778), not the selected endpoint host — matching the H1/H2 path.
     let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
         dispatch_proxy,
         dispatch_policy_port,
@@ -1434,10 +1437,10 @@ where
     .filter(|_| {
         crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
     });
-    match state.backend_pending_limit.try_acquire_for_subset(
-        effective_host,
+    let pending_scope = crate::proxy::pending_limit_scope_for_proxy(dispatch_proxy);
+    match state.backend_pending_limit.try_acquire(
+        pending_scope.as_ref(),
         dispatch_policy_port,
-        dispatch_proxy.upstream_subset.as_deref(),
         pending_cap,
     ) {
         Ok(pending_slot) => Ok(Ok(PlainAttemptDispatch {
@@ -1449,6 +1452,7 @@ where
                 proxy_id = %dispatch_proxy.id,
                 backend_host = %effective_host,
                 backend_port = dispatch_dial_port,
+                pending_scope_digest = pending_scope.digest(),
                 in_flight_requests = limit.current,
                 max_in_flight_requests = limit.cap,
                 "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"

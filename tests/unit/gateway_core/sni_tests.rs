@@ -222,8 +222,8 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-    }
-}
+        pending_limit_scope: None,
+    },
 
 // ── TLS SNI extraction ───────────────────────────────────────────────────────
 

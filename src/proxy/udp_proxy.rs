@@ -956,7 +956,8 @@ fn resolve_udp_session_epoch_view(
     let base_proxy = epoch
         .proxy_by_namespaced_id(listener_proxy_namespace, listener_proxy_id)
         .ok_or_else(|| {
-            anyhow::anyhow!("Proxy {listener_proxy_namespace}/{listener_proxy_id} not found")
+            anyhow::anyhow!("Proxy {listener_proxy_namespace
+}/{listener_proxy_id} not found")
         })?;
 
     let sni_hostname = if base_proxy.passthrough {
@@ -997,7 +998,8 @@ fn resolve_udp_session_epoch_view(
 
     let proxy = epoch
         .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
+        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace
+}/{resolved_proxy_id} not found"))?
         .clone();
     let plugins =
         epoch
@@ -3647,7 +3649,8 @@ async fn handle_dtls_client_inner(
     // Look up proxy config
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace
+}/{proxy_id} not found"))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 

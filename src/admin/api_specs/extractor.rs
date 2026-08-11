@@ -553,7 +553,7 @@ pub fn extract_with_external_refs(
                 return Err(ExtractError::PluginInvalidScope {
                     plugin_id: pc.id,
                     scope: scope_str,
-                });
+                });,
             }
 
             // proxy_id must be absent or match the spec's proxy id.

@@ -75,6 +75,8 @@ fn mesh_service(name: &str) -> MeshService {
         }],
         workloads: Vec::new(),
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
+        generation: None,
     }
 }
 

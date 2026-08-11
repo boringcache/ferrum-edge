@@ -156,6 +156,8 @@ fn mesh_service_rejects_empty_name() {
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
+        generation: None,
     };
     let errors = validate_mesh_config(&[], &[svc], &[], &[], &[], &[], None);
     assert!(
@@ -182,6 +184,8 @@ fn mesh_ports_reject_zero_on_core_resources() {
         }],
         workloads: Vec::new(),
         protocol_overrides: HashMap::from([(0, AppProtocol::Grpc)]),
+        uid: None,
+        generation: None,
     };
     service.protocol_overrides.insert(8080, AppProtocol::Http2);
 

@@ -249,6 +249,8 @@ fn test_load_balancer_cache() {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         }],
         ..Default::default()
     };
@@ -632,6 +634,8 @@ fn test_least_latency_cache_record_and_select() {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         }],
         ..Default::default()
     };
@@ -1260,6 +1264,8 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         }],
         ..Default::default()
     };
@@ -1376,6 +1382,8 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     }
 }
 
@@ -1674,7 +1682,9 @@ fn test_apply_delta_mixed_add_remove_modify() {
     let u3 = make_upstream("u3", make_targets(3));
     let modified_u2 = Upstream {
         algorithm: LoadBalancerAlgorithm::Random,
-        ..make_upstream("u2", make_targets(1))
+        ..make_upstream("u2", make_targets(1)),
+        k8s_service_uid: None,
+        k8s_service_generation: None,
     };
     let new_config = GatewayConfig {
         upstreams: vec![modified_u2.clone(), u3.clone()],
@@ -3001,6 +3011,8 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            k8s_service_uid: None,
+            k8s_service_generation: None,
         }],
         ..Default::default()
     };

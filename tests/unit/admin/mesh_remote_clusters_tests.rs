@@ -69,6 +69,8 @@ fn service(name: &str) -> MeshService {
             spiffe_id: spiffe("spiffe://remote.local/ns/default/sa/reviews"),
         }],
         protocol_overrides: HashMap::new(),
+        uid: None,
+        generation: None,
     }
 }
 
