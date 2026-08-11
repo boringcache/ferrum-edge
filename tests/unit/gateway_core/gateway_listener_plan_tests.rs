@@ -1,9 +1,8 @@
 //! External regression tests for [`GatewayListenerPlan::from_config`].
 //!
-//! Translation admits HTTP-family Gateway listeners beside UDP/DTLS stream
-//! proxies on the same numeric port because TCP and UDP are distinct transports.
-//! The production planner must apply the same rule: only TCP/TLS raw-stream
-//! claims block an HTTP-family TCP listener.
+//! Plain HTTP listeners may share a numeric port with UDP/DTLS because TCP and
+//! UDP are distinct transports. TLS-class listeners also own that UDP port when
+//! HTTP/3 is enabled and must then be refused on a stream collision.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -100,7 +99,19 @@ fn plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new())
+    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), false)
+}
+
+fn http3_plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
+    let mut config = GatewayConfig {
+        proxies,
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_kind();
+    config
+        .http_tls_listen_ports
+        .insert((ferrum_edge::config::types::default_namespace(), PORT));
+    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), true)
 }
 
 #[test]
@@ -136,6 +147,36 @@ fn http_and_dtls_stream_may_share_numeric_port() {
         !plan.refused.contains_key(&PORT),
         "DTLS must not withdraw the HTTP-family listener: {:?}",
         plan.refused
+    );
+}
+
+#[test]
+fn http3_and_udp_stream_on_same_port_is_refused() {
+    let plan = http3_plan_for(vec![
+        http_proxy("https-gw", PORT),
+        stream_proxy("udp-stream", BackendScheme::Udp, PORT),
+    ]);
+
+    assert!(!plan.ports.contains_key(&PORT));
+    let reason = plan.refused.get(&PORT).expect("refusal reason");
+    assert!(
+        reason.contains("HTTP/3 socket"),
+        "unexpected refusal: {reason}"
+    );
+}
+
+#[test]
+fn http3_and_dtls_stream_on_same_port_is_refused() {
+    let plan = http3_plan_for(vec![
+        http_proxy("https-gw", PORT),
+        stream_proxy("dtls-stream", BackendScheme::Dtls, PORT),
+    ]);
+
+    assert!(!plan.ports.contains_key(&PORT));
+    let reason = plan.refused.get(&PORT).expect("refusal reason");
+    assert!(
+        reason.contains("UDP/DTLS stream proxy"),
+        "unexpected refusal: {reason}"
     );
 }
 
