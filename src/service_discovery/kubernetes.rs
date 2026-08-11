@@ -169,6 +169,7 @@ impl KubernetesDiscoverer {
     ///
     /// Returns `None` when the named/first port is absent or outside
     /// `1..=u16::MAX` (checked admission; never wraps).
+    #[cfg(test)]
     fn extract_port(&self, item: &serde_json::Value) -> Option<u16> {
         match self.classify_port(item) {
             EndpointSlicePortAdmission::Admitted(port) => Some(port),
