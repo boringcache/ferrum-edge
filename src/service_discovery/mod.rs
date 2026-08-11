@@ -167,6 +167,7 @@ impl DiscoverySnapshot {
     }
 
     /// Admission policy carried with this snapshot.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub fn admission_policy(&self) -> SnapshotAdmissionPolicy {
         self.admission_policy
     }
