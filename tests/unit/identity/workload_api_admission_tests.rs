@@ -10,23 +10,54 @@
 //!
 //! - every limit is finite and has a hard ceiling that configuration cannot
 //!   raise, and `0` is refused rather than meaning "unbounded";
+//! - the per-UID quota is **strictly below** the global ceiling on both gates,
+//!   so one UID can never hold the whole pool;
 //! - the total ceiling admits exactly `N` and refuses `N + 1`;
 //! - the per-UID quota refuses a saturated UID **while a different UID is still
-//!   served** — the fair-share property the whole per-UID bound exists for;
+//!   served**, both sequentially and under a concurrent burst — the fair-share
+//!   property the whole per-UID bound exists for;
 //! - a released permit returns capacity to both accountings;
+//! - a connection's watchdog is cancelled when the connection is dropped, and a
+//!   detached gate never force-closes;
+//! - the packed liveness word transitions coherently and refreshes on reads;
+//! - every pending write-side poll is woken and resolved by the force close;
+//! - accept failures are classified and retried within a bounded backoff, and a
+//!   fatal one terminates admission;
 //! - the metric families the boundary exports carry a closed label set.
 
 use ferrum_edge::identity::workload_api::admission::{
     IDLE_TIMEOUT_CEILING, INITIAL_CONNECTION_TIMEOUT_CEILING, MAX_CONCURRENT_RPCS_CEILING,
     MAX_CONCURRENT_STREAMS_CEILING, MAX_CONNECTIONS_CEILING, MAX_CONNECTIONS_PER_UID_CEILING,
-    SHUTDOWN_GRACE_CEILING,
+    MIN_MAX_CONNECTIONS, SHUTDOWN_GRACE_CEILING,
 };
 use ferrum_edge::identity::workload_api::{
-    ConnectionAdmission, WorkloadApiAdmissionConfig, close_reason, reject_reason,
+    AcceptDecision, AcceptFailure, AcceptRetryPolicy, ConnectionActivity, ConnectionAdmission,
+    WorkloadApiAdmissionConfig, close_reason, reject_reason,
 };
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+/// Deadlines far enough out that a paused-clock test which yields many times
+/// cannot trip one by accident; those tests are about cancellation and the
+/// force-close channel, not about the deadlines.
+fn long_lived_limits(max_connections: usize, max_per_uid: usize) -> WorkloadApiAdmissionConfig {
+    WorkloadApiAdmissionConfig {
+        initial_connection_timeout: Duration::from_secs(300),
+        idle_timeout: Duration::from_secs(3600),
+        ..limits(max_connections, max_per_uid)
+    }
+}
 
 /// A configuration small enough to saturate deterministically.
+///
+/// `max_per_uid` must stay strictly below `max_connections`; a configuration
+/// that does not is a fairness defect the gates refuse, and the tests that
+/// exercise that refusal build it explicitly.
 fn limits(max_connections: usize, max_per_uid: usize) -> WorkloadApiAdmissionConfig {
     WorkloadApiAdmissionConfig {
         max_connections,
@@ -165,7 +196,7 @@ fn an_over_ceiling_limit_is_refused_and_names_its_ceiling() {
 }
 
 #[test]
-fn a_per_uid_quota_above_the_global_ceiling_is_refused() {
+fn a_per_uid_quota_at_or_above_the_global_ceiling_is_refused() {
     // Not merely useless: an operator who wrote this believes they have a
     // per-principal bound and does not, which is precisely the posture this
     // issue is about.
@@ -174,6 +205,41 @@ fn a_per_uid_quota_above_the_global_ceiling_is_refused() {
         .expect_err("a quota that can never bind is a misconfiguration")
         .to_string();
     assert!(error.contains("MAX_CONNECTIONS_PER_UID"));
+
+    // Equality is refused just as firmly. A quota equal to the global ceiling
+    // lets one UID hold every connection, which is exactly the "another UID
+    // retains service" promise this bound is documented to keep.
+    let error = limits(8, 8)
+        .validate()
+        .expect_err("a quota equal to the global ceiling is not a fair share")
+        .to_string();
+    assert!(error.contains("MAX_CONNECTIONS_PER_UID"));
+    assert!(
+        error.contains("strictly below"),
+        "the diagnostic must say what the operator has to change; got: {error}"
+    );
+
+    // ...and the largest fair quota is admitted, so the rule is `<`, not `<=`
+    // spelled pessimistically.
+    limits(8, 7)
+        .validate()
+        .expect("a quota one below the global ceiling is the largest fair share");
+}
+
+#[test]
+fn a_global_ceiling_below_the_fairness_floor_is_refused() {
+    // With one total connection there is no fair share to hand out: whichever
+    // UID connects first holds the entire pool. The floor is therefore two.
+    let error = limits(1, 1)
+        .validate()
+        .expect_err("a single-connection pool cannot be fairly shared")
+        .to_string();
+    assert!(error.contains("MAX_CONNECTIONS"));
+    assert!(error.contains(&MIN_MAX_CONNECTIONS.to_string()));
+
+    limits(MIN_MAX_CONNECTIONS, 1)
+        .validate()
+        .expect("the smallest fair configuration is exactly the floor with a quota of one");
 }
 
 #[test]
@@ -221,7 +287,12 @@ fn clamping_enforces_the_ceilings_even_when_validation_is_bypassed() {
     assert_eq!(clamped.idle_timeout, IDLE_TIMEOUT_CEILING);
     assert_eq!(clamped.shutdown_grace, SHUTDOWN_GRACE_CEILING);
 
-    // Zero clamps up to a finite one rather than down to "unbounded".
+    // The clamp preserves the fairness invariant even against an over-ceiling
+    // quota: 1024 is strictly below 4096, so one UID still cannot take the pool.
+    assert!(clamped.max_connections_per_uid < clamped.max_connections);
+
+    // Zero clamps up to a finite floor rather than down to "unbounded", and the
+    // floor is the smallest *fair* configuration rather than `1 / 1`.
     let floor = WorkloadApiAdmissionConfig {
         max_connections: 0,
         max_connections_per_uid: 0,
@@ -232,13 +303,49 @@ fn clamping_enforces_the_ceilings_even_when_validation_is_bypassed() {
         shutdown_grace: Duration::ZERO,
     }
     .clamped();
-    assert_eq!(floor.max_connections, 1);
+    assert_eq!(floor.max_connections, MIN_MAX_CONNECTIONS);
     assert_eq!(floor.max_connections_per_uid, 1);
     assert_eq!(floor.max_concurrent_streams, 1);
     assert_eq!(floor.max_concurrent_rpcs, 1);
     assert_eq!(floor.initial_connection_timeout, Duration::from_secs(1));
     assert_eq!(floor.idle_timeout, Duration::from_secs(1));
     assert_eq!(floor.shutdown_grace, Duration::from_secs(1));
+}
+
+#[test]
+fn clamping_never_produces_a_quota_that_can_take_the_whole_pool() {
+    // The belt has to hold for *every* input, not just the ones `validate`
+    // would have caught: a runtime reached another way must still leave a
+    // second UID somewhere to go.
+    for max_connections in [0usize, 1, 2, 3, 7, 256, MAX_CONNECTIONS_CEILING, usize::MAX] {
+        for max_connections_per_uid in [
+            0usize,
+            1,
+            2,
+            max_connections,
+            max_connections.saturating_add(1),
+            MAX_CONNECTIONS_PER_UID_CEILING,
+            usize::MAX,
+        ] {
+            let clamped = limits(max_connections, max_connections_per_uid).clamped();
+            assert!(
+                clamped.max_connections >= MIN_MAX_CONNECTIONS,
+                "a fair pool needs room for at least two connections, got {clamped:?}"
+            );
+            assert!(
+                clamped.max_connections_per_uid >= 1,
+                "a quota of zero would refuse every peer, got {clamped:?}"
+            );
+            assert!(
+                clamped.max_connections_per_uid < clamped.max_connections,
+                "clamping must never let one UID hold the whole pool, got {clamped:?}"
+            );
+            clamped.validate().expect(
+                "a clamped configuration must itself be acceptable configuration; otherwise the \
+                 defensive path and the loud gate disagree about what a bounded transport is",
+            );
+        }
+    }
 }
 
 #[test]
@@ -258,8 +365,15 @@ fn a_constructed_admission_gate_never_exceeds_a_ceiling() {
 #[test]
 fn the_total_ceiling_admits_exactly_n_and_refuses_n_plus_one() {
     const TOTAL: usize = 4;
-    // Per-UID raised to the total so this test isolates the *global* bound.
-    let admission = ConnectionAdmission::detached(limits(TOTAL, TOTAL));
+    // Per-UID raised to the largest *fair* value — one below the total — so this
+    // test isolates the global bound. It cannot be raised to the total itself:
+    // that is the configuration the fairness gate refuses, and it is also why
+    // the live suite cannot saturate the global ceiling from one UID.
+    let policy = limits(TOTAL, TOTAL - 1);
+    policy
+        .validate()
+        .expect("the largest fair quota is acceptable configuration");
+    let admission = ConnectionAdmission::detached(policy);
 
     let mut held = Vec::new();
     for index in 0..TOTAL {
@@ -389,4 +503,449 @@ fn admission_reason_labels_are_a_closed_compile_time_set() {
     let before = all.len();
     all.dedup();
     assert_eq!(before, all.len(), "reason constants must be distinct");
+}
+
+#[test]
+fn a_concurrent_burst_from_a_saturated_uid_never_denies_an_independent_uid() {
+    // The ordering regression this pins is invisible to a sequential test.
+    //
+    // If `reserve` took the *global* permit before checking the per-UID quota,
+    // every one of the hammering threads below would hold one of the remaining
+    // global slots while it queued for the per-UID lock — and for as long as
+    // that queue drained, the shared pool would read as empty and the innocent
+    // UIDs would be refused with `max_connections`. The quota would then be a
+    // denial-of-service primitive rather than a fair share.
+    //
+    // With the quota judged first, under the same lock, an over-quota caller
+    // never touches the global semaphore at all, so the assertion below is an
+    // invariant rather than a race the test hopes to win.
+    const TOTAL: usize = 8;
+    const HOSTILE_QUOTA: usize = 4;
+    const HOSTILE_UID: u32 = 1000;
+    const HAMMER_THREADS: usize = 4;
+    const ROUNDS: usize = 300;
+
+    let admission = ConnectionAdmission::detached(limits(TOTAL, HOSTILE_QUOTA));
+    // The hostile UID holds its full quota for the whole test, so every further
+    // attempt from it must be refused on the quota, never on the global pool.
+    let _hostile_held: Vec<_> = (0..HOSTILE_QUOTA)
+        .map(|_| {
+            admission
+                .reserve(HOSTILE_UID)
+                .expect("a peer may use its own quota in full")
+        })
+        .collect();
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..HAMMER_THREADS {
+            let hammer = admission.clone();
+            let stop = &stop;
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(
+                        hammer.reserve(HOSTILE_UID).is_none(),
+                        "a UID at its quota must be refused, never admitted"
+                    );
+                    std::thread::yield_now();
+                }
+            });
+        }
+
+        for round in 0..ROUNDS {
+            // Take *every* remaining global slot with independent UIDs. Under
+            // the defective ordering the hammering threads hold some of these
+            // transiently and at least one of these reservations fails.
+            let mut innocent = Vec::with_capacity(TOTAL - HOSTILE_QUOTA);
+            for slot in 0..(TOTAL - HOSTILE_QUOTA) {
+                let Some(permit) = admission.reserve(2000 + slot as u32) else {
+                    // Let the hammering threads finish before unwinding.
+                    stop.store(true, Ordering::Relaxed);
+                    panic!(
+                        "round {round}: an independent UID was refused while a different UID was \
+                         merely being refused at its own quota; a per-UID refusal must not consume \
+                         global capacity, even transiently"
+                    );
+                };
+                innocent.push(permit);
+            }
+            drop(innocent);
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    assert_eq!(
+        admission.active_connections(),
+        HOSTILE_QUOTA,
+        "only the hostile UID's own held permits may remain charged"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_connection_cancels_its_watchdog_rather_than_leaving_it_asleep() {
+    // Connection concurrency is bounded by the admission ceiling; connection
+    // *churn* is not. A watchdog that only noticed its connection had gone on
+    // its next tick would let arbitrarily many detached tasks accumulate, each
+    // asleep for up to a second. The guard has to cancel it at drop.
+    let admission = ConnectionAdmission::detached(long_lived_limits(8, 4));
+    let (activity, watchdog) = admission.start_watchdog();
+    let observer = watchdog.abort_handle();
+    tokio::task::yield_now().await;
+    assert!(
+        !observer.is_finished(),
+        "the watchdog must run for as long as its connection is alive"
+    );
+
+    drop(watchdog);
+    drop(activity);
+
+    // The clock is paused, so nothing here can be satisfied by a tick elapsing:
+    // the only way this loop finishes is an actual cancellation.
+    for _ in 0..64 {
+        if observer.is_finished() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("dropping the connection must cancel its watchdog immediately, not on its next tick");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detached_gate_never_force_closes_the_connections_it_admits() {
+    // `detached` promises a gate that never force-closes because nothing will
+    // signal it. Dropping the sender in the constructor breaks that promise in
+    // the most direct way possible: a closed force-close channel is exactly the
+    // shutdown signal the watchdog acts on, so every admitted connection would
+    // be force-closed because the constructor returned.
+    let admission = ConnectionAdmission::detached(long_lived_limits(8, 4));
+    let (activity, watchdog) = admission.start_watchdog();
+    // Dropped deliberately: the connection, not the gate, is what must keep the
+    // channel open, or a caller that retained only its connections would still
+    // see them torn down.
+    drop(admission);
+
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+        assert!(
+            !activity.is_closed(),
+            "a detached gate must never force-close a connection"
+        );
+    }
+    drop(watchdog);
+}
+
+#[tokio::test]
+async fn a_stream_admitted_through_a_detached_gate_still_carries_traffic() {
+    // The same regression as above, observed the way a real peer would: bytes
+    // in, bytes out. Under a dropped force-close sender the first watchdog poll
+    // aborts the connection and this read fails with `ConnectionAborted`.
+    let admission = ConnectionAdmission::detached(limits(8, 4));
+    let (mut peer, gateway_side) = tokio::io::duplex(64);
+    let mut admitted = admission
+        .admit_io(1000, gateway_side)
+        .expect("a fresh gate admits the first connection");
+
+    // Give the watchdog every chance to have run before the first byte moves.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+
+    peer.write_all(b"hello").await.expect("the peer writes");
+    let mut buffer = [0u8; 5];
+    admitted
+        .read_exact(&mut buffer)
+        .await
+        .expect("an admitted connection is readable, not force-closed by its own constructor");
+    assert_eq!(&buffer, b"hello");
+    assert!(!admitted.activity().is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_liveness_word_is_coherent_and_every_read_refreshes_the_deadline() {
+    // The flag that selects which deadline applies and the timestamp it is
+    // compared against live in one atomic word, so a watchdog can never observe
+    // "the peer has spoken" without the timestamp that says when — the shape
+    // that closes an actively-read connection on a weakly ordered CPU.
+    let activity = ConnectionActivity::new();
+
+    let observed = activity.snapshot();
+    assert!(!observed.saw_first_read);
+    assert!(observed.since_last_read < Duration::from_millis(50));
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let observed = activity.snapshot();
+    assert!(
+        !observed.saw_first_read,
+        "a connection that has said nothing is still on its initial deadline"
+    );
+    assert!(observed.since_last_read >= Duration::from_secs(5));
+
+    activity.mark_read();
+    let observed = activity.snapshot();
+    assert!(observed.saw_first_read);
+    assert!(
+        observed.since_last_read < Duration::from_millis(50),
+        "the first read must publish its own timestamp, not leave a stale one behind"
+    );
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let observed = activity.snapshot();
+    assert!(
+        observed.saw_first_read,
+        "the first-read flag can never be lost once set"
+    );
+    assert!(observed.since_last_read >= Duration::from_secs(3));
+
+    // A subsequent read refreshes the idle deadline coherently too.
+    activity.mark_read();
+    let observed = activity.snapshot();
+    assert!(observed.saw_first_read);
+    assert!(observed.since_last_read < Duration::from_millis(50));
+
+    // And the close is published exactly once, however many paths reach it.
+    assert!(activity.force_close(), "the first close wins");
+    assert!(
+        !activity.force_close(),
+        "a second close must not be counted again"
+    );
+    assert!(activity.is_closed());
+}
+
+/// An inner I/O that is never ready, so every poll of the wrapper takes its
+/// `Pending` branch and the wrapper's own waker discipline is what is observed.
+struct NeverReadyIo;
+
+impl AsyncRead for NeverReadyIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for NeverReadyIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+#[derive(Default)]
+struct CountingWaker {
+    wakes: AtomicUsize,
+}
+
+impl CountingWaker {
+    fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
+    }
+}
+
+impl Wake for CountingWaker {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn every_pending_write_side_poll_is_woken_and_resolved_by_the_force_close() {
+    // `poll_write` registering the waker is not enough. A connection parked in
+    // `poll_flush` or `poll_shutdown` on a peer that has stopped reading is
+    // exactly the connection the bounded shutdown has to reach, and a delegated
+    // `Pending` registers only the *inner* socket's waker — which nothing wakes.
+    let admission = ConnectionAdmission::detached(limits(8, 4));
+
+    // Flush: the force close has to reach it, and it reports the abort.
+    {
+        let mut admitted = admission
+            .admit_io(1000, NeverReadyIo)
+            .expect("the gate has capacity");
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut admitted).poll_flush(&mut cx).is_pending(),
+            "an inner I/O that is never ready must park"
+        );
+        assert_eq!(counter.wakes(), 0, "nothing has happened yet");
+
+        assert!(admitted.activity().force_close(), "this is the first close");
+        assert!(
+            counter.wakes() >= 1,
+            "a parked flush must be woken by the force close, or the connection waits for a peer \
+             that is never going to speak"
+        );
+
+        match Pin::new(&mut admitted).poll_flush(&mut cx) {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted),
+            other => panic!("a force-closed flush must abort, got {other:?}"),
+        }
+    }
+
+    // Shutdown: woken the same way, but it completes with success — a shutdown
+    // racing the force close must finish, not hand the caller an error it
+    // cannot act on.
+    {
+        let mut admitted = admission
+            .admit_io(1001, NeverReadyIo)
+            .expect("the gate has capacity");
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut admitted).poll_shutdown(&mut cx).is_pending(),
+            "an inner I/O that is never ready must park"
+        );
+        assert_eq!(counter.wakes(), 0, "nothing has happened yet");
+
+        assert!(admitted.activity().force_close(), "this is the first close");
+        assert!(
+            counter.wakes() >= 1,
+            "a parked shutdown must be woken by the force close"
+        );
+
+        match Pin::new(&mut admitted).poll_shutdown(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("shutdown after a force close must report success, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_write_parked_before_the_force_close_is_woken_and_then_aborts() {
+    let admission = ConnectionAdmission::detached(limits(8, 4));
+    let mut admitted = admission
+        .admit_io(1000, NeverReadyIo)
+        .expect("the gate has capacity");
+    let counter = Arc::new(CountingWaker::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut cx = Context::from_waker(&waker);
+
+    let parked = Pin::new(&mut admitted).poll_write(&mut cx, b"x");
+    assert!(parked.is_pending());
+    assert!(admitted.activity().force_close());
+    assert!(counter.wakes() >= 1);
+    match Pin::new(&mut admitted).poll_write(&mut cx, b"x") {
+        Poll::Ready(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted),
+        other => panic!("a force-closed write must abort, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn accept_failures_are_classified_by_what_they_mean_for_the_listener() {
+    use ferrum_edge::identity::workload_api::classify_accept_error;
+
+    for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(code)),
+            AcceptFailure::Resource,
+            "errno {code} is an exhaustion that persists until capacity is released"
+        );
+    }
+    for code in [libc::ECONNABORTED, libc::EINTR, libc::EAGAIN] {
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(code)),
+            AcceptFailure::Transient,
+            "errno {code} is a per-connection event, not a broken listener"
+        );
+    }
+    for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(code)),
+            AcceptFailure::Fatal,
+            "errno {code} means the listener itself is unusable and retrying is a spin"
+        );
+    }
+    // An error carrying no OS code is not one of the enumerated recoverable
+    // conditions, so it fails closed onto termination rather than into a loop.
+    assert_eq!(
+        classify_accept_error(&io::Error::other("synthetic")),
+        AcceptFailure::Fatal
+    );
+}
+
+#[test]
+fn the_accept_retry_policy_backs_off_within_a_bound_and_terminates_on_a_fatal_error() {
+    let mut policy = AcceptRetryPolicy::new();
+
+    // A fatal failure ends admission, so the serve task exits and the
+    // termination guard mesh mode watches actually fires.
+    assert_eq!(
+        policy.on_error(AcceptFailure::Fatal),
+        AcceptDecision::Terminate
+    );
+
+    // A short run of transient failures retries at once — that is what an
+    // accept loop is supposed to do about a peer that went away.
+    let mut policy = AcceptRetryPolicy::new();
+    for _ in 0..8 {
+        match policy.on_error(AcceptFailure::Transient) {
+            AcceptDecision::Retry { backoff, .. } => assert_eq!(backoff, Duration::ZERO),
+            AcceptDecision::Terminate => panic!("a transient failure is retryable"),
+        }
+    }
+    // A run long enough to look like a spin is backed off instead.
+    match policy.on_error(AcceptFailure::Transient) {
+        AcceptDecision::Retry { backoff, .. } => assert!(backoff > Duration::ZERO),
+        AcceptDecision::Terminate => panic!("a transient failure is retryable"),
+    }
+
+    // Exhaustion backs off from the first occurrence, grows, and saturates —
+    // bounded CPU while the condition lasts, and a bounded log rate with it.
+    let mut policy = AcceptRetryPolicy::new();
+    let mut logged = 0usize;
+    let mut previous = Duration::ZERO;
+    for attempt in 1..=200u32 {
+        match policy.on_error(AcceptFailure::Resource) {
+            AcceptDecision::Retry { backoff, log } => {
+                assert!(backoff > Duration::ZERO, "attempt {attempt} must pause");
+                assert!(
+                    backoff <= Duration::from_secs(1),
+                    "attempt {attempt} must stay inside the backoff ceiling"
+                );
+                assert!(backoff >= previous, "the backoff must not shrink mid-run");
+                previous = backoff;
+                if log {
+                    logged += 1;
+                }
+            }
+            AcceptDecision::Terminate => panic!("exhaustion is retryable, not fatal"),
+        }
+    }
+    assert!(
+        logged <= 12,
+        "a persistent exhaustion must not emit one warning per retry; that is itself a \
+         disk-exhaustion primitive. Logged {logged} of 200"
+    );
+    assert!(logged >= 1, "the run must still be visible at all");
+    assert_eq!(policy.consecutive_failures(), 200);
+
+    // A successful accept clears the run, so an isolated later failure does not
+    // inherit an old backoff.
+    policy.on_accepted();
+    assert_eq!(policy.consecutive_failures(), 0);
+    match policy.on_error(AcceptFailure::Transient) {
+        AcceptDecision::Retry { backoff, .. } => assert_eq!(backoff, Duration::ZERO),
+        AcceptDecision::Terminate => panic!("a transient failure is retryable"),
+    }
 }

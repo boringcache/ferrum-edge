@@ -2,17 +2,24 @@
 //! (issue #3758).
 //!
 //! The unit suite (`tests/unit/identity/workload_api_admission_tests.rs`) pins
-//! the *decision* half — ceilings, refusal of `0`, per-UID fair share across two
-//! different UIDs, and the closed reason-label set — because a single-uid test
-//! process cannot reach the second-UID case through real sockets. These tests
-//! pin the half that only real sockets can prove:
+//! the *decision* half — ceilings, refusal of `0`, the total bound across
+//! several UIDs, per-UID fair share (sequentially and under a concurrent burst),
+//! and the closed reason-label set — because a single-uid test process cannot
+//! reach the second-UID case through real sockets. That division is not a
+//! convenience: the per-UID quota must stay **strictly below** the global
+//! ceiling, so a single-UID process *cannot* saturate the global pool at all,
+//! and no test here claims to. These tests pin the half that only real sockets
+//! can prove:
 //!
-//! - the total ceiling admits exactly `N` and sheds `N + 1` **without allocating
-//!   a gRPC connection** — the shed peer sees an immediate EOF, not a session;
+//! - an over-quota connection is shed **without allocating a gRPC connection** —
+//!   the shed peer sees an immediate EOF, not a session — and the listener keeps
+//!   serving through a sustained flood of them;
 //! - the per-UID quota binds for this process's own UID while the global pool
 //!   still has room, so the quota is genuinely per principal;
 //! - `SETTINGS_MAX_CONCURRENT_STREAMS` is actually advertised on the wire at the
-//!   configured value, read straight off a raw HTTP/2 handshake;
+//!   configured value, read straight off a raw HTTP/2 handshake, **and** a peer
+//!   that ignores it and opens one stream too many gets a bounded protocol
+//!   refusal rather than an unbounded server-side allocation;
 //! - the service-wide RPC ceiling **sheds** with `RESOURCE_EXHAUSTED` rather
 //!   than queueing, and releases exactly when the streaming RPC that held the
 //!   permit ends;
@@ -23,7 +30,10 @@
 //!   stream — the shape that hangs a purely graceful drain forever;
 //! - normal X.509-SVID rotation, JWT-SVID mint/validate, bundle streaming, peer
 //!   attestation, and socket-inode cleanup all still work under tight limits;
-//! - the exported metric families stay fixed-cardinality.
+//! - the exported metric families stay fixed-cardinality, and the RPC families
+//!   state in their help text that they are the stream observation — one
+//!   admitted RPC is exactly one HTTP/2 stream — so nothing here claims a
+//!   separate stream family that does not exist.
 //!
 //! Everything runs on the ordinary hosted Linux CI runner: Unix sockets in a
 //! per-test temp directory, no root, no network. Nothing here sleeps for a fixed
@@ -297,21 +307,26 @@ async fn wait_for_service(path: &Path, budget: Duration) {
 }
 
 #[tokio::test]
-async fn the_total_connection_ceiling_sheds_the_next_connection_before_any_grpc_allocation() {
-    const TOTAL: usize = 3;
+async fn an_over_quota_connection_is_shed_before_any_grpc_allocation() {
+    // The bound observed here is the **per-UID quota**, and it says so: the test
+    // process has one UID, and a fair configuration keeps that quota strictly
+    // below the global ceiling, so a single-UID client can never reach the
+    // global bound. The global bound across several UIDs is pinned against the
+    // same accounting in the unit suite.
+    const QUOTA: usize = 3;
     let harness = Harness::start(
-        "total",
+        "quota",
         WorkloadApiAdmissionConfig {
-            max_connections: TOTAL,
-            max_connections_per_uid: TOTAL,
+            max_connections: QUOTA + 1,
+            max_connections_per_uid: QUOTA,
             ..limits()
         },
     )
     .await;
 
-    // Every connection up to the ceiling is admitted and stays open.
+    // Every connection up to the quota is admitted and stays open.
     let mut held = Vec::new();
-    for _ in 0..TOTAL {
+    for _ in 0..QUOTA {
         held.push(connect_admitted(&harness.path).await);
     }
 
@@ -405,32 +420,228 @@ async fn the_configured_stream_ceiling_is_advertised_on_the_wire() {
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` (identifier `0x3`) if it carries one.
 async fn read_max_concurrent_streams(stream: &mut UnixStream) -> Option<u32> {
     loop {
-        let mut header = [0u8; 9];
-        stream
-            .read_exact(&mut header)
-            .await
-            .expect("the server sends well-formed HTTP/2 frames");
-        let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
-        let frame_type = header[3];
-        let flags = header[4];
-        let mut payload = vec![0u8; length];
-        if length > 0 {
-            stream
-                .read_exact(&mut payload)
-                .await
-                .expect("a frame's payload follows its header");
-        }
+        let frame = read_frame(stream).await;
         // Type 0x4 is SETTINGS; the ACK flag marks the peer's answer to ours
         // rather than its own parameters.
-        if frame_type == 0x4 && (flags & 0x1) == 0 {
-            for entry in payload.chunks_exact(6) {
-                if u16::from_be_bytes([entry[0], entry[1]]) == 0x3 {
-                    return Some(u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]));
-                }
-            }
-            return None;
+        if frame.frame_type == H2_SETTINGS && (frame.flags & H2_ACK) == 0 {
+            return settings_max_concurrent_streams(&frame.payload);
         }
     }
+}
+
+fn settings_max_concurrent_streams(payload: &[u8]) -> Option<u32> {
+    for entry in payload.chunks_exact(6) {
+        if u16::from_be_bytes([entry[0], entry[1]]) == 0x3 {
+            return Some(u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP/2 frame helpers
+//
+// A conforming client obeys `SETTINGS_MAX_CONCURRENT_STREAMS` and simply queues
+// its extra requests locally, so the *server's* enforcement of that ceiling is
+// unreachable through any real gRPC client. Reaching it needs a client that
+// deliberately ignores the advertised value, which is what these frames are.
+// ---------------------------------------------------------------------------
+
+const H2_HEADERS: u8 = 0x1;
+const H2_RST_STREAM: u8 = 0x3;
+const H2_SETTINGS: u8 = 0x4;
+const H2_GOAWAY: u8 = 0x7;
+const H2_ACK: u8 = 0x1;
+const H2_END_HEADERS: u8 = 0x4;
+/// `REFUSED_STREAM`, the error code RFC 9113 §5.1.2 defines for a stream opened
+/// past the advertised concurrency limit.
+const H2_REFUSED_STREAM: u32 = 0x7;
+
+struct H2Frame {
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let length = payload.len();
+    let mut frame = Vec::with_capacity(9 + length);
+    frame.push((length >> 16) as u8);
+    frame.push((length >> 8) as u8);
+    frame.push(length as u8);
+    frame.push(frame_type);
+    frame.push(flags);
+    frame.extend_from_slice(&stream_id.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+async fn read_frame(stream: &mut UnixStream) -> H2Frame {
+    let mut header = [0u8; 9];
+    stream
+        .read_exact(&mut header)
+        .await
+        .expect("the server sends well-formed HTTP/2 frames");
+    let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+    let mut payload = vec![0u8; length];
+    if length > 0 {
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("a frame's payload follows its header");
+    }
+    H2Frame {
+        frame_type: header[3],
+        flags: header[4],
+        // The reserved high bit is masked off, per RFC 9113 §4.1.
+        stream_id: u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff,
+        payload,
+    }
+}
+
+/// An HPACK indexed header field (RFC 7541 §6.1) from the static table.
+fn hpack_indexed(index: u8) -> Vec<u8> {
+    vec![0x80 | index]
+}
+
+/// An HPACK literal header field **without** indexing, indexed name
+/// (RFC 7541 §6.2.2), with a raw (non-Huffman) value.
+///
+/// Without indexing on purpose: nothing here needs a dynamic-table entry, and
+/// not creating one keeps the encoder stateless and the bytes auditable.
+fn hpack_literal(name_index: u8, value: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    if name_index < 15 {
+        out.push(name_index);
+    } else {
+        // 4-bit prefix saturated, then the remainder as a one-octet varint.
+        out.push(0x0f);
+        assert!(name_index - 15 < 128, "index needs a multi-octet varint");
+        out.push(name_index - 15);
+    }
+    assert!(value.len() < 128, "value needs a multi-octet length varint");
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+/// An HPACK literal header field without indexing, **new** name, raw strings.
+fn hpack_literal_new_name(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x00];
+    assert!(name.len() < 128 && value.len() < 128, "lengths stay one octet");
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+/// A gRPC request header block for `FetchX509SVID`.
+///
+/// Static-table indices: 3 = `:method: POST`, 6 = `:scheme: http`, 4 = `:path`,
+/// 1 = `:authority`, 31 = `content-type`.
+fn grpc_request_header_block() -> Vec<u8> {
+    let mut block = hpack_indexed(3);
+    block.extend(hpack_indexed(6));
+    block.extend(hpack_literal(4, "/SpiffeWorkloadAPI/FetchX509SVID"));
+    block.extend(hpack_literal(1, "localhost"));
+    block.extend(hpack_literal(31, "application/grpc"));
+    block.extend(hpack_literal_new_name("te", "trailers"));
+    block
+}
+
+#[tokio::test]
+async fn a_stream_past_the_advertised_ceiling_is_refused_at_the_protocol_level() {
+    // The complement to the SETTINGS assertion above. Advertising a ceiling is
+    // only half of a bound: a peer that ignores `SETTINGS_MAX_CONCURRENT_STREAMS`
+    // has to be *refused*, or the advertised value protects nobody but the
+    // well-behaved. This client ignores it deliberately — no real gRPC client
+    // can, because a conforming HTTP/2 client queues its extra requests locally
+    // rather than putting them on the wire.
+    let harness = Harness::start(
+        "streamcap",
+        WorkloadApiAdmissionConfig {
+            max_concurrent_streams: 1,
+            ..limits()
+        },
+    )
+    .await;
+
+    let mut stream = UnixStream::connect(&harness.path)
+        .await
+        .expect("the socket accepts a connection");
+    stream
+        .write_all(H2_PREFACE)
+        .await
+        .expect("the client preface and SETTINGS are written");
+
+    // The server's ceiling takes effect once its SETTINGS has been acknowledged,
+    // so the ACK is sent before the streams rather than left implicit.
+    let advertised = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_frame(&mut stream).await;
+            if frame.frame_type == H2_SETTINGS && (frame.flags & H2_ACK) == 0 {
+                return settings_max_concurrent_streams(&frame.payload);
+            }
+        }
+    })
+    .await
+    .expect("the server sends its SETTINGS frame promptly");
+    assert_eq!(advertised, Some(1));
+    stream
+        .write_all(&h2_frame(H2_SETTINGS, H2_ACK, 0, &[]))
+        .await
+        .expect("the settings acknowledgement is written");
+
+    // Stream 1 stays open: the headers carry no END_STREAM and no request
+    // message ever follows, so the server is still waiting for the body and the
+    // stream is counted as active. Stream 3 is therefore one too many.
+    let block = grpc_request_header_block();
+    let mut streams = h2_frame(H2_HEADERS, H2_END_HEADERS, 1, &block);
+    streams.extend(h2_frame(H2_HEADERS, H2_END_HEADERS, 3, &block));
+    stream
+        .write_all(&streams)
+        .await
+        .expect("both header blocks are written");
+
+    let refusal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_frame(&mut stream).await;
+            match frame.frame_type {
+                H2_RST_STREAM if frame.stream_id == 3 => {
+                    assert_eq!(frame.payload.len(), 4, "RST_STREAM carries a 4-byte code");
+                    return Some(u32::from_be_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]));
+                }
+                // A connection-level refusal is a bounded rejection too; RFC
+                // 9113 §5.1.2 permits either.
+                H2_GOAWAY => return None,
+                // Anything the server says about stream 1 (or a window update)
+                // is not what is being asserted here.
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect(
+        "a stream opened past the advertised ceiling must be refused promptly; parking it is the \
+         unbounded allocation the ceiling exists to prevent",
+    );
+    if let Some(code) = refusal {
+        assert_eq!(
+            code, H2_REFUSED_STREAM,
+            "the excess stream must be refused with REFUSED_STREAM, which tells a conforming \
+             client the request may be retried on a new stream"
+        );
+    }
+
+    drop(stream);
+    harness.shutdown_within(Duration::from_secs(30)).await;
 }
 
 #[tokio::test]
@@ -494,12 +705,12 @@ async fn the_service_wide_rpc_ceiling_sheds_rather_than_queueing_and_releases_ex
 #[tokio::test]
 async fn a_connection_that_never_speaks_is_closed_on_its_deadline_and_returns_its_permit() {
     // The cheapest flood shape there is, and the one no per-request timeout can
-    // see. The global ceiling is 1, so the follow-up RPC can only succeed if the
-    // silent connection's permit was actually released.
+    // see. This process's own UID quota is 1, so the follow-up RPC can only
+    // succeed if the silent connection's permit was actually released.
     let harness = Harness::start(
         "initial",
         WorkloadApiAdmissionConfig {
-            max_connections: 1,
+            max_connections: 2,
             max_connections_per_uid: 1,
             initial_connection_timeout: Duration::from_secs(1),
             idle_timeout: Duration::from_secs(2),
@@ -527,7 +738,7 @@ async fn a_client_disconnect_returns_its_connection_permit() {
     let harness = Harness::start(
         "release",
         WorkloadApiAdmissionConfig {
-            max_connections: 1,
+            max_connections: 2,
             max_connections_per_uid: 1,
             ..limits()
         },
@@ -542,7 +753,7 @@ async fn a_client_disconnect_returns_its_connection_permit() {
             .expect("the only permitted connection is served normally");
     }
 
-    // The pool was full while that client existed; it can only be served now if
+    // This UID's quota was full while that client existed; it can only be served now if
     // the permit followed the connection object rather than any one code path.
     wait_for_service(&harness.path, Duration::from_secs(15)).await;
     harness.shutdown_within(Duration::from_secs(30)).await;
@@ -603,7 +814,7 @@ async fn normal_identity_service_is_unchanged_under_tight_limits() {
         "normal",
         WorkloadApiAdmissionConfig {
             max_connections: 4,
-            max_connections_per_uid: 4,
+            max_connections_per_uid: 3,
             max_concurrent_streams: 8,
             max_concurrent_rpcs: 8,
             shutdown_grace: Duration::from_secs(5),
@@ -707,7 +918,7 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
     let harness = Harness::start(
         "metrics",
         WorkloadApiAdmissionConfig {
-            max_connections: 1,
+            max_connections: 2,
             max_connections_per_uid: 1,
             ..limits()
         },
@@ -772,6 +983,22 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
         "the rejection counter must be exported once a connection has been shed"
     );
 
+    // The issue asks for stream observability. The RPC families *are* that
+    // observation — one admitted RPC is exactly one HTTP/2 stream — and the help
+    // text has to say so, or an operator reading `/metrics` cannot tell that no
+    // separate stream family is missing.
+    for (family, expected) in [
+        ("# HELP ferrum_mesh_workload_api_active_rpcs", "one HTTP/2 stream"),
+        ("# HELP ferrum_mesh_workload_api_rpcs_rejected_total", "HTTP/2 stream"),
+    ] {
+        if let Some(line) = rendered.lines().find(|line| line.starts_with(family)) {
+            assert!(
+                line.contains(expected),
+                "{family} must state its relationship to HTTP/2 streams: {line}"
+            );
+        }
+    }
+
     harness.shutdown_within(Duration::from_secs(30)).await;
 }
 
@@ -785,10 +1012,13 @@ async fn the_exported_admission_metrics_stay_fixed_cardinality() {
 /// descriptors return to their baseline, identity service continues for the
 /// peers inside the pool, and shutdown stays bounded afterwards.
 ///
-/// What it deliberately does **not** claim: the "an independent peer UID keeps
-/// being served" half needs a second UID, which an unprivileged CI process
-/// cannot create. That property is pinned against the same accounting in
-/// `tests/unit/identity/workload_api_admission_tests.rs`.
+/// What it deliberately does **not** claim: the flood saturates this process's
+/// own per-UID quota, not the global ceiling — under strict fair share a single
+/// UID cannot reach the global ceiling at all — and the "an independent peer UID
+/// keeps being served" half needs a second UID, which an unprivileged CI process
+/// cannot create. Both properties are pinned against the same accounting in
+/// `tests/unit/identity/workload_api_admission_tests.rs`, including under a
+/// concurrent burst.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_sustained_connection_flood_leaves_descriptors_and_shutdown_bounded() {
@@ -796,7 +1026,7 @@ async fn a_sustained_connection_flood_leaves_descriptors_and_shutdown_bounded() 
     let harness = Harness::start(
         "flood",
         WorkloadApiAdmissionConfig {
-            max_connections: TOTAL,
+            max_connections: TOTAL + 1,
             max_connections_per_uid: TOTAL,
             shutdown_grace: Duration::from_secs(1),
             ..limits()

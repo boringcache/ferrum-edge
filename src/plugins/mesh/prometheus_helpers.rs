@@ -1328,7 +1328,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         );
 
         output.push_str(
-            "# HELP ferrum_mesh_workload_api_active_rpcs SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling.\n",
+            "# HELP ferrum_mesh_workload_api_active_rpcs SPIFFE Workload API RPCs currently admitted by the service-wide concurrency ceiling; each admitted RPC occupies exactly one HTTP/2 stream, so this is also the live admitted-stream count.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_active_rpcs gauge\n");
         render_mesh_process_metric(
@@ -1372,7 +1372,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     let workload_api_rpcs_rejected = WORKLOAD_API_RPCS_REJECTED.load(Ordering::Relaxed);
     if workload_api_rpcs_rejected > 0 {
         output.push_str(
-            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned.\n",
+            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by the service-wide concurrency ceiling before any producer work was spawned; each shed RPC is one refused HTTP/2 stream.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_rpcs_rejected_total counter\n");
         render_mesh_process_metric(

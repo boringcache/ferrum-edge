@@ -1560,7 +1560,9 @@ pub struct EnvConfig {
     /// Simultaneously accepted Workload API connections per kernel-attested
     /// peer UID. Keeps one compromised member of the socket group from
     /// consuming the whole global pool and denying identity issuance to every
-    /// other workload on the node.
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_connections`: a quota equal to the global ceiling
+    /// lets one UID hold every connection and is not a fair share.
     pub mesh_workload_api_max_connections_per_uid: usize,
     /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` advertised on each Workload API
     /// connection, and the per-connection request-concurrency limit paired with

@@ -22,18 +22,23 @@
 //!    only trustworthy key for a per-principal quota. A socket whose credentials
 //!    cannot be read is **refused** — fail-closed, because an unattributable
 //!    connection cannot be charged to any quota.
-//! 2. **Total connections**, then **per-UID connections**. Both are
-//!    non-blocking: `try_acquire` / a bounded counter, never a wait. A caller
-//!    over either limit is shed immediately by closing the socket, so no
-//!    backlog of would-be connections accumulates behind the ceiling. The
-//!    per-UID quota is what keeps one compromised member of the socket group
-//!    from consuming the whole global pool — the total limit alone is a
-//!    single shared resource and is exactly what a flood exhausts first.
+//! 2. **Per-UID quota first, then total connections** — as **one** decision
+//!    taken under a single lock. Both halves are non-blocking: a bounded
+//!    counter and `try_acquire`, never a wait. The order is load-bearing rather
+//!    than incidental: taking the global permit first would let a burst from an
+//!    already-saturated UID each hold a global slot while queued on the per-UID
+//!    lock, transiently emptying the whole shared pool and refusing an
+//!    *innocent* second UID — which is precisely the fair-share property the
+//!    per-UID quota exists to provide. A caller over either limit is shed
+//!    immediately by closing the socket, so no backlog of would-be connections
+//!    accumulates behind the ceiling.
 //! 3. The admitted socket is wrapped in [`AdmittedUnixStream`], which **owns**
-//!    the permit. Release is therefore tied to the connection object's lifetime
-//!    rather than to any particular code path: a clean close, a transport
-//!    error, a handshake that never completes, a cancelled task, and a panic
-//!    unwind all drop the wrapper and all release the permit.
+//!    the permit and the connection's watchdog task. Release is therefore tied
+//!    to the connection object's lifetime rather than to any particular code
+//!    path: a clean close, a transport error, a handshake that never completes,
+//!    a cancelled task, and a panic unwind all drop the wrapper, all release
+//!    the permit, and all cancel the watchdog immediately rather than leaving a
+//!    detached task asleep until its next tick.
 //!
 //! HTTP/2 stream and service-wide RPC ceilings are applied on top of that, in
 //! [`super::listener`] (`max_concurrent_streams` + a per-connection concurrency
@@ -76,6 +81,14 @@
 //! "disabled" spelling for any of them: an unbounded Workload API transport is
 //! the defect this module exists to remove.
 //!
+//! The per-UID quota is additionally required to be **strictly below** the
+//! global ceiling, by both gates. A quota equal to the global ceiling is not a
+//! fair share at all — one UID may then hold every slot, which is exactly the
+//! posture the per-UID bound is documented to prevent — so a globally fair
+//! configuration necessarily has room for at least two connections. That is the
+//! finite floor: [`MIN_MAX_CONNECTIONS`] is `2`, and `clamped` never produces
+//! equality, for zero, one, or over-ceiling input.
+//!
 //! ## Metrics
 //!
 //! Counters and gauges are **fixed-cardinality**: an aggregate active-connection
@@ -84,6 +97,16 @@
 //! attacker-influenced or credential-adjacent and are never metric labels; the
 //! per-rejection detail stays in `debug!` logs, which are off by default and so
 //! cannot themselves be flooded into a disk-exhaustion primitive.
+//!
+//! The RPC gauge and shed counter **are** the stream-level observation: every
+//! admitted Workload API RPC occupies exactly one HTTP/2 stream for its whole
+//! lifetime, so `active_rpcs` is the live admitted-stream count and
+//! `rpcs_rejected_total` is the over-ceiling stream refusal count. That
+//! relationship is stated in the metric help text rather than being left for a
+//! reader to infer, and there is deliberately no *second* stream family: a
+//! stream refused by HTTP/2's own advertised `SETTINGS_MAX_CONCURRENT_STREAMS`
+//! is refused inside h2 before any Ferrum code runs, so counting it here would
+//! claim an observation this layer does not make.
 
 use std::collections::HashMap;
 use std::io;
@@ -97,7 +120,7 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use tokio_stream::Stream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::plugins::mesh::prometheus_helpers as mesh_metrics;
 
@@ -113,6 +136,16 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// Hard ceiling on total connections. An operator may raise the soft limit up to
 /// here and no further.
 pub const MAX_CONNECTIONS_CEILING: usize = 4096;
+
+/// Smallest total-connection ceiling a *fair* configuration can express.
+///
+/// The per-UID quota must be strictly below the global ceiling, or one UID may
+/// hold the whole pool and the fair-share promise is empty. A quota is at least
+/// `1`, so the global ceiling is at least `2`: a globally fair transport
+/// necessarily has room for a second connection. This is a finite floor, not a
+/// "disabled" spelling — `1` is refused by [`WorkloadApiAdmissionConfig::validate`]
+/// and raised to `2` by [`WorkloadApiAdmissionConfig::clamped`].
+pub const MIN_MAX_CONNECTIONS: usize = 2;
 
 /// Default per-peer-UID connection quota.
 ///
@@ -179,12 +212,24 @@ const WATCHDOG_MAX_TICK: Duration = Duration::from_secs(1);
 /// watchdog into a busy loop.
 const WATCHDOG_MIN_TICK: Duration = Duration::from_millis(25);
 
-/// How long the accept loop pauses after a resource-exhaustion accept error.
+/// First backoff step after a resource-exhaustion accept error.
 ///
 /// `EMFILE`/`ENFILE`/`ENOBUFS` persist until a descriptor is released, and
 /// retrying immediately would spin a runtime worker at full speed for as long as
 /// the condition lasted.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Longest the accept loop pauses between retries. The backoff doubles from
+/// [`ACCEPT_BACKOFF`] up to this, so a condition that persists costs a bounded,
+/// small fraction of one runtime worker rather than a spin.
+pub const ACCEPT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Consecutive *transient* accept failures tolerated without a pause.
+///
+/// `ECONNABORTED`/`EINTR` are per-connection events an accept loop is expected
+/// to retry at once; a run of them long enough to look like a spin is treated
+/// like exhaustion and backed off instead.
+const TRANSIENT_RETRY_BURST: u32 = 8;
 
 /// Rejection reasons. A closed set of `&'static str`, so the metric dimension
 /// they key is fixed regardless of what any caller does.
@@ -284,6 +329,14 @@ impl WorkloadApiAdmissionConfig {
             self.max_connections,
             MAX_CONNECTIONS_CEILING,
         )?;
+        if self.max_connections < MIN_MAX_CONNECTIONS {
+            return Err(WorkloadApiListenerError::Admission(format!(
+                "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS ({}) must be at least \
+                 {MIN_MAX_CONNECTIONS}: the per-UID quota has to stay strictly below it, so a \
+                 globally fair Workload API transport needs room for at least two connections",
+                self.max_connections
+            )));
+        }
         check_range(
             "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID",
             self.max_connections_per_uid,
@@ -315,14 +368,19 @@ impl WorkloadApiAdmissionConfig {
             SHUTDOWN_GRACE_CEILING,
         )?;
 
-        // A per-UID quota above the global ceiling is not an error the operator
-        // would notice at runtime — it simply never binds — so it is reported as
-        // the misconfiguration it is rather than silently ignored.
-        if self.max_connections_per_uid > self.max_connections {
+        // A per-UID quota at or above the global ceiling is not an error the
+        // operator would notice at runtime — it simply never leaves a slot for
+        // anyone else — so it is reported as the misconfiguration it is rather
+        // than silently ignored. Equality is refused as firmly as excess: a
+        // quota equal to the global ceiling lets one UID hold every connection,
+        // which is exactly the denial of identity service to the rest of the
+        // node that the per-UID bound is documented to prevent.
+        if self.max_connections_per_uid >= self.max_connections {
             return Err(WorkloadApiListenerError::Admission(format!(
-                "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID ({}) exceeds \
-                 FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS ({}), so the per-UID quota can never \
-                 bind and one peer may take the whole pool",
+                "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID ({}) must be strictly below \
+                 FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS ({}); at or above it one peer UID may \
+                 hold the whole pool and no other workload on the node can obtain or renew an \
+                 identity",
                 self.max_connections_per_uid, self.max_connections
             )));
         }
@@ -342,14 +400,24 @@ impl WorkloadApiAdmissionConfig {
     /// This configuration with every hard ceiling applied.
     ///
     /// The runtime belt to `validate`'s braces: whatever the admission layer is
-    /// handed, it enforces at most the ceiling. A zero is raised to one for the
-    /// same reason — the admission layer has no representation for "unbounded".
+    /// handed, it enforces at most the ceiling. A zero is raised to a finite
+    /// floor for the same reason — the admission layer has no representation for
+    /// "unbounded".
+    ///
+    /// The fair-share invariant survives here too, which is the whole point of
+    /// the belt: the total is floored at [`MIN_MAX_CONNECTIONS`] and the per-UID
+    /// quota is capped at `max_connections - 1`, so no input — `0`, `1`, or a
+    /// value far over either ceiling — can produce a quota equal to the global
+    /// ceiling and hand one UID the entire pool.
     pub fn clamped(&self) -> Self {
+        let max_connections = self
+            .max_connections
+            .clamp(MIN_MAX_CONNECTIONS, MAX_CONNECTIONS_CEILING);
         Self {
-            max_connections: self.max_connections.clamp(1, MAX_CONNECTIONS_CEILING),
+            max_connections,
             max_connections_per_uid: self
                 .max_connections_per_uid
-                .clamp(1, MAX_CONNECTIONS_PER_UID_CEILING),
+                .clamp(1, MAX_CONNECTIONS_PER_UID_CEILING.min(max_connections - 1)),
             max_concurrent_streams: self
                 .max_concurrent_streams
                 .clamp(1, MAX_CONCURRENT_STREAMS_CEILING),
@@ -421,65 +489,114 @@ fn check_duration(
     )
 }
 
+/// High bit of the packed read word: set once a byte has been read from the
+/// peer.
+const FIRST_READ_BIT: u64 = 1 << 63;
+
+/// The remaining 63 bits hold milliseconds since [`ConnectionActivity::base`].
+/// 63 bits of milliseconds is ~292 million years, so the saturation below is a
+/// formality rather than a reachable case.
+const READ_MILLIS_MASK: u64 = FIRST_READ_BIT - 1;
+
+/// What a watchdog observed about one connection at a single instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivitySnapshot {
+    /// Whether any byte has ever been read from the peer. Selects which of the
+    /// two deadlines applies.
+    pub saw_first_read: bool,
+    /// Time since the last byte read from the peer, or since admission when
+    /// there has not been one.
+    pub since_last_read: Duration,
+}
+
 /// Shared per-connection state the watchdog and the I/O wrapper both hold.
+///
+/// The liveness half is **one** atomic word, not two. Split `saw_first_read` and
+/// `last_read_millis` atomics can be observed incoherently on a weakly ordered
+/// CPU: a watchdog could see "the peer has spoken" without the timestamp that
+/// says *when*, evaluate the long idle deadline against a stale `0`, and close a
+/// connection that is actively being read. Packing the flag into the high bit of
+/// the timestamp makes the pair indivisible by construction, and the update is a
+/// `fetch_max` — the encoded word is monotonically non-decreasing (the flag only
+/// ever goes `0 -> 1` and the timestamp only ever grows), so concurrent reads
+/// can never move the deadline backwards either.
 #[derive(Debug)]
-struct ConnectionActivity {
+pub struct ConnectionActivity {
     /// Set once the connection has been force-closed. Every subsequent I/O poll
     /// fails, which is what actually ends the connection.
     closed: AtomicBool,
-    /// Whether any byte has ever been read from the peer. Selects which of the
-    /// two deadlines applies.
-    saw_first_read: AtomicBool,
-    /// Milliseconds, on the shared monotonic base, of the last read from the
-    /// peer (or of admission, before the first read).
-    last_read_millis: AtomicU64,
-    /// Monotonic base for `last_read_millis`.
+    /// `FIRST_READ_BIT | milliseconds-since-base-of-the-last-read`.
+    read_state: AtomicU64,
+    /// Monotonic base for the packed timestamp.
     base: Instant,
     read_waker: AtomicWaker,
     write_waker: AtomicWaker,
 }
 
+impl Default for ConnectionActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionActivity {
-    fn new() -> Self {
+    /// Fresh state for a connection admitted now.
+    pub fn new() -> Self {
         Self {
             closed: AtomicBool::new(false),
-            saw_first_read: AtomicBool::new(false),
-            last_read_millis: AtomicU64::new(0),
+            read_state: AtomicU64::new(0),
             base: Instant::now(),
             read_waker: AtomicWaker::new(),
             write_waker: AtomicWaker::new(),
         }
     }
 
-    fn mark_read(&self) {
-        let elapsed = self.base.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        self.last_read_millis.store(elapsed, Ordering::Relaxed);
-        self.saw_first_read.store(true, Ordering::Relaxed);
+    fn now_millis(&self) -> u64 {
+        self.base
+            .elapsed()
+            .as_millis()
+            .min(u128::from(READ_MILLIS_MASK)) as u64
     }
 
-    fn is_closed(&self) -> bool {
+    /// Record a byte read from the peer, refreshing the idle deadline.
+    ///
+    /// `fetch_max` rather than a store: two threads reading concurrently must
+    /// not be able to publish an older timestamp last, and the first-read flag
+    /// must not be able to be cleared by a racing update that read the clock a
+    /// moment earlier.
+    pub fn mark_read(&self) {
+        let encoded = FIRST_READ_BIT | self.now_millis();
+        self.read_state.fetch_max(encoded, Ordering::AcqRel);
+    }
+
+    /// The first-read flag and the idle age, read coherently from one word.
+    pub fn snapshot(&self) -> ActivitySnapshot {
+        let raw = self.read_state.load(Ordering::Acquire);
+        ActivitySnapshot {
+            saw_first_read: raw & FIRST_READ_BIT != 0,
+            since_last_read: Duration::from_millis(
+                self.now_millis().saturating_sub(raw & READ_MILLIS_MASK),
+            ),
+        }
+    }
+
+    /// Whether the connection has been force-closed.
+    pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
     /// Flip the flag and wake whichever half is parked, so the close is observed
     /// on the next poll rather than whenever the peer happens to write next.
-    fn force_close(&self) -> bool {
+    ///
+    /// Returns `true` for the caller that actually performed the close, so the
+    /// close is counted exactly once however many paths reach it.
+    pub fn force_close(&self) -> bool {
         if self.closed.swap(true, Ordering::AcqRel) {
             return false;
         }
         self.read_waker.wake();
         self.write_waker.wake();
         true
-    }
-
-    /// Time since the last read from the peer.
-    fn since_last_read(&self) -> Duration {
-        let last = Duration::from_millis(self.last_read_millis.load(Ordering::Relaxed));
-        self.base.elapsed().saturating_sub(last)
-    }
-
-    fn saw_first_read(&self) -> bool {
-        self.saw_first_read.load(Ordering::Relaxed)
     }
 }
 
@@ -589,6 +706,17 @@ pub struct ConnectionAdmission {
     total: Arc<Semaphore>,
     per_uid: Arc<Mutex<HashMap<u32, usize>>>,
     force_close: watch::Receiver<bool>,
+    /// Retained only by [`ConnectionAdmission::detached`], and cloned into every
+    /// watchdog it starts.
+    ///
+    /// A watchdog treats a *closed* force-close channel as the shutdown it
+    /// precedes, which is correct when a real listener's sender goes away — but
+    /// a detached gate has no listener, and dropping the sender at the end of
+    /// the constructor would force-close every connection the gate ever admits
+    /// the instant its watchdog first polled. Holding a sender for as long as
+    /// any watchdog exists means a detached gate never force-closes, which is
+    /// exactly what its contract says.
+    force_close_retainer: Option<Arc<watch::Sender<bool>>>,
 }
 
 impl std::fmt::Debug for ConnectionAdmission {
@@ -613,17 +741,26 @@ impl ConnectionAdmission {
             per_uid: Arc::new(Mutex::new(HashMap::new())),
             limits,
             force_close,
+            force_close_retainer: None,
         }
     }
 
     /// Build an admission gate with no force-close channel attached.
     ///
     /// For callers (and tests) that exercise the accounting policy without a
-    /// listener lifecycle. The returned gate never force-closes on shutdown
-    /// because nothing will ever signal it.
+    /// listener lifecycle. The returned gate **never** force-closes: the sender
+    /// is retained by the gate and by every watchdog it starts, so the channel
+    /// it is signalled on stays open for as long as anything could observe it.
+    /// Dropping it here instead would close the channel immediately, and a
+    /// closed channel is precisely the shutdown signal the watchdog acts on —
+    /// so a real socket admitted through a detached gate would be force-closed
+    /// because its constructor returned.
     pub fn detached(limits: WorkloadApiAdmissionConfig) -> Self {
-        let (_tx, rx) = watch::channel(false);
-        Self::new(limits, rx)
+        let (tx, rx) = watch::channel(false);
+        Self {
+            force_close_retainer: Some(Arc::new(tx)),
+            ..Self::new(limits, rx)
+        }
     }
 
     /// The effective (clamped) limits this gate enforces.
@@ -650,31 +787,31 @@ impl ConnectionAdmission {
     /// to a second UID, release on drop — can be exercised directly, which a
     /// single-uid test process cannot do through real sockets.
     pub fn reserve(&self, uid: u32) -> Option<ConnectionPermit> {
-        let total = match Arc::clone(&self.total).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                mesh_metrics::increment_workload_api_connection_rejected(
-                    reject_reason::MAX_CONNECTIONS,
-                );
-                debug!(
-                    peer_uid = uid,
-                    limit = self.limits.max_connections,
-                    "SPIFFE Workload API connection refused: total connection ceiling saturated"
-                );
-                return None;
-            }
-        };
-
-        {
+        // One decision, one lock. The per-UID quota is judged *before* any
+        // global capacity is taken, and the global permit and the per-UID
+        // increment are published together, so an over-quota caller can never
+        // hold a global slot even transiently.
+        //
+        // Taking the global permit first — the obvious ordering — is a
+        // fair-share defect rather than a style preference: a burst of `max`
+        // concurrent reservations from an already-saturated UID would each
+        // acquire a global permit and then queue on this lock, and for as long
+        // as that queue drained the shared pool would read as empty and a
+        // *different*, innocent UID would be refused with `max_connections`.
+        // The per-UID bound exists to make that impossible.
+        //
+        // Nothing inside the critical section can block: `try_acquire_owned` is
+        // non-blocking by definition and there is no `.await` here, so the lock
+        // is held for a few instructions and never across a suspension point.
+        let permit = {
             let mut guard = match self.per_uid.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             let current = guard.get(&uid).copied().unwrap_or(0);
             if current >= self.limits.max_connections_per_uid {
-                // `total` is dropped with this scope, so a per-UID refusal does
-                // not leak a global slot. No entry is created for a refused uid
-                // either, so a probing flood cannot grow the map.
+                // No entry is created for a refused uid, so a probing flood
+                // cannot grow the map, and no global slot was ever taken.
                 drop(guard);
                 mesh_metrics::increment_workload_api_connection_rejected(
                     reject_reason::MAX_CONNECTIONS_PER_UID,
@@ -686,15 +823,53 @@ impl ConnectionAdmission {
                 );
                 return None;
             }
+            let total = match Arc::clone(&self.total).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(guard);
+                    mesh_metrics::increment_workload_api_connection_rejected(
+                        reject_reason::MAX_CONNECTIONS,
+                    );
+                    debug!(
+                        peer_uid = uid,
+                        limit = self.limits.max_connections,
+                        "SPIFFE Workload API connection refused: total connection ceiling \
+                         saturated"
+                    );
+                    return None;
+                }
+            };
             guard.insert(uid, current + 1);
-        }
+            total
+        };
 
         mesh_metrics::increment_workload_api_active_connections();
         Some(ConnectionPermit {
-            _total: total,
+            _total: permit,
             per_uid: Arc::clone(&self.per_uid),
             uid,
         })
+    }
+
+    /// Start a connection watchdog against fresh activity state.
+    ///
+    /// The socketless half of `Self::admit`: it returns the shared state the
+    /// I/O wrapper marks reads on, together with the guard whose drop **cancels**
+    /// the watchdog task. Public because the lifetime contract — prompt
+    /// cancellation when the connection goes away, a deadline close counted
+    /// exactly once, a detached gate that never force-closes — is not otherwise
+    /// observable without waiting out a wall-clock tick against a real socket.
+    ///
+    /// Must be called from within a Tokio runtime, as every accept-loop path is.
+    pub fn start_watchdog(&self) -> (Arc<ConnectionActivity>, ConnectionWatchdog) {
+        let activity = Arc::new(ConnectionActivity::new());
+        let watchdog = spawn_connection_watchdog(
+            Arc::downgrade(&activity),
+            self.limits.clone(),
+            self.force_close.clone(),
+            self.force_close_retainer.clone(),
+        );
+        (activity, watchdog)
     }
 
     /// Admit an accepted socket, or refuse it and close it.
@@ -720,32 +895,76 @@ impl ConnectionAdmission {
                 return None;
             }
         };
+        self.admit_io(uid, stream)
+    }
+
+    /// Charge `uid` for one connection and wrap `stream` in the permit- and
+    /// watchdog-owning transport.
+    ///
+    /// The transport half of `Self::admit`, separated from the
+    /// `SO_PEERCRED` read because the principal is not always established the
+    /// same way — and because the poll-level behaviour of the wrapper (waking a
+    /// parked write on force close, failing every subsequent poll) is a property
+    /// of the wrapper rather than of Unix sockets, so it is exercised against an
+    /// inner I/O whose readiness the caller controls.
+    pub fn admit_io<S>(&self, uid: u32, stream: S) -> Option<AdmittedStream<S>> {
         let permit = self.reserve(uid)?;
-        let activity = Arc::new(ConnectionActivity::new());
-        spawn_connection_watchdog(
-            Arc::downgrade(&activity),
-            self.limits.clone(),
-            self.force_close.clone(),
-        );
-        Some(AdmittedUnixStream {
+        let (activity, watchdog) = self.start_watchdog();
+        Some(AdmittedStream {
             inner: stream,
             activity,
+            _watchdog: watchdog,
             _permit: permit,
         })
     }
 }
 
+/// A running connection watchdog, owned by the connection it watches.
+///
+/// Dropping it **aborts** the task. That is what makes the watchdog's lifetime
+/// connection-owned rather than tick-owned: connection concurrency is bounded by
+/// the admission ceiling, but connection *churn* is not, so a watchdog that
+/// merely noticed its `Weak` had expired on the next tick would leave
+/// arbitrarily many detached tasks asleep for up to one watchdog tick each.
+/// The close paths stay exactly-once regardless: a deadline or force close is
+/// published through [`ConnectionActivity::force_close`], whose swap admits one
+/// winner, and the counter is incremented only by that winner.
+#[derive(Debug)]
+pub struct ConnectionWatchdog {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectionWatchdog {
+    /// A handle that observes this watchdog's cancellation after the guard —
+    /// and therefore the connection — has been dropped.
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.handle.abort_handle()
+    }
+
+    /// Whether the watchdog task has already finished.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+impl Drop for ConnectionWatchdog {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Watch a single connection's deadlines and the listener's force-close signal.
 ///
-/// Holds only a [`Weak`] reference, so the task ends by itself once tonic drops
-/// the connection — the connection's lifetime owns the watchdog, not the other
-/// way round, and the number of live watchdogs is bounded by the connection
-/// ceiling.
+/// Holds only a [`Weak`] reference, so it can never keep the connection alive,
+/// and its [`ConnectionWatchdog`] guard cancels it the moment the connection is
+/// dropped. The number of live watchdogs is therefore bounded by the number of
+/// live connections, which is bounded by the connection ceiling.
 fn spawn_connection_watchdog(
     activity: Weak<ConnectionActivity>,
     limits: WorkloadApiAdmissionConfig,
     mut force_close: watch::Receiver<bool>,
-) {
+    force_close_retainer: Option<Arc<watch::Sender<bool>>>,
+) -> ConnectionWatchdog {
     let tick = limits
         .initial_connection_timeout
         .min(limits.idle_timeout)
@@ -753,7 +972,11 @@ fn spawn_connection_watchdog(
         / 4;
     let tick = tick.clamp(WATCHDOG_MIN_TICK, WATCHDOG_MAX_TICK);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        // Held for the task's whole life. In detached mode this is what keeps
+        // the force-close channel open, so `changed()` never resolves with the
+        // `Err` the loop below reads as shutdown.
+        let _force_close_retainer = force_close_retainer;
         loop {
             let forced = tokio::select! {
                 _ = tokio::time::sleep(tick) => false,
@@ -777,7 +1000,12 @@ fn spawn_connection_watchdog(
                 }
                 return;
             }
-            let (deadline, reason) = if activity.saw_first_read() {
+            // One coherent observation of the packed liveness word: the flag
+            // that selects the deadline and the age it is compared against are
+            // read together, so a connection being actively read can never be
+            // judged against a timestamp that predates its first read.
+            let observed = activity.snapshot();
+            let (deadline, reason) = if observed.saw_first_read {
                 (limits.idle_timeout, close_reason::IDLE_TIMEOUT)
             } else {
                 (
@@ -785,7 +1013,7 @@ fn spawn_connection_watchdog(
                     close_reason::INITIAL_TIMEOUT,
                 )
             };
-            if activity.since_last_read() >= deadline {
+            if observed.since_last_read >= deadline {
                 if activity.force_close() {
                     mesh_metrics::increment_workload_api_connection_closed(reason);
                     debug!(
@@ -798,28 +1026,45 @@ fn spawn_connection_watchdog(
             }
         }
     });
+    ConnectionWatchdog { handle }
 }
 
-/// An accepted Workload API connection that owns its admission permit.
+/// An accepted Workload API connection that owns its admission permit and its
+/// watchdog.
 ///
-/// The permit is a private field with no accessor precisely so it cannot be
-/// separated from the connection: dropping the stream is the only way to end
-/// the connection, and it is therefore also the only way to release capacity.
-#[cfg(unix)]
-pub struct AdmittedUnixStream {
-    inner: tokio::net::UnixStream,
+/// Both are private fields with no accessor precisely so they cannot be
+/// separated from the connection: dropping the stream is the only way to end the
+/// connection, and it is therefore also the only way to release capacity and the
+/// only way to cancel the watchdog.
+pub struct AdmittedStream<S> {
+    inner: S,
     activity: Arc<ConnectionActivity>,
+    _watchdog: ConnectionWatchdog,
     _permit: ConnectionPermit,
 }
 
+/// The accepted Workload API connection as the listener serves it.
 #[cfg(unix)]
-impl std::fmt::Debug for AdmittedUnixStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmittedUnixStream").finish_non_exhaustive()
+pub type AdmittedUnixStream = AdmittedStream<tokio::net::UnixStream>;
+
+impl<S> AdmittedStream<S> {
+    /// The shared per-connection state the watchdog publishes closes through.
+    ///
+    /// Read-only in effect for the transport: the wrapper marks reads on it and
+    /// consults [`ConnectionActivity::is_closed`], and a caller can observe the
+    /// same state — but the permit and watchdog remain inaccessible, so the
+    /// connection's lifetime accounting cannot be detached from the connection.
+    pub fn activity(&self) -> &Arc<ConnectionActivity> {
+        &self.activity
     }
 }
 
-#[cfg(unix)]
+impl<S> std::fmt::Debug for AdmittedStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedStream").finish_non_exhaustive()
+    }
+}
+
 fn aborted() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
@@ -827,8 +1072,7 @@ fn aborted() -> io::Error {
     )
 }
 
-#[cfg(unix)]
-impl tokio::io::AsyncRead for AdmittedUnixStream {
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AdmittedStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -863,8 +1107,7 @@ impl tokio::io::AsyncRead for AdmittedUnixStream {
     }
 }
 
-#[cfg(unix)]
-impl tokio::io::AsyncWrite for AdmittedUnixStream {
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for AdmittedStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -911,12 +1154,28 @@ impl tokio::io::AsyncWrite for AdmittedUnixStream {
         self.inner.is_write_vectored()
     }
 
+    /// Same register-then-recheck discipline as the write polls, and for the
+    /// same reason: a connection parked in `poll_flush` on an inner socket whose
+    /// buffer is full is exactly a connection the force close has to reach, and
+    /// delegating a bare `Pending` here would register only the *inner*
+    /// socket's waker — which nothing wakes when the peer has stopped reading.
+    /// The bounded settle at shutdown would then have to wait out the settle
+    /// window instead of being observed immediately.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.activity.is_closed() {
             return Poll::Ready(Err(aborted()));
         }
-        Pin::new(&mut this.inner).poll_flush(cx)
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Pending => {
+                this.activity.write_waker.register(cx.waker());
+                if this.activity.is_closed() {
+                    return Poll::Ready(Err(aborted()));
+                }
+                Poll::Pending
+            }
+            other => other,
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -926,7 +1185,20 @@ impl tokio::io::AsyncWrite for AdmittedUnixStream {
             // completes rather than looping on an error it cannot act on.
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending => {
+                this.activity.write_waker.register(cx.waker());
+                // The post-close result is deliberately the same `Ok(())` the
+                // fast path above returns: a shutdown racing the force close
+                // must complete, not fail, or the caller loops on an error it
+                // cannot act on.
+                if this.activity.is_closed() {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending
+            }
+            other => other,
+        }
     }
 }
 
@@ -953,7 +1225,10 @@ impl tonic::transport::server::Connected for AdmittedUnixStream {
 ///
 /// Ends immediately when `stop` flips, so shutdown stops admission at once
 /// rather than admitting one more connection per accept the runtime happens to
-/// have already completed.
+/// have already completed — and ends on a **fatal** listener error, so a socket
+/// that can never accept again terminates the serve task and fires the
+/// termination signal mesh mode watches, instead of retrying a permanent failure
+/// forever inside one non-yielding future.
 #[cfg(unix)]
 pub fn admission_stream(
     listener: tokio::net::UnixListener,
@@ -964,6 +1239,7 @@ pub fn admission_stream(
         listener: tokio::net::UnixListener,
         admission: ConnectionAdmission,
         stop: watch::Receiver<bool>,
+        retry: AcceptRetryPolicy,
     }
 
     futures_util::stream::unfold(
@@ -971,6 +1247,7 @@ pub fn admission_stream(
             listener,
             admission,
             stop,
+            retry: AcceptRetryPolicy::new(),
         },
         |mut state| async move {
             loop {
@@ -996,6 +1273,7 @@ pub fn admission_stream(
                             drop(stream);
                             return None;
                         }
+                        state.retry.on_accepted();
                         if let Some(admitted) = state.admission.admit(stream) {
                             return Some((Ok(admitted), state));
                         }
@@ -1003,15 +1281,37 @@ pub fn admission_stream(
                         // an immediate EOF instead of a connection that lingers.
                     }
                     Err(error) => {
-                        warn!(
-                            error = %error,
-                            "SPIFFE Workload API accept failed"
-                        );
-                        if is_resource_exhaustion(&error) {
-                            // Retrying a descriptor exhaustion immediately would
-                            // spin a worker at full speed until something else
-                            // released a descriptor.
-                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        let failure = classify_accept_error(&error);
+                        match state.retry.on_error(failure) {
+                            AcceptDecision::Terminate => {
+                                error!(
+                                    error = %error,
+                                    "SPIFFE Workload API accept failed fatally; ending the \
+                                     listener so the serve task terminates and mesh mode observes \
+                                     the loss of the surface"
+                                );
+                                return None;
+                            }
+                            AcceptDecision::Retry { backoff, log } => {
+                                if log {
+                                    warn!(
+                                        error = %error,
+                                        failure = ?failure,
+                                        consecutive_failures = state.retry.consecutive_failures(),
+                                        backoff_ms = backoff.as_millis() as u64,
+                                        "SPIFFE Workload API accept failed; retrying"
+                                    );
+                                }
+                                if backoff.is_zero() {
+                                    // Always a suspension point, even with no
+                                    // backoff, so a burst of per-connection
+                                    // failures can never become a non-yielding
+                                    // loop on a runtime worker.
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    tokio::time::sleep(backoff).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -1020,14 +1320,117 @@ pub fn admission_stream(
     )
 }
 
-/// Whether an `accept(2)` failure is a resource exhaustion that will persist
-/// until something unrelated releases capacity.
+/// How an `accept(2)` failure should be treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptFailure {
+    /// A per-connection failure an accept loop is expected to retry at once:
+    /// the peer went away, or the call was interrupted. The listener is fine.
+    Transient,
+    /// A resource exhaustion that persists until something unrelated releases
+    /// capacity. Retryable, but only behind a backoff.
+    Resource,
+    /// The listener itself is unusable — a closed or invalid descriptor, a
+    /// socket that is not a socket. Retrying is a spin that can never succeed,
+    /// so admission ends and the serve task's termination guard fires.
+    Fatal,
+}
+
+/// Classify an `accept(2)` failure.
+///
+/// An error with no OS code is classified `Fatal`: it is not one of the
+/// enumerated recoverable conditions, and ending the listener surfaces it
+/// through mesh mode's termination path rather than hiding it in a retry loop.
 #[cfg(unix)]
-fn is_resource_exhaustion(error: &io::Error) -> bool {
+pub fn classify_accept_error(error: &io::Error) -> AcceptFailure {
     let Some(code) = error.raw_os_error() else {
-        return false;
+        return AcceptFailure::Fatal;
     };
-    code == libc::EMFILE || code == libc::ENFILE || code == libc::ENOBUFS || code == libc::ENOMEM
+    if code == libc::EMFILE
+        || code == libc::ENFILE
+        || code == libc::ENOBUFS
+        || code == libc::ENOMEM
+    {
+        return AcceptFailure::Resource;
+    }
+    // Compared rather than matched: `EAGAIN` and `EWOULDBLOCK` are the same
+    // value on Linux, and two equal constants in one match are an unreachable
+    // pattern.
+    if code == libc::ECONNABORTED
+        || code == libc::EINTR
+        || code == libc::EAGAIN
+        || code == libc::EWOULDBLOCK
+        || code == libc::EPROTO
+        || code == libc::ECONNRESET
+        || code == libc::ETIMEDOUT
+    {
+        return AcceptFailure::Transient;
+    }
+    AcceptFailure::Fatal
+}
+
+/// What the accept loop should do about one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptDecision {
+    /// Try again after `backoff`, logging this occurrence only when `log`.
+    Retry { backoff: Duration, log: bool },
+    /// Stop accepting. The incoming stream ends and the serve task exits.
+    Terminate,
+}
+
+/// The accept loop's bounded retry and log-rate state machine.
+///
+/// Separated from the loop so the policy is exercised directly: a state machine
+/// driven by injected failure classes is deterministic, while a real listener
+/// cannot be made to return `EMFILE` on demand from a test.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptRetryPolicy {
+    consecutive: u32,
+}
+
+impl AcceptRetryPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A successful accept clears the run, so an isolated failure never inherits
+    /// an old backoff.
+    pub fn on_accepted(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Consecutive failures since the last successful accept.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Decide what one failure means.
+    ///
+    /// Backoff doubles from [`ACCEPT_BACKOFF`] and saturates at
+    /// [`ACCEPT_MAX_BACKOFF`], so a condition that persists costs a bounded
+    /// fraction of one worker. Logging is deliberately *not* per occurrence:
+    /// a persistent `EMFILE` retried every second would otherwise emit a warn
+    /// per retry for as long as the node stayed exhausted, which is itself a
+    /// disk-exhaustion primitive. The first three are logged, then powers of
+    /// two, so the run stays visible without flooding.
+    pub fn on_error(&mut self, failure: AcceptFailure) -> AcceptDecision {
+        if failure == AcceptFailure::Fatal {
+            return AcceptDecision::Terminate;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        let attempt = self.consecutive;
+        let backoff = if failure == AcceptFailure::Transient && attempt <= TRANSIENT_RETRY_BURST {
+            Duration::ZERO
+        } else {
+            let steps = attempt.saturating_sub(1).min(5);
+            ACCEPT_BACKOFF
+                .saturating_mul(1u32 << steps)
+                .min(ACCEPT_MAX_BACKOFF)
+        };
+        AcceptDecision::Retry {
+            backoff,
+            log: attempt <= 3 || attempt.is_power_of_two(),
+        }
+    }
 }
 
 /// Resolve once a `watch::Sender<bool>` has published `true`, or once the sender
