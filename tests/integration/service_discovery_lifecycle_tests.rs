@@ -159,6 +159,9 @@ struct ScriptedDiscoverer {
     fail: Arc<AtomicBool>,
     hang: Arc<AtomicBool>,
     panic_until_call: u64,
+    /// Delay before a scripted panic, so a test can move registry state while
+    /// the poller is provably still inside `discover()`.
+    panic_delay: std::time::Duration,
 }
 
 impl ScriptedDiscoverer {
@@ -169,6 +172,7 @@ impl ScriptedDiscoverer {
             fail: Arc::new(AtomicBool::new(false)),
             hang: Arc::new(AtomicBool::new(false)),
             panic_until_call: 0,
+            panic_delay: std::time::Duration::ZERO,
         }
     }
 
@@ -178,6 +182,15 @@ impl ScriptedDiscoverer {
             ..Self::new(vec![target("recovered.local", 8080)])
         }
     }
+
+    /// Always panics, but only after `panic_delay`.
+    fn panicking_slowly(panic_delay: std::time::Duration) -> Self {
+        Self {
+            panic_until_call: u64::MAX,
+            panic_delay,
+            ..Self::new(Vec::new())
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -185,6 +198,9 @@ impl ServiceDiscoverer for ScriptedDiscoverer {
     async fn discover(&self) -> Result<DiscoverySnapshot, anyhow::Error> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call <= self.panic_until_call {
+            if !self.panic_delay.is_zero() {
+                tokio::time::sleep(self.panic_delay).await;
+            }
             panic!("scripted discovery panic on call {call}");
         }
         if self.fail.load(Ordering::SeqCst) {
@@ -1272,4 +1288,367 @@ async fn per_upstream_unbounded_retention_is_honored_under_the_opt_in() {
     health::override_discovery_staleness_policy_for_test(None);
 
     assert_eq!(staleness.max_stale, None);
+}
+
+// ── #3717 × #3721: expiry must lose to cancellation and shutdown ──────
+//
+// The staleness timer and the lifecycle signals race by construction: a
+// reconcile cancels a task, and the manager registers the replacement, while
+// the outgoing task may already be inside its expiry path. A stale generation
+// that wins that race installs static-only targets over the routing state its
+// replacement is about to own, and consumes the replacement's expiry episode so
+// the real withdrawal is never reported. These tests drive the production
+// expiry application at an exact point instead of racing a live poller.
+
+/// Probe over the production staleness-expiry path for one generation.
+fn expiry_probe(
+    upstream_id: &str,
+    lb_cache: Arc<LoadBalancerCache>,
+    static_targets: Vec<UpstreamTarget>,
+    policy: SdStalePolicy,
+    generation: u64,
+) -> ferrum_edge::service_discovery::StalenessExpiryProbeForTest {
+    ferrum_edge::service_discovery::staleness_expiry_probe_for_test(
+        &default_namespace(),
+        upstream_id,
+        "scripted",
+        lb_cache,
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        static_targets,
+        LoadBalancerAlgorithm::RoundRobin,
+        1,
+        60,
+        policy,
+        generation,
+        true,
+    )
+}
+
+/// Install the merged view a poller would have published before it went stale.
+fn seed_published_targets(lb_cache: &LoadBalancerCache, upstream_id: &str) {
+    lb_cache.update_targets(
+        &default_namespace(),
+        upstream_id,
+        vec![target("static.local", 9000), target("discovered.local", 8080)],
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
+}
+
+#[tokio::test]
+async fn a_canceled_generation_neither_withdraws_nor_claims_its_expiry_episode() {
+    let _guard = isolated().await;
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "cancel-vs-expiry",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let withdrawals_before = metrics.service_discovery_stale_withdrawals_total();
+    let expiries_before = metrics.service_discovery_stale_expiries_total();
+
+    let mut probe = expiry_probe(
+        "cancel-vs-expiry",
+        Arc::clone(&lb_cache),
+        statics,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+    seed_published_targets(&lb_cache, "cancel-vs-expiry");
+    probe.set_installed_discovered(vec![target("discovered.local", 8080)]);
+
+    // A reconcile cancels this task before registering its replacement.
+    probe.cancel();
+
+    assert_eq!(
+        probe.apply_expiry(),
+        ferrum_edge::service_discovery::StalenessExpiryOutcome::Aborted,
+        "a canceled task must abort its expiry application, not publish it"
+    );
+    assert!(
+        lb_hosts(&lb_cache, "cancel-vs-expiry").contains(&"discovered.local".to_string()),
+        "a canceled task must not install static-only targets over the routing \
+         state its replacement is about to own"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&probe.key),
+        Some(false),
+        "a canceled task must not claim the expiry episode"
+    );
+    assert_eq!(
+        health::expiry_retry_attempts_for_test(&probe.key),
+        Some(0),
+        "an abort is not a publication failure and must not schedule a retry"
+    );
+    assert_eq!(
+        metrics.service_discovery_stale_withdrawals_total(),
+        withdrawals_before,
+        "an aborted expiry must not record a withdrawal"
+    );
+    assert_eq!(
+        metrics.service_discovery_stale_expiries_total(),
+        expiries_before,
+        "an aborted expiry must not record an expiry"
+    );
+}
+
+#[tokio::test]
+async fn a_shutting_down_generation_does_not_claim_a_retain_policy_expiry() {
+    let _guard = isolated().await;
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "shutdown-vs-expiry",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let expiries_before = metrics.service_discovery_stale_expiries_total();
+
+    // `retain` never touches routing, but claiming its episode is still a
+    // lifecycle-owned mutation: a task on its way out must not consume it.
+    let mut probe = expiry_probe(
+        "shutdown-vs-expiry",
+        Arc::clone(&lb_cache),
+        statics,
+        SdStalePolicy::Retain,
+        1,
+    );
+    seed_published_targets(&lb_cache, "shutdown-vs-expiry");
+    probe.shutdown();
+
+    assert_eq!(
+        probe.apply_expiry(),
+        ferrum_edge::service_discovery::StalenessExpiryOutcome::Aborted,
+        "global shutdown must abort the expiry application"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&probe.key),
+        Some(false),
+        "a shutting-down task must not claim the expiry episode"
+    );
+    assert_eq!(
+        metrics.service_discovery_stale_expiries_total(),
+        expiries_before
+    );
+
+    // Without the lifecycle signal the same probe applies the retain expiry.
+    let mut fresh = expiry_probe(
+        "shutdown-vs-expiry",
+        Arc::clone(&lb_cache),
+        Vec::new(),
+        SdStalePolicy::Retain,
+        2,
+    );
+    assert_eq!(
+        fresh.apply_expiry(),
+        ferrum_edge::service_discovery::StalenessExpiryOutcome::Applied
+    );
+    assert_eq!(health::expiry_applied_for_test(&fresh.key), Some(true));
+    assert!(metrics.service_discovery_stale_expiries_total() > expiries_before);
+}
+
+#[tokio::test]
+async fn a_replaced_generation_reports_supersession_rather_than_publishing() {
+    let _guard = isolated().await;
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "replaced-vs-expiry",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+
+    let mut probe = expiry_probe(
+        "replaced-vs-expiry",
+        Arc::clone(&lb_cache),
+        statics,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+    seed_published_targets(&lb_cache, "replaced-vs-expiry");
+    probe.set_installed_discovered(vec![target("discovered.local", 8080)]);
+
+    // The reconcile completed: a replacement generation owns the key.
+    health::register_task_for_test(&probe.key, 99, "scripted", scripted_staleness());
+
+    assert_eq!(
+        probe.apply_expiry(),
+        ferrum_edge::service_discovery::StalenessExpiryOutcome::Superseded,
+        "supersession is distinct from an abort and from a publication failure"
+    );
+    assert!(
+        lb_hosts(&lb_cache, "replaced-vs-expiry").contains(&"discovered.local".to_string()),
+        "a superseded generation must not overwrite the replacement's routing state"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&probe.key),
+        Some(false),
+        "a superseded task must not consume the replacement's expiry episode"
+    );
+    assert_eq!(
+        health::expiry_retry_attempts_for_test(&probe.key),
+        Some(0),
+        "supersession must not be retried as a publication failure"
+    );
+}
+
+#[tokio::test]
+async fn a_lifecycle_abort_inside_the_withdrawal_fence_claims_nothing() {
+    let _guard = isolated().await;
+
+    let key = task_key("fenced-withdrawal-abort");
+    health::register_task_for_test(&key, 1, "scripted", scripted_staleness());
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let replacement_started = Arc::new(AtomicBool::new(false));
+    let decided = Arc::new(AtomicBool::new(false));
+
+    let holder = {
+        let key = key.clone();
+        let entered = Arc::clone(&entered);
+        let replacement_started = Arc::clone(&replacement_started);
+        let decided = Arc::clone(&decided);
+        std::thread::spawn(move || {
+            health::publish_withdrawal_under_fence_with_abort_for_test(&key, 1, || {
+                entered.store(true, Ordering::SeqCst);
+                // Hold the fence across the whole window in which a reconcile
+                // tries to install the replacement generation, then decide —
+                // inside the fence — that the lifecycle signal won.
+                spin_until(|| replacement_started.load(Ordering::SeqCst));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                decided.store(true, Ordering::SeqCst);
+                None
+            })
+        })
+    };
+
+    spin_until(|| entered.load(Ordering::SeqCst));
+    replacement_started.store(true, Ordering::SeqCst);
+    health::register_task_for_test(&key, 2, "scripted", scripted_staleness());
+
+    assert!(
+        decided.load(Ordering::SeqCst),
+        "a replacement generation registered while the withdrawal fence was held; \
+         the lifecycle check and the routing mutation are not atomic"
+    );
+    assert_eq!(
+        holder.join().expect("fence thread"),
+        health::FencedWithdrawalForTest::Aborted,
+        "a lifecycle abort inside the fence is neither a publication nor a failure"
+    );
+    assert_eq!(
+        health::expiry_applied_for_test(&key),
+        Some(false),
+        "an aborted withdrawal must not claim any expiry episode"
+    );
+}
+
+// ── #3717 × #3721: expiry during supervisor restart backoff ───────────
+
+/// Bounded variant of [`wait_for`]: at most `polls` × 10ms.
+async fn wait_for_within(polls: u32, mut predicate: impl FnMut() -> bool) -> bool {
+    for _ in 0..polls {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    predicate()
+}
+
+#[tokio::test]
+async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backoff() {
+    let _guard = isolated().await;
+
+    let statics = vec![target("static.local", 9000)];
+    let config = config_with(vec![upstream_with_sd(
+        "crash-loop-stale",
+        statics.clone(),
+        None,
+    )]);
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    // Every poll panics after a short delay, so the test can move the staleness
+    // anchor while the poller is provably still inside `discover()`.
+    let discoverer = Arc::new(ScriptedDiscoverer::panicking_slowly(
+        std::time::Duration::from_millis(500),
+    ));
+    let calls = Arc::clone(&discoverer.calls);
+    let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let withdrawals_before = metrics.service_discovery_stale_withdrawals_total();
+
+    // Stand in for the snapshot this upstream published before it went bad.
+    seed_published_targets(&lb_cache, "crash-loop-stale");
+
+    let task = spawn_supervised_discovery_task_for_test(
+        &default_namespace(),
+        "crash-loop-stale",
+        "scripted",
+        discoverer,
+        Arc::clone(&lb_cache),
+        None,
+        Arc::new(HealthChecker::new()),
+        DnsCache::new(Default::default()),
+        statics,
+        LoadBalancerAlgorithm::RoundRobin,
+        1,
+        // Long enough that the bound never elapses on its own: only the forced
+        // anchor below expires this task.
+        600,
+        SdStalePolicy::Withdraw,
+        1,
+    );
+
+    // Two crashes in, the supervisor's next backoff window is seconds long.
+    assert!(
+        wait_for(|| calls.load(Ordering::SeqCst) >= 3).await,
+        "the poller never entered a crash loop"
+    );
+    // Expire the task while the third poll is still sleeping toward its panic,
+    // so the deadline is already elapsed when the supervisor re-arms it at the
+    // top of the following backoff window.
+    assert!(health::age_anchor_for_test(&task.key, 6000));
+
+    // The supervisor must apply expiry inside that backoff window. Waiting for
+    // the next poller generation instead would take the whole (multi-second,
+    // and still growing) backoff, and a poller that panics before reaching its
+    // own timer would never apply it at all.
+    assert!(
+        wait_for_within(200, || {
+            health::expiry_applied_for_test(&task.key) == Some(true)
+        })
+        .await,
+        "a crash-looping generation must still expire during restart backoff"
+    );
+
+    let hosts = lb_hosts(&lb_cache, "crash-loop-stale");
+    assert!(
+        !hosts.contains(&"discovered.local".to_string()),
+        "expired discovered targets must be withdrawn from routing"
+    );
+    assert!(
+        hosts.contains(&"static.local".to_string()),
+        "static targets must survive a staleness withdrawal"
+    );
+    assert!(
+        metrics.service_discovery_stale_withdrawals_total() > withdrawals_before,
+        "the withdrawal must be recorded exactly as a poller-applied one is"
+    );
+    assert!(
+        health::snapshot()
+            .upstreams
+            .iter()
+            .any(|u| u.upstream == task.key && u.withdrawn),
+        "the withdrawal must be visible in per-upstream health"
+    );
+
+    let _ = task.cancel_tx.send(true);
+    let _ = task.handle.await;
 }

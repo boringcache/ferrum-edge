@@ -404,19 +404,49 @@ pub(crate) fn publish_if_current<T>(
     FencedPublish::Published(result)
 }
 
+/// What the caller's withdrawal closure did inside the fence.
+pub(crate) enum WithdrawalAttempt<E> {
+    /// Static-only targets were installed over the discovered set.
+    Published,
+    /// Installation was attempted and failed; discovered targets remain.
+    Failed(E),
+    /// Cancellation or global shutdown was observed inside the fence,
+    /// immediately before the routing mutation, so nothing was written.
+    Aborted,
+}
+
+/// Outcome of a fenced staleness withdrawal for a still-current generation.
+pub(crate) enum FencedWithdrawal<E> {
+    /// Static-only targets were installed. `claimed` is whether this call
+    /// claimed the expiry episode (exactly one claim per episode).
+    Published { claimed: bool },
+    /// The installation failed; the episode stays unclaimed so the caller can
+    /// keep failing closed and retry.
+    Failed(E),
+    /// A lifecycle signal won inside the fence: nothing published, nothing
+    /// claimed, nothing to retry.
+    Aborted,
+}
+
 /// Publish a staleness withdrawal and claim its expiry episode under one fence.
 ///
-/// Returns the publication result plus whether this call claimed the episode,
-/// so the caller keeps emitting exactly one operator warning and one metric per
+/// Returns what the closure did plus whether this call claimed the episode, so
+/// the caller keeps emitting exactly one operator warning and one metric per
 /// episode. Claiming inside the fence keeps a superseded generation from
 /// consuming the replacement's episode, and gives the static-only
 /// republication the same anti-race guarantee as [`publish_if_current`].
+///
+/// The closure decides *inside* the fence whether the withdrawal may still be
+/// written at all: a task canceled (or a gateway shut down) after the staleness
+/// timer fired must neither install static-only targets nor consume the
+/// episode, and a [`WithdrawalAttempt::Aborted`] result is not a publication
+/// failure — see [`FencedWithdrawal`].
 pub(crate) fn publish_withdrawal_if_current<E>(
     key: &str,
     generation: u64,
-    publish: impl FnOnce() -> Result<(), E>,
-) -> FencedPublish<(Result<(), E>, bool)> {
-    let result;
+    publish: impl FnOnce() -> WithdrawalAttempt<E>,
+) -> FencedPublish<FencedWithdrawal<E>> {
+    let outcome;
     let claimed;
     {
         let Some(mut entry) = registry().get_mut(key) else {
@@ -425,22 +455,32 @@ pub(crate) fn publish_withdrawal_if_current<E>(
         if entry.generation != generation {
             return FencedPublish::Superseded;
         }
-        result = publish();
-        claimed = if result.is_ok() && !entry.expiry_applied {
-            entry.expiry_applied = true;
-            entry.withdrawn = true;
-            entry.expiry_retry_at = None;
-            entry.expiry_retry_attempts = 0;
-            true
-        } else {
-            false
-        };
+        match publish() {
+            WithdrawalAttempt::Published => {
+                claimed = !entry.expiry_applied;
+                if claimed {
+                    entry.expiry_applied = true;
+                    entry.withdrawn = true;
+                    entry.expiry_retry_at = None;
+                    entry.expiry_retry_attempts = 0;
+                }
+                outcome = FencedWithdrawal::Published { claimed };
+            }
+            WithdrawalAttempt::Failed(error) => {
+                claimed = false;
+                outcome = FencedWithdrawal::Failed(error);
+            }
+            WithdrawalAttempt::Aborted => {
+                claimed = false;
+                outcome = FencedWithdrawal::Aborted;
+            }
+        }
     }
     if claimed {
         // Never inside the fence: the recompute walks every shard.
         refresh_coarse_aggregate();
     }
-    FencedPublish::Published((result, claimed))
+    FencedPublish::Published(outcome)
 }
 
 /// Register (or replace) the health entry for a newly started task generation.
@@ -810,16 +850,72 @@ pub fn publish_under_fence_for_test<T>(
 }
 
 /// Drive the staleness-withdrawal fence exactly as the discovery loop's expiry
-/// path does. `None` means the generation was superseded and `publish` never
-/// ran; otherwise the publication result and whether this call claimed the
-/// expiry episode.
+/// path does when no lifecycle signal is pending. `None` means the generation
+/// was superseded and `publish` never ran; otherwise the publication result and
+/// whether this call claimed the expiry episode.
+///
+/// The adapter below never aborts, so the abort outcome is unreachable here;
+/// use [`publish_withdrawal_under_fence_with_abort_for_test`] to cover a
+/// cancellation or shutdown observed inside the fence.
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn publish_withdrawal_under_fence_for_test(
     key: &str,
     generation: u64,
     publish: impl FnOnce() -> Result<(), String>,
 ) -> Option<(Result<(), String>, bool)> {
-    publish_withdrawal_if_current(key, generation, publish).published()
+    let attempt = || match publish() {
+        Ok(()) => WithdrawalAttempt::Published,
+        Err(error) => WithdrawalAttempt::Failed(error),
+    };
+    match publish_withdrawal_if_current(key, generation, attempt).published()? {
+        FencedWithdrawal::Published { claimed } => Some((Ok(()), claimed)),
+        FencedWithdrawal::Failed(error) => Some((Err(error), false)),
+        // Unreachable for the adapter above; reported as "did not publish"
+        // rather than panicking in a shipped code path.
+        FencedWithdrawal::Aborted => None,
+    }
+}
+
+/// Test-facing projection of a fenced staleness-withdrawal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub enum FencedWithdrawalForTest {
+    /// Static-only targets were installed; `claimed` marks the one call per
+    /// episode that claimed it.
+    Published { claimed: bool },
+    /// Installation was attempted and failed.
+    Failed,
+    /// A lifecycle signal was observed inside the fence; nothing was written.
+    Aborted,
+    /// The generation no longer owned the key; the closure never ran.
+    Superseded,
+}
+
+/// Drive the staleness-withdrawal fence with a closure that may decide, inside
+/// the fence, that cancellation or shutdown won (`None`).
+///
+/// Test-only seam for the interleaving contract of the abort path: while the
+/// closure runs, a concurrent [`register_task_for_test`] for the same key
+/// cannot complete, and an abort must claim nothing.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn publish_withdrawal_under_fence_with_abort_for_test(
+    key: &str,
+    generation: u64,
+    publish: impl FnOnce() -> Option<Result<(), String>>,
+) -> FencedWithdrawalForTest {
+    let attempt = || match publish() {
+        Some(Ok(())) => WithdrawalAttempt::Published,
+        Some(Err(error)) => WithdrawalAttempt::Failed(error),
+        None => WithdrawalAttempt::Aborted,
+    };
+    match publish_withdrawal_if_current(key, generation, attempt) {
+        FencedPublish::Superseded => FencedWithdrawalForTest::Superseded,
+        FencedPublish::Published(FencedWithdrawal::Published { claimed }) => {
+            FencedWithdrawalForTest::Published { claimed }
+        }
+        FencedPublish::Published(FencedWithdrawal::Failed(_)) => FencedWithdrawalForTest::Failed,
+        FencedPublish::Published(FencedWithdrawal::Aborted) => FencedWithdrawalForTest::Aborted,
+    }
 }
 
 /// Whether `key`'s current entry has its expiry episode applied. Test-only

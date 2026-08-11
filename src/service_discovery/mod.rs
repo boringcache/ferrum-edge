@@ -26,7 +26,9 @@ use crate::load_balancer::{LoadBalancerCache, target_host_port_key};
 use crate::plugins::PluginHttpClient;
 use crate::request_epoch::RequestEpochStore;
 use dashmap::DashMap;
-use health::{DiscoveryFailureReason, DiscoveryStaleness, FencedPublish};
+use health::{
+    DiscoveryFailureReason, DiscoveryStaleness, FencedPublish, FencedWithdrawal, WithdrawalAttempt,
+};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -909,32 +911,71 @@ async fn supervise_discovery_task(
         registry.record_service_discovery_task_restart();
 
         // Wait out the backoff, but stay responsive to cancel/shutdown so a
-        // reconcile during backoff does not have to wait for the full delay.
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
-            _ = wait_for_cancel(cancel_rx.clone()) => {
-                health::record_clean_exit(&ctx.key, ctx.generation);
-                info!(
-                    upstream = %ctx.upstream_id,
-                    generation = ctx.generation,
-                    "Service discovery: task canceled during restart backoff"
-                );
-                return;
-            }
-            _ = async {
-                if let Some(ref rx) = shutdown_rx {
-                    wait_for_shutdown(rx.clone()).await;
-                } else {
-                    std::future::pending::<()>().await;
+        // reconcile during backoff does not have to wait for the full delay —
+        // and keep the staleness deadline armed. A poller that panics before it
+        // ever reaches its own timer would otherwise postpone fail-closed
+        // expiry/withdrawal for as long as it keeps crash-looping, because the
+        // backoff grows while the staleness bound stays fixed (issue #3717).
+        // The crash-looping generation is still the current owner, so applying
+        // expiry here is the same fenced action its poller would have taken.
+        let backoff_deadline = tokio::time::Instant::now() + backoff;
+        loop {
+            // `None` once this episode's expiry action has run, so an already
+            // expired generation waits only on the backoff deadline.
+            let stale_deadline = health::next_stale_deadline(&ctx.key, ctx.generation);
+            let expired = tokio::select! {
+                // Cancellation and shutdown win a simultaneous wake-up: neither
+                // routing state nor the expiry episode may be touched once the
+                // task is on its way out.
+                biased;
+                _ = wait_for_cancel(cancel_rx.clone()) => {
+                    health::record_clean_exit(&ctx.key, ctx.generation);
+                    info!(
+                        upstream = %ctx.upstream_id,
+                        generation = ctx.generation,
+                        "Service discovery: task canceled during restart backoff"
+                    );
+                    return;
                 }
-            } => {
-                health::record_clean_exit(&ctx.key, ctx.generation);
-                info!(
-                    upstream = %ctx.upstream_id,
-                    generation = ctx.generation,
-                    "Service discovery: shutting down during restart backoff"
-                );
-                return;
+                _ = async {
+                    if let Some(ref rx) = shutdown_rx {
+                        wait_for_shutdown(rx.clone()).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    health::record_clean_exit(&ctx.key, ctx.generation);
+                    info!(
+                        upstream = %ctx.upstream_id,
+                        generation = ctx.generation,
+                        "Service discovery: shutting down during restart backoff"
+                    );
+                    return;
+                }
+                _ = tokio::time::sleep_until(backoff_deadline) => false,
+                _ = async {
+                    match stale_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => true,
+            };
+            if !expired {
+                break;
+            }
+            // No poller state exists here: the crashed poller's installed view
+            // died with it, and the restart publishes its first admitted
+            // snapshot unconditionally.
+            match apply_staleness_expiry(&ctx, None, &cancel_rx, &shutdown_rx) {
+                // Applied (or a failure that armed its own bounded retry
+                // deadline): keep waiting out the remaining backoff.
+                StalenessExpiryOutcome::Applied | StalenessExpiryOutcome::PublishFailed => {}
+                // A lifecycle signal landed; the next pass takes the biased
+                // cancel/shutdown branch and exits cleanly.
+                StalenessExpiryOutcome::Aborted => {}
+                // A replacement owns the key: stop waiting and let the fence
+                // check below end this supervisor.
+                StalenessExpiryOutcome::Superseded => break,
             }
         }
 
@@ -1014,6 +1055,117 @@ pub fn spawn_supervised_discovery_task_for_test(
     SupervisedTaskForTest {
         cancel_tx,
         handle,
+        key,
+        generation,
+    }
+}
+
+/// Test-only probe over the production staleness-expiry path.
+///
+/// Registers the generation exactly as [`ServiceDiscoveryManager::start`] does,
+/// then lets an external test drive `apply_staleness_expiry` synchronously.
+/// Cancellation, shutdown, and generation replacement are therefore observed at
+/// an exact point instead of racing a live poller's timer, which is what makes
+/// the lifecycle-versus-expiry contract testable deterministically.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub struct StalenessExpiryProbeForTest {
+    ctx: Arc<DiscoveryTaskContext>,
+    state: DiscoveryLoopState,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Health-registry key this probe registered.
+    pub key: String,
+    /// Generation this probe registered under.
+    pub generation: u64,
+}
+
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+impl StalenessExpiryProbeForTest {
+    /// Raise this task's cancel signal, as a config reconcile or manager stop
+    /// does before it registers a replacement.
+    pub fn cancel(&self) {
+        let _ = self.cancel_tx.send(true);
+    }
+
+    /// Raise the global shutdown signal wired into this probe.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Seed the installed discovered view a live poller would have built, so a
+    /// withdrawal has something to withdraw.
+    pub fn set_installed_discovered(&mut self, targets: Vec<UpstreamTarget>) {
+        self.state.last_discovered = targets;
+        self.state.snapshot_installed = true;
+    }
+
+    /// Discovered targets this probe still believes are installed.
+    pub fn installed_discovered(&self) -> &[UpstreamTarget] {
+        &self.state.last_discovered
+    }
+
+    /// Run the production expiry application once.
+    pub fn apply_expiry(&mut self) -> StalenessExpiryOutcome {
+        apply_staleness_expiry(
+            &self.ctx,
+            Some(&mut self.state),
+            &self.cancel_rx,
+            &self.shutdown_rx,
+        )
+    }
+}
+
+/// Build a [`StalenessExpiryProbeForTest`] over the production expiry path.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn staleness_expiry_probe_for_test(
+    upstream_namespace: &str,
+    upstream_id: &str,
+    provider_name: &'static str,
+    lb_cache: Arc<LoadBalancerCache>,
+    request_epoch: Option<Arc<RequestEpochStore>>,
+    health_checker: Arc<HealthChecker>,
+    dns_cache: DnsCache,
+    static_targets: Vec<UpstreamTarget>,
+    algorithm: LoadBalancerAlgorithm,
+    poll_interval_seconds: u64,
+    max_stale_seconds: u64,
+    policy: crate::config::types::SdStalePolicy,
+    generation: u64,
+    with_shutdown_channel: bool,
+) -> StalenessExpiryProbeForTest {
+    let key = service_discovery_task_key(upstream_namespace, upstream_id);
+    let staleness = health::resolve_staleness(max_stale_seconds, policy, poll_interval_seconds);
+    health::register_task(&key, generation, provider_name, staleness);
+
+    let ctx = Arc::new(DiscoveryTaskContext {
+        key: key.clone(),
+        generation,
+        upstream_namespace: upstream_namespace.to_string(),
+        upstream_id: upstream_id.to_string(),
+        provider_name,
+        lb_cache,
+        request_epoch,
+        static_targets,
+        algorithm,
+        hash_on: None,
+        dns_cache,
+        health_checker,
+        poll_interval_seconds,
+        staleness,
+    });
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    StalenessExpiryProbeForTest {
+        ctx,
+        state: DiscoveryLoopState::new(),
+        cancel_tx,
+        cancel_rx,
+        shutdown_tx,
+        shutdown_rx: with_shutdown_channel.then_some(shutdown_rx),
         key,
         generation,
     }
@@ -1136,6 +1288,30 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// Whether this task must stop writing routing state: its own cancel signal
+/// (config reconcile / manager stop) or global shutdown is already raised.
+///
+/// Cheap and synchronous, so it is safe to call inside a publication fence.
+fn lifecycle_signaled(
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    if *cancel_rx.borrow() {
+        return true;
+    }
+    shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
+}
+
+/// Classify a loop exit taken because a lifecycle signal was observed off the
+/// select's own cancel/shutdown branches.
+fn lifecycle_exit(cancel_rx: &tokio::sync::watch::Receiver<bool>) -> DiscoveryLoopExit {
+    if *cancel_rx.borrow() {
+        DiscoveryLoopExit::Canceled
+    } else {
+        DiscoveryLoopExit::Shutdown
+    }
+}
+
 /// Wait for a shutdown signal on a watch channel.
 async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     while !*rx.borrow() {
@@ -1206,6 +1382,27 @@ pub(crate) enum DiscoveryApplyControl {
     Continue,
     /// Exit the discovery task (cancel/shutdown observed around publication).
     Stop,
+}
+
+/// Outcome of one staleness-expiry application.
+///
+/// The three failure-shaped outcomes are deliberately distinct: only
+/// [`StalenessExpiryOutcome::PublishFailed`] is a real publication failure that
+/// schedules a bounded retry and records a failure. A generation that was
+/// superseded, canceled, or shut down published nothing and owes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalenessExpiryOutcome {
+    /// The expiry action ran for this episode: a `retain` claim, or a published
+    /// static-only withdrawal (claimed exactly once per episode).
+    Applied,
+    /// A replacement generation owns the key; nothing was published or claimed.
+    Superseded,
+    /// Cancellation or global shutdown won; nothing was published or claimed,
+    /// no retry was scheduled, and no failure was recorded.
+    Aborted,
+    /// The static-only republication was attempted and failed; the episode
+    /// stays unclaimed and a bounded retry is scheduled.
+    PublishFailed,
 }
 
 /// Outcome of one fenced installation of a merged target set.
@@ -1609,7 +1806,11 @@ async fn run_discovery_loop(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                apply_staleness_expiry(&ctx, &mut state);
+                let expiry =
+                    apply_staleness_expiry(&ctx, Some(&mut state), &cancel_rx, &shutdown_rx);
+                if expiry == StalenessExpiryOutcome::Aborted {
+                    return lifecycle_exit(&cancel_rx);
+                }
                 continue;
             }
             _ = wait_for_cancel(cancel_rx.clone()) => {
@@ -1644,7 +1845,15 @@ async fn run_discovery_loop(
                             None => std::future::pending::<()>().await,
                         }
                     } => {
-                        apply_staleness_expiry(&ctx, &mut state);
+                        let expiry = apply_staleness_expiry(
+                            &ctx,
+                            Some(&mut state),
+                            &cancel_rx,
+                            &shutdown_rx,
+                        );
+                        if expiry == StalenessExpiryOutcome::Aborted {
+                            return lifecycle_exit(&cancel_rx);
+                        }
                     }
                     _ = wait_for_cancel(cancel_rx.clone()) => {
                         return DiscoveryLoopExit::Canceled;
@@ -1726,10 +1935,35 @@ async fn run_discovery_loop(
 ///
 /// Withdrawal publishes through the same ownership fence as an ordinary
 /// snapshot, so a superseded generation cannot install static-only targets over
-/// the replacement's routing state.
-fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopState) {
+/// the replacement's routing state. Cancellation and global shutdown are
+/// checked before the episode is claimed and again *inside* that fence,
+/// immediately before the routing mutation: a task canceled by a reconcile (or
+/// a gateway shutting down) must not write static-only targets over the state
+/// its replacement is about to own, and must not consume the replacement's
+/// expiry episode. An abort is not a publication failure — no retry is
+/// scheduled and no failure is recorded.
+///
+/// `state` is the poller's installed view where one exists. The supervisor
+/// applies expiry during restart backoff without it: the crashed poller's view
+/// died with it, and the restarted poller starts from a fresh state that
+/// republishes its first admitted snapshot anyway.
+fn apply_staleness_expiry(
+    ctx: &DiscoveryTaskContext,
+    state: Option<&mut DiscoveryLoopState>,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+) -> StalenessExpiryOutcome {
     let policy = ctx.staleness.policy;
     let registry = crate::plugins::prometheus_metrics::global_registry();
+
+    if lifecycle_signaled(cancel_rx, shutdown_rx) {
+        debug!(
+            upstream = %ctx.upstream_id,
+            generation = ctx.generation,
+            "Service discovery: canceled or shutting down before staleness expiry could be applied"
+        );
+        return StalenessExpiryOutcome::Aborted;
+    }
 
     if !policy.withdraws() {
         if health::claim_expiry(&ctx.key, ctx.generation) {
@@ -1742,17 +1976,22 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
                 "Service discovery: last admitted snapshot exceeded the staleness bound; retaining discovered targets under the configured policy"
             );
         }
-        return;
+        return StalenessExpiryOutcome::Applied;
     }
 
-    let withdrawn_count = state.last_discovered.len();
+    let withdrawn_count = state.as_ref().map(|s| s.last_discovered.len() as u64);
     let merged = merge_targets(&ctx.static_targets, &[]);
-    // The static-only republication and the expiry claim run under the same
-    // ownership fence as ordinary publication: a generation replaced while this
-    // withdrawal was being computed can neither overwrite the replacement's
-    // load-balancer state nor consume its expiry episode.
+    // The static-only republication, the lifecycle re-check, and the expiry
+    // claim run under the same ownership fence as ordinary publication: a
+    // generation replaced while this withdrawal was being computed can neither
+    // overwrite the replacement's load-balancer state nor consume its expiry
+    // episode, and a cancel/shutdown that lands inside the fence stops the
+    // routing mutation before it happens.
     let fenced = health::publish_withdrawal_if_current(&ctx.key, ctx.generation, || {
-        install_merged_targets(
+        if lifecycle_signaled(cancel_rx, shutdown_rx) {
+            return WithdrawalAttempt::Aborted;
+        }
+        match install_merged_targets(
             &ctx.upstream_namespace,
             &ctx.upstream_id,
             &merged,
@@ -1761,26 +2000,39 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
             ctx.algorithm,
             &ctx.hash_on,
             &ctx.health_checker,
-        )
+        ) {
+            Ok(()) => WithdrawalAttempt::Published,
+            Err(error) => WithdrawalAttempt::Failed(error),
+        }
     });
-    let (published, claimed) = match fenced {
-        FencedPublish::Published(outcome) => outcome,
+    let withdrawal = match fenced {
+        FencedPublish::Published(withdrawal) => withdrawal,
         FencedPublish::Superseded => {
             debug!(
                 upstream = %ctx.upstream_id,
                 generation = ctx.generation,
                 "Service discovery: superseded task did not publish a staleness withdrawal"
             );
-            return;
+            return StalenessExpiryOutcome::Superseded;
         }
     };
 
-    match published {
-        Ok(()) => {
+    match withdrawal {
+        FencedWithdrawal::Aborted => {
+            debug!(
+                upstream = %ctx.upstream_id,
+                generation = ctx.generation,
+                "Service discovery: canceled or shutting down inside the withdrawal fence; nothing was published or claimed"
+            );
+            StalenessExpiryOutcome::Aborted
+        }
+        FencedWithdrawal::Published { claimed } => {
             // Reset the installed view so recovery republishes the fresh
             // snapshot even when it is byte-identical to the withdrawn set.
-            state.last_discovered.clear();
-            state.snapshot_installed = true;
+            if let Some(state) = state {
+                state.last_discovered.clear();
+                state.snapshot_installed = true;
+            }
             if claimed {
                 registry.record_service_discovery_stale_expiry();
                 registry.record_service_discovery_stale_withdrawal();
@@ -1794,8 +2046,9 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
                     "Service discovery: last admitted snapshot exceeded the staleness bound; withdrew discovered targets and retained static targets"
                 );
             }
+            StalenessExpiryOutcome::Applied
         }
-        Err(error) => {
+        FencedWithdrawal::Failed(error) => {
             // Keep the expiry unapplied and retry with bounded backoff. Marking
             // it applied here would retain stale dynamic targets indefinitely;
             // leaving the elapsed deadline unchanged would hot-loop.
@@ -1807,6 +2060,7 @@ fn apply_staleness_expiry(ctx: &DiscoveryTaskContext, state: &mut DiscoveryLoopS
                 retry_after_seconds = retry_after.map(|duration| duration.as_secs()),
                 "Service discovery: staleness withdrawal could not be published; discovered targets remain installed and withdrawal will be retried"
             );
+            StalenessExpiryOutcome::PublishFailed
         }
     }
 }
