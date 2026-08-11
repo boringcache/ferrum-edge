@@ -685,7 +685,8 @@ fn destination_rule_status(
             // the translator only warns on. `maxRequestsPerConnection` is
             // universally deferred because Ferrum does not enforce
             // close-after-N backend requests. `idleTimeout`, `http2MaxRequests`,
-            // `h2UpgradePolicy`, `maxRetries`, and `http1MaxPendingRequests` are
+            // `maxConcurrentStreams`, `h2UpgradePolicy`, `maxRetries`, and
+            // `http1MaxPendingRequests` are
             // enforced at top-level, `portLevelSettings`, and selected-subset
             // scope. Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
@@ -755,8 +756,14 @@ fn destination_rule_status(
 /// close-after-N-request semantics.
 ///
 /// The remaining applied knobs (`idleTimeout`, `http2MaxRequests`,
-/// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`) are enforced at
+/// `maxConcurrentStreams`, `h2UpgradePolicy`, `maxRetries`,
+/// `http1MaxPendingRequests`) are enforced at
 /// top-level, `portLevelSettings`, AND selected-subset scope.
+///
+/// `http2MaxRequests` is the destination-wide ACTIVE-REQUEST breaker
+/// (`src/backend_active_request_limit.rs`), applying to HTTP/1.1 and HTTP/2
+/// alike; `maxConcurrentStreams` is the separate per-HTTP/2-connection stream
+/// control. Both are applied, so neither is deferred.
 const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
     "maxRequestsPerConnection",
     "connectionPool.http.maxRequestsPerConnection (not applied: backend close-after-N-requests is unsupported)",

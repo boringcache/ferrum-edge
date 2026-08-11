@@ -1654,19 +1654,26 @@ fn parse_keepalive_duration_seconds(
 
 /// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
 ///
-/// Supported fields: `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`,
-/// `maxRetries`, and `http1MaxPendingRequests`. `maxRequestsPerConnection` is
+/// Supported fields: `idleTimeout`, `http2MaxRequests`, `maxConcurrentStreams`,
+/// `h2UpgradePolicy`, `maxRetries`, and `http1MaxPendingRequests`.
+/// `maxRequestsPerConnection` is
 /// parsed and validated for operator feedback, but is NOT projected because the
 /// runtime does not have close-after-N-requests behavior for the shared backend
 /// pools. Returning `Ok(None)` from this function signals
 /// "block was present but no supported field was set" so the caller can skip
 /// emitting an empty overlay on the slice.
 ///
-/// All five applied fields are enforced at top-level, `portLevelSettings`, AND
+/// All six applied fields are enforced at top-level, `portLevelSettings`, AND
 /// subset scope with field-level precedence
-/// `portLevelSettings` > selected subset > top-level. Reqwest's H2 path does
-/// not expose the same `http2MaxRequests` builder knob as direct-H2/native
-/// gRPC; that transport caveat is documented in `docs/mesh.md`.
+/// `portLevelSettings` > selected subset > top-level.
+///
+/// `http2MaxRequests` and `maxConcurrentStreams` are DIFFERENT controls and are
+/// carried separately (issue #3775). `http2MaxRequests` is Istio's "maximum
+/// number of active requests to a destination, applicable to both HTTP1.1 and
+/// HTTP2" — a destination-wide request budget enforced by
+/// `src/backend_active_request_limit.rs` across every transport, connection, and
+/// pool shard. `maxConcurrentStreams` is the per-HTTP/2-connection stream limit
+/// and is the only one of the two that programs the hyper H2 builder.
 ///
 /// `maxRetries` semantics differ honestly from Envoy: Envoy's
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
@@ -1701,7 +1708,7 @@ fn translate_connection_pool_http(
     if let Some(v) = http.get("maxRequestsPerConnection") {
         let _ = translate_http_uint32(object, "maxRequestsPerConnection", v, true)?;
         acc.warnings.push(format!(
-            "DestinationRule {}/{}: connectionPool.http.maxRequestsPerConnection is parsed and validated but not applied (backend close-after-N-requests is unsupported); use http2MaxRequests for HTTP/2-family concurrency instead",
+            "DestinationRule {}/{}: connectionPool.http.maxRequestsPerConnection is parsed and validated but not applied (backend close-after-N-requests is unsupported); use maxConcurrentStreams for per-connection HTTP/2 stream concurrency or http2MaxRequests for the destination-wide active-request budget instead",
             object.metadata.namespace, object.metadata.name
         ));
     }
@@ -1711,6 +1718,18 @@ fn translate_connection_pool_http(
     };
     let http2_max_requests = match http.get("http2MaxRequests") {
         Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v, false)?),
+        None => None,
+    };
+    // Istio's per-HTTP/2-connection stream control. Distinct from
+    // `http2MaxRequests` above: this one, and only this one, programs the H2
+    // transport builder. Zero is rejected like the other positive uint32 knobs.
+    let max_concurrent_streams = match http.get("maxConcurrentStreams") {
+        Some(v) => Some(translate_http_uint32(
+            object,
+            "maxConcurrentStreams",
+            v,
+            false,
+        )?),
         None => None,
     };
     let h2_upgrade_policy = match http.get("h2UpgradePolicy") {
@@ -1748,6 +1767,7 @@ fn translate_connection_pool_http(
         max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
+        max_concurrent_streams,
         h2_upgrade_policy,
         max_retries,
         http1_max_pending_requests,
@@ -1792,7 +1812,8 @@ fn translate_h2_upgrade_policy(
 
 /// Parse a uint32 `connectionPool.http.*` knob. Negative and non-integer
 /// values are always rejected. `allow_zero` controls the lower bound: most
-/// knobs (`http2MaxRequests`, `http1MaxPendingRequests`) reject `0`, while
+/// knobs (`http2MaxRequests`, `maxConcurrentStreams`,
+/// `http1MaxPendingRequests`) reject `0`, while
 /// `maxRetries` accepts it as an explicit retry-disabling cap and
 /// `maxRequestsPerConnection` accepts it as Istio's documented "unlimited"
 /// sentinel. The latter field is still deferred, but accepting `0` keeps

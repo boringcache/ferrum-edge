@@ -3005,6 +3005,7 @@ fn backend_tls_sni_with_subset_do_not_upgrade_is_admitted() {
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
@@ -3014,6 +3015,7 @@ fn backend_tls_sni_with_subset_do_not_upgrade_is_admitted() {
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
     );
@@ -3044,6 +3046,7 @@ fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
@@ -3053,6 +3056,7 @@ fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
     );
@@ -3082,6 +3086,7 @@ fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
@@ -3091,6 +3096,7 @@ fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
         },
     );
@@ -3261,6 +3267,7 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
             http_idle_timeout_ms: Some(45_000),
+            http2_max_requests: None,
             h2_max_concurrent_streams: Some(10),
         },
         ResolvedSubsetTrafficPolicy {
@@ -3270,6 +3277,7 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
             http_idle_timeout_ms: Some(12_000),
+            http2_max_requests: None,
             h2_max_concurrent_streams: Some(40),
         },
     );

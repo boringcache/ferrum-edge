@@ -27,6 +27,7 @@ fn subset_definition_round_trip_json() {
             max_retries: Some(2),
             http1_max_pending_requests: Some(7),
             http_idle_timeout_ms: None,
+            http2_max_requests: None,
             h2_max_concurrent_streams: None,
             passive_health_check: None,
         }),
@@ -101,6 +102,7 @@ fn subset_traffic_policy_omits_none_fields() {
         max_retries: None,
         http1_max_pending_requests: None,
         http_idle_timeout_ms: None,
+        http2_max_requests: None,
         h2_max_concurrent_streams: None,
         passive_health_check: None,
     };
@@ -133,6 +135,7 @@ fn subset_traffic_policy_tls_round_trip_json() {
         max_retries: None,
         http1_max_pending_requests: None,
         http_idle_timeout_ms: None,
+        http2_max_requests: None,
         h2_max_concurrent_streams: None,
         passive_health_check: None,
     };
@@ -399,6 +402,7 @@ fn upstream_valid_subsets_pass_validation() {
                 max_retries: None,
                 http1_max_pending_requests: None,
                 http_idle_timeout_ms: None,
+                http2_max_requests: None,
                 h2_max_concurrent_streams: None,
                 passive_health_check: None,
             }),

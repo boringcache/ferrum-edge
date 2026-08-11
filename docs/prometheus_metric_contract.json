@@ -1323,6 +1323,42 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_destination_active_requests",
+    "type": "gauge",
+    "help": "Active upstream requests currently holding a DestinationRule http2MaxRequests permit.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "destination_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_destination_active_requests_admitted_total",
+    "type": "counter",
+    "help": "Upstream requests admitted through the DestinationRule http2MaxRequests breaker.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "destination_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_destination_active_requests_rejected_total",
+    "type": "counter",
+    "help": "Upstream requests shed because their destination was at its http2MaxRequests ceiling.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "destination_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_edge_overhead_ms",
     "type": "histogram",
     "help": "Gateway overhead (excluding backend and plugins) in milliseconds.",

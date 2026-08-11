@@ -8776,10 +8776,14 @@ fn apply_destination_rules(
                                     .connection_pool_http
                                     .as_ref()
                                     .and_then(|http| http.idle_timeout_ms),
-                                h2_max_concurrent_streams: sp
+                                http2_max_requests: sp
                                     .connection_pool_http
                                     .as_ref()
                                     .and_then(|http| http.http2_max_requests),
+                                h2_max_concurrent_streams: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.max_concurrent_streams),
                                 passive_health_check,
                             }
                         }),
@@ -8976,6 +8980,7 @@ fn resolve_subset_traffic_policy(
             let max_retries = tp.and_then(|tp| tp.max_retries);
             let http1_max_pending_requests = tp.and_then(|tp| tp.http1_max_pending_requests);
             let http_idle_timeout_ms = tp.and_then(|tp| tp.http_idle_timeout_ms);
+            let http2_max_requests = tp.and_then(|tp| tp.http2_max_requests);
             let h2_max_concurrent_streams = tp.and_then(|tp| tp.h2_max_concurrent_streams);
             if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(
                 resolved_tls,
@@ -8984,6 +8989,7 @@ fn resolve_subset_traffic_policy(
                 max_retries,
                 http1_max_pending_requests,
                 http_idle_timeout_ms,
+                http2_max_requests,
                 h2_max_concurrent_streams,
             ) {
                 resolved_map.insert(subset.name.clone(), resolved);
@@ -9082,7 +9088,14 @@ fn apply_connection_pool_http_to_port_override(
     if let Some(idle_ms) = http.idle_timeout_ms {
         slot.http_idle_timeout_ms = Some(idle_ms);
     }
-    if let Some(max_streams) = http.http2_max_requests {
+    // `http2MaxRequests` is the DESTINATION-WIDE active-request budget
+    // (issue #3775), not an H2 transport setting.
+    if let Some(max_active) = http.http2_max_requests {
+        slot.http2_max_requests = Some(max_active);
+    }
+    // `maxConcurrentStreams` is the per-H2-connection stream limit and is the
+    // only one of the two that reaches the hyper builder.
+    if let Some(max_streams) = http.max_concurrent_streams {
         slot.h2_max_concurrent_streams = Some(max_streams);
     }
     // An explicit `Some(Default)` (port-level `DEFAULT`) overwrites an

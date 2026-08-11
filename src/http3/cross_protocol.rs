@@ -404,6 +404,7 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        state,
         backend_admission_plugins,
         ctx,
         proxy,

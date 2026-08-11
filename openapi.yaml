@@ -10760,12 +10760,25 @@ components:
           description: >-
             Subset backend HTTP idle timeout in milliseconds projected from a
             mesh DestinationRule. Direct admin/file configuration is rejected.
+        http2_max_requests:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+          readOnly: true
+          description: >-
+            Subset destination-wide active-request cap (DestinationRule
+            `connectionPool.http.http2MaxRequests`) projected from a mesh
+            DestinationRule. Applies to HTTP/1.1 and HTTP/2 alike; the admission
+            lane is isolated by selected subset. Direct admin/file configuration
+            is rejected.
         h2_max_concurrent_streams:
           type: [integer, "null"]
           format: uint32
+          minimum: 1
           readOnly: true
           description: >-
-            Subset HTTP/2 concurrent-stream cap projected from a mesh
+            Subset per-connection HTTP/2 concurrent-stream cap (DestinationRule
+            `connectionPool.http.maxConcurrentStreams`) projected from a mesh
             DestinationRule. Direct admin/file configuration is rejected.
         passive_health_check:
           oneOf:
@@ -11045,9 +11058,21 @@ components:
         http_idle_timeout_ms:
           type: [integer, "null"]
           format: uint64
+        http2_max_requests:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+          description: >-
+            Destination-wide active-request cap (DestinationRule
+            `connectionPool.http.http2MaxRequests`) for this port, enforced for
+            HTTP/1.1 and HTTP/2 across every connection and pool shard.
         h2_max_concurrent_streams:
           type: [integer, "null"]
           format: uint32
+          minimum: 1
+          description: >-
+            Per-connection HTTP/2 stream cap (DestinationRule
+            `connectionPool.http.maxConcurrentStreams`) for this port.
         tls:
           oneOf:
             - $ref: "#/components/schemas/BackendTlsConfig"

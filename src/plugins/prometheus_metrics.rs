@@ -2565,6 +2565,7 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_destination_active_request_prometheus(&mut output);
         output
     }
 
@@ -2614,6 +2615,19 @@ impl MetricsRegistry {
         crate::proxy::udp_placement_migration::render_prometheus(output, &gateway_ns_label);
     }
 
+    /// Append the fixed-cardinality DestinationRule `http2MaxRequests`
+    /// active-request breaker totals outside the render cache, so a shed or a
+    /// released permit is visible on the next scrape.
+    fn append_destination_active_request_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::backend_active_request_limit::render_prometheus(output, &gateway_ns_label);
+    }
+
     /// Render metrics without caching. Used internally and for testing.
     ///
     /// Includes the process-static mesh observability families so this stays a
@@ -2630,6 +2644,7 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_destination_active_request_prometheus(&mut output);
         output
     }
 

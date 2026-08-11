@@ -8241,6 +8241,7 @@ async fn run_h3_backend_admission_or_send_reject(
     cb_is_half_open_probe: bool,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        state,
         backend_admission_plugins,
         ctx,
         proxy,

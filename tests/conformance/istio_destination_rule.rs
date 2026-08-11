@@ -266,16 +266,18 @@ fn dr_connection_pool_http_idle_timeout() {
     assert_eq!(http.idle_timeout_ms, Some(30_000));
 }
 
-/// `trafficPolicy.connectionPool.http.http2MaxRequests` — T1-C (PR #908).
-/// Projects onto `Proxy.pool_http2_max_concurrent_streams` per port at
-/// `resolve_effective_proxy_for_target` time.
+/// `trafficPolicy.connectionPool.http.http2MaxRequests` — issue #3775.
+/// The DESTINATION-WIDE active-request breaker: "maximum number of active
+/// requests to a destination, applicable to both HTTP1.1 and HTTP2". Projects
+/// onto `UpstreamPortOverride.http2_max_requests` and is enforced at backend
+/// admission by `backend_active_request_limit`, NOT by any H2 stream setting.
 #[test]
 fn dr_connection_pool_http_http2_max_requests() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http2MaxRequests",
         status = Status::Supported,
-        notes = "T1-C (PR #908): projects onto Proxy.pool_http2_max_concurrent_streams via the H2/gRPC builder knobs.",
+        notes = "Issue #3775: destination-wide ACTIVE-REQUEST breaker applying to HTTP/1.1 and HTTP/2 alike. Projects onto UpstreamPortOverride.http2_max_requests; a permit is taken during backend admission (before any dial) per (namespace, logical destination, policy port, selected subset, config generation) and released only when the response exchange terminates, so connection count, pool shards, retries, and peer SETTINGS cannot multiply or raise it. Over-budget requests are shed with a backend-neutral 503 / gRPC UNAVAILABLE. The per-connection stream knob is the separate maxConcurrentStreams field.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -289,6 +291,39 @@ fn dr_connection_pool_http_http2_max_requests() {
         .connection_pool_http
         .expect("http overlay");
     assert_eq!(http.http2_max_requests, Some(100));
+    assert_eq!(
+        http.max_concurrent_streams, None,
+        "http2MaxRequests must not populate the per-connection stream knob"
+    );
+}
+
+/// `trafficPolicy.connectionPool.http.maxConcurrentStreams` — issue #3775.
+/// Istio's per-HTTP/2-connection stream control, and the only field that
+/// programs the direct-H2 / native-gRPC hyper builder.
+#[test]
+fn dr_connection_pool_http_max_concurrent_streams() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.connectionPool.http.maxConcurrentStreams",
+        status = Status::Supported,
+        notes = "Issue #3775: per-HTTP/2-connection stream limit. Projects onto UpstreamPortOverride.h2_max_concurrent_streams and Proxy.pool_http2_max_concurrent_streams, threading into the direct-H2 and native-gRPC hyper builders (max_concurrent_streams advertises the local SETTINGS value; initial_max_send_streams seeds the outbound bound until the peer's SETTINGS arrive, which a peer may raise or lower). Direct-H2/gRPC pool keys carry the effective value so update/delete cannot reuse a connection built under a prior limit. Reqwest's H2 path exposes no equivalent builder knob. Zero rejected at translate time.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {
+            "connectionPool": {"http": {"maxConcurrentStreams": 64}}
+        }
+    }));
+    let http = dr
+        .traffic_policy
+        .expect("traffic policy")
+        .connection_pool_http
+        .expect("http overlay");
+    assert_eq!(http.max_concurrent_streams, Some(64));
+    assert_eq!(
+        http.http2_max_requests, None,
+        "maxConcurrentStreams must not populate the destination request budget"
+    );
 }
 
 /// `trafficPolicy.connectionPool.http.h2UpgradePolicy` — F5.1.
@@ -385,7 +420,7 @@ fn dr_subset_connection_pool_http_combined() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests projects onto direct-H2/native-gRPC builders (reqwest H2 has no equivalent builder knob). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests is the destination-wide active-request breaker whose lane key carries the selected subset (issue #3775). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -426,7 +461,7 @@ fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_supported() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → pool_http2_max_concurrent_streams on direct-H2/native-gRPC builders and those pools' keys (`none` when unset); reqwest H2 has no equivalent knob. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
+        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → the destination-wide active-request breaker (issue #3775), whose admission lane key carries the selected subset so sibling subsets keep independent budgets; the separate maxConcurrentStreams field is what programs the direct-H2/native-gRPC builders and those pools' keys. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
     );
     let result = translate_k8s_objects(
         &[destination_rule(json!({
