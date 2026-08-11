@@ -1165,10 +1165,18 @@ fn service_discovery_cursor_and_rejection_counters_are_label_safe_and_rendered()
     assert!(output.contains("ferrum_service_discovery_shared_admission_rejected_total 1"));
     assert!(output.contains("ferrum_service_discovery_cursor_advance_total 3"));
     assert!(output.contains("ferrum_service_discovery_cursor_rollback_total 1"));
-    // No unbounded dimensions: upstream names / indexes / raw reasons must not appear.
-    assert!(!output.contains("reason="));
-    assert!(!output.contains("index="));
-    assert!(!output.contains("upstream="));
+    // No unbounded dimensions: the service-discovery metric families are unlabeled.
+    // Scope this check to those families because unrelated registry metrics legitimately
+    // carry bounded labels such as `reason`.
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("ferrum_service_discovery_"))
+    {
+        assert!(
+            !line.contains('{'),
+            "service-discovery metric unexpectedly has labels: {line}"
+        );
+    }
 }
 
 #[test]
