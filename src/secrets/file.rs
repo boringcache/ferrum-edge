@@ -51,6 +51,7 @@ fn map_file_secret_error(key: &str, error: CredentialFileError) -> String {
 ///
 /// Prefer [`read_secret_detached`] on async paths so a blocked open/read cannot
 /// pin Tokio runtime teardown after the configured fetch timeout.
+#[allow(dead_code)] // used only by external tests; production paths use `read_secret_detached`
 pub fn read_secret(path: &str, key: &str) -> Result<String, String> {
     credential_file::read_credential_file(
         path,
