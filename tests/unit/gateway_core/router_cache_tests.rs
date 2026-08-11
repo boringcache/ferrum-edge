@@ -1880,6 +1880,7 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     let mut sibling = test_proxy("sibling", "/api");
     sibling.hosts = vec!["other.example.com".into()];
     sibling.listen_port = Some(8080);
+    sibling.listen_port_tls = true;
 
     let cache = RouterCache::new(
         &test_config(vec![refused, refused_exact, refused_regex, sibling]),
@@ -1936,7 +1937,7 @@ fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
     );
 
     let sibling_hit = cache
-        .find_proxy_on_frontend(Some("other.example.com"), "/api/x", Some(8080), false)
+        .find_proxy_on_frontend(Some("other.example.com"), "/api/x", Some(8080), true)
         .expect("an unrelated listen_port must keep routing");
     assert_eq!(sibling_hit.proxy.id, "sibling");
 }
