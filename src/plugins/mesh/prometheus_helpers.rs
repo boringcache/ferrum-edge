@@ -59,6 +59,22 @@ static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
     DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Per-reason ADS admission rejections (issue #3741). The key is always a
+/// compile-time `XdsAdmissionRejection::metric_reason()` constant, so the series
+/// count is fixed and no client-supplied text can reach a label.
+static XDS_STREAM_ADMISSION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+/// Total active ADS streams and distinct active node state keys. Both are
+/// absolute gauges published by the single process-wide
+/// `XdsAdmissionController`; label-free because every dimension that could
+/// distinguish them (node id, principal, tenant namespace) is client-influenced
+/// and would be unbounded.
+static XDS_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+static XDS_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
+/// Set once the ADS admission controller has published a value, so the two
+/// gauges are emitted (including at zero) on a CP that serves xDS and stay
+/// absent everywhere else.
+static XDS_ADMISSION_OBSERVED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
@@ -842,14 +858,43 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count an ADS stream the CP rejected because a node is already at its
-/// per-node concurrent-stream ceiling (`FERRUM_XDS_MAX_STREAMS_PER_NODE`).
-/// Aggregated (no per-node label) to avoid an unbounded, client-controlled
-/// `node_id` metric dimension; the offending node id is still logged at `warn!`
-/// at the reject site. Surfaces a DoS / misconfigured-client signal the plain
-/// gRPC `RESOURCE_EXHAUSTED` status alone does not expose to scraping.
+/// Count an ADS stream the CP refused at admission — any scope: total,
+/// per-namespace, per-principal, per-node, distinct-node cardinality, an
+/// invalid `Node.id`, or the initial-request deadline (issue #3741).
+///
+/// Aggregated (no labels) to avoid an unbounded, client-controlled `node_id` /
+/// principal metric dimension. The offending node id is never logged raw; the
+/// reject site logs a redacted digest instead. Surfaces a DoS /
+/// misconfigured-client signal the plain gRPC `RESOURCE_EXHAUSTED` status alone
+/// does not expose to scraping. Use
+/// [`increment_xds_stream_admission_rejection`] alongside it for the bounded
+/// per-reason breakdown.
 pub fn increment_xds_stream_rejected() {
     XDS_STREAMS_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count an ADS admission rejection by bounded reason (issue #3741).
+///
+/// `reason` must be an `XdsAdmissionRejection::metric_reason()` constant. It is
+/// `&'static str` precisely so the label set is closed at compile time and no
+/// node id, principal, subject, token, SPIFFE URI, or tenant-supplied text can
+/// ever reach `/metrics`.
+pub fn increment_xds_stream_admission_rejection(reason: &'static str) {
+    XDS_STREAM_ADMISSION_REJECTIONS
+        .entry(reason)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish the ADS admission controller's absolute occupancy: total active ADS
+/// streams (SotW + Delta) and distinct active node state keys (issue #3741).
+///
+/// Called from the single process-wide controller on every reserve/release, so
+/// the gauges return to zero when the last stream ends.
+pub fn set_xds_admission_gauges(active_streams: u64, active_node_ids: u64) {
+    XDS_ACTIVE_STREAMS.store(active_streams, Ordering::Relaxed);
+    XDS_ACTIVE_NODE_IDS.store(active_node_ids, Ordering::Relaxed);
+    XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
 }
 
 /// Set the coarse posture gauge for the mesh inbound listener's mTLS
@@ -1187,13 +1232,51 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     let xds_streams_rejected = XDS_STREAMS_REJECTED.load(Ordering::Relaxed);
     if xds_streams_rejected > 0 {
         output.push_str(
-            "# HELP ferrum_xds_streams_rejected_total ADS streams rejected for exceeding the per-node concurrent-stream ceiling.\n",
+            "# HELP ferrum_xds_streams_rejected_total ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline).\n",
         );
         output.push_str("# TYPE ferrum_xds_streams_rejected_total counter\n");
         render_mesh_process_metric(
             output,
             "ferrum_xds_streams_rejected_total",
             xds_streams_rejected,
+            gateway_ns_label,
+        );
+    }
+
+    if !XDS_STREAM_ADMISSION_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_xds_stream_admission_rejections_total ADS streams rejected at admission, by bounded reason.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_stream_admission_rejections_total counter\n");
+        for entry in XDS_STREAM_ADMISSION_REJECTIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_xds_stream_admission_rejections_total{{reason=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key()),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if XDS_ADMISSION_OBSERVED.load(Ordering::Relaxed) != 0 {
+        output.push_str(
+            "# HELP ferrum_xds_active_streams Currently active ADS streams (SotW plus Delta) admitted by the control plane.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_active_streams gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_xds_active_streams",
+            XDS_ACTIVE_STREAMS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
+        output.push_str(
+            "# HELP ferrum_xds_active_node_ids Distinct node state keys with at least one active ADS stream.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_active_node_ids gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_xds_active_node_ids",
+            XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed),
             gateway_ns_label,
         );
     }
@@ -2268,6 +2351,31 @@ fn write_optional_mesh_label(
 #[cfg(test)]
 pub fn xds_streams_rejected_count() -> u64 {
     XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
+}
+
+/// Current value of the per-reason ADS admission rejection counter.
+///
+/// Exposed (not `cfg(test)`) so the external unit/integration suites can assert
+/// the bounded reason breakdown without scraping and parsing the whole metrics
+/// document. Process-global, so callers should compare deltas rather than
+/// absolute values.
+pub fn xds_stream_admission_rejection_count(reason: &str) -> u64 {
+    XDS_STREAM_ADMISSION_REJECTIONS
+        .get(reason)
+        .map(|entry| entry.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Current value of the active-ADS-stream gauge. See
+/// [`xds_stream_admission_rejection_count`] for the process-global caveat.
+pub fn xds_active_streams_gauge() -> u64 {
+    XDS_ACTIVE_STREAMS.load(Ordering::Relaxed)
+}
+
+/// Current value of the distinct-active-node gauge. See
+/// [`xds_stream_admission_rejection_count`] for the process-global caveat.
+pub fn xds_active_node_ids_gauge() -> u64 {
+    XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed)
 }
 
 /// Current value of the warming partial-apply counter for a `namespace`.

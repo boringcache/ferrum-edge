@@ -1467,11 +1467,47 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
-    /// Maximum concurrent ADS streams the CP admits per node id. A DP keeps a
-    /// single stream; the default headroom tolerates brief reconnect overlap.
-    /// `0` disables the cap. Only meaningful when `xds_enabled` is true.
+    /// Maximum concurrent ADS streams the CP admits per node state key
+    /// (namespace + authenticated principal + `Node.id`). A DP keeps a single
+    /// stream; the default headroom tolerates brief reconnect overlap. `0`
+    /// disables the cap. Only meaningful when `xds_enabled` is true.
     /// Default: 4.
     pub xds_max_streams_per_node: usize,
+    /// Maximum total concurrent ADS streams for this CP process, across SotW
+    /// and Delta and every namespace/principal/node. The outermost admission
+    /// budget: it bounds relay tasks, response channels, filtered config
+    /// snapshots, and broadcast subscribers regardless of how many unique
+    /// `Node.id` values a client invents. `0` disables the cap (refused under
+    /// production posture). Default: 1024.
+    pub xds_max_total_streams: usize,
+    /// Maximum concurrent ADS streams per namespace/tenant. `0` disables the
+    /// cap (refused under production posture). Default: 512.
+    pub xds_max_streams_per_namespace: usize,
+    /// Maximum concurrent ADS streams per authenticated principal (JWT `sub`).
+    /// Fleets that share one credential across every DP present a single
+    /// principal, so the default is deliberately generous. `0` disables the cap
+    /// (refused under production posture). Default: 256.
+    pub xds_max_streams_per_principal: usize,
+    /// Maximum distinct node state keys with at least one active ADS stream.
+    /// Bounds the node-scoped snapshot/nonce/identity/waypoint/scoping maps
+    /// independently of the stream count. `0` disables the cap (refused under
+    /// production posture). Default: 2048.
+    pub xds_max_active_nodes: usize,
+    /// Maximum accepted `Node.id` length in UTF-8 bytes. Longer ids are refused
+    /// with `INVALID_ARGUMENT` before the value is cloned, stored, or logged.
+    /// `0` disables the ceiling (refused under production posture).
+    /// Default: 253 (the DNS name ceiling).
+    pub xds_max_node_id_bytes: usize,
+    /// Deadline, in seconds, for an admitted ADS stream to send its first
+    /// request and identify a node. A stream that misses it is closed with
+    /// `DEADLINE_EXCEEDED` so a stalled peer cannot park a task, a channel, and
+    /// an admission permit indefinitely. `0` disables the deadline (refused
+    /// under production posture). Default: 30.
+    pub xds_first_request_timeout_seconds: u64,
+    /// Visibly unsafe override that permits `0` (unbounded) ADS admission
+    /// budgets under `FERRUM_MESH_PRODUCTION_MODE=true`. Startup warns loudly
+    /// whenever any scope is unbounded. Default: false.
+    pub xds_allow_unbounded_stream_limits: bool,
     /// Mesh CA backend. `internal` uses Ferrum's own CA (root cert+key on
     /// disk); `spire` delegates to a SPIRE Agent over UDS; `none` (default)
     /// disables mesh identity features.
@@ -2891,7 +2927,17 @@ impl Default for EnvConfig {
             cp_require_namespace_claim: false,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
-            xds_max_streams_per_node: 4,
+            xds_max_streams_per_node: crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NODE,
+            xds_max_total_streams: crate::xds::admission::DEFAULT_XDS_MAX_TOTAL_STREAMS,
+            xds_max_streams_per_namespace:
+                crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
+            xds_max_streams_per_principal:
+                crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
+            xds_max_active_nodes: crate::xds::admission::DEFAULT_XDS_MAX_ACTIVE_NODES,
+            xds_max_node_id_bytes: crate::xds::admission::DEFAULT_XDS_MAX_NODE_ID_BYTES,
+            xds_first_request_timeout_seconds:
+                crate::xds::admission::DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS,
+            xds_allow_unbounded_stream_limits: false,
             mesh_ca_backend: "none".to_string(),
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
@@ -3419,7 +3465,14 @@ impl EnvConfig {
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
-            xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => 4usize;
+            xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NODE;
+            xds_max_total_streams: usize = "FERRUM_XDS_MAX_TOTAL_STREAMS" => crate::xds::admission::DEFAULT_XDS_MAX_TOTAL_STREAMS;
+            xds_max_streams_per_namespace: usize = "FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE;
+            xds_max_streams_per_principal: usize = "FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL;
+            xds_max_active_nodes: usize = "FERRUM_XDS_MAX_ACTIVE_NODES" => crate::xds::admission::DEFAULT_XDS_MAX_ACTIVE_NODES;
+            xds_max_node_id_bytes: usize = "FERRUM_XDS_MAX_NODE_ID_BYTES" => crate::xds::admission::DEFAULT_XDS_MAX_NODE_ID_BYTES;
+            xds_first_request_timeout_seconds: u64 = "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS" => crate::xds::admission::DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS;
+            xds_allow_unbounded_stream_limits: bool = "FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS" => false;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
@@ -4178,6 +4231,13 @@ impl EnvConfig {
             xds_enabled,
             xds_stream_channel_capacity,
             xds_max_streams_per_node,
+            xds_max_total_streams,
+            xds_max_streams_per_namespace,
+            xds_max_streams_per_principal,
+            xds_max_active_nodes,
+            xds_max_node_id_bytes,
+            xds_first_request_timeout_seconds,
+            xds_allow_unbounded_stream_limits,
             mesh_ca_backend,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
@@ -6230,6 +6290,9 @@ impl EnvConfig {
         // Bounded pre-authentication admission on the CP gRPC listener.
         self.validate_cp_grpc_connection_limits()?;
 
+        // Bounded post-authentication ADS admission (issue #3741).
+        self.validate_xds_admission_limits()?;
+
         // The forwarding trust boundary is parsed strictly here so a typo fails
         // `ferrum-edge validate` and fails startup before any listener binds,
         // rather than quietly shrinking the trust set at runtime.
@@ -6314,6 +6377,58 @@ impl EnvConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The xDS ADS admission budgets this configuration resolves to
+    /// (issue #3741). Shared by `ferrum-edge validate` and CP startup so the
+    /// two can never disagree about what the CP will actually enforce.
+    pub fn xds_admission_limits(&self) -> crate::xds::admission::XdsAdmissionLimits {
+        crate::xds::admission::XdsAdmissionLimits {
+            max_total_streams: self.xds_max_total_streams,
+            max_streams_per_namespace: self.xds_max_streams_per_namespace,
+            max_streams_per_principal: self.xds_max_streams_per_principal,
+            max_streams_per_node: self.xds_max_streams_per_node,
+            max_active_nodes: self.xds_max_active_nodes,
+            max_node_id_bytes: self.xds_max_node_id_bytes,
+            first_request_timeout: std::time::Duration::from_secs(
+                self.xds_first_request_timeout_seconds,
+            ),
+        }
+    }
+
+    /// Refuse silently unbounded ADS admission budgets under production mesh
+    /// posture (issue #3741).
+    ///
+    /// `0` on any ADS budget means "unbounded", which is exactly the posture
+    /// that let one authenticated bearer exhaust CP tasks, channels, snapshot
+    /// memory, and broadcast subscribers by cycling `Node.id` values. Under
+    /// `FERRUM_MESH_PRODUCTION_MODE=true` that requires the visibly unsafe
+    /// `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` acknowledgement; outside
+    /// production it is permitted and warned about at startup.
+    ///
+    /// Only meaningful when `FERRUM_XDS_ENABLED=true`: a CP that never mounts
+    /// ADS enforces nothing here, so an unused value must not fail validation.
+    pub fn validate_xds_admission_limits(&self) -> Result<(), String> {
+        if !self.xds_enabled {
+            return Ok(());
+        }
+        let limits = self.xds_admission_limits();
+        let unbounded = limits.unbounded_scope_names();
+        if unbounded.is_empty() {
+            return Ok(());
+        }
+        if !crate::identity::production_mode() || self.xds_allow_unbounded_stream_limits {
+            return Ok(());
+        }
+        Err(format!(
+            "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_XDS_ENABLED=true refuses unbounded xDS \
+             admission budgets, but these are set to 0 (unbounded): {}. A 0 value removes an \
+             aggregate DoS boundary: one authenticated bearer can then exhaust control-plane \
+             tasks, response channels, filtered config snapshots, and broadcast subscribers by \
+             cycling arbitrary Node.id values. Set finite values, or set \
+             FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true to accept the risk explicitly.",
+            unbounded.join(", ")
+        ))
     }
 
     /// Resolve the CP gRPC listen address: an explicit

@@ -9,6 +9,7 @@
 // allowance scoped to dead code only; unused imports should still be caught.
 #![allow(dead_code)]
 
+pub mod admission;
 pub mod carrier;
 pub mod conformance;
 pub mod nonce;
@@ -66,6 +67,15 @@ pub use carrier::{
     FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL, FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
     FERRUM_ECDS_WORKLOADS_TYPE_URL, MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES,
     MAX_WAYPOINT_GATEWAY_CLASS_LEN, MeshSliceCarrier, apply_carrier, build_slice_carriers,
+};
+#[allow(unused_imports)]
+pub use admission::{
+    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, DEFAULT_XDS_MAX_ACTIVE_NODES,
+    DEFAULT_XDS_MAX_NODE_ID_BYTES, DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
+    DEFAULT_XDS_MAX_STREAMS_PER_NODE, DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
+    DEFAULT_XDS_MAX_TOTAL_STREAMS, XdsAdmissionController, XdsAdmissionLimits,
+    XdsAdmissionRejection, XdsStreamPermit, principal_key, redacted_identifier, validate_node_id,
+    xds_state_key,
 };
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
