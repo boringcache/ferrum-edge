@@ -1048,8 +1048,7 @@ fn the_rpc_defaults_are_sized_for_legitimate_long_lived_stream_occupancy() {
     // abusive.
     const {
         assert!(
-            DEFAULT_MAX_CONCURRENT_RPCS
-                >= DEFAULT_MAX_CONNECTIONS * LONG_LIVED_RPCS_PER_CONNECTION,
+            DEFAULT_MAX_CONCURRENT_RPCS >= DEFAULT_MAX_CONNECTIONS * LONG_LIVED_RPCS_PER_CONNECTION,
             "the service-wide RPC default must cover the legitimate long-lived streams on every \
              admitted default connection"
         );
