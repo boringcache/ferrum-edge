@@ -157,7 +157,7 @@ impl ConsulDiscoverer {
 
 /// Parse `X-Consul-Index` with a bounded length check. Malformed or oversized
 /// values fail closed (no candidate cursor) without logging header contents.
-fn parse_consul_index_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+pub(crate) fn parse_consul_index_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = headers.get("X-Consul-Index")?;
     let value = raw.to_str().ok()?;
     if value.is_empty() || value.len() > MAX_CONSUL_INDEX_HEADER_LEN {
@@ -188,16 +188,27 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         let candidate_index = parse_consul_index_header(response.headers());
 
         if !response.status().is_success() {
-            // Fail closed without logging response bodies (may contain secrets).
-            anyhow::bail!("Consul API returned status {}", response.status().as_u16());
+            // Fail closed without reading or logging response bodies (may
+            // contain secrets). Fixed ACL remediation for 401/403 only.
+            let status = response.status().as_u16();
+            drop(response);
+            if matches!(status, 401 | 403) {
+                anyhow::bail!(
+                    "Consul API returned status {status}; check Consul ACL token policy (service:read on the discovered service)"
+                );
+            }
+            anyhow::bail!("Consul API returned status {status}");
         }
 
-        // Decode via the existing JSON path. Body byte caps for Consul /
-        // Kubernetes discovery are owned by issue #3720; do not include body
-        // snippets in the error (payloads may carry tokens/PII).
-        let body: Vec<serde_json::Value> = response
-            .json()
+        // Distinguish transport/read failures from malformed JSON without
+        // logging body bytes, URLs, tokens, or unredacted error strings.
+        // Body byte caps for Consul / Kubernetes discovery are owned by
+        // issue #3720 — do not absorb that work here.
+        let body_bytes = response
+            .bytes()
             .await
+            .map_err(|_| anyhow::anyhow!("Consul API response body read failed"))?;
+        let body: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes)
             .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
         let provider_item_count = body.len();
         let mut targets = Vec::new();
@@ -437,33 +448,5 @@ mod tests {
         assert!(url.contains("tag=prod"));
         assert!(url.contains("index=99"));
         assert!(url.contains("wait=30s"));
-    }
-
-    #[test]
-    fn parse_consul_index_header_accepts_decimal_u64() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("X-Consul-Index", "42".parse().unwrap());
-        assert_eq!(parse_consul_index_header(&headers), Some(42));
-    }
-
-    #[test]
-    fn parse_consul_index_header_rejects_oversized_or_non_digit() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "X-Consul-Index",
-            "18446744073709551616".parse().unwrap(), // 2^64, 20 digits but overflows u64
-        );
-        assert_eq!(parse_consul_index_header(&headers), None);
-
-        headers.clear();
-        headers.insert("X-Consul-Index", "12abc".parse().unwrap());
-        assert_eq!(parse_consul_index_header(&headers), None);
-
-        headers.clear();
-        headers.insert(
-            "X-Consul-Index",
-            "000000000000000000000".parse().unwrap(), // 21 digits
-        );
-        assert_eq!(parse_consul_index_header(&headers), None);
     }
 }

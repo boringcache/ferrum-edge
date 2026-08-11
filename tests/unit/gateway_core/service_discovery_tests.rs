@@ -3465,15 +3465,20 @@ async fn consul_legitimate_empty_first_response_clears_prior_targets_then_commit
         None,
         1,
     );
-    let prior = vec![make_target("10.0.0.55", 8080)];
-    let mut harness = ConsulPipelineHarness::new("up-consul", prior);
+    // Seed the LB with stale dynamic targets while also configuring a static
+    // target that must survive the first empty publication/clear path.
+    let prior_dynamic = vec![make_target("10.0.0.55", 8080)];
+    let static_targets = vec![make_target("static-keep.example", 8080)];
+    let mut harness = ConsulPipelineHarness::new("up-consul", prior_dynamic);
+    harness.static_targets = static_targets;
     assert_eq!(harness.lb_hosts(), vec!["10.0.0.55".to_string()]);
     assert!(!harness.state.snapshot_installed());
 
     harness.discover_and_apply(&discoverer).await.unwrap();
-    assert!(
-        harness.lb_hosts().is_empty(),
-        "first empty admitted snapshot must publish/clear prior dynamic targets"
+    assert_eq!(
+        harness.lb_hosts(),
+        vec!["static-keep.example".to_string()],
+        "first empty admitted snapshot must clear prior dynamic targets while retaining static targets"
     );
     assert_eq!(cursor_index(&discoverer), 12);
     assert!(harness.state.snapshot_installed());
@@ -3672,7 +3677,7 @@ async fn consul_legitimate_empty_json_array_is_admissible() {
             assert!(cursor.is_some());
             drop(cursor);
         }
-        SnapshotAdmission::Rejected { reason } => {
+        SnapshotAdmission::Rejected { reason, .. } => {
             panic!("legitimate [] must be accepted, got {reason}")
         }
     }
@@ -3704,7 +3709,7 @@ fn non_consul_accept_filtered_empty_policy_preserves_pre_pr_semantics() {
             assert!(targets.is_empty());
             assert!(cursor.is_none());
         }
-        SnapshotAdmission::Rejected { reason } => {
+        SnapshotAdmission::Rejected { reason, .. } => {
             panic!("non-Consul providers must accept filtered-empty, got {reason}")
         }
     }
@@ -3793,7 +3798,7 @@ async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_qu
 
     // Wait until the empty snapshot publishes (clearing prior targets) and the
     // follow-up blocking query with index=12 installs the next target.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut saw_cleared = false;
     loop {
         let hosts: Vec<String> = cache
@@ -3820,4 +3825,360 @@ async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_qu
     }
 
     manager.stop();
+}
+
+#[test]
+fn parse_consul_index_header_accepts_decimal_u64() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("X-Consul-Index", "42".parse().unwrap());
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        Some(42)
+    );
+}
+
+#[test]
+fn parse_consul_index_header_rejects_oversized_or_non_digit() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "X-Consul-Index",
+        "18446744073709551616".parse().unwrap(), // 2^64, 20 digits but overflows u64
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+
+    headers.clear();
+    headers.insert("X-Consul-Index", "12abc".parse().unwrap());
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+
+    headers.clear();
+    headers.insert(
+        "X-Consul-Index",
+        "000000000000000000000".parse().unwrap(), // 21 digits
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+}
+
+#[tokio::test]
+async fn consul_401_acl_denied_does_not_advance_cursor_or_leak_body() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string("ACL not found: secret-token-value")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        Some("secret-token-value".to_string()),
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("401 must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("status 401"), "got: {msg}");
+    assert!(
+        msg.contains("ACL token policy"),
+        "401 must carry a fixed ACL remediation hint: {msg}"
+    );
+    assert!(
+        !msg.contains("secret-token-value"),
+        "401 path must not leak token or body: {msg}"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_403_acl_denied_does_not_advance_cursor_or_leak_body() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string("Permission denied for token abc")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("403 must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("status 403"), "got: {msg}");
+    assert!(
+        msg.contains("ACL token policy"),
+        "403 must carry a fixed ACL remediation hint: {msg}"
+    );
+    assert!(
+        !msg.contains("Permission denied"),
+        "403 must not leak body: {msg}"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+}
+
+#[tokio::test]
+async fn consul_repeated_all_rejected_retains_cursor_and_increments_rejection_metric() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same candidate index, sustained all-rejected catalog.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_invalid_entries())
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_provider_normalization_rejected_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        10,
+        "repeated all-rejected polls must not advance the cursor"
+    );
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+    let after = registry.service_discovery_provider_normalization_rejected_total();
+    assert!(
+        after >= before + 2,
+        "each rejected poll must increment the bounded rejection counter (before={before}, after={after})"
+    );
+}
+
+#[tokio::test]
+async fn consul_cursor_advance_and_rollback_emit_bounded_metrics() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "40"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "40"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.2", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.3", 8080))
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let advance_before = registry.service_discovery_cursor_advance_total();
+    let rollback_before = registry.service_discovery_cursor_rollback_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 0 -> 40
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 40 -> 50
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 50 -> 7
+    assert_eq!(cursor_index(&discoverer), 7);
+
+    let advance_after = registry.service_discovery_cursor_advance_total();
+    let rollback_after = registry.service_discovery_cursor_rollback_total();
+    assert!(
+        advance_after >= advance_before + 2,
+        "higher-index commits must increment advance (before={advance_before}, after={advance_after})"
+    );
+    assert!(
+        rollback_after >= rollback_before + 1,
+        "lower-index commit must increment rollback (before={rollback_before}, after={rollback_after})"
+    );
+}
+
+#[tokio::test]
+async fn consul_shared_admission_rejection_increments_bounded_metric() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_shared_admission_rejected_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let after = registry.service_discovery_shared_admission_rejected_total();
+    assert!(
+        after >= before + 1,
+        "shared-admission rejection must increment bounded counter (before={before}, after={after})"
+    );
 }

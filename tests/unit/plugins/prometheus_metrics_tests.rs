@@ -1150,6 +1150,28 @@ fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
 }
 
 #[test]
+fn service_discovery_cursor_and_rejection_counters_are_label_safe_and_rendered() {
+    let registry = MetricsRegistry::new();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_shared_admission_rejected();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_rollback();
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_service_discovery_provider_normalization_rejected_total 2"));
+    assert!(output.contains("ferrum_service_discovery_shared_admission_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_cursor_advance_total 3"));
+    assert!(output.contains("ferrum_service_discovery_cursor_rollback_total 1"));
+    // No unbounded dimensions: upstream names / indexes / raw reasons must not appear.
+    assert!(!output.contains("reason="));
+    assert!(!output.contains("index="));
+    assert!(!output.contains("upstream="));
+}
+
+#[test]
 fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     let registry = MetricsRegistry::new();
     registry.record_ai_federation_circuit_opened();

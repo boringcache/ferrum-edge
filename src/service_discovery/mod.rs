@@ -69,7 +69,9 @@ impl DiscoveryCursorCommit {
         use std::sync::atomic::Ordering;
         let previous = self.slot.load(Ordering::Relaxed);
         self.slot.store(self.index, Ordering::Relaxed);
+        let registry = crate::plugins::prometheus_metrics::global_registry();
         if self.index < previous {
+            registry.record_service_discovery_cursor_rollback();
             warn!(
                 previous_index = previous,
                 new_index = self.index,
@@ -77,6 +79,7 @@ impl DiscoveryCursorCommit {
                 "Service discovery: blocking-query cursor rolled back after admitted snapshot (registry likely restarted)"
             );
         } else if self.index > previous {
+            registry.record_service_discovery_cursor_advance();
             debug!(
                 previous_index = previous,
                 new_index = self.index,
@@ -206,6 +209,13 @@ pub enum SnapshotAdmission {
     Rejected {
         /// Bounded structured reason for logs/metrics correlation.
         reason: &'static str,
+        /// Candidate blocking-query index from the rejected snapshot, if any.
+        /// Retained only for deduplicated diagnostics — never committed.
+        candidate_index: Option<u64>,
+        /// Raw provider catalog item count (bounded diagnostic field).
+        provider_items: usize,
+        /// Provider-normalized target count before shared host/egress filtering.
+        normalized_targets: usize,
     },
 }
 
@@ -217,6 +227,10 @@ pub enum SnapshotAdmission {
 /// - [`SnapshotAdmissionPolicy::AtomicCursor`] accepts a legitimate empty
 ///   Consul catalog (`provider_item_count == 0`) and mixed subsets, but rejects
 ///   a non-empty provider payload that yields zero admitted targets.
+///
+/// Operator-facing rejection warnings are emitted by
+/// [`apply_discovered_snapshot`] with bounded duplicate suppression. This
+/// function only classifies admission.
 pub fn admit_discovered_snapshot(
     upstream_id: &str,
     provider_name: &str,
@@ -228,45 +242,42 @@ pub fn admit_discovered_snapshot(
         cursor,
         admission_policy,
     } = snapshot;
+    let candidate_index = cursor.as_ref().map(DiscoveryCursorCommit::index);
 
     match admission_policy {
         SnapshotAdmissionPolicy::AcceptFilteredEmpty => {
             let filtered =
                 filter_discovered_targets(upstream_id, provider_name, raw, backend_allow_ips);
+            // Propagate any pending cursor so commit still occurs strictly after
+            // publication (DNS-SD / Kubernetes / mesh currently carry none).
             SnapshotAdmission::Accepted {
                 targets: filtered,
-                cursor: None,
+                cursor,
             }
         }
         SnapshotAdmissionPolicy::AtomicCursor {
             provider_item_count,
         } => {
             if provider_item_count > 0 && raw.is_empty() {
-                warn!(
-                    upstream = %upstream_id,
-                    provider = provider_name,
-                    provider_items = provider_item_count,
-                    reason = "provider_normalization_rejected",
-                    "Service discovery: non-empty provider catalog produced zero normalized targets; retaining last-known targets and blocking-query cursor"
-                );
+                // Drop the pending cursor without committing (fail closed).
+                drop(cursor);
                 return SnapshotAdmission::Rejected {
                     reason: "provider_normalization_rejected",
+                    candidate_index,
+                    provider_items: provider_item_count,
+                    normalized_targets: 0,
                 };
             }
             let raw_len = raw.len();
             let filtered =
                 filter_discovered_targets(upstream_id, provider_name, raw, backend_allow_ips);
             if provider_item_count > 0 && filtered.is_empty() {
-                warn!(
-                    upstream = %upstream_id,
-                    provider = provider_name,
-                    provider_items = provider_item_count,
-                    normalized_targets = raw_len,
-                    reason = "shared_admission_rejected",
-                    "Service discovery: snapshot rejected by shared target validation; retaining last-known targets and blocking-query cursor"
-                );
+                drop(cursor);
                 return SnapshotAdmission::Rejected {
                     reason: "shared_admission_rejected",
+                    candidate_index,
+                    provider_items: provider_item_count,
+                    normalized_targets: raw_len,
                 };
             }
             SnapshotAdmission::Accepted {
@@ -732,6 +743,14 @@ pub(crate) fn proxy_targets_discovered_upstream(
     proxy.namespace == upstream_namespace && proxy.upstream_id.as_deref() == Some(upstream_id)
 }
 
+/// Bounded key for suppressing duplicate all-rejected warnings while a Consul
+/// catalog stays rejected at the same candidate index for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RejectionWarnKey {
+    reason: &'static str,
+    candidate_index: Option<u64>,
+}
+
 /// Per-task state retained across discovery poll iterations.
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryLoopState {
@@ -742,6 +761,10 @@ pub(crate) struct DiscoveryLoopState {
     /// path even when empty so prior LB cache contents cannot outlive an
     /// uncommitted empty Consul catalog.
     snapshot_installed: bool,
+    /// Last rejection warn already emitted for this task. Suppresses sustained
+    /// duplicate warnings for the same reason/candidate without unbounded
+    /// cardinality (fixed reason strings + optional u64 index only).
+    last_rejection_warn: Option<RejectionWarnKey>,
 }
 
 impl DiscoveryLoopState {
@@ -797,15 +820,70 @@ pub(crate) async fn apply_discovered_snapshot(
         dns_cache.backend_allow_ips(),
     );
     let (discovered, pending_cursor) = match admission {
-        SnapshotAdmission::Accepted { targets, cursor } => (targets, cursor),
-        SnapshotAdmission::Rejected { reason } => {
-            // `admit_discovered_snapshot` already emitted the structured warn.
-            debug!(
-                upstream = %upstream_id,
-                provider = provider_name,
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            state.last_rejection_warn = None;
+            (targets, cursor)
+        }
+        SnapshotAdmission::Rejected {
+            reason,
+            candidate_index,
+            provider_items,
+            normalized_targets,
+        } => {
+            let registry = crate::plugins::prometheus_metrics::global_registry();
+            match reason {
+                "provider_normalization_rejected" => {
+                    registry.record_service_discovery_provider_normalization_rejected();
+                }
+                "shared_admission_rejected" => {
+                    registry.record_service_discovery_shared_admission_rejected();
+                }
+                _ => {}
+            }
+
+            let warn_key = RejectionWarnKey {
                 reason,
-                "Service discovery: snapshot not admitted; retaining last-known targets and blocking-query cursor"
-            );
+                candidate_index,
+            };
+            if state.last_rejection_warn != Some(warn_key) {
+                match reason {
+                    "provider_normalization_rejected" => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            provider_items,
+                            reason,
+                            "Service discovery: non-empty provider catalog produced zero normalized targets; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                    "shared_admission_rejected" => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            provider_items,
+                            normalized_targets,
+                            reason,
+                            "Service discovery: snapshot rejected by shared target validation; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            reason,
+                            "Service discovery: snapshot rejected; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                }
+                state.last_rejection_warn = Some(warn_key);
+            } else {
+                debug!(
+                    upstream = %upstream_id,
+                    provider = provider_name,
+                    reason,
+                    "Service discovery: snapshot not admitted (same rejection as prior poll); retaining last-known targets and blocking-query cursor"
+                );
+            }
             return DiscoveryApplyControl::Continue;
         }
     };
@@ -840,13 +918,23 @@ pub(crate) async fn apply_discovered_snapshot(
         !state.snapshot_installed || !targets_equal(&discovered, &state.last_discovered);
 
     if needs_publish {
-        info!(
-            "Service discovery [{}]: upstream {} targets changed ({} -> {} discovered targets)",
-            provider_name,
-            upstream_id,
-            state.last_discovered.len(),
-            discovered.len(),
-        );
+        if !state.snapshot_installed {
+            // Avoid the misleading `0 -> 0 targets changed` wording for an
+            // intentional first install (including an empty catalog that clears
+            // stale shared LB state after task restart/reconcile).
+            info!(
+                "Service discovery [{}]: upstream {} installing initial discovered snapshot ({} discovered targets)",
+                provider_name, upstream_id, discovered.len(),
+            );
+        } else {
+            info!(
+                "Service discovery [{}]: upstream {} targets changed ({} -> {} discovered targets)",
+                provider_name,
+                upstream_id,
+                state.last_discovered.len(),
+                discovered.len(),
+            );
+        }
 
         let merged = merge_targets(static_targets, &discovered);
 
