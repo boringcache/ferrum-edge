@@ -2250,11 +2250,12 @@ async fn handle_admin_request_inner(
             // previously-ready dependency, so it shares `unavailable`. So does
             // a DP whose applied configuration aged past its bound (#3726): it
             // started ready and lost its authority, which is not "starting".
-            health_status["status"] = json!(if serving_degraded || !jwks_ready || dp_config_stale {
-                "unavailable"
-            } else {
-                "starting"
-            });
+            health_status["status"] =
+                json!(if serving_degraded || !jwks_ready || dp_config_stale {
+                    "unavailable"
+                } else {
+                    "starting"
+                });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK

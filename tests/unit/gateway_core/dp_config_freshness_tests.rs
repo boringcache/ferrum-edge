@@ -148,7 +148,10 @@ fn an_applied_snapshot_resets_the_age_and_restores_admission() {
     freshness.record_snapshot_applied_at(at(epoch, 610));
 
     let snapshot = freshness.evaluate_at(at(epoch, 611));
-    assert!(!snapshot.stale, "an applied snapshot clears the sticky flag");
+    assert!(
+        !snapshot.stale,
+        "an applied snapshot clears the sticky flag"
+    );
     assert!(!snapshot.new_traffic_blocked);
     assert_eq!(snapshot.snapshot_age_seconds, 1);
     assert_eq!(snapshot.reason, FreshnessReason::Ok.as_str());
@@ -200,7 +203,10 @@ fn a_successful_failover_handoff_never_latches_an_already_aged_snapshot() {
     let during_handoff = freshness.evaluate_at(at(epoch, 5_000));
     assert!(!during_handoff.stale, "a handoff is not authority loss");
     assert!(!during_handoff.new_traffic_blocked);
-    assert_eq!(during_handoff.cp_authority, CpAuthority::Reconnecting.as_str());
+    assert_eq!(
+        during_handoff.cp_authority,
+        CpAuthority::Reconnecting.as_str()
+    );
 
     // The fallback answers. Still no blip, and the applied snapshot the
     // fallback delivers resets the age.
@@ -296,7 +302,10 @@ fn startup_without_any_snapshot_is_bounded_from_process_start() {
     let before = freshness.evaluate_at(at(epoch, 599));
     assert!(!before.stale);
     assert!(!before.applied_snapshot);
-    assert_eq!(before.reason, FreshnessReason::AwaitingFirstSnapshot.as_str());
+    assert_eq!(
+        before.reason,
+        FreshnessReason::AwaitingFirstSnapshot.as_str()
+    );
     assert_eq!(before.snapshot_age_seconds, 599);
 
     let after = freshness.evaluate_at(at(epoch, 600));
@@ -320,7 +329,11 @@ fn a_disabled_bound_never_goes_stale() {
     assert!(!snapshot.stale, "0 is the documented unbounded opt-in");
     assert!(!snapshot.new_traffic_blocked);
     assert_eq!(snapshot.max_stale_seconds, 0);
-    assert!(freshness.next_stale_deadline_at(at(epoch, 10_000_000)).is_none());
+    assert!(
+        freshness
+            .next_stale_deadline_at(at(epoch, 10_000_000))
+            .is_none()
+    );
 }
 
 /// The monitor is deadline-driven, not tick-driven: the deadline it arms is the

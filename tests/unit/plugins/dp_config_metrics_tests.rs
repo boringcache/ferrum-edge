@@ -72,7 +72,10 @@ fn two_scrapes_observe_live_dp_config_state_while_the_cached_body_is_unchanged()
     );
 
     for family in FAMILIES {
-        assert!(first.contains(family), "{family} missing from the first scrape");
+        assert!(
+            first.contains(family),
+            "{family} missing from the first scrape"
+        );
         assert!(
             second.contains(family),
             "{family} missing from the second scrape"
@@ -123,13 +126,18 @@ fn the_dp_config_families_are_appended_live_and_never_memoized() {
         .expect("render_cacheable_body");
     // The memoized body runs to the next item in the impl block.
     let tail = &PROMETHEUS_METRICS_SRC[cacheable_start + 1..];
-    let cacheable_end = ["\n    fn ", "\n    pub fn ", "\n    pub(crate) fn ", "\n}\n"]
-        .iter()
-        .filter_map(|marker| tail.find(marker))
-        .min()
-        .map_or(PROMETHEUS_METRICS_SRC.len(), |offset| {
-            cacheable_start + 1 + offset
-        });
+    let cacheable_end = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+        "\n}\n",
+    ]
+    .iter()
+    .filter_map(|marker| tail.find(marker))
+    .min()
+    .map_or(PROMETHEUS_METRICS_SRC.len(), |offset| {
+        cacheable_start + 1 + offset
+    });
     let cacheable_body = &PROMETHEUS_METRICS_SRC[cacheable_start..cacheable_end];
     for family in FAMILIES {
         assert!(
