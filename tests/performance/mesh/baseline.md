@@ -1,14 +1,48 @@
 # Mesh Performance Baseline
 
-**Directional reference numbers only.** Hardware-specific — collect your own baseline on the production-equivalent host before treating any of these as targets.
+**Directional reference numbers only.** Hardware-specific absolute values are
+not universal product targets. Only defensible normalized/self-relative
+guardrails (for example the hosted `ip_restriction` scaling ceilings already
+enforced in CI) become gates. Treat the tables below as a same-runner reference
+shape, not a laptop SLA.
 
-To regenerate on your machine:
+> **Publication status (issue #3332):** result cells remain `_TBD_` until a
+> GitHub-hosted `Mesh Performance Baselines` workflow run produces zero-error
+> Criterion artifacts and those numbers are copied into this file. Do not fill
+> cells from local machines.
+
+## Reference environment (filled from hosted provenance)
+
+| Field | Value |
+|---|---|
+| Ferrum commit SHA | _TBD_ (from `provenance.json`) |
+| Runner class | `ubuntu-latest` (GitHub-hosted Linux) |
+| CPU model / topology | _TBD_ |
+| RAM | _TBD_ |
+| OS / kernel / arch | _TBD_ |
+| Rust toolchain | `rust-toolchain.toml` → `stable` (exact `rustc --version --verbose` in artifact) |
+| Criterion / harness | `tests/performance/mesh` (`criterion` pin in that crate's lockfile) |
+| Build profile / features | Criterion `bench` profile inherits `release`; default features |
+| Non-default settings | none beyond harness defaults |
+| Warmup / measurement | `--warm-up-time 3 --measurement-time 15` per bench |
+| Raw artifacts | Actions artifact `mesh-performance-baselines-<sha>` → `mesh/criterion/**` + `summary.json` |
+
+## Commands
+
 ```bash
-cd tests/performance/mesh
-./run.sh
-```
+# Preferred: hosted collection
+# Actions → "Mesh Performance Baselines" → suites=all (or mesh)
 
-Each row below records the criterion-reported mean (and an estimate of the variance class) for the parameterised bench. Times are listed in the smallest unit criterion reported on the reference machine. **Empty entries are expected on first commit** — fill them in as you run the suite.
+# Equivalent Criterion invocation used by the workflow:
+cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench authz_match \
+  -- --warm-up-time 3 --measurement-time 15
+cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ip_restriction \
+  -- --warm-up-time 3 --measurement-time 15
+cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench slice_apply \
+  -- --warm-up-time 3 --measurement-time 15
+cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench xds_translation \
+  -- --warm-up-time 3 --measurement-time 15
+```
 
 ## authz_match
 
@@ -63,10 +97,53 @@ catastrophic regression in the cached client-IP or constant-time hook overhead.
 | 1 000 | _TBD_ | |
 | 5 000 | _TBD_ | |
 
-## Interpretation notes
+## Overhead formula
 
-- These are **single-threaded** micro-benches. Production paths can amortise across cores; the numbers below are a per-CPU upper bound, not aggregate throughput.
-- `authz_match` measures the worst-case linear scan. The plugin layer caches PolicyScope filter results per-request; that cache is _not_ exercised here.
-- `ip_restriction` measures the compiled O(log n) lookup after canonical client-IP caching; policy construction and rule parsing are outside the timed loop.
-- `slice_apply` measures the cold rebuild. The ArcSwap swap itself is ~constant time and is not included in the bench window.
-- `xds_translation` runs on the CP side; the DP fingerprint-dedup downstream means most translations get reused, so production hit rate is high.
+These microbenchmarks have no direct-vs-gateway comparison. For E2E suites the
+shared throughput overhead definition is:
+
+`overhead_percent = ((direct_throughput - gateway_throughput) / direct_throughput) * 100`
+
+where throughput is RPS (HBONE) or QPS (DNS upstream-forward). Latency quantiles
+are reported beside the overhead column and are not folded into it.
+
+## Rerun procedure
+
+1. Push the candidate SHA (or use the PR branch).
+2. Run Actions → **Mesh Performance Baselines** → `suites=mesh` or `all`.
+3. Download artifact `mesh-performance-baselines-<sha>`.
+4. Confirm `summary.json` → `acceptance_gate.mesh_complete == true`.
+5. Copy Criterion means (and σ / CI from `estimates.json`) into the tables above.
+6. Link the artifact (or commit a companion `summary.json` excerpt) from the
+   reference-environment table.
+7. Re-check interpretation notes below for harness bottlenecks before treating
+   numbers as gateway capacity.
+
+## Bottleneck review
+
+- These are **single-threaded** Criterion micro-benches. Production paths can
+  amortise across cores; per-call times are a per-CPU upper bound, not aggregate
+  throughput.
+- `authz_match` measures the worst-case linear scan. The plugin layer caches
+  PolicyScope filter results per-request; that cache is _not_ exercised here.
+- `ip_restriction` measures the compiled O(log n) lookup after canonical
+  client-IP caching; policy construction and rule parsing are outside the timed
+  loop.
+- `slice_apply` measures the cold rebuild. The ArcSwap swap itself is ~constant
+  time and is not included in the bench window.
+- `xds_translation` runs on the CP side; DP fingerprint-dedup downstream means
+  most translations get reused, so production hit rate is high.
+
+## Refresh cadence
+
+Refresh this table when any of the following land on `main`:
+
+- Material changes to mesh authz evaluation, `ip_restriction` lookup, slice
+  apply, or xDS translation hot paths.
+- Criterion / harness dependency bumps that change measurement semantics.
+- Runner-class changes for the hosted collection workflow.
+- At least once per minor release train, or sooner if a sustained CI
+  self-relative guardrail alert fires.
+
+Re-run via `.github/workflows/mesh-performance-baselines.yml` and publish only
+zero-error hosted results.

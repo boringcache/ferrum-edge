@@ -120,8 +120,15 @@ as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 
 | Suite | Path | Measures | Residual |
 |---|---|---|---|
-| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Provenance-complete `baseline.md` rows still `_TBD_` — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
-| Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same baseline-publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| In-process mesh Criterion | `tests/performance/mesh/` | `authz_match`, `ip_restriction`, `slice_apply`, `xds_translation` | Hosted collection workflow landed; `baseline.md` result cells stay `_TBD_` until a successful artifact is published — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Same two-stage publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same two-stage publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+
+Hosted collection (stage 1) lives in
+`.github/workflows/mesh-performance-baselines.yml`. It records provenance,
+Criterion trees, HBONE/DNS JSON (≥3 repetitions), `summary.json`, and draft
+markdown under the `mesh-performance-baselines-<sha>` artifact. Stage 2 copies
+only zero-error hosted aggregates into the three `baseline.md` tables.
 
 `tests/performance/mesh/README.md` is a **frozen Trusted Cross automation
 surface**: every path under `tests/performance/` is treated as protected
@@ -135,6 +142,7 @@ instead of rewriting that protected README.
 
 ## Related surfaces
 
+- Mesh/HBONE/DNS baseline collection: `.github/workflows/mesh-performance-baselines.yml`
 - Manual exploratory matrix: `.github/workflows/perf-benchmark.yml`
 - PR overhead gate: `tests/performance/ci_overhead_bench.py` via `ci.yml`
 - Connection saturation headlines: `docs/connection_saturation_benchmark.md`
