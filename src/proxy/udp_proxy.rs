@@ -2731,6 +2731,7 @@ async fn process_new_session_datagram(
         overload,
         health_checker,
         preselected_backend_target,
+        admitted_datagram_plugins,
         stream_ctx,
     )
     .await?;
@@ -4063,23 +4064,20 @@ async fn create_session(
     overload: &Arc<crate::overload::OverloadState>,
     health_checker: &HealthChecker,
     preselected_backend_target: Option<(String, u16)>,
+    admitted_datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     mut stream_ctx: StreamConnectionContext,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
         plugins,
-        datagram_plugins,
+        datagram_plugins: _,
         consumer_index: _,
         sni_hostname: _,
     } = view;
-    // Same binding the caller applied to the first datagram: a per-instance
-    // trigger that evaluated `false` during `on_stream_connect` performs zero
-    // datagram-hook work for the whole flow, including the hook-ingress channel
-    // this session would otherwise allocate for it.
-    let datagram_plugins = crate::plugins::admitted_datagram_plugins(
-        &datagram_plugins,
-        &stream_ctx.plugin_trigger_decisions(),
-    );
+    // The caller bound this list once before applying first-datagram policy.
+    // Reuse that exact list for the session so admission counters and wrapper
+    // hooks are not consulted a second time.
+    let datagram_plugins = admitted_datagram_plugins;
     let proxy_id = proxy.id.as_str();
     let proxy_name = proxy.name.clone();
     let proxy_namespace = proxy.namespace.clone();

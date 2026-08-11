@@ -607,9 +607,21 @@ async fn a_true_udp_trigger_keeps_the_flow_datagram_hooks() {
     let plugins = published(&udp_config(proxy_id, 19_612, "10.0.0.0/8"), proxy_id);
 
     let mut inside = udp_stream_ctx("10.4.4.4", StreamFrontendTransport::Udp, 19_612);
-    let hooks = admitted_flow_hooks(&plugins, &mut inside).await;
+    for plugin in &plugins {
+        let _ = plugin.on_stream_connect(&mut inside).await;
+    }
+    let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
+        .iter()
+        .filter(|plugin| plugin.requires_udp_datagram_hooks())
+        .cloned()
+        .collect();
+    let hooks = admitted_datagram_plugins_for_test(&datagram_plugins, &inside);
     assert_eq!(hooks.len(), 1, "an admitted instance keeps its hooks");
     assert_eq!(hooks[0].name(), "udp_rate_limiting");
+    assert!(
+        Arc::ptr_eq(&hooks, &datagram_plugins),
+        "an all-admitted flow must reuse the generation-owned hook list without allocating"
+    );
 }
 
 #[tokio::test]

@@ -7700,14 +7700,20 @@ pub(crate) fn admitted_datagram_plugins(
     if datagram_plugins.is_empty() {
         return Arc::clone(datagram_plugins);
     }
-    let admitted: Vec<Arc<dyn Plugin>> = datagram_plugins
+    let Some(first_rejected) = datagram_plugins
         .iter()
-        .filter(|plugin| plugin.admits_stream_session_hooks(decisions))
-        .cloned()
-        .collect();
-    if admitted.len() == datagram_plugins.len() {
+        .position(|plugin| !plugin.admits_stream_session_hooks(decisions))
+    else {
         return Arc::clone(datagram_plugins);
-    }
+    };
+    let mut admitted = Vec::with_capacity(datagram_plugins.len().saturating_sub(1));
+    admitted.extend(datagram_plugins[..first_rejected].iter().cloned());
+    admitted.extend(
+        datagram_plugins[first_rejected + 1..]
+            .iter()
+            .filter(|plugin| plugin.admits_stream_session_hooks(decisions))
+            .cloned(),
+    );
     Arc::from(admitted)
 }
 
