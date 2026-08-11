@@ -4120,7 +4120,7 @@ async fn consul_cursor_advance_and_rollback_emit_bounded_metrics() {
         "higher-index commits must increment advance (before={advance_before}, after={advance_after})"
     );
     assert!(
-        rollback_after >= rollback_before + 1,
+        rollback_after > rollback_before,
         "lower-index commit must increment rollback (before={rollback_before}, after={rollback_after})"
     );
 }
@@ -4178,7 +4178,7 @@ async fn consul_shared_admission_rejection_increments_bounded_metric() {
 
     let after = registry.service_discovery_shared_admission_rejected_total();
     assert!(
-        after >= before + 1,
+        after > before,
         "shared-admission rejection must increment bounded counter (before={before}, after={after})"
     );
 }
