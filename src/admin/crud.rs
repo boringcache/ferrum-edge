@@ -598,7 +598,10 @@ where
     F: Future<Output = DbResult<T>>,
 {
     match guard {
-        Some(guard) => guard.run_to_completion_while_held(future).await,
+        Some(guard) => guard
+            .run_to_completion_while_held(future)
+            .await
+            .map_err(mark_mtls_dns_admission_unavailable),
         None => Ok(NamespaceConfigAdmissionCompletion::Held(future.await)),
     }
 }
@@ -667,10 +670,10 @@ async fn recover_late_resource_write<R: AdminResource>(
     http_client: crate::plugins::PluginHttpClient,
     action: LateResourceWrite<'_>,
     recovery: LateResourceRecovery<'_, R>,
-) -> Result<bool, anyhow::Error> {
+) -> Result<Option<NamespaceConfigAdmissionGuard>, anyhow::Error> {
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
-        return Ok(true);
+        return Ok(Some(recovery_guard));
     }
     if matches!(
         &action,
@@ -685,7 +688,7 @@ async fn recover_late_resource_write<R: AdminResource>(
         .await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let compensation = async {
@@ -759,7 +762,7 @@ async fn recover_late_resource_write<R: AdminResource>(
             return Err(error);
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Resolve the authoritative post-write view of a committed resource.
@@ -789,6 +792,26 @@ async fn settle_written_resource<R: AdminResource>(
             "committed {} could not be re-read for its authoritative stored state",
             R::RESOURCE_NAME
         )),
+    }
+}
+
+/// Settle a committed write while continuing to observe namespace admission.
+///
+/// Merely retaining the guard is insufficient: its lease can expire while the
+/// authoritative read is in flight. In that case the read may describe a later
+/// writer, so fail closed instead of using it for this request's response and
+/// audit after-image.
+async fn settle_written_resource_while_held<R: AdminResource>(
+    guard: Option<&NamespaceConfigAdmissionGuard>,
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    written: R,
+) -> DbResult<R> {
+    match run_db_write_while_held(guard, settle_written_resource(db, namespace, written)).await? {
+        NamespaceConfigAdmissionCompletion::Held(result) => result,
+        NamespaceConfigAdmissionCompletion::Lost { result: _, error } => {
+            Err(mark_mtls_dns_admission_unavailable(error))
+        }
     }
 }
 
@@ -843,8 +866,11 @@ async fn persist_create_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(recovery_guard)) => {
+                        guard = Some(recovery_guard);
+                        Ok(())
+                    }
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during create; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -863,7 +889,13 @@ async fn persist_create_to_settlement<R: AdminResource>(
     // the same authoritative record. A failure here is reported as a failed
     // write: the alternative — auditing and answering with the request-side
     // revision — is the stale-value defect itself.
-    let settled = settle_written_resource::<R>(success_db.as_ref(), &namespace, written).await?;
+    let settled = settle_written_resource_while_held::<R>(
+        guard.as_ref(),
+        success_db.as_ref(),
+        &namespace,
+        written,
+    )
+    .await?;
     finish_write_success(
         success_db,
         &state,
@@ -921,8 +953,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(true),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(recovery_guard)) => {
+                        guard = Some(recovery_guard);
+                        Ok(true)
+                    }
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during update; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -939,7 +974,13 @@ async fn persist_update_to_settlement<R: AdminResource>(
     if !result? {
         return Ok(None);
     }
-    let settled = settle_written_resource::<R>(success_db.as_ref(), &namespace, written).await?;
+    let settled = settle_written_resource_while_held::<R>(
+        guard.as_ref(),
+        success_db.as_ref(),
+        &namespace,
+        written,
+    )
+    .await?;
     finish_write_success(
         success_db,
         &state,
@@ -1042,7 +1083,13 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
     if !result? {
         return Ok(None);
     }
-    let settled = settle_written_resource::<R>(db.as_ref(), &namespace, written).await?;
+    let settled = settle_written_resource_while_held::<R>(
+        guard.as_ref(),
+        db.as_ref(),
+        &namespace,
+        written,
+    )
+    .await?;
     finish_write_success(
         db,
         &state,
@@ -1104,8 +1151,8 @@ async fn persist_delete_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(true),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(_recovery_guard)) => Ok(true),
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during delete; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -3025,6 +3072,9 @@ impl AdminResource for GatewayTrustBundleRecord {
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         if let Some(conflict) =
             crate::config::db_backend::gateway_trust_bundle_revision_conflict(error)
         {
