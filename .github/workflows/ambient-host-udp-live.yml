@@ -273,7 +273,9 @@ jobs:
               exit 1
             }
           done
-          sudo unshare --net sh -eu -c 'ip link set lo up; iptables -t mangle -L >/dev/null; ip6tables -t mangle -L >/dev/null'
+          sudo unshare --net -- ip link set lo up
+          sudo unshare --net -- iptables -t mangle -L >/dev/null
+          sudo unshare --net -- ip6tables -t mangle -L >/dev/null
 
       - name: Run ambient host-UDP live gate as root
         env:
