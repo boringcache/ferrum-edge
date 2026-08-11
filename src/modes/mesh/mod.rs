@@ -8982,16 +8982,18 @@ fn resolve_subset_traffic_policy(
             let http_idle_timeout_ms = tp.and_then(|tp| tp.http_idle_timeout_ms);
             let http2_max_requests = tp.and_then(|tp| tp.http2_max_requests);
             let h2_max_concurrent_streams = tp.and_then(|tp| tp.h2_max_concurrent_streams);
-            if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(
-                resolved_tls,
-                passive,
+            let resolved = ResolvedSubsetTrafficPolicy {
+                tls: resolved_tls,
+                passive_health_check: passive,
                 h2_upgrade_policy,
                 max_retries,
                 http1_max_pending_requests,
                 http_idle_timeout_ms,
                 http2_max_requests,
                 h2_max_concurrent_streams,
-            ) {
+            }
+            .into_non_empty();
+            if let Some(resolved) = resolved {
                 resolved_map.insert(subset.name.clone(), resolved);
             }
         }

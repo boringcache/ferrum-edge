@@ -743,7 +743,7 @@ async fn destination_active_request_permit_releases_on_task_cancellation() {
 /// budget; a per-transport copy is how the pre-#3775 behavior diverged.
 #[test]
 fn destination_active_request_breaker_is_wired_into_backend_admission() {
-    let source = include_str!("../../../src/proxy/backend_dispatch.rs");
+    let source = include_str!("../../src/proxy/backend_dispatch.rs");
     let admission = source
         .find("pub(crate) fn run_backend_admission_plugins(")
         .expect("backend admission funnel");
@@ -780,14 +780,14 @@ fn destination_active_request_breaker_is_wired_into_backend_admission() {
 /// trailers, disconnects, and errors instead of releasing at response headers.
 #[test]
 fn destination_active_request_permit_is_held_for_the_response_lifetime() {
-    let limiter_source = include_str!("../../../src/backend_active_request_limit.rs");
+    let limiter_source = include_str!("../../src/backend_active_request_limit.rs");
     assert!(
         limiter_source.contains(
             "impl crate::plugins::BackendAdmissionPermit for DestinationActiveRequestPermit"
         ),
         "the guard must be carried by the backend-admission permit set"
     );
-    let body_source = include_str!("../../../src/proxy/body.rs");
+    let body_source = include_str!("../../src/proxy/body.rs");
     assert!(
         body_source.contains(
             "_backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>"
@@ -801,7 +801,7 @@ fn destination_active_request_permit_is_held_for_the_response_lifetime() {
 /// hyper H2 builder.
 #[test]
 fn per_connection_stream_cap_stays_separate_from_the_destination_budget() {
-    let mesh_source = include_str!("../../../src/modes/mesh/mod.rs");
+    let mesh_source = include_str!("../../src/modes/mesh/mod.rs");
     let projection = mesh_source
         .find("fn apply_connection_pool_http_to_port_override(")
         .expect("per-port connectionPool.http projection");

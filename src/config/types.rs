@@ -1060,29 +1060,10 @@ pub struct ResolvedSubsetTrafficPolicy {
 }
 
 impl ResolvedSubsetTrafficPolicy {
-    /// Build from the fully resolved subset overlays. Returns `None` only when
-    /// every carried field is absent, so callers can skip empty entries.
-    pub fn new(
-        tls: Option<BackendTlsConfig>,
-        passive_health_check: Option<PassiveHealthCheck>,
-        h2_upgrade_policy: Option<H2UpgradePolicy>,
-        max_retries: Option<u32>,
-        http1_max_pending_requests: Option<u32>,
-        http_idle_timeout_ms: Option<u64>,
-        http2_max_requests: Option<u32>,
-        h2_max_concurrent_streams: Option<u32>,
-    ) -> Option<Self> {
-        let resolved = Self {
-            tls,
-            passive_health_check,
-            h2_upgrade_policy,
-            max_retries,
-            http1_max_pending_requests,
-            http_idle_timeout_ms,
-            http2_max_requests,
-            h2_max_concurrent_streams,
-        };
-        (!resolved.is_empty()).then_some(resolved)
+    /// Return this fully resolved subset overlay unless every carried field is
+    /// absent, so callers can skip empty entries.
+    pub fn into_non_empty(self) -> Option<Self> {
+        (!self.is_empty()).then_some(self)
     }
 
     fn is_empty(&self) -> bool {

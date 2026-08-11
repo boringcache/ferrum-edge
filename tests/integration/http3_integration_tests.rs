@@ -474,6 +474,9 @@ async fn test_http3_proxy_state_creation() {
         backend_pending_limit: Arc::new(
             ferrum_edge::backend_pending_limit::BackendPendingLimiter::new(),
         ),
+        backend_active_request_limit: Arc::new(
+            ferrum_edge::backend_active_request_limit::BackendActiveRequestLimiter::new(),
+        ),
     };
 
     // Verify proxy state is created successfully
@@ -777,6 +780,9 @@ async fn test_http3_full_integration() {
         reqwest_conn_admission,
         backend_pending_limit: Arc::new(
             ferrum_edge::backend_pending_limit::BackendPendingLimiter::new(),
+        ),
+        backend_active_request_limit: Arc::new(
+            ferrum_edge::backend_active_request_limit::BackendActiveRequestLimiter::new(),
         ),
     };
 
