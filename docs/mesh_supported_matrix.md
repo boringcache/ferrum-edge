@@ -200,12 +200,22 @@ need them, or because they are blocked upstream / architecturally:
   replacement UID/identity is admitted while stale registry state is gone, then
   restarts the SPIRE Agent and NodeWaypoint DaemonSets and proves SVID-backed
   traffic, policy, and HBONE authentication recover.
-- **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
-  capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
-  services or proxies force the NodeWaypoint UDP/DTLS path closed during config
-  preparation while the policy update still applies to supported TCP/HTTP
-  traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
-  supported topology for workload-scoped UDP/DTLS authorization.
+- **UDP/DTLS per-pod authz scoping on NodeWaypoint — supported on Linux**
+  (issue #3286). The socket-cookie channel stays TCP-only, so UDP/DTLS resolves
+  its source workload from a separate exact channel: the kernel-reported ingress
+  interface of each datagram (`IP_PKTINFO`/`IPV6_PKTINFO`) joined against the
+  node-agent registry's published pod addresses and attested SPIFFE identity. The
+  resolved pod's `PolicyScopeCache` is stamped before `mesh_authz`, so
+  namespace/selector-scoped `AuthorizationPolicy` enforces per source workload and
+  UDP/DTLS service ports and proxies stay routable. Everything unattributable
+  fails closed at the session boundary — no ingress-interface cmsg, an interface
+  no enrolled pod owns (all off-node traffic), an interface two enrolled pods
+  claim, a source address the interface's pod does not own, a registry entry with
+  no attested identity or address, and a pod whose workload has left the live
+  slice. Admitted sessions are re-authorized per datagram, so pod churn, veth
+  reuse, and registry removal terminate them. The blanket config-preparation
+  suppression of NodeWaypoint UDP/DTLS remains only on builds where the channel
+  cannot exist (non-Linux). Mesh-wide UDP/DTLS policy is unchanged.
 - **Ambient native gRPC over HBONE on the H1/H2 frontend** — the generic
   HTTP-family HBONE dispatch relays an inner HTTP/1.1 byte stream through the
   CONNECT tunnel, so it has no HTTP/2 trailer path for native gRPC and refuses

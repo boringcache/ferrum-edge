@@ -1521,11 +1521,34 @@ fn prepare_normalized_gateway_config_for_mesh(
     Ok(config)
 }
 
+/// Fail-closed suppression of NodeWaypoint UDP/DTLS under scoped policy.
+///
+/// Historically this ALWAYS ran: a NodeWaypoint UDP/DTLS session had no
+/// trustworthy per-source-pod identity, so an enforcing namespace/selector-scoped
+/// `AuthorizationPolicy` disabled every UDP/DTLS service port and proxy rather
+/// than serving traffic whose scope could not be proven.
+///
+/// Issue #3286 supplies that identity: the datapath attributes each datagram to
+/// exactly one enrolled pod from the kernel-reported ingress interface plus the
+/// node-agent-published source address, and stamps that pod's
+/// `PolicyScopeCache` before `mesh_authz` evaluates
+/// ([`crate::proxy::node_waypoint_udp_identity`]). Where that channel is
+/// available the ports stay UP and scoped policy is ENFORCED per source
+/// workload — an unattributable session is denied individually instead of the
+/// whole surface being removed.
+///
+/// The suppression remains, unchanged, wherever the channel cannot exist (a
+/// non-Linux build has neither `IP_PKTINFO` attribution nor sysfs interface
+/// resolution). Fail-closed is still the outcome in both worlds; the difference
+/// is whether attributable workloads keep working.
 fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) {
     if runtime.topology != MeshTopology::NodeWaypoint {
+        return;
+    }
+    if crate::proxy::node_waypoint_udp_identity::source_identity_supported() {
         return;
     }
 
@@ -1696,7 +1719,13 @@ fn node_waypoint_dns_slice_for_prepared_config(
     base_slice: &MeshSlice,
     config: &GatewayConfig,
 ) -> Option<MeshSlice> {
+    // Bound to the same condition as the port suppression it compensates for:
+    // hiding UDP services from mesh DNS is only correct when their routing was
+    // actually stripped. With per-datagram source attribution available the
+    // ports stay up and scoped policy enforces, so the names must keep
+    // resolving (issue #3286).
     if runtime.topology != MeshTopology::NodeWaypoint
+        || crate::proxy::node_waypoint_udp_identity::source_identity_supported()
         || effective_node_waypoint_scoped_authz_policy_labels(config).is_empty()
     {
         return None;
@@ -12419,6 +12448,51 @@ async fn arm_mesh_runtime_startup(
         // unexercised on a live multi-pod datapath, where a tuple/byte-order or
         // enrollment miss fails closed (never misattributes).
         owner.push_mesh_background(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
+        // NodeWaypoint UDP/DTLS per-datagram source-workload attribution
+        // (issue #3286). A UDP listener has one shared frontend socket and no
+        // per-client socket cookie, so the TCP cookie bridge cannot scope it.
+        // The attribution channel instead pairs the kernel-reported ingress
+        // interface of each datagram (IP_PKTINFO) with the node-agent registry's
+        // published pod addresses: a NodeWaypoint proxy is host-network, so a
+        // local pod's egress is the only traffic entering the host namespace on
+        // that pod's interface, and forging a source address cannot change which
+        // interface a packet arrived on. Sessions that cannot be attributed
+        // carry no scope and `mesh_authz` denies them while scoped policies
+        // exist. Started only where attribution can actually work; elsewhere the
+        // slice-preparation fail-closed suppression of UDP/DTLS stays in force.
+        let proxy_state = if crate::proxy::node_waypoint_udp_identity::source_identity_supported() {
+            let udp_source_index = Arc::new(
+                crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex::new(),
+            );
+            let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+            ));
+            let manager =
+                crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndexManager::new(
+                    source,
+                    crate::proxy::node_waypoint_udp_identity::VethInterfaceResolver::new(),
+                    udp_source_index.clone(),
+                    std::time::Duration::from_secs(2),
+                );
+            let manager_shutdown = shutdown_tx.subscribe();
+            info!(
+                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                "Node-waypoint UDP/DTLS source-identity attribution enabled; \
+                 namespace/selector-scoped AuthorizationPolicy is enforced per source pod \
+                 instead of disabling UDP/DTLS service ports"
+            );
+            owner.push_mesh_background(tokio::spawn(async move {
+                manager.run(manager_shutdown).await;
+            }));
+            proxy_state.with_node_waypoint_udp_source_index(udp_source_index)
+        } else {
+            warn!(
+                "Node-waypoint UDP/DTLS source-identity attribution is Linux-only; UDP/DTLS \
+                 service ports and proxies stay disabled while enforcing namespace/selector-scoped \
+                 AuthorizationPolicies exist"
+            );
+            proxy_state
+        };
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
@@ -12873,8 +12947,16 @@ async fn arm_mesh_runtime_startup(
     // `with_node_waypoint_identity_resolver` populated the field on
     // `proxy_state`, and BEFORE `initial_reconcile_stream_listeners()` below so
     // listeners binding on startup observe it. `None` (and thus a no-op) in
-    // every non-NodeWaypoint topology. UDP/DTLS listeners deliberately do not
-    // consume the resolver — see `StreamListenerManager::set_node_waypoint_identity_resolver`.
+    // every non-NodeWaypoint topology. UDP/DTLS listeners consume the resolver
+    // only through the source-attribution index installed just above (issue
+    // #3286): they have no per-client socket cookie, so their source pod is
+    // resolved from the datagram's ingress interface and the resolver is used
+    // solely to look up that pod's per-pod policy scope.
+    if let Some(index) = proxy_state.node_waypoint_udp_source_index.as_ref() {
+        proxy_state
+            .stream_listener_manager
+            .set_node_waypoint_udp_source_index(index.clone());
+    }
     if let Some(resolver) = proxy_state.node_waypoint_identity_resolver.as_ref() {
         proxy_state
             .stream_listener_manager
@@ -20869,6 +20951,15 @@ mod tests {
         }
     }
 
+    /// Whether this build can attribute a NodeWaypoint UDP/DTLS datagram to a
+    /// source pod (issue #3286). When it can, scoped policy is ENFORCED per
+    /// source workload and the UDP/DTLS surface stays up; when it cannot, the
+    /// original fail-closed suppression removes that surface instead. Both are
+    /// fail-closed; the tests below pin each side of the split.
+    fn udp_source_identity_available() -> bool {
+        crate::proxy::node_waypoint_udp_identity::source_identity_supported()
+    }
+
     fn scoped_node_waypoint_deny_policy() -> MeshPolicy {
         MeshPolicy {
             name: "team-a-deny".to_string(),
@@ -20910,10 +21001,6 @@ mod tests {
             .iter()
             .find(|service| service.name == "dns")
             .expect("service kept for non-UDP metadata");
-        assert!(
-            service_udp_stream_ports(dns).is_empty(),
-            "unsupported UDP service port must be stripped from NodeWaypoint mesh metadata"
-        );
         let mesh_authz = prepared
             .plugin_configs
             .iter()
@@ -20922,12 +21009,33 @@ mod tests {
         let mesh_slice: MeshSlice =
             serde_json::from_value(mesh_authz.config["mesh_slice"].clone()).unwrap();
         assert_eq!(mesh_slice.mesh_policies.len(), 1);
-        assert!(
-            !prepared.upstreams.iter().any(|upstream| upstream
+        let synthesized_udp_upstreams = prepared.upstreams.iter().any(|upstream| {
+            upstream
                 .id
-                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)),
-            "synthesized UDP upstreams must not survive fail-closed suppression"
-        );
+                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        });
+        if udp_source_identity_available() {
+            assert_eq!(
+                service_udp_stream_ports(dns).len(),
+                1,
+                "with per-datagram source attribution the UDP service port must stay routable; \
+                 scoped policy is enforced per source pod at the session boundary instead"
+            );
+            assert!(
+                synthesized_udp_upstreams,
+                "the synthesized UDP upstream must survive so attributable clients keep working"
+            );
+        } else {
+            assert!(
+                service_udp_stream_ports(dns).is_empty(),
+                "without per-datagram source attribution the UDP service port must be stripped \
+                 from NodeWaypoint mesh metadata"
+            );
+            assert!(
+                !synthesized_udp_upstreams,
+                "synthesized UDP upstreams must not survive fail-closed suppression"
+            );
+        }
     }
 
     #[test]
@@ -20947,8 +21055,17 @@ mod tests {
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
         let prepared =
             gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice prepares");
-        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
-            .expect("UDP-only service must be suppressed from DNS-visible slice");
+        let sanitized = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared);
+        if udp_source_identity_available() {
+            assert!(
+                sanitized.is_none(),
+                "the DNS carve-out compensates for stripped UDP routing; with per-datagram source \
+                 attribution the routing survives, so the name must keep resolving"
+            );
+            return;
+        }
+        let dns_slice =
+            sanitized.expect("UDP-only service must be suppressed from DNS-visible slice");
 
         assert!(
             dns_slice.services.is_empty(),
@@ -21011,17 +21128,29 @@ mod tests {
             .find(|service| service.name == "dns")
             .expect("service retained for TCP");
 
-        assert!(
-            service_udp_stream_ports(dns).is_empty(),
-            "UDP entry sharing port 53 must be stripped"
-        );
         let tcp_ports = service_tcp_stream_ports(dns);
         assert_eq!(tcp_ports.len(), 1);
         assert_eq!(tcp_ports[0].port, 53);
         assert_eq!(tcp_ports[0].name.as_deref(), Some("dns-tcp"));
 
-        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
-            .expect("mixed service should use sanitized service list for DNS");
+        let sanitized = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared);
+        if udp_source_identity_available() {
+            assert_eq!(
+                service_udp_stream_ports(dns).len(),
+                1,
+                "the UDP entry sharing port 53 stays routable under per-datagram attribution"
+            );
+            assert!(
+                sanitized.is_none(),
+                "a mixed TCP+UDP service must stay DNS-visible when UDP routing survives"
+            );
+            return;
+        }
+        assert!(
+            service_udp_stream_ports(dns).is_empty(),
+            "UDP entry sharing port 53 must be stripped"
+        );
+        let dns_slice = sanitized.expect("mixed service should use sanitized service list for DNS");
         let dns_table = dns_proxy::DnsResolutionTable::from_mesh_slice(&dns_slice);
         assert!(
             dns_table.resolve("dns.default.svc.cluster.local").is_none(),
@@ -21061,8 +21190,16 @@ mod tests {
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
         let prepared =
             gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice prepares");
-        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
-            .expect("UDP ServiceEntry must be suppressed from DNS-visible slice");
+        let sanitized = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared);
+        if udp_source_identity_available() {
+            assert!(
+                sanitized.is_none(),
+                "a UDP ServiceEntry stays DNS-visible when its routing survives"
+            );
+            return;
+        }
+        let dns_slice =
+            sanitized.expect("UDP ServiceEntry must be suppressed from DNS-visible slice");
 
         assert!(
             dns_slice.service_entries.is_empty(),
@@ -21196,12 +21333,29 @@ mod tests {
         let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
             .expect("scoped NodeWaypoint policy update must apply");
 
+        let retained = prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "operator-udp");
+        if udp_source_identity_available() {
+            assert!(
+                retained,
+                "an operator UDP/DTLS proxy stays up under per-datagram source attribution; each \
+                 unattributable session is denied individually instead"
+            );
+            assert!(
+                prepared
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.proxy_id.as_deref() == Some("operator-udp")),
+                "its proxy-scoped plugin config must be retained with it"
+            );
+            return;
+        }
         assert!(
-            !prepared
-                .proxies
-                .iter()
-                .any(|proxy| proxy.id == "operator-udp"),
-            "operator-defined UDP/DTLS proxy must be disabled under scoped NodeWaypoint authz"
+            !retained,
+            "operator-defined UDP/DTLS proxy must be disabled when source attribution is \
+             unavailable"
         );
         assert!(
             prepared
@@ -21267,6 +21421,15 @@ mod tests {
 
         fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, &runtime);
 
+        if udp_source_identity_available() {
+            assert_eq!(
+                config.proxies.len(),
+                2,
+                "with per-datagram source attribution nothing is pruned; scoped policy is enforced \
+                 per session instead"
+            );
+            return;
+        }
         assert_eq!(config.proxies.len(), 1);
         assert_eq!(config.proxies[0].namespace, "tenant-b");
         assert_eq!(config.proxies[0].id, "shared");
@@ -21346,10 +21509,20 @@ mod tests {
             .iter()
             .find(|service| service.name == "dns")
             .expect("service kept for non-UDP metadata");
-        assert!(
-            service_udp_stream_ports(dns).is_empty(),
-            "operator authz override with per-pod scoping must disable UDP service path"
-        );
+        if udp_source_identity_available() {
+            assert_eq!(
+                service_udp_stream_ports(dns).len(),
+                1,
+                "an operator authz override does not change the attribution channel: the UDP \
+                 service path stays routable and is enforced per source pod"
+            );
+        } else {
+            assert!(
+                service_udp_stream_ports(dns).is_empty(),
+                "operator authz override with per-pod scoping must disable the UDP service path \
+                 when source attribution is unavailable"
+            );
+        }
     }
 
     #[test]

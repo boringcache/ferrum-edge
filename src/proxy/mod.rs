@@ -93,6 +93,7 @@ pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
+pub mod node_waypoint_udp_identity;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;
 pub mod sni;
@@ -5997,6 +5998,16 @@ pub struct ProxyState {
     /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
     /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
+    /// NodeWaypoint per-datagram UDP/DTLS source-workload attribution index
+    /// (issue #3286). `None` outside NodeWaypoint topology and whenever the
+    /// channel is unavailable; when present, UDP/DTLS listeners resolve each
+    /// session's source pod from the kernel-provided ingress interface plus the
+    /// registry-published source address, so namespace/selector-scoped
+    /// `AuthorizationPolicy` enforces per source workload instead of the whole
+    /// UDP/DTLS surface being disabled. See
+    /// [`crate::proxy::node_waypoint_udp_identity`].
+    pub node_waypoint_udp_source_index:
+        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
     /// This is live, not staged: `can_attempt_hbone_backend` gates HBONE
     /// dispatch on this slot being loaded (see `current_dispatch_hbone` →
@@ -7817,6 +7828,7 @@ impl ProxyState {
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
             node_waypoint_identity_resolver: None,
+            node_waypoint_udp_source_index: None,
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
@@ -7860,6 +7872,19 @@ impl ProxyState {
         resolver: Arc<NodeWaypointIdentityResolver>,
     ) -> Self {
         self.node_waypoint_identity_resolver = Some(resolver);
+        self
+    }
+
+    /// Return a copy of this state with the NodeWaypoint UDP/DTLS source
+    /// attribution index installed before listeners start accepting traffic
+    /// (issue #3286). Installed only in NodeWaypoint topology and only when the
+    /// channel is supported; every other topology keeps `None` and behaves
+    /// exactly as before.
+    pub fn with_node_waypoint_udp_source_index(
+        mut self,
+        index: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    ) -> Self {
+        self.node_waypoint_udp_source_index = Some(index);
         self
     }
 

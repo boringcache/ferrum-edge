@@ -897,6 +897,14 @@ pub struct StreamListenerManager {
     /// (`connect4`/`connect6` cgroup hooks), and a shared UDP frontend socket
     /// has no per-source-pod cookie. See [`Self::set_node_waypoint_identity_resolver`].
     node_waypoint_identity_resolver: arc_swap::ArcSwap<Option<Arc<NodeWaypointIdentityResolver>>>,
+    /// NodeWaypoint UDP/DTLS per-datagram source-attribution index (issue
+    /// #3286). Populated by the mesh runtime in NodeWaypoint topology only;
+    /// snapshotted into each UDP listener spawn so a session's source pod is
+    /// resolved from the kernel ingress interface + registered source address
+    /// before `mesh_authz` evaluates scoped policy.
+    node_waypoint_udp_source_index: arc_swap::ArcSwap<
+        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
+    >,
     /// Pre-parsed trusted proxy CIDR set (from `FERRUM_TRUSTED_PROXIES`).
     /// Shared with each spawned TCP stream accept loop that has
     /// `stream_proxy_protocol: true`. The accept loop honors the forwarded
@@ -1146,6 +1154,7 @@ impl StreamListenerManager {
             mesh_outbound_enforcement,
             stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
+            node_waypoint_udp_source_index: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
             backend_conn_limit: std::sync::OnceLock::new(),
             stream_sni_plaintext_fallback: AtomicBool::new(false),
@@ -1251,6 +1260,30 @@ impl StreamListenerManager {
     pub fn set_node_waypoint_identity_resolver(&self, resolver: Arc<NodeWaypointIdentityResolver>) {
         self.node_waypoint_identity_resolver
             .store(Arc::new(Some(resolver)));
+    }
+
+    /// Install the NodeWaypoint UDP/DTLS source-attribution index (issue
+    /// #3286).
+    ///
+    /// Called once by the mesh `NodeWaypoint` runtime before the first
+    /// stream-listener `reconcile()`, alongside
+    /// [`Self::set_node_waypoint_identity_resolver`]. UDP/DTLS listeners
+    /// snapshot the slot at spawn and resolve every session's source pod from
+    /// the kernel-provided ingress interface plus the node-agent-published
+    /// source address, then stamp the pod's `PolicyScopeCache` so `mesh_authz`
+    /// enforces namespace/selector-scoped policies per source workload. An
+    /// unattributable datagram leaves the scope absent and `mesh_authz` denies
+    /// the session — there is no mesh-wide fallback while scoped enforcement
+    /// applies.
+    ///
+    /// Scope is strictly `NodeWaypoint`: every other topology and non-mesh UDP
+    /// proxy keeps `None` and behaves exactly as before.
+    pub fn set_node_waypoint_udp_source_index(
+        &self,
+        index: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    ) {
+        self.node_waypoint_udp_source_index
+            .store(Arc::new(Some(index)));
     }
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
@@ -2065,6 +2098,29 @@ impl StreamListenerManager {
                 let listener_udp_metrics = Some(metrics.clone());
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                // Snapshot the NodeWaypoint UDP source-attribution slots once
+                // per listener spawn (issue #3286). Both are `None` outside
+                // NodeWaypoint topology; scoping is only enabled when BOTH are
+                // present, because an index without the resolver could attribute
+                // a pod but not resolve its per-pod policy scope.
+                let node_waypoint_udp_source_index = self
+                    .node_waypoint_udp_source_index
+                    .load_full()
+                    .as_ref()
+                    .clone();
+                let node_waypoint_identity_resolver_for_udp = self
+                    .node_waypoint_identity_resolver
+                    .load_full()
+                    .as_ref()
+                    .clone();
+                let node_waypoint_udp_source_scoping = node_waypoint_udp_source_index
+                    .zip(node_waypoint_identity_resolver_for_udp)
+                    .map(|(index, resolver)| {
+                        crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping {
+                            index,
+                            resolver,
+                        }
+                    });
                 let bind_failures = Arc::clone(&self.bind_failures);
                 let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
@@ -2114,6 +2170,7 @@ impl StreamListenerManager {
                         udp_gso_enabled,
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
+                        node_waypoint_udp_source_scoping,
                     })
                     .await
                     {
