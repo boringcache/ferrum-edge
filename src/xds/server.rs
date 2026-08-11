@@ -2324,8 +2324,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 /// Extract and validate the `Node.id` carried on one ADS request.
 ///
 /// Returns `Ok(None)` when the message carries no node (ACK/NACK follow-ups
-/// legitimately omit it) or an empty id — `resolve_stream_node_id` then refuses
-/// a stream that has never supplied one. A **present** id is validated against
+/// legitimately omit it). An explicitly present empty id is rejected through
+/// the same admission-reason path as every other invalid id, so it is counted
+/// without changing omission semantics. A **present** id is validated against
 /// the configured contract before it is cloned, stored, keyed, or logged, so a
 /// hostile value never reaches a map or a log line (issue #3741).
 fn requested_node_id(
@@ -2336,7 +2337,7 @@ fn requested_node_id(
         return Ok(None);
     };
     if node.id.is_empty() {
-        return Ok(None);
+        return Err(XdsAdmissionRejection::NodeIdEmpty);
     }
     crate::xds::admission::validate_node_id(&node.id, max_node_id_bytes)?;
     Ok(Some(node.id.as_str()))
