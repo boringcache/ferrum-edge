@@ -11936,8 +11936,16 @@ async fn handle_websocket_request_authenticated(
     // framer is born with the same per-proxy bounds as the client-side framer.
     // This precedes every retry attempt and uses the immutable request plugin
     // generation, so target rotation cannot change policy mid-upgrade.
-    let ws_size_limits =
-        EffectiveWsSizeLimits::from_plugins(state.max_websocket_frame_size_bytes, &plugins);
+    // Per-instance execution-trigger admission is decided HERE, before the
+    // session's parser ceilings exist, so a skipped size-limit instance
+    // constrains neither the client-side nor the backend-side framer (issue
+    // #3734). The decision is memoized on the upgrade context, so the later
+    // frame/disconnect collection reuses it rather than re-evaluating.
+    let ws_size_limit_plugins = collect_websocket_size_limit_plugins(&plugins, &mut ctx);
+    let ws_size_limits = EffectiveWsSizeLimits::from_plugins(
+        state.max_websocket_frame_size_bytes,
+        &ws_size_limit_plugins,
+    );
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
     // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
@@ -12821,15 +12829,14 @@ async fn handle_websocket_request_authenticated(
     // lists come from the same request-cache snapshot, so neither path reloads
     // the cache or risks mixing generations.
     let (ws_framing_plugins, ws_frame_plugins) =
-        collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &mut ctx);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
-    // avoids the per-frame filter cost paid by the frame-hook path.
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| p.requires_ws_disconnect_hooks())
-        .cloned()
-        .collect();
+    // avoids the per-frame filter cost paid by the frame-hook path. Both lists
+    // consume the same per-instance admission decision, taken while the upgrade
+    // still holds authoritative request facts.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> =
+        collect_websocket_disconnect_plugins(&plugins, &mut ctx);
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
@@ -14937,26 +14944,85 @@ pub(crate) struct EffectiveWsSizeLimits {
 pub(crate) fn collect_websocket_relay_plugins(
     plugins: &[Arc<dyn Plugin>],
     requires_websocket_framing: bool,
-    upgrade_ctx: &RequestContext,
+    upgrade_ctx: &mut RequestContext,
 ) -> WebSocketRelayPluginLists {
     if !requires_websocket_framing {
         return (Vec::new(), Vec::new());
     }
-    let framing_plugins: Vec<_> = plugins
-        .iter()
-        .filter(|plugin| plugin.requires_websocket_framing())
-        .map(|plugin| {
+    let mut framing_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if !plugin.requires_websocket_framing() {
+            continue;
+        }
+        // Per-instance execution-trigger admission, decided HERE — the last
+        // point at which the session still has authoritative request facts
+        // (issue #3734). A `false` instance is dropped before the session's
+        // capability set exists, so it forces neither framing nor size limits,
+        // observes no frame, reassembles nothing, and receives no delivery hook.
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        framing_plugins.push(
             Arc::clone(plugin)
                 .bind_ws_session(upgrade_ctx)
-                .unwrap_or_else(|| Arc::clone(plugin))
-        })
-        .collect();
+                .unwrap_or_else(|| Arc::clone(plugin)),
+        );
+    }
     let frame_plugins = framing_plugins
         .iter()
         .filter(|plugin| plugin.requires_ws_frame_hooks())
         .cloned()
         .collect();
     (framing_plugins, frame_plugins)
+}
+
+/// Collect the instances whose published WebSocket size limits may constrain
+/// this session's parsers, under the same per-instance admission decision as
+/// the frame and disconnect paths.
+///
+/// Called before the backend handshake, which is the earliest point a ceiling is
+/// consumed. The decision is memoized on the upgrade context, so the frame,
+/// reassembly, delivery, and disconnect sets collected later agree with it
+/// without a second evaluation.
+pub(crate) fn collect_websocket_size_limit_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    upgrade_ctx: &mut RequestContext,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut limit_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if plugin.websocket_size_limits().is_none() {
+            continue;
+        }
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        limit_plugins.push(Arc::clone(plugin));
+    }
+    limit_plugins
+}
+
+/// Collect the session's `on_ws_disconnect` plugins under the same admission
+/// decision as the frame path.
+///
+/// Called from both the H1/H2 and H3 WebSocket handlers, after
+/// [`collect_websocket_relay_plugins`] has memoized each triggered instance's
+/// decision on the upgrade context, so an instance that is skipped for frames is
+/// skipped for disconnect too and the two can never disagree.
+pub(crate) fn collect_websocket_disconnect_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    upgrade_ctx: &mut RequestContext,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut disconnect_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if !plugin.requires_ws_disconnect_hooks() {
+            continue;
+        }
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        disconnect_plugins.push(Arc::clone(plugin));
+    }
+    disconnect_plugins
 }
 
 impl EffectiveWsSizeLimits {
