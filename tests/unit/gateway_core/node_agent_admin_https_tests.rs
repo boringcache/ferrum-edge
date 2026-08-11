@@ -229,14 +229,7 @@ fn plan_admin_https_listener_fails_closed_on_missing_material() {
     let crls = load_crls_from_env(&env).unwrap();
     let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
     let err = expect_https_plan_error(
-        plan_admin_https_listener(
-            &env,
-            &policy,
-            &crls,
-            "Invalid test admin TLS",
-            addr,
-            None,
-        ),
+        plan_admin_https_listener(&env, &policy, &crls, "Invalid test admin TLS", addr, None),
         "missing TLS material must fail closed",
     );
     let msg = format!("{err:#}");
