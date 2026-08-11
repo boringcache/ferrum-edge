@@ -25,14 +25,14 @@ target SHA and as-of UTC) whenever the blocker set changes.
 <!-- launch-readiness:begin -->
 ```json
 {
-  "verdict": "PASS",
+  "verdict": "FAIL",
   "policy_version": "2",
   "classification_version": "launch-blocker-v2",
   "launch_tier": "ga",
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
-    "critical": 0,
-    "high": 0,
+    "critical": 1,
+    "high": 6,
     "medium": 0
   },
   "notes": "Reviewed snapshot only. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
