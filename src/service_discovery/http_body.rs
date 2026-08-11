@@ -153,11 +153,9 @@ impl DiscoveryBodyBudgetPermit {
             return Ok(());
         }
         match &self.test_budget {
-            Some(budget) => try_charge_counter(
-                &budget.used,
-                budget.limits.body_budget_bytes,
-                additional,
-            )?,
+            Some(budget) => {
+                try_charge_counter(&budget.used, budget.limits.body_budget_bytes, additional)?
+            }
             None => try_charge_budget(additional)?,
         }
         self.charged = self.charged.saturating_add(additional);

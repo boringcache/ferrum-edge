@@ -4487,10 +4487,7 @@ async fn discovery_body_test_override_does_not_leak_to_parallel_threads() {
         parallel_limits.max_error_bytes,
         DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
     );
-    assert_eq!(
-        parallel_budget,
-        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
-    );
+    assert_eq!(parallel_budget, DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES);
 }
 
 #[test]
