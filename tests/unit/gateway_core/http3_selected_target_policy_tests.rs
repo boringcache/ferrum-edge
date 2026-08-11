@@ -1164,7 +1164,7 @@ fn h3_cross_protocol_http1_admission_uses_logical_scope_lane() {
         .expect("scope-keyed H1 admission");
     let acquisition_tail = &gate_tail[acquisition..];
     let acquisition_end = acquisition_tail
-        .find("pending_cap,")
+        .find("Some(cap),")
         .expect("pending cap argument");
     let acquisition_call = &acquisition_tail[..acquisition_end];
 
@@ -1199,7 +1199,7 @@ fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
     let cap_lookup = &gate_tail[..acquisition];
     let acquisition_tail = &gate_tail[acquisition..];
     let acquisition_end = acquisition_tail
-        .find("pending_cap,")
+        .find("Some(cap),")
         .expect("pending cap argument");
     let acquisition_call = &acquisition_tail[..acquisition_end];
 
