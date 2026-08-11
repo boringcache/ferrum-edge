@@ -598,10 +598,13 @@ impl V001SqlBuilder {
     /// covers every query shape the store issues (`WHERE namespace = ?` and
     /// `WHERE namespace = ? AND id = ?`), so no secondary index is created.
     ///
-    /// `revision` is a monotonic per-record counter used for optimistic
-    /// concurrency; the store increments it inside the same transaction that
-    /// writes `bundle`, so two admin replicas rotating concurrently cannot both
-    /// believe they won.
+    /// `revision` is the optimistic-concurrency token. It is NOT a per-record
+    /// counter: the store stamps it from `config_changes.sequence` inside the
+    /// same transaction that writes `bundle`, so two admin replicas rotating
+    /// concurrently cannot both believe they won, AND a record deleted and
+    /// recreated never reuses a revision a stale client still holds. The column
+    /// default exists only so the DDL is well-formed; every write supplies an
+    /// explicit value.
     fn create_gateway_trust_bundles_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"

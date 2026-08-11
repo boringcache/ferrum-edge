@@ -4509,16 +4509,36 @@ impl DatabaseStore {
     ///
     /// A namespace that already holds a record fails on the `namespace` primary
     /// key — that is the cross-process backstop for the singleton rule.
+    ///
+    /// `record.revision` is IGNORED. The stored revision comes from the change
+    /// row this transaction writes, so every incarnation of the namespace
+    /// singleton — including one recreated moments after a delete — starts at a
+    /// value strictly greater than anything the previous incarnation ever held.
+    /// Honouring a caller-supplied revision (or restarting at 1) is what would
+    /// let a stale pre-delete expectation compare-and-set against a new
+    /// incarnation's material.
     pub async fn create_gateway_trust_bundle(
         &self,
         record: &GatewayTrustBundleRecord,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let bundle_json = serde_json::to_string(&record.bundle)?;
-        let revision = i64::try_from(record.revision.max(1))
-            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
 
         let mut tx = self.pool().begin().await?;
+        // Written FIRST so the insert can carry the assigned revision. Both
+        // statements are in one transaction, so a poller can still never see a
+        // committed bundle with no change to detect, or the reverse.
+        let revision = self
+            .record_config_change_returning_sequence_tx(
+                &mut tx,
+                &record.namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                &record.id,
+                "upsert",
+            )
+            .await?;
+        let revision = i64::try_from(revision)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
         let insert_sql = self.q(GATEWAY_TRUST_BUNDLE_INSERT_SQL);
         sqlx::query(&insert_sql)
             .bind(&record.namespace)
@@ -4531,14 +4551,6 @@ impl DatabaseStore {
             .bind(record.updated_at.to_rfc3339())
             .execute(&mut *tx)
             .await?;
-        self.record_config_change_tx(
-            &mut tx,
-            &record.namespace,
-            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-            &record.id,
-            "upsert",
-        )
-        .await?;
         self.compact_config_changes_tx(&mut tx, &record.namespace)
             .await?;
         tx.commit().await?;
@@ -4604,7 +4616,30 @@ impl DatabaseStore {
         let asserted_revision = expected_revision.unwrap_or(current_revision);
         let asserted_revision_sql = i64::try_from(asserted_revision)
             .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
-        let next_revision = i64::try_from(asserted_revision.saturating_add(1))
+        // The next revision is BACKEND-assigned from the change sequence, not
+        // `asserted + 1`. Both forms are monotonic within one incarnation, but
+        // only the sequence keeps advancing across a delete/recreate, which is
+        // what stops a stale pre-delete expectation from ever matching again.
+        // Recorded before the compare-and-set so the write can carry it; a lost
+        // CAS rolls the whole transaction back, change row included.
+        let next_revision = self
+            .record_config_change_returning_sequence_tx(
+                &mut tx,
+                &record.namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                &record.id,
+                "upsert",
+            )
+            .await?;
+        // Fail closed rather than clamp: a source that did not advance past the
+        // revision being replaced is not the monotonic source this contract
+        // requires, and writing a non-increasing revision would resurrect the
+        // reuse window.
+        if next_revision <= current_revision || next_revision <= asserted_revision {
+            tx.rollback().await?;
+            anyhow::bail!("gateway trust bundle revision source is not monotonic");
+        }
+        let next_revision = i64::try_from(next_revision)
             .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
 
         let update_sql = self.q(GATEWAY_TRUST_BUNDLE_UPDATE_SQL);
@@ -4657,14 +4692,6 @@ impl DatabaseStore {
                 None => Ok(false),
             };
         }
-        self.record_config_change_tx(
-            &mut tx,
-            &record.namespace,
-            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-            &record.id,
-            "upsert",
-        )
-        .await?;
         self.compact_config_changes_tx(&mut tx, &record.namespace)
             .await?;
         tx.commit().await?;
@@ -6019,6 +6046,46 @@ impl DatabaseStore {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    /// Record a config change and return the durable sequence the backend
+    /// assigned it (issue #3727).
+    ///
+    /// `config_changes.sequence` is a database-assigned auto-increment key that
+    /// is never reused, and [`Self::lock_config_change_sequence_tx`] — taken
+    /// inside [`Self::record_config_change_tx`] and held for the rest of this
+    /// transaction — is the only way a row reaches the table. No other
+    /// transaction can therefore commit a change row for this namespace between
+    /// the insert above and the read below, which makes `MAX(sequence)` for the
+    /// namespace exactly the row this call just wrote.
+    ///
+    /// This is the monotonic source gateway trust-bundle revisions come from:
+    /// it advances on every mutation *including a delete*, so a delete/recreate
+    /// pair can never hand a recreated record a revision a stale client still
+    /// holds.
+    async fn record_config_change_returning_sequence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<u64, anyhow::Error> {
+        self.record_config_change_tx(tx, namespace, resource_type, resource_id, operation)
+            .await?;
+        let row = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes WHERE namespace = ?"))
+        .bind(namespace)
+        .fetch_one(&mut **tx)
+        .await?;
+        let sequence: i64 = row.try_get("max_sequence")?;
+        // Checked, never clamped: a sequence that is not a positive signed
+        // BIGINT is not the monotonic key the revision contract assumes, and
+        // substituting a default would reintroduce revision reuse.
+        if sequence < 1 {
+            anyhow::bail!("config change sequence is out of range");
+        }
+        Ok(sequence as u64)
     }
 
     async fn compact_config_changes_tx(

@@ -2366,13 +2366,21 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// namespace primary key is the cross-process backstop for the singleton
     /// rule, so a concurrent create surfaces as a unique-constraint conflict
     /// rather than silently replacing another writer's roots.
+    ///
+    /// `record.revision` is IGNORED. The implementation must stamp a revision
+    /// taken from the backend's durable monotonic change sequence, which every
+    /// trust mutation (including a delete) advances. Starting each incarnation
+    /// at 1 — or honouring a caller-supplied value — would let a client that
+    /// read the pre-delete record win a compare-and-set against the record that
+    /// replaced it.
     async fn create_gateway_trust_bundle(
         &self,
         record: &GatewayTrustBundleRecord,
     ) -> Result<(), anyhow::Error>;
 
     /// Replace an existing record and its config-change row in one transaction,
-    /// bumping `revision`.
+    /// advancing `revision` to the next value the backend's durable change
+    /// sequence yields (not `current + 1`, which would restart per incarnation).
     ///
     /// `expected_revision` is the optimistic-concurrency guard: `Some(n)`
     /// requires the stored revision to still be `n`, and a mismatch returns

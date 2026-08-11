@@ -5358,8 +5358,13 @@ paths:
 
         Server-owned identity: the stored `namespace` is always the
         `X-Ferrum-Namespace` value and an omitted `id` defaults to that same
-        value. A `namespace` or `updated_by` field in the body is ignored —
-        attribution is the verified JWT subject.
+        value. A `namespace`, `revision`, or `updated_by` field in the body is
+        ignored — attribution is the verified JWT subject and `revision` is
+        assigned by the store.
+
+        The `201` body is read back from the committed record, so its
+        `revision` is the value the store assigned and is the same value a
+        following `GET` returns.
       tags: [Gateway Trust]
       requestBody:
         required: true
@@ -5423,7 +5428,16 @@ paths:
         nothing. Omitting `revision` (or sending `0`) skips the check.
 
         The store assigns the next revision itself; the value in the request
-        body is only the expectation.
+        body is only the expectation. The `200` body is read back from the
+        committed record, so its `revision` is the newly assigned value, not the
+        expectation that was sent.
+
+        Revisions come from the backend's durable config-change sequence rather
+        than a per-record counter that restarts at 1, and a `DELETE` advances
+        that sequence too. A record that is deleted and recreated therefore
+        never reuses a revision, so a `PUT` carrying an expectation read before
+        the delete returns `409` (or `404` when the record is absent) instead of
+        overwriting the replacement.
       tags: [Gateway Trust]
       requestBody:
         required: true
@@ -10642,8 +10656,11 @@ components:
           format: int64
           minimum: 0
           description: >-
-            Server-assigned monotonic revision. On update, the value sent is the
-            expected current revision (`0` or omitted = no expectation).
+            Backend-assigned monotonic revision, taken from the durable
+            config-change sequence — never a per-record counter that restarts at
+            1, so it is never reused across a delete and recreate. On update, the
+            value sent is the expected current revision (`0` or omitted = no
+            expectation); the stored value is always assigned by the server.
         updated_by:
           type: string
           nullable: true
@@ -10677,7 +10694,8 @@ components:
           minimum: 0
           description: >-
             Expected current revision for optimistic concurrency on update.
-            Ignored on create.
+            Ignored on create, and never stored — the store assigns the revision
+            from its durable change sequence.
 
     TrustBundleSet:
       type: object

@@ -81,10 +81,25 @@ pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = 255;
 
 /// Authoritative, namespace-keyed gateway trust-bundle resource.
 ///
-/// `revision` is server-assigned and monotonic per record. A client echoes the
-/// revision it read back on update; a mismatch is a 409, which is how a
-/// concurrent rotation from a second admin replica is detected rather than
+/// `revision` is assigned by the BACKEND from a durable monotonic source (the
+/// SQL `config_changes.sequence` / MongoDB config-change sequence counter), not
+/// by the caller and not by a per-record counter that restarts at 1. A client
+/// echoes the revision it read back on update; a mismatch is a 409, which is how
+/// a concurrent rotation from a second admin replica is detected rather than
 /// silently overwritten.
+///
+/// Sourcing the revision from the change sequence is what closes the ABA hole a
+/// per-record counter leaves open. With a counter that restarts at 1 for every
+/// incarnation, a client could read revision 1, a second actor could DELETE the
+/// namespace singleton and recreate it (revision 1 again), and the first
+/// client's later `PUT` with expected revision 1 would compare-and-set
+/// successfully against a *different* trust incarnation and overwrite it. The
+/// namespace admission lease serializes individual writes, but nothing
+/// serializes the gap between a client's `GET` and its later `PUT`, so only a
+/// revision that can never be reused fixes it. Every trust mutation — including
+/// the delete — advances the shared change sequence, so a recreated record is
+/// always strictly newer than the incarnation it replaced and the stale
+/// expectation can only conflict or report not-found.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayTrustBundleRecord {
@@ -100,7 +115,9 @@ pub struct GatewayTrustBundleRecord {
     pub trust_domain: String,
     /// The admitted trust material, in the same shape mesh config uses.
     pub bundle: TrustBundleSet,
-    /// Monotonic revision. Server-assigned on write; supplied by the client on
+    /// Monotonic revision. Backend-assigned on every physical write from the
+    /// durable change sequence — never carried over from a request body, a
+    /// backup payload, or a previous incarnation — and supplied by the client on
     /// update as the expected current value (`0` = no expectation).
     #[serde(default)]
     pub revision: u64,
@@ -117,6 +134,11 @@ pub struct GatewayTrustBundleRecord {
 impl GatewayTrustBundleRecord {
     /// Build a record from an already-validated bundle. Used by loaders and
     /// tests; admin writes go through the CRUD admission path.
+    ///
+    /// `revision` is left UNASSIGNED (`0`). A caller-authored revision is never
+    /// persisted: the store stamps the backend-assigned value inside the write
+    /// transaction, so no construction site can seed a value that a later
+    /// incarnation could repeat.
     pub fn new(namespace: &str, id: &str, bundle: TrustBundleSet) -> Self {
         let now = Utc::now();
         Self {
@@ -124,7 +146,7 @@ impl GatewayTrustBundleRecord {
             trust_domain: bundle.local.trust_domain.to_string(),
             namespace: namespace.to_string(),
             bundle,
-            revision: 1,
+            revision: 0,
             updated_by: None,
             created_at: now,
             updated_at: now,

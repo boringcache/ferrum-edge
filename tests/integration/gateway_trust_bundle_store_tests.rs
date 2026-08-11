@@ -96,7 +96,14 @@ async fn create_rotate_revoke_round_trips_through_the_authoritative_store() {
         .expect("the record must exist");
     assert_eq!(loaded.trust_domain, "cluster.local");
     assert_eq!(loaded.bundle.local.x509_authorities, vec![root_a.clone()]);
-    assert_eq!(loaded.revision, 1);
+    // The store assigns the revision from its durable change sequence, so the
+    // only contract is "positive and backend-assigned" — deliberately NOT
+    // "starts at 1", which is the per-incarnation counter this resource must
+    // not have.
+    assert!(
+        loaded.revision >= 1,
+        "create must receive a backend-assigned positive revision"
+    );
 
     // Rotation with overlap: the new root is added alongside the old one so
     // in-flight workloads keep validating during rollout.
@@ -119,9 +126,9 @@ async fn create_rotate_revoke_round_trips_through_the_authoritative_store() {
         after_rotation.bundle.local.x509_authorities,
         vec![root_a.clone(), root_b.clone()]
     );
-    assert_eq!(
-        after_rotation.revision, 2,
-        "the store assigns the next revision itself"
+    assert!(
+        after_rotation.revision > loaded.revision,
+        "the store assigns the next revision itself, strictly advancing it"
     );
 
     // A restart must reconstruct exactly this state from the database alone.
@@ -213,7 +220,10 @@ async fn a_stale_revision_loses_the_race_without_overwriting() {
     let conflict =
         gateway_trust_bundle_revision_conflict(&error).expect("a typed revision conflict");
     assert_eq!(conflict.expected, read_by_both.revision);
-    assert_eq!(conflict.current, read_by_both.revision + 1);
+    assert!(
+        conflict.current > read_by_both.revision,
+        "the conflict must report the strictly newer revision the winner committed"
+    );
 
     // Writer A's material is still the one stored.
     let stored = store
@@ -619,23 +629,23 @@ async fn two_simultaneous_writers_cannot_both_commit_a_rotation() {
     let error = loser.expect_err("the losing writer must report an error, not Ok(false)");
     if let Some(conflict) = gateway_trust_bundle_revision_conflict(&error) {
         assert_eq!(conflict.expected, expected);
-        assert_eq!(
-            conflict.current,
-            expected + 1,
-            "the conflict must report the revision the winner committed"
+        assert!(
+            conflict.current > expected,
+            "the conflict must report the strictly newer revision the winner committed"
         );
     }
 
-    // Exactly one bump, and the stored material belongs to the winner.
+    // Exactly one commit, and the stored material belongs to the winner. The
+    // revision is backend-assigned from the change sequence, so the contract is
+    // "strictly advanced", not "expected + 1".
     let stored = store
         .get_namespace_gateway_trust_bundle("ferrum")
         .await
         .expect("read")
         .expect("exists");
-    assert_eq!(
-        stored.revision,
-        expected + 1,
-        "two writers must not both advance the revision from the same read"
+    assert!(
+        stored.revision > expected,
+        "the committed rotation must advance the revision past the shared read"
     );
     assert_ne!(
         stored.bundle.local.x509_authorities, created.bundle.local.x509_authorities,
@@ -682,17 +692,18 @@ async fn an_unexpecting_writer_still_compares_and_sets() {
         "at least one unexpecting writer must commit; got a={result_a:?} b={result_b:?}"
     );
 
-    // Whatever the interleaving, the revision advanced exactly once per
-    // committed write — never two writes onto the same revision.
+    // Whatever the interleaving, every committed write strictly advanced the
+    // revision — never two writes onto the same revision. The exact value comes
+    // from the backend's change sequence (which other mutations also advance),
+    // so the assertion is monotonicity, not arithmetic.
     let stored = store
         .get_namespace_gateway_trust_bundle("ferrum")
         .await
         .expect("read")
         .expect("exists");
-    assert_eq!(
-        stored.revision,
-        read_by_both.revision + committed as u64,
-        "each committed write must advance the revision exactly once"
+    assert!(
+        committed >= 1 && stored.revision > read_by_both.revision,
+        "each committed write must advance the revision"
     );
 }
 
@@ -787,6 +798,209 @@ async fn a_lost_compare_and_set_is_classified_from_an_authoritative_re_read() {
             }
         }
     }
+}
+
+// ── Incarnation safety (delete/recreate ABA) ────────────────────────────────
+
+/// A recreated record must never reuse a revision the deleted incarnation held.
+///
+/// This is the property that makes the compare-and-set meaningful across a
+/// revocation. With a per-record counter that restarts at 1, every incarnation
+/// of the namespace singleton would hand out the same first revision, and a
+/// client that read the old one would hold a token that still "matches".
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_and_recreate_assigns_a_strictly_newer_revision() {
+    let (store, _temp_dir) = sqlite_store().await;
+
+    let mut previous_revision = 0_u64;
+    for round in 0..4 {
+        store
+            .create_gateway_trust_bundle(&record(
+                "ferrum",
+                "cluster.local",
+                vec![root_ca_der_base64(&format!("root-{round}"))],
+            ))
+            .await
+            .expect("create must succeed");
+        let created = store
+            .get_namespace_gateway_trust_bundle("ferrum")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert!(
+            created.revision > previous_revision,
+            "incarnation {round} reused or regressed a revision: {} after {}",
+            created.revision,
+            previous_revision
+        );
+        previous_revision = created.revision;
+
+        // A rotation inside the incarnation also strictly advances.
+        let mut rotated = created.clone();
+        rotated.bundle.local.x509_authorities = vec![root_ca_der_base64("rotated")];
+        assert!(
+            store
+                .update_gateway_trust_bundle(&rotated, Some(created.revision))
+                .await
+                .expect("rotation must succeed")
+        );
+        let after = store
+            .get_namespace_gateway_trust_bundle("ferrum")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert!(after.revision > previous_revision);
+        previous_revision = after.revision;
+
+        assert!(
+            store
+                .delete_gateway_trust_bundle("ferrum", &after.id)
+                .await
+                .expect("delete must succeed")
+        );
+    }
+}
+
+/// The ABA attack itself: read, someone else revokes and recreates, then the
+/// stale reader writes back with the revision it saw.
+///
+/// The namespace admission lease serializes the individual writes but cannot
+/// span the gap between the reader's GET and its later PUT, so only a revision
+/// that is never reused can refuse this. The replacement's material must
+/// survive untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_expectation_from_a_previous_incarnation_cannot_overwrite_the_replacement() {
+    let (store, _temp_dir) = sqlite_store().await;
+    store
+        .create_gateway_trust_bundle(&record(
+            "ferrum",
+            "cluster.local",
+            vec![root_ca_der_base64("original-root")],
+        ))
+        .await
+        .expect("create must succeed");
+
+    // The victim reads the first incarnation.
+    let stale_read = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+
+    // A second actor revokes and immediately recreates the singleton.
+    assert!(
+        store
+            .delete_gateway_trust_bundle("ferrum", &stale_read.id)
+            .await
+            .expect("delete must succeed")
+    );
+    let replacement_root = root_ca_der_base64("replacement-root");
+    let recreated = record("ferrum", "cluster.local", vec![replacement_root.clone()]);
+    store
+        .create_gateway_trust_bundle(&recreated)
+        .await
+        .expect("recreate must succeed");
+    let replacement = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(
+        replacement.revision > stale_read.revision,
+        "the replacement incarnation must not reuse the deleted one's revision"
+    );
+
+    // The stale client now writes back with the revision it read before the
+    // delete. It must be refused.
+    let mut stale_write = stale_read.clone();
+    stale_write.bundle.local.x509_authorities = vec![root_ca_der_base64("attacker-root")];
+    let error = store
+        .update_gateway_trust_bundle(&stale_write, Some(stale_read.revision))
+        .await
+        .expect_err("a stale pre-delete expectation must never commit");
+    let conflict =
+        gateway_trust_bundle_revision_conflict(&error).expect("a typed revision conflict");
+    assert_eq!(conflict.expected, stale_read.revision);
+    assert_eq!(conflict.current, replacement.revision);
+
+    let stored = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        stored.bundle.local.x509_authorities,
+        vec![replacement_root],
+        "the recreated incarnation's roots must survive the stale write"
+    );
+    assert_eq!(stored.revision, replacement.revision);
+}
+
+/// The same expectation against a namespace whose record is simply GONE must be
+/// not-found, not a conflict and never a resurrection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_expectation_after_a_revocation_reports_not_found() {
+    let (store, _temp_dir) = sqlite_store().await;
+    store
+        .create_gateway_trust_bundle(&record(
+            "ferrum",
+            "cluster.local",
+            vec![root_ca_der_base64("original-root")],
+        ))
+        .await
+        .expect("create must succeed");
+    let stale_read = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(
+        store
+            .delete_gateway_trust_bundle("ferrum", &stale_read.id)
+            .await
+            .expect("delete must succeed")
+    );
+
+    assert!(
+        !store
+            .update_gateway_trust_bundle(&stale_read, Some(stale_read.revision))
+            .await
+            .expect("a revoked record must report not-found, not error"),
+        "a stale expectation against a revoked record must not resurrect it"
+    );
+    assert!(
+        store
+            .get_namespace_gateway_trust_bundle("ferrum")
+            .await
+            .expect("read")
+            .is_none(),
+        "the namespace must remain revoked"
+    );
+}
+
+/// A caller-authored revision is never persisted: the store stamps the value it
+/// assigns. Without this, a restore payload or a hand-built record could seed a
+/// revision a later incarnation repeats.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_supplied_revision_is_ignored_on_create() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let mut seeded = record("ferrum", "cluster.local", vec![root_ca_der_base64("root")]);
+    seeded.revision = 9_000_000;
+    store
+        .create_gateway_trust_bundle(&seeded)
+        .await
+        .expect("create must succeed");
+
+    let stored = store
+        .get_namespace_gateway_trust_bundle("ferrum")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_ne!(
+        stored.revision, 9_000_000,
+        "the store must assign the revision, not adopt the caller's"
+    );
+    assert!(stored.revision >= 1);
 }
 
 // ── Fail-closed stored-row decoding ─────────────────────────────────────────

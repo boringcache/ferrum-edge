@@ -156,7 +156,8 @@ already use — there is no second representation that can drift.
   is never ambiguous and a concurrent create from a second admin replica loses on
   a duplicate key rather than silently replacing another writer's roots.
 - **Stored fields.** Resource `id`, `namespace`, `trust_domain` (must equal
-  `bundle.local.trust_domain`), the bounded `bundle`, a monotonic `revision`,
+  `bundle.local.trust_domain`), the bounded `bundle`, a backend-assigned
+  `revision` (see *Incarnation-safe revisions* below),
   `updated_by` (the verified admin JWT subject — never a client-supplied value),
   and `created_at` / `updated_at`.
 - **Bounded, validated material.** Admission caps authority counts (16 X.509 and
@@ -208,6 +209,30 @@ already use — there is no second representation that can drift.
   still compares against the revision read inside its own write transaction. The
   bundle write and its `config_changes` entry remain one transaction (SQL, and
   MongoDB with `FERRUM_MONGO_REPLICA_SET`).
+- **Incarnation-safe revisions.** The revision a write stores is **not**
+  `current + 1` and never restarts at 1. It is the durable, backend-assigned
+  change sequence — SQL `config_changes.sequence`, MongoDB's global
+  `config_change_counters` value — recorded by the same write that produces the
+  poll signal. Every trust mutation advances it, *including the delete*, so a
+  namespace singleton that is deleted and recreated always comes back strictly
+  newer than the incarnation it replaced. Without that property the
+  compare-and-set has an ABA hole: a client reads revision 1, another actor
+  deletes and recreates the record (revision 1 again), and the first client's
+  later `PUT` with expected revision 1 matches and overwrites trust material it
+  never read. The namespace admission lease serializes individual writes but
+  cannot cover the gap between a client's `GET` and its later `PUT`, so only a
+  never-reused revision closes it. Every physical recreation goes through the
+  same path — restore's create branch, and late-write delete compensation — so
+  none of them can replay a stale revision out of a payload or snapshot.
+  Conversions to signed 64-bit are checked and never clamped, and a source that
+  fails to advance past the revision being replaced is refused rather than
+  defaulted.
+- **Authoritative write responses.** A successful `POST`/`PUT` body and the
+  matching audit event both come from an authoritative post-write re-read of the
+  committed record, taken while the namespace admission guard still applies, so
+  they carry the revision the store assigned rather than the `0` a create body
+  carries or the expectation a `PUT` body carries. If that re-read fails, the
+  request is reported as failed — no fabricated revision, no cached fallback.
 - **Standalone MongoDB contract.** Standalone MongoDB has no multi-document
   transaction, so for this resource the poll signal is written **first** and the
   document mutation second. If the change record fails, nothing was mutated at

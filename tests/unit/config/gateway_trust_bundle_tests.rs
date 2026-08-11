@@ -672,6 +672,18 @@ fn revision_defaults_to_zero_meaning_no_concurrency_expectation() {
     );
 }
 
+/// No construction site may seed a revision. Every stored value comes from the
+/// backend's durable change sequence, which is what keeps a delete/recreate from
+/// handing a new incarnation a revision a stale client still holds.
+#[test]
+fn a_constructed_record_carries_no_caller_authored_revision() {
+    let record = valid_record();
+    assert_eq!(
+        record.revision, 0,
+        "constructing a record must leave the revision unassigned, not seed 1"
+    );
+}
+
 // ── Usable-material admission (issue #3727 hardening) ───────────────────────
 
 #[test]

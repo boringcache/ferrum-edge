@@ -627,7 +627,17 @@ curl -H "Authorization: Bearer $TOKEN" \
 expected *current* revision. A mismatch returns `409` with `expected_revision`
 and `current_revision` and writes nothing, so a rotation from a second admin
 replica cannot be silently overwritten. Omit `revision` (or send `0`) to skip
-the check. The store assigns the next revision itself.
+the check. The store assigns the next revision itself, and the successful
+`POST`/`PUT` response body carries that assigned revision — the same value a
+following `GET` returns — rather than echoing what the request sent.
+
+Revisions come from the backend's durable config-change sequence, not from a
+per-record counter that restarts at 1. That is what makes the check safe across
+a `DELETE` + re-`POST`: the delete advances the sequence too, so a recreated
+record is always strictly newer than the incarnation it replaced. A client that
+read the old record and later `PUT`s with the revision it saw gets `409` (or
+`404` if the record is simply gone) instead of overwriting trust material it
+never read.
 
 **Singleton.** A `POST` into a namespace that already holds a record returns
 `409`. Rotate with `PUT`, or `DELETE` first.

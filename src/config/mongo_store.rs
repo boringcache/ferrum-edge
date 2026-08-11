@@ -3178,12 +3178,43 @@ mod inner {
             resource_id: &str,
             operation: &str,
         ) -> Result<(), anyhow::Error> {
+            self.record_config_change_returning_sequence(
+                namespace,
+                resource_type,
+                resource_id,
+                operation,
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// Record a config change and return the durable sequence assigned to
+        /// it (issue #3727).
+        ///
+        /// `config_change_counters._id = "global"` is a monotonic counter
+        /// advanced by an atomic `findAndModify`, so the value returned here is
+        /// unique for the whole deployment and is never reused — including
+        /// across a delete followed by a recreate. That is the property gateway
+        /// trust-bundle revisions need: a per-record counter restarting at 1
+        /// would let a stale pre-delete expectation match a new incarnation.
+        async fn record_config_change_returning_sequence(
+            &self,
+            namespace: &str,
+            resource_type: &str,
+            resource_id: &str,
+            operation: &str,
+        ) -> Result<u64, anyhow::Error> {
             let sequence = self.next_config_change_sequence().await?;
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
             self.compact_config_changes(namespace).await?;
-            Ok(())
+            // Checked, never defaulted: a zero sequence is not the monotonic
+            // key the revision contract assumes.
+            if sequence == 0 {
+                anyhow::bail!("MongoDB config change sequence is out of range");
+            }
+            Ok(sequence)
         }
 
         async fn record_config_changes_batch(
@@ -3234,6 +3265,27 @@ mod inner {
             resource_id: &str,
             operation: &str,
         ) -> mongodb::error::Result<()> {
+            self.record_config_change_in_session_returning_sequence(
+                session,
+                namespace,
+                resource_type,
+                resource_id,
+                operation,
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// In-session variant of
+        /// [`Self::record_config_change_returning_sequence`] (issue #3727).
+        async fn record_config_change_in_session_returning_sequence(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            resource_type: &str,
+            resource_id: &str,
+            operation: &str,
+        ) -> mongodb::error::Result<u64> {
             let sequence = self.next_config_change_sequence_in_session(session).await?;
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
@@ -3241,7 +3293,12 @@ mod inner {
                 .insert_one(doc)
                 .session(&mut *session)
                 .await?;
-            Ok(())
+            if sequence == 0 {
+                return Err(mongodb::error::Error::custom(
+                    "MongoDB config change sequence is out of range",
+                ));
+            }
+            Ok(sequence)
         }
 
         async fn compact_config_changes_best_effort(&self, namespace: &str) {
@@ -5389,14 +5446,25 @@ mod inner {
     /// same namespace fails on a duplicate key instead of silently replacing
     /// another writer's roots. `revision` is stored as a signed 64-bit integer
     /// because BSON has no unsigned integer type.
+    ///
+    /// `assigned_revision` is the BACKEND-assigned value from the config-change
+    /// sequence; `record.revision` is deliberately overwritten rather than
+    /// persisted, so no caller, payload, or previous incarnation can steer the
+    /// stored counter. The conversion is checked and never clamped: an
+    /// unrepresentable revision is an error, because a clamp would write a
+    /// revision the compare-and-set contract cannot rely on.
     fn gateway_trust_bundle_to_doc(
         record: &GatewayTrustBundleRecord,
+        assigned_revision: u64,
     ) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(record)?;
         doc.insert("_id", record.namespace.as_str());
-        let revision = i64::try_from(record.revision.max(1)).map_err(|_| {
+        let revision = i64::try_from(assigned_revision).map_err(|_| {
             anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
         })?;
+        if revision < 1 {
+            anyhow::bail!("gateway trust bundle revision is out of range");
+        }
         doc.insert("revision", revision);
         Ok(doc)
     }
@@ -9172,28 +9240,38 @@ mod inner {
             record: &GatewayTrustBundleRecord,
         ) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            let doc = gateway_trust_bundle_to_doc(record)?;
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 session
                     .start_transaction()
                     .and_run(
-                        (self, doc, record.namespace.clone(), record.id.clone()),
-                        |s, (this, doc, namespace, id)| {
+                        (self, record.clone(), record.namespace.clone(), record.id.clone()),
+                        |s, (this, record, namespace, id)| {
                             Box::pin(async move {
+                                // The change row is written first so its
+                                // sequence can BE the stored revision. Inside a
+                                // transaction the order is invisible to
+                                // readers, and the revision is therefore
+                                // backend-assigned even for the very first
+                                // incarnation of the namespace singleton.
+                                let revision = this
+                                    .record_config_change_in_session_returning_sequence(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                let doc = gateway_trust_bundle_to_doc(record, revision)
+                                    .map_err(|error| {
+                                        mongodb::error::Error::custom(error.to_string())
+                                    })?;
                                 this.gateway_trust_bundles()
-                                    .insert_one(doc.clone())
+                                    .insert_one(doc)
                                     .session(&mut *s)
                                     .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "gateway_trust_bundle",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
                                 Ok(())
                             })
                         },
@@ -9219,13 +9297,19 @@ mod inner {
                 // is exactly what must not happen here: a committed rotation or
                 // revocation with no change row is invisible to a poller that
                 // already consumed the cursor, and no later poll repairs it.
-                self.record_config_change(
-                    &record.namespace,
-                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-                    &record.id,
-                    "upsert",
-                )
-                .await?;
+                //
+                // The signal-first order also supplies the revision: the change
+                // sequence it returns IS the stored revision, so the invariant
+                // and the monotonic revision source are the same write.
+                let revision = self
+                    .record_config_change_returning_sequence(
+                        &record.namespace,
+                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                        &record.id,
+                        "upsert",
+                    )
+                    .await?;
+                let doc = gateway_trust_bundle_to_doc(record, revision)?;
                 self.gateway_trust_bundles().insert_one(doc).await?;
             }
             self.check_slow_query("create_gateway_trust_bundle", start);
@@ -9270,12 +9354,6 @@ mod inner {
             let Ok(current_revision_sql) = i64::try_from(current_revision) else {
                 return Err(anyhow::anyhow!("gateway trust bundle revision exceeds Int64 range"));
             };
-            let next_revision =
-                i64::try_from(current_revision.saturating_add(1)).map_err(|_| {
-                    anyhow::anyhow!("gateway trust bundle revision exceeds BSON Int64 range")
-                })?;
-            let mut doc = gateway_trust_bundle_to_doc(record)?;
-            doc.insert("revision", next_revision);
             // The replacement filter re-asserts the observed revision, so on a
             // replica set the compare-and-set is atomic and on standalone the
             // single-document replace is still atomic: a racing writer that
@@ -9293,31 +9371,50 @@ mod inner {
                 let matched = session
                     .start_transaction()
                     .and_run(
-                        (
-                            self,
-                            filter,
-                            doc,
-                            record.namespace.clone(),
-                            record.id.clone(),
-                        ),
-                        |s, (this, filter, doc, namespace, id)| {
+                        (self, filter, record.clone(), current_revision),
+                        |s, (this, filter, record, current_revision)| {
                             Box::pin(async move {
+                                // The next revision comes from the change
+                                // sequence, not from `current + 1`: only a
+                                // source that keeps advancing across a
+                                // delete/recreate stops a stale pre-delete
+                                // expectation from matching a new incarnation.
+                                // Recorded first so the replacement can carry
+                                // it; a lost compare-and-set aborts the whole
+                                // transaction, change row included.
+                                let next_revision = this
+                                    .record_config_change_in_session_returning_sequence(
+                                        &mut *s,
+                                        record.namespace.as_str(),
+                                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                                        record.id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                if next_revision <= *current_revision {
+                                    return Err(mongodb::error::Error::custom(
+                                        "gateway trust bundle revision source is not monotonic",
+                                    ));
+                                }
+                                let doc = gateway_trust_bundle_to_doc(record, next_revision)
+                                    .map_err(|error| {
+                                        mongodb::error::Error::custom(error.to_string())
+                                    })?;
                                 let replaced = this
                                     .gateway_trust_bundles()
-                                    .replace_one(filter.clone(), doc.clone())
+                                    .replace_one(filter.clone(), doc)
                                     .session(&mut *s)
                                     .await?;
                                 if replaced.matched_count == 0 {
+                                    // The change row this attempt already wrote
+                                    // commits with the (empty) transaction. That
+                                    // is the same harmless trade-off standalone
+                                    // makes: one redundant full reload that
+                                    // re-reads unchanged state. Aborting to drop
+                                    // it would be indistinguishable from a real
+                                    // transaction failure at this seam.
                                     return Ok(false);
                                 }
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "gateway_trust_bundle",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
                                 Ok(true)
                             })
                         },
@@ -9335,14 +9432,25 @@ mod inner {
                 // `create_gateway_trust_bundle`). A change record for a
                 // compare-and-set that then loses its race costs one redundant
                 // full reload; the reverse order could commit a rotation no
-                // poller ever learns about.
-                self.record_config_change(
-                    &record.namespace,
-                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
-                    &record.id,
-                    "upsert",
-                )
-                .await?;
+                // poller ever learns about. That same signal supplies the
+                // backend-assigned revision, so the invariant and the monotonic
+                // source remain one write.
+                let next_revision = self
+                    .record_config_change_returning_sequence(
+                        &record.namespace,
+                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                        &record.id,
+                        "upsert",
+                    )
+                    .await?;
+                // Fail closed rather than clamp: a source that did not advance
+                // past the revision being replaced is not monotonic, and
+                // writing a non-increasing revision would reopen the reuse
+                // window a stale expectation exploits.
+                if next_revision <= current_revision {
+                    anyhow::bail!("gateway trust bundle revision source is not monotonic");
+                }
+                let doc = gateway_trust_bundle_to_doc(record, next_revision)?;
                 let replaced = self
                     .gateway_trust_bundles()
                     .replace_one(filter, doc)

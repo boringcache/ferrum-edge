@@ -5095,6 +5095,9 @@ async fn reconcile_restored_gateway_trust_bundles(
             desired.id = existing.id.clone();
             desired.created_at = existing.created_at;
             desired.updated_at = Utc::now();
+            // A payload revision is never an expectation and never a stored
+            // value; the store assigns the next one from the change sequence.
+            desired.revision = 0;
             // Restore runs under the namespace admission lease, so it does not
             // compete with a concurrent admin write and states no revision
             // expectation; the store still compare-and-sets against the
@@ -5116,7 +5119,13 @@ async fn reconcile_restored_gateway_trust_bundles(
             Ok(0)
         }
         (None, Some(mut desired)) => {
-            desired.revision = 1;
+            // `revision` is deliberately NOT seeded here. The store assigns it
+            // from the durable change sequence, so a physically recreated record
+            // is always strictly newer than the incarnation the restore
+            // replaced; replaying a revision out of the payload (or restarting
+            // at 1) would let a client that read the previous incarnation
+            // compare-and-set against the restored one.
+            desired.revision = 0;
             desired.created_at = Utc::now();
             desired.updated_at = desired.created_at;
             db.create_gateway_trust_bundle(&desired)
@@ -8079,6 +8088,9 @@ async fn handle_restore(
             // Attribution is server-owned: the restoring admin subject, never
             // whatever the backup file claimed.
             record.updated_by = Some(actor.sub.clone());
+            // A backup file's revision is not authority: the store assigns a
+            // fresh backend-monotonic revision to whatever it physically writes.
+            record.revision = 0;
             record.normalize_fields();
             if let Err(errors) = record.validate_fields() {
                 trust_errors.extend(errors);

@@ -187,6 +187,32 @@ async fn get_json(base: &str, path: &str, namespace: &str) -> (u16, Value) {
     (status, body)
 }
 
+async fn put_json(base: &str, path: &str, namespace: &str, body: Value) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .put(format!("{base}{path}"))
+        .bearer_auth(admin_token("restore-admin"))
+        .header("X-Ferrum-Namespace", namespace)
+        .json(&body)
+        .send()
+        .await
+        .expect("PUT succeeds");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+async fn delete_resource(base: &str, path: &str, namespace: &str) -> u16 {
+    reqwest::Client::new()
+        .delete(format!("{base}{path}"))
+        .bearer_auth(admin_token("restore-admin"))
+        .header("X-Ferrum-Namespace", namespace)
+        .send()
+        .await
+        .expect("DELETE succeeds")
+        .status()
+        .as_u16()
+}
+
 fn bundle_body(trust_domain: &str, authority: &str) -> Value {
     json!({
         "local": {
@@ -228,7 +254,11 @@ async fn a_hostile_body_namespace_influences_neither_the_stored_namespace_nor_th
         created["updated_by"], "restore-admin",
         "attribution must come from the verified JWT subject"
     );
-    assert_eq!(created["revision"], 1);
+    assert!(
+        created["revision"].as_u64().unwrap_or_default() >= 1,
+        "the create body must carry a backend-assigned positive revision, got {}",
+        created["revision"]
+    );
 
     // tenant-b must have received nothing at all.
     let (status, listed) = get_json(&base, "/gateway-trust-bundles", "tenant-b").await;
@@ -238,6 +268,175 @@ async fn a_hostile_body_namespace_influences_neither_the_stored_namespace_nor_th
         0,
         "the body namespace must not have created a record in another tenant"
     );
+}
+
+// ── Authoritative write responses ───────────────────────────────────────────
+
+/// A successful `POST` and `PUT` must report the revision the STORE assigned.
+///
+/// The generic write path used to serialize the request-side resource after
+/// persistence, so a create answered `revision: 0` (the body default) and an
+/// update answered the client's *expectation* — neither of which the store had
+/// written. An admin client that echoed the response back on its next rotation
+/// would then lose the compare-and-set for no reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_and_update_bodies_carry_the_authoritative_stored_revision() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let root_a = root_ca_der_base64("root-a");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &root_a),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+    let created_revision = created["revision"]
+        .as_u64()
+        .expect("the create body must carry a numeric revision");
+    assert!(
+        created_revision >= 1,
+        "a create must not answer the request-side default of 0"
+    );
+
+    let (status, fetched) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        fetched["revision"].as_u64(),
+        Some(created_revision),
+        "the 201 body must carry the same revision a following GET observes"
+    );
+
+    // Rotate, echoing the revision that was read. The 200 body must carry the
+    // NEW revision, not the expectation that was sent.
+    let root_b = root_ca_der_base64("root-b");
+    let (status, updated) = put_json(
+        &base,
+        "/gateway-trust-bundles/ferrum",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "revision": created_revision,
+            "bundle": bundle_body("cluster.local", &root_b),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rotation must succeed: {updated}");
+    let updated_revision = updated["revision"]
+        .as_u64()
+        .expect("the update body must carry a numeric revision");
+    assert!(
+        updated_revision > created_revision,
+        "the 200 body must carry the newly assigned revision, not the expectation"
+    );
+
+    let (status, fetched) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        fetched["revision"].as_u64(),
+        Some(updated_revision),
+        "the 200 body must carry the same revision a following GET observes"
+    );
+
+    // The revision the response advertised is immediately usable as the next
+    // expectation — the practical consequence of reporting the stored value.
+    let root_c = root_ca_der_base64("root-c");
+    let (status, again) = put_json(
+        &base,
+        "/gateway-trust-bundles/ferrum",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "revision": updated_revision,
+            "bundle": bundle_body("cluster.local", &root_c),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the advertised revision must be a valid expectation: {again}"
+    );
+}
+
+/// End-to-end ABA refusal on the real admin surface: a client reads the record,
+/// another actor revokes and recreates it, and the client's later `PUT` with the
+/// revision it read must be a `409` that leaves the replacement intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_pre_delete_revision_is_refused_over_the_admin_api() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let original = root_ca_der_base64("original-root");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &original),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+    let stale_revision = created["revision"].as_u64().expect("numeric revision");
+
+    assert_eq!(
+        delete_resource(&base, "/gateway-trust-bundles/ferrum", "ferrum").await,
+        204
+    );
+
+    let replacement = root_ca_der_base64("replacement-root");
+    let (status, recreated) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &replacement),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "recreate must succeed: {recreated}");
+    let replacement_revision = recreated["revision"].as_u64().expect("numeric revision");
+    assert!(
+        replacement_revision > stale_revision,
+        "a recreated singleton must not reuse the deleted incarnation's revision"
+    );
+
+    let attacker = root_ca_der_base64("attacker-root");
+    let (status, conflict) = put_json(
+        &base,
+        "/gateway-trust-bundles/ferrum",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "revision": stale_revision,
+            "bundle": bundle_body("cluster.local", &attacker),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a stale pre-delete expectation must not commit: {conflict}"
+    );
+    assert_eq!(conflict["expected_revision"].as_u64(), Some(stale_revision));
+    assert_eq!(
+        conflict["current_revision"].as_u64(),
+        Some(replacement_revision)
+    );
+
+    let (status, stored) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        stored["bundle"]["local"]["x509_authorities"][0], replacement,
+        "the recreated incarnation's roots must survive the stale write"
+    );
+    assert_eq!(stored["revision"].as_u64(), Some(replacement_revision));
 }
 
 // ── Backup / restore round trip ─────────────────────────────────────────────
