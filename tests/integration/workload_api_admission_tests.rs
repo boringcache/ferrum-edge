@@ -793,12 +793,35 @@ async fn a_connection_that_never_speaks_is_closed_on_its_deadline_and_returns_it
     let mut silent = UnixStream::connect(&harness.path)
         .await
         .expect("the socket accepts a connection");
-    let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(15), silent.read(&mut byte))
-        .await
-        .expect("a connection that never sends a byte must be closed on its initial deadline")
-        .expect("the close is a clean transport teardown");
-    assert_eq!(read, 0, "the peer observes EOF, not a half-open socket");
+
+    // An admitted connection is handed to tonic, which may flush HTTP/2 SETTINGS
+    // before the client sends anything. Keep the client silent and drain the
+    // finite server bytes until EOF proves the initial-connection deadline closed
+    // it — the first byte is not evidence of a half-open socket.
+    const MAX_SERVER_BYTES: usize = 512;
+    const READ_CHUNK: usize = 64;
+    let mut total_read = 0usize;
+    let mut buf = [0u8; READ_CHUNK];
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if total_read >= MAX_SERVER_BYTES {
+                panic!(
+                    "server sent {total_read} bytes without closing; a silent connection must be closed on its initial deadline (cap {MAX_SERVER_BYTES})"
+                );
+            }
+            let read = silent
+                .read(&mut buf)
+                .await
+                .expect("the close is a clean transport teardown");
+            if read == 0 {
+                break;
+            }
+            total_read += read;
+        }
+    })
+    .await
+    .expect("a connection that never sends a byte must be closed on its initial deadline");
 
     wait_for_service(&harness.path, Duration::from_secs(15)).await;
     harness.shutdown_within(Duration::from_secs(30)).await;
