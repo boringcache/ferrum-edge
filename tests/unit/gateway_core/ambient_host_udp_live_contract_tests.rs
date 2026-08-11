@@ -236,6 +236,255 @@ fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail(
     );
 }
 
+/// Return the INSTRUCTIONS of a single `FROM ... AS <stage>` block, up to the
+/// next `FROM`. Comment lines are stripped: the trailing comment block of a
+/// stage documents the NEXT stage, so an absence assertion over raw text would
+/// read a neighbouring stage's prose as this stage's content.
+fn dockerfile_stage_body(dockerfile: &str, stage: &str) -> String {
+    let marker = format!(" AS {stage}\n");
+    let start = dockerfile
+        .find(&marker)
+        .unwrap_or_else(|| panic!("Dockerfile has no `AS {stage}` stage"))
+        + marker.len();
+    let rest = &dockerfile[start..];
+    let body = match rest.find("\nFROM ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Ambient UDP lifecycle executes generated `sh -c` iptables/ip6tables
+/// scripts, so the image the chart selects for it must ship those tools. It gets
+/// its OWN published variant rather than weakening the distroless `-ebpf`
+/// contract that the node-agent and NodeWaypoint still depend on (#3705).
+#[test]
+fn dockerfile_publishes_a_tools_capable_runtime_without_weakening_ebpf() {
+    let dockerfile = read("Dockerfile");
+
+    assert!(
+        dockerfile.contains("AS capture-tools-base\n"),
+        "the tool provisioning must live in its own stage so CI can smoke the \
+         tool contract without the Rust and nightly eBPF builds"
+    );
+    assert!(
+        dockerfile.contains("AS runtime-ebpf-tools\n"),
+        "the Ambient UDP lifecycle runtime target must exist"
+    );
+
+    let tools_base = dockerfile_stage_body(&dockerfile, "capture-tools-base");
+    assert!(
+        tools_base.contains("iptables"),
+        "the tool base must install iptables"
+    );
+    assert!(
+        tools_base.contains("${IPROUTE2_VERSION}"),
+        "the tool base must share the pinned iproute2 version with the \
+         distroless staging closure"
+    );
+    assert!(
+        tools_base.contains("for tool in ip iptables ip6tables iptables-save ip6tables-save; do"),
+        "the tool base must assert the complete production tool set at build \
+         time, so a missing tool fails the build instead of a node"
+    );
+    assert!(
+        tools_base.contains("test -x /bin/sh"),
+        "the tool base must assert a usable shell at build time"
+    );
+
+    let tools_runtime = dockerfile_stage_body(&dockerfile, "runtime-ebpf-tools");
+    assert!(
+        dockerfile.contains("FROM capture-tools-base AS runtime-ebpf-tools"),
+        "the published tools runtime must inherit exactly the smoked tool base"
+    );
+    assert!(
+        tools_runtime.contains("/app/bpf/ferrum-ebpf"),
+        "the tools runtime must be a strict superset of `-ebpf` and carry the BPF ELF"
+    );
+    assert!(
+        tools_runtime.contains("/app/ferrum-edge"),
+        "the tools runtime must carry the gateway binary"
+    );
+
+    // The complementary half: `-ebpf` must stay distroless. A future change must
+    // not "solve" the Ambient UDP tool requirement by adding a shell here.
+    let ebpf_runtime = dockerfile_stage_body(&dockerfile, "runtime-ebpf");
+    assert!(
+        !ebpf_runtime.contains("iptables"),
+        "the published `-ebpf` image must not gain iptables"
+    );
+    assert!(
+        !ebpf_runtime.contains("/bin/sh"),
+        "the published `-ebpf` image must not gain a shell"
+    );
+    assert!(
+        ebpf_runtime.contains("/usr/sbin/ip"),
+        "the published `-ebpf` image must keep its staged `ip` executable"
+    );
+}
+
+/// A chart that names a tag the release pipeline never publishes is the same
+/// outage as a chart that names an image without the tools. Both halves are
+/// pinned here.
+#[test]
+fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
+    let chart = read("charts/ferrum-mesh/templates/ambient-daemonset.yaml");
+    assert!(
+        chart.contains(
+            "{{- $ambientImageTag = printf \"%s-ebpf-tools\" \
+             (trimSuffix \"-ebpf\" $ambientImageTag) -}}"
+        ),
+        "the Ambient UDP lifecycle must select the tools-capable runtime variant, \
+         promoting an explicit `-ebpf` tag rather than double-suffixing it"
+    );
+    assert!(
+        chart.contains("{{- if $ambientUdpLifecycle -}}"),
+        "the tools variant must be selected by the UDP lifecycle predicate"
+    );
+    assert!(
+        !chart.contains(
+            "(eq $ambientTopology \"node_waypoint\") $ambientUdpLifecycle) \
+             (not (hasSuffix \"-ebpf\" $ambientImageTag))"
+        ),
+        "the UDP lifecycle must no longer be folded into the distroless `-ebpf` \
+         selection, which cannot run the production host-UDP backend"
+    );
+
+    // The node-agent keeps the distroless variant: only the pod that shells out
+    // receives the larger attack surface.
+    let node_agent = read("charts/ferrum-mesh/templates/node-agent-daemonset.yaml");
+    assert!(
+        node_agent.contains("printf \"%s-ebpf\" $nodeAgentImageTag"),
+        "the node-agent must keep selecting the distroless `-ebpf` variant"
+    );
+    assert!(
+        !node_agent.contains("-ebpf-tools"),
+        "the node-agent must not silently adopt the tools-capable image"
+    );
+
+    let release = read(".github/workflows/release.yml");
+    assert!(
+        release.contains("target: runtime-ebpf-tools"),
+        "the release pipeline must build the tools-capable runtime target"
+    );
+    for registry_tag in [
+        "-t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools",
+        "-t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools",
+    ] {
+        assert!(
+            release.contains(registry_tag),
+            "the release pipeline must publish `{registry_tag}` so the chart's \
+             automatic selection can never name a nonexistent image"
+        );
+    }
+    assert!(
+        release.contains("docker-ebpf-tools-digest-${{ matrix.arch_dir }}"),
+        "the tools variant must publish its own per-architecture digest artifact"
+    );
+    assert!(
+        release.contains("pattern: docker-ebpf-tools-digest-*")
+            && release.contains("path: /tmp/digests-tools"),
+        "the tools digests must be collected separately so the two variants' \
+         manifests cannot be merged into one four-descriptor list"
+    );
+    // Gating parity with the `-ebpf` manifest job. The tools manifest lives in
+    // its own job because `docker-ebpf-manifest`'s step list is frozen
+    // byte-for-byte by the trusted cross-build policy, so the equivalence has to
+    // be asserted here instead of being structural.
+    assert!(
+        release.contains(
+            "    needs: [build-release-binaries, docker-manifest, docker-ebpf, \
+             docker-ebpf-manifest]\n"
+        ),
+        "the tools manifest must be gated on the core release path AND on the \
+         `-ebpf` manifest, so a release can never advertise the tools tag \
+         without the variant it is a superset of"
+    );
+    assert!(
+        release.contains("docker-ebpf-tools-manifest:\n"),
+        "the tools manifest job must exist"
+    );
+}
+
+/// The live-kernel job runs prebuilt binaries on the hosted runner, so it proves
+/// the RUNNER's package set. The production image contract is what proves the
+/// runtime the chart actually selects can execute the same tools.
+#[test]
+fn ambient_host_udp_gate_proves_the_production_image_tool_contract() {
+    let workflow = read(".github/workflows/ambient-host-udp-live.yml");
+
+    assert!(
+        workflow.contains("  ambient-host-udp-image:\n"),
+        "the gate must carry a production image contract job"
+    );
+    assert!(
+        workflow.contains("target: runtime-ebpf-tools"),
+        "the image job must build the EXACT production target the chart selects"
+    );
+    assert!(
+        workflow.contains("target: capture-tools-base"),
+        "the image job must smoke the tool base before the expensive builds"
+    );
+    assert!(
+        workflow.contains("for tool in ip iptables ip6tables iptables-save ip6tables-save; do"),
+        "the image job must prove the full production tool set executes"
+    );
+    assert!(
+        workflow.contains("--entrypoint /bin/sh ferrum-edge-ebpf-tools:ci"),
+        "the image job must prove the selected image can execute a shell, which \
+         is what the generated capture scripts require"
+    );
+    assert!(
+        workflow.contains("test -s /app/bpf/ferrum-ebpf"),
+        "the image job must prove the tools image is a superset of `-ebpf`"
+    );
+    assert!(
+        workflow.contains("target: runtime-ebpf")
+            && workflow.contains("the distroless -ebpf image must not ship"),
+        "the image job must independently prove `-ebpf` stayed distroless, so \
+         this contract cannot be satisfied by weakening that image instead"
+    );
+    assert!(
+        workflow.contains("      - ambient-host-udp-image\n"),
+        "the required gate must depend on the image contract job"
+    );
+    assert!(
+        workflow.contains("${{ needs.ambient-host-udp-image.result }}\" != \"success\""),
+        "the required gate must fail when the image contract fails or is absent"
+    );
+}
+
+#[test]
+fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
+    let filter = read(".github/scripts/live_suite_path_filter.py");
+    assert!(
+        filter.contains("r\"^Dockerfile$\""),
+        "a Dockerfile edit can change whether the chart-selected runtime ships \
+         the capture tools, so it must schedule this gate"
+    );
+    assert!(
+        filter.contains("ambient-host-udp-live|release"),
+        "a release-publication edit can retire the tag the chart selects"
+    );
+    assert!(
+        filter.contains("r\"^\\.github/scripts/stage_iproute2_runtime\\.sh$\""),
+        "the runtime tool staging helper must schedule this gate"
+    );
+    assert!(
+        filter.contains("(\"ambient-host-udp\", [\"Dockerfile\"], True)"),
+        "the trusted classifier self-test must pin the Dockerfile trigger"
+    );
+
+    let plan = read(".github/scripts/pr_ci_plan.py");
+    assert!(
+        plan.contains("r\"^Dockerfile$\""),
+        "the planner's eBPF/capture live patterns must include the Dockerfile"
+    );
+}
+
 #[test]
 fn pr_ci_plan_schedules_ebpf_live_for_host_udp_surfaces() {
     let plan = read(".github/scripts/pr_ci_plan.py");

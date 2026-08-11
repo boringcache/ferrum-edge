@@ -41,7 +41,7 @@ adding, removing, or materially changing a workflow.
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
-| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`); relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
+| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -568,7 +568,8 @@ cannot be changed by a pull request, so the introducing bootstrap is also an
 explicit root-review boundary rather than a self-authorizing verifier change.
 
 The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
-generators, Ambient mesh serving, Helm mesh charts, the live fixture, and
+generators, Ambient mesh serving, Helm mesh charts, the `Dockerfile` and its
+runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
@@ -579,6 +580,33 @@ destination recovery, ingress-ifindex attribution, transparent replies,
 restart/cleanup ownership, and explicit negative cases. Skips under required
 mode are hard failures. Bounded redacted diagnostics are uploaded with 14-day
 retention.
+
+A second required-gate job, **Ambient host-UDP production image contract**,
+covers the boundary the live-kernel job structurally cannot. That job runs
+prebuilt test binaries directly on the hosted runner, so it proves the RUNNER
+has `ip`/`iptables`/`ip6tables` — not that the image the mesh chart selects
+does. The Ambient UDP lifecycle drives generated `sh -c` iptables/ip6tables
+scripts, so a chart that selected a distroless image would render a pod that
+could not run the very backend the live gate validates, with CI still green.
+The image job therefore:
+
+1. builds `capture-tools-base` first (cheap: apt only), so a broken tool closure
+   fails in about a minute instead of after the Rust and nightly eBPF builds;
+2. builds the exact production target `runtime-ebpf-tools` — the `-ebpf-tools`
+   tag the chart names — and proves inside the container that `/bin/sh`, `ip`,
+   `iptables`, `ip6tables`, `iptables-save`, and `ip6tables-save` all execute,
+   that `ferrum-edge version` runs, and that the BPF ELF is present (so the
+   image really is a superset of `-ebpf`);
+3. builds `runtime-ebpf` and proves from its normalized exported filesystem that
+   it has **not** gained a shell, package manager, `iptables`, `ip6tables`, or
+   `nft`, and has kept its staged `ip`. Without step 3 a later change could
+   "satisfy" this contract by weakening the distroless variant instead.
+
+Full containerized TPROXY execution is deliberately out of scope for this job:
+the datapath needs privileged host-netns manipulation that the live-kernel job
+already performs against the real kernel. The two jobs are complementary — the
+live job proves the datapath, the image job proves the shipped runtime can
+execute it — and the `Ambient Host UDP Live` gate requires both.
 
 #### 6. Performance Regression Job
 
@@ -1883,6 +1911,18 @@ cannot gain a direct attestation dependency from this pull request. The
 `attest-release-images` under `if: always()`: the release workflow cannot
 succeed unless attestation verification succeeded, and a GitHub Release created
 before attestation finishes is deleted when attestation fails.
+
+**Known gap — `-ebpf-tools` is published but not yet signed/attested.** The
+`attest-release-images` job is frozen byte-for-byte by the trusted cross-build
+verifier, which a pull request may not modify, so the Ambient UDP lifecycle
+variant is currently published without Cosign signatures, SBOMs, or SLSA
+provenance. Closing that gap requires a trusted-base change that adds the
+`ebpftools` family to the frozen job (and adds
+`"docker-ebpf-tools-digest-": ("docker-ebpf",)` to `DIGEST_ARTIFACT_OWNERS`, so
+the new digest wildcard is owned the way the other two are). The same freeze is
+why the GitHub Release notes still describe only the default and `-ebpf` images;
+the `-ebpf-tools` variant is documented in `docs/docker.md` and
+`docs/node_agent.md` instead.
 
 The signatures and attestations are stored beside the immutable subject in each
 registry; neither registry is treated as a mutable pointer or as a fallback for

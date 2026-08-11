@@ -294,11 +294,142 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # The live-kernel job above runs prebuilt test binaries directly on the hosted
+  # runner, which proves the RUNNER's package set — not the image the mesh chart
+  # actually selects. The Ambient UDP lifecycle drives generated `sh -c`
+  # iptables/ip6tables scripts, so a chart that selected the distroless `-ebpf`
+  # image would render a pod that cannot execute the very backend the live gate
+  # validates, and CI would stay green (#3705). This job closes that boundary by
+  # smoking the EXACT production image target the chart names.
+  #
+  # Full containerized TPROXY execution is impractical here (the datapath needs
+  # privileged host netns manipulation the live job already covers on the real
+  # kernel), so the contract proven here is precisely the one the runner cannot
+  # prove: that the selected image can execute the tools.
+  ambient-host-udp-image:
+    name: Ambient host-UDP production image contract
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      # Cheap, deterministic half: the tool-provisioning stage the production
+      # runtime is built FROM. This alone would not prove the shipped image, so
+      # the full target is smoked below; running it first surfaces a broken tool
+      # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
+      - name: Build the capture tool base stage
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: capture-tools-base
+          load: true
+          tags: ferrum-edge-capture-tools-base:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      # The exact target the mesh chart's `-ebpf-tools` tag publishes.
+      - name: Build the production Ambient UDP lifecycle runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf-tools:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      - name: Prove the published runtime can execute the production tool set
+        run: |
+          set -euo pipefail
+
+          # Every tool the generated host/pod-netns UDP setup and teardown
+          # scripts invoke. `preflight_capture_tools` refuses startup without
+          # them, so an image failing here crash-loops the Ambient UDP producer.
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c '
+            set -eu
+            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
+              command -v "$tool" >/dev/null 2>&1 || {
+                echo "missing required tool: $tool" >&2
+                exit 1
+              }
+            done
+            ip -V >/dev/null
+            iptables --version >/dev/null
+            ip6tables --version >/dev/null
+            iptables-save --version >/dev/null
+            ip6tables-save --version >/dev/null
+          '
+
+          # The image must still be a working Ferrum runtime, and must carry the
+          # eBPF ELF that makes it a strict superset of the `-ebpf` variant.
+          docker run --rm ferrum-edge-ebpf-tools:ci version >/dev/null
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c \
+            'test -s /app/bpf/ferrum-ebpf'
+
+      # The complementary half of the contract: the ordinary `-ebpf` image the
+      # chart still selects for eBPF capture / NodeWaypoint must REMAIN
+      # distroless. Proving the tools image alone would let a later change
+      # "fix" this finding by quietly adding a shell to `-ebpf` instead.
+      - name: Build the distroless eBPF runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf:ci
+          cache-from: type=gha,scope=ambient-host-udp-images
+          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          provenance: false
+
+      - name: Prove the `-ebpf` image keeps its distroless contract
+        run: |
+          set -euo pipefail
+          container="$(docker create ferrum-edge-ebpf:ci)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          listing="$RUNNER_TEMP/ebpf-image-files.txt"
+          # Normalize exactly like the production Dockerfile smoke so the
+          # exact-path assertions below cannot be defeated by a `./` prefix.
+          docker export "$container" | tar -tf - \
+            | sed -e 's#^\./##' -e 's#^/##' > "$listing"
+
+          # Positive control: prove the exact-path assertion is live before
+          # asserting absences against the same inventory.
+          grep -Fxq app/ferrum-edge "$listing"
+          # `ip` IS expected: NodeWaypoint owns an exact policy rule/route.
+          grep -Fxq usr/sbin/ip "$listing"
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/busybox usr/bin/busybox usr/bin/apt usr/bin/apt-get \
+            usr/bin/dpkg usr/sbin/iptables usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" "$listing"; then
+              echo "::error::the distroless -ebpf image must not ship /$forbidden" >&2
+              exit 1
+            fi
+          done
+
   gate:
     name: Ambient Host UDP Live
     needs:
       - changes
       - ambient-host-udp-live
+      - ambient-host-udp-image
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -329,4 +460,9 @@ jobs:
             exit 1
           fi
 
-          echo "Live-kernel validation passed." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.ambient-host-udp-image.result }}" != "success" ]; then
+            echo "Production image contract failed or did not complete: ${{ needs.ambient-host-udp-image.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Live-kernel validation and production image contract passed." >> "$GITHUB_STEP_SUMMARY"

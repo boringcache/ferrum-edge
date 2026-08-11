@@ -628,6 +628,11 @@ EBPF_LIVE_PATTERNS = [
         r"^rust-toolchain\.toml$",
         r"^build\.rs$",
         r"^proto/",
+        # The live eBPF/capture suites build and run the published runtime image
+        # targets, and the mesh chart auto-selects one of them, so the image
+        # definition and its runtime tool staging are in scope for these gates.
+        r"^Dockerfile$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^ebpf/",
         r"^src/capture/",
         r"^src/ebpf/",
@@ -846,6 +851,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/k8s/ambient_host_udp_live/run.sh"],
+            {"run_ebpf_live": True},
+        ),
+        (
+            "pull_request",
+            ["Dockerfile"],
             {"run_ebpf_live": True},
         ),
         (

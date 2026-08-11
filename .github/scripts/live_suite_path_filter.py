@@ -223,9 +223,15 @@ SUITE_PATTERNS: dict[str, list[str]] = {
     # Ambient host-network UDP live-kernel gate (#3705): production
     # ProxyHostUdpBackend TPROXY capture, attribution, replies, and cleanup.
     "ambient-host-udp": [
-        r"^\.github/workflows/(ci|ambient-host-udp-live)\.yml$",
+        r"^\.github/workflows/(ci|ambient-host-udp-live|release)\.yml$",
         r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy)\.py$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^\.github/actions/setup-rust-ci/",
+        # The chart auto-selects a published runtime variant for the Ambient UDP
+        # lifecycle, so the image the chart names is part of this gate's subject:
+        # a Dockerfile or release-publication edit can make the selected tag stop
+        # shipping the shell/iptables tools the production backend executes.
+        r"^Dockerfile$",
         r"^tests/k8s/ambient_host_udp_live/",
         r"^tests/unit/gateway_core/(ambient_host_udp_live_contract_tests|mesh_host_udp_capture_plan_tests)\.rs$",
         r"^tests/integration/mesh_k8s_pod_discovery/host_udp_capture_tests\.rs$",
@@ -345,6 +351,14 @@ def self_test() -> int:
         ("ambient-host-udp", ["charts/ferrum-mesh/values.yaml"], True),
         ("ambient-host-udp", ["docs/tcp_udp_proxy.md"], True),
         ("ambient-host-udp", ["docs/ci_cd.md"], True),
+        ("ambient-host-udp", ["Dockerfile"], True),
+        ("ambient-host-udp", [".github/workflows/release.yml"], True),
+        ("ambient-host-udp", [".github/scripts/stage_iproute2_runtime.sh"], True),
+        (
+            "ambient-host-udp",
+            ["charts/ferrum-mesh/templates/ambient-daemonset.yaml"],
+            True,
+        ),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
     ]
