@@ -48,8 +48,12 @@ pub fn send_rpc(
     use std::os::unix::net::UnixStream;
 
     let frame = encode_frame(request).map_err(CniError::IpcFailed)?;
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| CniError::IpcFailed(format!("connect {socket_path}: {e}")))?;
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        // The configured socket can contain host filesystem details.  Keep
+        // the CNI stdout error actionable without echoing that path to the
+        // container runtime or its logs.
+        CniError::IpcFailed(format!("connect failed: {:?}", e.kind()))
+    })?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| CniError::IpcFailed(format!("set_read_timeout: {e}")))?;
@@ -170,10 +174,16 @@ mod tests {
         )
         .expect_err("connect should fail when socket is missing");
         match err {
-            CniError::IpcFailed(msg) => assert!(
-                msg.contains("connect"),
-                "expected connect error, got: {msg}"
-            ),
+            CniError::IpcFailed(msg) => {
+                assert!(
+                    msg.contains("connect"),
+                    "expected connect error, got: {msg}"
+                );
+                assert!(
+                    !msg.contains(socket_path.to_string_lossy().as_ref()),
+                    "connect error must not disclose the socket path: {msg}"
+                );
+            }
             other => panic!("expected IpcFailed, got {other:?}"),
         }
     }
