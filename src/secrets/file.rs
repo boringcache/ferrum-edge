@@ -44,8 +44,8 @@ fn map_file_secret_error(key: &str, error: CredentialFileError) -> String {
 /// (trailing newlines are common in Docker secrets and heredocs).
 /// Returns an error if the file cannot be read or is empty after trimming.
 ///
-/// The errors name the suffixed variable and the failure class ("No such
-/// file or directory", "Permission denied", "not a regular file", oversized)
+/// The errors name the suffixed variable and the failure class ("credential
+/// path not found", "Permission denied", "not a regular file", oversized)
 /// but never the path itself: a secret's source reference is treated as
 /// sensitive alongside its value, and `run` logs / `validate` prints this text.
 ///
