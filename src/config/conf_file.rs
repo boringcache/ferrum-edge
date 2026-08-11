@@ -4,18 +4,37 @@
 //! Values here serve as defaults in a 3-tier resolution chain:
 //! **env var > conf file > hardcoded default**. The `resolve_var()` function
 //! in `env_config.rs` implements this precedence.
+//!
+//! # Load contract
+//!
+//! `ferrum.conf` is an immutable process-startup snapshot. It is loaded once
+//! through the shared bounded stable-file reader (regular-file open target,
+//! Unix `O_NONBLOCK`, 1 MiB ceiling with `limit + 1`, stable identity/content
+//! probes). The accepted result — or a precise load error — is cached for the
+//! process lifetime. A failed load is never converted into an empty config via
+//! `unwrap_or_default()`.
+//!
+//! When `FERRUM_CONF_PATH` is unset and `./ferrum.conf` is genuinely absent,
+//! an empty defaults map is accepted for backward compatibility. An explicitly
+//! configured path that is missing, non-regular, oversized, unstable, invalid
+//! UTF-8, or malformed fails closed.
 
+use crate::config::stable_file::{
+    MAX_FERRUM_CONF_BYTES, StableFileError, StableFileReadOptions, format_stable_file_error,
+    read_stable_file,
+};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::info;
 
-/// Lazily-loaded, cached conf file. Loaded once on first access via `OnceLock`,
-/// shared across all callers for the lifetime of the process. This enables code
-/// that runs outside `EnvConfig` (e.g., tracing init in `main()`, secret
-/// resolution, plugin constructors) to respect `ferrum.conf` values without
-/// re-parsing the file each time.
-static CONF_FILE_CACHE: OnceLock<ConfFile> = OnceLock::new();
+/// Lazily-loaded, cached conf-file result. Loaded once on first access via
+/// `OnceLock`, shared across all callers for the lifetime of the process. This
+/// enables code that runs outside `EnvConfig` (e.g., tracing init in `main()`,
+/// secret resolution, plugin constructors) to respect `ferrum.conf` values
+/// without re-parsing the file each time — and ensures every consumer observes
+/// the same accepted generation or the same sticky load error.
+static CONF_FILE_CACHE: OnceLock<Result<ConfFile, String>> = OnceLock::new();
 
 /// Resolve a single `FERRUM_*` variable from the environment or `ferrum.conf`.
 ///
@@ -24,12 +43,18 @@ static CONF_FILE_CACHE: OnceLock<ConfFile> = OnceLock::new();
 /// This is the public entry point for code that needs conf-file-aware variable
 /// resolution but does not have access to an `EnvConfig` instance (e.g., early
 /// startup in `main()`, secret resolution, plugin constructors, JWT auth).
+///
+/// A sticky conf-file load failure does **not** invent an empty defaults map:
+/// conf lookups return `None` while `ConfFile::load()` / `EnvConfig::from_env()`
+/// surface the same cached error.
 pub fn resolve_ferrum_var(key: &str) -> Option<String> {
     if let Ok(val) = std::env::var(key) {
         return Some(val);
     }
-    let conf = CONF_FILE_CACHE.get_or_init(|| ConfFile::load().unwrap_or_default());
-    conf.get(key).map(|v| v.to_string())
+    match CONF_FILE_CACHE.get_or_init(ConfFile::load_uncached) {
+        Ok(conf) => conf.get(key).map(|v| v.to_string()),
+        Err(_) => None,
+    }
 }
 
 /// Default path for the ferrum.conf configuration file.
@@ -41,27 +66,41 @@ pub const CONF_PATH_ENV_VAR: &str = "FERRUM_CONF_PATH";
 /// Parsed configuration file values. Keys are the same `FERRUM_*` names used
 /// by environment variables. Values here provide defaults that can be
 /// overridden by environment variables.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ConfFile {
     values: HashMap<String, String>,
 }
 
 impl ConfFile {
     /// Load the conf file from the path specified by `FERRUM_CONF_PATH` env var,
-    /// falling back to `./ferrum.conf`. Returns an empty `ConfFile` if the file
-    /// does not exist (silently skipped).
+    /// falling back to `./ferrum.conf`. Returns an empty `ConfFile` only when
+    /// the default path is genuinely absent. An explicit `FERRUM_CONF_PATH` or
+    /// an existing/default path that fails the stable-file contract surfaces a
+    /// precise configuration error. The process-wide cache retains that result
+    /// for the lifetime of the process.
     pub fn load() -> Result<Self, String> {
-        let path = std::env::var(CONF_PATH_ENV_VAR).unwrap_or_else(|_| DEFAULT_CONF_PATH.into());
+        CONF_FILE_CACHE
+            .get_or_init(Self::load_uncached)
+            .clone()
+    }
 
-        if !Path::new(&path).exists() {
-            return Ok(Self::default());
+    /// Load without consulting the process cache. Intended for tests that need
+    /// an isolated path probe; production callers use [`Self::load`].
+    pub fn load_from_path(path: &Path, absent_ok: bool) -> Result<Self, String> {
+        let options = StableFileReadOptions::new(MAX_FERRUM_CONF_BYTES, "ferrum.conf");
+        match read_stable_file(path, options) {
+            Ok(contents) => {
+                info!("Loading configuration from {}", path.display());
+                Self::parse(&contents)
+            }
+            Err(StableFileError::NotFound) if absent_ok => Ok(Self::default()),
+            Err(error) => Err(format_stable_file_error(path, options, &error)),
         }
+    }
 
-        info!("Loading configuration from {}", path);
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read conf file '{}': {}", path, e))?;
-
-        Self::parse(&contents)
+    fn load_uncached() -> Result<Self, String> {
+        let (path, absent_ok) = resolve_conf_path();
+        Self::load_from_path(&path, absent_ok)
     }
 
     /// Parse conf file contents. Format:
@@ -127,5 +166,12 @@ impl ConfFile {
     #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+fn resolve_conf_path() -> (PathBuf, bool) {
+    match std::env::var(CONF_PATH_ENV_VAR) {
+        Ok(path) => (PathBuf::from(path), false),
+        Err(_) => (PathBuf::from(DEFAULT_CONF_PATH), true),
     }
 }

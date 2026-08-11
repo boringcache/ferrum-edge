@@ -9,16 +9,30 @@
 //! invalid document refuses startup) and SIGHUP (Unix) reloads the document,
 //! keeping the last good slice when the reload fails.
 //!
+//! Reads go through the shared bounded stable-file primitive (regular-file
+//! open target, Unix `O_NONBLOCK`, 64 MiB ceiling with `limit + 1`, stable
+//! identity/content probes). SIGHUP reload performs filesystem and parse work
+//! on `spawn_blocking`, coalesces repeated signals so only one generation is
+//! parsed at a time (with at most one follow-up after an in-flight load), and
+//! refuses to let an older completed load overwrite a newer accepted
+//! generation. Shutdown aborts any in-flight blocking join handle so the task
+//! cannot leak worker state.
+//!
 //! The document carries only the `mesh` section (plus an optional `version`
 //! stamp); gateway resources (proxies/upstreams/consumers/plugins) are
 //! rejected — mesh mode materializes its routes from the slice, and operators
 //! who need plain gateway routes should run file mode.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::config::stable_file::{
+    MAX_MESH_CONFIG_FILE_BYTES, StableFileReadOptions, detect_json_or_yaml_extension,
+    read_stable_file, stable_file_error_anyhow,
+};
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -54,6 +68,17 @@ pub fn load_mesh_slice_from_file(
     Ok(MeshSlice::from_gateway_config(&config, request))
 }
 
+/// Async-runtime wrapper: performs the bounded stable read + parse on a
+/// blocking worker so Tokio core workers stay free for heartbeats/shutdown.
+pub async fn load_mesh_slice_from_file_off_thread(
+    path: PathBuf,
+    request: MeshSliceRequest,
+) -> Result<MeshSlice, anyhow::Error> {
+    tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&path, request))
+        .await
+        .map_err(|error| anyhow::anyhow!("Mesh configuration file validation worker failed: {error}"))?
+}
+
 /// Parse the mesh document at `path` into its raw (un-normalized, un-validated)
 /// [`crate::modes::mesh::config::MeshConfig`].
 ///
@@ -87,20 +112,13 @@ pub fn read_mesh_config_document(
         }
     }
 
-    let content = std::fs::read_to_string(path)?;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    // Same format detection as the gateway file loader: extension first, then
-    // a YAML-parse heuristic (YAML is a JSON superset, so the fallback only
-    // matters for diagnostics).
-    let is_yaml = match ext.as_str() {
-        "yaml" | "yml" => true,
-        "json" => false,
-        _ => serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok(),
-    };
+    let options = StableFileReadOptions::new(MAX_MESH_CONFIG_FILE_BYTES, "mesh configuration file");
+    let content = read_stable_file(path, options)
+        .map_err(|error| stable_file_error_anyhow(path, options, error))?;
+
+    // Extension first; unknown/extensionless paths sniff once so a large
+    // document is not fully parsed twice merely to detect format.
+    let is_yaml = detect_json_or_yaml_extension(path, &content);
 
     let document: MeshFileDocument = if is_yaml {
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
@@ -160,6 +178,11 @@ fn mesh_doc_parse_error(err: impl std::fmt::Display) -> String {
 /// when a reload fails. The initial load happens before this task is spawned
 /// (fail-closed at startup); identical reloads are deduped downstream by the
 /// slice-apply task's `content_eq` check.
+///
+/// Filesystem + parse work runs on `spawn_blocking`. Rapid SIGHUP delivery is
+/// coalesced: at most one load runs at a time, and a signal that arrives
+/// during an in-flight load schedules exactly one follow-up generation. An
+/// older completed load cannot overwrite a newer accepted generation.
 pub async fn start_mesh_file_source_with_shutdown(
     path: String,
     request: MeshSliceRequest,
@@ -168,6 +191,8 @@ pub async fn start_mesh_file_source_with_shutdown(
 ) {
     #[cfg(unix)]
     {
+        use futures_util::FutureExt as _;
+
         let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
             Ok(stream) => stream,
@@ -181,6 +206,15 @@ pub async fn start_mesh_file_source_with_shutdown(
                 return;
             }
         };
+
+        let latest_requested = AtomicU64::new(0);
+        let mut accepted_generation = 0u64;
+        let mut pending_follow_up = false;
+        let mut in_flight: Option<(
+            u64,
+            tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
+        )> = None;
+
         loop {
             tokio::select! {
                 received = hangup.recv() => {
@@ -188,30 +222,98 @@ pub async fn start_mesh_file_source_with_shutdown(
                         warn!(
                             "SIGHUP stream closed; mesh file source will not reload until restart"
                         );
+                        abort_in_flight(&mut in_flight).await;
                         super::common::wait_for_shutdown(&mut shutdown_rx).await;
                         return;
                     }
-                    match load_mesh_slice_from_file(Path::new(&path), request.clone()) {
-                        Ok(slice) => {
-                            info!(
-                                file_path = %path,
-                                mesh_slice_version = %slice.version,
-                                "Reloaded mesh config file on SIGHUP"
-                            );
-                            state.install_slice(slice);
+                    // Coalesce any already-queued hangups into one follow-up.
+                    while hangup.recv().now_or_never().flatten().is_some() {}
+
+                    if in_flight.is_some() {
+                        pending_follow_up = true;
+                        continue;
+                    }
+
+                    in_flight = Some(spawn_mesh_reload(
+                        &latest_requested,
+                        &path,
+                        request.clone(),
+                    ));
+                }
+                join_result = async {
+                    match in_flight.as_mut() {
+                        Some((_, handle)) => Some(handle.await),
+                        None => {
+                            std::future::pending::<()>().await;
+                            None
                         }
-                        Err(e) => {
+                    }
+                } => {
+                    let Some((generation, _)) = in_flight.take() else {
+                        continue;
+                    };
+                    let Some(join_result) = join_result else {
+                        continue;
+                    };
+                    match join_result {
+                        Ok(Ok(slice)) => {
+                            let latest = latest_requested.load(Ordering::Acquire);
+                            if generation < latest {
+                                info!(
+                                    file_path = %path,
+                                    generation,
+                                    latest,
+                                    "Discarding stale mesh file reload generation"
+                                );
+                            } else if generation >= accepted_generation {
+                                info!(
+                                    file_path = %path,
+                                    mesh_slice_version = %slice.version,
+                                    generation,
+                                    "Reloaded mesh config file on SIGHUP"
+                                );
+                                state.install_slice(slice);
+                                accepted_generation = generation;
+                            }
+                        }
+                        Ok(Err(e)) => {
                             warn!(
                                 file_path = %path,
+                                generation,
                                 error = %e,
                                 "Failed to reload mesh config file on SIGHUP; keeping the last \
                                  good mesh slice"
                             );
                         }
+                        Err(join_error) if join_error.is_cancelled() => {
+                            info!(
+                                file_path = %path,
+                                generation,
+                                "Mesh file reload cancelled during shutdown"
+                            );
+                        }
+                        Err(join_error) => {
+                            warn!(
+                                file_path = %path,
+                                generation,
+                                error = %join_error,
+                                "Mesh file reload worker panicked; keeping the last good mesh slice"
+                            );
+                        }
+                    }
+
+                    if pending_follow_up {
+                        pending_follow_up = false;
+                        in_flight = Some(spawn_mesh_reload(
+                            &latest_requested,
+                            &path,
+                            request.clone(),
+                        ));
                     }
                 }
                 _ = super::common::wait_for_shutdown(&mut shutdown_rx) => {
                     info!("Mesh file source shutting down");
+                    abort_in_flight(&mut in_flight).await;
                     return;
                 }
             }
@@ -228,5 +330,31 @@ pub async fn start_mesh_file_source_with_shutdown(
         let _ = &request;
         let _ = &state;
         super::common::wait_for_shutdown(&mut shutdown_rx).await;
+    }
+}
+
+#[cfg(unix)]
+fn spawn_mesh_reload(
+    latest_requested: &AtomicU64,
+    path: &str,
+    request: MeshSliceRequest,
+) -> (
+    u64,
+    tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>,
+) {
+    let generation = latest_requested.fetch_add(1, Ordering::AcqRel) + 1;
+    let load_path = PathBuf::from(path);
+    let handle =
+        tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&load_path, request));
+    (generation, handle)
+}
+
+#[cfg(unix)]
+async fn abort_in_flight(
+    in_flight: &mut Option<(u64, tokio::task::JoinHandle<Result<MeshSlice, anyhow::Error>>)>,
+) {
+    if let Some((_, handle)) = in_flight.take() {
+        handle.abort();
+        let _ = handle.await;
     }
 }

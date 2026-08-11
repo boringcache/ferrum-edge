@@ -309,3 +309,101 @@ fn test_comments_only() {
     let conf = ConfFile::parse("# just comments\n# nothing else\n").unwrap();
     assert!(conf.is_empty());
 }
+
+// ── Stable-file load contract (issue #3776) ─────────────────────────────────
+
+#[test]
+fn absent_default_conf_path_yields_empty_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.conf");
+    let conf = ConfFile::load_from_path(&missing, true).expect("absent default is empty");
+    assert!(conf.is_empty());
+}
+
+#[test]
+fn explicit_missing_conf_path_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-explicit.conf");
+    let err = ConfFile::load_from_path(&missing, false).expect_err("explicit missing");
+    assert!(
+        err.contains("not found") || err.contains("Failed to read"),
+        "expected missing-path diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn conf_file_exact_limit_loads_and_limit_plus_one_refuses() {
+    use ferrum_edge::config::stable_file::MAX_FERRUM_CONF_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let exact = dir.path().join("exact.conf");
+    // Fill with valid KEY=VALUE lines under the ceiling.
+    let mut body = String::new();
+    let mut n = 0u32;
+    while (body.len() as u64) + 32 < MAX_FERRUM_CONF_BYTES {
+        body.push_str(&format!("FERRUM_CUSTOM_{n} = v\n"));
+        n += 1;
+    }
+    let pad = (MAX_FERRUM_CONF_BYTES as usize).saturating_sub(body.len());
+    if pad > 1 {
+        body.push('#');
+        body.push_str(&"x".repeat(pad - 1));
+    }
+    assert_eq!(body.len() as u64, MAX_FERRUM_CONF_BYTES);
+    std::fs::write(&exact, &body).unwrap();
+    ConfFile::load_from_path(&exact, false).expect("exact ferrum.conf ceiling must load");
+
+    let over = dir.path().join("over.conf");
+    std::fs::write(&over, format!("{body}y")).unwrap();
+    let err = ConfFile::load_from_path(&over, false).expect_err("limit+1");
+    assert!(
+        err.contains("maximum supported size"),
+        "expected size diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn conf_file_malformed_syntax_fails_without_inventing_empty_cache_via_load_from_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.conf");
+    std::fs::write(&path, "NOT_A_VALID_LINE\n").unwrap();
+    let err = ConfFile::load_from_path(&path, false).expect_err("malformed");
+    assert!(
+        err.contains("missing '='") || err.contains("Invalid conf"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn resolve_ferrum_var_source_does_not_unwrap_or_default_on_load_failure() {
+    // Source-contract pin: the lazy resolver must not convert a load failure
+    // into an empty ConfFile for the process lifetime.
+    let src = include_str!("../../../src/config/conf_file.rs");
+    assert!(
+        !src.contains("unwrap_or_default()"),
+        "resolve_ferrum_var must not failure-open via unwrap_or_default"
+    );
+    assert!(
+        src.contains("OnceLock<Result<ConfFile, String>>"),
+        "cache must retain Result so failures stay sticky and explicit"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn conf_file_fifo_is_rejected_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("ferrum.conf");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let started = std::time::Instant::now();
+    let err = ConfFile::load_from_path(&fifo, false).expect_err("fifo");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        err.contains("not a regular file") || err.contains("Failed to read"),
+        "got: {err}"
+    );
+}

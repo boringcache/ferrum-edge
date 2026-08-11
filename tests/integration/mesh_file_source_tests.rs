@@ -196,3 +196,210 @@ fn reload_then_load_produces_advancing_versions() {
         "each load stamps its own version"
     );
 }
+
+#[test]
+fn mesh_file_oversized_sparse_document_is_refused() {
+    use ferrum_edge::config::stable_file::MAX_MESH_CONFIG_FILE_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let over = dir.path().join("mesh-over.yaml");
+    let file = std::fs::File::create(&over).unwrap();
+    file.set_len(MAX_MESH_CONFIG_FILE_BYTES + 1).unwrap();
+    drop(file);
+    let err = load_mesh_slice_from_file(&over, request_for_namespace("ferrum"))
+        .expect_err("limit+1");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maximum supported size is 67108864 bytes"),
+        "expected size diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn mesh_file_at_documented_ceiling_constant_is_admitted_by_stable_reader() {
+    // Full 64 MiB fixtures are covered by `stable_file_tests` at a reduced
+    // ceiling; this pins the mesh source to that shared constant/primitive.
+    use ferrum_edge::config::stable_file::{
+        MAX_MESH_CONFIG_FILE_BYTES, StableFileReadOptions, read_stable_file,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mesh.yaml");
+    std::fs::write(&path, VALID_MESH_YAML).unwrap();
+    let options = StableFileReadOptions::new(MAX_MESH_CONFIG_FILE_BYTES, "mesh configuration file");
+    read_stable_file(&path, options).expect("valid mesh document under ceiling");
+    load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).expect("loads");
+}
+
+#[test]
+fn unknown_extension_json_object_parses_once_as_json() {
+    // Extensionless/unknown paths that start with `{` must take the JSON path
+    // without a prior full YAML probe parse.
+    let json = serde_json::json!({
+        "mesh": {
+            "services": [{
+                "name": "api",
+                "namespace": "ferrum",
+                "ports": [{"port": 80, "protocol": "http"}],
+            }],
+        }
+    });
+    let mut file = tempfile::Builder::new()
+        .suffix(".unknown")
+        .tempfile()
+        .unwrap();
+    write!(file, "{}", json).unwrap();
+    let slice = load_mesh_slice_from_file(file.path(), request_for_namespace("ferrum"))
+        .expect("JSON-shaped unknown extension");
+    assert_eq!(slice.services.len(), 1);
+}
+
+#[test]
+fn malformed_yaml_fails_without_echoing_document_body() {
+    let path = write_temp("yaml", "mesh: [\n  this is not valid\n");
+    let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+        .expect_err("malformed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid mesh configuration document"),
+        "got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_mesh_path_is_rejected_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("mesh.yaml");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let started = std::time::Instant::now();
+    let err = load_mesh_slice_from_file(&fifo, request_for_namespace("ferrum"))
+        .expect_err("fifo");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not a regular file"),
+        "got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_reload_does_not_stall_tokio_heartbeat() {
+    use ferrum_edge::config::stable_file::MAX_MESH_CONFIG_FILE_BYTES;
+    use ferrum_edge::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file_off_thread;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // A multi-MiB stable read (two full probes) must run on the blocking pool
+    // so a Tokio heartbeat/timer on a core worker keeps advancing.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large-mesh.yaml");
+    let mut body = VALID_MESH_YAML.to_string();
+    body.push('\n');
+    let target = (8 * 1024 * 1024).min(MAX_MESH_CONFIG_FILE_BYTES as usize);
+    let pad = target.saturating_sub(body.len());
+    body.push('#');
+    if pad > 1 {
+        body.push_str(&"x".repeat(pad - 1));
+    }
+    std::fs::write(&path, &body).unwrap();
+
+    let heartbeat = Arc::new(AtomicBool::new(false));
+    let heartbeat_flag = Arc::clone(&heartbeat);
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            heartbeat_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let load = tokio::spawn(load_mesh_slice_from_file_off_thread(
+        path.clone(),
+        request_for_namespace("ferrum"),
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !heartbeat.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Tokio heartbeat must advance while a large mesh file load runs off-thread");
+
+    let loaded = load.await.expect("join").expect("large mesh loads");
+    assert_eq!(loaded.services.len(), 1);
+    ticker.abort();
+    let _ = ticker.await;
+}
+
+#[test]
+fn mesh_file_source_uses_spawn_blocking_and_stable_reader() {
+    let src = include_str!("../../src/modes/mesh/config_consumer/file_source.rs");
+    assert!(
+        src.contains("spawn_blocking"),
+        "SIGHUP reload must isolate filesystem/parse work on spawn_blocking"
+    );
+    assert!(
+        src.contains("read_stable_file"),
+        "mesh file source must use the shared stable-file primitive"
+    );
+    assert!(
+        src.contains("pending_follow_up"),
+        "rapid SIGHUP delivery must coalesce into at most one follow-up load"
+    );
+    assert!(
+        !src.contains("std::fs::read_to_string"),
+        "mesh file source must not use unbounded read_to_string"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_reload_retains_last_good_slice() {
+    use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mesh.yaml");
+    std::fs::write(&path, VALID_MESH_YAML).unwrap();
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+    let state = MeshRuntimeState::new();
+    state.install_slice(slice);
+    let before = state
+        .snapshot()
+        .as_ref()
+        .as_ref()
+        .cloned()
+        .expect("installed");
+    assert_eq!(before.services.len(), 1);
+
+    // Replace with invalid content; a subsequent load fails while the installed
+    // generation remains the last accepted slice.
+    std::fs::write(&path, "mesh: {").unwrap();
+    let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+        .expect_err("invalid reload candidate");
+    assert!(err.to_string().contains("invalid mesh configuration document"));
+    let after = state
+        .snapshot()
+        .as_ref()
+        .as_ref()
+        .cloned()
+        .expect("retained");
+    assert!(
+        before.content_eq(&after),
+        "failed reload must retain the complete prior mesh slice"
+    );
+
+    // Recovery without restart.
+    std::fs::write(&path, VALID_MESH_YAML).unwrap();
+    let recovered = load_mesh_slice_from_file(&path, request_for_namespace("ferrum")).unwrap();
+    state.install_slice(recovered);
+    assert_eq!(
+        state.snapshot().as_ref().as_ref().unwrap().services.len(),
+        1
+    );
+}

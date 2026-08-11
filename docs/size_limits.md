@@ -146,6 +146,26 @@ Enforcement rules:
 
 See also [configuration.md](configuration.md#service-discovery).
 
+## Authoritative configuration file ceilings
+
+Proxy request/response size limits do **not** cover on-disk configuration documents. Ferrum admits those through a shared bounded stable-file reader (`src/config/stable_file.rs`):
+
+| Document | Ceiling | Notes |
+|----------|---------|-------|
+| File-mode gateway config (`FERRUM_FILE_CONFIG_PATH`) | 64 MiB | YAML/JSON `GatewayConfig`; SIGHUP reload keeps last known-good on failure |
+| `ferrum.conf` (`FERRUM_CONF_PATH`) | 1 MiB | Process-startup snapshot only; sticky load result (no empty fallback on failure) |
+| Localized mesh policy (`FERRUM_MESH_FILE_CONFIG_PATH`) | 64 MiB | `file` / `stock_xds` protocols; SIGHUP reload is off-thread and coalesced |
+
+Enforcement rules:
+
+- **Opened target.** Only regular files are admitted. Symlinks are followed when the opened target is regular (Kubernetes projected ConfigMap/Secret layout). FIFOs, Unix sockets, directories, and block/character devices are rejected promptly without waiting for EOF/producer.
+- **Non-blocking open (Unix).** `O_NONBLOCK` prevents a raced special file from wedging the caller after the pre-open metadata check.
+- **Metadata + streaming.** Known oversized metadata is fast-rejected; reads still stream through `limit + 1` so growth or inaccurate metadata cannot bypass the ceiling.
+- **Stability.** Two independent open/read cycles must observe matching file identity and byte-identical content. Instability retries a bounded number of times, then fails closed.
+- **Diagnostics.** Errors name the logical source and never include file contents.
+
+See also [configuration.md](configuration.md) and [mesh.md](mesh.md#localized-file-source-no-control-plane).
+
 ## Error Responses
 
 Pre-commit gateway rejections below are JSON with `Content-Type: application/json` on ordinary HTTP paths. Post-commit streaming overruns do **not** synthesize that JSON body — see the protocol table above.
