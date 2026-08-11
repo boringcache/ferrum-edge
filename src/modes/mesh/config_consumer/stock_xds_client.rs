@@ -933,6 +933,10 @@ async fn next_policy_baseline(
     Some(policy_rx.borrow_and_update().clone())
 }
 
+// This cold-path state transition deliberately keeps the immutable client
+// inputs and the two mutable stream-state owners explicit. Bundling them would
+// obscure which values may change while one ADS response is admitted.
+#[allow(clippy::too_many_arguments)]
 async fn handle_stock_response(
     response: proto::DiscoveryResponse,
     config: &StockXdsClientConfig,
