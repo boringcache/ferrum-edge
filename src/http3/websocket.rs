@@ -557,6 +557,28 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
     }
 }
 
+/// Status, body, and transaction-log rejection phase for an H3 WebSocket
+/// upgrade refused because its session deadline already elapsed. Mirrors the
+/// H1/H2 mapping in `handle_websocket_request_authenticated` exactly so the
+/// three frontends stay auditable under the same phase names. The bodies are
+/// fixed constants: no claim, token, identity, or deadline value is echoed.
+fn h3_websocket_deadline_rejection(
+    reason: crate::proxy::WsTerminationReason,
+) -> (StatusCode, &'static str, &'static str) {
+    match reason {
+        crate::proxy::WsTerminationReason::CredentialExpired => (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+            "websocket_credential_expired",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+            "websocket_max_lifetime",
+        ),
+    }
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -636,6 +658,41 @@ pub(crate) async fn handle_h3_websocket(
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
     let mut ctx = ctx;
+    let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
+        &ctx,
+        state.env_config.websocket_max_lifetime_seconds,
+    );
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // Same rejection record the H1/H2 path emits, so a credential-expiry or
+        // maximum-lifetime refusal is auditable on every frontend instead of
+        // only on H1 Upgrade / H2 Extended CONNECT.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(());
+    }
 
     // ── Connection admission ─────────────────────────────────────────
     let ws_connection_permit = match crate::proxy::try_acquire_websocket_connection_permit(
@@ -773,13 +830,13 @@ pub(crate) async fn handle_h3_websocket(
     // connection closes. Captured out of the loop alongside the handshake.
     let backend_conn_guard;
     let backend_handshake = loop {
-        // The H3 WebSocket bridge has no `websocket_mesh_egress` fork —
-        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial to
-        // a mesh-tagged target would bypass the secured mesh transport, so fail
-        // closed BEFORE dialing (issue #2007). Sits at the loop top so the
-        // initial target AND every retry-rotated target re-entering the loop
-        // are screened.
-        if let Some(reason) = crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+        // The H3 WebSocket bridge has no `websocket_mesh_egress` or Unix fork —
+        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial
+        // would bypass the secured mesh transport or hit a Unix target's
+        // schema-only placeholder, so fail closed BEFORE dialing (issues #2007
+        // and #3261). Sits at the loop top so the initial target AND every
+        // retry-rotated target re-entering the loop are screened.
+        if let Some(reason) = crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
             current_target.as_deref(),
         ) {
             warn!(
@@ -787,7 +844,7 @@ pub(crate) async fn handle_h3_websocket(
                 target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
                 target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
                 reason,
-                "H3 WebSocket: refusing direct dial to a mesh-transport-tagged target"
+                "H3 WebSocket: refusing direct dial to a target requiring another transport"
             );
             // Gateway-side dispatch-policy shed with no backend dialed: neutral
             // to the breaker (releases a claimed HALF_OPEN probe slot) and to
@@ -1221,6 +1278,31 @@ pub(crate) async fn handle_h3_websocket(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // The breaker already recorded this hop's success above, so only the
+        // rejection record and the request counter are owed here.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        return Ok(());
+    }
+
     // Capture the LB connection guard NOW — before the 200 is sent — so
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
@@ -1510,6 +1592,9 @@ pub(crate) async fn handle_h3_websocket(
         // tungstenite's permissive accept-unmasked mode can normalize them.
         true,
         ws_idle_tracker,
+        ws_session_deadline,
+        state.health_check_shutdown_rx.clone(),
+        Arc::clone(&state.overload),
         crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
         &adaptive_buf,
     )

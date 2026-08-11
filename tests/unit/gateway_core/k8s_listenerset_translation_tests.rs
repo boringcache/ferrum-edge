@@ -7,8 +7,8 @@
 
 use base64::Engine as _;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
-    translate_k8s_objects_collecting_skips,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, K8sMetadata, K8sObject,
+    K8sTranslationOptions, translate_k8s_objects, translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::reconciler::merge_k8s_translation;
@@ -676,6 +676,21 @@ fn listenerset_protocol_conflict_with_gateway_listener() {
     );
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "ListenersNotValid");
+    let gateway_http = GatewayApiListenerKey {
+        namespace: "default".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "http".to_string(),
+    };
+    assert_eq!(
+        translation
+            .listener_conflicts
+            .get(&gateway_http)
+            .map(|conflict| conflict.reason),
+        Some("ProtocolConflict"),
+        "Gateway HTTP claim must appear in translation.listener_conflicts for status parity: {:?}",
+        translation.listener_conflicts
+    );
 }
 
 /// Regression for upstream `HTTPRouteHTTPSListener`: a Gateway may declare an
@@ -796,6 +811,512 @@ fn gateway_https_catch_all_and_hostname_siblings_stay_materializable() {
     );
     assert_eq!(programmed["status"], "True");
     assert_eq!(programmed["reason"], "Programmed");
+}
+
+#[test]
+fn duplicate_gateway_listener_section_fails_closed() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "a-primary",
+            "port": 80,
+            "protocol": "HTTP",
+            "hostname": "shared.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "b-duplicate",
+            "port": 80,
+            "protocol": "HTTP",
+            "hostname": "shared.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        }
+    ]);
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        service("backend"),
+        http_route(
+            "duplicate-section-route",
+            json!([{
+                "name": "edge",
+                "sectionName": "b-duplicate"
+            }]),
+            "shared.example.com",
+            "/must-not-materialize",
+        ),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener b-duplicate rejected: HostnameConflict")
+    }));
+    let duplicate_key = GatewayApiListenerKey {
+        namespace: "default".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "b-duplicate".to_string(),
+    };
+    let conflict = translation
+        .listener_conflicts
+        .get(&duplicate_key)
+        .expect("duplicate Gateway listener must be recorded as conflicted");
+    assert_eq!(conflict.reason, "HostnameConflict");
+    assert!(
+        !translation.config.proxies.iter().any(|proxy| proxy
+            .listen_path
+            .as_deref()
+            .is_some_and(|path| path.contains("must-not-materialize"))),
+        "a route attached to a duplicate Gateway section must not materialize"
+    );
+}
+
+#[test]
+fn incompatible_gateway_listener_protocol_fails_closed() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "a-http",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "b-tcp",
+            "port": 80,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener b-tcp rejected: ProtocolConflict")
+    }));
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener a-http rejected: ProtocolConflict")
+    }));
+    assert!(
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.services.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .all(|service| service.name != "edge-a-http" && service.name != "edge-b-tcp"),
+        "neither protocol-conflicted claim may become a MeshService: {:?}",
+        translation.config.mesh
+    );
+
+    for listener in ["a-http", "b-tcp"] {
+        let key = GatewayApiListenerKey {
+            namespace: "default".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "edge".to_string(),
+            listener: listener.to_string(),
+        };
+        let conflict = translation
+            .listener_conflicts
+            .get(&key)
+            .unwrap_or_else(|| panic!("translation must record ProtocolConflict for {listener}"));
+        assert_eq!(conflict.reason, "ProtocolConflict");
+        assert_eq!(
+            conflict.message,
+            "Port 80 is claimed by incompatible protocol families on the same TCP \
+             transport (HTTP-family vs raw stream), so every conflicting claim on this \
+             port is refused (Conflicted)."
+        );
+        assert!(
+            !conflict.message.contains("example.com"),
+            "conflict message must not echo hostnames"
+        );
+    }
+}
+
+/// HTTP `a`, TCP `b`, HTTP `c` on one Gateway+port must refuse every TCP-family
+/// participant regardless of listener/name order. A sequential accept/remove
+/// walk wrongly lets the trailing HTTP claim survive when ordered `a,b,c`.
+#[test]
+fn three_claim_http_tcp_http_protocol_conflict_is_order_independent() {
+    let orders: [[&str; 3]; 2] = [["a", "b", "c"], ["a", "c", "b"]];
+    for names in orders {
+        let listeners: Vec<Value> = names
+            .iter()
+            .map(|name| {
+                let protocol = if *name == "b" { "TCP" } else { "HTTP" };
+                let mut listener = json!({
+                    "name": name,
+                    "port": 8080,
+                    "protocol": protocol,
+                    "allowedRoutes": { "namespaces": { "from": "Same" } }
+                });
+                if protocol == "TCP" {
+                    listener["allowedRoutes"] = json!({
+                        "kinds": [{ "kind": "TCPRoute" }],
+                        "namespaces": { "from": "Same" }
+                    });
+                }
+                listener
+            })
+            .collect();
+        let mut gateway = http_gateway("edge", Some("Same"));
+        gateway.spec["listeners"] = Value::Array(listeners);
+        let objects = vec![gateway_class(), gateway];
+        let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+        for name in names {
+            let key = GatewayApiListenerKey {
+                namespace: "default".to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
+                gateway: "edge".to_string(),
+                listener: name.to_string(),
+            };
+            let conflict = translation.listener_conflicts.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "order {:?} must ProtocolConflict every TCP-family claim including {name}: {:?}",
+                    names, translation.listener_conflicts
+                )
+            });
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(
+                conflict.message,
+                "Port 8080 is claimed by incompatible protocol families on the same TCP \
+                 transport (HTTP-family vs raw stream), so every conflicting claim on this \
+                 port is refused (Conflicted)."
+            );
+            assert!(
+                translation.warnings.iter().any(|warning| {
+                    warning.contains(&format!(
+                        "Gateway default/edge listener {name} rejected: ProtocolConflict"
+                    ))
+                }),
+                "order {:?} warnings must refuse {name}: {:?}",
+                names,
+                translation.warnings
+            );
+        }
+        assert_eq!(
+            translation.listener_conflicts.len(),
+            3,
+            "order {:?} must refuse exactly the three TCP-family claims: {:?}",
+            names,
+            translation.listener_conflicts
+        );
+        let services = translation
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.services.as_slice())
+            .unwrap_or(&[]);
+        for name in names {
+            assert!(
+                services
+                    .iter()
+                    .all(|service| service.name != format!("edge-{name}")),
+                "order {:?} must not materialize conflicted MeshService edge-{name}: {:?}",
+                names,
+                services
+                    .iter()
+                    .map(|service| service.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Independent Gateways that share only a numeric port still share one OS
+/// socket. Gateway team-a/alpha with only HTTP and team-b/beta with only TCP on
+/// the same port must both ProtocolConflict (and any additional HTTP-family
+/// participant must withdraw too). Status messages stay port/family wording —
+/// never other namespaces' or Gateways' object/listener names.
+#[test]
+fn cross_gateway_http_and_tcp_on_same_port_protocol_conflict() {
+    let orders: [[&str; 3]; 2] = [["alpha", "beta", "gamma"], ["gamma", "beta", "alpha"]];
+    for gateway_order in orders {
+        let mut objects = vec![gateway_class()];
+        for name in gateway_order {
+            let (namespace, listeners) = match name {
+                "alpha" => (
+                    "team-a",
+                    json!([{
+                        "name": "alpha-http",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    }]),
+                ),
+                "beta" => (
+                    "team-b",
+                    json!([
+                        {
+                            "name": "beta-tcp",
+                            "port": 8080,
+                            "protocol": "TCP",
+                            "allowedRoutes": {
+                                "kinds": [{ "kind": "TCPRoute" }],
+                                "namespaces": { "from": "Same" }
+                            }
+                        },
+                        {
+                            "name": "beta-udp",
+                            "port": 8080,
+                            "protocol": "UDP",
+                            "allowedRoutes": {
+                                "kinds": [{ "kind": "UDPRoute" }],
+                                "namespaces": { "from": "Same" }
+                            }
+                        }
+                    ]),
+                ),
+                "gamma" => (
+                    "team-c",
+                    json!([{
+                        "name": "gamma-http",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    }]),
+                ),
+                other => panic!("unexpected gateway fixture {other}"),
+            };
+            let mut gateway = http_gateway(name, Some("Same"));
+            gateway.metadata.namespace = namespace.to_string();
+            gateway.spec["listeners"] = listeners;
+            objects.push(gateway);
+        }
+
+        let translation =
+            translate_k8s_objects(&objects, options().with_source_namespaces(Vec::new()))
+                .expect("translate");
+        let expected_message = "Port 8080 is claimed by incompatible protocol families on the \
+             same TCP transport (HTTP-family vs raw stream), so every conflicting claim on this \
+             port is refused (Conflicted).";
+
+        let expected = [
+            ("team-a", "alpha", "alpha-http"),
+            ("team-b", "beta", "beta-tcp"),
+            ("team-c", "gamma", "gamma-http"),
+        ];
+        for (namespace, gateway, listener) in expected {
+            let key = GatewayApiListenerKey {
+                namespace: namespace.to_string(),
+                parent_kind: GatewayApiListenerParentKind::Gateway,
+                gateway: gateway.to_string(),
+                listener: listener.to_string(),
+            };
+            let conflict = translation.listener_conflicts.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "order {:?} must ProtocolConflict {namespace}/{gateway}#{listener}: {:?}",
+                    gateway_order, translation.listener_conflicts
+                )
+            });
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(
+                conflict.message, expected_message,
+                "order {:?} message must be generic port/family wording without object names",
+                gateway_order
+            );
+            let services = translation
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.services.as_slice())
+                .unwrap_or(&[]);
+            assert!(
+                services
+                    .iter()
+                    .all(|service| service.name != format!("{gateway}-{listener}")),
+                "order {:?} must not materialize conflicted MeshService {gateway}-{listener}: {:?}",
+                gateway_order,
+                services
+                    .iter()
+                    .map(|service| service.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let udp = GatewayApiListenerKey {
+            namespace: "team-b".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "beta".to_string(),
+            listener: "beta-udp".to_string(),
+        };
+        assert!(
+            !translation.listener_conflicts.contains_key(&udp),
+            "order {:?} UDP must remain accepted beside global HTTP/TCP conflict: {:?}",
+            gateway_order,
+            translation.listener_conflicts
+        );
+        assert_eq!(
+            translation.listener_conflicts.len(),
+            3,
+            "order {:?} must withdraw exactly the three TCP-family claims: {:?}",
+            gateway_order,
+            translation.listener_conflicts
+        );
+    }
+}
+
+/// UDP remains a separate transport: when HTTP and TCP conflict on a port, a
+/// co-located UDP claim on the same number must stay accepted.
+#[test]
+fn udp_coexists_when_http_and_tcp_protocol_conflict_on_same_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "http",
+            "port": 9000,
+            "protocol": "HTTP",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "tcp",
+            "port": 9000,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        },
+        {
+            "name": "udp",
+            "port": 9000,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    for listener in ["http", "tcp"] {
+        let key = GatewayApiListenerKey {
+            namespace: "default".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "edge".to_string(),
+            listener: listener.to_string(),
+        };
+        assert_eq!(
+            translation
+                .listener_conflicts
+                .get(&key)
+                .map(|conflict| conflict.reason),
+            Some("ProtocolConflict"),
+            "{listener} must ProtocolConflict: {:?}",
+            translation.listener_conflicts
+        );
+    }
+    let udp = GatewayApiListenerKey {
+        namespace: "default".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "udp".to_string(),
+    };
+    assert!(
+        !translation.listener_conflicts.contains_key(&udp),
+        "UDP must remain accepted beside an HTTP/TCP family conflict: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation.warnings.iter().any(|warning| {
+            warning.contains("Gateway default/edge listener udp rejected: ProtocolConflict")
+        }),
+        "UDP must not receive ProtocolConflict warnings: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn tcp_and_udp_gateway_listeners_may_share_a_numeric_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "tcp",
+            "port": 9000,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        },
+        {
+            "name": "udp",
+            "port": 9000,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "TCP and UDP are different transports and must not ProtocolConflict on one number: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ProtocolConflict")),
+        "TCP+UDP must not emit ProtocolConflict warnings: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn tcp_and_tls_passthrough_listeners_may_share_a_numeric_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "tcp",
+            "port": 8443,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        },
+        {
+            "name": "tls",
+            "port": 8443,
+            "protocol": "TLS",
+            "hostname": "sni.example.com",
+            "tls": { "mode": "Passthrough" },
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TLSRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "raw TCP and TLS-passthrough share the opaque stream plane and must not ProtocolConflict: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ProtocolConflict")),
+        "TCP+TLS-passthrough must not emit ProtocolConflict warnings: {:?}",
+        translation.warnings
+    );
 }
 
 #[test]
@@ -986,7 +1507,7 @@ fn listenerset_update_and_delete_withdraw_materialization() {
 }
 
 #[test]
-fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
+fn same_named_gateway_and_listenerset_tls_services_both_materialize() {
     let mut gateway = object(
         "Gateway",
         "shared",
@@ -1044,9 +1565,9 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .all(|service| service.name != "listenerset-shared-same")
+                .any(|service| service.name == "listenerset-shared-same")
         }),
-        "the non-winning ListenerSet must not emit its kind-scoped service"
+        "the ListenerSet must retain its own certificate-backed service now that frontend TLS is listener-scoped"
     );
     let status = translation
         .listenerset_statuses
@@ -1058,8 +1579,8 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         "the non-conflicting ListenerSet stays accepted"
     );
     assert!(
-        !status.programmed && status.programmed_listeners.is_empty(),
-        "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"
+        status.programmed && status.programmed_listeners == ["same"],
+        "the independently certificate-backed ListenerSet listener must report Programmed"
     );
 }
 
@@ -1189,7 +1710,7 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
 }
 
 #[test]
-fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
+fn cross_namespace_listenerset_extends_parent_gateway_tls_candidates() {
     let mut gateway = object(
         "Gateway",
         "edge",
@@ -1240,7 +1761,7 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
         .with_source_namespaces(vec!["gateway-ns".to_string(), "extension-ns".to_string()]);
     let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
 
-    assert_eq!(translation.config.frontend_tls_namespace_sources.len(), 1);
+    assert_eq!(translation.config.frontend_tls_certificate_sources.len(), 2);
     assert_eq!(
         translation.config.frontend_tls_source_namespace.as_deref(),
         Some("gateway-ns")
@@ -1251,13 +1772,13 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
             .frontend_tls_cert_path
             .as_deref()
             .is_some_and(|path| path.starts_with("k8s://gateway-ns/gateway-cert#tls.crt?")),
-        "the parent Gateway must retain the physical TLS serving slot"
+        "the parent Gateway must remain the deterministic fallback"
     );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
             .any(|service| service.namespace == "gateway-ns" && service.name == "edge-https")
-            && !mesh.services.iter().any(|service| {
+            && mesh.services.iter().any(|service| {
                 service.namespace == "extension-ns"
                     && service.name == "listenerset-extra-https-extra"
             })
