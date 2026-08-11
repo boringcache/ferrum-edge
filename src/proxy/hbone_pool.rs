@@ -260,6 +260,26 @@ impl HbonePoolError {
                 | Self::H2Handshake { .. }
         )
     }
+
+    /// Peer reachability failures that must not pin `ProtocolSupport::Unsupported`
+    /// from a startup/refresh HBONE probe.
+    ///
+    /// `mesh.hbone` dispatch fails closed on `Unsupported`, and the default
+    /// capability refresh interval is 24h. A DaemonSet rolling restart therefore
+    /// wedges every outbound mesh dial for a day if the first probe runs while
+    /// the peer NodeWaypoint is still gone: connect/DNS evidence is transient
+    /// peer unavailability, not proof the destination lacks HBONE. Leave the
+    /// record `Unknown` (or preserve a prior definitive verdict) so
+    /// `can_attempt_hbone_backend` stays fail-open until a later probe or live
+    /// dial can prove the tunnel. Protocol/identity failures
+    /// (`TlsHandshake`/`H2Handshake`/`NoSvid`/…) remain sticky capability
+    /// signals.
+    pub fn is_transient_peer_unavailability(&self) -> bool {
+        matches!(
+            self,
+            Self::DnsLookup { .. } | Self::ConnectTimeout { .. } | Self::Connect { .. }
+        )
+    }
 }
 
 /// Upper bound on retired-generation records kept while waiting for their
@@ -3585,6 +3605,35 @@ mod tests {
             h2_failure.is_capability_failure(),
             "pre-CONNECT HTTP/2 establishment failure is a capability signal"
         );
+        assert!(
+            !h2_failure.is_transient_peer_unavailability(),
+            "ALPN/H2 handshake failure is protocol evidence, not peer downtime"
+        );
+
+        let connect = HbonePoolError::Connect {
+            addr: "10.0.0.1:15008".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+        };
+        assert!(
+            connect.is_capability_failure(),
+            "connect failures remain capability-classified for dial dampening"
+        );
+        assert!(
+            connect.is_transient_peer_unavailability(),
+            "connect refused during a peer restart must not pin Unsupported on the HBONE probe"
+        );
+
+        let connect_timeout = HbonePoolError::ConnectTimeout {
+            addr: "10.0.0.1:15008".to_string(),
+            timeout_ms: 1_000,
+        };
+        assert!(connect_timeout.is_transient_peer_unavailability());
+
+        let dns = HbonePoolError::DnsLookup {
+            host: "orders.default.svc.cluster.local".to_string(),
+            message: "name not found".to_string(),
+        };
+        assert!(dns.is_transient_peer_unavailability());
     }
 
     #[test]

@@ -2649,6 +2649,7 @@ expect_allowed() {
   local retry_route_not_found="${6:-false}"
   local max_attempts="${7:-8}"
   local output="" code="" body="" status=1 err
+  local dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
   err="$(mktemp)"
   for attempt in $(seq 1 "$max_attempts"); do
     set +e
@@ -2675,13 +2676,24 @@ expect_allowed() {
         sleep 1
         continue
       fi
+      # Post-DaemonSet-restart callers also opt into waiting out the exact
+      # HBONE capability-not-ready refusal. A sticky Unsupported record is
+      # repaired in-proxy; this retry only covers the brief window before a
+      # live dial / refresh proves the peer tunnel.
+      if [[ "$retry_route_not_found" == "true" ]] &&
+        [[ "$code" == "502" ]] &&
+        [[ "$body" == "$dispatch_not_ready_body" ]]; then
+        sleep 1
+        continue
+      fi
       break
     fi
     # A rolling NodeWaypoint restart becomes Kubernetes-Ready before the CP's
     # updated waypoint inventory has necessarily rematerialized every outbound
     # route. Only callers that opt into this bounded convergence mode retry the
-    # exact route-missing response above; authorization failures and other HTTP
-    # errors still fail immediately so policy regressions cannot be hidden.
+    # exact route-missing / HBONE-not-ready responses above; authorization
+    # failures and other HTTP errors still fail immediately so policy
+    # regressions cannot be hidden.
     sleep 1
   done
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
@@ -3134,7 +3146,7 @@ expect_attributed_forged_assertion_blocked() {
   local family="${4:-4}"
   local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
   local out_dir before_file after_file output code body err status before_count after_count attempt
-  local dispatch_not_ready_body
+  local dispatch_not_ready_body dispatch_wait_deadline
   from_record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
   destination_record="$(workload_pod_record_for_app "$destination")"
@@ -3158,7 +3170,14 @@ expect_attributed_forged_assertion_blocked() {
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
   dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
-  for attempt in $(seq 1 30); do
+  # Elapsed-time bound: a rolling ambient restart can leave the source
+  # NodeWaypoint Ready with a live slice while HBONE peers are still coming
+  # up. Prefer wall-clock over a fixed attempt count so slow curls cannot burn
+  # the whole budget in a handful of probes (mirrors wait_for_ambient_mesh_slice).
+  local dispatch_wait_deadline=$((SECONDS + 90))
+  attempt=0
+  while ((SECONDS < dispatch_wait_deadline)); do
+    attempt=$((attempt + 1))
     set +e
     output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
     status=$?
@@ -3172,11 +3191,12 @@ expect_attributed_forged_assertion_blocked() {
     fi
 
     # A restarted source NodeWaypoint can report ready after accepting the
-    # slice but before its per-workload HBONE target tags are materialized.
-    # Retry only that explicit convergence response; every other transport or
-    # HTTP outcome remains an immediate failure, and success still requires a
-    # destination policy rejection plus the deny-recorder increment below.
-    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 30 ]]; then
+    # slice but before its per-workload HBONE target tags are materialized /
+    # before peer tunnels are dialable. Retry only that explicit convergence
+    # response; every other transport or HTTP outcome remains an immediate
+    # failure, and success still requires a destination policy rejection plus
+    # the deny-recorder increment below.
+    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" ]]; then
       sleep 0.5
       continue
     fi
@@ -3185,6 +3205,11 @@ expect_attributed_forged_assertion_blocked() {
     cat "$err" >&2 || true
     return 1
   done
+  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+    echo "expected forged assertion request to fail via destination HBONE policy rejection within 90s, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}' after ${attempt} attempts" >&2
+    cat "$err" >&2 || true
+    return 1
+  fi
 
   for _ in $(seq 1 20); do
     if fetch_policy_denies_for_node "$dst_node" "$after_file"; then

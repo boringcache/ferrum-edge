@@ -8720,18 +8720,66 @@ impl ProxyState {
             }
             Ok(Err(err)) => {
                 if err.is_capability_failure() {
-                    record.hbone = ProtocolSupport::Unsupported;
+                    if err.is_transient_peer_unavailability() {
+                        // Rolling NodeWaypoint restarts probe while the peer is
+                        // still down. Pinning Unsupported here fails closed every
+                        // mesh.hbone dial until the 24h refresh — the live
+                        // forged/restored-assertor path reproduced that as a
+                        // sticky `HBONE dispatch required` 502. Preserve a prior
+                        // definitive verdict; otherwise leave Unknown so
+                        // can_attempt_hbone_backend stays fail-open.
+                        if let Some(previous) = target.previous_hbone {
+                            if !matches!(previous, ProtocolSupport::Unknown) {
+                                record.hbone = previous;
+                            }
+                        }
+                        append_probe_error(
+                            record,
+                            format!(
+                                "HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"
+                            ),
+                        );
+                        debug!(
+                            "HBONE probe for {}:{} via port {} saw transient peer unavailability; leaving unknown/prior: {}",
+                            host, port, hbone_port, err
+                        );
+                    } else {
+                        record.hbone = ProtocolSupport::Unsupported;
+                        append_probe_error(
+                            record,
+                            format!(
+                                "HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"
+                            ),
+                        );
+                        debug!(
+                            "HBONE probe for {}:{} via port {} classified unsupported: {}",
+                            host, port, hbone_port, err
+                        );
+                    }
                 } else if let Some(previous) = target.previous_hbone {
                     record.hbone = previous;
+                    append_probe_error(
+                        record,
+                        format!(
+                            "HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"
+                        ),
+                    );
+                    debug!(
+                        "HBONE probe for {}:{} via port {} preserved prior classification after non-capability failure: {}",
+                        host, port, hbone_port, err
+                    );
+                } else {
+                    append_probe_error(
+                        record,
+                        format!(
+                            "HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"
+                        ),
+                    );
+                    debug!(
+                        "HBONE probe for {}:{} via port {} left unknown after non-capability failure: {}",
+                        host, port, hbone_port, err
+                    );
                 }
-                append_probe_error(
-                    record,
-                    format!("HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"),
-                );
-                debug!(
-                    "HBONE probe for {}:{} via port {} classified unsupported: {}",
-                    host, port, hbone_port, err
-                );
             }
             Err(_) => {
                 if let Some(previous) = target.previous_hbone {
