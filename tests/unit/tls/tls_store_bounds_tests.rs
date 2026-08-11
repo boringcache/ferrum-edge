@@ -589,8 +589,7 @@ fn event_log_bounds_load_and_compacts_atomically() {
 fn event_log_oversized_candidate_leaves_prior_live_and_durable_state_intact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("tls-events.json");
-    let log =
-        TlsEventLog::open_with_document_limit(4, Some(path.clone()), 4 * 1024).expect("open");
+    let log = TlsEventLog::open_with_document_limit(4, Some(path.clone()), 4 * 1024).expect("open");
     log.record(event_with("seed-a"));
     log.record(event_with("seed-b"));
     let before = log.list(&TlsEventFilter::default());
@@ -625,9 +624,7 @@ fn event_log_oversized_candidate_leaves_prior_live_and_durable_state_intact() {
     assert_eq!(reloaded[1].sources[0].cert_id, "seed-b");
 }
 
-fn replica_snapshot_refreshes_shared_store_record_count_gauge_impl(
-    store_dir: &std::path::Path,
-) {
+fn replica_snapshot_refreshes_shared_store_record_count_gauge_impl(store_dir: &std::path::Path) {
     use ferrum_edge::plugins::prometheus_metrics::global_registry;
 
     let path = store_dir.join("probe-store.json");
@@ -673,8 +670,7 @@ fn replica_snapshot_refreshes_shared_store_record_count_gauge_impl(
 #[test]
 fn replica_snapshot_refreshes_shared_store_record_count_gauge() {
     const CHILD_DIR_ENV: &str = "FERRUM_TEST_TLS_STORE_BOUNDS_GAUGE_CHILD_DIR";
-    const TEST_NAME: &str =
-        "unit::tls::tls_store_bounds_tests::replica_snapshot_refreshes_shared_store_record_count_gauge";
+    const TEST_NAME: &str = "unit::tls::tls_store_bounds_tests::replica_snapshot_refreshes_shared_store_record_count_gauge";
 
     if let Ok(dir) = std::env::var(CHILD_DIR_ENV) {
         replica_snapshot_refreshes_shared_store_record_count_gauge_impl(std::path::Path::new(&dir));
