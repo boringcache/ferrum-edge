@@ -236,9 +236,7 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
         "removed source.principal value must not leak into another label: {counter}"
     );
     assert!(
-        counter.contains(
-            r#"destination_principal="spiffe://cluster.local/ns/default/sa/backend""#
-        ),
+        counter.contains(r#"destination_principal="spiffe://cluster.local/ns/default/sa/backend""#),
         "unremoved destination.principal must remain available: {counter}"
     );
 }
